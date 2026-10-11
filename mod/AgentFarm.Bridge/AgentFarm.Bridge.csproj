@@ -48,6 +48,19 @@
       <HintPath>$(GamePath)\StardewModdingAPI.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <!--
+      编译期必需：StardewModdingAPI.Constants.ApiVersion 的类型是 ISemanticVersion，
+      它定义在 smapi-internal\SMAPI.Toolkit.CoreInterfaces.dll 里。
+      这不是 NuGet 包，而是 SMAPI 自带程序集，运行期由 SMAPI 自己解析。
+    -->
+    <Reference Include="SMAPI.Toolkit.CoreInterfaces">
+      <HintPath>$(GamePath)\smapi-internal\SMAPI.Toolkit.CoreInterfaces.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="SMAPI.Toolkit">
+      <HintPath>$(GamePath)\smapi-internal\SMAPI.Toolkit.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="StardewValley.GameData">
       <HintPath>$(GamePath)\StardewValley.GameData.dll</HintPath>
       <Private>false</Private>

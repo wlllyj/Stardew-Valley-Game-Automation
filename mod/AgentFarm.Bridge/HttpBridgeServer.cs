@@ -5,6 +5,7 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 
 namespace AgentFarm.Bridge
@@ -36,7 +37,9 @@ namespace AgentFarm.Bridge
             {
                 StatusCode = code,
                 ReasonPhrase = phrase,
-                Json = Json.Serialize(new ErrorResponse { Ok = false, Status = StatusForCode(code), Reason = reason }),
+                Json = JsonSerializer.Serialize(
+                    new ErrorResponse { Ok = false, Status = StatusForCode(code), Reason = reason },
+                    Json.Options),
             };
 
         private static string StatusForCode(int code)

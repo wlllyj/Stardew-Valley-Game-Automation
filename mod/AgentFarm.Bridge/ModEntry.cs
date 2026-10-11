@@ -29,7 +29,6 @@ namespace AgentFarm.Bridge
             helper.Events.GameLoop.DayStarted += this.OnDayStarted;
             helper.Events.GameLoop.UpdateTicked += this.OnUpdateTicked;
             helper.Events.GameLoop.ReturnedToTitle += this.OnReturnedToTitle;
-            helper.Events.GameLoop.GameExiting += this.OnGameExiting;
 
             // 启动顺序说明：Entry 里就把服务起起来。
             // 理由：无人值守时“脑”需要在游戏还在标题画面时就能发现端口与令牌，
@@ -101,13 +100,11 @@ namespace AgentFarm.Bridge
             this._host.InvalidateWorldCache();
         }
 
-        /// <summary>游戏退出：删掉发现文件（避免“脑”连到一个已经死掉的端口）。</summary>
-        private void OnGameExiting(object sender, EventArgs e)
-        {
-            try { this._host?.Stop(deleteBridgeFile: true); } catch { }
-        }
-
-        /// <summary>mod 卸载（含游戏退出）时清理：关监听 + 删 bridge.json。</summary>
+        /// <summary>
+        /// mod 卸载（含游戏正常退出）时清理：关监听 + 删 bridge.json。
+        /// 注意 SMAPI 的 IGameLoopEvents 里没有 GameExiting 事件（实测 4.5.2），
+        /// 所以“退出清理”就靠这个重写点。
+        /// </summary>
         protected override void Dispose(bool disposing)
         {
             try { this._host?.Stop(deleteBridgeFile: true); } catch { }
@@ -125,7 +122,6 @@ namespace AgentFarm.Bridge
 
         private static string SafeGameVersion()
         {
-            try { return Constants.GameVersion?.ToString() ?? Game1.version; } catch { }
             try { return Game1.version; } catch { return "?"; }
         }
 

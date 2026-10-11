@@ -223,10 +223,13 @@ namespace AgentFarm.Bridge
             return sb.ToString();
         }
 
+        /// <summary>
+        /// 游戏版本字符串，形如 "1.6.15"。
+        /// 走 <c>Game1.version</c>：实测 SMAPI 4.5.2 的 <c>Constants</c> 上**没有** GameVersion 属性（编译期 CS0117），
+        /// 别改回去。
+        /// </summary>
         private static string GameVersionString()
         {
-            try { return Constants.GameVersion?.ToString() ?? Game1.version; }
-            catch { }
             try { return Game1.version; } catch { return "unknown"; }
         }
 
