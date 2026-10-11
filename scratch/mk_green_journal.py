@@ -33,6 +33,7 @@ for i, (start_day, end_day) in enumerate(DAYS):
                  "final": {"day": end_day, "timeOfDay": 600, "stamina": 270.0, "crops": 33,
                            "unwatered_crops": 0, "money": 200},
                  "checks": {"slept_by_us": True, "no_hard_failures": True, "crops_watered": True,
+                            "watered_outdoor": True,
                             "day_justified": True, "no_unmet_stages": True},
                  "day_text": "spring 10：phase water_area...", "ok_steps": 32, "skipped_steps": 0,
                  "failed_steps": 0, "stages": [{"stage": "water_area", "leftover": 0, "ok": 32}],

@@ -166,11 +166,24 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
                 problems.append(
                     f"[{name}] 缺跨日证据：final 的日期与 day_start 相同（final={d['final'].get('day')!r}）"
                 )
+            # 浇水证据（log-analyst `docs/_analyze-farmcounts.md` §6/§7）：窗口 `tiles[]` 的
+            # crops/unwatered_crops 在室内恒 0（run2 实证：day_end.final 是 FarmHouse crops=0，
+            # 而 checks.crops_watered=true 白过），且 Mod 的 farm.unwateredCrops 用的是
+            # HoeDirt.needsWatering()（只读 CropData.NeedsWatering、不看浇水状态）⇒ 两者都
+            # 不能当浇水证据。必须由 longrun 写 `checks.watered_outdoor`（见 task-19）。
+            watered_outdoor = checks.get("watered_outdoor")
+            if watered_outdoor is None:
+                problems.append(
+                    f"[{name}] 缺 farm 级/户外浇水证据：checks.watered_outdoor 未写"
+                    "（窗口 unwatered_crops 在室内恒 0，不作为证据；缺失 ≠ 通过）"
+                )
+            elif watered_outdoor is False:
+                problems.append(f"[{name}] checks.watered_outdoor=false（睡前还有没浇的作物）")
             unwatered = d["final"].get("unwatered_crops")
-            if unwatered != 0:
-                problems.append(f"[{name}] 睡前 unwatered_crops={unwatered!r}（要求 0）")
+            if unwatered not in (0, None):
+                problems.append(f"[{name}] 睡前 unwatered_crops={unwatered!r}（窗口口径，要求 0）")
             if checks.get("crops_watered") is False:
-                problems.append(f"[{name}] checks.crops_watered=false（睡前还有没浇的作物）")
+                problems.append(f"[{name}] checks.crops_watered=false（窗口口径，睡前还有没浇的作物）")
         if checks.get("no_hard_failures") is False:
             problems.append(f"[{name}] checks.no_hard_failures=false（当天有硬失败步骤）")
         # 失败数一律以 day_end.stages 求和为准，并与 failed_steps 交叉核对（负例 B：只信自述）
