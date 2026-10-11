@@ -100,3 +100,20 @@ Lead 的修复（我逐行读过 `verify-run3.py:150-204`）与实测结果一�
 - **残留洞（新，neg-D）**：`scratch/review-neg-D-unmet-but-verified.jsonl`（3 天，`checks.no_unmet_stages=false` 且 `day_end.stages=[{tiles:15,ok:10,failed:0,leftover:5}]`——**自述与阶段记录一致地"没做完"**，但 `day_end.verified=true`、`failed_steps=0`）→ 工具 **零问题 / VERIFIED / exit 0**。原因：`verify-run3.py:193` 只做**一致性**比较（`bool(unmet) != (leftover_targeted == 0)`），而旧版那条无条件的 `elif unmet is False: 问题` 被这次修改删掉了 ⇒ 当 `no_unmet_stages=False` 与自算 leftover **一致**时，脚本不再把它当失败；唯一还能拦住它的是 `verify-run3.py:186` 的 `verified is False`，而这份账本自称 `verified=true`。真实 longrun 里 `rep.verified = all(rep.checks.values())`（`longrun.py:1365`）会连带写成 false、所以今天多半拦得住；但工具存在的意义就是**不信执行者的自述**，且"verified 只取部分 checks"正是 R1 那类 bug 的形态。建议加回一行：`if unmet is False: problems.append(f"[{name}] checks.no_unmet_stages=false（有阶段后置条件未成立）")`，与一致性检查并存。
 - Nit：`_tile_count()`（`verify-run3.py:79-87`）对**没有 `tiles` 字段**的历史账本返回 0，于是该阶段落入 `leftover_zero_target` 并报「0 目标阶段 leftover=…」——方向是 fail-safe（宁可误报不放过），但错误信息会误导；run3 的账本每阶段都写 `tiles`（`longrun.py:971`），不受影响。
 - `verify-run3.py:119-121` 的 `event=="stage"` 已按约定保留 + 加 legacy 注释；权威口径统一为 `day_end.stages`。
+
+## 7.2 neg-D 修复后的独立复跑（6 账本，deputy-lead 自己跑的命令）
+
+命令：`& $py tools\verify-run3.py --journal <账本>`（`$py` = `C:\Users\admin\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`），仅读 `scratch\`、`logs\`、`tools\`，未改任何文件。
+
+| 账本 | 实测结论 |
+|---|---|
+| `scratch/journal-green.jsonl` | 无问题 → **VERIFIED exit 0**（尾部连续 VERIFIED 3/3，正例未破） |
+| `scratch/review-neg-A-no-verified.jsonl` | spring 10/11/12 各 1 条「day_end 缺 verified 字段（缺失 ≠ 通过）」→ **exit 1** |
+| `scratch/review-neg-B-self-report-green.jsonl` | 每天 2 条：「自述 failed_steps=0 与 day_end.stages 求和 3 不一致（账目不可信）」「checks.no_unmet_stages=True 与自算不一致（有目标阶段遗留 leftover=5 格）」→ **exit 1** |
+| `scratch/review-neg-C-fallback-ok.jsonl` | 每天 2 条：「当天 stages 硬失败 3 格」「当天有阶段遗留目标 leftover=5（阶段没做完）」→ **exit 1** |
+| `scratch/review-neg-D-unmet-but-verified.jsonl` | 每天 1 条「checks.no_unmet_stages=false（有阶段后置条件未成立；自算有目标阶段 leftover=5 格）」→ **exit 1**（修复前为零问题 exit 0） |
+| `logs/longrun-3day-llm-run2.jsonl`（真机） | spring 10 共 7 条：`ended_by=sleep_failed` ×2、`no_hard_failures=false`、硬失败 14 格、`verified=false` ×2、sleep 失败 1 次 ×2、leftover=15；末条「journal 里出现 跨日没有推进 ×1」→ **exit 1 / needs_review** |
+
+- 修复确已落地且是**无条件**判定：`tools/verify-run3.py:201` `if unmet is False:` 与 `:193` 的一致性检查**并列**（不是 `elif`），注释 `:198-200` 明确写了「负例 D」与「不因自算结果与它一致而放行」。结构已用 read 工具逐行确认（`:185-212`）。
+- 复跑口径与 Lead 自报**完全一致**（6/6）。**判定：PASS**（neg-D 洞已堵，回归未破）。
+- 仍未闭合的**非阻塞** nit（沿用）：①`_tile_count()`（`:79-87`）对无 `tiles` 字段的历史账本返回 0 ⇒ 误报为「0 目标阶段 leftover」，fail-safe 但文案误导，run3 不受影响；②`checks`/`verified` 双双缺失且阶段记录缺 `tiles` 的账本，工具只能报「缺 verified」+疑似「0 目标 leftover」，无法还原真实遗留——这是账本本身不携带的信息，可接受。
