@@ -24,6 +24,7 @@ from typing import Any
 from .bridge import (
     BASELINE_GAME_VERSION,
     BASELINE_SMAPI_VERSION,
+    MOD_VERSION_EXPECTED,
     SCHEMA_WORLD,
     BridgeClient,
     BridgeError,
@@ -41,6 +42,17 @@ from .llm import (
     secrets_dir,
 )
 from .winfocus import ensure_game_foreground, find_game_window, foreground_window
+from .watchdog import assess, format_findings, verdict, write_stop_report
+# 规划层（P3 ⑤）：模块导入本身**不发任何请求**，LLM 调用藏在 planner.default_llm_chat 里延迟导入。
+from .planner import (
+    BOUNDARY_NEW_DAY,
+    BOUNDARY_RECOVERY,
+    BOUNDARY_TASK_CHANGE,
+    Brief,
+    BoundaryPlanner,
+    PlannerState,
+    farm_areas,
+)
 
 SEASON_ZH = {"spring": "春", "summer": "夏", "fall": "秋", "winter": "冬"}
 
@@ -147,6 +159,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if info.smapi_version != BASELINE_SMAPI_VERSION:
         print(f"{WARN} SMAPI 版本 {info.smapi_version} ≠ 基线 {BASELINE_SMAPI_VERSION}")
         warnings += 1
+    if info.mod_version != MOD_VERSION_EXPECTED:
+        print(f"{WARN} Mod 版本 {info.mod_version} ≠ 期望 {MOD_VERSION_EXPECTED}"
+              f"（Mods\\ 里已经是新版，但游戏进程加载的还是旧 dll —— 需重启游戏）")
+        warnings += 1
 
     client = BridgeClient(info)
 
@@ -171,16 +187,56 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"{FAIL} /v1/observe 失败：{exc}")
         return 1
     if obs.get("schema") != SCHEMA_WORLD:
-        print(f"{FAIL} observe schema 异常：{obs.get('schema')!r}")
-        failures += 1
+        print(f"{WARN} observe 返回 schema={obs.get('schema')!r}，期望 {SCHEMA_WORLD!r}")
+        print(f"      → 游戏里装的 Mod 还是升级前的版本（dll 被游戏锁住，必须重启游戏才能换）。"
+              f"新字段（如 location.furniture[]）不可用，其余功能正常。")
+        warnings += 1
     else:
         print(f"{OK} /v1/observe 成功（schema={obs.get('schema')}，鉴权链路正常）")
     print(f"      {fmt_observe_line(obs)}")
 
     live = obs.get("liveness") or {}
+    game = obs.get("game") or {}
+    # ⚠️ `windowActive` / `pauseWhenOutOfFocus` / `oofFixCount` 只在 **/v1/health** 的 game 段里，
+    #    observe 的 game 段是 shouldTimePass/paused，**没有**它们。
+    #    早期版本这里读的是 `obs["game"]["windowActive"]`（永远是 None），于是不管真实焦点如何
+    #    都会打印"窗口在前台却没推进" —— 诊断信息一旦撒谎，比没有诊断更糟。
+    #
+    #    v0.5.0 起的真机制（IL 实证，docs\_il-oof-pause.md）：`Game1._update` IL_0444–IL_0480 在
+    #    "窗口不活跃 且 pauseWhenOutOfFocus==true" 时直接 ret，跳过 UpdateGameClock 与
+    #    UpdateLocations（含 PathFindController）—— 这才是"时钟不走 + 角色不动"的唯一门。
+    #    Mod 每帧把该选项扳回 false，所以**失焦不再是合理原因**。
+    hgame = health.get("game") or {}
+    active = hgame.get("windowActive")
+    oof = hgame.get("pauseWhenOutOfFocus")
+    oof_fixes = hgame.get("oofFixCount")
     if obs.get("hasSaveLoaded") and not live.get("worldAdvancing"):
-        print(f"{WARN} 世界似乎没有在推进（secondsSinceClockMoved={live.get('secondsSinceClockMoved')}）。"
-              f"若游戏窗口失去焦点，检查是否启用了「失焦暂停」")
+        if oof is True:
+            print(f"{WARN} 世界没在推进，而 `pauseWhenOutOfFocus` **此刻就是 true** —— 这就是那道门"
+                  f"（Game1._update IL_0444-IL_0480）：时钟与角色更新整段被跳过。")
+            print(f"      v0.5.0 应每帧把它扳回关闭；当前 oofFixCount={oof_fixes}。"
+                  f"若游戏里装的还是 0.4.0，重启游戏装新版即可。")
+        elif oof is None:
+            print(f"{WARN} 世界没在推进，且 health 里**没有** `pauseWhenOutOfFocus` 字段"
+                  f"（Mod < 0.5.0，字段是 0.5.0 新增的）。")
+            if active is False:
+                print(f"      窗口不在前台 —— 这正是 0.4.0 及更早版本的已知行为（失焦即冻结，"
+                      f"因为 GameLaunched 里那次赋值被读档换掉的 Options 实例冲掉了）。装 0.5.0 即可。")
+            else:
+                print(f"      窗口在前台却也停着，需要人工排查"
+                      f"（secondsSinceClockMoved={live.get('secondsSinceClockMoved')}）")
+        elif active is False:
+            print(f"{WARN} 世界没在推进（窗口不在前台），但 `pauseWhenOutOfFocus=false`、"
+                  f"oofFixCount={oof_fixes} —— v0.5.0 起**失焦不该再让世界停摆**，这是新问题，需要人工排查"
+                  f"（secondsSinceClockMoved={live.get('secondsSinceClockMoved')}，"
+                  f"shouldTimePass={game.get('shouldTimePass')}，paused={game.get('paused')}）")
+        elif active is True:
+            print(f"{WARN} 世界没在推进，窗口**确实**在前台、`pauseWhenOutOfFocus=false` —— 需要人工排查"
+                  f"（secondsSinceClockMoved={live.get('secondsSinceClockMoved')}，"
+                  f"shouldTimePass={game.get('shouldTimePass')}，paused={game.get('paused')}）")
+        else:
+            print(f"{WARN} 世界没在推进，且**拿不到 windowActive**（Mod 太旧或字段改名），无法区分原因"
+                  f"（secondsSinceClockMoved={live.get('secondsSinceClockMoved')}）")
         warnings += 1
 
     # 5) exec 链路（noop 不碰游戏）
@@ -233,9 +289,12 @@ def cmd_noop(args: argparse.Namespace) -> int:
 def cmd_focus(args: argparse.Namespace) -> int:
     """把游戏窗口拉到前台。
 
-    为什么需要：实测（2026-10-11）游戏**失焦时角色不会被控制器驱动** ——
-    世界时间照常流逝，但 move_to 10/10 失败、角色一动不动；回到前台后 5/5 成功。
-    所以任何"会移动角色"的操作之前都必须确保游戏在前台。
+    【历史与现状，别记错】2026-10-11 上午实测：失焦时角色不被 `PathFindController`
+    驱动，move_to 10/10 失败；当时**误以为**"世界时间照常流逝、只是角色不动"。
+    当晚的 A/B 与 IL 定因把两条都推翻了：失焦时**时钟与角色一起停**，同一个门
+    （`Game1._update` IL_0444–IL_0480 的提前返回，由 `pauseWhenOutOfFocus` 控制）。
+    Mod v0.5.0 起每帧把它扳成 false，**焦点已不再是移动的前提**。
+    所以本命令现在是**可选兜底**（也是为了让真机记录与历史可比），不再是必需步骤。
     """
     hwnd = find_game_window()
     if hwnd is None:
@@ -245,6 +304,33 @@ def cmd_focus(args: argparse.Namespace) -> int:
     ok = ensure_game_foreground()
     print(f"{OK if ok else FAIL} {'游戏已在前台' if ok else '抢焦点失败'}")
     return 0 if ok else 1
+
+
+def cmd_triage(args: argparse.Namespace) -> int:
+    """无人值守体检：一次取 health + observe，按 watchdog 的判据给结论。
+
+    退出码就是结论：**0=ok / 1=warn / 2=stop**，这样外部脚本能直接拿它当门禁。
+    stop 时会顺手把事故报告写到 `logs/stops/`（人不在时唯一的"喊人"方式）。
+    """
+    client = BridgeClient(timeout=10.0)
+    try:
+        h = client.health()
+        obs = client.observe("summary", timeout=10.0)
+    except BridgeError as exc:
+        print(f"{FAIL} 连不上或快照取不到：{exc}")
+        return 2
+    findings = assess(h, obs, mod_version_expected=MOD_VERSION_EXPECTED)
+    print(format_findings(findings))
+    v = verdict(findings)
+    if v == "stop":
+        path = write_stop_report(findings, health=h, observe=obs, note="agentfarm triage")
+        print(f"🔴 判定 stop：无人值守必须停下（脑自己修不了）。事故报告：{path}")
+        return 2
+    if v == "warn":
+        print("⚠️ 判定 warn：可以继续，但上面的条目应先处理。")
+        return 1
+    print("✅ 判定 ok：世界在推进、失焦暂停已关闭、没有挡路弹窗。")
+    return 0
 
 
 def cmd_move(args: argparse.Namespace) -> int:
@@ -264,8 +350,11 @@ def cmd_move(args: argparse.Namespace) -> int:
         return 1
     print(f"移动前：{fmt_observe_line(obs)}")
     seq = obs.get("worldSeq")
+    if args.allow_bed:
+        print(f"{WARN} --allow-bed：已显式解禁床格，走到床上会触发睡觉弹窗（随后请用 dismiss_modal 收尾）")
     try:
-        res = client.move_to(args.x, args.y, timeout_ms=args.timeout_ms, based_on_seq=seq)
+        res = client.move_to(args.x, args.y, timeout_ms=args.timeout_ms, based_on_seq=seq,
+                             allow_bed=args.allow_bed)
     except BridgeError as exc:
         print(f"{FAIL} move_to 失败：{exc}")
         return 1
@@ -282,6 +371,184 @@ def cmd_move(args: argparse.Namespace) -> int:
     except BridgeError as exc:
         print(f"{WARN} 移动后取快照失败：{exc}")
     return 0
+
+
+def print_hops(payload: dict[str, Any], prefix: str = "  ") -> None:
+    """打印 move_to_location 回执里的 path / hops（成功与失败回执都带）。"""
+    path = payload.get("path") or []
+    hops = payload.get("hops") or []
+    if path:
+        print(f"{prefix}path：{' → '.join(str(p) for p in path)}")
+    for i, h in enumerate(hops, 1):
+        print(
+            f"{prefix}hop{i}：{h.get('from')} → {h.get('to')} "
+            f"result={h.get('result')} arrivedAt={h.get('arrivedAt')} "
+            f"source={h.get('sourceTile')} landing={h.get('landingTile')} "
+            f"used={h.get('usedTile')} {h.get('ms')}ms"
+        )
+        if h.get("detail"):
+            print(f"{prefix}        detail：{h.get('detail')}")
+
+
+def cmd_goto(args: argparse.Namespace) -> int:
+    """跨地点移动（move_to_location）：走到另一个地点，可选再走到该地点的某一格。
+
+    【为什么脑不自己规划路线】路线一律由 Mod 侧按**游戏真值的 warp 图** BFS 得出
+    （架构 §5.2.1 禁止硬编码地名/坐标）。脑只声明"我要去哪个地点"。
+    """
+    if not args.no_focus:
+        # v0.5.0 起失焦不再冻结世界（每帧强制 pauseWhenOutOfFocus=false），这里只作兜底。
+        if not ensure_game_foreground(verbose=False):
+            print(f"{WARN} 未能把游戏拉到前台（不影响世界推进，仅少一层兜底）")
+
+    client = BridgeClient()
+    try:
+        obs = client.observe("summary", timeout=8.0)
+    except BridgeError as exc:
+        print(f"{FAIL} 取快照失败：{exc}")
+        if getattr(exc, "status", "") in ("no_save", "unreachable_bridge"):
+            print(f"     提示：若停在标题界面，先跑 `agentfarm load` 读档")
+        return 1
+    if not obs.get("hasSaveLoaded"):
+        print(f"{FAIL} 尚未加载存档，无法移动；若停在标题界面请先跑 `agentfarm load`")
+        return 1
+
+    print(f"移动前：{fmt_observe_line(obs)}")
+    tile = tuple(args.tile) if args.tile else None
+    if args.allow_bed:
+        print(f"{WARN} --allow-bed：落地格若为床会触发睡觉弹窗（随后请用 dismiss_modal 收尾）")
+
+    try:
+        res = client.move_to_location(
+            args.location,
+            tile=tile,
+            timeout_ms=args.timeout_ms,
+            based_on_seq=obs.get("worldSeq"),
+            allow_bed=args.allow_bed,
+        )
+    except BridgeError as exc:
+        payload = getattr(exc, "payload", None) or {}
+        print(f"{FAIL} move_to_location 失败（status={getattr(exc, 'status', '?')}）：{exc}")
+        print_hops(payload)
+        return 1
+
+    print(f"{OK} move_to_location status={res.get('status')} 耗时 {res.get('elapsedMs')}ms "
+          f"reachedLocation={res.get('reachedLocation')}")
+    print_hops(res)
+
+    try:
+        after = client.observe("summary", timeout=8.0)
+        print(f"移动后：{fmt_observe_line(after)}")
+        loc = (after.get("player") or {}).get("location") or (after.get("location") or {}).get("name")
+        if loc and loc == args.location:
+            print(f"{OK} 地点已到达 {args.location}")
+        else:
+            print(f"{WARN} 观测地点 {loc!r} 与目标 {args.location!r} 不一致（以观测为准）")
+        if tile:
+            got = (after.get("player") or {}).get("tile")
+            if got and list(got) == list(tile):
+                print(f"{OK} 已在目标格 {tuple(tile)}")
+            else:
+                print(f"{WARN} 未在目标格：期望 {tuple(tile)}，实际 {got}")
+    except BridgeError as exc:
+        print(f"{WARN} 移动后取快照失败：{exc}")
+    return 0
+
+
+def cmd_load(args: argparse.Namespace) -> int:
+    """从标题界面读档（load_save）。
+
+    【为什么这是自主性的前提】换 Mod dll 必须重启游戏，重启后停在标题界面；标题界面上
+    唯一的正常入口是"点 Continue" —— 那属于伪造输入（硬纪律①禁止）。无人值守长跑也必须
+    能从崩溃/重启里自己爬起来。Mod 侧调用的是游戏自己的 `SaveGame.Load(存档名)`。
+    """
+    client = BridgeClient()
+
+    # health 在标题界面也能答（不依赖存档），先拿它判断"现在到底在不在存档里"。
+    try:
+        h = client.health()
+    except BridgeError as exc:
+        print(f"{FAIL} 连不上桥：{exc}")
+        return 1
+    rt = h.get("runtime") or {}
+    in_save = bool(rt.get("hasSaveLoaded"))
+    print(f"Mod {h.get('modVersion')} | hasSaveLoaded={in_save} onTitleScreen={rt.get('onTitleScreen')}")
+
+    if in_save and not args.force:
+        print(f"{WARN} 当前已经在存档里，拒绝读档：读档会丢掉当天进度（游戏只在睡觉时落盘）。")
+        print(f"      确实要丢弃当前进度重新读档，请加 --force。")
+        return 1
+
+    try:
+        res = client.load_save(args.save, force=args.force, timeout_ms=args.timeout_ms)
+    except BridgeError as exc:
+        print(f"{FAIL} load_save 失败（status={getattr(exc, 'status', '?')}）：{exc}")
+        return 1
+
+    print(f"{OK} 已进入存档 {res.get('save')}：地点 {res.get('reachedLocation')} "
+          f"格 {res.get('tile')}（{res.get('elapsedMs')}ms）")
+    try:
+        print(f"读档后：{fmt_observe_line(client.observe('summary', timeout=8.0))}")
+    except BridgeError as exc:
+        print(f"{WARN} 读档后取快照失败：{exc}")
+        return 1
+    return 0
+
+
+def cmd_shutdown(args: argparse.Namespace) -> int:
+    """让游戏**自己退出**（quit_game）。
+
+    【为什么这是一条正经技能】换 Mod dll 必须重启游戏；而无人值守时没人去点"退出"。
+    与 `load`（自己读档）配对，才构成"发现问题 → 自己关 → 换 dll → 自己开 → 自己读档"的闭环：
+    见 `tools\\deploy-mod.py`。
+    """
+    client = BridgeClient()
+    try:
+        res = client.quit_game()
+    except BridgeError as exc:
+        print(f"{FAIL} quit_game 失败（status={getattr(exc, 'status', '?')}）：{exc}")
+        return 1
+
+    print(f"{OK} {res.get('status')}：{res.get('reason')}")
+    if args.force_after and not args.no_force:
+        # 兜底：等进程真的消失，超时就强杀（先备份存档是调用方的责任）
+        info = load_bridge_info()
+        for _ in range(int(args.force_after)):
+            if pid_alive(info.pid) is not True:
+                print(f"{OK} 游戏进程（pid {info.pid}）已退出")
+                return 0
+            time.sleep(1)
+        print(f"{WARN} 等了 {args.force_after}s 进程仍在（pid {info.pid}），强杀")
+        if os.name == "nt":
+            os.system(f'taskkill /PID {info.pid} /F >NUL 2>&1')
+        return 0
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """无人值守**监督循环**：每 N 秒 health+observe 体检，stop 级发现就落事故报告（并可按需关游戏）。
+
+    【为什么这是一条正经命令（旧账条目 00888）】`watchdog` 早就写好且有 20 个单测，
+    但一直只有 `triage` 手动跑一次 —— 也就是"人得想起来去看"。P3 要连续 3 个游戏日无人介入，
+    必须有个"一直在看"的循环；本命令就是它，逻辑在 `brain\\agentfarm\\runner.py`（有 7 个单测）。
+    """
+    from .runner import SupervisedRunner, load_last_stop_report
+
+    if args.last_stop:
+        rep = load_last_stop_report()
+        if rep is None:
+            print(f"{WARN} 还没有任何事故报告（logs\\stops\\ 为空）")
+            return 0
+        print(json.dumps(rep, ensure_ascii=False, indent=2)[:4000])
+        return 0
+
+    runner = SupervisedRunner(
+        interval=args.interval,
+        duration_seconds=None if args.minutes <= 0 else args.minutes * 60.0,
+        max_samples=args.max_samples,
+        on_stop=args.on_stop,
+    )
+    return runner.run()
 
 
 def cmd_llm_check(args: argparse.Namespace) -> int:
@@ -341,6 +608,56 @@ def cmd_ask(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_plan(args: argparse.Namespace) -> int:
+    """规划层（P3 ⑤）自检：一份 full 快照 → 情境简报 → 边界决策 → **只打印任务意图**。
+
+    【本命令刻意做什么、不做什么】
+    * 只输出"任务意图"（task / area_hint / reason / expected_evidence）；
+      **坐标与动作序列由技能层按当下 observe 计算**，这里一行都不算。
+    * 默认**不碰大模型**（`--boundary-llm` 关着）。用户 m01184 明确要求：
+      大模型开始介入前先告知、等确认。所以真机默认是纯代码策略，
+      连"边界"也只跑 `deterministic_plan()`。
+    * `--boundary` 用来人为站到某个边界上（否则单次调用永远是"首次决策 = 非边界"），
+      这样即使不开 LLM 也能看清边界状态机是怎么判的。
+    """
+    try:
+        obs = BridgeClient().observe("full", timeout=10.0)
+    except BridgeError as exc:
+        print(f"{FAIL} 取不到 full 快照（游戏没开？）：{exc}")
+        return 1
+
+    areas, area_lines = farm_areas(obs)
+    brief = Brief.from_observe(obs, consecutive_failures=max(0, int(args.failures)),
+                               areas=areas, area_lines=area_lines)
+    state = PlannerState(last_seen_failures=max(0, int(args.failures)))
+    if args.boundary == BOUNDARY_NEW_DAY:
+        state.day_key = (-1, "forced-by-cli", -1)      # 与当前 day_key 必然不等 ⇒ 跨日边界
+    elif args.boundary == BOUNDARY_RECOVERY:
+        state.last_seen_failures = max(0, int(args.failures)) - 1   # 计数"上升" ⇒ 恢复边界
+    elif args.boundary == BOUNDARY_TASK_CHANGE:
+        state.last_task_kind = "__forced__"            # 与代码策略给出的阶段不同 ⇒ 换任务边界
+    else:
+        state.day_key = brief.day_key                  # 自动：首次决策（非边界）
+
+    planner = BoundaryPlanner(llm_enabled=bool(args.boundary_llm))
+    decision = planner.decide(state, brief)
+
+    if args.json:
+        print(json.dumps(decision.as_dict(), ensure_ascii=False, indent=2))
+    else:
+        print(f"地点={brief.location} 农场={brief.is_farm} 粒度={'逐格' if brief.tiles_present else '整场计数'}")
+        print(f"边界={decision.boundary or '（无：常规区间）'}  来源={decision.source}  真的调了 LLM={decision.llm_called}")
+        if decision.fallback_reason:
+            print(f"{WARN} 降级原因：{decision.fallback_reason}")
+        for index, intent in enumerate(decision.intents, 1):
+            print(f"  {index}. {intent.to_line()}")
+        print("（以上只有任务意图；坐标与动作序列由技能层按当下 observe 计算）")
+    if not args.boundary_llm:
+        print("提示：大模型边界决策**默认关闭**。要真调 LLM 请显式加 --boundary-llm"
+              "（用户 m01184 要求：大模型介入前先告知）。")
+    return 0 if decision.intents else 1
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """真机测试时的"眼睛"：每 N 秒打一行，什么时候世界不动了一眼就能看出来。"""
     client = BridgeClient()
@@ -382,9 +699,56 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--timeout-ms", type=int, default=8000, dest="timeout_ms")
     m.add_argument("--no-focus", action="store_true", dest="no_focus",
                    help="不要把游戏拉到前台（用于验证失焦行为）")
+    m.add_argument("--allow-bed", action="store_true", dest="allow_bed",
+                   help="显式允许走到床格（默认禁止：踩床会触发睡觉弹窗）。仅用于复现睡觉弹窗来验证 dismiss_modal")
     m.set_defaults(func=cmd_move)
 
-    sub.add_parser("focus", help="把《星露谷》窗口拉到前台").set_defaults(func=cmd_focus)
+    g = sub.add_parser("goto", help="跨地点移动：走到另一个地点（可选再走到该地点的某格）")
+    g.add_argument("location", help="目标地点名（如 Farm；大小写不敏感，必须是游戏真值里真实存在的地点）")
+    g.add_argument("--tile", nargs=2, type=int, metavar=("X", "Y"), default=None,
+                   help="到达该地点后再走到的格；省略则只要求跨到该地点")
+    g.add_argument("--timeout-ms", type=int, default=30000, dest="timeout_ms",
+                   help="整体预算（跨地点要多跳，默认 30000）")
+    g.add_argument("--no-focus", action="store_true", dest="no_focus",
+                   help="不要把游戏拉到前台（用于验证失焦行为）")
+    g.add_argument("--allow-bed", action="store_true", dest="allow_bed",
+                   help="落地格允许是床（默认禁止：踩床会触发睡觉弹窗）")
+    g.set_defaults(func=cmd_goto)
+
+    ld = sub.add_parser("load", help="从标题界面读档（换 Mod 重启后自己回到存档；无人值守必需）")
+    ld.add_argument("--save", default=None, help="存档文件夹名；省略=自动挑最近写过的那个")
+    ld.add_argument("--force", action="store_true",
+                    help="已经在存档里时也强行读档（会丢掉当天进度，破坏性）")
+    ld.add_argument("--timeout-ms", type=int, default=60000, dest="timeout_ms")
+    ld.set_defaults(func=cmd_load)
+
+    sd = sub.add_parser("shutdown", help="让游戏自己退出（quit_game）——与 load 配对构成无人值守重启闭环")
+    sd.add_argument("--force-after", type=int, default=0, dest="force_after",
+                    help="等多少秒后仍没退出就强杀（0=不等待也不强杀）")
+    sd.add_argument("--no-force", action="store_true", dest="no_force",
+                    help="只发退出请求，绝不强杀")
+    sd.set_defaults(func=cmd_shutdown)
+
+    sub.add_parser("focus", help="把《星露谷》窗口拉到前台（v0.5.0 起只是可选兜底）").set_defaults(func=cmd_focus)
+
+    r = sub.add_parser(
+        "run",
+        help="无人值守监督循环：每 N 秒体检，stop 就落 logs\\stops\\ 事故报告（默认不动游戏）",
+    )
+    r.add_argument("--interval", type=float, default=15.0, help="采样间隔秒（默认 15）")
+    r.add_argument("--minutes", type=float, default=60.0, help="跑多少分钟（<=0 表示不限时；默认 60）")
+    r.add_argument("--max-samples", type=int, default=None, dest="max_samples",
+                   help="最多采样几次（自检用；默认不限）")
+    r.add_argument("--on-stop", choices=("report", "quit", "nothing"), default="report",
+                   dest="on_stop", help="停机动作：report=只落报告（默认）/ quit=再让游戏自己退出 / nothing")
+    r.add_argument("--last-stop", action="store_true", dest="last_stop",
+                   help="不跑循环，只打印最近一次事故报告")
+    r.set_defaults(func=cmd_run)
+
+    sub.add_parser(
+        "triage",
+        help="无人值守体检：世界在推进吗／失焦暂停关着吗／有没有挡路弹窗（退出码 0=ok 1=warn 2=stop）",
+    ).set_defaults(func=cmd_triage)
 
     w = sub.add_parser("watch", help="持续打印世界摘要")
     w.add_argument("--interval", type=float, default=2.0)
@@ -394,9 +758,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     a = sub.add_parser("ask", help="临时问慢脑一句（人工验证提示词）")
     a.add_argument("question")
-    a.add_argument("--max-tokens", type=int, default=8192, dest="max_tokens")
+    a.add_argument("--max-tokens", type=int, default=16384, dest="max_tokens",
+                   help="给慢脑的 token 上限（默认 16384；与 llm.DEFAULT_MAX_TOKENS 同口径）")
     a.add_argument("--reasoning", action="store_true", help="同时打印思考过程")
     a.set_defaults(func=cmd_ask)
+
+    pl = sub.add_parser(
+        "plan",
+        help="规划层（P3 ⑤）：打印当前该做的任务意图（默认纯代码策略，不碰大模型）",
+    )
+    pl.add_argument("--boundary-llm", action="store_true", dest="boundary_llm",
+                    help="**默认关闭**：允许在边界上调用真实大模型（用户要求先告知再启用）")
+    pl.add_argument("--boundary", choices=(BOUNDARY_NEW_DAY, BOUNDARY_RECOVERY, BOUNDARY_TASK_CHANGE),
+                    default=None, help="人为站到某个边界上，用来观察边界状态机（默认：首次决策）")
+    pl.add_argument("--failures", type=int, default=0,
+                    help="假装技能层已经连续失败 N 次（配合 --boundary recovery 看异常恢复）")
+    pl.add_argument("--json", action="store_true", help="打印完整 JSON（含来源/降级原因/拒收问题）")
+    pl.set_defaults(func=cmd_plan)
     return p
 
 

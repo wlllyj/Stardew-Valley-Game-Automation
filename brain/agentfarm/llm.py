@@ -34,8 +34,11 @@ from typing import Any
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-flash"          # 用户选定（2026-10-11）
 FALLBACK_MODELS = ("deepseek-flash", "deepseek-v4-pro")  # 实测该端点可用
-DEFAULT_MAX_TOKENS = 8192                  # 推理模型要留足：实测一个"农场优先级"问题
-                                           # 光思考就吃掉 2048+ token（见 docs/00-开发日志.md 条目 009）
+DEFAULT_MAX_TOKENS = 16384                 # 推理模型要留足：实测一个"农场优先级"问题
+                                           # 光思考就吃掉 2048+ token（见 docs/00-开发日志.md 条目 009）；
+                                           # 8192 在 run2 真机上仍被推理吃光、content 为空 ⇒
+                                           # `LlmError:truncated` ⇒ 白白降级成纯代码策略（task-9）。
+                                           # 这个值是**唯一真值源**：`planner`/`longrun` 的默认值由单测钉成一致。
 DEFAULT_TIMEOUT = 90.0
 MAX_ATTEMPTS = 3
 

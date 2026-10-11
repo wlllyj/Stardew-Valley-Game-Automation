@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import socket
@@ -38,9 +40,11 @@ class FakeBridgeHandler(BaseHTTPRequestHandler):
     """假 Mod。可用类属性调整行为，让每个测试构造不同场景。"""
 
     token = TOKEN
-    world_schema = "agentfarm-world/3"
+    world_schema = "agentfarm-world/6"
     exec_status = "ok"
     require_token = True
+    # 失败回执上额外挂的字段（用来测"失败也带 path/hops"这类审计要求）
+    exec_fail_extra = None
 
     def log_message(self, *args: object) -> None:  # 静音
         pass
@@ -110,15 +114,20 @@ class FakeBridgeHandler(BaseHTTPRequestHandler):
             return
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+        # 记下最近一次请求体，供测试断言"客户端到底发了什么"（例如 allow_bed 是否只在 True 时出现）
+        type(self).last_body = body
         skill = body.get("skill")
         if skill == "noop":
             self._send(200, {"ok": True, "status": "ok", "skill": "noop", "reason": "",
                              "elapsedMs": 1, "worldSeqBefore": 42, "worldSeqAfter": 42})
             return
         if self.exec_status != "ok":
-            self._send(200, {"ok": False, "status": self.exec_status,
-                             "skill": skill, "reason": "目标不可达（假 Mod 构造）",
-                             "elapsedMs": 500, "worldSeqBefore": 42, "worldSeqAfter": 42})
+            payload = {"ok": False, "status": self.exec_status,
+                       "skill": skill, "reason": "目标不可达（假 Mod 构造）",
+                       "elapsedMs": 500, "worldSeqBefore": 42, "worldSeqAfter": 42}
+            if type(self).exec_fail_extra:
+                payload.update(type(self).exec_fail_extra)
+            self._send(200, payload)
             return
         self._send(200, {"ok": True, "status": "ok", "skill": skill, "reason": "",
                          "elapsedMs": 3210, "worldSeqBefore": 42, "worldSeqAfter": 57})
@@ -152,9 +161,10 @@ class BridgeClientTest(unittest.TestCase):
         os.environ.pop("AGENTFARM_BRIDGE_JSON", None)
 
     def setUp(self) -> None:
-        FakeBridgeHandler.world_schema = "agentfarm-world/3"
+        FakeBridgeHandler.world_schema = "agentfarm-world/6"   # 与脑侧 SCHEMA_WORLD 一致
         FakeBridgeHandler.exec_status = "ok"
         FakeBridgeHandler.require_token = True
+        FakeBridgeHandler.exec_fail_extra = None
         self._write_bridge_json()
 
     # ---------- 发现与校验 ----------
@@ -189,7 +199,7 @@ class BridgeClientTest(unittest.TestCase):
 
     def test_observe_summary(self) -> None:
         obs = BridgeClient().observe("summary")
-        self.assertEqual(obs["schema"], "agentfarm-world/3")
+        self.assertEqual(obs["schema"], "agentfarm-world/6")
         self.assertEqual(obs["player"]["tile"], [2, 11])
         self.assertEqual(obs["farm"]["weeds"], 443)
 
@@ -200,6 +210,76 @@ class BridgeClientTest(unittest.TestCase):
         self.assertEqual(res["status"], "ok")
         self.assertEqual(res["worldSeqBefore"], 42)
         self.assertEqual(res["worldSeqAfter"], 57)
+
+    def test_move_to_allow_bed_only_when_true(self) -> None:
+        """allow_bed 默认不得出现在请求里：无人值守踩床会触发睡觉流程（破坏性副作用）。
+
+        只有显式 allow_bed=True 才发这个字段，且它只影响 Mod 对"床"的判定。
+        """
+        c = BridgeClient()
+        c.move_to(10, 9, timeout_ms=2000)
+        self.assertEqual(FakeBridgeHandler.last_body["args"]["tile"], [10, 9])
+        self.assertNotIn("allow_bed", FakeBridgeHandler.last_body["args"])
+
+        c.move_to(10, 9, timeout_ms=2000, allow_bed=True)
+        self.assertIs(FakeBridgeHandler.last_body["args"]["allow_bed"], True)
+
+    def test_move_to_location_request_shape(self) -> None:
+        """跨地点移动：location 必发；tile/allow_bed 只在显式给出时才出现。"""
+        c = BridgeClient()
+        c.move_to_location("Farm", timeout_ms=20000)
+        body = FakeBridgeHandler.last_body
+        self.assertEqual(body["skill"], "move_to_location")
+        self.assertEqual(body["args"], {"location": "Farm"})
+        self.assertEqual(body["timeout_ms"], 20000)
+
+        c.move_to_location("Farm", tile=(64, 15), timeout_ms=20000)
+        self.assertEqual(FakeBridgeHandler.last_body["args"], {"location": "Farm", "tile": [64, 15]})
+
+        c.move_to_location("Farm", timeout_ms=20000, allow_bed=True)
+        self.assertIs(FakeBridgeHandler.last_body["args"]["allow_bed"], True)
+
+    def test_move_to_location_failure_exposes_hops(self) -> None:
+        """失败回执也必须能拿到 path/hops：脑要看出"走到哪一步断的"才能换策略。
+
+        Mod 侧把 path/hops 放在 ok=false 的响应里，客户端 `_request` 把它转成 BridgeError
+        时必须把**完整 payload** 留在异常上（否则这些审计信息就丢了）。
+        """
+        FakeBridgeHandler.exec_status = "hop_failed"
+        FakeBridgeHandler.exec_fail_extra = {
+            "path": ["FarmHouse", "Farm"],
+            "hops": [{"from": "FarmHouse", "to": "Farm", "result": "hop_failed",
+                      "sourceTile": [12, 3], "landingTile": [64, 15], "ms": 500}],
+            "reachedLocation": "FarmHouse",
+        }
+        with self.assertRaises(BridgeError) as ctx:
+            BridgeClient().move_to_location("Farm", timeout_ms=20000)
+        self.assertEqual(ctx.exception.status, "hop_failed")
+        payload = ctx.exception.payload or {}
+        self.assertEqual(payload["hops"][0]["result"], "hop_failed")
+        self.assertEqual(payload["path"], ["FarmHouse", "Farm"])
+
+    def test_load_save_request_shape(self) -> None:
+        """读档：save/force 只在显式给出时才出现（默认让 Mod 自己挑最近存档、且不 force）。"""
+        c = BridgeClient()
+        c.load_save(timeout_ms=60000)
+        body = FakeBridgeHandler.last_body
+        self.assertEqual(body["skill"], "load_save")
+        self.assertNotIn("args", body)          # 空 args 不发，保持请求最小
+        self.assertEqual(body["timeout_ms"], 60000)
+
+        c.load_save("Wahaha_450799035", timeout_ms=60000)
+        self.assertEqual(FakeBridgeHandler.last_body["args"], {"save": "Wahaha_450799035"})
+
+        c.load_save("Wahaha_450799035", force=True, timeout_ms=60000)
+        self.assertIs(FakeBridgeHandler.last_body["args"]["force"], True)
+
+    def test_load_save_already_in_save_is_rejected(self) -> None:
+        """已经在存档里时 Mod 报 precondition_failed；脑必须原样把它当成失败（不静默）。"""
+        FakeBridgeHandler.exec_status = "precondition_failed"
+        with self.assertRaises(BridgeError) as ctx:
+            BridgeClient().load_save(timeout_ms=60000)
+        self.assertEqual(ctx.exception.status, "precondition_failed")
 
     # ---------- 失败路径（旧方案的教训：失败必须显式） ----------
     def test_unauthorized_surfaces_reason(self) -> None:
@@ -213,10 +293,39 @@ class BridgeClientTest(unittest.TestCase):
         self.assertEqual(ctx.exception.http_status, 401)
 
     def test_world_schema_mismatch_is_rejected(self) -> None:
-        FakeBridgeHandler.world_schema = "agentfarm-world/4"
+        """未知 schema 必须显式失败，绝不"看起来像成功"（旧项目缺陷 D5）。
+
+        注意：这里必须用一个**比当前版本更高**的 schema（当前是 /5），
+        否则它会被当成"合法的旧版本"而只警告不报错（见下一个用例）。
+        """
+        FakeBridgeHandler.world_schema = "agentfarm-world/7"
         with self.assertRaises(BridgeError) as ctx:
             BridgeClient().observe("summary")
         self.assertEqual(ctx.exception.status, "schema_mismatch")
+
+    def test_legacy_world_schema_is_accepted_with_loud_warning(self) -> None:
+        """升级窗口：游戏里还是上一版 Mod（dll 被锁、必须重启游戏才能换）。
+
+        此时 /3 快照要**能用**（否则脑在新 Mod 装机前完全瞎掉），但必须**大声警告**
+        且警告里点明缺哪个字段、怎么消除。
+        """
+        import agentfarm.bridge as bridge_mod
+
+        bridge_mod._warned_once.clear()
+        FakeBridgeHandler.world_schema = "agentfarm-world/3"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            obs = BridgeClient().observe("summary")
+        self.assertEqual(obs["schema"], "agentfarm-world/3")
+        text = err.getvalue()
+        self.assertIn("agentfarm-world/3", text)
+        self.assertIn("location.furniture[]", text)
+
+        # 只警告一次：第二次调用不再刷屏
+        err2 = io.StringIO()
+        with contextlib.redirect_stderr(err2):
+            BridgeClient().observe("summary")
+        self.assertEqual(err2.getvalue(), "")
 
     def test_exec_failure_status_is_not_swallowed(self) -> None:
         FakeBridgeHandler.exec_status = "unreachable"

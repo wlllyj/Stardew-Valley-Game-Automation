@@ -16,6 +16,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -24,11 +25,32 @@ from typing import Any
 
 # ---- 契约常量（改这里必须同步 docs/03-桥接协议.md 并升版本号） ----
 SCHEMA_BRIDGE = "agentfarm-bridge/1"
-SCHEMA_WORLD = "agentfarm-world/3"   # v3：新增 player.isInBed、game.paused / game.shouldTimePass；
-                                     #     dismiss_modal 行为改为 answerDialogue + closeDialogue，
-                                     #     并新增 worldResumed / status=world_stuck。见 docs/03-桥接协议.md
+SCHEMA_WORLD = "agentfarm-world/6"   # v5：新增 location.doors[]（仅 detail=full）；
+                                     #     v4：新增 location.furniture[]（仅 detail=full），
+                                     #     修掉 move_to 的家具误判（改问游戏 isPassable）。
+                                     # v3：player.isInBed、game.paused / game.shouldTimePass、
+                                     #     dismiss_modal 改 answerDialogue + closeDialogue、
+                                     #     worldResumed / status=world_stuck。见 docs/03-桥接协议.md
+SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-world/3")
+# 升级窗口期间的兼容口径：Mod 的 dll 被游戏锁住、必须重启游戏才能换版本，
+# 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
+# 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.1.0"
+MOD_VERSION_EXPECTED = "0.7.21"   # v0.7.21：观测里补 player.wateringCan{present,waterLeft,max,
+                                 # bottomless,upgradeLevel}（水在 WateringCan 上、不在 inventory）
+                                 # 与 location.refillTiles[]（判据=游戏自己的
+                                 # CanRefillWateringCanOnTile，扫全图、最多 24）——"连续 3 日浇水"
+                                 # 必须能看见"还剩几格水"、"去哪儿补水"；
+                                 # v0.7.20：新增 sleep（跨日唯一正路）与 buy（用游戏自己的
+                                 # tryToPurchaseItem + addItemToInventoryBool 买种子）；
+                                 # v0.7.19：修"播种不扣种子"（placementAction 不扣物品，
+                                 # 补调 Farmer.reduceActiveItemByOne；见 manifest 与开发日志条目 024）；
+                                 # v0.7.18：先判后动 + tillable[]；
+                                 # v0.7.1：interact（调游戏自己的 checkAction）；v0.7.0：quit_game + world/5
+                                 # 与“目标=当前所在格直接 ok”。v0.5.0：每帧强制
+                                 # pauseWhenOutOfFocus=false（IL 定因：Game1._update
+                                 # IL_0444-IL_0480 那道门），health 新增
+                                 # game.pauseWhenOutOfFocus / game.oofFixCount 两个证据字段
 
 # 已知基线：环境实测快照 docs/02-环境实测快照.md
 BASELINE_GAME_VERSION = "1.6.15"
@@ -36,6 +58,15 @@ BASELINE_SMAPI_VERSION = "4.5.2"
 
 # 覆盖 bridge.json 位置的环境变量（测试与多实例调试用）
 ENV_BRIDGE_JSON = "AGENTFARM_BRIDGE_JSON"
+
+# 只警告一次的去重集合（同一进程里同一条警告不刷屏）
+_warned_once: set[str] = set()
+
+
+def _warn_once(key: str, message: str) -> None:
+    if key not in _warned_once:
+        _warned_once.add(key)
+        print(f"[agentfarm] 警告：{message}", file=sys.stderr)
 
 
 class BridgeError(Exception):
@@ -248,11 +279,19 @@ class BridgeClient:
         result = self._request("GET", f"/v1/observe?detail={detail}", timeout=timeout)
         schema = result.get("schema")
         if schema != SCHEMA_WORLD:
-            raise BridgeError(
-                f"observe 返回 schema={schema!r}，期望 {SCHEMA_WORLD!r}（协议 §8）",
-                status="schema_mismatch",
-                payload=result,
-            )
+            if schema in SCHEMA_WORLD_LEGACY:
+                _warn_once(
+                    f"world-schema:{schema}",
+                    f"Mod 返回旧快照 {schema!r}（期望 {SCHEMA_WORLD!r}）：游戏里装的 Mod 还是升级前的版本"
+                    f"（期望 {MOD_VERSION_EXPECTED}），新字段（如 location.doors[] / location.furniture[]）不可用。"
+                    f"重启游戏完成升级后本警告消失。",
+                )
+            else:
+                raise BridgeError(
+                    f"observe 返回 schema={schema!r}，期望 {SCHEMA_WORLD!r}（协议 §8）",
+                    status="schema_mismatch",
+                    payload=result,
+                )
         return result
 
     def exec_skill(
@@ -309,7 +348,237 @@ class BridgeClient:
         """
         return self.exec_skill("dismiss_modal", timeout_ms=timeout_ms)
 
-    def move_to(self, x: int, y: int, *, timeout_ms: int = 8000, based_on_seq: int | None = None) -> dict[str, Any]:
+    def move_to(
+        self,
+        x: int,
+        y: int,
+        *,
+        timeout_ms: int = 8000,
+        based_on_seq: int | None = None,
+        allow_bed: bool = False,
+    ) -> dict[str, Any]:
+        """走到指定格（move_to）。
+
+        `allow_bed=False`（默认）时，床格会被 Mod 拒绝——无人值守踩到床会触发
+        `Go to sleep for the night?` 睡觉流程，是会改写游戏进程的破坏性副作用。
+        只有**明确要复现睡觉弹窗来做 `dismiss_modal` 验证**时才传 `allow_bed=True`；
+        它只解禁"床"这一项，其它不可踩家具照样拒绝。
+
+        注意：该参数要求 Mod ≥ 0.5.1（协议 §6 `move_to.args.allow_bed`）。
+        **低于 0.5.1 的 Mod 会静默忽略未知参数**——真机实测 v0.5.0 上 `allow_bed=True` 与不带
+        该参数的请求返回**逐字相同**的 `precondition_failed: 目标格 (9,9) 有家具（床）`。
+        所以"脑发了参数、体不认识"是这里最容易踩的坑：脑不能靠"我发了"就当"它生效了"，
+        必须以回执（`reason` 里有没有 `allow_bed=true`）为准。
+        """
+        args: dict[str, Any] = {"tile": [int(x), int(y)]}
+        if allow_bed:
+            args["allow_bed"] = True
+        return self.exec_skill("move_to", args, timeout_ms=timeout_ms, based_on_seq=based_on_seq)
+
+    def move_to_location(
+        self,
+        location: str,
+        *,
+        tile: tuple[int, int] | None = None,
+        timeout_ms: int = 30000,
+        based_on_seq: int | None = None,
+        allow_bed: bool = False,
+    ) -> dict[str, Any]:
+        """跨地点移动（move_to_location，Mod ≥ 0.6.0）。
+
+        `location` 只用来**在游戏真值里查表**（`Game1.locations[i].Name` 与每条 warp 的
+        `TargetName`，大小写不敏感）；路线一律由 Mod 侧按 warp 图 BFS 求出，脑**不需要**
+        也不应该自己规划跨地点路线（架构 §5.2.1 禁止硬编码地名/坐标）。
+
+        传送是**游戏自己**触发的：Mod 只把玩家走到 warp 源格，等
+        `Game1.currentLocation.Name` 真的变了才算一跳成功。因此：
+          * 成功回执带 `path`（地点序列）、`hops[]`（每跳的 from/to/arrivedAt/
+            sourceTile/landingTile/usedTile/ms/result）、`reachedLocation`；
+          * `hops[].result == "mismatch"` = warp 上写的目标与实际落地地点不一致（脑要审计）；
+          * 失败回执**也**带 path/hops，用来判断"走到哪一步断的"。
+
+        失败状态码：`precondition_failed`（地点不存在/坐标为负/目标格有阻挡家具）、
+        `unreachable_no_route`（warp 图上无路）、`hop_failed`（走到触发格但没传送）、
+        `unreachable`、`blocked`、`timeout`、`ui_modal`、`no_save`。
+        """
+        args: dict[str, Any] = {"location": location}
+        if tile is not None:
+            args["tile"] = [int(tile[0]), int(tile[1])]
+        if allow_bed:
+            args["allow_bed"] = True
+        return self.exec_skill("move_to_location", args, timeout_ms=timeout_ms, based_on_seq=based_on_seq)
+
+    def load_save(
+        self,
+        save: str | None = None,
+        *,
+        force: bool = False,
+        timeout_ms: int = 60000,
+    ) -> dict[str, Any]:
+        """从**标题界面**读档（load_save，Mod ≥ 0.6.0）。
+
+        用途（自主性前提，不是便利功能）：
+          * 换 Mod dll 必须重启游戏，重启后游戏停在标题界面；标题界面上唯一的正常入口是
+            "点 Continue" —— 那属于**伪造输入**，被硬纪律①禁止；
+          * 无人值守长跑必须能从崩溃/重启里自己爬起来。
+
+        实现上调用的是**游戏自己的** `SaveGame.Load(存档名)`（与玩家点 Continue 同一条路），
+        不写任何世界状态、不动角色坐标/金钱/时间。成功判据是"世界真的可读了"
+        （`Context.IsWorldReady` 且 player/currentLocation 都读得到）。
+
+        `save=None` 时由 Mod 自动挑**最近写过**的存档。
+        ⚠️ 已经**在存档里**时默认拒绝（`precondition_failed`）：读档会直接丢掉当天进度
+        （游戏只在睡觉时落盘）。确实要丢弃当前进度时传 `force=True`。
+
+        成功回执含 `save`（存档文件夹名）、`reachedLocation`、`tile`。
+        """
+        args: dict[str, Any] = {}
+        if save:
+            args["save"] = save
+        if force:
+            args["force"] = True
+        return self.exec_skill("load_save", args, timeout_ms=timeout_ms)
+
+    def interact(self, tile: tuple[int, int] | None = None, *, timeout_ms: int = 5000) -> dict[str, Any]:
+        """**用一下面前那一格**（interact，Mod ≥ 0.7.1）。
+
+        实现上是调**游戏自己的动作入口** `GameLocation.checkAction(tile, viewport, player)`
+        （api-probe 编译期实证 3 参重载存在）—— 与 `dismiss_modal` 调 `answerDialogue` 而不按确认键
+        **同一条纪律**：不合成键鼠事件。
+
+        【为什么进建筑必须用它】真机证据（2026-08-11 晚）：
+          * `Farm` / `FarmHouse` 的 `location.doors` **都是空的** ⇒ `isCollidingWithDoors` 无从触发；
+          * `GameLocation.checkAction` 的 IL 里遍历 `this.buildings`，调 `getPointForHumanDoor()` /
+            `getWarpFromDoor(...)` / **`Building.doAction(Vector2, Farmer)`** ⇒ 进建筑是"动作"路径；
+          * `door_push`（把"朝门走一步"喂给寻路器）只能把玩家推到墙前 3 像素，矩形角**永远进不了门格**。
+
+        `tile=None` 时用"玩家当前面朝的那一格"（走到门口朝上时正好是门格）。
+        回执里的 `reachedLocation` 是**动作发起时**的地点；门/建筑的传送由游戏自己发起、有淡出期，
+        **必须以随后的 observe 为准**。
+        """
+        args: dict[str, Any] = {}
+        if tile is not None:
+            args["tile"] = [int(tile[0]), int(tile[1])]
+        return self.exec_skill("interact", args, timeout_ms=timeout_ms)
+
+    def use_tool(
+        self,
+        tile: tuple[int, int] | None = None,
+        *,
+        tool: str | None = None,
+        timeout_ms: int = 12000,
+    ) -> dict[str, Any]:
+        """**用工具对某一格动手**（use_tool，Mod ≥ 0.7.6）：砍树枝 / 敲石头 / 割草 / 锄地 / 浇水。
+
+        `tool`：`axe` / `pickaxe` / `hoe` / `can` / `scythe` / `auto`（省略＝`auto`）。
+        `auto` 由 Mod 按目标格上的东西挑（twig→axe、可破石头→pickaxe、weed|grass→scythe、
+        空耕地→hoe、有作物的耕地→can），并在回执的 `reason` 里**报出真实用的那件物品名** ——
+        所以脑必须读回执核对"它到底拿了什么工具"，不能假设。
+
+        实现走**游戏自己的入口** `Game1.pressUseToolButton()`（api-probe 实证存在；
+        `Farmer.UseTool(...)` / `completeToolUse()` 在 1.6.15 **不存在**），选工具用 `CurrentToolIndex`。
+        纪律同 `interact`/`dismiss_modal`：不合成键鼠事件。
+
+        ⚠️ **验收必须用 observe 的 `location.tiles[]` 差分**：回执只是声明，格子上东西没了才是证据。
+        失败状态码：`precondition_failed`（没这类工具/有模态）、`tool_ineffective`（挥满 6 次目标格仍在）、
+        `timeout`、`no_save`。
+        """
+        args: dict[str, Any] = {}
+        if tile is not None:
+            args["tile"] = [int(tile[0]), int(tile[1])]
+        if tool:
+            args["tool"] = tool
+        return self.exec_skill("use_tool", args, timeout_ms=timeout_ms)
+
+    def select_item(self, item: str, *, timeout_ms: int = 5000) -> dict[str, Any]:
+        """选中背包里的某件物品（`select_item`，Mod ≥ 0.7.9）。
+
+        `item` 可以是 `ItemId`（例 `472`）、`QualifiedItemId`（`(O)472`）或物品名，大小写不敏感。
+        实现是设 `Game1.player.CurrentToolIndex`（等价于玩家滚快捷栏），**并复核** `CurrentItem`
+        真的是它 —— 不符时报 `select_failed`，绝不"我设了就当选中了"。
+        回执 reason 给出槽位与物品名；拿不到时是 `precondition_failed` + 完整背包清单。
+        """
+        return self.exec_skill("select_item", {"item": item}, timeout_ms=timeout_ms)
+
+    def plant(self, seed: str, tile: tuple[int, int], *, timeout_ms: int = 15000) -> dict[str, Any]:
+        """把种子种进**已经锄好的耕地**（`plant`，Mod ≥ 0.7.9）。
+
+        `seed`：种子 `ItemId`（例 `472` = 防风草种子）；`tile`：目标耕地格。
+        前置条件是"该格是 `HoeDirt` 且没有作物"（不满足直接 `precondition_failed`，不瞎试）。
+        实现走**游戏自己的使用键入口** `Game1.pressUseToolButton()`（最多 3 次）；
+        探针证伪了 `Object.performUseAction` 的"对指定格使用"重载，也刻意不调 `HoeDirt.plant`
+        （那是直接写世界状态）。
+        ⚠️ **验收必须用 `tiles[]` 差分**：该格要真的出现 `crop`（回执只是声明）。
+        """
         return self.exec_skill(
-            "move_to", {"tile": [int(x), int(y)]}, timeout_ms=timeout_ms, based_on_seq=based_on_seq
+            "plant",
+            {"seed": seed, "tile": [int(tile[0]), int(tile[1])]},
+            timeout_ms=timeout_ms,
         )
+
+    def sleep(self, *, timeout_ms: int = 180000) -> dict[str, Any]:
+        """**睡到第二天**（`sleep`，Mod ≥ 0.7.20）—— 跨日的唯一正路（长跑循环的日终动作）。
+
+        实现走**游戏自己让玩家点"是"的那条路**：`GameLocation.answerDialogueAction("Sleep_Yes", null)`
+        → `startSleep()` → `doSleep()` → `Game1.NewDay(0f)`（IL 证据见 `docs\\_il-plant-consume.md`
+        同级的 sleep 取证与 `logs\\il-sleep-entry-u8.txt`）。不是合成键鼠、也不是自己写 `Date`。
+
+        ⚠️ **验收必须用 observe 差分**：`clock` 的 `(year, season, day)` 必须真的变大。
+        回执 reason 里的"第 N 天"是 `Game1.Date.TotalDays`（春 1 日起 0 基），
+        与 `clock.day`（月内日）**差 1**，别拿回执当日期证据。
+        睡眠本身是异步协程：Mod 侧跨 tick 等到跨日完成才回执（实测 1.7s），所以 HTTP 要给足时间。
+        """
+        return self.exec_skill("sleep", timeout_ms=timeout_ms, http_timeout=timeout_ms / 1000.0 + 12.0)
+
+    def buy(
+        self,
+        item: str,
+        count: int = 1,
+        *,
+        shop: str = "SeedShop",
+        timeout_ms: int = 25000,
+    ) -> dict[str, Any]:
+        """**买种子**（`buy`，Mod ≥ 0.7.20）。
+
+        `item`：`ItemId`（`472`）/ `QualifiedItemId`（`(O)472`）/ 物品名，大小写不敏感；
+        `count`：**想买几个**（请求量，不是承诺量）—— Mod 会按"钱够几个 / 库存 / 堆叠上限"夹小，
+        最终由游戏自己的 `ShopMenu.tryToPurchaseItem(item, null, count, 0, 0)` 裁决；
+        `shop`：`Data/Shops` 里的店铺 id（默认 `SeedShop` = 种子店）。
+
+        ⚠️ 纪律同 `plant`：**回执只是声明**。验收要用 observe 差分看两件事——
+        `player.money` 少了多少、`player.inventory[]` 里这件多了几个；
+        回执里的"游戏返回值"**不是成败**（IL 证明它只表示"这行该撤了"）。
+        失败状态码：`item_not_sold`（附货架清单）/ `cannot_afford` / `no_inventory_space` /
+        `shop_unavailable` / `shop_timeout` / `purchase_no_effect` / `purchase_partial`。
+        """
+        return self.exec_skill(
+            "buy",
+            {"item": item, "count": int(count), "shop": shop},
+            timeout_ms=timeout_ms,
+        )
+
+    def quit_game(self, *, timeout_ms: int = 3000) -> dict[str, Any]:
+        """让**游戏自己退出**（quit_game，Mod ≥ 0.7.0）。
+
+        用游戏自己的退出标志 `Game1.quit`（api-probe 编译期实证可写）—— 等价于玩家点退出，
+        既不伪造键鼠、也不写世界状态，更不是 `Stop-Process` 强杀。
+
+        【为什么需要它】换 Mod dll 必须重启游戏，而重启后停在标题界面。
+        "启动 + 自己读档" 已经自主（`load_save`），这一步把另一半补上：
+        **发现问题需要关游戏时，脑自己把它关掉**（详见 `tools\\deploy-mod.py`）。
+
+        ⚠️ **回执可能收不到**：置位后游戏会在随后的帧里退出，HTTP 连接可能被重置。
+        因此本方法把 `connection_broken` / `bad_response` / `unreachable_bridge` / `timeout`
+        一律折成 `{"status": "assumed_quitting"}` —— 那是**预期行为**，不是故障。
+        调用方必须再以**进程是否真的消失**为准（`pid_alive(bridge_info.pid)` 或进程名轮询）。
+        """
+        try:
+            return self.exec_skill("quit_game", timeout_ms=timeout_ms, http_timeout=6.0)
+        except BridgeError as exc:
+            if exc.status in ("connection_broken", "bad_response", "unreachable_bridge", "timeout"):
+                return {
+                    "ok": True,
+                    "status": "assumed_quitting",
+                    "reason": f"请求中断（{exc.status}）：游戏很可能已经在退出（以进程是否消失为准）",
+                }
+            raise
