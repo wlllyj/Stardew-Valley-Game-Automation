@@ -46,6 +46,15 @@ namespace AgentFarm.Bridge
         private long _requestsServed;
         private volatile bool _farmScanWanted;
 
+        /// <summary>
+        /// 每帧兜底「失焦不暂停」时，本局把 <c>pauseWhenOutOfFocus</c> 从 true 扳回 false 的次数。
+        /// 它是"这个选项真的被别处改回了 true"的**直接证据**（不是推理）。
+        /// </summary>
+        private long _oofFixCount;
+
+        /// <summary>强制关闭「失焦暂停」抛异常的次数（只为把日志节流到一次）。</summary>
+        private long _oofErrorCount;
+
         public BridgeHost(IMonitor monitor, string modVersion)
         {
             this._monitor = monitor;
@@ -135,6 +144,10 @@ namespace AgentFarm.Bridge
         /// <summary>每 tick 调用（主线程）。</summary>
         public void OnUpdateTicked()
         {
+            // 必须**在**本帧游戏逻辑之前把「失焦暂停」关掉：UpdateTicked 由 Game1.Update 在
+            // Game1._update 之前派发，而 _update 的第 IL_0466 行读取的就是这个字段。
+            this.EnforceNoPauseOnFocusLoss();
+
             this._dispatcher.OnUpdateTicked();
 
             bool wantScan = this._farmScanWanted;
@@ -146,6 +159,50 @@ namespace AgentFarm.Bridge
             {
                 this._lastHeartbeatUtc = DateTime.UtcNow;
                 this.WriteBridgeFile();
+            }
+        }
+
+        /// <summary>
+        /// 每帧强制关闭「失焦自动暂停」（<c>Game1.options.pauseWhenOutOfFocus = false</c>）。
+        ///
+        /// 为什么必须每帧做，而不是在 GameLaunched 里设一次（v0.4.0 就是这么做的，**无效**）：
+        /// `Game1._update` 的提前返回块（IL_0444–IL_0480）在窗口不活跃且该选项为 true 时
+        /// **直接 ret**，于是 `UpdateGameClock`（IL_12C3）与 `UpdateLocations`（IL_12D1 →
+        /// `Farmer.Update` → `PathFindController.update`）整段被跳过 —— 世界时钟停、角色不动，
+        /// 而 `shouldTimePass()` 依旧返回 true（它根本没被调用）。
+        /// 而读档时 `SaveGame+&lt;getLoadEnumerator&gt;d__101.MoveNext()` IL_1526–IL_1530
+        /// 会用**存档文件里那份 Options 实例**整体替换 `Game1.options`（紧接 IL_162F 写回
+        /// default_options），把我们在 GameLaunched 里改的值冲掉；回标题、新建游戏同理。
+        /// 既然门是每帧重新读这个字段的，我们就在**每帧**（同一帧、游戏逻辑之前）把它关掉。
+        ///
+        /// 这样"游戏窗口必须保持前台"就不再是运行时的必要约束（无人值守的关键）。
+        /// </summary>
+        public void EnforceNoPauseOnFocusLoss()
+        {
+            try
+            {
+                var options = Game1.options;
+                if (options == null) return;
+                if (!options.pauseWhenOutOfFocus) return;
+
+                options.pauseWhenOutOfFocus = false;
+                long n = Interlocked.Increment(ref this._oofFixCount);
+
+                // 只在第 1 次和之后每 ~20 秒记一次：这个函数每帧都跑，不节流会把控制台刷满。
+                if (n == 1 || n % 1200 == 0)
+                {
+                    this._monitor.Log(
+                        $"把「失焦自动暂停」扳回关闭（第 {n} 次）—— 它被改回 true 了（读档/回标题会整体换掉 Game1.options）。" +
+                        "没有这一帧兜底，失焦时世界时钟与角色更新都会被跳过。", LogLevel.Info);
+                }
+            }
+            catch (Exception ex)
+            {
+                // 每帧都跑：异常也只在第一次记，避免刷屏掩盖真正的问题。
+                if (Interlocked.Increment(ref this._oofErrorCount) == 1)
+                {
+                    this._monitor.Log($"强制关闭「失焦自动暂停」失败（忽略，不影响其他功能）：{ex.Message}", LogLevel.Warn);
+                }
             }
         }
 
@@ -256,10 +313,17 @@ namespace AgentFarm.Bridge
             catch { return "unknown"; }
         }
 
-        /// <summary>游戏窗口是否在前台。诊断失焦导致“世界在走但角色不动”的关键字段。</summary>
+        /// <summary>游戏窗口是否在前台。注意：焦点本身不决定世界走不走，真正的门是 pauseWhenOutOfFocus。</summary>
         private static bool GameWindowActive()
         {
             try { return Game1.game1?.IsActive ?? false; }
+            catch { return false; }
+        }
+
+        /// <summary><c>Options.pauseWhenOutOfFocus</c> 的当前实际值（health 用）。</summary>
+        private static bool SafePauseWhenOutOfFocus()
+        {
+            try { return Game1.options != null && Game1.options.pauseWhenOutOfFocus; }
             catch { return false; }
         }
 
@@ -352,6 +416,8 @@ namespace AgentFarm.Bridge
                     Version = GameVersionString(),
                     Smapi = SmapiVersionString(),
                     WindowActive = GameWindowActive(),
+                    PauseWhenOutOfFocus = SafePauseWhenOutOfFocus(),
+                    OofFixCount = Interlocked.Read(ref this._oofFixCount),
                 },
                 Runtime = new HealthRuntime
                 {
@@ -401,6 +467,27 @@ namespace AgentFarm.Bridge
             return HttpResponse.Json200(JsonSerializer.Serialize(result, JsonDefaults.Options));
         }
 
+        /// <summary>
+        /// 哪些技能是**跨 tick 长任务**（Handler 会在"还没走完"时返回 null，由调度器下个 tick 继续调用）。
+        ///
+        /// 【里程碑 B】move_to_location 与 move_to 共用 <see cref="StepMover"/> 状态机，同样跨 tick：
+        /// 忘了把它加进来，症状会立刻变成"第一跳刚发起就把 null 交给网络线程"，
+        /// 也就是条目 013 那类"接口报 ok、实际半途而废"的翻版。
+        ///
+        /// 【里程碑 C】load_save 同理：发起读档后要每 tick 等世界变可读，必须在这里。
+        ///
+        /// 【P3 步骤③】use_tool 也是：挥动 → 等 `player.UsingTool` 落回 false → 再看目标格 —— 天然跨 tick。
+        ///
+        /// 【P3 步骤⑤/⑥】sleep 也是：这一 tick 只把"睡觉"发起出去，之后每 tick 等
+        /// `Game1.Date.TotalDays` 变大（跨日要淡黑 + 存档 + 换天，可能好几十秒）。
+        ///
+        /// buy 也是：`Utility.TryOpenShopMenu` 之后要等 `Game1.activeClickableMenu` 变成 `ShopMenu`
+        /// 才能买（菜单不是同 tick 就挂上的）。买完是同 tick 返回终态。
+        /// </summary>
+        private static bool IsLongTaskSkill(string skill)
+            => skill == "move_to" || skill == "move_to_location" || skill == "load_save"
+            || skill == "use_tool" || skill == "plant" || skill == "sleep" || skill == "buy";
+
         private HttpResponse ServeExec(HttpRequest req)
         {
             ExecRequest exec;
@@ -432,7 +519,7 @@ namespace AgentFarm.Bridge
                 }, JsonDefaults.Options));
             }
 
-            int timeoutMs = Skills.ClampTimeout(exec.TimeoutMs);
+            int timeoutMs = Skills.ClampTimeoutFor(skill, exec.TimeoutMs);
 
             // stale 判定放在主线程里做，保证读到的 worldSeq 是执行当下的真值。
             Func<object> runner = Skills.Create(skill, exec, this._world, this._monitor);
@@ -441,7 +528,7 @@ namespace AgentFarm.Bridge
             try
             {
                 result = this._dispatcher.SubmitAndWait(
-                    isLongTask: skill == "move_to",
+                    isLongTask: IsLongTaskSkill(skill),
                     timeoutMs: timeoutMs + (int)HttpWaitPadding.TotalMilliseconds,
                     handler: () =>
                     {

@@ -51,18 +51,24 @@ namespace AgentFarm.Bridge
 
         private void OnGameLaunched(object sender, GameLaunchedEventArgs e)
         {
-            // 「失焦不暂停」—— 无人值守的硬条件。
+            // 「失焦不暂停」—— 无人值守的硬条件（v0.5.0 起由 BridgeHost.EnforceNoPauseOnFocusLoss 每帧兜底）。
             //
-            // 为什么需要：游戏窗口一旦失焦就自动暂停时间，而无人值守时窗口几乎总是后台的，
-            // 于是整个世界会静默冻结，所有自动化都在“冻结的世界”里空转。
-            // 这个选项在游戏设置界面里**没有对应文本**（1.6.15 实测），但 Game1._update 仍会读它，
-            // 所以只能从代码里关。旧项目已实测确认有效（架构 §5.7 / §10 风险登记册）。
+            // 为什么需要：`Game1._update` 的提前返回块（IL_0444–IL_0480）在窗口不活跃且
+            // `Game1.options.pauseWhenOutOfFocus == true` 时**直接 ret**，于是
+            // `UpdateGameClock`（IL_12C3）与 `UpdateLocations`（IL_12D1）整段被跳过 ——
+            // 世界时钟停、角色不动，而 `shouldTimePass()` 仍返回 true（它压根没被调用）。
+            //
+            // ⚠️ 这里设一次**是不够的**（v0.4.0 的教训）：读档时
+            // `SaveGame+<getLoadEnumerator>d__101.MoveNext()` IL_1526–IL_1530 会用存档里那份
+            // Options 实例整体替换 `Game1.options`，把这里的修改冲掉（回标题/新建游戏同理）。
+            // 所以真正的兜底在每帧（见 BridgeHost），这里只负责"读档之前"的那段时间。
             try
             {
                 if (Game1.options != null && Game1.options.pauseWhenOutOfFocus)
                 {
                     Game1.options.pauseWhenOutOfFocus = false;
-                    this.Monitor.Log("已关闭“失焦自动暂停”（pauseWhenOutOfFocus=false）—— 保证后台运行时世界继续推进。", LogLevel.Info);
+                    this.Monitor.Log("已关闭“失焦自动暂停”（pauseWhenOutOfFocus=false）。注意：读档会换掉整个 Game1.options，"
+                                     + "所以真正的兜底是每帧强制（health 里的 oofFixCount 是证据）。", LogLevel.Info);
                 }
                 else if (Game1.options != null)
                 {

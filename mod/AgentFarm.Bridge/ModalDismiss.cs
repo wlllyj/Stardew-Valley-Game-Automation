@@ -198,7 +198,9 @@ namespace AgentFarm.Bridge
         /// 留下“答是答了，但状态没走完”的半成品。
         /// 因此顺序是：`answerDialogue(Response)` → 异常才退回 `answerDialogueAction(组合键)`。
         /// </summary>
-        private static string AnswerWith(Response chosen)
+        /// 【为什么是 internal】`SleepSkill`（睡觉 = 在 "go to sleep for the night?" 上答 Yes）
+        /// 必须走**同一份**应答口径，绝不允许出现第二份实现 —— 这是本项目唯一一处"把选项交给游戏"的代码。
+        internal static string AnswerWith(Response chosen)
         {
             GameLocation loc = null;
             try { loc = Game1.currentLocation; } catch { }

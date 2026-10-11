@@ -55,12 +55,26 @@ namespace AgentFarm.Bridge
         [JsonPropertyName("smapi")] public string Smapi { get; set; }
 
         /// <summary>
-        /// 游戏窗口是否在前台（<c>Game1.game1.IsActive</c>）。
-        /// 真机诊断：失焦时世界时钟照常推进，但 PathFindController 不驱动角色
-        /// （失焦 10/10 失败、回到前台 5/5 成功）。把它暴露出来，脑才能一眼区分
-        /// “寻路失败”与“窗口没在前台”。
+        /// 游戏窗口是否在前台（<c>Game1.game1.IsActive</c>）。注意：它**只说明焦点状态**，
+        /// 不直接决定世界走不走 —— 真正的门是 <c>Game1._update</c> IL_0444–IL_0480：
+        /// 窗口不活跃 **且** <see cref="PauseWhenOutOfFocus"/> 为 true 时直接 ret，
+        /// 于是 UpdateGameClock / UpdateLocations（含 PathFindController）整段被跳过。
+        /// Mod 每帧把该选项关掉（见 BridgeHost.EnforceNoPauseOnFocusLoss），
+        /// 所以正常运行时"失焦"不该再让世界停摆；一旦停了，先看下面两个字段。
         /// </summary>
         [JsonPropertyName("windowActive")] public bool WindowActive { get; set; }
+
+        /// <summary>
+        /// 游戏选项 <c>Options.pauseWhenOutOfFocus</c> 的**当前实际值**（不是我们期望的值）。
+        /// true 表示这一帧世界会被冻结在失焦状态；正常运行应为 false。
+        /// </summary>
+        [JsonPropertyName("pauseWhenOutOfFocus")] public bool PauseWhenOutOfFocus { get; set; }
+
+        /// <summary>
+        /// Mod 本局把 <c>pauseWhenOutOfFocus</c> 从 true 扳回 false 的次数。
+        /// &gt;0 就是"这个选项被读档/回标题换掉过"的**直接证据**；它长期为 0 说明没人改它。
+        /// </summary>
+        [JsonPropertyName("oofFixCount")] public long OofFixCount { get; set; }
     }
 
     internal sealed class HealthRuntime
@@ -79,7 +93,7 @@ namespace AgentFarm.Bridge
     }
 
     // ==================================================================
-    //  /v1/observe  —— agentfarm-world/3
+    //  /v1/observe  —— agentfarm-world/5
     // ==================================================================
 
     internal sealed class WorldSnapshot
@@ -134,8 +148,10 @@ namespace AgentFarm.Bridge
 
         /// <summary>
         /// 玩家当前是否可以移动（<c>Game1.player.CanMove</c>）。
-        /// 真机教训：游戏窗口失焦时世界时钟照常推进，但 PathFindController 不驱动角色
-        /// （10/10 失败；切回前台 5/5 成功）。把“人能不能动”变成脑看得见的字段，别再靠猜。
+        /// 真机教训：窗口失焦且 <c>pauseWhenOutOfFocus=true</c> 时，<c>Game1._update</c> 提前 ret，
+        /// `UpdateLocations → Farmer.Update → PathFindController.update` 全被跳过，角色一格不动
+        /// （实测失焦 0/3 位移 vs 抢焦点后每次 3 格位移）。v0.5.0 起 Mod 每帧关掉该选项，
+        /// 让"失焦"不再等于"角色不动"；这个字段继续保留，用来区分"人能不能动"。
         /// </summary>
         [JsonPropertyName("canMove")] public bool CanMove { get; set; }
 
@@ -150,6 +166,21 @@ namespace AgentFarm.Bridge
         [JsonPropertyName("isInBed")] public bool IsInBed { get; set; }
 
         [JsonPropertyName("tools")] public ToolsView Tools { get; set; }
+
+        /// <summary>
+        /// **v0.7.21 新增**：浇水壶的水量（`WateringCan.WaterLeft` / `waterCanMax`）。
+        ///
+        /// 【为什么必须有】长跑循环要"连续 N 个游戏日浇水"，而**水壶会空**：基础壶 40 格，
+        /// 30 多格作物浇一天就没了，壶空的第二天 `use_tool(can)` 会一直 `tool_ineffective`。
+        /// 脑必须先知道"还剩几格水"才能在浇干前去补水（见 `LocationView.RefillTiles`）。
+        /// </summary>
+        [JsonPropertyName("wateringCan")] public WateringCanView WateringCan { get; set; }
+
+        /// <summary>
+        /// **背包清单（仅 `detail=full`）**：播种/收获/吃东西都要先知道"我有什么"。
+        /// 此前快照只有 `inventoryCount`，脑根本不知道手里有没有防风草种子（P3 步骤④的硬缺口）。
+        /// </summary>
+        [JsonPropertyName("inventory")] public ItemView[] Inventory { get; set; }
     }
 
     /// <summary>
@@ -201,6 +232,214 @@ namespace AgentFarm.Bridge
         [JsonPropertyName("debris")] public int Debris { get; set; }
         [JsonPropertyName("terrainFeatures")] public int TerrainFeatures { get; set; }
         [JsonPropertyName("characters")] public int Characters { get; set; }
+
+        /// <summary>
+        /// **v4 新增，仅 `detail=full` 时出现**（`summary` 必须为 null → 字段缺失）。
+        ///
+        /// 当前地点每一件家具的清单，专供诊断"到底哪件家具覆盖了哪一格"：
+        /// 迭代 4 之前只能靠**网格扫描猜**（在屋里逐格 move_to 看哪格被拒），
+        /// 既慢又容易得出错误结论（v3 就是这样把 13 格误判成"有家具"的）。
+        /// 有了这份清单，`tile` / `bbox` / `passable` / `ground` 摆在一起看，
+        /// 一眼就能看出"是哪块大地毯盖住了这格、它其实可以踩"。
+        /// </summary>
+        [JsonPropertyName("furniture")] public FurnitureView[] Furniture { get; set; }
+
+        /// <summary>
+        /// **v0.6.2 新增，仅 `detail=full` 时出现**（`summary` 必须为 null → 字段缺失）。
+        ///
+        /// 当前地点的**门**清单（`GameLocation.doors`：门格 → 门类型）。
+        ///
+        /// 【为什么必须有】`GameLocation.isCollidingWithDoors` 的 IL 实证：它遍历的是
+        /// **`this.doors`**，用玩家像素矩形**四个角**所在格去比对，命中才 `getWarpFromDoor` 拿 Warp。
+        /// ⇒ **门的权威格子在这张字典里**，`Building.getPointForHumanDoor()` 只是其中一条解析路径。
+        /// 跨地点图必须同时用这两者；诊断"为什么门没触发"也必须先看这份清单。
+        /// </summary>
+        [JsonPropertyName("doors")] public DoorView[] Doors { get; set; }
+
+        /// <summary>
+        /// **v0.7.18 新增（仅 `detail=full`）**：当前地点里**能锄出耕地**的空格（近处优先，最多 200 个）。
+        ///
+        /// 【为什么需要（用户 m01668 提的）】P3 要"开垦 N 格"，而在此之前脑只能**瞎试空格**
+        /// （验收脚本就是这么干的：挨个 `use_tool(hoe)`，不可锄的要白挥 6 次才报 `tool_ineffective`）。
+        /// 判据照抄游戏自己的 `Hoe.DoFunction`（IL_0165–IL_01A7）：没有地形特征、没有放置物、不是水面、
+        /// 且 `Back` 图层上有 `Diggable` 属性 ⇒ 见 `StepMover.Tillable`。
+        /// </summary>
+        [JsonPropertyName("tillable")] public int[][] Tillable { get; set; }
+
+        /// <summary>
+        /// **v0.7.4 新增（`agentfarm-world/6`），仅 `detail=full` 时出现**。
+        ///
+        /// **逐格清单**：这一格上有什么、该用什么工具、现在能不能站人。
+        ///
+        /// 【为什么必须有（P3 的头号缺口）】在此之前 `objects` / `terrainFeatures` **只有计数**
+        /// （`weeds=456, stones=247` 之类），脑**看不见"哪一格上是什么"** ⇒ 规划层只能猜格子，
+        /// 正是旧项目"照着 LLM 给的坐标乱走"的病根。有了 `tiles[]`，脑才能自己挑"要清的那一格"。
+        ///
+        /// 判据全部问游戏：`Object.IsWeeds()/IsTwig()/IsBreakableStone()`、
+        /// `terrainFeatures` 的具体类型（`Grass/Tree/FruitTree/ResourceClump/HoeDirt/Bush`）、
+        /// 可站性用 `StepMover.Standable`（与 `move_to` 同一套判据）。
+        /// **上限 400 格**，超出时 `tilesTruncated=true`（payload 必须有界）。
+        /// </summary>
+        [JsonPropertyName("tiles")] public TileView[] Tiles { get; set; }
+
+        /// <summary>`tiles[]` 是否因为超过上限被截断（null/false = 完整）。</summary>
+        [JsonPropertyName("tilesTruncated")] public bool? TilesTruncated { get; set; }
+
+        /// <summary>
+        /// **v0.7.21 新增（仅 `detail=full`）**：当前地点里**能给浇水壶补水**的格子（近处优先，最多 24 个）。
+        ///
+        /// 【判据是游戏自己的】逐格调 `GameLocation.CanRefillWateringCanOnTile(x, y)`
+        /// （api-probe 实证 public；`logs\api-water-members.txt`）——包括水面、水槽，也包括
+        /// 农场小屋里的水槽这类"看起来不像是水"的格子，**不硬编码坐标、也不猜地形**。
+        /// 长跑循环里壶水量低于阈值时，脑走到最近一格补水再继续浇。
+        /// </summary>
+        [JsonPropertyName("refillTiles")] public int[][] RefillTiles { get; set; }
+
+        /// <summary>`refillTiles[]` 是否因为超过上限被截断（null/false = 完整）。</summary>
+        [JsonPropertyName("refillTilesTruncated")] public bool? RefillTilesTruncated { get; set; }
+    }
+
+    /// <summary>浇水壶视图（快照 v0.7.21 新增）。见 <see cref="PlayerView.WateringCan"/>。</summary>
+    internal sealed class WateringCanView
+    {
+        /// <summary>背包里到底有没有浇水壶。</summary>
+        [JsonPropertyName("present")] public bool Present { get; set; }
+
+        /// <summary>`WateringCan.WaterLeft`：还能浇几格（0 = 空了，必须先补水）。</summary>
+        [JsonPropertyName("waterLeft")] public int WaterLeft { get; set; }
+
+        /// <summary>`WateringCan.waterCanMax`：当前升级等级下的容量上限。</summary>
+        [JsonPropertyName("max")] public int Max { get; set; }
+
+        /// <summary>`Farmer.hasWateringCanEnchantment`：无尽之壶（附魔）时为 true，永远不用补水。</summary>
+        [JsonPropertyName("bottomless")] public bool Bottomless { get; set; }
+
+        /// <summary>`WateringCan.UpgradeLevel`：壶的升级等级（诊断用）。</summary>
+        [JsonPropertyName("upgradeLevel")] public int UpgradeLevel { get; set; }
+    }
+
+    /// <summary>背包里一件物品的视图（快照 v0.7.9 新增，仅 `detail=full`）。</summary>
+    internal sealed class ItemView
+    {
+        /// <summary>背包槽位下标（`select_item` 就用它设 `CurrentToolIndex`）。</summary>
+        [JsonPropertyName("slot")] public int Slot { get; set; }
+
+        /// <summary>`Item.ItemId`（例：防风草种子 `472`、锄头 `Hoe`）。</summary>
+        [JsonPropertyName("id")] public string Id { get; set; }
+
+        /// <summary>`Item.QualifiedItemId`（带类型前缀的全局 id，例：`(O)472`）。</summary>
+        [JsonPropertyName("qualifiedId")] public string QualifiedId { get; set; }
+
+        /// <summary>可读名（`DisplayName`，失败退回 `Name`）。</summary>
+        [JsonPropertyName("name")] public string Name { get; set; }
+
+        /// <summary>堆叠数量。</summary>
+        [JsonPropertyName("stack")] public int Stack { get; set; }
+
+        /// <summary>是不是工具（`Tool` 子类）。</summary>
+        [JsonPropertyName("isTool")] public bool IsTool { get; set; }
+    }
+
+    /// <summary>单格清单项（快照 v0.7.4 / `agentfarm-world/6` 新增，仅 `detail=full`）。</summary>
+    internal sealed class TileView
+    {
+        /// <summary>格坐标 `[x, y]`。</summary>
+        [JsonPropertyName("tile")] public int[] Tile { get; set; }
+
+        /// <summary>
+        /// `weed`（杂草）/ `twig`（树枝）/ `stone`（可敲石头）/ `object`（其它放置物，如机器、箱子、掉落物）/
+        /// `tree`（树）/ `fruitTree`（果树）/ `clump`（资源堆）/ `grass`（草）/ `dirt`（耕地）/
+        /// `bush`（灌木）/ `unknown`。
+        /// </summary>
+        [JsonPropertyName("kind")] public string Kind { get; set; }
+
+        /// <summary>要清掉/处理这一格该用哪个工具：`scythe` / `axe` / `pickaxe` / `hoe` / `can` / `none`。</summary>
+        [JsonPropertyName("tool")] public string Tool { get; set; }
+
+        /// <summary>select_item 专用：要找的物品（ItemId / QualifiedItemId / 名字，大小写不敏感）。</summary>
+        [JsonPropertyName("item")] public string Item { get; set; }
+
+        /// <summary>plant 专用：要种下的种子 ItemId（例 472 = 防风草种子）。</summary>
+        [JsonPropertyName("seed")] public string Seed { get; set; }
+
+        /// <summary>`objects` 里那一项的 `ItemId`（没有则为 null）。</summary>
+        [JsonPropertyName("objId")] public string ObjId { get; set; }
+
+        /// <summary>`terrainFeatures` 里那一项的类型名（没有则为 null）。</summary>
+        [JsonPropertyName("feature")] public string Feature { get; set; }
+
+        /// <summary>
+        /// 这一格**自己**能不能站人（与 `move_to` 同一套判据，`allow_bed=true`）。
+        /// ⚠️ 有杂草/石头/树枝的格子**必然**是 false（那正是"要清掉的东西"），
+        /// 所以规划不能只看它 —— 判断"够不够得着"要用 <see cref="Actionable"/>。
+        /// </summary>
+        [JsonPropertyName("standable")] public bool Standable { get; set; }
+
+        /// <summary>
+        /// 这一格**够不够得着**（能不能站到旁边/站上去对它动手）＝ 自身可站 **或** 四邻有一格可站。
+        /// 这是规划层真正要用的那个判据（锄地/播种/砍草都是"对着某一格动手"）。
+        /// 首版只算了 `Standable`，真机一看 400 格全是 `reachable=false`（因为格子上都有东西）——
+        /// 语义错了，故拆成 standable + actionable 两个字段。
+        /// </summary>
+        [JsonPropertyName("actionable")] public bool Actionable { get; set; }
+
+        /// <summary>作物：`Crop.indexOfHarvest`（成熟后收获物的 id）；没有作物则 null。</summary>
+        [JsonPropertyName("crop")] public string Crop { get; set; }
+
+        /// <summary>作物是否已成熟可收（`Crop.fullyGrown`）。</summary>
+        [JsonPropertyName("ripe")] public bool Ripe { get; set; }
+
+        /// <summary>作物是否已枯死（`Crop.dead`）。</summary>
+        [JsonPropertyName("dead")] public bool Dead { get; set; }
+
+        /// <summary>耕地是否已浇水（`HoeDirt.isWatered()`）。</summary>
+        [JsonPropertyName("watered")] public bool Watered { get; set; }
+
+        /// <summary>
+        /// 这一格现在**能不能播种** ＝ 是耕地（`HoeDirt`）且上面没有作物。
+        /// 规划层"开垦 → 播种"就靠它（`kind=dirt` + `plantable=true` + `watered=false` ⇒ 该下种子）。
+        /// </summary>
+        [JsonPropertyName("plantable")] public bool Plantable { get; set; }
+    }
+
+    /// <summary>单个门的诊断视图（快照 v0.6.2 新增，仅 `detail=full`）。</summary>
+    internal sealed class DoorView
+    {
+        /// <summary>门格 `[x, y]`（世界格坐标）——玩家像素矩形的**角**落到这一格才会触发。</summary>
+        [JsonPropertyName("tile")] public int[] Tile { get; set; }
+
+        /// <summary>门类型字符串（`GameLocation.doors` 的值，例如 <c>"Farmhouse"</c>）。</summary>
+        [JsonPropertyName("type")] public string Type { get; set; }
+    }
+
+    /// <summary>
+    /// 单件家具的诊断视图（快照 v4 新增，仅 `detail=full`）。
+    ///
+    /// 字段口径：
+    ///   * `tile`   —— `Furniture.TileLocation`（家具原点所在格，世界格坐标）；
+    ///   * `bbox`   —— `Furniture.GetBoundingBox()` 的像素矩形 `[x, y, w, h]`（**世界像素**，
+    ///                 多格家具的宽高按格数放大，例：2x2 的床就是 128x128）；
+    ///   * `passable` —— **游戏自己的** `f.isPassable()`。这才是"能不能踩上去"的权威答案；
+    ///   * `ground`   —— `f.isGroundFurniture()`（地面类家具，如地毯）。⚠️ 1.6.15 上它**是方法**，
+    ///                 当属性写会 CS0428（编译期实证）；
+    ///   * `blocking` —— 本桥的最终判定（与 `Skills.SafeStandable` 同口径）：
+    ///                 `isBed || !passable`。**`isBed` 单独列出来**是因为床是特例：
+    ///                 它可踩（`passable` 可能为 true）但会触发睡觉确认框冻结世界时间，故显式拒绝；
+    ///   * `type` / `name` —— 类名（如 `BedFurniture` / `Furniture`）与可读名。
+    ///     `name` 取 `DisplayName`（失败则退回 `Name`，再失败为 null）。
+    /// </summary>
+    internal sealed class FurnitureView    {
+        [JsonPropertyName("tile")] public int[] Tile { get; set; }
+        [JsonPropertyName("bbox")] public int[] Bbox { get; set; }
+        [JsonPropertyName("passable")] public bool Passable { get; set; }
+        [JsonPropertyName("ground")] public bool Ground { get; set; }
+        [JsonPropertyName("isBed")] public bool IsBed { get; set; }
+
+        /// <summary>本桥的阻挡判定（`isBed || !passable`），与 move_to 的前置检查同口径。</summary>
+        [JsonPropertyName("blocking")] public bool Blocking { get; set; }
+
+        [JsonPropertyName("type")] public string Type { get; set; }
+        [JsonPropertyName("name")] public string Name { get; set; }
     }
 
     internal sealed class FarmView
@@ -282,8 +521,74 @@ namespace AgentFarm.Bridge
 
     internal sealed class ExecArgs
     {
-        /// <summary>move_to 的目标格 [x, y]。</summary>
+        /// <summary>move_to / move_to_location 的目标格 [x, y]。</summary>
         [JsonPropertyName("tile")] public int[] Tile { get; set; }
+
+        /// <summary>
+        /// <c>move_to_location</c> 专用：目标**地点名**（如 <c>"Farm"</c>）。
+        ///
+        /// 【硬约束】这个字符串只用来**在游戏真值里查表**（<c>Game1.locations[i].Name</c> 与各条 warp 的
+        /// <c>TargetName</c>），大小写不敏感匹配后取图上的规范名。
+        /// 它**绝不会**用来拼坐标、查表下标或硬编码路线 —— 路线一律由地点图上的 BFS 得出（§5.2.1）。
+        /// </summary>
+        [JsonPropertyName("location")] public string Location { get; set; }
+
+        /// <summary>
+        /// move_to 专用：是否**显式放行床格**（默认 <c>false</c>）。
+        ///
+        /// 【为什么要默认拦、又要能放行】床（<see cref="StardewValley.Objects.BedFurniture"/>）
+        /// 可以踩，但踩上去会弹 "Go to sleep for the night?"，答错/半途关闭会把世界卡住
+        /// （条目 013 的真实事故）。无人值守时这属于**破坏性副作用**，必须默认拦住；
+        /// 但测试 <c>dismiss_modal</c> 时需要**故意**走到床上把弹窗引出来，所以留一个显式开关。
+        /// 放行是**调用方主动声明**的，成功回执的 reason 里会写明"本次放了床"以便事后审计。
+        /// </summary>
+        [JsonPropertyName("allow_bed")] public bool AllowBed { get; set; }
+
+        /// <summary>
+        /// <c>use_tool</c> 专用：要用哪把工具（<c>axe</c> / <c>pickaxe</c> / <c>hoe</c> / <c>can</c> /
+        /// <c>scythe</c> / <c>auto</c>）。
+        ///
+        /// 省略或 <c>auto</c> 时由 Mod 按目标格上的东西自动挑（树枝→斧、可敲石头→镐、杂草/草→镰刀、
+        /// 空耕地→锄、有作物的耕地→水壶），并在回执里**报出真实用的那件物品名**。
+        /// **不允许**脑用工具名去猜 ItemId —— 一切以回执报出的实际物品为准（真机可审计）。
+        /// </summary>
+        [JsonPropertyName("tool")] public string Tool { get; set; }
+
+        /// <summary>select_item 专用：要找的物品（ItemId / QualifiedItemId / 名字，大小写不敏感）。</summary>
+        [JsonPropertyName("item")] public string Item { get; set; }
+
+        /// <summary>plant 专用：要种下的种子 ItemId（例 472 = 防风草种子）。</summary>
+        [JsonPropertyName("seed")] public string Seed { get; set; }
+
+        /// <summary>
+        /// <c>load_save</c> 专用：要读的**存档文件夹名**（例如 <c>"Wahaha_450799035"</c>）。
+        ///
+        /// 省略时由 Mod 自己挑**最近写过**的存档（见 <see cref="LoadSaveSkill"/>）。
+        /// 名字只在 <c>Constants.SavesPath</c> 下做**存在性校验**，不参与拼路径之外的任何逻辑。
+        /// </summary>
+        [JsonPropertyName("save")] public string Save { get; set; }
+
+        /// <summary>
+        /// <c>load_save</c> 专用：当前**已经**在存档里时，是否仍然强行读档（默认 <c>false</c>）。
+        ///
+        /// 读档会直接丢掉当天进度（游戏只在睡觉时落盘），属于破坏性副作用，
+        /// 所以与 <c>move_to</c> 的 <c>allow_bed</c> 同一条纪律：必须调用方显式声明。
+        /// </summary>
+        [JsonPropertyName("force")] public bool Force { get; set; }
+
+        /// <summary>
+        /// <c>buy</c> 专用：想买几个（默认 1）。这是**请求量**，不是承诺量：
+        /// Mod 会用「钱够几个 / 库存剩几个 / 单个堆叠上限」把它夹小，再由游戏自己的购买函数
+        /// 做最终裁决（钱不够时游戏会整体拒绝，不会扣一半）。回执里报出**实际成交数**。
+        /// </summary>
+        [JsonPropertyName("count")] public int? Count { get; set; }
+
+        /// <summary>
+        /// <c>buy</c> 专用：商店 id（默认 <c>"SeedShop"</c> = 皮埃尔杂货店，卖防风草种子等）。
+        /// 与 <c>args.location</c> 同一条纪律：这个字符串只交给游戏自己的
+        /// <c>Utility.TryOpenShopMenu(shopId, ...)</c> 去查 <c>Data/Shops</c>，Mod 不解析它。
+        /// </summary>
+        [JsonPropertyName("shop")] public string Shop { get; set; }
     }
 
     /// <summary>
@@ -326,6 +631,74 @@ namespace AgentFarm.Bridge
         /// 其它技能恒为 `true`（本字段对它们无意义，可忽略）。
         /// </summary>
         [JsonPropertyName("worldResumed")] public bool WorldResumed { get; set; } = true;
+
+        // ------------------------------------------------------------------
+        //  里程碑 B（move_to_location）新增：成功/失败都给的“可审计行程单”
+        //
+        //  全局约定不变：值为 null 时字段被**省略**，所以别的技能的回执形状完全不变。
+        // ------------------------------------------------------------------
+
+        /// <summary>
+        /// 实际走过的地点序列（含起点），例如 <c>["FarmHouse","Farm"]</c>。
+        /// 只记**观测到的事实**（<c>Game1.currentLocation.Name</c> 的变化），不记计划。
+        /// </summary>
+        [JsonPropertyName("path")] public string[] Path { get; set; }
+
+        /// <summary>每一跳的明细。失败时也会给出已经走过的跳，便于脑看到“走到哪一步断的”。</summary>
+        [JsonPropertyName("hops")] public HopView[] Hops { get; set; }
+
+        /// <summary>回执落账那一刻**真实观测到**的地点名（<c>Game1.currentLocation.Name</c>）。</summary>
+        [JsonPropertyName("reachedLocation")] public string ReachedLocation { get; set; }
+
+        /// <summary>
+        /// <c>load_save</c> 专用：真正被读进来的**存档文件夹名**（失败时也给，便于审计）。
+        /// 【可选字段】null 时序列化省略，因此老客户端读到的响应形状不变。
+        /// </summary>
+        [JsonPropertyName("save")] public string Save { get; set; }
+
+        /// <summary>
+        /// <c>load_save</c> 专用：读档完成后玩家所在格 [x, y]。
+        /// 【可选字段】null 时序列化省略。
+        /// </summary>
+        [JsonPropertyName("tile")] public int[] Tile { get; set; }
+    }
+
+    /// <summary>
+    /// <c>move_to_location</c> 的一跳明细。
+    ///
+    /// 【为什么 to 与 arrivedAt 要分开】<c>to</c> 是**地图上写的**（warp 的 <c>TargetName</c>），
+    /// <c>arrivedAt</c> 是**实际观测到的**（<c>Game1.currentLocation.Name</c>）。
+    /// 两者不一致时 <c>result="mismatch"</c> —— 这是给脑审计用的：
+    /// 本实现从不拿"地图上写的目标"冒充"到了"，判据只有后者。
+    /// </summary>
+    internal sealed class HopView
+    {
+        /// <summary>这一跳从哪个地点出发（出发时的观测值）。</summary>
+        [JsonPropertyName("from")] public string From { get; set; }
+
+        /// <summary>这一跳打算去哪（warp 的 <c>TargetName</c>）。</summary>
+        [JsonPropertyName("to")] public string To { get; set; }
+
+        /// <summary>实际观测到的落地地点名；失败时为出发地点。</summary>
+        [JsonPropertyName("arrivedAt")] public string ArrivedAt { get; set; }
+
+        /// <summary>计划使用的 warp **源格**（本地点内，warp 的 X/Y）。</summary>
+        [JsonPropertyName("sourceTile")] public int[] SourceTile { get; set; }
+
+        /// <summary>地图上写的**落点格**（目标地点内，warp 的 TargetX/TargetY；仅供参考）。</summary>
+        [JsonPropertyName("landingTile")] public int[] LandingTile { get; set; }
+
+        /// <summary>实际最后走向的那个候选格（源格/穿过格/邻格），用于复盘“到底试了哪一格”。</summary>
+        [JsonPropertyName("usedTile")] public int[] UsedSourceTile { get; set; }
+
+        /// <summary>这一跳花了多少毫秒。</summary>
+        [JsonPropertyName("ms")] public long Ms { get; set; }
+
+        /// <summary>ok / mismatch / hop_failed / blocked / timeout / unreachable / ui_modal / error。</summary>
+        [JsonPropertyName("result")] public string Result { get; set; }
+
+        /// <summary>失败或 mismatch 时的可操作说明。</summary>
+        [JsonPropertyName("detail")] public string Detail { get; set; }
     }
 
     // ==================================================================

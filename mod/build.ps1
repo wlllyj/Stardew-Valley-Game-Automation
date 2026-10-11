@@ -146,7 +146,7 @@ if ($ok) {
     Write-Host ''
     Write-Host '下一步（真机验证）：'
     Write-Host '  1) 启动 Stardew Valley（SMAPI）；'
-    Write-Host '  2) 控制台应出现 “AgentFarm Bridge v0.1.0 已就绪”；'
+    Write-Host '  2) 控制台应出现 “AgentFarm Bridge 已就绪”（版本号以日志为准，不要写死）；'
     Write-Host "  3) 读 %APPDATA%\StardewValley\AgentFarm\bridge.json 拿 port 与 token；"
     Write-Host '  4) curl http://127.0.0.1:<port>/v1/health'
     exit 0
