@@ -29,6 +29,7 @@ from .bridge import (
     BridgeError,
     default_bridge_json_path,
     load_bridge_info,
+    pid_alive,
 )
 from .llm import (
     ENV_API_KEY,
@@ -39,6 +40,7 @@ from .llm import (
     load_api_key,
     secrets_dir,
 )
+from .winfocus import ensure_game_foreground, find_game_window, foreground_window
 
 SEASON_ZH = {"spring": "春", "summer": "夏", "fall": "秋", "winter": "冬"}
 
@@ -130,6 +132,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"      端口 {info.port} | pid {info.pid} | Mod {info.mod_version} | "
           f"游戏 {info.game_version} | SMAPI {info.smapi_version} | 启动于 {info.started_at}")
 
+    # 文件存在 ≠ 游戏在跑：实测游戏退出后 bridge.json 可能残留（协议要求清理但没清）
+    alive = pid_alive(info.pid)
+    if alive is False:
+        print(f"{WARN} bridge.json 里的 pid {info.pid} 已经不存在 —— 这是上一次运行留下的**陈旧文件**。")
+        print(f"      游戏可能已经退出，或 Mod 的退出清理没生效。")
+        print(f"      （脑不会因此误判：后面的 HTTP 探测仍会独立失败，报 'unreachable_bridge'）")
+        warnings += 1
+
     # 2) 版本基线
     if info.game_version != BASELINE_GAME_VERSION:
         print(f"{WARN} 游戏版本 {info.game_version} ≠ 基线 {BASELINE_GAME_VERSION}（可能已更新，需重跑验收）")
@@ -220,7 +230,29 @@ def cmd_noop(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_focus(args: argparse.Namespace) -> int:
+    """把游戏窗口拉到前台。
+
+    为什么需要：实测（2026-10-11）游戏**失焦时角色不会被控制器驱动** ——
+    世界时间照常流逝，但 move_to 10/10 失败、角色一动不动；回到前台后 5/5 成功。
+    所以任何"会移动角色"的操作之前都必须确保游戏在前台。
+    """
+    hwnd = find_game_window()
+    if hwnd is None:
+        print(f"{FAIL} 找不到《星露谷》窗口（游戏没启动？）")
+        return 1
+    print(f"      游戏窗口 hwnd={hwnd}，当前前台 hwnd={foreground_window()}")
+    ok = ensure_game_foreground()
+    print(f"{OK if ok else FAIL} {'游戏已在前台' if ok else '抢焦点失败'}")
+    return 0 if ok else 1
+
+
 def cmd_move(args: argparse.Namespace) -> int:
+    # 实测教训：失焦时控制器不驱动角色 —— 移动前先把游戏拉到前台
+    if not args.no_focus:
+        if not ensure_game_foreground(verbose=False):
+            print(f"{WARN} 未能把游戏拉到前台；失焦时角色可能不会移动（实测会卡死检测失败）")
+
     client = BridgeClient()
     try:
         obs = client.observe("summary", timeout=8.0)
@@ -348,7 +380,11 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("x", type=int)
     m.add_argument("y", type=int)
     m.add_argument("--timeout-ms", type=int, default=8000, dest="timeout_ms")
+    m.add_argument("--no-focus", action="store_true", dest="no_focus",
+                   help="不要把游戏拉到前台（用于验证失焦行为）")
     m.set_defaults(func=cmd_move)
+
+    sub.add_parser("focus", help="把《星露谷》窗口拉到前台").set_defaults(func=cmd_focus)
 
     w = sub.add_parser("watch", help="持续打印世界摘要")
     w.add_argument("--interval", type=float, default=2.0)

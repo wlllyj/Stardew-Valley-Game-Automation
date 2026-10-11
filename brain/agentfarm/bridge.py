@@ -86,6 +86,33 @@ def default_bridge_json_path() -> Path:
     return Path(appdata) / "StardewValley" / "AgentFarm" / "bridge.json"
 
 
+def pid_alive(pid: int | None) -> bool | None:
+    """检查进程是否还活着。返回 None = 无法判断（非 Windows 等）。
+
+    ⚠️ Windows 上**绝不能**用 `os.kill(pid, 0)` 做存在性检查 —— 在 Windows 上
+    它不是"发信号 0"，而是会走到 `TerminateProcess`，**真的把目标进程杀掉**。
+    这里用 `OpenProcess(SYNCHRONIZE)` + `WaitForSingleObject(0)`：只查询、不触碰。
+
+    【为什么需要它】实测（2026-10-11）游戏正常退出后 `bridge.json` 仍留在磁盘上。
+    脑不能假定 Mod 一定守约清理，必须自己判断"这个文件是不是上一局的遗物"。
+    """
+    if pid is None or os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    SYNCHRONIZE = 0x00100000
+    WAIT_TIMEOUT = 0x00000102
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
+    if not handle:
+        return False                      # 打不开 = 进程不存在（或权限不足，保守当死）
+    try:
+        return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def load_bridge_info(path: Path | None = None) -> BridgeInfo:
     """读取并校验 `bridge.json`。
 
