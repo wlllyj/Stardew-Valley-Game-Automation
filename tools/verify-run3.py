@@ -14,6 +14,10 @@
    day_key 不同 —— 回执不算证据，观测里的日期变化才算。
 2. **睡前未浇为 0**：`day_end.final.unwatered_crops == 0`（全局口径）。
 3. **无硬失败**：当天 stages 的 failed 之和为 0。
+3b. **阶段后置条件成立**：优先读 `day_end.checks.no_unmet_stages`（task-15 起），读不到就
+    按 `day_end.stages[].leftover` 自己算 —— 只认「做过且做完」，`blocked`/封格不得洗白成功。
+3c. **过程里没有异常事件**：`bridge_down` / `watchdog_stop` / `modal_timeout` / `no_day_progress`
+    出现任意一条即判未达标（这些是"人不在场也出过事"的证据）。
 4. **LLM 覆盖**：`decision` 条数与其中 `llm==true` 的条数（长跑默认开 LLM）。
 5. **尾部连续 VERIFIED 天数** >= `--days`；存在 `finish` 事件时核对 `code`。
 
@@ -155,6 +159,29 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
             problems.append(f"[{name}] day_end verified=false")
         if d["sleep_fail"]:
             problems.append(f"[{name}] 当天有 {d['sleep_fail']} 次 sleep 失败（回执 ok=false）")
+
+        # 3b. 阶段后置条件（task-15 起 checks.no_unmet_stages；读不到就按 leftover 自算）
+        unmet = checks.get("no_unmet_stages")
+        if unmet is None:
+            stage_recs = (d.get("end") or {}).get("stages") or []
+            leftover = sum(
+                int(s.get("leftover") or 0) for s in stage_recs if isinstance(s, dict)
+            )
+            if leftover:
+                problems.append(f"[{name}] 当天有阶段遗留目标 leftover={leftover}（阶段没做完）")
+        elif unmet is False:
+            problems.append(f"[{name}] checks.no_unmet_stages=false（有阶段后置条件未成立）")
+
+    # 3c. 异常事件（"人不在场也出过事"）
+    for code, label in (
+        ("bridge_down", "bridge 掉线"),
+        ("watchdog_stop", "watchdog 判定 STOP"),
+        ("modal_timeout", "模态等待超时"),
+        ("no_day_progress", "跨日没有推进"),
+    ):
+        n = events.get(code, 0)
+        if n:
+            problems.append(f"journal 里出现 {label} ×{n}")
 
     streak = 0
     for d in reversed(days):
