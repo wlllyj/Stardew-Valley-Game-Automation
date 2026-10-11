@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using Microsoft.Xna.Framework;
 using StardewModdingAPI;
 using StardewValley;
+using StardewValley.Objects;
 using StardewValley.Pathfinding;
 
 namespace AgentFarm.Bridge
@@ -67,6 +68,22 @@ namespace AgentFarm.Bridge
                 case "move_to":
                     return new MoveToSkill(req, world, monitor).Step;
 
+                case "dismiss_modal":
+                    // 单 tick 完成的短任务：不返回 null，所以不会被当成跨 tick 长任务。
+                    return () =>
+                    {
+                        ModalDismissResult r = ModalDismiss.Dismiss();
+                        return new ExecResponse
+                        {
+                            Ok = r.Ok,
+                            Status = r.Status,
+                            Skill = "dismiss_modal",
+                            Reason = r.Reason,
+                            Schema = "agentfarm-exec/1",
+                            ElapsedMs = 0,
+                        };
+                    };
+
                 default:
                     // 未实现的技能：合法请求但还没有实现（区别于 unknown_skill）。
                     return () => new ExecResponse
@@ -74,7 +91,7 @@ namespace AgentFarm.Bridge
                         Ok = false,
                         Status = "not_implemented",
                         Skill = skill,
-                        Reason = $"技能“{skill}”尚未实现（里程碑 A 只提供 noop 与 move_to）",
+                        Reason = $"技能“{skill}”尚未实现（里程碑 A 只提供 noop、move_to 与 dismiss_modal）",
                     };
             }
         }
@@ -82,12 +99,12 @@ namespace AgentFarm.Bridge
         /// <summary>已知技能名（用于区分 unknown_skill 与 not_implemented）。</summary>
         private static readonly HashSet<string> KnownSkills = new HashSet<string>(StringComparer.Ordinal)
         {
-            // 里程碑 A 已实现
-            "noop", "move_to",
+            // 已实现
+            "noop", "move_to", "dismiss_modal",
             // 架构 §5.3 规划中（返回 not_implemented，便于“脑”一次性看清缺口）
             "move_to_location", "exit_building", "use_tool", "plant", "harvest",
             "pickup_debris", "collect_machine", "refill_watering_can", "talk",
-            "buy", "sell", "sleep", "dismiss_modal",
+            "buy", "sell", "sleep",
         };
 
         public static bool IsKnownSkill(string skill) => skill != null && KnownSkills.Contains(skill);
@@ -135,7 +152,8 @@ namespace AgentFarm.Bridge
                 };
 
             private ExecResponse Ok(long elapsedMs)
-                => new ExecResponse
+            {
+                var r = new ExecResponse
                 {
                     Ok = true,
                     Status = "ok",
@@ -145,6 +163,22 @@ namespace AgentFarm.Bridge
                     WorldSeqBefore = this._seqBefore,
                     WorldSeqAfter = this._world.WorldSeq,
                 };
+
+                // ---- 到达后的副作用：是否顺手弹出了模态 ----
+                //
+                // 真机实测：走到床边会“成功到达”，但同时触发 "go to sleep for the night?" 对话框，
+                // 整个世界时间随之冻结。v1 在这种情况下只回一个 ok，脑会以为一切正常，
+                // 于是继续下发下一步 —— 而所有动作都会因为模态挡路而失败。
+                // 这里把“到达 + 弹窗”如实报回去，脑再决定是否调 dismiss_modal。
+                try
+                {
+                    r.UiOpened = Game1.activeClickableMenu != null;
+                    if (r.UiOpened) r.ActiveMenuText = UiRead.ActiveMenuText();
+                }
+                catch { }
+
+                return r;
+            }
 
             /// <summary>每次被主线程调用：返回 null = 还在走，返回非 null = 终态。</summary>
             public object Step()
@@ -243,10 +277,21 @@ namespace AgentFarm.Bridge
                         0);
                 }
 
-                if (!SafeStandable(_target))
+                if (!SafeStandable(_target, out Furniture blocking))
                 {
                     return this.Fail("unreachable",
                         $"目标格 {FormatTile(_target)} 不可通行（被建筑/水面/障碍占据），无法走上去", 0);
+                }
+
+                if (blocking != null)
+                {
+                    // 家具（床/桌椅/箱子摆放位）单独报 precondition_failed：
+                    // 这不是“走不到”，而是“这个格子本来就不该被当成落脚点”。
+                    // 真机教训：派到床格会先成功到达，再弹出睡觉确认框冻结整个世界时间；
+                    // 提前挡住比事后补救便宜得多。
+                    string kind = blocking is StardewValley.Objects.BedFurniture ? "床/家具" : blocking.GetType().Name;
+                    return this.Fail("precondition_failed",
+                        $"目标格 {FormatTile(_target)} 有家具（{kind}），不能作为落脚点；请改选旁边的空地板格", 0);
                 }
 
                 // ---- 发起寻路 ----
@@ -296,20 +341,44 @@ namespace AgentFarm.Bridge
 
             /// <summary>
             /// 这一格角色站得上去吗。
-            /// 放置物一律挡路；地形特征里树/灌木/资源堆挡路，草地与耕地能走。
+            /// 放置物一律挡路；地形特征里树/灌木/资源堆挡路，草地与耕地能走；
+            /// 家具（床/桌椅等）通过 <paramref name="blockingFurniture"/> 单独报出，由调用方区分处理：
+            /// “有家具”是**前置条件不满足**，而不是“A* 走不到”。
             /// 建筑与围墙这里判不准，由“A* 无解立即放弃 + 卡死检测”兜底。
             /// </summary>
-            private static bool SafeStandable(Point p)
+            /// <param name="blockingFurniture">该格上的家具（没有则为 null）。</param>
+            private static bool SafeStandable(Point p, out Furniture blockingFurniture)
             {
+                blockingFurniture = null;
                 try
                 {
                     GameLocation loc = Game1.currentLocation;
                     if (loc == null) return false;
 
-                    if (loc.objects != null && loc.objects.ContainsKey(new Vector2(p.X, p.Y))) return false;
+                    var tile = new Vector2(p.X, p.Y);
+
+                    // ---- 家具检查（v2 新增）----
+                    //
+                    // 1.6.x 的 loc.furniture 是 NetCollection<Furniture>，**直接 foreach 遍历**
+                    // （没有 .Pairs，那是 objects/terrainFeatures 的写法）。
+                    // 床尤其重要：它自带碰撞，A* 永远绕不进去，只会浪费一次 8 秒超时或报“A* 无解”。
+                    try
+                    {
+                        if (loc.furniture != null)
+                        {
+                            foreach (Furniture f in loc.furniture)
+                            {
+                                if (f == null) continue;
+                                if (f.TileLocation == tile) { blockingFurniture = f; return false; }
+                            }
+                        }
+                    }
+                    catch { }
+
+                    if (loc.objects != null && loc.objects.ContainsKey(tile)) return false;
                     if (loc.isWaterTile(p.X, p.Y)) return false;
 
-                    if (loc.terrainFeatures != null && loc.terrainFeatures.TryGetValue(new Vector2(p.X, p.Y), out StardewValley.TerrainFeatures.TerrainFeature tf) && tf != null)
+                    if (loc.terrainFeatures != null && loc.terrainFeatures.TryGetValue(tile, out StardewValley.TerrainFeatures.TerrainFeature tf) && tf != null)
                     {
                         if (tf is StardewValley.TerrainFeatures.ResourceClump) return false;
                         if (tf is StardewValley.TerrainFeatures.Tree) return false;

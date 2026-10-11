@@ -1,8 +1,8 @@
 {
   "Name": "AgentFarm Bridge",
   "Author": "AgentFarm",
-  "Version": "0.1.0",
-  "Description": "AgentFarm 自动化项目的桥接 Mod：在 127.0.0.1 上暴露极简 HTTP/JSON 接口，供外部“脑”读取世界快照与下发技能（里程碑 A：observe + move_to）。",
+  "Version": "0.2.0",
+  "Description": "AgentFarm 自动化项目的桥接 Mod：在 127.0.0.1 上暴露极简 HTTP/JSON 接口，供外部“脑”读取世界快照与下发技能。v0.2.0：协议升级 agentfarm-world/2 —— 修正农场 weeds/twigs 分类、天气恒为空串；新增对话框内容字段与 dismiss_modal 技能（无人值守的解除模态能力）；move_to 排除家具格并回报弹窗副作用；新增失焦诊断字段。",
   "UniqueID": "AgentFarm.Bridge",
   "EntryDll": "AgentFarm.Bridge.dll",
   "MinimumApiVersion": "4.0.0",

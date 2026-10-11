@@ -250,6 +250,13 @@ namespace AgentFarm.Bridge
             catch { return "unknown"; }
         }
 
+        /// <summary>游戏窗口是否在前台。诊断失焦导致“世界在走但角色不动”的关键字段。</summary>
+        private static bool GameWindowActive()
+        {
+            try { return Game1.game1?.IsActive ?? false; }
+            catch { return false; }
+        }
+
         private sealed class BridgeDiscovery
         {
             [System.Text.Json.Serialization.JsonPropertyName("schema")] public string Schema { get; set; }
@@ -338,6 +345,7 @@ namespace AgentFarm.Bridge
                 {
                     Version = GameVersionString(),
                     Smapi = SmapiVersionString(),
+                    WindowActive = GameWindowActive(),
                 },
                 Runtime = new HealthRuntime
                 {

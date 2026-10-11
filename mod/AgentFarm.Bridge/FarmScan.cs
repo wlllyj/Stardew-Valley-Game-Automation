@@ -39,8 +39,16 @@ namespace AgentFarm.Bridge
             "FishSmoker", "MushroomBox", "WoodChipper", "BaitMaker", "Anvil", "MiniForge", "SolarPanel",
         };
 
-        // 石头的 ItemId：1.6 里是 (O)343 / (O)450 / (O)668 / (O)670 ...
-        // 保守用“含 Stone 的 TypeDefinitionId 或已知小 ID 集合”，避免漏计/误计。
+        // ---- 石头 ID 兜底集合（已被 IsBreakableStone() 取代）----
+        //
+        // 【为什么保留】真机实测（2026-10-11）已经证明：1.6.x 的 ItemId 是**数字字符串**
+        // （"343" / "450" / ...），旧代码按 `id == "Weeds"` / `id == "Twig"` 比较永远匹配不上，
+        // 导致 weeds/twigs 恒为 0。现在杂草/树枝/石头**一律走游戏自己的判定方法**
+        // （`Object.IsWeeds()` / `IsTwig()` / `IsBreakableStone()`），这是唯一与游戏口径一致的做法。
+        //
+        // 这一组数字只作为**兜底**：当某个 Mod/未来版本让 `IsBreakableStone()` 漏判时，
+        // 仍按已知石类 ID 计入，避免 stones 数字突然掉下去。回归时可对照：
+        // 若 IsBreakableStone() 已经覆盖全部，这组集合命中数为 0（不影响结果）。
         private static readonly HashSet<string> StoneIds = new HashSet<string>(StringComparer.Ordinal)
         {
             "343", "450", "668", "670", "845", "846", "847",
@@ -264,15 +272,28 @@ namespace AgentFarm.Bridge
         {
             if (obj == null) return;
 
+            // ---- 杂草 / 树枝 / 可击碎石头：用游戏自己的判定方法 ----
+            //
+            // 【为什么不用 ItemId 比较】1.6.x 的 ItemId 是数字字符串（例如杂草 (O)0 / 树枝 (O)294，
+            // 实际拿到的是 "0"/"294" 这类数字），旧代码的 `id == "Weeds"` 永远为 false，
+            // 于是 weeds/twigs 恒为 0（真机实测：weeds=0 而真值 443、twigs=0 而真值 114）。
+            // `Object.IsWeeds()/IsTwig()/IsBreakableStone()` 是游戏内部同一套判定，
+            // 已经过 tools/api-probe 编译期实证，是唯一不会与游戏口径漂移的写法。
+            //
+            // 顺序说明：三者互斥（同一个 Object 不会是杂草又是树枝），因此可安全提前 return。
+            bool isWeeds = false, isTwig = false, isStone = false;
+            try { isWeeds = obj.IsWeeds(); } catch { }
+            try { isTwig = obj.IsTwig(); } catch { }
+            try { isStone = obj.IsBreakableStone(); } catch { }
+
+            if (isWeeds) { _acc.Weeds++; return; }
+            if (isTwig) { _acc.Twigs++; return; }
+            if (isStone) { _acc.Stones++; return; }
+
+            // 兜底：IsBreakableStone() 未覆盖时，仍按已知石类 ID 计入（详见 StoneIds 注释）。
             string id = null;
             try { id = obj.ItemId; } catch { }
-
-            if (!string.IsNullOrEmpty(id))
-            {
-                if (id == "Weeds") { _acc.Weeds++; return; }
-                if (id == "Twig" || id == "Twigs") { _acc.Twigs++; return; }
-                if (StoneIds.Contains(id)) { _acc.Stones++; return; }
-            }
+            if (!string.IsNullOrEmpty(id) && StoneIds.Contains(id)) { _acc.Stones++; return; }
 
             if (IsMachine(obj))
             {

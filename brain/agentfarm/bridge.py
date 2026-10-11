@@ -23,7 +23,9 @@ from typing import Any
 
 # ---- 契约常量（改这里必须同步 docs/03-桥接协议.md 并升版本号） ----
 SCHEMA_BRIDGE = "agentfarm-bridge/1"
-SCHEMA_WORLD = "agentfarm-world/1"
+SCHEMA_WORLD = "agentfarm-world/2"   # v2：新增 isOutdoorFarm / activeMenuText / dialogueResponses /
+                                     #      dialogueIsQuestion / onScreenMenus / windowActive / canMove /
+                                     #      hasController；删除 dialogsOnScreen。见 docs/03-桥接协议.md
 MOD_VERSION_EXPECTED = "0.1.0"
 
 # 已知基线：环境实测快照 docs/02-环境实测快照.md

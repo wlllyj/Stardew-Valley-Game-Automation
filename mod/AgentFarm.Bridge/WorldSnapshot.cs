@@ -7,7 +7,7 @@ using StardewValley.TerrainFeatures;
 namespace AgentFarm.Bridge
 {
     /// <summary>
-    /// 感知层（架构文档 §5.1）：把游戏真值打包成 `agentfarm-world/1` 快照。
+    /// 感知层（架构文档 §5.1）：把游戏真值打包成 `agentfarm-world/2` 快照。
     ///
     /// 【铁律】本类所有方法**只能在游戏主线程调用**（由 MainThreadDispatcher 保证）。
     ///
@@ -17,7 +17,13 @@ namespace AgentFarm.Bridge
     /// </summary>
     internal sealed class WorldObserver
     {
-        public const string WorldSchema = "agentfarm-world/1";
+        /// <summary>
+        /// 快照协议版本。
+        /// v1 → v2 的变更（详见 docs/03-桥接协议.md §5/§8）：新增 weatherOnFarm / isOutdoorFarm /
+        /// onScreenMenus / activeMenuText / dialogueResponses / dialogueIsQuestion / windowActive /
+        /// canMove / hasController / exec.uiOpened，删除误导性的 ui.dialogsOnScreen。
+        /// </summary>
+        public const string WorldSchema = "agentfarm-world/2";
 
         /// <summary>世界指纹单调递增计数器。</summary>
         private long _worldSeq;
@@ -174,27 +180,42 @@ namespace AgentFarm.Bridge
                 Season = Game1.currentSeason,
                 Day = Game1.dayOfMonth,
                 TimeOfDay = Game1.timeOfDay,
-                Weather = SafeWeather(),
+                Weather = DescribeWeather(Game1.currentLocation),
+                WeatherOnFarm = DescribeWeather(SafeFarm()),
             };
         }
 
-        /// <summary>
-        /// 天气。1.6.15 实测：`Game1.weather` **已不存在**（旧版是 int，中期版本改成 string，
-        /// 现在改由 world state 按地点分别记录）。这里从 `Game1.netWorldState` 取当前地点的天气字符串。
-        /// </summary>
-        private static string SafeWeather()
+        private static GameLocation SafeFarm()
         {
-            try
-            {
-                string loc = Game1.currentLocation?.Name;
-                if (loc == null) return "";
+            try { return Game1.getFarm(); } catch { return null; }
+        }
 
-                var table = Game1.netWorldState?.Value?.LocationWeather;
-                if (table != null && table.TryGetValue(loc, out StardewValley.Network.LocationWeather lw) && lw != null)
-                    return lw.weather?.Value ?? "";
-            }
-            catch { }
-            return "";
+        /// <summary>
+        /// 天气字符串（v2 起恒为明确取值，不再返回空串）。
+        ///
+        /// 【为什么不用 netWorldState.LocationWeather】
+        /// v1 走的是 <c>Game1.netWorldState.Value.LocationWeather[name].weather</c>，
+        /// 真机上恒为 ""（那套字段本机版本里是空的）。1.6.15 的权威判定是 Game1 上的
+        /// 四个 <c>IsXxxHere(GameLocation)</c> 方法（已由 tools/api-probe 编译期实证）。
+        ///
+        /// 【判定顺序与含义】顺序即优先级，先命中先返回：
+        ///   1. lightning —— 雷雨。它同时会让 IsRainingHere 为 true，所以必须排在 rain 前面，
+        ///                   否则雷暴会被误报成普通下雨；
+        ///   2. rain      —— 下雨（含雷雨，但已被上面截走）；
+        ///   3. snow      —— 下雪；
+        ///   4. debris    —— 大风（DebrisWeather，天上飘树叶/花瓣）；
+        ///   5. sunny     —— 以上都不成立（晴/多云归入此档）。
+        /// </summary>
+        private static string DescribeWeather(GameLocation loc)
+        {
+            if (loc == null) return "sunny";
+
+            try { if (Game1.IsLightningHere(loc)) return "lightning"; } catch { }
+            try { if (Game1.IsRainingHere(loc)) return "rain"; } catch { }
+            try { if (Game1.IsSnowingHere(loc)) return "snow"; } catch { }
+            try { if (Game1.IsDebrisWeatherHere(loc)) return "debris"; } catch { }
+
+            return "sunny";
         }
 
         private PlayerView ReadPlayer()
@@ -223,6 +244,8 @@ namespace AgentFarm.Bridge
                 Money = SafeInt(() => p.Money),
                 FarmingLevel = SafeInt(() => p.FarmingLevel),
                 InventoryCount = SafeInt(() => p.Items?.Count ?? 0),
+                CanMove = SafeBool(() => p.CanMove),
+                HasController = SafeBool(() => p.controller != null),
                 Tools = ReadTools(p),
             };
             return view;
@@ -255,7 +278,12 @@ namespace AgentFarm.Bridge
             var v = new LocationView
             {
                 Name = SafeString(() => loc.Name),
+
+                // isFarm 保留原语义（SMAPI 的 GameLocation.IsFarm：Farm 与 FarmHouse 都为 true），
+                // 但注释已写清陷阱；脑要“是否站在露天农场”请用 isOutdoorFarm。
                 IsFarm = SafeBool(() => loc.IsFarm),
+                IsOutdoorFarm = SafeBool(() => loc.Name == "Farm"),
+
                 IsFarmhouse = SafeBool(() => loc.Name == "FarmHouse"),
                 IsOutdoors = SafeBool(() => loc.IsOutdoors),
                 Characters = SafeInt(() => loc.characters?.Count ?? 0),
@@ -295,7 +323,14 @@ namespace AgentFarm.Bridge
             var v = new UiView();
             try { v.ActiveMenu = Game1.activeClickableMenu?.GetType().Name; } catch { }
             try { v.EventUp = Game1.eventUp; } catch { }
-            try { v.DialogsOnScreen = Game1.onScreenMenus?.Count ?? 0; } catch { }
+            try { v.OnScreenMenus = Game1.onScreenMenus?.Count ?? 0; } catch { }
+
+            // 模态里的文字 + 对话框选项：无人值守时脑必须读到这些内容才能决定
+            // “该关掉它 / 该回答它 / 该换计划”。实测床边睡觉确认框会让**整个世界时间冻结**，
+            // 而 v1 只给得出一个类名 "DialogueBox"，脑无从判断。
+            v.ActiveMenuText = UiRead.ActiveMenuText();
+            v.DialogueResponses = UiRead.DialogueResponseTexts();
+            v.DialogueIsQuestion = UiRead.DialogueIsQuestion();
 
             v.IsModal = v.ActiveMenu != null
                 || v.EventUp
