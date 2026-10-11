@@ -76,6 +76,17 @@ def day_key(row: dict[str, Any]) -> str:
     return "?"
 
 
+def _tile_count(stage: dict[str, Any]) -> int:
+    """阶段的目标格数：longrun 的 day_end.stages[].tiles 是格子列表。"""
+    tiles = stage.get("tiles")
+    if isinstance(tiles, (list, tuple)):
+        return len(tiles)
+    try:
+        return int(tiles or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def build_days(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     days: list[dict[str, Any]] = []
     cur: dict[str, Any] | None = None
@@ -106,6 +117,8 @@ def build_days(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             else:
                 cur["sleep_fail"] += 1
         elif ev == "stage":
+            # ⚠ legacy：longrun 目前不写 event=="stage"（只写 day_end.stages）。
+            # 这里只作历史账本的兜底；权威口径永远是 day_end.stages。
             cur["stages"].append(row)
         elif ev == "day_end":
             cur["ended_by"] = row.get("ended_by", "")
@@ -134,6 +147,16 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         name = d["key"]
         end_stats = d.get("end") or {}
         checks = d.get("checks") or {}
+        stage_recs = [s for s in (end_stats.get("stages") or []) if isinstance(s, dict)]
+        sum_failed = sum(int(s.get("failed") or 0) for s in stage_recs)
+        # leftover 只在"有目标的阶段"上算（Lead 对 task-15 的裁定：0 目标阶段不许拖黑当天）
+        leftover_targeted = sum(int(s.get("leftover") or 0) for s in stage_recs if _tile_count(s) > 0)
+        leftover_zero_target = sum(int(s.get("leftover") or 0) for s in stage_recs if _tile_count(s) <= 0)
+        legacy_failed = sum(int(s.get("failed") or 0) for s in d["stages"])
+
+        # 0. 字段缺失不得当成通过（deputy-lead 负例 A：day_end 整块省略 verified/checks）
+        if d["verified"] is None:
+            problems.append(f"[{name}] day_end 缺 verified 字段（缺失 ≠ 通过）")
         if d["ended_by"] != "sleep":
             problems.append(f"[{name}] ended_by={d['ended_by'] or '?'}（不是我们主动睡过去的）")
         else:
@@ -150,27 +173,43 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
                 problems.append(f"[{name}] checks.crops_watered=false（睡前还有没浇的作物）")
         if checks.get("no_hard_failures") is False:
             problems.append(f"[{name}] checks.no_hard_failures=false（当天有硬失败步骤）")
-        failed = end_stats.get("failed_steps")
-        if failed is None:
-            failed = sum(int(s.get("failed") or 0) for s in d["stages"])
-        if failed:
-            problems.append(f"[{name}] 当天 stages 硬失败 {failed} 格")
+        # 失败数一律以 day_end.stages 求和为准，并与 failed_steps 交叉核对（负例 B：只信自述）
+        failed_field = end_stats.get("failed_steps")
+        if failed_field is None:
+            failed_field = sum_failed or legacy_failed
+        elif sum_failed and int(failed_field) != sum_failed:
+            problems.append(
+                f"[{name}] 自述 failed_steps={failed_field} 与 day_end.stages 求和 {sum_failed} 不一致（账目不可信）"
+            )
+        if int(failed_field or 0):
+            problems.append(f"[{name}] 当天 stages 硬失败 {failed_field} 格")
         if d["verified"] is False:
             problems.append(f"[{name}] day_end verified=false")
         if d["sleep_fail"]:
             problems.append(f"[{name}] 当天有 {d['sleep_fail']} 次 sleep 失败（回执 ok=false）")
 
-        # 3b. 阶段后置条件（task-15 起 checks.no_unmet_stages；读不到就按 leftover 自算）
+        # 3b. 阶段后置条件：无论 checks.no_unmet_stages 在不在，都按 day_end.stages 自算并比对
         unmet = checks.get("no_unmet_stages")
-        if unmet is None:
-            stage_recs = (d.get("end") or {}).get("stages") or []
-            leftover = sum(
-                int(s.get("leftover") or 0) for s in stage_recs if isinstance(s, dict)
+        if unmet is not None and bool(unmet) != (leftover_targeted == 0):
+            problems.append(
+                f"[{name}] checks.no_unmet_stages={unmet} 与自算不一致"
+                f"（有目标阶段遗留 leftover={leftover_targeted} 格）"
             )
-            if leftover:
-                problems.append(f"[{name}] 当天有阶段遗留目标 leftover={leftover}（阶段没做完）")
-        elif unmet is False:
-            problems.append(f"[{name}] checks.no_unmet_stages=false（有阶段后置条件未成立）")
+        # 自述说"有阶段没做完"就一律算问题，**不因自算结果与它一致而放行**
+        # （deputy-lead 负例 D：checks.no_unmet_stages=false 与 stages.leftover=5 一致地没做完，
+        #   且 day_end.verified 自述 true ⇒ 旧口径零问题。工具的意义就是不信自述。）
+        if unmet is False:
+            problems.append(
+                f"[{name}] checks.no_unmet_stages=false（有阶段后置条件未成立"
+                f"；自算有目标阶段 leftover={leftover_targeted} 格）"
+            )
+        if unmet is None and leftover_targeted:
+            problems.append(f"[{name}] 当天有阶段遗留目标 leftover={leftover_targeted}（阶段没做完）")
+        if leftover_zero_target:
+            problems.append(
+                f"[{name}] 0 目标阶段 leftover={leftover_zero_target}"
+                "（task-15 修 A 后应为 0；请查 stage_no_target 分支）"
+            )
 
     # 3c. 异常事件（"人不在场也出过事"）
     for code, label in (
@@ -185,7 +224,7 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
 
     streak = 0
     for d in reversed(days):
-        if d["ended_by"] == "sleep" and d["cross_day"] and d["verified"] is not False:
+        if d["ended_by"] == "sleep" and d["cross_day"] and d["verified"] is True:
             streak += 1
         else:
             break
