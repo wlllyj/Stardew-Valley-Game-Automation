@@ -5,7 +5,7 @@
 
 ## 0. 一句话状态
 
-Mod **0.7.21** 装机中（游戏**未运行**、桥文件不存在）；单测 **188 OK**；`git status` 有 4 个 dev-coder 的 WIP 文件未提交（见 §4）；在跑的任务 = task-7（dev-coder）、task-10（log-analyst）；已交付的分析 = task-3（run1 行为）、task-6（睡觉根因）、task-9 复核（deputy-lead）；**今天最硬的结论 = 睡觉失败的机制已用 IL 定案**（`docs\_il-sleep-path.md`）。
+Mod **0.7.21** 装机中（游戏**未运行**、桥文件不存在、端口 17890 无监听、存档未被改写——machine-runner 独立复核过）；单测 **194 OK**（dev-coder 昨晚收工前跑出，188 → +6）；`git status` 有 dev-coder 的 5 个 WIP 文件未提交（见 §4）；任务：task-7（dev-coder，已停点、**代码在树里但未 bump/manifest 仍 0.7.21**）、task-10（log-analyst，收尾中）；已交付的分析 = task-3（run1 行为）、task-6（睡觉根因）、task-9 复核（deputy-lead，6 账本独立复跑 PASS）；**今天最硬的结论 = 睡觉失败的机制已用 IL 定案**（`docs\_il-sleep-path.md`）。goal 已 pause（rev3 / disarmed），你说"继续"就 resume。
 
 ## 1. 明天开工 30 分钟内要做的三件事
 
@@ -43,8 +43,16 @@ task-7 (Mod 0.7.22: 镰刀真挥 + Done() Grass 判据 + clear() 多刀)   ← d
 
 ## 4. 未提交的工作树（明天先看清再决定）
 
-`git status --short`（收工时）：**dev-coder 的 4 个 WIP 文件不要替它提交/回退**——`brain/agentfarm/bridge.py`、`brain/agentfarm/farmwork.py`、`mod/AgentFarm.Bridge/UseToolSkill.cs`、`tests/test_farmwork.py`（task-7/task-13 的在制改动，当时单测仍 188 OK）。
-Lead 自己的改动（`tools/verify-run3.py`、`docs/_il-sleep-path.md`、`docs/00-开发日志.md` 条目 028）与本条目已提交。
+`git status --short`（收工时）：**dev-coder 的在制文件不要替它提交/回退**——`mod/AgentFarm.Bridge/UseToolSkill.cs`、`brain/agentfarm/farmwork.py`、`brain/agentfarm/bridge.py`（仅 docstring）、`tests/test_farmwork.py`、`tests/test_longrun.py`；另有 `scratch/_farm_dump.py` 未跟踪（不是 dev-coder 的）。
+Lead 自己的改动（`tools/verify-run3.py`、`docs/_il-sleep-path.md`、`docs/_analyze-sleep-fail.md`、`docs/_review-task9.md`、`docs/00-开发日志.md` 条目 028、本条目、`scratch/_review_neg_gen.py`）已提交（`2ed2117`）。
+
+### 4a. dev-coder 的 task-7 停点报告（昨晚收工，原文要点）
+
+- **验证原文**：`py_compile exit=0`；`python -m unittest discover -s tests` → `Ran 194 tests in 2.342s` / `OK`；`dotnet build .\AgentFarm.Bridge.csproj -c Release --nologo` → `已成功生成。` / `0 个警告` / `0 个错误`（仅编译自检，**未 bump、未 deploy**）。
+- **改了什么**：①`UseToolSkill.Swing()` 不再调 `Game1.pressUseToolButton()`，改调新增 `BeginUse()` —— 照抄游戏近战门闸**之后**那段（`GetToolLocation(clickPx,false)` → `FacingDirection` → `lastClick=clickPx` → `p.BeginUsingTool()`；拿不到 player/工具或异常时回退 `pressUseToolButton()`）；②`Done()` 补 `if (tf is Grass) return false;`；③失败回执加"现在还是「<kind>」+ 起手=是/否"；④`farmwork.clear()` 挥到 `kind` 变化为止、上限 `MAX_CLEAR_SWINGS=4`，只有挥满上限或 Mod 回 `tool_ineffective`/`precondition_failed` 才 `proven_inert` 封格，`no_save`/`ui_modal` 记 `failed` 且**不封格**；⑤`_receipt_of()` 把 Mod reason 带进 journal。
+- **待裁定的偏差**：没有"伪造输入边沿"，改走 `BeginUsingTool()`。
+- **Lead 裁定（2026-10-11 收工）**：**批准走 `BeginUsingTool()`**。理由：`Farmer.BeginUsingTool()` 只 fire `beginUsingToolEvent`，订阅者 `Farmer.performBeginUsingTool()` 就是真正的起手（`CanMove=false; UsingTool=true; CurrentTool.beginUsing(...)`），镰刀同步进 `MeleeWeapon.setFarmerAnimating` → 同一次调用内 `DoDamage` —— 这是**游戏自己的入口**（与"用 `addItemToInventoryBool` 收货、用 `chargePlayer` 扣钱"同一原则）；伪造 `InputState._currentMouseState`/`Game1.oldMouseState` 会污染同帧所有读输入的系统，且挥动方向取决于人手鼠标位置，不可接受。**条件**：真机差分必须看到 `grass → 非 grass` + 回执"起手=是"；若真机证明割不动，再回头讨论"合成左键边沿"这条备选。
+- **明天给 dev-coder 的两条附加要求**：①非近战工具现在跳过 `fadeToBlack`/`nonWarpFade` 门卫（渐黑时可能白挥一次）⇒ 在 `BeginUse()` 里加一个便宜的门：`Game1.fadeToBlack`（或 `nonWarpFade`）为真时返回**可重试**状态而不是挥；②Mod 内部 `MaxSwings=6` 与脑侧 4 刀叠加，最坏 4 次请求 ⇒ 真机跑完要拿 journal 的"第 N 刀"轨迹确认没有空转。
 
 ## 5. 命令速查（全部在仓库根目录跑）
 
