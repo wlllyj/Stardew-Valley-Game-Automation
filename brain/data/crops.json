@@ -1,0 +1,477 @@
+{
+  "schema": "agentfarm-crops/1",
+  "source": "legacy crop_economics.json (WorkBuddy stardew-auto-farm)",
+  "crops": [
+    {
+      "season": "spring",
+      "id": "Parsnip",
+      "name": "防风草",
+      "seed_cost": 20,
+      "sell": 35,
+      "grow_days": 4,
+      "regrow": 0,
+      "yield_avg": 1.0,
+      "profit_per_day": 3.75,
+      "tier": "early"
+    },
+    {
+      "season": "spring",
+      "id": "Cauliflower",
+      "name": "花椰菜",
+      "seed_cost": 80,
+      "sell": 175,
+      "grow_days": 12,
+      "regrow": 0,
+      "yield_avg": 1.0,
+      "profit_per_day": 7.92,
+      "tier": "early"
+    },
+    {
+      "season": "spring",
+      "id": "Potato",
+      "name": "土豆",
+      "seed_cost": 50,
+      "sell": 80,
+      "grow_days": 6,
+      "regrow": 0,
+      "yield_avg": 1.25,
+      "profit_per_day": 8.33,
+      "tier": "early",
+      "note": "25% 概率额外产出，期望 1.25"
+    },
+    {
+      "season": "spring",
+      "id": "GreenBean",
+      "name": "四季豆",
+      "seed_cost": 60,
+      "sell": 40,
+      "grow_days": 10,
+      "regrow": 3,
+      "yield_avg": 1.0,
+      "profit_per_day": 7.86,
+      "tier": "mid",
+      "note": "多次收获，全季28天收7轮"
+    },
+    {
+      "season": "spring",
+      "id": "Strawberry",
+      "name": "草莓",
+      "seed_cost": 100,
+      "sell": 120,
+      "grow_days": 8,
+      "regrow": 4,
+      "yield_avg": 1.0,
+      "profit_per_day": 22.14,
+      "tier": "best",
+      "note": "仅春季13日彩蛋节购买种子。13日种下全季可收6轮，周期收益 620g"
+    },
+    {
+      "season": "spring",
+      "id": "Kale",
+      "name": "羽衣甘蓝",
+      "seed_cost": 70,
+      "sell": 110,
+      "grow_days": 6,
+      "regrow": 0,
+      "yield_avg": 1.0,
+      "profit_per_day": 6.67,
+      "tier": "mid"
+    },
+    {
+      "season": "spring",
+      "id": "Rhubarb",
+      "name": "大黄",
+      "seed_cost": 100,
+      "sell": 220,
+      "grow_days": 13,
+      "regrow": 0,
+      "yield_avg": 1.0,
+      "profit_per_day": 9.23,
+      "tier": "mid",
+      "note": "沙漠绿洲购买种子"
+    },
+    {
+      "season": "summer",
+      "id": "Blueberry",
+      "name": "蓝莓",
+      "seed_cost": 80,
+      "sell": 50,
+      "grow_days": 13,
+      "regrow": 4,
+      "yield_avg": 3.0,
+      "profit_per_day": 18.57,
+      "tier": "best",
+      "note": "每株每次收 3 个，全季收 4 轮 = 600，投入 80"
+    },
+    {
+      "season": "summer",
+      "id": "Melon",
+      "name": "甜瓜",
+      "seed_cost": 80,
+      "sell": 250,
+      "grow_days": 12,
+      "regrow": 0,
+      "yield_avg": 1.0,
+      "profit_per_day": 14.17,
+      "tier": "mid"
+    },
+    {
+      "season": "summer",
+      "id": "Hops",
+      "name": "啤酒花",
+      "seed_cost": 60,
+      "sell": 25,
+      "grow_days": 11,
+      "regrow": 1,
+      "yield_avg": 1.0,
+      "profit_per_day": 13.93,
+      "tier": "mid",
+      "note": "每日可收，全季收18轮。加工成淡啤酒价值300，是夏日现金牛"
+    },
+    {
+      "season": "summer",
+      "id": "Starfruit",
+      "name": "杨桃",
+      "seed_cost": 400,
+      "sell": 750,
+      "grow_days": 13,
+      "regrow": 0,
+      "yield_avg": 1.0,
+      "profit_per_day": 26.92,
+      "tier": "best",
+      "note": "沙漠绿洲购买种子。单价利润最高，加工成杨桃酒价值 2250"
+    },
+    {
+      "season": "summer",
+      "id": "HotPepper",
+      "name": "辣椒",
+      "seed_cost": 40,
+      "sell": 40,
+      "grow_days": 5,
+      "regrow": 3,
+      "yield_avg": 1.0,
+      "profit_per_day": 10.0,
+      "tier": "early"
+    },
+    {
+      "season": "summer",
+      "id": "Tomato",
+      "name": "番茄",
+      "seed_cost": 50,
+      "sell": 60,
+      "grow_days": 11,
+      "regrow": 4,
+      "yield_avg": 1.0,
+      "profit_per_day": 8.93,
+      "tier": "early"
+    },
+    {
+      "season": "fall",
+      "id": "Cranberry",
+      "name": "蔓越莓",
+      "seed_cost": 240,
+      "sell": 75,
+      "grow_days": 7,
+      "regrow": 5,
+      "yield_avg": 2.0,
+      "profit_per_day": 18.21,
+      "tier": "best",
+      "note": "每株每次收 2 个，全季收 5 轮 = 750，投入 240。秋季性价比之王，天然适合自动化"
+    },
+    {
+      "season": "fall",
+      "id": "Pumpkin",
+      "name": "南瓜",
+      "seed_cost": 100,
+      "sell": 320,
+      "grow_days": 13,
+      "regrow": 0,
+      "yield_avg": 1.0,
+      "profit_per_day": 16.92,
+      "tier": "mid"
+    },
+    {
+      "season": "fall",
+      "id": "Grape",
+      "name": "葡萄",
+      "seed_cost": 60,
+      "sell": 80,
+      "grow_days": 10,
+      "regrow": 3,
+      "yield_avg": 1.0,
+      "profit_per_day": 17.86,
+      "tier": "mid",
+      "note": "多次收获，全季收7轮。加工成葡萄酒/果酱收益翻倍"
+    },
+    {
+      "season": "fall",
+      "id": "SweetGemBerry",
+      "name": "甜蜜宝石莓",
+      "seed_cost": 1000,
+      "sell": 3000,
+      "grow_days": 24,
+      "regrow": 0,
+      "yield_avg": 1.0,
+      "profit_per_day": 83.33,
+      "tier": "best",
+      "note": "旅行商人随机出售稀有种子。单日利润全游戏最高"
+    },
+    {
+      "season": "fall",
+      "id": "BokChoy",
+      "name": "小白菜",
+      "seed_cost": 50,
+      "sell": 80,
+      "grow_days": 4,
+      "regrow": 0,
+      "yield_avg": 1.0,
+      "profit_per_day": 7.5,
+      "tier": "early"
+    },
+    {
+      "season": "fall",
+      "id": "Amaranth",
+      "name": "苋菜",
+      "seed_cost": 70,
+      "sell": 150,
+      "grow_days": 7,
+      "regrow": 0,
+      "yield_avg": 1.0,
+      "profit_per_day": 11.43,
+      "tier": "mid"
+    }
+  ],
+  "meta": {
+    "version": "1.6",
+    "currency": "g",
+    "season_days": 28
+  },
+  "comment": "星露谷物语作物经济数据库。profit_per_day = (售价 - 种子成本) / 生长天数，不考虑加工与肥料。多收作物按期望产出折算。数据基于 1.6 版本，不随时间衰败的作物按 1 季 28 天计算。",
+  "season_strategy": {
+    "spring": {
+      "best_crop": "Strawberry",
+      "strategy": "春季前 12 天种土豆/防风草快速回本并升级工具；13 日彩蛋节把所有钱换成草莓种子，立刻种下。草莓是春季绝对最优，且可留作温室与次年种子。"
+    },
+    "summer": {
+      "best_crop": "Starfruit",
+      "strategy": "前期无沙漠通道时，蓝莓是纯粹性价比之王（低成本、多收、易自动化）。解锁沙漠后，大量杨桃 + 酿酒桶是夏季与温室的最强组合。啤酒花适合啤酒桶流水线。"
+    },
+    "fall": {
+      "best_crop": "Cranberry",
+      "strategy": "蔓越莓是秋季最优解——高利润、多收、一次种下收整季，完美适配自动收获。南瓜做巨型作物（3x3 概率）。若旅行商人出稀有种子，优先买下种在温室。"
+    },
+    "winter": {
+      "best_crop": null,
+      "strategy": "冬季无法户外种植。核心任务转向：①下矿刷矿（铱矿/火山锻炉升级工具）；②温室与姜岛农场全力运转；③社区中心献祭补齐；④钓鱼升级；⑤建造更多酿酒桶/罐头瓶产线。冬季是设施建设期，不是收入期。"
+    }
+  },
+  "processing_chain": {
+    "_comment": "加工链价值表。raw=作物原价, processed=加工品价值, multiplier=增值倍数",
+    "keg_wine": [
+      {
+        "crop": "Starfruit",
+        "raw": 750,
+        "processed": 2250,
+        "multiplier": 3.0
+      },
+      {
+        "crop": "Pumpkin",
+        "raw": 320,
+        "processed": 960,
+        "multiplier": 3.0
+      },
+      {
+        "crop": "Melon",
+        "raw": 250,
+        "processed": 750,
+        "multiplier": 3.0
+      },
+      {
+        "crop": "Rhubarb",
+        "raw": 220,
+        "processed": 660,
+        "multiplier": 3.0
+      },
+      {
+        "crop": "Grape",
+        "raw": 80,
+        "processed": 240,
+        "multiplier": 3.0
+      },
+      {
+        "crop": "Cranberry",
+        "raw": 75,
+        "processed": 225,
+        "multiplier": 3.0
+      },
+      {
+        "crop": "Blueberry",
+        "raw": 50,
+        "processed": 150,
+        "multiplier": 3.0
+      },
+      {
+        "crop": "Hops",
+        "raw": 25,
+        "processed": 300,
+        "multiplier": 12.0,
+        "note": "啤酒花→淡啤酒，倍数最高"
+      }
+    ],
+    "preserves_jar": [
+      {
+        "crop": "Starfruit",
+        "raw": 750,
+        "processed": 1050,
+        "multiplier": 1.4
+      },
+      {
+        "crop": "Pumpkin",
+        "raw": 320,
+        "processed": 690,
+        "multiplier": 2.16
+      },
+      {
+        "crop": "Cranberry",
+        "raw": 75,
+        "processed": 250,
+        "multiplier": 3.33,
+        "note": "罐头瓶对低价作物性价比极高"
+      },
+      {
+        "crop": "Blueberry",
+        "raw": 50,
+        "processed": 200,
+        "multiplier": 4.0
+      },
+      {
+        "crop": "HotPepper",
+        "raw": 40,
+        "processed": 160,
+        "multiplier": 4.0
+      }
+    ],
+    "general_rule": "高价作物（>200g）走酿酒桶；低价多收作物（<100g）走罐头瓶。酿酒桶耗时 7 天，罐头瓶耗时 2-3 天。"
+  },
+  "community_center_priority": {
+    "_comment": "社区中心献祭优先级，按解锁收益排序。综合效率最优路线的核心。",
+    "tier_S": [
+      {
+        "bundle": "Crafts Room 工艺室",
+        "unlocks": "修复桥梁→解锁采石场与矿洞捷径",
+        "why": "最早可完成，奖励春季种子"
+      },
+      {
+        "bundle": "Pantry 储藏室",
+        "unlocks": "修复温室",
+        "why": "温室=全年无休种植，效率飞跃。全游戏最高优先级"
+      }
+    ],
+    "tier_A": [
+      {
+        "bundle": "Fish Tank 鱼缸",
+        "unlocks": "修复矿车（快速传送）",
+        "why": "大幅节省通勤时间"
+      },
+      {
+        "bundle": "Boiler Room 锅炉房",
+        "unlocks": "修复巴士→解锁沙漠",
+        "why": "沙漠=杨桃种子+绿洲商店，夏季经济核心"
+      }
+    ],
+    "tier_B": [
+      {
+        "bundle": "Bulletin Board 公告板",
+        "unlocks": "修复桥梁至沙漠区",
+        "why": "NPC 好感度换取"
+      },
+      {
+        "bundle": "Vault 金库",
+        "unlocks": "修复公共汽车（花钱）",
+        "why": "用钱解决，后期轻松"
+      }
+    ],
+    "key_items": [
+      {
+        "item": "春季作物 ×4",
+        "source": "防风草/青豆/花椰菜/土豆",
+        "season": "spring"
+      },
+      {
+        "item": "夏季作物 ×4",
+        "source": "番茄/辣椒/蓝莓/甜瓜",
+        "season": "summer"
+      },
+      {
+        "item": "秋季作物 ×4",
+        "source": "玉米/茄子/南瓜/山药",
+        "season": "fall"
+      },
+      {
+        "item": "高品质作物 ×3",
+        "source": "金星防风草/甜瓜/南瓜",
+        "season": "spring/summer/fall"
+      },
+      {
+        "item": "动物产品 ×5",
+        "source": "大鸡蛋/大牛奶/羊毛/鸭蛋",
+        "season": "any"
+      }
+    ]
+  },
+  "year_roadmap": {
+    "_comment": "三年综合效率最优路线图",
+    "year_1": {
+      "spring": "第1-12天：种防风草+土豆回本，砍树攒木材，钓鱼赚钱。第13天彩蛋节：全部资金买草莓种子并立刻种下（8天成熟后可收3次）。同步升级锄头与水壶。",
+      "summer": "蓝莓铺满农场（低成本高回报），建 20+ 罐头瓶做蓝莓果酱。推进社区中心工艺室+储藏室。攒钱买鸡舍。",
+      "fall": "蔓越莓全覆盖。全力推进社区中心，目标拿下温室。建造第一批酿酒桶。开始送礼给 NPC（重点：村长、木匠）。",
+      "winter": "温室到手则种杨桃。下矿刷矿升级工具至铱级。建造大量酿酒桶。完成剩余献祭。备耕来年。"
+    },
+    "year_2": {
+      "spring": "温室种杨桃+草莓。户外种草莓。酿酒桶规模上到 100+。优先完成社区中心剩余部分。",
+      "summer": "解锁沙漠后大量种杨桃（户外8x8区域+温室）。杨桃酒流水线满负荷。",
+      "fall": "蔓越莓 + 南瓜。追求巨型作物。完成社区中心，修复公共汽车。",
+      "winter": "全力下矿（骷髅洞窟 + 火山地牢）。升级至铱工具。扩建动物棚。"
+    },
+    "year_3": {
+      "focus": "姜岛开发。金核桃收集、姜岛农场（可全年种植）。自动化全覆盖（洒水器+自动抓取器+垃圾箱）。此时农场应已完全自维持，挂机即可产出。",
+      "target": "农场实现零人工干预满负荷运转，日收入 5 位数。"
+    }
+  },
+  "automation_target": {
+    "_comment": "挂机农场的最终目标形态",
+    "required_mods": [
+      {
+        "name": "Automate",
+        "nexus_id": "Nexus:1063",
+        "role": "箱子连接机器与作物，自动收获/加工/收集"
+      },
+      {
+        "name": "Tractor Mod",
+        "nexus_id": "Nexus:1401",
+        "role": "拖拉机批量耕地/播种/收割，大幅减少操作量"
+      },
+      {
+        "name": "Chests Anywhere",
+        "nexus_id": "Nexus:518",
+        "role": "远程访问所有箱子，无需跑动"
+      },
+      {
+        "name": "Auto-Grabber",
+        "nexus_id": "vanilla",
+        "role": "自动收集动物产品（游戏内置）"
+      },
+      {
+        "name": "Sprinklers",
+        "nexus_id": "vanilla",
+        "role": "自动浇水（游戏内置，优先铱洒水器）"
+      },
+      {
+        "name": "AutoFarmPlanner",
+        "nexus_id": "local",
+        "role": "本方案：策略大脑，给出每日行动建议"
+      }
+    ],
+    "layout_principle": "农场按 '压缩式' 布局——作物区紧邻箱子与加工机器，洒水器全覆盖，自动抓取器覆盖所有畜棚。减少任何需要玩家跑动的环节。"
+  }
+}

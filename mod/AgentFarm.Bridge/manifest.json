@@ -1,0 +1,10 @@
+{
+  "Name": "AgentFarm Bridge",
+  "Author": "AgentFarm",
+  "Version": "0.1.0",
+  "Description": "AgentFarm 自动化项目的桥接 Mod：在 127.0.0.1 上暴露极简 HTTP/JSON 接口，供外部“脑”读取世界快照与下发技能（里程碑 A：observe + move_to）。",
+  "UniqueID": "AgentFarm.Bridge",
+  "EntryDll": "AgentFarm.Bridge.dll",
+  "MinimumApiVersion": "4.0.0",
+  "UpdateKeys": []
+}

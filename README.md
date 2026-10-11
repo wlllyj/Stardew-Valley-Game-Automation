@@ -8,18 +8,12 @@
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| **P1** | **架构设计** | ✅ **已完成** —— 架构 [v1.0 已冻结](docs/01-架构设计.md)，8 项决策全部拍板 |
-| P2 | 跑通基本操作（连得上、看得见、动得了、能走出屋） | ⏸ **暂缓** —— 等用户审阅架构文档；施工顺序见 [开发日志条目 005](docs/00-开发日志.md) |
+| **P1** | **架构设计** | ✅ 已完成 —— [架构 v1.0 已冻结](docs/01-架构设计.md)，8 项决策全部拍板 |
+| **P2** | **跑通基本操作**（连得上 / 看得见 / 动得了 / 能走出屋） | 🟡 **进行中** —— 协议与 Python 脑骨架已通；C# 桥 Mod 编写中 |
 | P3 | 端到端：农场清障 + 开垦 + 种田，无人介入跑通 | ⬜ 未开始 |
 | P4+ | 温室/社区中心/采矿/钓鱼/畜牧/社交等能力扩展 | ⬜ 未开始 |
 
-**已定决策**：脑 = 独立 Python 守护进程（不依赖 GUI）｜通信 = 本地 HTTP RPC + WS 事件｜**全程只做合法游戏操作，不做瞬移/改状态**｜测试用现有 Wahaha 存档（运行前自动备份）｜评测口径照抄 StarDojo YAML｜TractorMod 在 P3 基准测试前关闭｜**新建干净仓库，只搬已审计确认的资产**。
-
-**环境已就绪**：旧规划器守护进程（PID 9268）已停止；6 个旧 `AutoFarm*` mod 已移出 `Mods\`（归档于 `Mods.disabled-旧AutoFarm-20261011\`，可逆）。
-
-**最近更新**：2026-10-11 —— 完成环境实测、旧项目盘点、外部同类项目调研，架构 v0.92 草案成形。详见 [开发日志](docs/00-开发日志.md)。
-
-> **可行性已获外部印证**：开源项目 [stardew-together](https://github.com/Zsh123456-BOOP/stardew-together) 在**与本机完全相同的版本组合**（Stardew 1.6.15 / SMAPI 4.5.2 / .NET 6）上，**153 小时无人值守跑完全部成就**（1.7451 亿 token ≈ ¥213）。该仓库无 LICENSE，我们只借鉴其设计。
+**最近更新**：2026-10-11 —— 启动 P2；桥接协议定稿；Python 脑骨架 + 假 Mod + 11 个单元测试全过；大模型通路接通并实测开销。详见 [开发日志](docs/00-开发日志.md)。
 
 ---
 
@@ -29,7 +23,40 @@
 - **LLM 只出任务意图，不出坐标动作清单**——坐标与动作由技能层按**当下**世界状态计算（旧方案正是死在这里）。
 - **闭合反馈环**：每个动作都有前置校验、后置校验、机器可读的失败原因；失败必须回流到决策层与经验库。
 - **进度契约**：任务在预算内无状态改善 → 强制改变行为（重试→换路→换目标→上报），禁止空转。
+- **只信游戏证据**：任务只有 `VERIFIED`（游戏状态差分证实）与 `needs_review` 两种终态，后者不许冒充完成。
 - 详见 [架构设计](docs/01-架构设计.md)。
+
+---
+
+## 快速上手
+
+```bat
+rem 医生检查：能不能连上 Mod、看到什么、版本对不对（需要游戏已启动并加载存档）
+tools\agentfarm.cmd doctor
+
+rem 打印一行世界摘要
+tools\agentfarm.cmd observe
+
+rem 让角色走到指定格（真实移动）
+tools\agentfarm.cmd move 64 15
+
+rem 每 2 秒打印一次世界摘要（真机测试时的"眼睛"）
+tools\agentfarm.cmd watch
+
+rem 检查大模型通路（不会打印密钥）
+tools\agentfarm.cmd llm-check
+
+rem 跑单元测试（不需要游戏）
+python -m unittest discover -s tests -v
+```
+
+**没有游戏也能开发**：先起一个假 Mod，再用 `AGENTFARM_BRIDGE_JSON` 把脑指过去。
+
+```bat
+python tools\fake_bridge.py --port 17899 --out brain\run\fake-bridge.json
+set AGENTFARM_BRIDGE_JSON=%CD%\brain\run\fake-bridge.json
+tools\agentfarm.cmd doctor
+```
 
 ---
 
@@ -38,30 +65,39 @@
 | 文档 | 内容 |
 |---|---|
 | [00 · 开发日志](docs/00-开发日志.md) | **持续追加**的开发过程记录（最新在最上），含规则与模板 |
-| [01 · 架构设计](docs/01-架构设计.md) | 分层架构、协议草案、技能清单、路线图、验收标准、风险登记 |
-| [02 · 环境实测快照](docs/02-环境实测快照.md) | 本机游戏/SMAPI/.NET/Python 版本、Mod 清单、遗留进程 |
-| [_legacy-audit](docs/_legacy-audit.md) | 旧 `stardew-auto-farm` 项目全量盘点（协议/执行层/根因/可复用资产） |
-| [_external-research](docs/_external-research.md) | 外部同类项目与学术工作调研（agent-stardew / stardew-mcp / StarDojo 等） |
+| [01 · 架构设计](docs/01-架构设计.md) | 分层架构、七层契约、地点拓扑、veto 原因码、验收标准、风险登记 |
+| [02 · 环境实测快照](docs/02-环境实测快照.md) | 游戏/SMAPI/.NET/Python 版本、Mod 清单、遗留进程处置 |
+| [03 · 桥接协议](docs/03-桥接协议.md) | **Mod ↔ 脑的唯一契约**：传输、服务发现、health/observe/exec、状态码 |
+| [04 · 配置与密钥](docs/04-配置与密钥.md) | 密钥约定、环境变量、模型选型、实测开销、环境陷阱 |
+| [knowledge/](docs/knowledge/INDEX.md) | 旧项目已验证的 API 知识（带可信度标注）、设计模式、失败教训 |
+| [_legacy-audit](docs/_legacy-audit.md) | 旧 `stardew-auto-farm` 全量盘点（协议/执行层/根因/可复用资产） |
+| [_external-research](docs/_external-research.md) | 外部同类项目与学术调研（stardew-together / StarDojo / SPIKE 等） |
 
 ---
 
 ## 本机事实基线（关键几条）
 
 - 游戏 **Stardew Valley 1.6.15** + **SMAPI 4.5.2**，位于 `D:\Program Files (x86)\Steam\steamapps\common\Stardew Valley`
-- 已装 .NET SDK 6.0.136 / 6.0.428；DSH 自带 Python 3.12 与 Node 22；**系统无 git、裸 `python` 是商店占位符**
-- 存在**前期成果**：`C:\Users\admin\WorkBuddy\2026-10-04-20-36-38\stardew-auto-farm`（6 个 SMAPI mod + LLM 规划器），当前**停摆**（39/39 动作被静默跳过）
-- ⚠️ 该旧方案的 AI 规划器守护进程**仍在运行**（PID 9268），游戏启动后会与新系统抢控制权 → 建议先停止
+- **Git 2.55.0** 已安装，仓库已初始化（分支 `main`）
+- .NET SDK 6.0.136 / 6.0.428；DSH 自带 Python 3.12（裸 `python` 是 Microsoft Store 占位符，**不要直接用**）
+- **慢脑**：DeepSeek `deepseek-flash`（推理模型）。实测一次真实规划 **41.4 秒 / 7123 token**
+- 旧方案的守护进程已停止、6 个旧 `AutoFarm*` mod 已移出 `Mods\`（归档于 `Mods.disabled-旧AutoFarm-20261011\`）
 
 ---
 
-## 目录约定（规划）
+## 目录结构
 
 ```
 星露谷游戏自动化/
-├─ README.md            ← 本文件
-├─ docs/                ← 文档与知识资产
-├─ mod/                 ← 体：C# / SMAPI Mod（感知 + 动作原语 + 本地 RPC）
-├─ brain/               ← 脑：Python（世界模型 / 任务 / 决策 / 记忆 / 慢脑）
-├─ tools/               ← 诊断与回放脚本
-└─ tests/               ← 单元测试 / mock 世界 / 场景用例
+├─ README.md
+├─ docs/                 文档与知识资产（00~04 + knowledge/ + 两份调研）
+├─ mod/                  体：C# / SMAPI Mod（感知 + 动作原语 + 本地 RPC）
+│  └─ AgentFarm.Bridge/
+├─ brain/                脑：Python
+│  ├─ agentfarm/         bridge.py（桥客户端） / llm.py（大模型） / __main__.py（CLI）
+│  ├─ data/              静态知识（crops.json 等）
+│  └─ run/               运行态（不进版本库）
+├─ tools/                诊断与运维（agentfarm.cmd / fake_bridge.py / analyze_log.py / parse_save.py / il-probe）
+├─ tests/                单元测试（不需要游戏）
+└─ secrets/              密钥（**不进版本库**）
 ```

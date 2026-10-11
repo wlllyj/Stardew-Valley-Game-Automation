@@ -1,0 +1,75 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    AgentFarm.Bridge —— 《星露谷》自动化项目的“桥接 Mod”（里程碑 A：看得见 + 走得动）
+
+    设计要点
+      * 目标框架 net6.0，与 Stardew Valley 1.6.15 / SMAPI 4.5.2 完全一致。
+      * **不引入任何 NuGet 包**：直接引用游戏目录下的 DLL（SMAPI mod 的标准做法）。
+      * 默认游戏目录可用环境变量 STARDEW_GAME_PATH 覆盖（无人值守部署时用得上）。
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <AssemblyName>AgentFarm.Bridge</AssemblyName>
+    <RootNamespace>AgentFarm.Bridge</RootNamespace>
+    <LangVersion>10.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <!-- 游戏 DLL 是 1.6.15 定版，MSBuild 版本校验没有意义反而会误报 -->
+    <NoWarn>$(NoWarn);MSB3270</NoWarn>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <DebugType>none</DebugType>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <EnableDefaultNoneItems>false</EnableDefaultNoneItems>
+  </PropertyGroup>
+
+  <!-- 游戏目录：环境变量优先，否则用本机实测路径 -->
+  <PropertyGroup Condition="'$(STARDEW_GAME_PATH)' != ''">
+    <GamePath>$(STARDEW_GAME_PATH)</GamePath>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(GamePath)' == ''">
+    <GamePath>D:\Program Files (x86)\Steam\steamapps\common\Stardew Valley</GamePath>
+  </PropertyGroup>
+
+  <Target Name="CheckGamePath" BeforeTargets="BeforeBuild">
+    <Error Condition="!Exists('$(GamePath)\Stardew Valley.dll')"
+           Text="找不到游戏程序集：'$(GamePath)\Stardew Valley.dll'。请设置环境变量 STARDEW_GAME_PATH 指向《星露谷》安装目录。" />
+  </Target>
+
+  <ItemGroup>
+    <!-- 注意：1.6.15 的游戏主程序集文件名里带空格（Stardew Valley.dll），不是 StardewValley.dll -->
+    <Reference Include="Stardew Valley">
+      <HintPath>$(GamePath)\Stardew Valley.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="StardewModdingAPI">
+      <HintPath>$(GamePath)\StardewModdingAPI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="StardewValley.GameData">
+      <HintPath>$(GamePath)\StardewValley.GameData.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MonoGame.Framework">
+      <HintPath>$(GamePath)\MonoGame.Framework.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="xTile">
+      <HintPath>$(GamePath)\xTile.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="System.Text.Json">
+      <HintPath>$(GamePath)\System.Text.Json.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="manifest.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>
