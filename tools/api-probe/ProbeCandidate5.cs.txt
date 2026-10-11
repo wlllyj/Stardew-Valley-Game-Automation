@@ -1,0 +1,60 @@
+using System;
+using System.Collections.Generic;
+using Microsoft.Xna.Framework;
+using StardewModdingAPI;
+using StardewValley;
+using StardewValley.Objects;
+using StardewValley.TerrainFeatures;
+
+namespace ApiProbe
+{
+    /// <summary>
+    /// 第五轮探针：**修复迭代 4 要用的每一个成员，逐条编译期钉死**。
+    ///
+    /// 前四轮的教训：StardewModdingAPI.xml 与 DLL 不一致、`Furniture.getBoundingBox()`
+    /// 不存在（CS1061）、`isPassable()` 必须当方法调用（当属性写会 CS0428）。
+    /// 所以本轮不靠记忆、不靠 XML，先用编译器把签名问清楚，再动桥 Mod 的代码。
+    /// </summary>
+    public static class ProbeCandidate5
+    {
+        // ================= A. 家具："能不能踩"到底怎么问 =================
+        public static bool A_IsPassable(Furniture f) => f.isPassable();
+        public static bool A_IsGroundFurnitureMethod(Furniture f) => f.isGroundFurniture();
+        public static bool A_IsBed(Furniture f) => f is BedFurniture;
+        public static Rectangle A_GetBoundingBox(Furniture f) => f.GetBoundingBox();
+        public static Vector2 A_TileLocation(Furniture f) => f.TileLocation;
+        public static int A_FurnitureTypeValue(Furniture f) => f.furniture_type.Value;
+
+        // 诊断清单要用的可读名字：Furniture 继承 Item，DisplayName 应当可用
+        public static string A_DisplayName(Furniture f) => f.DisplayName;
+        public static string A_Name(Furniture f) => f.Name;
+        public static string A_QualifiedItemId(Furniture f) => f.QualifiedItemId;
+        public static string A_ItemId(Furniture f) => f.ItemId;
+
+        // ================= B. 家具集合怎么遍历（1.6.x NetCollection）=================
+        public static IEnumerable<Furniture> B_FurnitureField(GameLocation loc) => loc.furniture;
+        // Pairs 形式（objects / terrainFeatures 是这么用的）——确认 furniture 是否也有
+        public static int B_FurniturePairsCount(GameLocation loc) => loc.furniture.Pairs.Count;
+
+        // ================= C. 地点级"这格通不通"（父代理给的实证签名）=================
+        // 注意：真实签名是 (xTile.Dimensions.Location, xTile.Dimensions.Rectangle)
+        public static bool C_IsTilePassable(
+            GameLocation loc, xTile.Dimensions.Location tile, xTile.Dimensions.Rectangle viewport)
+            => loc.isTilePassable(tile, viewport);
+
+        public static string C_DoesTileHaveProperty(GameLocation loc, int x, int y)
+            => loc.doesTileHaveProperty(x, y, "Passable", "Back");
+
+        // ================= D. 地图尺寸的正确读法（Map.DisplayWidth 会抛异常）=================
+        public static int D_LayersCount(GameLocation loc) => loc.map?.Layers?.Count ?? 0;
+        public static int D_LayerWidth(GameLocation loc) => loc.map?.Layers?[0]?.LayerWidth ?? 0;
+        public static int D_LayerHeight(GameLocation loc) => loc.map?.Layers?[0]?.LayerHeight ?? 0;
+
+        // ================= E. 地形特征:Grass 到底能不能踩 =================
+        public static bool E_IsGrass(TerrainFeature tf) => tf is Grass;
+        public static bool E_IsTree(TerrainFeature tf) => tf is Tree;
+        public static bool E_IsBush(TerrainFeature tf) => tf is Bush;
+        public static bool E_IsResourceClump(TerrainFeature tf) => tf is ResourceClump;
+        public static bool E_IsFruitTree(TerrainFeature tf) => tf is FruitTree;
+    }
+}

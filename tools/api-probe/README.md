@@ -19,6 +19,10 @@ cd /d "D:\Deepseek Harness Workspace\星露谷游戏自动化\tools\api-probe"
 dotnet build -c Release
 ```
 
+> **探针工程必须保持可编译**：每一轮问完问题后，把**已证伪**的候选改成注释留档（写上 CS 错误码），
+> 把结论补进本文的表格。历史轮次留了两个反面教材（**已改名成 `.cs.txt` 以免参与编译**）：
+> `ProbeCandidate4.cs.txt` / `ProbeCandidate5.cs.txt`（第 4/5 轮家具判定探针，14 个编译错误）。
+
 3. 读编译输出：
 
 | 编译结果 | 含义 |
@@ -44,6 +48,15 @@ dotnet build -c Release
 | `Constants.ApiVersion` **存在**（返回 `ISemanticVersion`） | 需要 `SMAPI.Toolkit.CoreInterfaces` 引用 |
 | `Game1.weather` **不存在**（1.6.15 已移除） | CS0117；改用 `Game1.netWorldState.Value.LocationWeather` |
 | `Game1.version` 可用，返回 `"1.6.15"` | 编译通过 |
+| `PathFindController.reachedDestination` / `.paused` / `.timerToMove` **不存在** | CS1061（第 6 轮） |
+| `Farmer.Halt()` / `movementDirections`（`List<int>`，有 `Clear()`）/ `isMoving()` / `controller` / `pathToEndPoint` / `endBehaviorFunction` **都存在** | 编译通过（第 6 轮）；IL 语义见 `docs\_il-farmer-halt.md` |
+| `SaveGame.Load(String)` **存在且返回 `void`** | CS0029（把它当 `IEnumerator<int>` 返回时报错）；IL 见 `docs\_il-savegame-load.md` |
+| `Game1.gameMode`（可写 `int`）/ `Game1.currentLoader` / `Game1.hasLoadedGame` / `Constants.SavesPath` / `Game1.GetSaveGameName()` / `Game1.uniqueIDForThisGame` **都存在** | 编译通过（第 7 轮） |
+| `Game1.locationRequest` **存在**（判"正在传送"用） | 编译通过（第 9 轮） |
+| `GameLocation.getWarpFromDoor(Point, Character)` / `isCollidingWithDoors(Rectangle, Character)` **可调用** | 编译通过（第 9 轮） |
+| `SaveGame.GetSaveGames()` / `Game1.loadingMultiplePlayers` / `Context.IsSaveLoaded` / `Game1.ExitToTitleScreen` **不存在** | CS0117（第 7 轮） |
+| `SaveGame.GetSavesFolder()` / `Program.savesFolder` **在 Mod 侧不可访问** | CS0117（第 8 轮）⇒ 改用 `Constants.SavesPath` + 游戏自己的存在性判据复核 |
+| `GameLocation.doors` **可读**，但 `loc.doors.Count` 不行（`Count` 是方法组） | CS0428（第 9 轮）⇒ 需要遍历时用 `foreach` |
 
 > 与 `tools/il-probe/`（Probe26，IL 反汇编）的分工：
 > **本工具回答"能不能编译"**（存在性与签名），**IL 探针回答"内部怎么实现"**（私有字段、字段名、运行时结构）。

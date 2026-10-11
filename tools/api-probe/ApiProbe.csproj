@@ -26,8 +26,15 @@
     <Nullable>disable</Nullable>
     <AssemblyName>ApiProbe</AssemblyName>
     <RootNamespace>ApiProbe</RootNamespace>
-    <!-- 探针只求编译通过，不产出可用程序 -->
-    <OutputType>Library</OutputType>
+    <!--
+      第 18 轮起改为 Exe：除了"编译通过与否"，还需要**用反射列出真实成员清单**
+      （`Program.cs` → `Probe.DumpMembers()` 落 `logs/api-bed-members.txt`）。
+      原因：连续两轮因为"猜成员名"白编译（`Furniture.performAction`、
+      `BedFurniture.IsPlayerBed`、`Farmer.startSleep/startSleeping/sleep` 全不存在）。
+      读清单比猜名字便宜。
+    -->
+    <OutputType>Exe</OutputType>
+    <GenerateProgramFile>false</GenerateProgramFile>
   </PropertyGroup>
 
   <PropertyGroup>

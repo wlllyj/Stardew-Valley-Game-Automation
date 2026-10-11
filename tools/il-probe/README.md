@@ -120,14 +120,38 @@ dotnet run -c Release -- "<游戏目录>" | Out-File -Encoding utf8 probe26_out.
 
 ---
 
-## 建议的改造（新项目）
+## ⚠️ 本工具自身的一个 bug（2026-10-11 已修，**旧结论必须重打**）
 
-| 改造 | 理由 |
+原版 `Dump` 的最后一行是：
+
+```csharp
+if (!string.IsNullOrEmpty(operand))
+    Console.WriteLine($"  IL_{start:X4}: {op.Name,-14} {operand}");
+```
+
+`operand` 只在 switch 里列举的 `OperandType` 分支里被赋值，于是**所有没有操作数的指令**
+（`ldarg.0/1`、`ldloc`、`stloc`、`ret`、`add`、`pop`、`br`… 即 `OperandType.InlineNone`）
+**被静默丢掉了**。症状是 dump 里 IL 偏移**不连续**（例：`IL_0000` 直接跳到 `IL_0008`）。
+
+**为什么危险**：`ret` 是**控制流**。看不见它，就会把"这里提前返回了"读成"顺序往下执行"，
+于是"某方法里没有 `CanMove = false`""没有提前返回"这类**否定性结论全部不可信**。
+本仓库早先关于 `Farmer.Halt()` / `PathFindController.update` 的阅读都是在带 bug 的版本上做的，
+已在 2026-10-11 用修好的版本**重打并复核**（见 `docs\_il-farmer-halt.md`）。
+
+现在无论 `operand` 是否为空都会打印（等价于"每个操作码都占一行"）。
+
+## 已完成的改造（2026-10-11）
+
+| 改造 | 状态 |
 |---|---|
-| 把 `Probe26.cs:20` 的默认路径改为读环境变量（如 `STARDEW_GAME_DIR`） | 去掉硬编码盘符（本仓库统一的参数化口径） |
-| 把目标方法列表改为从命令行/文件读入 | 现在要 dump 新方法必须改代码重编译 |
-| 输出同时写 `probe26_out.txt` | 旧项目正是因为**没有落盘输出**，导致 6 个方法名至今无法升格为"已验证" |
-| 接入"每次游戏更新跑一遍"的流程 | 审计 §4.1 明确建议 |
+| 目标列表改为**从命令行读入** | ✅ `dotnet run -c Release -- "<游戏目录>" "Type\|Method" …`（不传则 dump 下面那 6 个默认目标） |
+| dump **编译器生成的嵌套类型**（迭代器/lambda） | ✅ 写成 `Outer+NestedSubstring\|Method`，例如 `"StardewValley.SaveGame+getLoadEnumerator\|MoveNext"` |
+| 方法名**按包含**匹配（dump lambda） | ✅ 方法名以 `*` 结尾即"包含匹配"，例如 `"StardewValley.SaveGame+DisplayClass101\|*"` |
+| 默认路径改为读环境变量 | ✅ 顺序：命令行参数 > `STARDEW_GAME_DIR` > 旧机器硬编码路径 |
+| 输出落盘 | ⚠️ 仍未内置；**约定**：结论写进 `docs\_il-*.md`（如 `_il-farmer-halt.md`、`_il-savegame-load.md`） |
+
+**仍待改进**：`InlineR` / `InlineI8` 的操作数没有解码（浮点/长整型常量会打印成裸 opcode，
+例如 `ldc.r8` 后面看不到 `64.0`）。不影响语义判断，但碰浮点常量时要知道这件事。
 
 ---
 

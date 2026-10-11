@@ -1,0 +1,59 @@
+using System;
+using Microsoft.Xna.Framework;
+using StardewModdingAPI;
+using StardewValley;
+using StardewValley.Objects;
+using StardewValley.TerrainFeatures;
+
+namespace ApiProbe
+{
+    /// <summary>
+    /// 第四轮候选：**这格到底能不能站人**（2026-10-11 真机投诉）。
+    ///
+    /// 背景：迭代 3 用"家具像素包围盒与目标格相交"来判定"有家具、不能落脚"，
+    /// 真机扫屋子网格后判定结果明显过宽：
+    ///   x=6..10, y=8..10 共 13 格全被判"有家具"，而其中 (7,9) 在 v0.2.0 时
+    ///   是**真能走到的**（`move 7 9 -> OK 350ms`，角色确实站上去了）。
+    ///   ⇒ 包围盒求交把"可踩的地毯之类"也算成了障碍，会让脑在屋里几乎无处可去。
+    ///
+    /// 要找的是"**问游戏**这格能不能站"，而不是自己拿几何去猜。
+    /// </summary>
+    public static class ProbeCandidate4
+    {
+        // ================= A. 家具自身的"能不能踩" =================
+        public static bool A_IsGroundFurniture(Furniture f) => f.isGroundFurniture;
+        public static bool A_IsPassable(Furniture f) => f.isPassable();
+        public static int A_FurnitureType(Furniture f) => (int)f.furniture_type;
+        public static bool A_IsBed(Furniture f) => f is BedFurniture;
+        public static Rectangle A_BBox(Furniture f) => f.GetBoundingBox();
+        public static Rectangle A_BBoxField(Furniture f) => f.boundingBox;
+        public static Vector2 A_TileLocation(Furniture f) => f.TileLocation;
+        public static Vector2 A_getTileLocation(Furniture f) => f.TileLocation;
+
+        // 地毯类别常量（看哪些类别允许踩）
+        public static int A_TypeRug() => (int)FurnitureType.rug;
+        public static int A_TypeBed() => (int)FurnitureType.bed;
+        public static int A_TypeTable() => (int)FurnitureType.table;
+        public static int A_TypeChair() => (int)FurnitureType.chair;
+
+        // ================= B. 直接问地点"这格通不通" =================
+        public static bool B_IsTilePassable(Vector2 t) => Game1.currentLocation.isTilePassable(t);
+        public static bool B_IsTilePassableChar(Vector2 t) => Game1.currentLocation.isTilePassable(t, Game1.player);
+        public static bool B_IsTileOccupied(Vector2 t) => Game1.currentLocation.isTileOccupiedForPlacement(t);
+        public static bool B_IsTileLocationFree(Vector2 t) => Game1.currentLocation.isTileLocationTotallyClearAndPlaceable(t);
+        public static bool B_DoesTileHaveProperty(Vector2 t) => Game1.currentLocation.doesTileHaveProperty((int)t.X, (int)t.Y, "Passable", "Back") != null;
+
+        // ================= C. 地形/物件层面（迭代 1/2 已在用）=================
+        public static bool C_ObjectAt(Vector2 t) => Game1.currentLocation.objects.ContainsKey(t);
+        public static bool C_TerrainAt(Vector2 t) => Game1.currentLocation.terrainFeatures.ContainsKey(t);
+        public static bool C_IsWater(Vector2 t) => Game1.currentLocation.isWaterTile((int)t.X, (int)t.Y);
+
+        // ================= D. 地图尺寸的正确读法（旧方案踩过 Map.DisplayWidth 抛异常）=====
+        public static int D_LayersCount() => Game1.currentLocation.map?.Layers?.Count ?? 0;
+        public static int D_FirstLayerWidth() => Game1.currentLocation.map?.Layers?[0]?.LayerWidth ?? 0;
+        public static int D_FirstLayerHeight() => Game1.currentLocation.map?.Layers?[0]?.LayerHeight ?? 0;
+        public static int D_MapWidth() => Game1.currentLocation.map?.Width ?? 0;
+        public static int D_MapHeight() => Game1.currentLocation.map?.Height ?? 0;
+        public static int D_DisplayWidth() => Game1.currentLocation.map?.DisplayWidth ?? 0;
+    }
+}

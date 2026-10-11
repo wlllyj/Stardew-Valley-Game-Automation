@@ -1,0 +1,10 @@
+v0.7.21：观测里补上「**水壶还剩几格水**」与「**哪里能补水**」两块真值 —— 这是"连续 3 个游戏日浇水"的硬缺口。
+①`player.wateringCan = {present, waterLeft, max, bottomless, upgradeLevel}`：水在 `WateringCan` 自己身上
+   （`WaterLeft` / `waterCanMax`，api-probe 实证 public，logs\api-water-members.txt），不在 `inventory[]` 里。
+   基础壶 40 格，30 多格作物浇一天就干；脑必须先知道剩多少，才能**浇干之前**去补水。
+   找不到壶时 `present=false`（**不报 0**——0 会被脑当成"壶空了"而去白补水）。
+②`location.refillTiles[]`（仅 detail=full，近处优先、最多 24 个；`refillTilesTruncated` 说明截断）：
+   判据是**游戏自己的** `GameLocation.CanRefillWateringCanOnTile(x, y)`（不只是水面，小屋水槽也算），
+   不硬编码坐标、不猜地形属性。与 `tillable[]` 的差别：补水要**走到水边**，所以扫全图（80×65 ≈ 5200 次
+   判定，一次 observe 的开销可接受），而不是像 `tillable[]` 那样只扫 ±12（那是"局部动作"的口径）。
+   地图尺寸读不到时退回玩家 ±40 窗口，绝不让 observe 因这个字段抛异常。

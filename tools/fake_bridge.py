@@ -45,10 +45,10 @@ def world_snapshot(detail: str, tick: int) -> dict:
     """一个会缓慢变化的世界：时钟每 4 秒推进 10 分钟，move_to 会真的改变玩家坐标。"""
     time_of_day = _hmm((tick // 4) * 10)
     tile = list(STATE["tile"])
-    return {
+    snap = {
         "ok": True,
         "status": "ok",
-        "schema": "agentfarm-world/3",
+        "schema": "agentfarm-world/6",
         "worldSeq": 100 + tick,
         "generatedAt": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "hasSaveLoaded": True,
@@ -76,6 +76,17 @@ def world_snapshot(detail: str, tick: int) -> dict:
         "liveness": {"worldAdvancing": True, "secondsSinceClockMoved": 0.5},
         "_fake": {"detail": detail, "note": "这是假 Mod，不是真实游戏数据"},
     }
+    # v4：家具清单，**只在 detail=full**（与真 Mod 一致）。
+    if detail == "full":
+        snap["location"]["furniture"] = [
+            {"tile": [10, 9], "bbox": [160, 144, 16, 32], "passable": True,
+             "ground": False, "isBed": True, "blocking": True,
+             "type": "BedFurniture", "name": "床"},
+            {"tile": [7, 9], "bbox": [112, 144, 48, 32], "passable": True,
+             "ground": True, "isBed": False, "blocking": False,
+             "type": "Furniture", "name": "地毯"},
+        ]
+    return snap
 
 
 class Handler(BaseHTTPRequestHandler):

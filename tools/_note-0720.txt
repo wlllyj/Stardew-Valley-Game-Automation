@@ -1,0 +1,16 @@
+v0.7.20：新增两个技能 —— **睡觉（sleep）** 与 **买东西（buy）**，为"连续 3 个游戏日无人值守"补齐"跨日"与"补货"两块。
+①sleep（跨 tick）：游戏只在睡觉时落盘，quit_game+load_save 是**假跨日**（读回来还是同一天早上）。
+   IL 定案（logs\il-sleep-entry-u8.txt）：startSleep/doSleep 是 private，唯一外部入口是
+   `GameLocation.answerDialogueAction("<lastQuestionKey 首段>_Yes", null)`（玩家点"是"走的就是这条），
+   它 → startSleep() → doSleep() → Game1.NewDay(0f)。本技能两条路：床上已弹出提问就复用
+   ModalDismiss 的"把选项交给游戏"口径选肯定项；否则直接 answerDialogueAction("Sleep_Yes")。
+   判据：跨日成功 = Game1.Date.TotalDays 变大；超时回执带上 isInBed/newDay/pauseTime/menu/timeOfDay 等诊断。
+②buy：开店走 public 的 Utility.TryOpenShopMenu(shopId, null, false)，然后用**游戏自己的购买函数**
+   ShopMenu.tryToPurchaseItem(item, null, count, 0, 0)（private，只能反射；见 logs\il-shop-buy-u8.txt）：
+   它内部含 readOnly 检查、钱够不够的裁决（不够整体拒绝，不会扣一半）、chargePlayer 扣钱、
+   库存记账与 onPurchase 回调。⚠️ 两个坑：它的 bool 返回值**不是成败**（"库存归零"返回 true、
+   "正常卖出"返回 false），且**它不把东西放进背包**（东西在 this.heldItem，即"鼠标上那件"）——
+   所以用游戏自己在关店收尾时用的同一句 Game1.player.addItemToInventoryBool(held, false) 收货，
+   判据一律用观测差分（钱少了多少 + 背包这件多了几个）。Mod 绝不自己写 Money -= price。
+   新增参数 args.count（想买几个，会被"钱/库存/堆叠上限"夹小）与 args.shop（默认 "SeedShop"）。
+   买不到时的回执会附上货架清单（最多 12 条"名字(价g)"），便于脑改买别的。
