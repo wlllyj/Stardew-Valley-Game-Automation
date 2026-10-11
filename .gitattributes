@@ -1,0 +1,32 @@
+# 换行符策略：仓库内统一 LF，Windows 脚本强制 CRLF。
+# 目的：C# / Python / Markdown / PowerShell 混在一个仓库里时，
+#       不让 core.autocrlf 把每次 checkout 都变成"满屏假改动"。
+* text=auto eol=lf
+
+# Windows 原生脚本必须 CRLF，否则某些场景下 cmd.exe / PowerShell 解析异常
+*.ps1   text eol=crlf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# 二进制：明确告诉 git 不要做任何转换或 diff
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.dll   binary
+*.exe   binary
+*.zip   binary
+*.7z    binary
+*.xlsx  binary
+*.docx  binary
+
+# 语言统计与 diff 优化
+*.md    text
+*.json  text
+*.yml   text
+*.yaml  text
+*.cs    text
+*.py    text
+*.ts    text
+*.tsx   text
