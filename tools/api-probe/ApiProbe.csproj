@@ -1,0 +1,70 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    「这个 API 到底存不存在 / 签名是什么」的**编译期探针**。
+
+    用法：把候选代码写进 Probe.cs（哪怕只是 `_ = SomeType.SomeMember;`），
+          然后 `dotnet build`。编译器就是权威答案。
+
+    为什么需要它（实测教训，见 docs/00-开发日志.md 条目 010）：
+      StardewModdingAPI.xml **与 DLL 不一致**。XML 第 128 行声称存在
+      `Constants.GameVersion`，但实际编译报 CS0117（未包含该定义）。
+      => **永远不要用 XML 文档判断 API 是否存在，只有编译器算数。**
+
+    为什么不用 PowerShell 反射：目标程序集依赖 SMAPI.Toolkit / MonoGame 等，
+    在游戏外加载容易因依赖缺失失败；编译期检查零依赖、零副作用。
+
+    运行：
+      dotnet build -c Release
+      （GamePath 可用环境变量 STARDEW_GAME_PATH 覆盖）
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <!-- 游戏与 SMAPI 都是 AMD64；显式对齐，避免 MSB3270 架构不匹配 -->
+    <PlatformTarget>x64</PlatformTarget>
+    <Nullable>disable</Nullable>
+    <AssemblyName>ApiProbe</AssemblyName>
+    <RootNamespace>ApiProbe</RootNamespace>
+    <!-- 探针只求编译通过，不产出可用程序 -->
+    <OutputType>Library</OutputType>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <GamePath Condition="'$(GamePath)' == '' and '$(STARDEW_GAME_PATH)' != ''">$(STARDEW_GAME_PATH)</GamePath>
+    <GamePath Condition="'$(GamePath)' == ''">D:\Program Files (x86)\Steam\steamapps\common\Stardew Valley</GamePath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="StardewModdingAPI">
+      <HintPath>$(GamePath)\StardewModdingAPI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="StardewValley">
+      <HintPath>$(GamePath)\Stardew Valley.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="StardewValley.GameData">
+      <HintPath>$(GamePath)\StardewValley.GameData.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MonoGame.Framework">
+      <HintPath>$(GamePath)\MonoGame.Framework.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="xTile">
+      <HintPath>$(GamePath)\xTile.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- SMAPI 的语义化版本接口（Constants.ApiVersion 的返回类型在这里） -->
+    <Reference Include="SMAPI.Toolkit.CoreInterfaces">
+      <HintPath>$(GamePath)\smapi-internal\SMAPI.Toolkit.CoreInterfaces.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="SMAPI.Toolkit">
+      <HintPath>$(GamePath)\smapi-internal\SMAPI.Toolkit.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

@@ -17,8 +17,9 @@
     <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
-    <!-- 游戏 DLL 是 1.6.15 定版，MSBuild 版本校验没有意义反而会误报 -->
-    <NoWarn>$(NoWarn);MSB3270</NoWarn>
+    <!-- 游戏与 SMAPI 都是 AMD64：显式对齐目标架构，从源头消除 MSB3270。
+         （原先是用 NoWarn 把它压掉，但那只是把"可能运行期失败"的信号藏起来。） -->
+    <PlatformTarget>x64</PlatformTarget>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
     <DebugType>none</DebugType>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
