@@ -30,6 +30,13 @@ namespace AgentFarm.Bridge
             helper.Events.GameLoop.UpdateTicked += this.OnUpdateTicked;
             helper.Events.GameLoop.ReturnedToTitle += this.OnReturnedToTitle;
 
+            // 真机排查用的小命令：afb verbose on|off|status
+            // 存在意义：mod 启动后看不出“请求到底有没有打进来”，
+            // 而 SMAPI 默认只显示 Info 及以上级别的日志。
+            helper.ConsoleCommands.Add("afb",
+                "AgentFarm Bridge 控制。用法: afb [verbose on|off|status]",
+                (command, args) => this.Monitor.Log(this._host.HandleCommand(args), LogLevel.Info));
+
             // 启动顺序说明：Entry 里就把服务起起来。
             // 理由：无人值守时“脑”需要在游戏还在标题画面时就能发现端口与令牌，
             // 而不是等到读档完成；未读档时 /v1/observe 会诚实地回 no_save。

@@ -15,9 +15,14 @@ namespace AgentFarm.Bridge
     /// 快照在“未加载存档”时要返回“其余段为 null”的形态；用 null 忽略策略可以让
     /// DTO 只写一份声明就同时满足“完整”与“缺段”两种形状。
     /// </summary>
-    internal static class Json
+    internal static class JsonDefaults
     {
-        /// <summary>统一的序列化设置：camelCase 策略（与外部“脑”的约定）+ 不转义中文。</summary>
+        /// <summary>
+        /// 统一的序列化设置：camelCase 策略（与外部“脑”的约定）+ 不转义中文。
+        ///
+        /// 【为什么是 public】让 tools/JsonContractCheck 能**复用同一份设置**跑字段名自检，
+        /// 避免“自检用了另一份设置所以永远通过”的假验证。
+        /// </summary>
         public static readonly JsonSerializerOptions Options = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,

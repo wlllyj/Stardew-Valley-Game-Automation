@@ -39,7 +39,7 @@ namespace AgentFarm.Bridge
                 ReasonPhrase = phrase,
                 Json = JsonSerializer.Serialize(
                     new ErrorResponse { Ok = false, Status = StatusForCode(code), Reason = reason },
-                    Json.Options),
+                    JsonDefaults.Options),
             };
 
         private static string StatusForCode(int code)
@@ -72,8 +72,8 @@ namespace AgentFarm.Bridge
     /// </summary>
     internal sealed class HttpBridgeServer : IDisposable
     {
-        private const int HeaderByteLimit = 32 * 1024;
-        private const int BodyByteLimit = 1024 * 1024;
+        // 报文解析/生成的尺寸与超时常量统一在 HttpProtocol 里定义。
+
         private const int IoTimeoutMs = 15000;
 
         private readonly Action<string, StardewModdingAPI.LogLevel> _log;
@@ -185,7 +185,7 @@ namespace AgentFarm.Bridge
             Interlocked.Increment(ref this.RequestsServed);
 
             using NetworkStream stream = client.GetStream();
-            HttpRequest req = this.ReadRequest(stream);
+            HttpRequest req = HttpProtocol.ReadRequest(stream);
             if (req == null)
             {
                 // 连请求行都没读到（端口探测/空连接）——安静关闭。
@@ -200,25 +200,53 @@ namespace AgentFarm.Bridge
             catch (Exception ex)
             {
                 // handler 内部已经做了兜底，这里是最后一道保险。
-                res = HttpResponse.JsonError(500, "Internal Server Error", "服务端异常：" + Summarize(ex));
+                res = HttpResponse.JsonError(500, "Internal Server Error",
+                    "服务端异常：" + ex.GetType().Name + ": " + ex.Message);
             }
 
             this.WriteResponse(stream, res);
         }
 
+
         // ==================================================================
-        //  读取请求
+        //  写回响应
         // ==================================================================
 
-        private HttpRequest ReadRequest(NetworkStream stream)
+        private void WriteResponse(Stream stream, HttpResponse res)
         {
-            // ---- 逐字节读，直到 \r\n\r\n（限制总长度）----
+            try
+            {
+                byte[] all = HttpProtocol.WriteResponseBytes(res);
+                stream.Write(all, 0, all.Length);
+                stream.Flush();
+            }
+            catch (Exception)
+            {
+                // 对端已经断开（例如脑侧先超时关连接）——正常现象，安静收场。
+            }
+        }
+    }
+
+    /// <summary>
+    /// 极简 HTTP/1.1 报文解析/生成。
+    ///
+    /// 【为什么独立成类】解析逻辑不依赖任何游戏对象，也不依赖网络套接字（只吃 Stream），
+    /// 因此可以脱离游戏单独跑测试 —— 这是本 Mod 唯一能“离线证明正确”的部分，
+    /// 值得为它留一个干净的边界。
+    /// </summary>
+    internal static class HttpProtocol
+    {
+        public const int HeaderByteLimit = 32 * 1024;
+        public const int BodyByteLimit = 1024 * 1024;
+
+        /// <summary>从流里读一条完整请求。返回 null 表示连接里没有可读的请求（探测连接/已关闭）。</summary>
+        public static HttpRequest ReadRequest(Stream stream)
+        {
             var head = new MemoryStream();
             int matched = 0;   // 已连续匹配 "\r\n\r\n" 的字节数
-            int b;
             while (matched < 4)
             {
-                b = stream.ReadByte();
+                int b = stream.ReadByte();
                 if (b < 0) return null;                 // 连接提前关闭
                 head.WriteByte((byte)b);
                 if (head.Length > HeaderByteLimit) return null;
@@ -232,7 +260,12 @@ namespace AgentFarm.Bridge
                 }
             }
 
-            string headText = Encoding.UTF8.GetString(head.ToArray());
+            return ParseRequestHead(Encoding.UTF8.GetString(head.ToArray()), stream);
+        }
+
+        /// <summary>解析请求头文本，并按 Content-Length 从同一个流里读正文。</summary>
+        public static HttpRequest ParseRequestHead(string headText, Stream bodyStream)
+        {
             string[] lines = headText.Split(new[] { "\r\n" }, StringSplitOptions.None);
             if (lines.Length == 0 || string.IsNullOrWhiteSpace(lines[0])) return null;
 
@@ -251,6 +284,7 @@ namespace AgentFarm.Bridge
             string rawPath = q >= 0 ? target.Substring(0, q) : target;
             string rawQuery = q >= 0 ? target.Substring(q + 1) : "";
             req.Path = Decode(rawPath);
+
             foreach (string pair in rawQuery.Split('&'))
             {
                 if (pair.Length == 0) continue;
@@ -267,9 +301,7 @@ namespace AgentFarm.Bridge
                 if (line.Length == 0) continue;
                 int colon = line.IndexOf(':');
                 if (colon <= 0) continue;
-                string k = line.Substring(0, colon).Trim();
-                string v = line.Substring(colon + 1).Trim();
-                req.Headers[k] = v;
+                req.Headers[line.Substring(0, colon).Trim()] = line.Substring(colon + 1).Trim();
             }
 
             // 正文（按 Content-Length）
@@ -280,14 +312,14 @@ namespace AgentFarm.Bridge
                 contentLength = parsed;
             }
 
-            if (contentLength > 0)
+            if (contentLength > 0 && bodyStream != null)
             {
                 if (contentLength > BodyByteLimit) contentLength = BodyByteLimit;
                 var buf = new byte[contentLength];
                 int read = 0;
                 while (read < contentLength)
                 {
-                    int n = stream.Read(buf, read, contentLength - read);
+                    int n = bodyStream.Read(buf, read, contentLength - read);
                     if (n <= 0) break;
                     read += n;
                 }
@@ -297,40 +329,29 @@ namespace AgentFarm.Bridge
             return req;
         }
 
+        /// <summary>生成完整响应字节（响应头 + 响应体），便于离线断言。</summary>
+        public static byte[] WriteResponseBytes(HttpResponse res)
+        {
+            byte[] body = Encoding.UTF8.GetBytes(res.Json ?? "");
+            var sb = new StringBuilder(256);
+            sb.Append("HTTP/1.1 ").Append(res.StatusCode).Append(' ').Append(res.ReasonPhrase).Append("\r\n");
+            sb.Append("Content-Type: ").Append(res.IsJson ? "application/json; charset=utf-8" : "text/plain; charset=utf-8").Append("\r\n");
+            sb.Append("Content-Length: ").Append(body.Length).Append("\r\n");
+            sb.Append("Cache-Control: no-store\r\n");
+            sb.Append("Connection: close\r\n");
+            sb.Append("\r\n");
+
+            byte[] head = Encoding.ASCII.GetBytes(sb.ToString());
+            var all = new byte[head.Length + body.Length];
+            Buffer.BlockCopy(head, 0, all, 0, head.Length);
+            Buffer.BlockCopy(body, 0, all, head.Length, body.Length);
+            return all;
+        }
+
         private static string Decode(string s)
         {
             try { return Uri.UnescapeDataString(s.Replace("+", " ")); }
             catch { return s; }
-        }
-
-        private static string Summarize(Exception ex) => ex.GetType().Name + ": " + ex.Message;
-
-        // ==================================================================
-        //  写回响应
-        // ==================================================================
-
-        private void WriteResponse(NetworkStream stream, HttpResponse res)
-        {
-            try
-            {
-                byte[] body = Encoding.UTF8.GetBytes(res.IsJson ? res.Json : res.Json);
-                var sb = new StringBuilder(256);
-                sb.Append("HTTP/1.1 ").Append(res.StatusCode).Append(' ').Append(res.ReasonPhrase).Append("\r\n");
-                sb.Append("Content-Type: ").Append(res.IsJson ? "application/json; charset=utf-8" : "text/plain; charset=utf-8").Append("\r\n");
-                sb.Append("Content-Length: ").Append(body.Length).Append("\r\n");
-                sb.Append("Cache-Control: no-store\r\n");
-                sb.Append("Connection: close\r\n");
-                sb.Append("\r\n");
-
-                byte[] head = Encoding.ASCII.GetBytes(sb.ToString());
-                stream.Write(head, 0, head.Length);
-                stream.Write(body, 0, body.Length);
-                stream.Flush();
-            }
-            catch (Exception)
-            {
-                // 对端已经断开（例如脑侧先超时关连接）——正常现象，安静收场。
-            }
         }
     }
 }

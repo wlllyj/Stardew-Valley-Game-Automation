@@ -190,8 +190,8 @@ namespace AgentFarm.Bridge
                 if (loc == null) return "";
 
                 var table = Game1.netWorldState?.Value?.LocationWeather;
-                if (table != null && table.TryGetValue(loc, out var entry) && entry != null)
-                    return entry.Value ?? "";
+                if (table != null && table.TryGetValue(loc, out StardewValley.Network.LocationWeather lw) && lw != null)
+                    return lw.weather?.Value ?? "";
             }
             catch { }
             return "";
@@ -258,7 +258,7 @@ namespace AgentFarm.Bridge
                 IsFarm = SafeBool(() => loc.IsFarm),
                 IsFarmhouse = SafeBool(() => loc.Name == "FarmHouse"),
                 IsOutdoors = SafeBool(() => loc.IsOutdoors),
-                Characters = SafeInt(() => loc.characters?.Length ?? 0),
+                Characters = SafeInt(() => loc.characters?.Count ?? 0),
             };
 
             try { v.Objects = loc.objects?.Length ?? 0; } catch { }

@@ -52,6 +52,16 @@ namespace AgentFarm.Bridge
             this._monitor = monitor;
         }
 
+        /// <summary>
+        /// 是否逐条打印请求日志（方法/路径/状态码/耗时/worldSeq）。
+        ///
+        /// 用 <see cref="LogLevel.Trace"/> 打印：“脑”侧每秒可能问好几次 observe，
+        /// 用 Info 会把 SMAPI 控制台刷满，反而看不见关键信息。
+        /// 同时提供控制台命令 `afb verbose on|off` 把它临时抬到 Info，
+        /// 这样真机排查时不需要重启游戏加 -verbose 参数。
+        /// </summary>
+        private volatile bool _verbose = true;
+
         public int Port => this._server?.Port ?? 0;
         public string BridgeFilePath => this._bridgeFilePath;
 
@@ -94,6 +104,7 @@ namespace AgentFarm.Bridge
             this._monitor.Log($"  监听：http://127.0.0.1:{this._server.Port}", LogLevel.Info);
             this._monitor.Log($"  令牌文件：{this._bridgeFilePath}", LogLevel.Info);
             this._monitor.Log("  接口：GET /v1/health（免鉴权）· GET /v1/observe?detail=summary|full · POST /v1/exec", LogLevel.Info);
+            this._monitor.Log("  控制台：afb verbose on|off|status", LogLevel.Info);
             this._monitor.Log("──────────────────────────────────────────────", LogLevel.Info);
         }
 
@@ -161,7 +172,7 @@ namespace AgentFarm.Bridge
                     StartedAt = this._startedAt.ToString("yyyy-MM-dd'T'HH:mm:sszzz", CultureInfo.InvariantCulture),
                 };
 
-                string json = JsonSerializer.Serialize(payload, Json.Options);
+                string json = JsonSerializer.Serialize(payload, JsonDefaults.Options);
 
                 // 原子写：先写同目录下的临时文件，再 File.Move 覆盖。
                 // 这样“脑”任何时刻读到的都是完整 JSON，不会读到写了一半的内容。
@@ -273,8 +284,7 @@ namespace AgentFarm.Bridge
             sw.Stop();
             Interlocked.Increment(ref this._requestsServed);
 
-            this.Log($"{(req.Method ?? "?")} {req.Path} → {res.StatusCode} · {sw.ElapsedMilliseconds}ms · worldSeq={this._world.WorldSeq}",
-                LogLevel.Trace);
+            this.LogRequest($"{(req.Method ?? "?")} {req.Path} → {res.StatusCode} · {sw.ElapsedMilliseconds}ms · worldSeq={this._world.WorldSeq}");
 
             return res;
         }
@@ -344,7 +354,7 @@ namespace AgentFarm.Bridge
                 },
             };
 
-            return JsonSerializer.Serialize(health, Json.Options);
+            return JsonSerializer.Serialize(health, JsonDefaults.Options);
         }
 
         private static bool SafeWorldReady()
@@ -374,7 +384,7 @@ namespace AgentFarm.Bridge
             if (result == null)
                 return HttpResponse.JsonError(504, "Gateway Timeout", "主线程在 10 秒内没有响应（游戏可能正在读档/加载）");
 
-            return HttpResponse.Json200(JsonSerializer.Serialize(result, Json.Options));
+            return HttpResponse.Json200(JsonSerializer.Serialize(result, JsonDefaults.Options));
         }
 
         private HttpResponse ServeExec(HttpRequest req)
@@ -384,7 +394,7 @@ namespace AgentFarm.Bridge
             {
                 exec = string.IsNullOrWhiteSpace(req.Body)
                     ? new ExecRequest()
-                    : JsonSerializer.Deserialize<ExecRequest>(req.Body, Json.Options);
+                    : JsonSerializer.Deserialize<ExecRequest>(req.Body, JsonDefaults.Options);
             }
             catch (JsonException ex)
             {
@@ -405,7 +415,7 @@ namespace AgentFarm.Bridge
                     Status = "unknown_skill",
                     Skill = skill,
                     Reason = $"未知技能“{skill}”（本 Mod 不认识这个技能名）",
-                }, Json.Options));
+                }, JsonDefaults.Options));
             }
 
             int timeoutMs = Skills.ClampTimeout(exec.TimeoutMs);
@@ -459,7 +469,7 @@ namespace AgentFarm.Bridge
                     Status = "error",
                     Skill = skill,
                     Reason = "执行异常：" + ex.GetType().Name + ": " + ex.Message,
-                }, Json.Options));
+                }, JsonDefaults.Options));
             }
 
             if (result == null)
@@ -470,15 +480,45 @@ namespace AgentFarm.Bridge
                     Status = "timeout",
                     Skill = skill,
                     Reason = $"等待执行结果超时（{timeoutMs}ms 预算 + {HttpWaitPadding.TotalSeconds:0} 秒余量已用尽）",
-                }, Json.Options));
+                }, JsonDefaults.Options));
             }
 
-            return HttpResponse.Json200(JsonSerializer.Serialize(result, Json.Options));
+            return HttpResponse.Json200(JsonSerializer.Serialize(result, JsonDefaults.Options));
         }
 
         private void Log(string message, LogLevel level)
         {
             try { this._monitor.Log(message, level); } catch { }
+        }
+
+        /// <summary>逐条打印每个请求（方法、路径、状态码、耗时、worldSeq）。</summary>
+        private void LogRequest(string message)
+        {
+            if (!this._verbose) return;
+            this.Log(message, LogLevel.Info);
+        }
+
+        /// <summary>控制台命令入口：afb verbose on|off|status。</summary>
+        public string HandleCommand(string[] args)
+        {
+            string sub = args.Length > 0 ? args[0].Trim().ToLowerInvariant() : "status";
+
+            switch (sub)
+            {
+                case "on":
+                    this._verbose = true;
+                    return "已开启逐条请求日志。";
+                case "off":
+                    this._verbose = false;
+                    return "已关闭逐条请求日志（启动信息与错误仍会打印）。";
+                case "status":
+                    return $"逐条请求日志：{(this._verbose ? "开启" : "关闭")}；"
+                         + $"端口 {this.Port}；已服务 {Interlocked.Read(ref this._requestsServed)} 个请求；"
+                         + $"worldSeq {this._world.WorldSeq}；worldAdvancing {this._world.WorldIsAdvancing}；"
+                         + $"令牌文件 {this._bridgeFilePath ?? "(未写入)"}";
+                default:
+                    return "用法：afb [verbose on|off|status]";
+            }
         }
     }
 }
