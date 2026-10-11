@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import struct
 import sys
 import tempfile
 import threading
@@ -227,6 +229,48 @@ class BridgeClientTest(unittest.TestCase):
         with self.assertRaises(BridgeError) as ctx:
             BridgeClient()._request("GET", "/v1/nope")
         self.assertEqual(ctx.exception.status, "not_found")
+
+    def test_connection_reset_becomes_bridge_error(self) -> None:
+        """对端强制重置连接时必须抛 BridgeError。
+
+        实机踩到的坑：游戏进程抖动/退出时 socket 被 RST，抛出来的是**裸**
+        ConnectionResetError（`http.client.RemoteDisconnected` 是它的子类），
+        它不是 URLError，不捕就会让整个"脑"带 traceback 崩掉 —— 无人值守时致命。
+        """
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+
+        def accept_and_reset() -> None:
+            try:
+                conn, _ = srv.accept()
+                # SO_LINGER=0 ⇒ close() 直接发 RST，制造"远程主机强迫关闭连接"
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                conn.close()
+            except OSError:
+                pass
+
+        t = threading.Thread(target=accept_and_reset, daemon=True)
+        t.start()
+        self.bridge_json.write_text(json.dumps({
+            "schema": "agentfarm-bridge/1", "port": port, "token": TOKEN, "pid": 1,
+            "modVersion": "0.2.0", "gameVersion": "1.6.15", "smapiVersion": "4.5.2",
+            "startedAt": "",
+        }), encoding="utf-8")
+        try:
+            try:
+                BridgeClient().health(timeout=3.0)
+            except BridgeError as exc:
+                self.assertIn(exc.status, ("connection_broken", "bad_response", "unreachable_bridge"))
+            except OSError as exc:  # 裸异常逃逸即失败
+                self.fail(f"裸异常逃逸到调用方：{type(exc).__name__}: {exc}")
+            else:
+                self.fail("连接被重置却当成成功了")
+        finally:
+            t.join(timeout=2)
+            srv.close()
 
     def test_connection_refused_is_actionable(self) -> None:
         self.bridge_json.write_text(json.dumps({"schema": "agentfarm-bridge/1", "port": 1,

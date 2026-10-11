@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import urllib.error
@@ -200,6 +201,18 @@ class BridgeClient:
             ) from exc
         except TimeoutError as exc:
             raise BridgeError(f"请求 {path} 超时（>{timeout or self.timeout}s）", status="timeout") from exc
+        except OSError as exc:
+            # 实机踩到的坑：游戏进程抖动/退出时，socket 会被**强制重置**，
+            # 抛出来的是裸 ConnectionResetError（http.client.RemoteDisconnected 也是它的子类），
+            # 不属于 URLError，不捕就会让整个"脑"带 traceback 崩掉。
+            raise BridgeError(
+                f"与 Mod 的连接中断（{type(exc).__name__}: {exc}）。游戏可能正在退出或已崩溃。",
+                status="connection_broken",
+            ) from exc
+        except http.client.HTTPException as exc:
+            # 收到半截响应/非法状态行等：同样属于"对端不可信"，绝不让异常逃逸。
+            raise BridgeError(f"与 Mod 的 HTTP 交互异常（{type(exc).__name__}: {exc}）",
+                              status="bad_response") from exc
 
         try:
             result = json.loads(payload) if payload.strip() else {}
