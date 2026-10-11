@@ -43,6 +43,23 @@ tools\agentfarm.cmd move 64 15
 rem 每 2 秒打印一次世界摘要（真机测试时的"眼睛"）
 tools\agentfarm.cmd watch
 
+rem 无人值守体检：世界在推进吗／失焦暂停关着吗／有没有挡路弹窗
+rem 退出码就是结论：0=ok  1=warn  2=stop（stop 会写 logs\stops\ 事故报告）
+tools\agentfarm.cmd triage
+
+rem 跨地点移动（按游戏真值的 warp 图 + 建筑门做 BFS；--tile 可省）
+tools\agentfarm.cmd goto Farm
+
+rem 从标题界面读档 / 让游戏自己退出（换 Mod dll 必须重启游戏，这两条配对使用）
+tools\agentfarm.cmd load
+tools\agentfarm.cmd shutdown --force-after 30
+
+rem 无人值守部署闭环：备份存档 → 自己关游戏 → 换 dll → 自己开 → 自己读档 → 自检
+python tools\deploy-mod.py
+
+rem 落点契约验收（回执 ok 是否真的停在目标格；退出码 0=通过 1=破裂 3=版本不对）
+python tools\verify-landing.py --rounds 10
+
 rem 检查大模型通路（不会打印密钥）
 tools\agentfarm.cmd llm-check
 
