@@ -1,8 +1,8 @@
 {
   "Name": "AgentFarm Bridge",
   "Author": "AgentFarm",
-  "Version": "0.2.0",
-  "Description": "AgentFarm 自动化项目的桥接 Mod：在 127.0.0.1 上暴露极简 HTTP/JSON 接口，供外部“脑”读取世界快照与下发技能。v0.2.0：协议升级 agentfarm-world/2 —— 修正农场 weeds/twigs 分类、天气恒为空串；新增对话框内容字段与 dismiss_modal 技能（无人值守的解除模态能力）；move_to 排除家具格并回报弹窗副作用；新增失焦诊断字段。",
+  "Version": "0.3.0",
+  "Description": "AgentFarm 自动化项目的桥接 Mod：在 127.0.0.1 上暴露极简 HTTP/JSON 接口，供外部“脑”读取世界快照与下发技能。v0.3.0：协议升 agentfarm-world/3 与 agentfarm-exec/2。dismiss_modal 彻底移除按键注入（IL 实证 ExitThisMenu 的 cleanupBeforeExit 为空方法、不复位 CanMove/dialogueUp，导致 shouldTimePass 恒 false、时钟永久停摆），改走游戏自身的 answerDialogue(Response)（会消费 afterQuestion，让游戏执行“回答之后该发生的事”），关闭走 closeDialogue()，并用 CanMove+IsPlayerFree 判定 worldResumed（未恢复则报 world_stuck）。新增 player.isInBed 与 game.paused / game.shouldTimePass 诊断字段。move_to 家具检查修正死代码并改用像素包围盒（床是多格家具）。modVersion 改从本文件读取。",
   "UniqueID": "AgentFarm.Bridge",
   "EntryDll": "AgentFarm.Bridge.dll",
   "MinimumApiVersion": "4.0.0",

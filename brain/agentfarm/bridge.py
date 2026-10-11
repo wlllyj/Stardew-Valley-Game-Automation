@@ -24,9 +24,10 @@ from typing import Any
 
 # ---- 契约常量（改这里必须同步 docs/03-桥接协议.md 并升版本号） ----
 SCHEMA_BRIDGE = "agentfarm-bridge/1"
-SCHEMA_WORLD = "agentfarm-world/2"   # v2：新增 isOutdoorFarm / activeMenuText / dialogueResponses /
-                                     #      dialogueIsQuestion / onScreenMenus / windowActive / canMove /
-                                     #      hasController；删除 dialogsOnScreen。见 docs/03-桥接协议.md
+SCHEMA_WORLD = "agentfarm-world/3"   # v3：新增 player.isInBed、game.paused / game.shouldTimePass；
+                                     #     dismiss_modal 行为改为 answerDialogue + closeDialogue，
+                                     #     并新增 worldResumed / status=world_stuck。见 docs/03-桥接协议.md
+SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
 MOD_VERSION_EXPECTED = "0.1.0"
 
 # 已知基线：环境实测快照 docs/02-环境实测快照.md
@@ -273,16 +274,40 @@ class BridgeClient:
             body["args"] = args
         if based_on_seq is not None:
             body["based_on_seq"] = int(based_on_seq)
-        return self._request(
+        result = self._request(
             "POST",
             "/v1/exec",
             body,
             timeout=http_timeout if http_timeout is not None else (timeout_ms / 1000.0 + 3.0),
         )
 
-    # 便捷封装：里程碑 A 的两个技能
+        # exec 的 schema 校验采取"**存在才校验**"的宽松口径：
+        # 实测 Mod 的部分响应分支（如未实现技能）不带 schema 字段，硬校验会把自己人打自己人
+        # （正是旧项目缺陷 D5 的翻版）。字段缺失 = 容忍并继续；字段存在但不符 = 明确报错。
+        schema = result.get("schema")
+        if schema is not None and schema != SCHEMA_EXEC:
+            raise BridgeError(
+                f"exec 返回 schema={schema!r}，期望 {SCHEMA_EXEC!r}（协议 §8）",
+                status="schema_mismatch",
+                payload=result,
+            )
+
+        # world_stuck 是 ok=false + status=world_stuck，已在 _request 里转成 BridgeError。
+        # 语义提醒：它表示"模态关了但世界没恢复"，脑**必须升级处理（重启游戏）**，
+        # 绝不允许当普通失败重试。
+        return result
+
+    # 便捷封装：里程碑 A 的技能
     def noop(self) -> dict[str, Any]:
         return self.exec_skill("noop", timeout_ms=1000)
+
+    def dismiss_modal(self, *, timeout_ms: int = 5000) -> dict[str, Any]:
+        """关闭当前挡路的模态（dismiss_modal）。
+
+        成功后请**务必检查 `worldResumed`**：它为 False 时说明模态关了但世界没恢复
+        （`canMove=false`），此时状态是 `world_stuck`，脑需要重启游戏而不是继续排计划。
+        """
+        return self.exec_skill("dismiss_modal", timeout_ms=timeout_ms)
 
     def move_to(self, x: int, y: int, *, timeout_ms: int = 8000, based_on_seq: int | None = None) -> dict[str, Any]:
         return self.exec_skill(

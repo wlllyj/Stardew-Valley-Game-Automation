@@ -24,6 +24,15 @@ namespace AgentFarm.Bridge
         public const int TimeoutDefaultMs = 8000;
 
         /// <summary>
+        /// exec 响应协议版本。
+        ///
+        /// v1 → v2（修复迭代 3）：新增 `worldResumed`（dismiss_modal 专用）。
+        /// 依据 docs/03-桥接协议.md §8「任何一侧改字段必须 +1 版本号」，
+        /// 并与 Python 侧同步（否则就是旧方案缺陷 D5“C# 写 /1 而 Python 写 /2”的翻版）。
+        /// </summary>
+        public const string ExecSchema = "agentfarm-exec/2";
+
+        /// <summary>
         /// based_on_seq 的“陈旧”阈值（架构 §5.3 时效拒绝）。
         ///
         /// 口径说明：worldSeq 会因为**玩家每跨一格**而 +1（指纹含玩家坐标），
@@ -59,7 +68,7 @@ namespace AgentFarm.Bridge
                         Status = "ok",
                         Skill = "noop",
                         Reason = "",
-                        Schema = "agentfarm-exec/1",
+                        Schema = ExecSchema,
                         WorldSeqBefore = world.WorldSeq,
                         WorldSeqAfter = world.WorldSeq,
                         ElapsedMs = 0,
@@ -75,11 +84,14 @@ namespace AgentFarm.Bridge
                         ModalDismissResult r = ModalDismiss.Dismiss();
                         return new ExecResponse
                         {
+                            // 注意：Ok 与 Status 都由 ModalDismiss 定；世界没恢复时它是
+                            // ok=false + status="world_stuck"，绝不当成普通成功。
                             Ok = r.Ok,
                             Status = r.Status,
                             Skill = "dismiss_modal",
                             Reason = r.Reason,
-                            Schema = "agentfarm-exec/1",
+                            Schema = ExecSchema,
+                            WorldResumed = r.WorldResumed,
                             ElapsedMs = 0,
                         };
                     };
@@ -277,11 +289,13 @@ namespace AgentFarm.Bridge
                         0);
                 }
 
-                if (!SafeStandable(_target, out Furniture blocking))
-                {
-                    return this.Fail("unreachable",
-                        $"目标格 {FormatTile(_target)} 不可通行（被建筑/水面/障碍占据），无法走上去", 0);
-                }
+                // ---- 家具优先于“不可通行” ----
+                //
+                // 顺序很重要（修复迭代 3 的真机 bug）：SafeStandable 发现家具时返回 **false**
+                // 并输出家具引用，所以旧写法先判 `!standable` 会把家具分支变成**死代码**，
+                // 真机上 move_to(9,8) 只会报笼统的“不可通行（被建筑/水面/障碍占据）”，
+                // 而“该格有家具”这个可操作的信息永远看不到。必须**先判家具**。
+                bool standable = SafeStandable(_target, out Furniture blocking);
 
                 if (blocking != null)
                 {
@@ -292,6 +306,12 @@ namespace AgentFarm.Bridge
                     string kind = blocking is StardewValley.Objects.BedFurniture ? "床/家具" : blocking.GetType().Name;
                     return this.Fail("precondition_failed",
                         $"目标格 {FormatTile(_target)} 有家具（{kind}），不能作为落脚点；请改选旁边的空地板格", 0);
+                }
+
+                if (!standable)
+                {
+                    return this.Fail("unreachable",
+                        $"目标格 {FormatTile(_target)} 不可通行（被建筑/水面/障碍占据），无法走上去", 0);
                 }
 
                 // ---- 发起寻路 ----
@@ -346,7 +366,7 @@ namespace AgentFarm.Bridge
             /// “有家具”是**前置条件不满足**，而不是“A* 走不到”。
             /// 建筑与围墙这里判不准，由“A* 无解立即放弃 + 卡死检测”兜底。
             /// </summary>
-            /// <param name="blockingFurniture">该格上的家具（没有则为 null）。</param>
+            /// <param name="blockingFurniture">像素范围覆盖该格的家具（没有则为 null）。</param>
             private static bool SafeStandable(Point p, out Furniture blockingFurniture)
             {
                 blockingFurniture = null;
@@ -357,23 +377,41 @@ namespace AgentFarm.Bridge
 
                     var tile = new Vector2(p.X, p.Y);
 
-                    // ---- 家具检查（v2 新增）----
+                    // ---- 家具检查 ----
                     //
                     // 1.6.x 的 loc.furniture 是 NetCollection<Furniture>，**直接 foreach 遍历**
                     // （没有 .Pairs，那是 objects/terrainFeatures 的写法）。
                     // 床尤其重要：它自带碰撞，A* 永远绕不进去，只会浪费一次 8 秒超时或报“A* 无解”。
+                    //
+                    // 【为什么按像素包围盒判，而不是比 TileLocation（修复迭代 3）】
+                    // 真机证明只比 `f.TileLocation == tile` 范围太窄：move_to(10,9) 通过了检查、
+                    // 成功走到该格，**并触发了睡觉弹窗** —— 床的触发区覆盖 (10,9)，但床的
+                    // TileLocation 并不在这格（床是多格家具）。
+                    // IL 实证：`Furniture.GetBoundingBoxAt(x,y)` 直接返回家具自己的
+                    // `boundingBox.Value`，而 `Furniture.RecalculateBoundingBox` 用
+                    // `getDefaultBoundingBoxForType(type)` 构造 `(TileLocation.X*64, TileLocation.Y*64,
+                    // 宽*64, 高*64)` —— 坐标已经是**世界像素**，尺寸按格数放大（多格家具会覆盖相邻若干格）。
+                    // 因此“家具像素包围盒 ∩ 目标格像素矩形”就是准确的命中判定。
+                    //
+                    // ⚠️ 签名以编译结果为准：1.6.15 的 `Furniture` 上**没有** `getBoundingBox()`
+                    //    （CS1061，编译期证伪），可用的是继承自 Object 的 `GetBoundingBox()`。
+                    //    它是**只读**的（Furniture 覆写的 GetBoundingBoxAt 不修改 boundingBox，
+                    //    会改写 boundingBox 的是 Object 那一版），不违反“不写游戏状态”。
                     try
                     {
                         if (loc.furniture != null)
                         {
+                            var tileRect = new Rectangle(p.X * Game1.tileSize, p.Y * Game1.tileSize,
+                                                         Game1.tileSize, Game1.tileSize);
+
                             foreach (Furniture f in loc.furniture)
                             {
                                 if (f == null) continue;
-                                if (f.TileLocation == tile) { blockingFurniture = f; return false; }
+                                if (f.GetBoundingBox().Intersects(tileRect)) { blockingFurniture = f; return false; }
                             }
                         }
                     }
-                    catch { }
+                    catch { blockingFurniture = null; }
 
                     if (loc.objects != null && loc.objects.ContainsKey(tile)) return false;
                     if (loc.isWaterTile(p.X, p.Y)) return false;

@@ -7,7 +7,7 @@ using StardewValley.TerrainFeatures;
 namespace AgentFarm.Bridge
 {
     /// <summary>
-    /// 感知层（架构文档 §5.1）：把游戏真值打包成 `agentfarm-world/2` 快照。
+    /// 感知层（架构文档 §5.1）：把游戏真值打包成 `agentfarm-world/3` 快照。
     ///
     /// 【铁律】本类所有方法**只能在游戏主线程调用**（由 MainThreadDispatcher 保证）。
     ///
@@ -22,8 +22,13 @@ namespace AgentFarm.Bridge
         /// v1 → v2 的变更（详见 docs/03-桥接协议.md §5/§8）：新增 weatherOnFarm / isOutdoorFarm /
         /// onScreenMenus / activeMenuText / dialogueResponses / dialogueIsQuestion / windowActive /
         /// canMove / hasController / exec.uiOpened，删除误导性的 ui.dialogsOnScreen。
+        ///
+        /// v2 → v3 的变更（修复迭代 3，真机“冻结”事故）：
+        ///   * 新增 `player.isInBed`、`game.paused`、`game.shouldTimePass`（新段 `game`）——
+        ///     事故现场是“模态没了、画面正常，但 canMove=false、时钟停走”，
+        ///     旧字段无法区分“游戏认为自己暂停/在睡觉”与“程序卡住”。
         /// </summary>
-        public const string WorldSchema = "agentfarm-world/2";
+        public const string WorldSchema = "agentfarm-world/3";
 
         /// <summary>世界指纹单调递增计数器。</summary>
         private long _worldSeq;
@@ -168,6 +173,7 @@ namespace AgentFarm.Bridge
             snap.Farm = ReadFarm(detail);
             snap.Ui = ReadUi();
             snap.Liveness = ReadLiveness();
+            snap.Game = ReadGame();
 
             return new WorldSnapshotViewResult { Body = snap, WorldSeq = _worldSeq };
         }
@@ -246,6 +252,7 @@ namespace AgentFarm.Bridge
                 InventoryCount = SafeInt(() => p.Items?.Count ?? 0),
                 CanMove = SafeBool(() => p.CanMove),
                 HasController = SafeBool(() => p.controller != null),
+                IsInBed = SafeBool(() => p.isInBed.Value),
                 Tools = ReadTools(p),
             };
             return view;
@@ -346,6 +353,27 @@ namespace AgentFarm.Bridge
             {
                 WorldAdvancing = this.WorldIsAdvancing,
                 SecondsSinceClockMoved = Math.Round(Math.Min(this.SecondsSinceClockMoved, 86400.0), 3),
+            };
+        }
+
+        /// <summary>
+        /// 游戏级暂停/时间状态（v3 新增，诊断“冻结”专用）。
+        ///
+        /// 【为什么加】事故现场：`canMove=false`、`isModal=false`、时钟 45 秒不走。
+        /// 旧快照里没有任何字段能说明“游戏自己是否认为时间应该推进”，排查只能靠猜。
+        /// 现在把 `Game1.paused` 与 `Game1.shouldTimePass()` 直接报出来：
+        ///   * `paused=true` → 游戏被显式暂停（例如打开菜单/失焦暂停）；
+        ///   * `shouldTimePass=false` 且 `paused=false` → 世界因为别的原因停摆
+        ///     （IL 实证：`CanMove=false` 且未使用工具时它就返回 false）；
+        ///   * `player.isInBed=true` → 正在睡觉流程里。
+        /// 三者一起就能把“冻结”的成因定位到具体分支。
+        /// </summary>
+        private static GameStateView ReadGame()
+        {
+            return new GameStateView
+            {
+                Paused = SafeBool(() => Game1.paused),
+                ShouldTimePass = SafeBool(() => Game1.shouldTimePass()),
             };
         }
 

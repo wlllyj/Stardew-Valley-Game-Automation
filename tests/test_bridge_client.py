@@ -38,7 +38,7 @@ class FakeBridgeHandler(BaseHTTPRequestHandler):
     """假 Mod。可用类属性调整行为，让每个测试构造不同场景。"""
 
     token = TOKEN
-    world_schema = "agentfarm-world/2"
+    world_schema = "agentfarm-world/3"
     exec_status = "ok"
     require_token = True
 
@@ -152,7 +152,7 @@ class BridgeClientTest(unittest.TestCase):
         os.environ.pop("AGENTFARM_BRIDGE_JSON", None)
 
     def setUp(self) -> None:
-        FakeBridgeHandler.world_schema = "agentfarm-world/2"
+        FakeBridgeHandler.world_schema = "agentfarm-world/3"
         FakeBridgeHandler.exec_status = "ok"
         FakeBridgeHandler.require_token = True
         self._write_bridge_json()
@@ -189,7 +189,7 @@ class BridgeClientTest(unittest.TestCase):
 
     def test_observe_summary(self) -> None:
         obs = BridgeClient().observe("summary")
-        self.assertEqual(obs["schema"], "agentfarm-world/2")
+        self.assertEqual(obs["schema"], "agentfarm-world/3")
         self.assertEqual(obs["player"]["tile"], [2, 11])
         self.assertEqual(obs["farm"]["weeds"], 443)
 
@@ -213,7 +213,7 @@ class BridgeClientTest(unittest.TestCase):
         self.assertEqual(ctx.exception.http_status, 401)
 
     def test_world_schema_mismatch_is_rejected(self) -> None:
-        FakeBridgeHandler.world_schema = "agentfarm-world/3"
+        FakeBridgeHandler.world_schema = "agentfarm-world/4"
         with self.assertRaises(BridgeError) as ctx:
             BridgeClient().observe("summary")
         self.assertEqual(ctx.exception.status, "schema_mismatch")

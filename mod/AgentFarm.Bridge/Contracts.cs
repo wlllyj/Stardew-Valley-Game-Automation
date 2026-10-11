@@ -79,7 +79,7 @@ namespace AgentFarm.Bridge
     }
 
     // ==================================================================
-    //  /v1/observe  —— agentfarm-world/2
+    //  /v1/observe  —— agentfarm-world/3
     // ==================================================================
 
     internal sealed class WorldSnapshot
@@ -96,6 +96,9 @@ namespace AgentFarm.Bridge
         [JsonPropertyName("farm")] public FarmView Farm { get; set; }
         [JsonPropertyName("ui")] public UiView Ui { get; set; }
         [JsonPropertyName("liveness")] public LivenessView Liveness { get; set; }
+
+        /// <summary>v3 新增：游戏级暂停/时间状态（诊断“看起来正常但世界停摆”用）。</summary>
+        [JsonPropertyName("game")] public GameStateView Game { get; set; }
     }
 
     internal sealed class ClockView
@@ -139,7 +142,31 @@ namespace AgentFarm.Bridge
         /// <summary>身上是否挂着寻路控制器（<c>player.controller != null</c>）。诊断“动作做了一半”用。</summary>
         [JsonPropertyName("hasController")] public bool HasController { get; set; }
 
+        /// <summary>
+        /// v3 新增：玩家是否“在床上”（<c>Game1.player.isInBed.Value</c>）。
+        /// 睡觉流程会把人置为 isInBed 且 CanMove=false、时间冻结，靠这个字段才能区分
+        /// “睡觉/过场流程中”与“模态挡路”。
+        /// </summary>
+        [JsonPropertyName("isInBed")] public bool IsInBed { get; set; }
+
         [JsonPropertyName("tools")] public ToolsView Tools { get; set; }
+    }
+
+    /// <summary>
+    /// 游戏级状态（v3 新增）。
+    ///
+    /// 【为什么需要】本次事故的真机现场是“画面正常、模态没了、canMove=false、时钟冻死”，
+    /// 而 v2 快照里没有任何字段能说明“游戏是否认为自己处于暂停/冻结状态”，只能靠猜。
+    /// 这两个字段把“游戏自己怎么看时间”直接摊开：
+    ///   * `paused`：`Game1.paused`；
+    ///   * `shouldTimePass`：`Game1.shouldTimePass()`（无参重载）。
+    /// IL 实证：`shouldTimePass` 里有 `if (!player.CanMove &amp;&amp; !player.UsingTool) return player.forceTimePass;`
+    /// —— 也就是说 **CanMove=false 会让时间停止推进**，这正是那次“时钟停在 640”的机制。
+    /// </summary>
+    internal sealed class GameStateView
+    {
+        [JsonPropertyName("paused")] public bool Paused { get; set; }
+        [JsonPropertyName("shouldTimePass")] public bool ShouldTimePass { get; set; }
     }
 
     internal sealed class ToolsView
@@ -285,6 +312,20 @@ namespace AgentFarm.Bridge
 
         /// <summary>若 uiOpened=true，这里是模态里的文字（同 ui.activeMenuText 的口径）。</summary>
         [JsonPropertyName("activeMenuText")] public string ActiveMenuText { get; set; }
+
+        /// <summary>
+        /// v2（exec schema）新增，**dismiss_modal 专用**，默认 `true`：
+        /// 关掉模态之后世界是否真的恢复可控 —— 同一 tick 内 `player.CanMove==true`
+        /// **且** `Context.IsPlayerFree==true`。
+        ///
+        /// 【为什么必须区分“菜单关了”与“世界恢复了”】真机事故：dismiss_modal 报“已关闭对话框”，
+        /// 随后时钟冻死、角色永久不能动（`exitThisMenu()` 不复位 `player.CanMove`，
+        /// 而 `shouldTimePass()` 在 CanMove=false 时恒为 false）。
+        /// 因此 `worldResumed=false` 时 `ok` 也是 `false`、`status="world_stuck"`，
+        /// 脑必须据此升级处理（重启游戏），**不得**当成普通成功。
+        /// 其它技能恒为 `true`（本字段对它们无意义，可忽略）。
+        /// </summary>
+        [JsonPropertyName("worldResumed")] public bool WorldResumed { get; set; } = true;
     }
 
     // ==================================================================

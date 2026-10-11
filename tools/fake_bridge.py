@@ -48,14 +48,14 @@ def world_snapshot(detail: str, tick: int) -> dict:
     return {
         "ok": True,
         "status": "ok",
-        "schema": "agentfarm-world/2",
+        "schema": "agentfarm-world/3",
         "worldSeq": 100 + tick,
         "generatedAt": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "hasSaveLoaded": True,
         "clock": {"year": 1, "season": "spring", "day": 3,
                   "timeOfDay": time_of_day, "weather": "rain", "weatherOnFarm": "rain"},
         "player": {"name": "MOCK-Jay", "location": "FarmHouse", "tile": tile, "facing": 0,
-                   "canMove": True, "hasController": False,
+                   "canMove": True, "hasController": False, "isInBed": False,
                    "stamina": 268.0, "maxStamina": 270.0, "health": 100, "maxHealth": 100,
                    "money": 482, "farmingLevel": 0, "inventoryCount": 12,
                    "tools": {"hoe": True, "axe": True, "pickaxe": True,
@@ -71,6 +71,8 @@ def world_snapshot(detail: str, tick: int) -> dict:
         #     并按协议"null 字段省略"的约定，没有菜单时不写 activeMenuText
         "ui": {"isModal": False, "eventUp": False, "onScreenMenus": 4,
                "dialogueResponses": [], "dialogueIsQuestion": False},
+        # v3：新增 game 段诊断（paused / shouldTimePass）
+        "game": {"paused": False, "shouldTimePass": True},
         "liveness": {"worldAdvancing": True, "secondsSinceClockMoved": 0.5},
         "_fake": {"detail": detail, "note": "这是假 Mod，不是真实游戏数据"},
     }
@@ -126,7 +128,9 @@ class Handler(BaseHTTPRequestHandler):
         skill = body.get("skill")
         timeout_ms = int(body.get("timeout_ms", 8000))
         if skill == "noop":
+            # 带 schema：验证客户端"存在才校验"的分支
             self._send(200, {"ok": True, "status": "ok", "skill": "noop", "reason": "",
+                             "schema": "agentfarm-exec/2", "worldResumed": True,
                              "elapsedMs": 1, "worldSeqBefore": 100, "worldSeqAfter": 100})
             return
         if skill == "move_to":
@@ -142,6 +146,7 @@ class Handler(BaseHTTPRequestHandler):
             STATE["tile"] = [int(tile[0]), int(tile[1])]
             STATE["move_calls"] += 1
             self._send(200, {"ok": True, "status": "ok", "skill": skill, "reason": "",
+                             "schema": "agentfarm-exec/2", "worldResumed": True,
                              "elapsedMs": elapsed, "worldSeqBefore": 100, "worldSeqAfter": 104})
             return
         self._send(200, {"ok": False, "status": "unknown_skill", "skill": skill,

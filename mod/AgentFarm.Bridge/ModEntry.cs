@@ -22,7 +22,7 @@ namespace AgentFarm.Bridge
 
         public override void Entry(IModHelper helper)
         {
-            this._host = new BridgeHost(this.Monitor);
+            this._host = new BridgeHost(this.Monitor, SafeModVersion());
 
             helper.Events.GameLoop.GameLaunched += this.OnGameLaunched;
             helper.Events.GameLoop.SaveLoaded += this.OnSaveLoaded;
@@ -42,7 +42,7 @@ namespace AgentFarm.Bridge
             // 而不是等到读档完成；未读档时 /v1/observe 会诚实地回 no_save。
             this._host.Start();
 
-            this.Monitor.Log($"AgentFarm Bridge v{BridgeHost.ModVersion} 已加载（SMAPI {SafeSmapiVersion()}，游戏 {SafeGameVersion()}）。", LogLevel.Info);
+            this.Monitor.Log($"AgentFarm Bridge v{this._host.ModVersion} 已加载（SMAPI {SafeSmapiVersion()}，游戏 {SafeGameVersion()}）。", LogLevel.Info);
         }
 
         // ==================================================================
@@ -125,6 +125,16 @@ namespace AgentFarm.Bridge
         private static string SafeSmapiVersion()
         {
             try { return Constants.ApiVersion?.ToString() ?? "?"; } catch { return "?"; }
+        }
+
+        /// <summary>
+        /// Mod 版本号，取自 manifest.json（<c>ModManifest.Version</c>）。
+        /// 【为什么不再写死】写死的常量会让日志、bridge.json、health 三处与 manifest 脱节
+        /// （真机上就出现过 manifest=0.2.0 而三处都报 0.1.0）。
+        /// </summary>
+        private string SafeModVersion()
+        {
+            try { return this.ModManifest?.Version?.ToString() ?? "unknown"; } catch { return "unknown"; }
         }
 
         private static string SafeGameVersion()

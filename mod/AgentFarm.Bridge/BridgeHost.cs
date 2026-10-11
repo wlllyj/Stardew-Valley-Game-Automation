@@ -23,7 +23,6 @@ namespace AgentFarm.Bridge
     /// </summary>
     internal sealed class BridgeHost
     {
-        public const string ModVersion = "0.1.0";
         public const string BridgeSchema = "agentfarm-bridge/1";
 
         private const int PortFirst = 17890;
@@ -47,10 +46,17 @@ namespace AgentFarm.Bridge
         private long _requestsServed;
         private volatile bool _farmScanWanted;
 
-        public BridgeHost(IMonitor monitor)
+        public BridgeHost(IMonitor monitor, string modVersion)
         {
             this._monitor = monitor;
+
+            // 版本号必须来自 manifest.json（ModEntry 传 this.ModManifest.Version），
+            // 不再写死：写死会让日志 / bridge.json / health 三处与 manifest 悄悄脱节。
+            this.ModVersion = string.IsNullOrWhiteSpace(modVersion) ? "unknown" : modVersion.Trim();
         }
+
+        /// <summary>Mod 版本号（形如 "0.2.0"），唯一来源是 manifest.json。</summary>
+        public string ModVersion { get; }
 
         /// <summary>
         /// 是否逐条打印请求日志（方法/路径/状态码/耗时/worldSeq）。
@@ -100,7 +106,7 @@ namespace AgentFarm.Bridge
             this.WriteBridgeFile();
 
             this._monitor.Log("──────────────────────────────────────────────", LogLevel.Info);
-            this._monitor.Log($"AgentFarm Bridge v{ModVersion} 已就绪（schema {BridgeSchema}）。", LogLevel.Info);
+            this._monitor.Log($"AgentFarm Bridge v{this.ModVersion} 已就绪（schema {BridgeSchema}）。", LogLevel.Info);
             this._monitor.Log($"  监听：http://127.0.0.1:{this._server.Port}", LogLevel.Info);
             this._monitor.Log($"  令牌文件：{this._bridgeFilePath}", LogLevel.Info);
             this._monitor.Log("  接口：GET /v1/health（免鉴权）· GET /v1/observe?detail=summary|full · POST /v1/exec", LogLevel.Info);
@@ -166,7 +172,7 @@ namespace AgentFarm.Bridge
                     Port = this.Port,
                     Token = this._token,
                     Pid = Environment.ProcessId,
-                    ModVersion = ModVersion,
+                    ModVersion = this.ModVersion,
                     GameVersion = GameVersionString(),
                     SmapiVersion = SmapiVersionString(),
                     StartedAt = this._startedAt.ToString("yyyy-MM-dd'T'HH:mm:sszzz", CultureInfo.InvariantCulture),
@@ -340,7 +346,7 @@ namespace AgentFarm.Bridge
                 Ok = true,
                 Status = "ok",
                 Schema = BridgeSchema,
-                ModVersion = ModVersion,
+                ModVersion = this.ModVersion,
                 Game = new HealthGame
                 {
                     Version = GameVersionString(),
