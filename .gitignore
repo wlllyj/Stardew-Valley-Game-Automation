@@ -1,0 +1,41 @@
+# ===== 密钥与凭据：绝不入库 =====
+*.key
+*.pem
+.env
+.env.*
+secrets/
+**/secrets/
+
+# ===== 运行态与日志（脑的产出，不属于源码） =====
+# 注意：tests/ 下的录制回放夹具（*.jsonl）是要入库的，所以这里只排除运行目录
+brain/run/
+run/
+logs/
+*.log
+
+# ===== C# / .NET 构建产物 =====
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo
+.vs/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# ===== 游戏存档与备份（体积大、可能含个人信息） =====
+save-backups/
+saves/
+*.zip
+*.7z
+
+# ===== 编辑器 / 系统 =====
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini
+*.tmp
