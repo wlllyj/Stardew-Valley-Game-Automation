@@ -408,6 +408,9 @@ class TestCliContract(unittest.TestCase):
         self.assertIn("env_spin_events", payload["env_inconclusive"])
         self.assertIn("env_blocked_total", payload["env_inconclusive"])
         self.assertIn("t_regressions", payload)
+        # 彩排实测：decision 只有 source/llm/boundary/truncated，顶部统计单独成块
+        self.assertIn("decision_counts", payload)
+        self.assertIn("total", payload["decision_counts"])
 
 
 def integrity_ledger(*, extra_events=(), day_end_overrides=None, finish=None):
@@ -530,6 +533,60 @@ class TestIntegrityAndSpinAccounting(unittest.TestCase):
         self.assertEqual(rep["t_regressions"][0]["t1"], 3.0)
         self.assertIn("t 回退", mod.render_text(rep, 10))
         self.assertNotIn("missed:t_regression", subjects(rep["categories"]["missed"]))
+
+
+class TestDecisionSourceAccounting(unittest.TestCase):
+    """彩排实测（`logs\\longrun-rehearsal-0.7.22.jsonl`）：`decision` 只写 source/llm/boundary/truncated
+    四键、**没有 token/usage** ⇒ 顶部统计只能给"次数 + 来源 + 边界 + 是否截断"，不能报 token 消耗。"""
+
+    def _report(self, events, name):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=1)
+
+    def _decisions(self):
+        return [
+            {"event": "decision", "t": 1.0, "day": MODAL_DAY, "boundary": "new_day",
+             "source": "llm", "llm": True, "intents": [], "problems": [], "fallback": None,
+             "truncated": False},
+            {"event": "decision", "t": 2.0, "day": MODAL_DAY, "boundary": None,
+             "source": "deterministic", "llm": False, "intents": [], "problems": [],
+             "fallback": None},
+            {"event": "decision", "t": 3.0, "day": MODAL_DAY, "boundary": "task_kind_change",
+             "source": "llm", "llm": True, "intents": [], "problems": [], "fallback": None,
+             "truncated": True},
+        ]
+
+    def test_decision_counts_split_by_source_and_boundary(self):
+        rep = self._report(integrity_ledger(extra_events=self._decisions()), "decision.jsonl")
+        dc = rep["decision_counts"]
+        self.assertEqual(dc["total"], 3)
+        self.assertEqual(dc["llm"], 2)
+        self.assertEqual(dc["by_source"], {"llm": 2, "deterministic": 1})
+        self.assertEqual(dc["by_boundary"], {"new_day": 1, "task_kind_change": 1, "(none)": 1})
+        self.assertEqual(len(dc["truncated_lines"]), 1)
+
+    def test_render_and_advice_expose_llm_boundary(self):
+        rep = self._report(integrity_ledger(extra_events=self._decisions()), "decision.jsonl")
+        text = mod.render_text(rep, 50)
+        self.assertIn("决策: 3 次（LLM 2）", text)
+        self.assertIn("truncated=1 行", text)
+        self.assertIn("LLM 回答被 max_tokens 截断", " ".join(a["text"] for a in rep["advice"]))
+
+    def test_clean_ledger_has_no_truncation_advice(self):
+        rep = self._report(integrity_ledger(), "decision_clean.jsonl")
+        self.assertEqual(rep["decision_counts"]["total"], 0)
+        self.assertNotIn("max_tokens", " ".join(a["text"] for a in rep["advice"]))
+
+    def test_truncated_false_is_not_flagged(self):
+        events = integrity_ledger(extra_events=[
+            {"event": "decision", "t": 1.0, "day": MODAL_DAY, "boundary": "new_day",
+             "source": "llm", "llm": True, "intents": [], "problems": [], "fallback": None,
+             "truncated": False},
+        ])
+        rep = self._report(events, "decision_ok.jsonl")
+        self.assertEqual(rep["decision_counts"]["truncated_lines"], [])
+        self.assertNotIn("max_tokens", " ".join(a["text"] for a in rep["advice"]))
 
 
 if __name__ == "__main__":

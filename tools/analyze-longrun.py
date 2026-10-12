@@ -1023,11 +1023,12 @@ def build_advice(report, top=8):
             "text": f"cancel 判定砍掉了 {len(cancels)} 个任务：确认'看不见 ⇒ cancel'是否把可做的事砍了（先走过去再判）",
             "lines": [f["line"] for f in cancels],
         })
-    # 7) LLM fallback
+    # 7) LLM fallback / 截断
     fallback = []
     for sess in sessions:
         for lineno, ev in sess["decisions"]:
-            if ev.get("fallback") or str(ev.get("source") or "").endswith("fallback"):
+            # brain 把 LLM 侧截断单独写成 `truncated=true`（run2 另有 source=…_fallback）
+            if ev.get("fallback") or str(ev.get("source") or "").endswith("fallback") or ev.get("truncated"):
                 fallback.append(lineno)
     if fallback:
         advice.append({
@@ -1153,6 +1154,23 @@ def build_report(rows, path, args, bad_lines):
         blocked_by_action[action] = blocked_by_action.get(action, 0) + 1
         if "grass" in str(ev.get("reason") or ""):
             blocked_grass += 1
+    # LLM 边界：`decision` 的 source/llm/boundary/truncated（brain 实写这四键，无 token/usage）
+    decisions = [ev for _, ev in rows if ev.get("event") == "decision"]
+    decision_by_source = {}
+    decision_by_boundary = {}
+    for ev in decisions:
+        src = str(ev.get("source") or "?")
+        decision_by_source[src] = decision_by_source.get(src, 0) + 1
+        boundary = str(ev.get("boundary") or "(none)")
+        decision_by_boundary[boundary] = decision_by_boundary.get(boundary, 0) + 1
+    decision_counts = {
+        "total": len(decisions),
+        "llm": sum(1 for ev in decisions if ev.get("llm") or ev.get("source") == "llm"),
+        "by_source": decision_by_source,
+        "by_boundary": decision_by_boundary,
+        "truncated_lines": [ln for ln, ev in rows
+                            if ev.get("event") == "decision" and ev.get("truncated")],
+    }
     report = {
         "journal": path,
         "lines": max((ln for ln, _ in rows), default=0),
@@ -1166,6 +1184,7 @@ def build_report(rows, path, args, bad_lines):
         "ok_steps_total": ok_steps_total,
         "skipped_steps_total": skipped_steps_total,
         "failed_steps_total": failed_steps_total,
+        "decision_counts": decision_counts,
         "no_day_progress": [
             {"line": ln, "reason": ev.get("reason"), "ended_by": ev.get("ended_by")}
             for ln, ev in rows if ev.get("event") == "no_day_progress"
@@ -1289,7 +1308,12 @@ def build_report(rows, path, args, bad_lines):
 
 MAPPING_TEXT = [
     ("day_start", "会话/天边界（每天一行摘要）"),
-    ("decision", "意图来源（llm/deterministic/…_fallback）→ 建议：fallback 计数"),
+    ("decision",
+     "顶部统计：总次数/LLM 次数/来源/边界（new_day、task_kind_change、recovery…）；"
+     "fallback 或 truncated=true ⇒ 建议 7（LLM 截断/兜底）"),
+    ("decision.truncated=true", "信息项（LLM 回答被截断；并入建议 7）"),
+    ("blocked.no_effect / stage_exhausted.capped|doomed",
+     "辅助字段（本工具现用 reason/action/tile；no_effect=true 表示世界无变化）"),
     ("intent_verdict", "1 该做没做（verdict=cancel 且当天再没做过）；unknown 是'看不见先走过去'"),
     ("policy", "1 该做没做（'今天不再要 XX'把任务整类砍掉）"),
     ("plot_exhausted / stage_no_target / stage_exhausted", "1 该做没做（阶段/片区没目标）；也可能掩盖'其实还有活'"),
@@ -1326,6 +1350,9 @@ MAPPING_TEXT = [
      "信息项：同一会话内 t 倒退只记录，不判失败（verify-run3.py 同口径）"),
     ("本工具与 tools\\verify-run3.py", "独立读数、交叉核对：同一本账本给出相反结论 ⇒ 停下来人工对账，别单方面改口径"),
     ("refill / goto_farm / plot", "辅助：补水、回农场、观测（截断警告）"),
+    ("idle", "辅助：一整轮没动作（acted/rounds）⇒ 空转，常与'该做没做'并看"),
+    ("seed_gate", "辅助：种子/钱不够 ⇒ till/plant 被跳过（不算硬失败）"),
+    ("plot_walk", "辅助：换片地（zone/stage）"),
 ]
 
 
@@ -1350,6 +1377,13 @@ def render_text(report, top):
     add(f"blocked: {blocked} 条（{blocked_detail}）；其中理由含 grass 的 {report['blocked_grass']} 条"
         + ("（草格无效挥动）" if report["blocked_grass"] else ""))
     add(f"sleep: {report['events'].get('sleep', 0)} 次（ok {report['sleep_ok']} / failed {report['sleep_failed']}）")
+    dc = report.get("decision_counts") or {}
+    if dc.get("total"):
+        src_txt = "、".join(f"{k}={v}" for k, v in sorted(dc["by_source"].items()))
+        bnd_txt = "、".join(f"{k}={v}" for k, v in sorted(dc["by_boundary"].items()))
+        add(f"决策: {dc['total']} 次（LLM {dc['llm']}）；来源 {src_txt}；边界 {bnd_txt}"
+            + (f"；truncated={len(dc['truncated_lines'])} 行 {dc['truncated_lines'][:5]}"
+               if dc["truncated_lines"] else "；无 truncated"))
     mi = report.get("manual_intervention") or {}
     red_total = mi.get("total", 0)
     add(f"模态: 打断 {mi.get('modal_interrupts_total', 0)} 次（信息项）"

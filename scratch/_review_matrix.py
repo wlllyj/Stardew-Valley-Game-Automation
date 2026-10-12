@@ -15,13 +15,17 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "verify-run3.py")
 
 # 期望读数（Lead 的裁定：绿账本必须 exit 0，负例必须 exit 1）
+# v3（2026-10-13 01:2x，deputy-lead 按 task-19 要求 5④ 加 B4b）：
+#   - K2 移出：它的 final_water 是 window 口径 0 覆盖却自称 watered_outdoor=true ⇒ 现 exit 1；
+#   - S（farm 口径 32 格）加入：正对照，加固不得误杀。
+#   ⇒ 若 Lead 裁定不加 B4b，把 K2 放回并删掉这条注释即可。
 EXPECT0 = {
     "scratch/journal-green.jsonl",
     "scratch/review-neg-G-env-info-item.jsonl",
     "scratch/review-neg-I-env-explained.jsonl",
     "scratch/review-neg-K-forged-consistent.jsonl",
-    "scratch/review-neg-K2-forged-empty.jsonl",
     "scratch/review-neg-P-t15-last-round-done.jsonl",
+    "scratch/review-neg-S-t19-farm-scope-ok.jsonl",
 }
 
 

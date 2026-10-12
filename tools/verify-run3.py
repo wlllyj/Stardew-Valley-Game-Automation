@@ -295,23 +295,19 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
                 f"{sum_failed_any - sum_failed} 次失败是环境挡路/无结论后重试做成（不计当天硬失败）"
             )
 
-        # 0. 字段缺失不得当成通过（deputy-lead 负例 A：day_end 整块省略 verified/checks）
-        if d["verified"] is None:
-            problems.append(f"[{name}] day_end 缺 verified 字段（缺失 ≠ 通过）")
-        if d["ended_by"] != "sleep":
-            problems.append(f"[{name}] ended_by={d['ended_by'] or '?'}（不是我们主动睡过去的）")
-        else:
-            if not d["sleep_ok"]:
-                problems.append(f"[{name}] ended_by=sleep 但 journal 里没有一次成功的 sleep 证据")
-            if not d["cross_day"]:
-                problems.append(
-                    f"[{name}] 缺跨日证据：final 的日期与 day_start 相同（final={d['final'].get('day')!r}）"
-                )
-            # 浇水证据（log-analyst `docs/_analyze-farmcounts.md` §6/§7）：窗口 `tiles[]` 的
-            # crops/unwatered_crops 在室内恒 0（run2 实证：day_end.final 是 FarmHouse crops=0，
-            # 而 checks.crops_watered=true 白过），且 Mod 的 farm.unwateredCrops 用的是
-            # HoeDirt.needsWatering()（只读 CropData.NeedsWatering、不看浇水状态）⇒ 两者都
-            # 不能当浇水证据。必须由 longrun 写 `checks.watered_outdoor`（见 task-19）。
+        def _water_problems() -> None:
+            """浇水证据（log-analyst `docs/_analyze-farmcounts.md` §6/§7）：窗口 `tiles[]` 的
+            crops/unwatered_crops 在室内恒 0（run2 实证：day_end.final 是 FarmHouse crops=0，
+            而 checks.crops_watered=true 白过），且 Mod 的 farm.unwateredCrops 用的是
+            HoeDirt.needsWatering()（只读 CropData.NeedsWatering、不看浇水状态）⇒ 两者都
+            不能当浇水证据。必须由 longrun 写 `checks.watered_outdoor`（见 task-19）。
+
+            **本检查与 `ended_by` 无关**（log-analyst 2026-10-13 彩排复核 §口径差 1）：原先它写在
+            `ended_by=="sleep"` 分支里 ⇒ 睡觉失败的那天会**静默跳过**浇水验收（彩排两天都是
+            `sleep_failed`，于是工具没报"缺 watered_outdoor"，而该字段当时确实缺）。"没睡成"
+            不等于"浇水不用查"，故两条分支都要执行（对本来就判红的日子只是多一条明示，不会把
+            任何 exit 0 的账本翻红）。
+            """
             watered_outdoor = checks.get("watered_outdoor")
             if watered_outdoor is None:
                 problems.append(
@@ -325,6 +321,21 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
                 problems.append(f"[{name}] 睡前 unwatered_crops={unwatered!r}（窗口口径，要求 0）")
             if checks.get("crops_watered") is False:
                 problems.append(f"[{name}] checks.crops_watered=false（窗口口径，睡前还有没浇的作物）")
+
+        # 0. 字段缺失不得当成通过（deputy-lead 负例 A：day_end 整块省略 verified/checks）
+        if d["verified"] is None:
+            problems.append(f"[{name}] day_end 缺 verified 字段（缺失 ≠ 通过）")
+        if d["ended_by"] != "sleep":
+            problems.append(f"[{name}] ended_by={d['ended_by'] or '?'}（不是我们主动睡过去的）")
+            _water_problems()
+        else:
+            if not d["sleep_ok"]:
+                problems.append(f"[{name}] ended_by=sleep 但 journal 里没有一次成功的 sleep 证据")
+            if not d["cross_day"]:
+                problems.append(
+                    f"[{name}] 缺跨日证据：final 的日期与 day_start 相同（final={d['final'].get('day')!r}）"
+                )
+            _water_problems()
         if checks.get("no_hard_failures") is False:
             problems.append(f"[{name}] checks.no_hard_failures=false（当天有硬失败步骤）")
         # 失败数一律以 day_end.stages 求和为准，并与 failed_steps 交叉核对（负例 B：只信自述）
@@ -397,7 +408,8 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
             ):
                 problems.append(
                     f"[{name}] checks.watered_outdoor=true 但 final_water.scope=window 且覆盖 0 格"
-                    "（当天没有任何户外快照 ⇒ task-19 要求 5④ 必须 False/缺省，不得默认 true）"
+                    "（当天没有任何户外快照）⇒ 该 true 不可采信：task-19 要求 5④ 规定此时必须如实"
+                    " False/缺省，禁止默认 true"
                 )
         elif checks.get("watered_outdoor") is True:
             infos.append(
