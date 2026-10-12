@@ -421,7 +421,13 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         if comparable and _ok_now() and f_code not in (0, None):
             problems.append(f"finish 自述 code={f_code}（自称未达标）而本工具判定达标（账本自相矛盾）")
         if comparable and (not _ok_now()) and f_code == 0:
-            problems.append("finish 自述 code=0（自称达标）而本工具判定未达标（账本自相矛盾）")
+            if problems:
+                # 已经有别的问题在顶着未达标 ⇒ 根因在别处，只记信息项，避免"一个根因两条"并把矛头指向 finish
+                infos.append(
+                    "finish 自述 code=0（自称达标）而本工具判定未达标 —— 已由上面的问题解释，不重复计为问题"
+                )
+            else:
+                problems.append("finish 自述 code=0（自称达标）而本工具判定未达标（账本自相矛盾）")
         if (not comparable) and f_code == 0 and not _ok_now():
             infos.append(
                 f"finish 自述 code=0 而本工具判定未达标，但两侧目标天数不同（--days={target_days} vs finish.days={f_days}）"
