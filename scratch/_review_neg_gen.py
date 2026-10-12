@@ -233,6 +233,85 @@ def day_block(d: int, *, mode: str) -> list[dict]:
         end["notes"] = ["伪造账本：这一天什么都没做，却自称 VERIFIED"]
         end["final_water"] = {"t": float(d * 600 + 510), "location": "FarmHouse", "tiles": 0,
                               "crops": 0, "dry": 0, "scope": "window"}
+    elif mode == "t19_window_no_outdoor":
+        # neg-R（task-19 验收前的盲区探针）：自称 watered_outdoor=true，但 final_water 明说走的是
+        # window 口径、且覆盖 0 格（= 当天**没有任何户外快照**）。task-19 要求 4 明令这种情形
+        # "如实 False/缺省，禁止默认 true" ⇒ 这条"true"在账本里**无法被证明**。
+        end["verified"] = True
+        end["checks"] = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                         "crops_watered": True, "watered_outdoor": True, "no_unmet_stages": True,
+                         "day_justified": True}
+        end["ok_steps"] = 32
+        end["skipped_steps"] = 0
+        end["failed_steps"] = 0
+        end["env_block_count"] = 0
+        end["inconclusive_count"] = 0
+        end["stages"] = [{"stage": "water_area", "tiles": 32, "ok": 32, "skipped": 0,
+                          "failed": 0, "stopped": "", "leftover": 0,
+                          "env_block_count": 0, "inconclusive_count": 0}]
+        end["plots"] = [{"zone": "field_ne", "tillable": 32, "plantable": 32, "watered": 32}]
+        end["final_water"] = {"t": float(d * 600 + 510), "location": "FarmHouse", "tiles": 0,
+                              "crops": 0, "dry": 0, "scope": "window"}
+    elif mode == "t19_farm_scope_ok":
+        # neg-S（正对照）：farm 口径、有覆盖、dry=0 ⇒ 合法绿日，必须 exit 0。
+        # 用来守"给 watered_outdoor 加证明力检查"时不会误杀合法的一天。
+        end["verified"] = True
+        end["checks"] = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                         "crops_watered": True, "watered_outdoor": True, "no_unmet_stages": True,
+                         "day_justified": True}
+        end["ok_steps"] = 32
+        end["skipped_steps"] = 0
+        end["failed_steps"] = 0
+        end["env_block_count"] = 0
+        end["inconclusive_count"] = 0
+        end["stages"] = [{"stage": "water_area", "tiles": 32, "ok": 32, "skipped": 0,
+                          "failed": 0, "stopped": "", "leftover": 0,
+                          "env_block_count": 0, "inconclusive_count": 0}]
+        end["plots"] = [{"zone": "field_ne", "tillable": 32, "plantable": 32, "watered": 32}]
+        end["final_water"] = {"t": float(d * 600 + 510), "location": "Farm", "tiles": 32,
+                              "crops": 32, "dry": 0, "scope": "farm"}
+    elif mode == "t15_last_round_done":
+        # neg-P（task-15 口径，Lead 权威定义）：**同一阶段种类当天两条记录** —— 更早一轮因种子
+        # 用完 leftover=5、最后一条把同一批做净 leftover=0。日级后置条件应以**最后一条**为准 ⇒
+        # 期望 exit 0；`stage_midway_leftover` 只记信息项（证明遮蔽已被显式记录）。
+        # 旧工具会把两条字面相加成 5 ⇒ 误报"checks.no_unmet_stages=true 与自算不一致"。
+        end["verified"] = True
+        end["checks"] = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                         "crops_watered": True, "watered_outdoor": True, "no_unmet_stages": True,
+                         "day_justified": True}
+        end["ok_steps"] = 5
+        end["skipped_steps"] = 0
+        end["failed_steps"] = 0
+        end["stages"] = [
+            {"stage": "plant_area", "tiles": 5, "ok": 0, "skipped": 0, "failed": 0,
+             "failed_any": 1, "env_block": 1, "inconclusive": 0,
+             "stopped": "no_seed", "leftover": 5},
+            {"stage": "plant_area", "tiles": 5, "ok": 5, "skipped": 0, "failed": 0,
+             "failed_any": 1, "env_block": 1, "inconclusive": 0,
+             "stopped": "", "leftover": 0},
+        ]
+        end["plots"] = [{"zone": "field_ne", "tillable": 5, "plantable": 5, "watered": 5}]
+        # t 单调：decision(d*600+5) 之后、sleep(d*600+500) 之前
+        rows.insert(2, {"t": float(d * 600 + 100), "event": "stage_midway_leftover",
+                        "day": ["1", "spring", d], "stage": "plant_area", "tiles": 5,
+                        "leftover": 5, "round": 1,
+                        "note": "更早一轮因种子用完留下 leftover=5，同日买到种子后做净（日级以最后一轮为准）"})
+    elif mode == "t15_earlier_done_last_leftover":
+        # neg-Q（遮蔽的反方向）：更早一轮做净 leftover=0，**最后一条**却有 leftover=5
+        # （例如换了另一片地、前一片干净后一片没做完）⇒ 必须仍报"未完成"，不许被更早的干净记录遮蔽。
+        end["verified"] = True
+        end["checks"] = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                         "crops_watered": True, "watered_outdoor": True, "no_unmet_stages": True,
+                         "day_justified": True}
+        end["ok_steps"] = 5
+        end["skipped_steps"] = 0
+        end["failed_steps"] = 5
+        end["stages"] = [
+            {"stage": "water_area", "tiles": 5, "ok": 5, "skipped": 0, "failed": 0,
+             "stopped": "", "leftover": 0},
+            {"stage": "water_area", "tiles": 5, "ok": 0, "skipped": 0, "failed": 5,
+             "stopped": "bridge", "leftover": 5},
+        ]
     else:
         raise SystemExit("unknown mode " + mode)
     rows.append(end)
@@ -260,7 +339,12 @@ def main() -> int:
                        ("env_explained", "review-neg-I-env-explained.jsonl"),
                        ("env_understated", "review-neg-J-env-understated.jsonl"),
                        ("forged_consistent", "review-neg-K-forged-consistent.jsonl"),
-                       ("forged_empty", "review-neg-K2-forged-empty.jsonl")):
+                       ("forged_empty", "review-neg-K2-forged-empty.jsonl"),
+                       ("t19_window_no_outdoor", "review-neg-R-t19-window-no-outdoor.jsonl"),
+                       ("t19_farm_scope_ok", "review-neg-S-t19-farm-scope-ok.jsonl"),
+                       ("t15_last_round_done", "review-neg-P-t15-last-round-done.jsonl"),
+                       ("t15_earlier_done_last_leftover",
+                        "review-neg-Q-t15-masked-leftover.jsonl")):
         path = os.path.join(HERE, name)
         with open(path, "w", encoding="utf-8") as fh:
             for row in build(mode):

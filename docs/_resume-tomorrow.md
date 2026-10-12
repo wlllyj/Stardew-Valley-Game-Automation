@@ -3,6 +3,21 @@
 > 本文是**收工快照**，只写"明天开工要用的东西"。`docs\_resume-prompt.md` 是 P2 时代的三步恢复法（仍然有效：单测 → `deploy-mod.py` → `run-plot.py`），但它的状态表已过期，以本文为准。
 > 目标不变：**P3 ⑥ —— 端到端自主完成「清障 → 开垦 → 播种 → 浇水」，连续 3 个游戏日无人工介入**（判据一律用 `observe?detail=full` 的 `tiles[]`/`inventory[]`/`money` 差分，回执不算证据）。
 
+## 0b. 2026-10-13 凌晨收工更新（**与下文冲突时以本节为准**）
+
+- **状态**：Mod **0.7.22 已冻结并装机过**（`dd7ea96`：`manifest.json` 0.7.22 + `brain\agentfarm\bridge.py:39 MOD_VERSION_EXPECTED="0.7.22"` + `dotnet build --no-incremental` 0 警 0 错 + 全量单测 **280 OK**）；彩排后已按 m02833 **优雅退出游戏**（`pids=[29744]` 已消失、`bridge.json` 不存在、17890 无监听），存档 `Wahaha_450799035` **3502298 B / mtime `2026-10-11 22:24:19` 未被改写**。开工请按老规矩来：`python tools\deploy-mod.py --no-quit` 起游戏 + 读档，再 `python tools\preflight.py --expect 0.7.22`（exit 0 才准跑）。
+- **彩排（1 游戏日，`logs\longrun-rehearsal-0.7.22.jsonl`，4.31 分钟 / 114 动作 / 退出码 1，两份 day 报告都是 spring 11）结论**：**农场作业面全绿，跨日仍失败**。
+  - 绿：浇水 **32/32**（`farm.dryCrops 32→0`，含一次 `refill waterLeft 0→40`）；`clear_area` 12 阶段全 VERIFIED、~83 格、`failed=0`/`skipped=0`/`proven_inert=0`；**LLM 边界决策真在用**（`decision` 11 条里 2 条 `source=llm`，给出 `water_area@anchor:field_ne / field_se`、`clear_area@anchor:field_nw` 等**具名田区方向**，坐标由代码落）；政策接管（`water_area` 提到最前）与校验关口（`till_area` cancel / `clear_area` unknown）都有账本证据。
+  - **硬发现 1（跨日卡点 A）**：`move_to_location("FarmHouse")` 把**门格 (64,14) 当 A* 目标** ⇒ `A* 未算出路径` ⇒ `sleep_failed`。旧 recipe 是"站 (64,15) 再 `checkAction((64,14))`"。
+  - **硬发现 2（早睡换形态）**：`plots_today >= max_plots_per_day(10)` ⇒ `no_plot` ⇒ 09:40、体力 144.7 就准备睡，而 `work_reasons` 仍非空（= m02532 的老毛病）；`day_justified` 现在居然**接受 `no_plot`**。
+  - **硬发现 3（跨日卡点 B）**：进屋后 `sleep_no_question` —— 玩家已站床旁 (8,8)、`interact((9,8))` 弹不出睡觉提问（`lastQuestionKey=(空)`），且脑侧想"踩上床格"时 A* 也失败（室内 `tiles[]` 只有 1 格，应看 `location.furniture[].isBed`）。
+  - **外部证据**：彩排前后 `day` 都是 `spring 11`、存档 size/mtime **没动** ⇒ 跨日确实没发生（`scratch\rehearsal_state.py` 只读快照）。
+- **明天第一件事（顺序）**：**task-19**（`checks.watered_outdoor` + `day_end.final_water`，消费 `farm.dryCrops`；缺它 run3 必被自己的工具判 exit 1）→ **task-31**（睡觉链路：门格寻路 + 上床/提问，彩排硬发现 1+3）→ **task-32**（上限触顶不许早睡，硬发现 2）→ 冻结 **0.7.23** → machine-runner 跑真 3 日 run3 → 双复核 + 四条外部证据。
+- **队友状态**：dev-coder **inactive 待命**（task-19 已挂在它名下、未落地，别再由别人动 `longrun.py`/`farmwork.py`）；deputy-lead task-15 验收已交付（`docs\_review-task15.md`，PASS-WITH-NITS，280 OK、27 本矩阵、它自己改了 `tools\verify-run3.py` +56/−7 并消除了 neg-P 误报）；log-analyst 正在做**彩排只读复算**（analyze-longrun + verify-run3 交叉 + 三件大事 + task-30 未定项）；machine-runner 待命等 "deploy done"；planner-dev inactive（task-27 已交付 `docs\_il-warp-loop.md`，task-29 未做）。
+- ⚠ **goal `goal-1ee4cda9` 仍是 paused（disarmed）**：模型侧 resume 被拒（"the user must resume it"）⇒ **需要用户在界面里 resume**，否则本轮结束后不会自动续跑。本次收工全文见 `docs/00-开发日志.md` **条目 034**。
+- **本次未提交的改动**（收工前会提交）：`tools\preflight.py`（`seed_items` 坑修复）、`scratch\rehearsal_state.py`、`docs\_release-0.7.22.md` §6、`docs\00-开发日志.md` 条目 034、本 §0b、`tools\verify-run3.py`（deputy 的 +56/−7）。
+- **一条观察**：后台长任务的 stdout/文件写是**块缓冲**（jsonl 攒到 2048 B 才落盘）⇒ 想边跑边看要加 `-u`。
+
 ## 0a. 2026-10-13 开工更新（**与下文冲突时以本节为准**）
 
 - **开工状态**（2026-10-13 上午实测）：游戏进程不存在、`bridge.json` 不存在、17890 无监听、存档 `Wahaha_450799035` size 3502298 / mtime `2026-10-11 22:24:19` 未改写；全量单测 **Ran 194 tests / OK**；工作树只有 dev-coder 的 5 个在制文件（`brain/agentfarm/bridge.py`、`brain/agentfarm/farmwork.py`、`mod/AgentFarm.Bridge/UseToolSkill.cs`、`tests/test_farmwork.py`、`tests/test_longrun.py`，+302/−35）。

@@ -75,3 +75,32 @@ $py = "C:\Users\admin\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\
 
 - 部署与 run3 各写一条 `docs\00-开发日志.md` 条目（倒序置顶，含 日期/阶段/目标/做了什么/结论与证据/下一步/待决）；踩坑必写。
 - run3 证据落 `docs\_run3-evidence.md`（machine-runner 交付，含跨日证据：`Game1.Date.TotalDays` 变化 + 存档 mtime/size 前进）。
+
+## 6. 实际执行记录（2026-10-13 夜，Lead 亲跑）
+
+| 时刻 | 动作 | 结果 |
+|---|---|---|
+| 01:11 | `python tools\_bump-mod-version.py 0.7.22 --note-file tools\_note-0722.txt` | manifest `0.7.21 → 0.7.22`，Description 头部插入 v0.7.22 说明 |
+| 01:11 | 改 `brain\agentfarm\bridge.py`：`MOD_VERSION_EXPECTED = "0.7.22"` | 与装机版本对齐（注释列出本版六项内容） |
+| 01:11 | `dotnet build .\AgentFarm.Bridge.csproj -c Release --no-incremental` | **0 个警告 / 0 个错误**；`AgentFarm.Bridge.dll` 158208 B / 01:11:35 |
+| 01:12 | `python -m unittest discover -s tests`（PYTHONUTF8=1 + PYTHONPATH=brain） | **Ran 280 tests / OK**（基线 262 → 280，含 task-11/15/28/30） |
+| 01:12 | `git commit dd7ea96` | 冻结提交：manifest + bridge.py + task-15（`longrun.py`/`test_longrun.py`）+ task-30（`tools\analyze-longrun.py`/其测试） |
+| 01:10–01:13 | `python tools\deploy-mod.py`（日志 `logs\deploy-0.7.22.log`） | 备份存档 → 装 0.7.21→0.7.22（dll 158208 / manifest 15083）→ 启动 `flags=0x210` → `桥已就绪：modVersion=0.7.22 port=17890` → `load_save` 进 `Wahaha_450799035`（FarmHouse (9,9)）→ `[OK] 部署闭环完成` |
+| 01:13 | `python tools\preflight.py --expect 0.7.22` | 版本 ✅（0.7.22 == 0.7.22）/ 已读档 ✅ / 无模态 ✅；`isOutdoorFarm` ❌（起跑瞬间人在 FarmHouse —— runner 的 `_prepare()` 会自己走到 Farm，01:15 复查已 ✅） |
+| 01:13 | 彩排起跑：`python tools\run-longrun.py --days 1 --size 5 --max-minutes 30 --journal logs\longrun-rehearsal-0.7.22.jsonl` | **LLM 边界决策开启**（默认；m01184 的告知义务见开发日志条目 034） |
+
+彩排前的世界读数（`scratch\rehearsal_state.py`，独立证据，非账本自述）：
+`spring 11 06:30 / FarmHouse (9,9) / isInBed=true / 体力 270 / 钱 14 / 无种子 / waterLeft 27 /
+farm={complete:true, crops:32, dryCrops:32, unwateredCrops:32, weeds:462, stones:245, twigs:121, grass:620, trees:218, emptyDirt:53}`；
+存档 `Wahaha_450799035` 3502298 B / `SaveGameInfo` 25234 B / mtime `2026-10-11 22:24:19`（**跑完必须前进**）。
+
+彩排中途实测（01:15，只读）：`farm.dryCrops` **32 → 18**（14 格浇下去了）、`waterLeft` **27 → 13**，而
+`farm.unwateredCrops` **仍是 32** —— 现场再次证明旧字段不是"今天没浇的格数"（task-10 的结论），
+`dryCrops` 才是（task-23 交付的新字段，本版首次真机使用）。
+
+**踩坑（本夜，已修）**：`tools\preflight.py:100` 调了不存在的 `worker.seed_items(obs)` ⇒ 每次跑都在
+"种子清点"一行打 `AttributeError: 'FarmWorker' object has no attribute 'seed_items'`（不致命，但基线 `seeds` 恒空）。
+修法：改成模块级函数 `farmwork.seed_items(worker.player_of(obs))`（`tools\preflight.py:27` 同步 import）；修后复跑该行不再报错。
+
+**另一个观察（未修，明天处理）**：后台跑长任务时 stdout/文件写都是**块缓冲**（`logs\longrun-rehearsal-0.7.22.jsonl`
+在 2048 B 才落盘一次、Tee 的 `.log` 整段不出现）⇒ 想边跑边看，起跑命令要带 `-u`。

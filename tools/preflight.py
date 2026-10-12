@@ -24,7 +24,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "brain"))
 
 from agentfarm.bridge import BridgeClient, BridgeError, MOD_VERSION_EXPECTED  # noqa: E402
-from agentfarm.farmwork import FarmWorker  # noqa: E402
+from agentfarm.farmwork import FarmWorker, seed_items  # noqa: E402
 
 
 def dig(obj, *path, default=None):
@@ -97,7 +97,7 @@ def main() -> int:
     # 基线（跑完后做差分的起点）
     worker = FarmWorker(client, log=lambda *_a, **_k: None)
     try:
-        seeds = worker.seed_items(obs)
+        seeds = seed_items(worker.player_of(obs))
     except Exception as exc:  # noqa: BLE001
         seeds = []
         print(f"⚠️ 种子清点失败：{type(exc).__name__}: {exc}")

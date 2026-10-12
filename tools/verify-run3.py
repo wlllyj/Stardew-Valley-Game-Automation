@@ -223,6 +223,13 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
     problems: list[str] = []
     infos: list[str] = []
 
+    # task-15：同一阶段种类当天跑多轮时，longrun 用 `stage_midway_leftover` 显式记录"更早一轮
+    # leftover>0、最后一轮 ==0"（遮蔽）。这里按天收好，逐日只记信息项 —— 它证明遮蔽已被记录。
+    midway_by_day: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        if r.get("event") == "stage_midway_leftover":
+            midway_by_day.setdefault(day_key(r), []).append(r)
+
     # 0. 时间轴自洽（deputy-lead `docs/_verify-run3-limits.md` 盲区 B2）：t 回退只记信息项。
     #    理由：t 是 longrun 自己的 time.time() 读数，系统时钟回拨（NTP）会让真长跑也"回退"，
     #    把它判成问题会误杀真机的 3 日验收 —— 记账自洽性不能盖过验收入口。
@@ -247,10 +254,46 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         checks = d.get("checks") or {}
         stage_recs = [s for s in (end_stats.get("stages") or []) if isinstance(s, dict)]
         sum_failed = sum(int(s.get("failed") or 0) for s in stage_recs)
-        # leftover 只在"有目标的阶段"上算（Lead 对 task-15 的裁定：0 目标阶段不许拖黑当天）
-        leftover_targeted = sum(int(s.get("leftover") or 0) for s in stage_recs if _tile_count(s) > 0)
-        leftover_zero_target = sum(int(s.get("leftover") or 0) for s in stage_recs if _tile_count(s) <= 0)
+        sum_failed_any = sum(int(s.get("failed_any") or 0) for s in stage_recs)
+        # leftover 口径（Lead 对 task-15 的权威定义）= **按阶段种类取当天最后一条记录**再求和，
+        # 且只算"有目标的阶段"（`tiles > 0`；0 目标阶段不许拖黑当天）。
+        # 理由：同一阶段种类当天可能跑多轮（种子用完先停一次、买到种子又把同一批做完），
+        # 字面相加会把世界完全达标的一天判成 needs_review —— 阶段后置条件是**日级**的。
+        # longrun 侧同一口径：`brain/agentfarm/longrun.py:1754-1758`（`last_by_stage`）。
+        last_by_stage: dict[str, dict[str, Any]] = {}
+        for s in stage_recs:
+            last_by_stage[str(s.get("stage") or "")] = s
+        leftover_targeted = sum(int(s.get("leftover") or 0) for s in last_by_stage.values()
+                                if _tile_count(s) > 0)
+        leftover_zero_target = sum(int(s.get("leftover") or 0) for s in last_by_stage.values()
+                                   if _tile_count(s) <= 0)
         legacy_failed = sum(int(s.get("failed") or 0) for s in d["stages"])
+        for r in midway_by_day.get(name, []):
+            infos.append(
+                f"[{name}] 阶段 {r.get('stage')} 当天更早一轮 leftover={r.get('leftover')}"
+                f"（tiles={r.get('tiles')}、round={r.get('round')}）而最后一轮已做净"
+                " ⇒ 按日级口径以最后一轮为准（遮蔽已被显式记录）"
+            )
+        # 遮蔽可见性（不依赖 longrun 额外发事件）：同一阶段种类的更早记录就在 `day_end.stages` 里，
+        # 直接推导 —— "更早一轮 leftover>0、最后一轮 ==0" 时把遮蔽写出来，复核的人不必自己去翻数组。
+        kinds: dict[str, list[dict[str, Any]]] = {}
+        for s in stage_recs:
+            kinds.setdefault(str(s.get("stage") or ""), []).append(s)
+        for kind, recs in kinds.items():
+            if len(recs) < 2:
+                continue
+            earlier = max(int(s.get("leftover") or 0) for s in recs[:-1])
+            if earlier > 0 and int(recs[-1].get("leftover") or 0) == 0:
+                extra = "；longrun 另记了 stage_midway_leftover 事件" if midway_by_day.get(name) else ""
+                infos.append(
+                    f"[{name}] 阶段 {kind} 当天共 {len(recs)} 条记录：更早一轮 leftover={earlier}"
+                    f"、最后一轮 0 ⇒ 按日级口径以最后一轮为准（遮蔽已显式列出）{extra}"
+                )
+        if sum_failed_any > sum_failed:
+            infos.append(
+                f"[{name}] failed_any={sum_failed_any} > failed={sum_failed}：另有 "
+                f"{sum_failed_any - sum_failed} 次失败是环境挡路/无结论后重试做成（不计当天硬失败）"
+            )
 
         # 0. 字段缺失不得当成通过（deputy-lead 负例 A：day_end 整块省略 verified/checks）
         if d["verified"] is None:
@@ -285,9 +328,10 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         if checks.get("no_hard_failures") is False:
             problems.append(f"[{name}] checks.no_hard_failures=false（当天有硬失败步骤）")
         # 失败数一律以 day_end.stages 求和为准，并与 failed_steps 交叉核对（负例 B：只信自述）
-        # task-15 ④ / task-22 之后：日级 `failed_steps` 只数"目标仍未完成的失败"，而 stage 的
-        # `failed` 仍是全部失败步 ⇒ 允许差额，但**差额必须被环境挡路/无结论计数完全解释**；
-        # 解释不完就是自述在洗账（负例 B 的口径不变：delta 不能被解释 ⇒ 问题）。
+        # task-15 之后两侧同口径：stage 的 `failed` 与日级 `failed_steps` 都只数"目标仍未完成的
+        # 失败"（全量另记 `failed_any`）⇒ 正常应严格相等。对 task-15 之前的旧账本（stage 侧记的是
+        # 全部失败步）仍保留差额容错：**差额必须被环境挡路/无结论计数完全解释**，解释不完就是
+        # 自述在洗账（负例 B 的口径不变：delta 不能被解释 ⇒ 问题）。
         sum_env = sum(int(s.get("env_block_count") or s.get("env_block") or 0) for s in stage_recs)
         sum_incon = sum(int(s.get("inconclusive_count") or s.get("inconclusive") or 0) for s in stage_recs)
         failed_field = end_stats.get("failed_steps")
@@ -343,6 +387,23 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
                 problems.append(
                     f"[{name}] checks.watered_outdoor=true 但 final_water.dry={dry}（账本自相矛盾）"
                 )
+            # task-19 要求 5④：**没有任何户外快照**时必须如实 False/缺省，禁止默认 true。
+            # window 口径覆盖 0 格 = 当天没有户外快照 ⇒ 这条 true 在账本里自相矛盾（证据来源为空）。
+            # 这不是世界校验（本工具仍是账本检查器），只是抓"自述与自己的证据口径打架"。
+            if (
+                checks.get("watered_outdoor") is True
+                and fw.get("scope") == "window"
+                and int(fw.get("tiles") or 0) == 0
+            ):
+                problems.append(
+                    f"[{name}] checks.watered_outdoor=true 但 final_water.scope=window 且覆盖 0 格"
+                    "（当天没有任何户外快照 ⇒ task-19 要求 5④ 必须 False/缺省，不得默认 true）"
+                )
+        elif checks.get("watered_outdoor") is True:
+            infos.append(
+                f"[{name}] checks.watered_outdoor=true 但账本没写 final_water"
+                "（无法核对证据来源；缺证据 ≠ 通过，也不额外判问题）"
+            )
         # 0 步也能 VERIFIED（盲区 B6）：当天一个阶段都没有、却自称达标 ⇒ 必须有"确实无活可做"的
         # 证据（no_intents / plot_exhausted / policy_fallback / sleep 理由是 no_work/night/stamina），
         # 否则不允许用"什么都没做"换一天达标（负例 K2）。
