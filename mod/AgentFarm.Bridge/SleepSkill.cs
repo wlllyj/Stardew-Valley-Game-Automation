@@ -28,21 +28,39 @@ namespace AgentFarm.Bridge
     /// ⇒ 因此本技能**调游戏自己的应答入口**，等价于玩家在 "go to sleep for the night?" 上点了 Yes：
     ///   ① 床上已经弹出提问时 → `GameLocation.answerDialogue(Response=Yes)`（ModalDismiss.AnswerWith，
     ///      它会消费 `location.afterQuestion`，与真人点 Yes 同一条路）；
-    ///   ② 没有提问（脑已经站到床上但对话框没弹，或直接从别处调用）→
-    ///      `GameLocation.answerDialogueAction("<lastQuestionKey 首段>_Yes")`，退到裸 `"Sleep_Yes"`。
+    ///   ② 没有提问、但 `lastQuestionKey` 首段**就是 `Sleep`** → `answerDialogueAction("Sleep_Yes")`；
+    ///   ③ 两者都不成立（**包括** `lastQuestionKey` 为空、或首段是别的前缀）→ **不发**，
+    ///      立刻 `sleep_no_question` 失败。
+    ///
+    /// 【③ 为什么必须这么严（2026-10-13 IL 定案，docs/_il-sleep-path.md）】
+    /// `answerDialogueAction` 是**字面量分派**：`IL_0ABC ldstr "Sleep_Yes"` → `op_Equality` →
+    /// `brtrue` 才走到 `startSleep()`，任何别的字符串都从默认出口**静默返回**（它**没有**
+    /// isInBed/dialogueUp/lastQuestionKey 前置判据 ⇒ 发出去不会报错）。所以"键发出去了"完全
+    /// 不等于"游戏收到了"：run2 两次 180s 超时就是发了一个按 `lastQuestionKey` 首段拼的错键。
+    /// 
     ///   **绝不注入键鼠事件**（与 ModalDismiss 同一条铁律：1.6.15 的 `DialogueBox.receiveKeyPress`
     ///   对 Enter/Space 没有应答语义，会经 `Options.actionButton` 变成 `receiveLeftClick(0,0,true)`＝确认当前项，
     ///   真机事故记录见 ModalDismiss 类注释）。
     ///
     /// 【成功判据：日期真的前进了】`Game1.Date.TotalDays` 变大。
     /// 回执里的说法只是声明；脑必须用 observe 复核（`clock.day` 变了、体力回满）。
-    /// 跨日要淡黑 + 存档 + 换天，**合法地慢**（几秒到几十秒），所以本技能是跨 tick 长任务，
-    /// 时间预算走自己的口径 <see cref="ClampBudget"/>（上限 5 分钟，比"走一格"的 30 秒宽）。
+    /// 跨日要淡黑 + 存档 + 换天：实测 ~1.8s（task-6 PASS 探针），默认预算 **15 秒**
+    /// （旧值 120s：run2 两次失败各白等 180s 才回报）。仍可用 `timeout_ms` 放宽，
+    /// 但"没有提问"这条路现在是秒级失败，不会再走到超时。
     /// ==================================================================
     /// </summary>
     internal sealed class SleepSkill
     {
-        private const int DefaultTimeoutMs = 120000;
+        /// <summary>
+        /// 默认预算 **15 秒**（旧值 120000）。
+        ///
+        /// 【为什么改】跨日实测只要 ~1.8s（task-6 的 PASS 探针：人已在床上时
+        /// `answerDialogueAction("Sleep_Yes")` → 日期 +1）；而"提问根本没弹出来"这种失败现在由
+        /// <see cref="FireSleepRequest"/> **秒级**报 `sleep_no_question` ⇒ 再用 120s/180s 只是为了
+        /// 把根因埋掉：run2 两次失败各等满 180s，journal 里只剩一句"睡觉请求失败"
+        /// （`docs/_analyze-sleep-fail.md` §4 R3）。
+        /// </summary>
+        private const int DefaultTimeoutMs = 15000;
         private const int MaxTimeoutMs = 300000;
 
         private readonly WorldObserver _world;
@@ -125,7 +143,19 @@ namespace AgentFarm.Bridge
                 this._dayBefore = SafeTotalDays();
                 this._timeBefore = SafeTimeOfDay();
 
-                this.FireSleepRequest();
+                bool delivered = this.FireSleepRequest();
+
+                // 没东西可应答 ⇒ **秒级**如实失败，绝不把"没有提问"拖成 3 分钟超时：
+                // 既是白等，也让 journal 里看不出根因（task-6 §4 R2/R3；Lead m01071）。
+                if (!delivered)
+                    return this.Fail("sleep_no_question",
+                        "睡觉提问没弹出来，拒绝盲发应答（盲发在 IL 上是静默 no-op）："
+                        + $"当前地点 {StepMover.CurrentLocationName()} 的 lastQuestionKey="
+                        + $"{(string.IsNullOrEmpty(LastQuestionKey()) ? "(空)" : LastQuestionKey())}；"
+                        + $"诊断：{this.Diagnose()}。"
+                        + "先让玩家**踩到床格**触发游戏自己的 checkAction(bed)"
+                        + "（脑侧 move_to(allow_bed=true)），等提问弹出来再 sleep",
+                        this.Elapsed());
 
                 // 跨 tick：这一 tick 只负责"把睡觉发起出去"，跨日要等淡黑 + 存档 + 换天。
                 return null;
@@ -144,6 +174,7 @@ namespace AgentFarm.Bridge
                     $"已发起睡觉（{this._trigger}）但 {elapsed}ms 内日期没有前进"
                     + $"（发起时第 {this._dayBefore} 天，现在第 {dayNow} 天）"
                     + $"；当前诊断：{this.Diagnose()}"
+                    + $"（默认预算 {DefaultTimeoutMs}ms；确认真跨日需要更久时可放宽 timeout_ms）"
                     + "。可能原因：睡觉提问没被应答 / 跨日流程被打断 / 世界被模态挡住；"
                     + "需要外部恢复（脑可先 dismiss_modal 再看，或重启游戏）",
                     elapsed);
@@ -156,7 +187,22 @@ namespace AgentFarm.Bridge
         //  发起睡觉
         // ==================================================================
 
-        private void FireSleepRequest()
+        /// <summary>
+        /// 发起睡觉。返回**是否真的把应答送出去了**。
+        ///
+        /// * `true`：①真开着提问且我们答了 Yes，或 ②`lastQuestionKey` 首段就是 `Sleep`
+        ///   且 `answerDialogueAction` 调用没抛异常；
+        /// * `false`：**没有**可证明是睡觉提问的东西 ⇒ 调用方立刻 `sleep_no_question` 失败，
+        ///   **不发送**、更不等超时。
+        ///
+        /// 【为什么必须这么严（2026-10-13 IL 定案，docs/_il-sleep-path.md）】
+        /// `GameLocation.answerDialogueAction(String, String[])` 是**字面量分派**：
+        /// `IL_0ABC ldstr "Sleep_Yes"` → `IL_0AC1 op_Equality` → `IL_0AC6 brtrue` 才走到
+        /// `startSleep()`；任何别的字符串都从默认出口**静默返回**，且它**没有**前置判据
+        /// ⇒ 发出去永远不会报错。所以"把键发出去了"完全不等于"游戏收到了"：
+        /// run2 两次 180s 超时就是发了一个按 `lastQuestionKey` 首段拼出来的错键。
+        /// </summary>
+        private bool FireSleepRequest()
         {
             // ① 床上已经弹出 "go to sleep for the night?" → 用游戏自己的 answerDialogue 答 Yes
             string note;
@@ -165,14 +211,26 @@ namespace AgentFarm.Bridge
             {
                 this._trigger = $"answerDialogue(Yes：\"{chosenText}\")";
                 this._triggerNote = note;
+                // 诊断：开着提问的键不是 Sleep 时留个痕（真机若出现"答了别的提问"能一眼看出来）。
+                string qHead = LastQuestionKeyHead();
+                if (!string.IsNullOrEmpty(qHead) && !qHead.Equals("Sleep", StringComparison.OrdinalIgnoreCase))
+                    this._triggerNote += $"；⚠ 当时 lastQuestionKey 首段是「{qHead}」而不是 Sleep";
                 this._monitor?.Log(
                     $"sleep：已用游戏自己的 answerDialogue 应答睡觉提问（选 \"{chosenText}\"：{note}）");
-                return;
+                return true;
             }
 
-            // ② 没有开着提问 → 直接走游戏的应答分发器
-            //    （IL 实证：answerDialogueAction 是唯一调用 GameLocation.startSleep 的地方）
+            // ② 没开着提问 ⇒ 必须能从 lastQuestionKey 证明"上一个提问就是睡觉提问"，才允许发键
             string key = BuildSleepAnswerKey();
+            if (string.IsNullOrEmpty(key))
+            {
+                this._trigger = "(未发送：拼不出 Sleep 前缀的应答键)";
+                this._triggerNote = "拒绝盲发（answerDialogueAction 发错键会静默 no-op）";
+                this._monitor?.Log(
+                    $"sleep：{this._trigger}；当前诊断：{this.Diagnose()}", LogLevel.Warn);
+                return false;
+            }
+
             string fallbackNote;
             bool delivered = TryAnswerDialogueAction(key, out fallbackNote);
 
@@ -182,6 +240,7 @@ namespace AgentFarm.Bridge
             this._monitor?.Log($"sleep：{this._trigger}（{fallbackNote}）");
             if (!delivered)
                 this._monitor?.Log("sleep：应答没有送回游戏（见回执 reason），将在超时后如实报失败", LogLevel.Warn);
+            return delivered;
         }
 
         /// <summary>
@@ -227,21 +286,33 @@ namespace AgentFarm.Bridge
         /// 【为什么不是裸 "Yes"】`ModalDismiss` 的注释已实证：游戏把答案拼成
         /// `lastQuestionKey.Split(' ')[0] + "_" + responseKey`（睡觉是 `"Sleep_Yes"`），
         /// 裸传 "Yes" 在所有 `questionKey_xxx` 型对话上都是空操作。
-        /// `lastQuestionKey` 读不到时退回裸 "Sleep_Yes"（睡觉的键名是固定的）。
+        /// `lastQuestionKey` 读不到、或首段**不是** `Sleep` 时返回 `null`。
+        ///
+        /// 【2026-10-13 改】旧实现在读不到时退回裸 `"Sleep_Yes"`。IL 定案（见
+        /// <see cref="FireSleepRequest"/>）证明"发错键 = 静默 no-op"，所以盲发毫无意义，
+        /// 只会把根因埋进超时里；现在返回 null 让调用方秒级失败。
         /// </summary>
         private static string BuildSleepAnswerKey()
         {
-            string questionKey = null;
-            try { questionKey = Game1.currentLocation?.lastQuestionKey; } catch { }
+            string head = LastQuestionKeyHead();
+            if (string.IsNullOrEmpty(head)) return null;
+            if (!head.Equals("Sleep", StringComparison.OrdinalIgnoreCase)) return null;
+            return head + "_Yes";
+        }
 
-            if (!string.IsNullOrEmpty(questionKey))
-            {
-                int space = questionKey.IndexOf(' ');
-                string head = space >= 0 ? questionKey.Substring(0, space) : questionKey;
-                if (!string.IsNullOrEmpty(head))
-                    return head + "_Yes";
-            }
-            return "Sleep_Yes";
+        /// <summary>当前地点的 `lastQuestionKey` 原文（读不到 = null）。</summary>
+        private static string LastQuestionKey()
+        {
+            try { return Game1.currentLocation?.lastQuestionKey; } catch { return null; }
+        }
+
+        /// <summary>`lastQuestionKey` 的首段（游戏把键拼成 `<首段>_<responseKey>`；睡觉是 `Sleep_Yes`）。</summary>
+        private static string LastQuestionKeyHead()
+        {
+            string q = LastQuestionKey();
+            if (string.IsNullOrEmpty(q)) return null;
+            int space = q.IndexOf(' ');
+            return space >= 0 ? q.Substring(0, space) : q;
         }
 
         private static bool TryAnswerDialogueAction(string key, out string note)

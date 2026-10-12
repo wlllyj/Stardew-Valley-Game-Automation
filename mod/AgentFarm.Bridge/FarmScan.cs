@@ -236,6 +236,13 @@ namespace AgentFarm.Bridge
                         if (dirt.needsWatering()) _acc.UnwateredCrops++;
                     }
                     catch { }
+                    // 真正的"今天还没浇"格数：判据与逐格 tiles[].watered 完全一致（HoeDirt.isWatered()）。
+                    // 上面那个 UnwateredCrops 用的是 needsWatering()，它不看浇水状态（docs\_analyze-farmcounts.md）。
+                    try
+                    {
+                        if (!dirt.isWatered()) _acc.DryCrops++;
+                    }
+                    catch { }
                 }
                 return;
             }

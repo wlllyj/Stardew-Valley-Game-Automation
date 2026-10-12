@@ -449,7 +449,19 @@ namespace AgentFarm.Bridge
         [JsonPropertyName("emptyDirt")] public int EmptyDirt { get; set; }
         [JsonPropertyName("crops")] public int Crops { get; set; }
         [JsonPropertyName("ripeCrops")] public int RipeCrops { get; set; }
+        /// <summary>
+        /// ⚠️ **这不是"今天还没浇水的作物格数"**：它数的是 `HoeDirt.needsWatering()`
+        /// （只读 `CropData.NeedsWatering`、**完全不看是否已经浇过水**，IL 定案见 `docs\_analyze-farmcounts.md`），
+        /// 所以一整天几乎不变（run2 实测 31→32）。要判"今天的作物浇完了没有"必须用 <see cref="DryCrops"/>。
+        /// </summary>
         [JsonPropertyName("unwateredCrops")] public int UnwateredCrops { get; set; }
+
+        /// <summary>
+        /// **有作物且当前没有浇水**的耕地格数（farm-wide 真值：判据 = `HoeDirt.crop != null &amp;&amp; !HoeDirt.isWatered()`，
+        /// 与逐格 `tiles[].watered` 是同一个 `isWatered()`）。`dryCrops == 0` 才等于"今天所有作物都浇过了"。
+        /// 只在 <see cref="Complete"/> == true（整场 Farm 分帧扫描跑完）时可信。
+        /// </summary>
+        [JsonPropertyName("dryCrops")] public int DryCrops { get; set; }
         [JsonPropertyName("weeds")] public int Weeds { get; set; }
         [JsonPropertyName("stones")] public int Stones { get; set; }
         [JsonPropertyName("twigs")] public int Twigs { get; set; }

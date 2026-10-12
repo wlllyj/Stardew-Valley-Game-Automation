@@ -15,9 +15,15 @@ namespace AgentFarm.Bridge
     /// ==================================================================
     ///  一、为什么这样实现（纪律：调游戏自己的入口，不伪造键鼠）
     /// ==================================================================
-    /// * **"按下使用键"用游戏自己的入口** <c>Game1.pressUseToolButton()</c>
-    ///   （api-probe 第 12 轮编译期实证存在）。它与玩家真的按键走的是同一条代码；
-    ///   我们**没有**合成任何键鼠事件。同源先例：`interact` 用 `GameLocation.checkAction`、
+    /// * **"按下使用键"按工具类型分派**（见 <see cref="Swing"/>）：
+    ///   ① 非近战（Hoe / WateringCan / Axe / Pickaxe）⇒ 走游戏自己的入口
+    ///      <c>Game1.pressUseToolButton()</c>（api-probe 第 12 轮编译期实证存在）。它与玩家真的按键
+    ///      走的是同一条代码；v0.7.19 / v0.7.21 真机反复验收过（锄地 `kind=dirt`、浇水 `watered=true`、
+    ///      水量 0→40），**不许顺手改**；
+    ///   ② 近战武器（镰刀/武器）⇒ `pressUseToolButton()` 内部有一道输入门闸，桥驱动时恒为 false
+    ///      （task-3 的 IL 证据：`IL_0826 isinst MeleeWeapon` / `IL_0833 call didPlayerJustLeftClick` /
+    ///      `IL_0838 brfalse`），改走 <see cref="BeginUse"/> 照抄门闸**之后**那段。
+    ///   两条路**都没有**合成任何键鼠事件。同源先例：`interact` 用 `GameLocation.checkAction`、
     ///   `dismiss_modal` 用 `answerDialogue`。
     /// * **选工具**用 <c>Game1.player.CurrentToolIndex</c>（api-probe 实证可写）——
     ///   等价于玩家滚动快捷栏。选完**必须复核** <c>CurrentTool</c> 的类型，回执里报出真实用的那件物品。
@@ -61,6 +67,7 @@ namespace AgentFarm.Bridge
         private string _wantedKind;      // 当前在试哪一类工具（hoe/can/axe/…）；Done() 按它选判据
         private string _objIdBefore;     // 动手前该格的 objId（没有则 null）
         private bool _sawUsingTool;      // 是否至少观察到一次"正在用工具"
+        private bool _deferredByFade;    // 渐黑/过场挡住起手 ⇒ Step() 报可重试状态（不是挥不动）
 
         // ---- auto：按顺序试可用工具（真机教训见下）----
         // 真机实测（2026-10-11）：**杂草是用锄头清掉的**（`use_tool(tool="hoe")` 一次 524ms，
@@ -97,15 +104,25 @@ namespace AgentFarm.Bridge
             };
 
         private ExecResponse Ok(long elapsedMs)
-            => new ExecResponse
+        {
+            // 回执要说清**凭什么**算成功：`Done()` 是按 `_wantedKind` 分支判的，文案也必须分支 ——
+            // 否则"已经空了"会被读成"这一格空了"（锄地是把空格**变成耕地**，不是变空；
+            // 而 scythe 加 `Grass` 判据之前，草格会拿到"已经空了"的假 ok）。
+            string what;
+            if (this._wantedKind == "hoe") what = "现在**已经是耕地**（HoeDirt）";
+            else if (this._wantedKind == "can") what = "现在**已经浇过水**（HoeDirt.watered=true）";
+            else what = $"现在**上面已经没有东西了**（kind=「{this.KindNow()}」）";
+            return new ExecResponse
             {
                 Ok = true, Status = "ok", Skill = "use_tool",
-                Reason = $"已用「{this._toolUsed}」对 {StepMover.FormatTile(this._target)} 动手 {this._swings} 次，"
-                       + $"该格原本是 {(this._objIdBefore ?? "（空）")}，现在**已经空了**（请用 observe 的 tiles[] 复核）",
+                Reason = $"已用「{this._toolUsed}」对 {StepMover.FormatTile(this._target)} 动手 {this._swings} 次"
+                       + $"（起手={this.StartedText()}），该格原本是 {(this._objIdBefore ?? "（空）")}，{what}"
+                       + "（请用 observe 的 tiles[] 复核）",
                 Schema = Skills.ExecSchema, ElapsedMs = elapsedMs,
                 WorldSeqBefore = this._seqBefore, WorldSeqAfter = this._world?.WorldSeq,
                 ReachedLocation = StepMover.CurrentLocationName(),
             };
+        }
 
         /// <summary>每次被主线程调用：返回 null = 还在挥；非 null = 终态。</summary>
         public object Step()
@@ -119,9 +136,11 @@ namespace AgentFarm.Bridge
                 {
                     StepMover.HaltPlayer();
                     return this.Fail("timeout",
-                        $"use_tool 超时（{this._timeoutMs}ms）：已挥 {this._swings} 次（用「{this._toolUsed}」），"
-                        + $"目标格 {StepMover.FormatTile(this._target)} 上仍有东西。"
-                        + "常见原因：工具不对/等级不够/体力不足/目标不在可作用范围内", elapsed);
+                        $"use_tool 超时（{this._timeoutMs}ms）：已挥 {this._swings} 次（用「{this._toolUsed}」，"
+                        + $"起手={this.StartedText()}），目标格 {StepMover.FormatTile(this._target)} 上仍有东西，"
+                        + $"现在还是「{this.KindNow()}」。"
+                        + "常见原因：工具不对/等级不够/体力不足/目标不在可作用范围内/屏幕一直在渐黑或过场",
+                        elapsed);
                 }
 
                 // 工具动画期间什么都不做（也别催它）
@@ -137,6 +156,16 @@ namespace AgentFarm.Bridge
                 // 锄头要"变成耕地"、水壶要"变成已浇水"、斧镐镰刀要"东西没了"——
                 // 不能统一用"没有物体"，否则对着空洞挥锄也会报 ok）
                 if (this.Done()) return this.Ok(elapsed);
+
+                // 渐黑/过场挡住起手（Swing() 里那道门）⇒ 报**可重试**状态：
+                // 这不是"这一格干不动"，脑只许记 failed、不许封格（下一轮世界恢复就能做）。
+                if (this._deferredByFade)
+                {
+                    StepMover.HaltPlayer();
+                    return this.Fail("world_fading",
+                        $"屏幕正在渐黑/过场（fadeToBlack/nonWarpFade）⇒ 现在起手也是白挥，use_tool 未执行"
+                        + $"（已挥 {this._swings} 次）。这是**可重试**状态：等世界恢复后重发即可。", elapsed);
+                }
 
                 if (this._swings >= MaxSwings)
                 {
@@ -164,7 +193,8 @@ namespace AgentFarm.Bridge
                     StepMover.HaltPlayer();
                     return this.Fail("tool_ineffective",
                         $"use_tool 试过的工具都无效：{string.Join("；", this._attemptText)}；目标格 "
-                        + $"{StepMover.FormatTile(this._target)} 上仍有东西 ⇒ 目标不在作用范围/等级不够/体力不足。", elapsed);
+                        + $"{StepMover.FormatTile(this._target)} 上仍有东西（现在还是「{this.KindNow()}」，"
+                        + $"起手={this.StartedText()}）⇒ 目标不在作用范围/等级不够/体力不足。", elapsed);
                 }
 
                 this.Swing();
@@ -259,6 +289,16 @@ namespace AgentFarm.Bridge
 
         private void Swing()
         {
+            // 0) 渐黑/过场期间**游戏自己也会拒绝起手** —— 这是 `pressUseToolButton` 的第一道门卫：
+            //    `IL_001C: call Boolean get_fadeToBlack(); IL_0021: brfalse.s IL_0025; IL_0023: ldc.i4.0; ret`
+            //    近战那条路我们绕开了 game 入口（见 BeginUse），所以这道门要自己补上；非近战那条路
+            //    游戏内部本来也有这道门。无论哪条路，渐黑时挥了都是白挥（世界不推进、动画不结算、
+            //    格子不会变）⇒ 不挥，记下"被环境挡住"交给 Step() 报**可重试**状态（world_fading）。
+            if (WorldFading())
+            {
+                this._deferredByFade = true;
+                return;
+            }
             this._swings++;
             try
             {
@@ -269,12 +309,90 @@ namespace AgentFarm.Bridge
                 int dir = (Math.Abs(dx) >= Math.Abs(dy)) ? (dx > 0 ? 1 : (dx < 0 ? 3 : 2)) : (dy > 0 ? 2 : 0);
                 p.faceDirection(dir);
 
-                // 2) 调游戏自己的"使用键"入口（不合成键鼠）
-                Game1.pressUseToolButton();
+                // 2) 按工具分派 —— **只对近战武器**绕开游戏入口，其余工具一个字都别改：
+                //
+                //    * MeleeWeapon（镰刀/武器）⇒ 走 BeginUse()。task-3 证明过的 IL 门闸只对这类成立：
+                //        IL_0826 CurrentTool → IL_082B isinst MeleeWeapon → IL_0830 brfalse IL_083D
+                //        IL_0832 ldc.i4.1 → IL_0833 call didPlayerJustLeftClick(true) → IL_0838 brfalse IL_0913
+                //      而 didPlayerJustLeftClick() 只认真实输入边沿（鼠标左键本帧刚按下 / 手柄 X /
+                //      键盘 useToolButton），桥驱动时恒为 false ⇒ 镰刀一刀都挥不出去
+                //      （真机取证：非 grass 7/7 成功、grass 5/5 失败，镰刀就在背包里）。
+                //
+                //    * Hoe / WateringCan / Axe / Pickaxe ⇒ **原样走 Game1.pressUseToolButton()**。
+                //      这是 v0.7.19 / v0.7.21 真机反复验收过的路（锄地 kind=dirt、浇水 watered=true、
+                //      水壶水量 0→40 都过了），task-3 的门闸与它们无关；它自带 fadeToBlack 门卫、
+                //      LowPriorityLeftClick、tryToPlaceItem、体力耗尽的抖动提示。run3 只剩一次真机机会，
+                //      **不许顺手把已验证路径换成未验证路径**。
+                bool melee = false;
+                try { melee = p != null && p.CurrentTool is MeleeWeapon; } catch { }
+
+                if (!melee)
+                {
+                    Game1.pressUseToolButton();
+                }
+                else if (!this.BeginUse(p))
+                {
+                    // 兜底：拿不到 player/工具时退回游戏入口（它对镰刀仍会被门闸挡住，但至少不崩）
+                    Game1.pressUseToolButton();
+                }
             }
             catch (Exception ex)
             {
                 this._monitor?.Log($"use_tool Swing 异常：{ex.GetType().Name}: {ex.Message}", LogLevel.Warn);
+            }
+        }
+
+        /// <summary>
+        /// 真·起手一次工具 —— **只用于近战武器（镰刀/武器）**，由 <see cref="Swing"/> 按工具类型分派调用；
+        /// 其余工具（Hoe / WateringCan / Axe / Pickaxe）**原样**走 <c>Game1.pressUseToolButton()</c>，不经过这里。
+        /// 返回 false = 没起手（调用方退回 Game1.pressUseToolButton()）。
+        ///
+        /// 【为什么要绕开 pressUseToolButton()】它内部对**近战武器**有一道输入门闸：
+        ///   IL_0826 player.CurrentTool → IL_082B isinst MeleeWeapon → IL_0830 brfalse IL_083D
+        ///   IL_0832 ldc.i4.1 → IL_0833 call Game1.didPlayerJustLeftClick(true) → IL_0838 brfalse IL_0913
+        /// 而 didPlayerJustLeftClick() 只认真实输入边沿（鼠标左键**本帧刚按下** / 手柄 X / 键盘 useToolButton），
+        /// 桥驱动时恒为 false ⇒ 直接 return，**不 BeginUsingTool、镰刀一刀都挥不出去**。
+        /// 真机取证：run1 里非 grass 7/7 全成功、grass 5/5 全失败（0 成功），而镰刀就在背包里。
+        ///
+        /// 这里改为照抄它在门闸**之后**的那段（IL_083D-IL_08BD）：
+        ///   savedFacing = player.FacingDirection
+        ///   toolLoc = player.GetToolLocation(clickPx, false)
+        ///   player.FacingDirection = player.getGeneralDirectionTowards(toolLoc, 0, false, true)
+        ///   player.lastClick = clickPx
+        ///   player.BeginUsingTool()
+        /// 唯一的改动是把真机里"人手鼠标的像素位置"换成**目标格中心**（自动化里没有鼠标，用目标格更准）。
+        ///
+        /// 【为什么 BeginUsingTool() 就够】它只做一件事：fire `beginUsingToolEvent`；而该事件在
+        /// `Farmer.initNetFields()` 里挂的是 `Farmer.performBeginUsingTool()`：
+        ///   CurrentTool == null ? return; CanMove=false; UsingTool=true; canReleaseTool=true;
+        ///   CurrentTool.beginUsing(currentLocation, (int)lastClick.X, (int)lastClick.Y, this);
+        /// 对镰刀（MeleeWeapon）这条路会走 `MeleeWeapon.setFarmerAnimating(who)`，它在**同一次调用内**就执行了
+        ///   who.lastClick = Vector2.Zero; Vector2 tl = who.GetToolLocation(true);
+        ///   MeleeWeapon.DoDamage(loc, (int)tl.X, (int)tl.Y, who.FacingDirection, 1, who);
+        /// 而 `GetToolLocation(true)`（ignoreClick=true）是**纯 FacingDirection 派生**的 ⇒
+        /// 割不割得到草只取决于朝向 + 站位，与鼠标无关。
+        /// </summary>
+        private bool BeginUse(Farmer p)
+        {
+            if (p == null || p.CurrentTool == null) return false;
+            try
+            {
+                // 目标格中心的像素坐标（真机这里的来源是鼠标位置）
+                var clickPx = new Vector2(this.Target.X * 64 + 32, this.Target.Y * 64 + 32);
+                var toolLoc = p.GetToolLocation(clickPx, false);
+                p.FacingDirection = p.getGeneralDirectionTowards(
+                    new Vector2((int)toolLoc.X, (int)toolLoc.Y), 0, false, true);
+                p.lastClick = clickPx;
+                p.BeginUsingTool();
+                // 回执要报真话：这次到底起手了没有（镰刀的 DoDamage 是同一调用内结算的）
+                try { this._sawUsingTool = this._sawUsingTool || p.UsingTool; } catch { }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                this._monitor?.Log($"use_tool BeginUse 异常，退回 pressUseToolButton：{ex.GetType().Name}: {ex.Message}",
+                    LogLevel.Warn);
+                return false;
             }
         }
 
@@ -424,6 +542,24 @@ namespace AgentFarm.Bridge
         ///   * `can` → 该格是耕地**且已浇水**；
         ///   * 其余（axe/pickaxe/scythe）→ 该格上的**物体没了**（树/资源堆/果树这类地形也算"东西"）。
         /// </summary>
+        /// <summary>回执里报"这格现在到底是什么"（别拿"应该是"糊弄）。</summary>
+        private string KindNow()
+        {
+            try { return ClassifyTile(this.Target); } catch { return "unknown"; }
+        }
+
+        /// <summary>回执里报"这次到底起手了没有"（镰刀被输入门闸挡住时会是"否"）。</summary>
+        private string StartedText() => this._sawUsingTool ? "是" : "否";
+
+        /// <summary>屏幕正在渐黑/过场？`pressUseToolButton` 的第一道门卫就是 `get_fadeToBlack`：
+        /// `IL_001C: call Boolean get_fadeToBlack(); IL_0021: brfalse.s IL_0025; IL_0023: ldc.i4.0; ret`
+        /// （证据 `scratch/il-grass-1-u8.txt:177-246`）。`nonWarpFade` 是"非传送引起的渐黑"
+        /// （睡觉/过场）。两者任一为真都不该起手 —— 挥了世界也不推进、动画不结算。</summary>
+        private static bool WorldFading()
+        {
+            try { return Game1.fadeToBlack || Game1.nonWarpFade; } catch { return false; }
+        }
+
         private bool Done()
         {
             try
@@ -449,6 +585,10 @@ namespace AgentFarm.Bridge
                 if (tf is StardewValley.TerrainFeatures.Tree) return false;
                 if (tf is StardewValley.TerrainFeatures.FruitTree) return false;
                 if (tf is StardewValley.TerrainFeatures.ResourceClump) return false;
+                // 草是**多刀**地形特征：`Grass.performToolAction` 只把 numberOfWeeds 减 1（金镰刀减 2），
+                // 只有减到 0 才移除特征。所以"还是草"必须算没做完 —— 原实现漏了这条，
+                // 会对着草回 "已经空了" 的假回执（真机 run1 的 5/5 grass 假 ok 就有这一半责任）。
+                if (tf is StardewValley.TerrainFeatures.Grass) return false;
                 return true;
             }
             catch { return false; }
