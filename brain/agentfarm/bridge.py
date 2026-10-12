@@ -91,8 +91,26 @@ class BridgeError(Exception):
 
 
 @dataclass(frozen=True)
+class BridgeFileAudit:
+    """`bridge.json` 的**只读**字段识别审计（真机双向取证用；不改变任何解析语义）。
+
+    `recognized` = `(协议里的字段名, 文件里实际的键名)`，按协议顺序；
+    `ignored` = 文件里有、但解析器不认识的键（原样，文件顺序）。
+    两者合起来就是文件里的全部键 ⇒ 真机上一次就能看清"pid 到底写在哪个键里"。
+    """
+
+    recognized: tuple[tuple[str, str], ...] = ()
+    ignored: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class BridgeInfo:
-    """`bridge.json` 的内容：Mod 告诉脑"我在哪个端口、口令是什么"。"""
+    """`bridge.json` 的内容：Mod 告诉脑"我在哪个端口、口令是什么"。
+
+    `notes`：读取时的**非致命**说明（字段名拼写与协议不一致、`pid` 读不出来等）。
+    它不是错误——文件仍然可用；只是提醒调用方"这一项的标准写法没对上，别拿它当硬判据"。
+    `audit`：只读的字段识别清单（见 `BridgeFileAudit`），供真机双向取证。
+    """
 
     schema: str
     port: int
@@ -103,6 +121,8 @@ class BridgeInfo:
     smapi_version: str
     started_at: str
     path: Path
+    notes: tuple[str, ...] = ()
+    audit: BridgeFileAudit = BridgeFileAudit()
 
     @property
     def base_url(self) -> str:
@@ -122,7 +142,11 @@ def default_bridge_json_path() -> Path:
 
 
 def pid_alive(pid: int | None) -> bool | None:
-    """检查进程是否还活着。返回 None = 无法判断（非 Windows 等）。
+    """检查进程是否还活着。返回 `None` = **不知道**（`pid` 缺失/为 `None`，或当前平台不支持）。
+
+    ⚠️ **调用方不得把 `None` 当成 `False`**：`None` 只说明"无法判断"，**不说明进程不存在**。
+    正确的判据是 `is True` / `is False` 分别处理——`None` 时只能改用别的证据（HTTP 探测、
+    进程名轮询）。把 `None` 当"已退出"会让一次正常的运行被误判成陈旧文件（或反过来漏掉强杀）。
 
     ⚠️ Windows 上**绝不能**用 `os.kill(pid, 0)` 做存在性检查 —— 在 Windows 上
     它不是"发信号 0"，而是会走到 `TerminateProcess`，**真的把目标进程杀掉**。
@@ -148,46 +172,248 @@ def pid_alive(pid: int | None) -> bool | None:
         kernel32.CloseHandle(handle)
 
 
-def load_bridge_info(path: Path | None = None) -> BridgeInfo:
-    """读取并校验 `bridge.json`。
+# 表示"文件里没有这个键"（与"键在、值是 null"区分开）
+_MISSING = object()
 
-    文件不存在时给出**可操作**的提示（游戏没开？Mod 没装？），而不是一句 FileNotFoundError。
+# 容错读取的**非致命**字段（协议里的字段名）。`schema`/`port`/`token` 不在此列：
+# 它们是"能不能连上"的硬前提，拼错就该明确失败，而不是被容错掩盖。
+TOLERANT_FIELDS = ("pid", "modVersion", "gameVersion", "smapiVersion", "startedAt")
+
+
+def _norm_field_name(name: str) -> str:
+    """字段名归一：小写 + 去掉下划线（`modVersion`/`mod_version`/`ModVersion` → `modversion`）。"""
+    return name.lower().replace("_", "")
+
+
+def _find_key(raw: dict[str, Any], canonical: str) -> str | None:
+    """找出 `canonical` 字段在文件里实际的键名；没有则 `None`。
+
+    查找优先级：**精确**（协议写法）> 大小写/下划线变体（`Pid`、`mod_version`、`ModVersion`）。
+    ⚠️ 只对 `TOLERANT_FIELDS` 用；`schema`/`port`/`token` 仍走精确键名。
     """
-    p = Path(path) if path is not None else default_bridge_json_path()
-    if not p.exists():
+    if canonical in raw:
+        return canonical
+    target = _norm_field_name(canonical)
+    for key in raw:
+        if isinstance(key, str) and _norm_field_name(key) == target:
+            return key
+    return None
+
+
+def _get_field(raw: dict[str, Any], canonical: str) -> tuple[Any, str | None]:
+    """容错取字段值，返回 `(值, 文件里实际的键名)`；文件里没有则 `(_MISSING, None)`。
+
+    为什么要容错：Mod 侧写出的键名是固定的 `pid`/`modVersion`…（`BridgeHost.cs` 里每个属性都有
+    显式 `[JsonPropertyName]`），但**旧版 Mod、人工手写的文件、或换了序列化策略的文件**可能写成
+    `Pid`/`mod_version`。此时 `raw.get("pid")` 会**静默返回 None**（不报错、不警告），而
+    `pid_alive(None)` 只回答"不知道"——上层若把 `None` 当成"进程已死"就会误判。
+    """
+    key = _find_key(raw, canonical)
+    if key is None:
+        return _MISSING, None
+    return raw[key], key
+
+
+def _collect_fields(raw: dict[str, Any]) -> tuple[dict[str, Any], list[tuple[str, str]], list[str]]:
+    """读取全部协议字段，返回 `(值表, recognized, notes)`。
+
+    **只读**：不做 schema/port/token 校验、不抛异常、不改任何东西。
+    `schema`/`port`/`token` 用**精确键名**（语义与以前逐字一致）；`TOLERANT_FIELDS` 走
+    `_find_key` 容错，并把"文件里实际的键名"记进 `recognized`、拼写漂移记进 `notes`。
+    """
+    values: dict[str, Any] = {}
+    recognized: list[tuple[str, str]] = []
+    notes: list[str] = []
+
+    def take(canonical: str, *, tolerant: bool) -> None:
+        if tolerant:
+            value, found = _get_field(raw, canonical)
+        else:
+            found = canonical if canonical in raw else None
+            value = raw[canonical] if found is not None else _MISSING
+        if found is not None:
+            recognized.append((canonical, found))
+            if found != canonical:
+                notes.append(
+                    f"bridge.json 用 {found!r} 而不是协议里的 {canonical!r}"
+                    f"（已按大小写/下划线不敏感读出）"
+                )
+        values[canonical] = value
+
+    for strict_field in ("schema", "port", "token"):
+        take(strict_field, tolerant=False)
+    for field in TOLERANT_FIELDS:
+        take(field, tolerant=True)
+    return values, recognized, notes
+
+
+def _parse_pid(value: Any) -> int | None:
+    """把 `pid` 字段转成正整数；转不了返回 `None`（**不抛异常**）。
+
+    能接受：`24444`、`"24444"`、`" 24444 "`、`24444.0`（JSON 里写成浮点的整数值）。
+    不接受：`true`/`false`（bool 是 int 的子类，但它不是 pid）、`"abc"`、`0`、负数、非整数浮点。
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float):
+        if not value.is_integer():
+            return None
+        parsed = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not (text.isdigit() or (text[:1] in "+-" and text[1:].isdigit())):
+            return None
+        parsed = int(text)
+    else:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    """读 `bridge.json` 并确保顶层是对象；失败一律抛**显式**的 `BridgeError`。"""
+    if not path.exists():
         raise BridgeError(
-            f"找不到 {p}。请确认：① 游戏已通过 SMAPI 启动；② 已加载存档；"
+            f"找不到 {path}。请确认：① 游戏已通过 SMAPI 启动；② 已加载存档；"
             f"③ Mod AgentFarm.Bridge 已安装并成功加载。",
             status="bridge_file_missing",
         )
     try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise BridgeError(f"{p} 不是合法 JSON：{exc}", status="bridge_file_invalid") from exc
+        raise BridgeError(f"{path} 不是合法 JSON：{exc}", status="bridge_file_invalid") from exc
+    if not isinstance(raw, dict):
+        # 顶层是数组/字符串时，旧写法会在 raw.get 上抛裸 AttributeError（不是 BridgeError）
+        raise BridgeError(
+            f"{path} 的顶层不是 JSON 对象，实际是 {type(raw).__name__}",
+            status="bridge_file_invalid",
+        )
+    return raw
 
-    schema = str(raw.get("schema", ""))
+
+def inspect_bridge_json(path: Path | None = None) -> dict[str, Any]:
+    """**只读取证钩子**：把"原始键名"与"解析结果"一次摆出来（真机双向取证用，task-13 要求）。
+
+    给 machine-runner 的用法：对磁盘上那份 `bridge.json` 调一次，就能同时拿到
+    "原始 pid 键 + 值"和"`load_bridge_info().pid`"两行读数，从而区分
+    **Mod 写错键名** 与 **脑读错字段**。
+
+    返回机器可读 dict（可直接 `json.dumps`）：`path`、`raw_keys`、`raw_pid_key`、
+    `raw_pid_value`、`parsed_pid`、`recognized`、`ignored_keys`、`notes`。
+
+    真机用法（起跑前各跑一次，就是那"两行读数"；`PYTHONPATH` 指向 `brain`）::
+
+        python -c "import json;from agentfarm.bridge import inspect_bridge_json as i;print(json.dumps(i(),ensure_ascii=False))"
+        python -c "from agentfarm.bridge import load_bridge_info as l;print(l().pid)"
+
+    **不做 schema/port/token 校验、也不因它们不合法而抛异常**（真机排查要一次看全）；
+    只有"文件不存在 / 不是合法 JSON / 顶层不是对象"才抛 `BridgeError`——那正是要报告的事实。
+    """
+    p = Path(path) if path is not None else default_bridge_json_path()
+    raw = _read_json_object(p)
+    values, recognized, notes = _collect_fields(raw)
+    if values["pid"] is _MISSING or values["pid"] is None:
+        notes.append("pid 缺失或为 null：pid_alive() 只会返回 None（不知道），不得当成“进程死了”")
+    elif _parse_pid(values["pid"]) is None:
+        notes.append(
+            f"pid={values['pid']!r} 不是合法进程号：pid_alive() 只会返回 None（不知道），"
+            f"不得当成“进程死了”"
+        )
+    used = {found for _, found in recognized}
+    return {
+        "path": str(p),
+        "raw_keys": list(raw.keys()),
+        "raw_pid_key": dict(recognized).get("pid"),
+        "raw_pid_value": None if values["pid"] is _MISSING else values["pid"],
+        "parsed_pid": _parse_pid(values["pid"]),
+        "recognized": [[canonical, found] for canonical, found in recognized],
+        "ignored_keys": [key for key in raw if key not in used],
+        "notes": notes,
+    }
+
+
+def load_bridge_info(path: Path | None = None) -> BridgeInfo:
+    """读取并校验 `bridge.json`（读文件 → `parse_bridge_info`）。
+
+    文件不存在时给出**可操作**的提示（游戏没开？Mod 没装？），而不是一句 FileNotFoundError。
+    字段容错口径见 `parse_bridge_info`；只读取证用 `inspect_bridge_json`。
+    """
+    p = Path(path) if path is not None else default_bridge_json_path()
+    return parse_bridge_info(_read_json_object(p), path=p)
+
+
+def parse_bridge_info(raw: dict[str, Any], *, path: Path | None = None) -> BridgeInfo:
+    """从**已经读进来的 dict** 解析并校验 `bridge.json`（`load_bridge_info` 的主体）。
+
+    单独暴露它有两个用途：① 真机排查可一次拿到"原始键名 + 解析结果"（见 `inspect_bridge_json`）；
+    ② 单测能直接喂畸形 dict，不必每次落盘。
+
+    字段容错口径（task-13）——**只对非致命字段**：
+      * `pid` / `modVersion` / `gameVersion` / `smapiVersion` / `startedAt`
+        按**大小写 + 下划线不敏感**读取（`Pid`、`mod_version`、`ModVersion` 都认），
+        `pid` 还接受字符串数字（`"24444"`）；读不出来**不抛异常**，`pid` 记 `None`
+        并把原因写进 `BridgeInfo.notes`（"存活判定不可用"，调用方不得据此断定进程不存在）。
+      * `port` 仍接受字符串数字（`"17890"`），但**缺失/是垃圾**继续抛 `bridge_file_invalid`；
+        `token` 缺失继续抛 `bridge_file_invalid`；`schema` 不符继续抛 `schema_mismatch`。
+        这三个一个字的校验语义都不许放宽——它们是"能不能连上"的硬前提。
+    """
+    values, recognized, notes = _collect_fields(raw)
+
+    schema_value = values["schema"]
+    schema = "" if schema_value is _MISSING else str(schema_value)
     if schema != SCHEMA_BRIDGE:
         raise BridgeError(
             f"bridge.json 的 schema 是 {schema!r}，期望 {SCHEMA_BRIDGE!r}。"
             f"两侧协议版本不一致，拒绝继续（协议 §8）。",
             status="schema_mismatch",
         )
+    if values["port"] is _MISSING or values["token"] is _MISSING:
+        # 必须显式判缺失：`str(_MISSING)` 不会抛异常，会静默把哨兵对象当成 token
+        missing = "/".join(name for name in ("port", "token") if values[name] is _MISSING)
+        raise BridgeError(f"{path or 'bridge.json'} 缺少 port/token 字段：缺 {missing}",
+                          status="bridge_file_invalid")
     try:
-        port = int(raw["port"])
-        token = str(raw["token"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise BridgeError(f"{p} 缺少 port/token 字段：{exc}", status="bridge_file_invalid") from exc
+        port = int(values["port"])
+        token = str(values["token"])
+    except (TypeError, ValueError) as exc:
+        raise BridgeError(f"{path or 'bridge.json'} 缺少 port/token 字段：{exc}",
+                          status="bridge_file_invalid") from exc
 
+    raw_pid = values["pid"]
+    pid = _parse_pid(raw_pid)
+    if pid is None:
+        if raw_pid is _MISSING or raw_pid is None:
+            notes.append(
+                "bridge.json 里没有 pid：pid_alive() 只会返回 None（不知道进程是否存在），"
+                "调用方不得据此断定游戏已退出"
+            )
+        else:
+            notes.append(
+                f"bridge.json 的 pid={raw_pid!r} 不是合法进程号，已按“未知”处理："
+                f"pid_alive() 只会返回 None，调用方不得据此断定游戏已退出"
+            )
+
+    def text(field: str) -> str:
+        value = values[field]
+        return "" if value is _MISSING or value is None else str(value)
+
+    used = {found for _, found in recognized}
     return BridgeInfo(
         schema=schema,
         port=port,
         token=token,
-        pid=raw.get("pid"),
-        mod_version=str(raw.get("modVersion", "")),
-        game_version=str(raw.get("gameVersion", "")),
-        smapi_version=str(raw.get("smapiVersion", "")),
-        started_at=str(raw.get("startedAt", "")),
-        path=p,
+        pid=pid,
+        mod_version=text("modVersion"),
+        game_version=text("gameVersion"),
+        smapi_version=text("smapiVersion"),
+        started_at=text("startedAt"),
+        path=Path(path) if path is not None else default_bridge_json_path(),
+        notes=tuple(notes),
+        audit=BridgeFileAudit(
+            recognized=tuple(recognized),
+            ignored=tuple(key for key in raw if key not in used),
+        ),
     )
 
 
@@ -475,13 +701,20 @@ class BridgeClient:
         空耕地→hoe、有作物的耕地→can），并在回执的 `reason` 里**报出真实用的那件物品名** ——
         所以脑必须读回执核对"它到底拿了什么工具"，不能假设。
 
-        实现走**游戏自己的入口** `Game1.pressUseToolButton()`（api-probe 实证存在；
-        `Farmer.UseTool(...)` / `completeToolUse()` 在 1.6.15 **不存在**），选工具用 `CurrentToolIndex`。
+        实现**故意不走** `Game1.pressUseToolButton()`：它对近战武器（镰刀）有一道"必须真有鼠标/
+        手柄输入边沿"的门闸（`Game1.didPlayerJustLeftClick`，只认本帧刚按下的输入），桥驱动时恒为假
+        ⇒ **镰刀一刀都挥不出去**（真机 run1：非 grass 7/7 全成功、grass 5/5 全失败）。
+        Mod ≥ 0.7.22 改为照抄它在门闸**之后**的那段（`GetToolLocation` → `FacingDirection` →
+        `lastClick` → `Farmer.BeginUsingTool()`），只把"人手鼠标的像素位置"换成**目标格中心**；
+        拿不到 player/工具或抛异常时仍回退 `pressUseToolButton()`。选工具仍用 `CurrentToolIndex`。
+        `Farmer.UseTool(...)` / `completeToolUse()` 在 1.6.15 **不存在**。
         纪律同 `interact`/`dismiss_modal`：不合成键鼠事件。
 
         ⚠️ **验收必须用 observe 的 `location.tiles[]` 差分**：回执只是声明，格子上东西没了才是证据。
-        失败状态码：`precondition_failed`（没这类工具/有模态）、`tool_ineffective`（挥满 6 次目标格仍在）、
-        `timeout`、`no_save`。
+        失败状态码：`precondition_failed`（没这类工具/有模态/这一格锄不了）、`tool_ineffective`
+        （挥满 6 次目标格仍在，回执里带"起手=是/否"与"现在还是 <kind>"）、`timeout`、`no_save`、
+        `world_fading`（屏幕渐黑/过场，Mod 侧 `fadeToBlack`/`nonWarpFade` —— **可重试**，脑记 failed
+        但**不封格**，见 `farmwork.ENV_BLOCK_STATUSES`；0.7.22 之前不会出现这个码）。
         """
         args: dict[str, Any] = {}
         if tile is not None:

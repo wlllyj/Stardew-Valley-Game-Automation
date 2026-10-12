@@ -19,7 +19,7 @@ import json
 import os
 import sys
 import time
-from typing import Any
+from typing import Any, Callable
 
 from .bridge import (
     BASELINE_GAME_VERSION,
@@ -28,6 +28,7 @@ from .bridge import (
     SCHEMA_WORLD,
     BridgeClient,
     BridgeError,
+    BridgeInfo,
     default_bridge_json_path,
     load_bridge_info,
     pid_alive,
@@ -495,6 +496,73 @@ def cmd_load(args: argparse.Namespace) -> int:
     return 0
 
 
+def _taskkill(pid: int) -> bool:
+    """强杀进程（仅 Windows；别的平台返回 False）。**兜底用**，正常路径不该走到。"""
+    if os.name != "nt":
+        return False
+    return os.system(f'taskkill /PID {int(pid)} /F >NUL 2>&1') == 0
+
+
+def _bridge_responds(client: BridgeClient, timeout: float = 2.0) -> bool:
+    """桥还答话吗（`health()`）——`pid` 不可用时的**独立判活证据**。只读，不驱动游戏。"""
+    try:
+        client.health(timeout=timeout)
+        return True
+    except BridgeError:
+        return False
+
+
+def await_game_exit(
+    info: BridgeInfo,
+    seconds: int,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    bridge_responds: Callable[[], bool] | None = None,
+    kill: Callable[[int], bool] = _taskkill,
+    out: Callable[[str], None] = print,
+) -> int:
+    """等游戏进程真的消失（最多 `seconds` 秒），超时则强杀。返回 CLI 退出码。
+
+    `quit_game` 的回执本身可能收不到（Mod 正在退出），所以判活必须**三态**——**`None` 不是 `False`**：
+      * `True`  ⇒ 确实还活着 → 继续等；
+      * `False` ⇒ 确实不在了 → 报"已退出"并返回 0；
+      * `None`  ⇒ **不知道**（`bridge.json` 缺 `pid`，或平台不支持）= 既不是"活着"，也**不是"已退出"**：
+        绝不走"已退出"分支。此时改用 `bridge_responds()`（HTTP `health()`）取独立证据——桥还在应答
+        ⇒ 进程显然还活着，继续等；桥不应答 ⇒ 也**只是"没有证据"**，照样把时间等完。
+    超时后：`pid` 是正整数 → 强杀并返回 0；**`pid` 未知 → 老实报"存活未知、无法强杀"并返回 1**
+    （本模块的原则是"只报告事实，不美化失败"：没能确认进程消失就不能报成功）。
+
+    【为什么需要这个函数】旧写法 `if pid_alive(info.pid) is not True:` 把 `None` 一并当成"已退出"，
+    于是 `bridge.json` 缺 `pid` 时会**立刻** `return 0`，跳过整个强杀兜底 —— 无人值守时游戏可能还挂着，
+    部署脚本却以为它已经关了。拆成纯函数也是为了能用**行为**断言测它（是否强杀/返回码），
+    而不是只断言日志文本。
+    """
+    pid = info.pid
+    ticks = max(0, int(seconds))
+    noted_unknown = False
+    for _ in range(ticks):
+        alive = pid_alive(pid)
+        if alive is False:
+            out(f"{OK} 游戏进程（pid {pid}）已退出")
+            return 0
+        if alive is None and not noted_unknown:
+            noted_unknown = True                      # 只解释一次，避免刷屏
+            if bridge_responds is not None and bridge_responds():
+                out(f"{WARN} 无法按 pid 判活（bridge.json 里可用的 pid = {pid!r}），但桥仍在应答 "
+                    f"⇒ 进程显然还活着，继续等待")
+            else:
+                out(f"{WARN} 无法按 pid 判活（bridge.json 里可用的 pid = {pid!r}），桥也没应答："
+                    f"存活未知，**不等于**已退出，继续等满 {ticks}s")
+        sleep(1)
+    if pid is None:
+        out(f"{WARN} 等了 {ticks}s 仍无法判定游戏进程是否退出（bridge.json 缺 pid，无法强杀）："
+            f"请手动确认进程是否还在")
+        return 1
+    out(f"{WARN} 等了 {ticks}s 进程仍在（pid {pid}），强杀")
+    kill(int(pid))
+    return 0
+
+
 def cmd_shutdown(args: argparse.Namespace) -> int:
     """让游戏**自己退出**（quit_game）。
 
@@ -511,17 +579,14 @@ def cmd_shutdown(args: argparse.Namespace) -> int:
 
     print(f"{OK} {res.get('status')}：{res.get('reason')}")
     if args.force_after and not args.no_force:
-        # 兜底：等进程真的消失，超时就强杀（先备份存档是调用方的责任）
+        # 兜底：等进程真的消失，超时就强杀（先备份存档是调用方的责任）。
+        # 三态判活见 await_game_exit —— pid 未知时**绝不**当成"已退出"。
         info = load_bridge_info()
-        for _ in range(int(args.force_after)):
-            if pid_alive(info.pid) is not True:
-                print(f"{OK} 游戏进程（pid {info.pid}）已退出")
-                return 0
-            time.sleep(1)
-        print(f"{WARN} 等了 {args.force_after}s 进程仍在（pid {info.pid}），强杀")
-        if os.name == "nt":
-            os.system(f'taskkill /PID {info.pid} /F >NUL 2>&1')
-        return 0
+        return await_game_exit(
+            info,
+            int(args.force_after),
+            bridge_responds=lambda: _bridge_responds(client),
+        )
     return 0
 
 

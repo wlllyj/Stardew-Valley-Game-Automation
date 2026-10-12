@@ -533,15 +533,6 @@ namespace AgentFarm.Bridge
             return null;
         }
 
-        /// <summary>
-        /// 按"这一格现在应该长成什么样"判断做完了没。**这是条目 022 之后最重要的修正**：
-        /// 旧判据统一是"该格没有物体"，而空洞本来就没有物体 ⇒ **对着房子墙边的空地挥锄也会报 ok**，
-        /// 真机就踩到了（报告"已经空了"，可那格根本没有 HoeDirt）。
-        /// 现在按工具分别判定：
-        ///   * `hoe` → 该格**变成耕地**（HoeDirt）；
-        ///   * `can` → 该格是耕地**且已浇水**；
-        ///   * 其余（axe/pickaxe/scythe）→ 该格上的**物体没了**（树/资源堆/果树这类地形也算"东西"）。
-        /// </summary>
         /// <summary>回执里报"这格现在到底是什么"（别拿"应该是"糊弄）。</summary>
         private string KindNow()
         {
@@ -560,6 +551,15 @@ namespace AgentFarm.Bridge
             try { return Game1.fadeToBlack || Game1.nonWarpFade; } catch { return false; }
         }
 
+        /// <summary>
+        /// 按"这一格现在应该长成什么样"判断做完了没。**这是条目 022 之后最重要的修正**：
+        /// 旧判据统一是"该格没有物体"，而空洞本来就没有物体 ⇒ **对着房子墙边的空地挥锄也会报 ok**，
+        /// 真机就踩到了（报告"已经空了"，可那格根本没有 HoeDirt）。
+        /// 现在按工具分别判定：
+        ///   * `hoe` → 该格**变成耕地**（HoeDirt）；
+        ///   * `can` → 该格是耕地**且已浇水**；
+        ///   * 其余（axe/pickaxe/scythe）→ 该格上的**物体没了**（树/资源堆/果树这类地形也算"东西"）。
+        /// </summary>
         private bool Done()
         {
             try

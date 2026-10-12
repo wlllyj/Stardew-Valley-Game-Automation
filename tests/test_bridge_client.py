@@ -30,7 +30,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "brain"))
 from agentfarm.bridge import (  # noqa: E402
     BridgeClient,
     BridgeError,
+    inspect_bridge_json,
     load_bridge_info,
+    parse_bridge_info,
+    pid_alive,
 )
 
 TOKEN = "0123456789abcdef0123456789abcdef"
@@ -190,6 +193,211 @@ class BridgeClientTest(unittest.TestCase):
         with self.assertRaises(BridgeError) as ctx:
             load_bridge_info()
         self.assertEqual(ctx.exception.status, "schema_mismatch")
+
+    # ---------- bridge.json 字段容错（task-13） ----------
+    # 背景：machine-runner 报「pid 读出来是 None」经复核**不成立**（键名就是 `pid`，合成文件能读出
+    # 24444）；但复核过程暴露了真正的静默失败面——键名大小写不同时 `raw.get("pid")` 直接返回 None，
+    # 不报错、不警告，而 `pid_alive(None)` 只回答"不知道"，上层若当 False 就会误判 run3 preflight。
+    def _standard_bridge_json(self) -> dict:
+        """标准写法（键名与 Mod 侧 `[JsonPropertyName]` 逐字一致）。"""
+        return {
+            "schema": "agentfarm-bridge/1", "port": self.port, "token": TOKEN, "pid": 24444,
+            "modVersion": "0.7.22", "gameVersion": "1.6.15", "smapiVersion": "4.5.2",
+            "startedAt": "2026-10-13T00:00:00+07:00",
+        }
+
+    def _write_raw_bridge_json(self, obj: dict) -> None:
+        self.bridge_json.write_text(json.dumps(obj), encoding="utf-8")
+
+    def test_pid_standard_key_is_read(self) -> None:
+        self._write_raw_bridge_json(self._standard_bridge_json())
+        info = load_bridge_info()
+        self.assertEqual(info.pid, 24444)
+        self.assertEqual(info.notes, ())          # 标准写法下不该有任何注记
+
+    def test_pid_key_case_insensitive(self) -> None:
+        """键名写成 `Pid` 时也必须读出来（旧版 Mod / 人工手写的文件），并留下注记。"""
+        obj = self._standard_bridge_json()
+        obj["Pid"] = obj.pop("pid")
+        self._write_raw_bridge_json(obj)
+        info = load_bridge_info()
+        self.assertEqual(info.pid, 24444)
+        self.assertTrue(any("Pid" in n for n in info.notes), info.notes)
+
+    def test_pid_string_number_is_coerced(self) -> None:
+        obj = self._standard_bridge_json()
+        obj["pid"] = "24444"
+        self._write_raw_bridge_json(obj)
+        self.assertEqual(load_bridge_info().pid, 24444)
+
+    def test_version_fields_case_insensitive(self) -> None:
+        """同类静默丢字段：modVersion/gameVersion/smapiVersion/startedAt 的大写变体也要读到。"""
+        obj = self._standard_bridge_json()
+        obj["ModVersion"] = obj.pop("modVersion")
+        obj["GameVersion"] = obj.pop("gameVersion")
+        obj["SmapiVersion"] = obj.pop("smapiVersion")
+        obj["StartedAt"] = obj.pop("startedAt")
+        self._write_raw_bridge_json(obj)
+        info = load_bridge_info()
+        self.assertEqual(info.mod_version, "0.7.22")
+        self.assertEqual(info.game_version, "1.6.15")
+        self.assertEqual(info.smapi_version, "4.5.2")
+        self.assertEqual(info.started_at, "2026-10-13T00:00:00+07:00")
+
+    def test_missing_pid_is_none_and_never_raises(self) -> None:
+        obj = self._standard_bridge_json()
+        obj.pop("pid")
+        self._write_raw_bridge_json(obj)
+        info = load_bridge_info()                    # 缺 pid 不是错误
+        self.assertIsNone(info.pid)
+        self.assertTrue(info.notes, "缺 pid 必须留下「存活判定不可用」的说明")
+        self.assertIsNone(pid_alive(info.pid))       # None = 不知道，调用方不得当 False
+
+    def test_invalid_pid_is_none_with_note(self) -> None:
+        obj = self._standard_bridge_json()
+        obj["pid"] = "abc"
+        self._write_raw_bridge_json(obj)
+        info = load_bridge_info()                    # 非法值也不许抛异常
+        self.assertIsNone(info.pid)
+        self.assertTrue(any("abc" in n for n in info.notes), info.notes)
+
+    def test_missing_port_or_token_still_invalid(self) -> None:
+        """边界：容错**不许**蔓延到 port/token —— 它们是"能不能连上"的硬前提。"""
+        for field in ("port", "token"):
+            with self.subTest(field=field):
+                obj = self._standard_bridge_json()
+                obj.pop(field)
+                self._write_raw_bridge_json(obj)
+                with self.assertRaises(BridgeError) as ctx:
+                    load_bridge_info()
+                self.assertEqual(ctx.exception.status, "bridge_file_invalid")
+
+    def test_port_case_variant_still_invalid(self) -> None:
+        """`Port`（大小写不同）**不算** port：不敏感容错只给非致命字段。"""
+        obj = self._standard_bridge_json()
+        obj["Port"] = obj.pop("port")
+        self._write_raw_bridge_json(obj)
+        with self.assertRaises(BridgeError) as ctx:
+            load_bridge_info()
+        self.assertEqual(ctx.exception.status, "bridge_file_invalid")
+
+    def test_schema_mismatch_still_raised(self) -> None:
+        obj = self._standard_bridge_json()
+        obj["schema"] = "agentfarm-bridge/999"
+        self._write_raw_bridge_json(obj)
+        with self.assertRaises(BridgeError) as ctx:
+            load_bridge_info()
+        self.assertEqual(ctx.exception.status, "schema_mismatch")
+
+    def test_snake_case_spellings_are_read(self) -> None:
+        """`mod_version` 这类蛇形拼写也要认：归一化只看「小写 + 去下划线」。"""
+        obj = self._standard_bridge_json()
+        obj["mod_version"] = obj.pop("modVersion")
+        obj["game_version"] = obj.pop("gameVersion")
+        obj["smapi_version"] = obj.pop("smapiVersion")
+        obj["started_at"] = obj.pop("startedAt")
+        self._write_raw_bridge_json(obj)
+        info = load_bridge_info()
+        self.assertEqual(info.mod_version, "0.7.22")
+        self.assertEqual(info.game_version, "1.6.15")
+        self.assertEqual(info.smapi_version, "4.5.2")
+        self.assertEqual(info.started_at, "2026-10-13T00:00:00+07:00")
+        self.assertEqual(info.pid, 24444)              # pid 没漂移，仍精确命中
+        self.assertEqual(len(info.notes), 4, info.notes)   # 每个漂移字段各一条注记
+
+    def test_lowercase_and_dot_variants_are_read(self) -> None:
+        """`modversion`（全小写、无下划线）与 `PID`（全大写）同样要认。"""
+        obj = self._standard_bridge_json()
+        obj["PID"] = obj.pop("pid")
+        obj["modversion"] = obj.pop("modVersion")
+        self._write_raw_bridge_json(obj)
+        info = load_bridge_info()
+        self.assertEqual(info.pid, 24444)
+        self.assertEqual(info.mod_version, "0.7.22")
+
+    def test_port_string_number_is_accepted(self) -> None:
+        """port 写成字符串数字时要能解析（JSON 手写/旧版 Mod 都可能）。"""
+        obj = self._standard_bridge_json()
+        obj["port"] = str(self.port)
+        self._write_raw_bridge_json(obj)
+        self.assertEqual(load_bridge_info().port, self.port)
+
+    def test_port_garbage_is_rejected(self) -> None:
+        """port 是垃圾 ⇒ 仍必须抛 `bridge_file_invalid`（容错不蔓延到硬前提）。"""
+        for bad in ("abc", "", None, [], {"x": 1}):
+            with self.subTest(port=bad):
+                obj = self._standard_bridge_json()
+                obj["port"] = bad
+                self._write_raw_bridge_json(obj)
+                with self.assertRaises(BridgeError) as ctx:
+                    load_bridge_info()
+                self.assertEqual(ctx.exception.status, "bridge_file_invalid")
+
+    def test_top_level_not_object_is_invalid(self) -> None:
+        """顶层不是 JSON 对象时给明确错误，而不是裸 AttributeError。"""
+        self.bridge_json.write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
+        with self.assertRaises(BridgeError) as ctx:
+            load_bridge_info()
+        self.assertEqual(ctx.exception.status, "bridge_file_invalid")
+
+    def test_parse_bridge_info_accepts_raw_dict(self) -> None:
+        """解析主体可脱离文件直接吃 dict（单测/真机排查都不用落盘）。"""
+        info = parse_bridge_info(dict(self._standard_bridge_json()))
+        self.assertEqual(info.pid, 24444)
+        self.assertEqual(info.port, self.port)
+        self.assertEqual(info.audit.ignored, ())
+
+    def test_audit_reports_recognized_and_ignored_keys(self) -> None:
+        """审计：哪些键被识别（协议名 → 文件里的实际键名）、哪些键解析器不认识。"""
+        obj = self._standard_bridge_json()
+        obj["Pid"] = obj.pop("pid")
+        obj["mod_version"] = obj.pop("modVersion")
+        obj["futureField"] = 1                     # 未来新增/写错的键
+        self._write_raw_bridge_json(obj)
+        recognized = dict(load_bridge_info().audit.recognized)
+        self.assertEqual(recognized["pid"], "Pid")
+        self.assertEqual(recognized["modVersion"], "mod_version")
+        self.assertEqual(recognized["port"], "port")
+        self.assertEqual(load_bridge_info().audit.ignored, ("futureField",))
+
+    def test_inspect_hook_gives_raw_and_parsed_pid(self) -> None:
+        """真机双向取证（task-13 要求）：一次调用同时给出「原始 pid 键/值」与「解析后的 pid」。"""
+        obj = self._standard_bridge_json()
+        obj["Pid"] = obj.pop("pid")
+        obj["whoKnows"] = True
+        self._write_raw_bridge_json(obj)
+        report = inspect_bridge_json()
+        self.assertEqual(report["raw_pid_key"], "Pid")
+        self.assertEqual(report["raw_pid_value"], 24444)
+        self.assertEqual(report["parsed_pid"], 24444)
+        self.assertIn("Pid", report["raw_keys"])
+        self.assertEqual(report["ignored_keys"], ["whoKnows"])
+        self.assertIn(["pid", "Pid"], [list(pair) for pair in report["recognized"]])
+        json.dumps(report, ensure_ascii=False)     # 必须可序列化，machine-runner 直接用
+
+    def test_inspect_hook_does_not_validate(self) -> None:
+        """取证钩子**不做** schema/port/token 校验：排查时要一次看全，而不是被第一个错误挡住。"""
+        obj = self._standard_bridge_json()
+        obj["schema"] = "agentfarm-bridge/999"
+        obj["port"] = "abc"
+        obj["token"] = ""
+        self._write_raw_bridge_json(obj)
+        report = inspect_bridge_json()             # 不抛异常
+        self.assertEqual(report["parsed_pid"], 24444)
+        self.assertEqual(report["ignored_keys"], [])
+        # 同样的文件走 load_bridge_info 则必须先被 schema 挡住
+        with self.assertRaises(BridgeError) as ctx:
+            load_bridge_info()
+        self.assertEqual(ctx.exception.status, "schema_mismatch")
+
+    def test_inspect_hook_reports_missing_pid_reason(self) -> None:
+        obj = self._standard_bridge_json()
+        obj.pop("pid")
+        self._write_raw_bridge_json(obj)
+        report = inspect_bridge_json()
+        self.assertIsNone(report["raw_pid_value"])
+        self.assertIsNone(report["parsed_pid"])
+        self.assertTrue(any("不知道" in n for n in report["notes"]), report["notes"])
 
     # ---------- 正常路径 ----------
     def test_health(self) -> None:

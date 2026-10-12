@@ -77,6 +77,41 @@ def _till_blocked_by(tv: dict[str, Any] | None, player: dict[str, Any] | None = 
     return till_blocked_by(tv, player)
 
 
+def statuses_of(step: StepResult) -> list[str]:
+    """抽出这一步涉及的 Mod status（**只用于 journal 汇总，不做任何判据**）。
+
+    三个来源，按可靠性排序：
+    1. `after["statuses"]` —— `FarmWorker.clear()` 会把整轮收到的每个非空 status 收集进这里；
+    2. `reason` 里的 `Mod status=x`（`till`/`plant`/`water`/`harvest`/`refill` 会附加）；
+    3. 回执前缀 `status: 文本`（`_receipt(exc)` 的格式；拿不到 status 的异常按 `error`）。
+
+    task-22：journal 里要能一眼看出"这一次到底是渐黑、模态，还是超时"，而不是只有一个 failed。
+    """
+    out: list[str] = []
+    after = step.after if isinstance(step.after, dict) else {}
+    raw = after.get("statuses") if isinstance(after, dict) else None
+    if isinstance(raw, (list, tuple)):
+        out.extend(str(x) for x in raw if x)
+    reason = step.reason or ""
+    i = reason.find("status=")
+    while i >= 0:
+        tail = reason[i + len("status="):]
+        j = 0
+        while j < len(tail) and (tail[j].isalnum() or tail[j] == "_"):
+            j += 1
+        if j:
+            out.append(tail[:j])
+        i = reason.find("status=", i + 1)
+    head = (step.receipt or "").split(":", 1)[0].strip()
+    if head and len(head) <= 32 and " " not in head:
+        out.append(head)
+    uniq: list[str] = []
+    for s in out:
+        if s and s not in uniq:
+            uniq.append(s)
+    return uniq
+
+
 #: "上一天未知"的哨兵日键：用来把**一天的第一次决策**顶到 `new_day` 边界上
 #: （`detect_boundary` 只在两边都非空且不相等时才判跨日，所以放 None 是没用的）。
 _DAY_START_SENTINEL: tuple[int, str, int] = (-1, "longrun-day-start", -1)
@@ -784,8 +819,11 @@ class LongRun:
         rep.final = self._essence(obs)          # ← 睡前观测：一天的验收就拿它当差分右端
         st = self.worker.sleep(home=self.home)
         self._actions += 1
+        # 【task-8 D】receipt 必须进 journal：sleep 的失败原因全在 Mod 回执原文里
+        # （`sleep_no_question` 带 lastQuestionKey/isInBed/activeMenu 诊断，`timeout` 带
+        # newDaySync 现场）。旧实现只记 reason ⇒ run2 的 journal 里只剩一句"睡觉请求失败"。
         self._journal("sleep", ok=st.ok, code=st.code, reason=st.reason,
-                      before=st.before, after=st.after)
+                      before=st.before, after=st.after, receipt=st.receipt)
         if st.ok:
             self._say(f"  · 睡觉：{st.reason}（{why}）")
             rep.notes.append(f"主动睡觉：{why}；{st.reason}")
@@ -834,12 +872,20 @@ class LongRun:
         - `s.proven_inert`（task-4 新增）：**动手前**判据就成立、压根没挥（缺工具 / 观测说这格
           今天动不了）。这种"zero-cost skip"同样是"今天别再碰它"的结论，但**不记 failed** ——
           真机 run1 的两个 grass 格就是这么被连挥两次、真花体力的（用户 m01804）。
+
+        **但两类失败不许封格**（task-22，两者都靠 `FarmWorker` 打的显式标记）：
+        - `s.env_block`（渐黑 / 模态 / 没存档）：环境挡路**不是**这一格的属性，世界好了这格还得做；
+        - `s.inconclusive`（超时 / 异常 / 没见过的码）：连结论都没拿到，更没资格判它"干不动"。
+          这两类如实卡在 `leftover` 里 ⇒ `met=False`、当天 needs_review。
         """
         before = self._tile_states(before_obs)
         after = self._tile_states(after_obs)
         marked = 0
         for s in steps:
             if not (s.failed or s.proven_inert) or not s.tile or s.action not in ("till", "clear", "sow"):
+                continue
+            if s.env_block or s.inconclusive:
+                # 环境挡路 / 没结论 ≠ 这一格干不动：不封格（记进 env_fail/inconclusive_fail 汇总）。
                 continue
             key = tuple(s.tile)
             if key in self.blocked or before.get(key) != after.get(key):
@@ -859,9 +905,19 @@ class LongRun:
         （或只是种子/水不够这种资源问题）更不该占配额 —— 同一格一天"清障 → 锄地 → 播种"
         是三次**正常**动作，按发起次数封格会把好格子一起封掉（单测
         `test_single_day_verified_and_world_changed` 当场抓到：25 格里 5 格永远种不下去）。
+
+        **`env_block` 不占配额**（task-22 §4.7）：本函数**不带动作过滤**，浇水/收获/补水/走路
+        上的任何失败都会落到这里 —— 一次瞬时渐黑或模态（`timeout`/`no_save`/`ui_modal`/
+        `world_fading` 是全桥通用 status）本该是可重试的环境抖动，却会把该格推到
+        `MAX_TILE_ATTEMPTS` → `capped` → `stage_exhausted`，当天被杀。
+
+        **`inconclusive` 仍计配额**：它不是"环境挡路"而是"连结论都没拿到"；持续如此应当被限流
+        成 `capped`，让当天如实落进 needs_review，而不是无限重试磨到天亮。
         """
         for s in steps:
             if not s.tile or not (s.failed or s.proven_inert):
+                continue
+            if s.env_block:
                 continue
             key = tuple(s.tile)
             self.tile_attempts[key] = self.tile_attempts.get(key, 0) + 1
@@ -967,12 +1023,27 @@ class LongRun:
         skipped = [s for s in all_steps if s.skipped]
         oks = [s for s in all_steps if s.ok]
         inert = [s for s in all_steps if s.proven_inert]
+        env_fail = [s for s in all_steps if s.env_block]
+        inconclusive = [s for s in all_steps if s.inconclusive]
         rep.stages.append({
             "stage": task, "tiles": 0 if not all_steps else len({s.tile for s in all_steps if s.tile}),
             "ok": len(oks), "skipped": len(skipped), "failed": len(failed),
             "proven_inert": len(inert),
+            "env_block": len(env_fail), "inconclusive": len(inconclusive),
             "stopped": stopped, "leftover": len(leftover),
         })
+        # task-22：环境挡路 / 没拿到结论都要**单独留痕**（它们不进 `blocked`，也不该藏在 failed 里）。
+        # 每阶段最多两条，带 statuses 与格数；事后看 journal 就能分清"这格真干不动"和"世界当时在忙"。
+        if env_fail:
+            self._journal("env_fail", stage=task, zone=self.zone_name,
+                          tiles=len({tuple(s.tile) for s in env_fail if s.tile}),
+                          statuses=sorted({x for s in env_fail for x in statuses_of(s)}),
+                          note="环境挡路（渐黑/模态/没存档）⇒ 不算干不动：不封格、不占本日尝试配额")
+        if inconclusive:
+            self._journal("inconclusive_fail", stage=task, zone=self.zone_name,
+                          tiles=len({tuple(s.tile) for s in inconclusive if s.tile}),
+                          statuses=sorted({x for s in inconclusive for x in statuses_of(s)}),
+                          note="连续请求没拿到结论（超时/异常/未知码）⇒ 不封格，但占本日尝试配额")
         if not all_steps and not met:
             self._journal("stage_no_target", stage=task, leftover=len(leftover), zone=self.zone_name)
         error = None
@@ -991,6 +1062,10 @@ class LongRun:
                        f"目标 {len(all_steps)} 步：做成 {len(oks)}、跳过 {len(skipped)}、失败 {len(failed)}"]
         if inert:
             reason_bits.append(f"其中 {len(inert)} 格当场判据成立「干不动」已封到当天结束")
+        if env_fail:
+            reason_bits.append(f"其中 {len(env_fail)} 格被环境挡住（渐黑/模态，不封格也不占配额）")
+        if inconclusive:
+            reason_bits.append(f"其中 {len(inconclusive)} 格没拿到结论（超时/异常，占配额但不封格）")
         if stopped:
             reason_bits.append(f"提前停：{stopped}")
         if met:
