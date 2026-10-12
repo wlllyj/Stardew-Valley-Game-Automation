@@ -19,7 +19,19 @@
 3c. **过程里没有异常事件**：`bridge_down` / `watchdog_stop` / `modal_timeout` / `no_day_progress`
     出现任意一条即判未达标（这些是"人不在场也出过事"的证据）。
 4. **LLM 覆盖**：`decision` 条数与其中 `llm==true` 的条数（长跑默认开 LLM）。
-5. **尾部连续 VERIFIED 天数** >= `--days`；存在 `finish` 事件时核对 `code`。
+5. **尾部连续 VERIFIED 天数** >= `--days`；存在 `finish` 事件时**核对自述**：`code` 必须与
+   本工具结论同向（自称达标而判未达标、或反之，都算账本自相矛盾）、`verified_streak` 不同则记信息项。
+6. **账本内部自洽**（deputy-lead `docs/_verify-run3-limits.md` §6 加固项）：
+   - `t` 不许回退（全局），每天 `day_start.t <= day_end.t`；
+   - 跨日必须**恰好 +1 天**（按 28 天/季折算绝对日序），不是"日期字符串不一样"（盲区 B5）；
+   - `checks.watered_outdoor=true` 与 `final_water.dry>0` 不许同时出现（盲区 B4）；
+   - 当天 0 个阶段也自称 VERIFIED ⇒ 信息项（盲区 B6：0 步不能自证做过事）；
+   - 没有 `finish` 事件 ⇒ 信息项（长跑可能被中断）。
+
+**能力边界（必读）**：本工具是**账本检查器，不是世界校验器** —— 完全自洽的伪造账本
+（K 系列）照样通过。真机验收必须叠加外部证据：存档 `mtime`/`size` 每天前进、SMAPI
+`Synchronizing 'NewDay'` / `SaveGame.Save()` 次数与天数一致、quit 前 live `/observe`
+与末尾 `day_end.final` 对账。详见 `docs/_verify-run3-limits.md` §5/§7。
 
 退出码：0 = 达标；1 = 未达标；2 = journal 读不出来。
 """
@@ -87,6 +99,55 @@ def _tile_count(stage: dict[str, Any]) -> int:
         return 0
 
 
+_SEASON_INDEX = {
+    "spring": 0,
+    "summer": 1,
+    "fall": 2,
+    "winter": 3,
+    "春": 0,
+    "夏": 1,
+    "秋": 2,
+    "冬": 3,
+}
+
+
+def _day_ordinal(day: Any) -> int | None:
+    """把 [年, 季, 日] 折成绝对日序（28 天/季、4 季/年）；认不出返回 None。
+
+    用途：跨日证据要"恰好 +1 天"，不能只判"日期字符串与 day_start 不一样"
+    （deputy-lead `docs/_verify-run3-limits.md` 盲区 B5：跨两天、跨月也会"不一样"）。
+    """
+    if not isinstance(day, (list, tuple)) or len(day) < 3:
+        return None
+    year, season, dom = day[0], day[1], day[2]
+    if isinstance(season, str):
+        idx = _SEASON_INDEX.get(season.strip().lower())
+    elif isinstance(season, int):
+        idx = season
+    else:
+        idx = None
+    try:
+        year_i = int(year)
+        dom_i = int(dom)
+    except (TypeError, ValueError):
+        return None
+    if idx is None or not (0 <= idx <= 3) or not (1 <= dom_i <= 28):
+        return None
+    return ((year_i - 1) * 4 + idx) * 28 + (dom_i - 1)
+
+
+def _day_of(row: dict[str, Any]) -> Any:
+    """从一行 journal 里取 [年, 季, 日]（顶层 day，或 final/before/after.day）。"""
+    day = row.get("day")
+    if isinstance(day, (list, tuple)):
+        return day
+    for holder in ("final", "before", "after"):
+        sub = row.get(holder)
+        if isinstance(sub, dict) and isinstance(sub.get("day"), (list, tuple)):
+            return sub["day"]
+    return None
+
+
 def build_days(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     days: list[dict[str, Any]] = []
     cur: dict[str, Any] | None = None
@@ -96,6 +157,8 @@ def build_days(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             cur = {
                 "key": day_key(row),
                 "start_lineno": row.get("_lineno"),
+                "start_day": _day_of(row),
+                "t_start": row.get("t"),
                 "stages": [],
                 "ended_by": "",
                 "ended_reason": "",
@@ -103,6 +166,7 @@ def build_days(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "sleep_ok": False,
                 "sleep_fail": 0,
                 "cross_day": False,
+                "excuse": False,
                 "verified": None,
                 "checks": {},
                 "end": {},
@@ -111,6 +175,10 @@ def build_days(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         if cur is None:
             continue
+        if ev in ("no_intents", "plot_exhausted", "policy_fallback"):
+            cur["excuse"] = True
+        if ev == "sleep" and str(row.get("reason") or "").startswith(("no_work", "night", "stamina")):
+            cur["excuse"] = True
         if ev == "sleep":
             if row.get("ok"):
                 cur["sleep_ok"] = True
@@ -126,10 +194,20 @@ def build_days(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             cur["final"] = row.get("final") or {}
             cur["checks"] = row.get("checks") or {}
             cur["verified"] = row.get("verified")
+            cur["t_end"] = row.get("t")
             # day_end 自带按日汇总（比逐条 stage 事件更权威）
             cur["end"] = {
                 k: row.get(k)
-                for k in ("day_text", "ok_steps", "skipped_steps", "failed_steps", "stages", "outcomes", "notes")
+                for k in (
+                    "day_text",
+                    "ok_steps",
+                    "skipped_steps",
+                    "failed_steps",
+                    "stages",
+                    "outcomes",
+                    "notes",
+                    "final_water",
+                )
             }
             fin_key = day_key({"final": cur["final"]}) if cur["final"] else "?"
             cur["cross_day"] = bool(cur["final"]) and fin_key != cur["key"]
@@ -144,6 +222,25 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
 
     problems: list[str] = []
     infos: list[str] = []
+
+    # 0. 时间轴自洽（deputy-lead `docs/_verify-run3-limits.md` 盲区 B2）：t 回退只记信息项。
+    #    理由：t 是 longrun 自己的 time.time() 读数，系统时钟回拨（NTP）会让真长跑也"回退"，
+    #    把它判成问题会误杀真机的 3 日验收 —— 记账自洽性不能盖过验收入口。
+    last_t: float | None = None
+    last_lineno: Any = None
+    backwards: list[str] = []
+    for r in rows:
+        t = r.get("t")
+        if not isinstance(t, (int, float)):
+            continue
+        if last_t is not None and t < last_t:
+            backwards.append(f"行 {r.get('_lineno')} t={t} < 行 {last_lineno} t={last_t}")
+        last_t, last_lineno = t, r.get("_lineno")
+    for b in backwards[:3]:
+        infos.append(f"journal 时间戳回退（自述 t，可能是时钟回拨）：{b}")
+    if len(backwards) > 3:
+        infos.append(f"另有 {len(backwards) - 3} 处时间戳回退未逐条列出")
+
     for d in days:
         name = d["key"]
         end_stats = d.get("end") or {}
@@ -221,6 +318,45 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         if d["sleep_fail"]:
             problems.append(f"[{name}] 当天有 {d['sleep_fail']} 次 sleep 失败（回执 ok=false）")
 
+        # 跨日必须是"恰好 +1 天"（盲区 B5）：只判"字符串不一样"会把跨两天/跨月放过去。
+        if d["ended_by"] == "sleep" and d["cross_day"]:
+            o0 = _day_ordinal(d.get("start_day"))
+            o1 = _day_ordinal(d["final"].get("day"))
+            if o0 is None or o1 is None:
+                infos.append(
+                    f"[{name}] 跨日天数无法核对（day 字段不是 [年,季,日]："
+                    f"start={d.get('start_day')!r} final={d['final'].get('day')!r}）"
+                )
+            elif o1 - o0 != 1:
+                problems.append(
+                    f"[{name}] 跨日不是恰好 +1 天（start={d.get('start_day')!r} → final={d['final'].get('day')!r}）"
+                )
+        # 当天窗口 t_start <= t_end（盲区 B2）：同样只记信息项（自述时间戳，时钟回拨会误杀）
+        t0, t1 = d.get("t_start"), d.get("t_end")
+        if isinstance(t0, (int, float)) and isinstance(t1, (int, float)) and t1 < t0:
+            infos.append(f"[{name}] 当天时间轴倒挂（自述 t）：day_start t={t0} > day_end t={t1}")
+        # final_water 与 checks.watered_outdoor 互检（盲区 B4：两份自述不许自相矛盾）
+        fw = end_stats.get("final_water")
+        if isinstance(fw, dict):
+            dry = fw.get("dry")
+            if checks.get("watered_outdoor") is True and isinstance(dry, (int, float)) and dry > 0:
+                problems.append(
+                    f"[{name}] checks.watered_outdoor=true 但 final_water.dry={dry}（账本自相矛盾）"
+                )
+        # 0 步也能 VERIFIED（盲区 B6）：当天一个阶段都没有、却自称达标 ⇒ 必须有"确实无活可做"的
+        # 证据（no_intents / plot_exhausted / policy_fallback / sleep 理由是 no_work/night/stamina），
+        # 否则不允许用"什么都没做"换一天达标（负例 K2）。
+        if d["verified"] is True and not stage_recs and not d["stages"]:
+            reason = str(d.get("ended_reason") or "")
+            excused = bool(d.get("excuse")) or reason.startswith(("no_work", "night", "stamina"))
+            if excused:
+                infos.append(f"[{name}] 当天 0 个阶段且自称 VERIFIED，但有\"无活可做\"证据（{reason or '事件'}）⇒ 接受")
+            else:
+                problems.append(
+                    f"[{name}] 当天 0 个阶段却自称 VERIFIED，且没有任何\"无活可做\"的证据"
+                    "（0 步不能自证做过事）"
+                )
+
         # 3b. 阶段后置条件：无论 checks.no_unmet_stages 在不在，都按 day_end.stages 自算并比对
         unmet = checks.get("no_unmet_stages")
         if unmet is not None and bool(unmet) != (leftover_targeted == 0):
@@ -266,7 +402,40 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
     decisions = [r for r in rows if r.get("event") == "decision"]
     llm_true = sum(1 for r in decisions if r.get("llm"))
 
-    ok = streak >= target_days and not problems
+    # finish 自述必须与本工具的结论同向（盲区 B1：K3 账本自称 code=1/streak=0 却全绿）
+    def _ok_now() -> bool:
+        return streak >= target_days and not problems
+
+    if finish is not None:
+        f_code = finish.get("code")
+        f_days = finish.get("days")
+        f_streak = finish.get("verified_streak")
+        # (a) finish 自身必须自洽：code==0 ⇔ verified_streak >= days
+        if isinstance(f_code, int) and isinstance(f_streak, int) and isinstance(f_days, int):
+            if (f_code == 0) != (f_streak >= f_days):
+                problems.append(
+                    f"finish 自身不自洽：code={f_code} 与 verified_streak={f_streak}/days={f_days} 不符"
+                )
+        # (b) 与本工具结论同向 —— 只在两侧目标天数可比时才算问题（否则 --days 不同会误报）
+        comparable = isinstance(f_days, int) and f_days == target_days
+        if comparable and _ok_now() and f_code not in (0, None):
+            problems.append(f"finish 自述 code={f_code}（自称未达标）而本工具判定达标（账本自相矛盾）")
+        if comparable and (not _ok_now()) and f_code == 0:
+            problems.append("finish 自述 code=0（自称达标）而本工具判定未达标（账本自相矛盾）")
+        if (not comparable) and f_code == 0 and not _ok_now():
+            infos.append(
+                f"finish 自述 code=0 而本工具判定未达标，但两侧目标天数不同（--days={target_days} vs finish.days={f_days}）"
+                "⇒ 只作信息项"
+            )
+        if isinstance(f_streak, int) and f_streak != streak:
+            infos.append(
+                f"finish 自述 verified_streak={f_streak} 与本工具尾部连续天数 {streak} 不同"
+                "（两侧 target_days 口径可能不同，需人工核）"
+            )
+    elif rows:
+        infos.append("journal 里没有 finish 事件（长跑可能被中断；不以它当证据）")
+
+    ok = _ok_now()
     summary = {
         "journal": None,
         "bad_lines": len(bad_lines),
