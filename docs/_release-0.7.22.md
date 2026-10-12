@@ -24,7 +24,7 @@
 
 **brain（`brain\agentfarm\`）**
 - `bridge.py` — `MOD_VERSION_EXPECTED = "0.7.22"`（唯一一处版本断言）。
-- `farmwork.py` / `longrun.py` — task-22 状态三分类与 `env_block`/`inconclusive` 记账、task-15 的 `no_unmet_stages` + 条款④、task-19 的 `checks.watered_outdoor` + `day_end.final_water`。
+- `farmwork.py` / `longrun.py` — task-22 状态三分类与 `env_block`/`inconclusive` 记账、**task-28 的 `busy`→ENV / `stale`→INCONCLUSIVE 与防自旋上限**、task-15 的 `no_unmet_stages` + 条款④、task-19 的 `checks.watered_outdoor` + `day_end.final_water`。
 - `__main__.py` — task-26 的 `await_game_exit` 三态。
 
 **明确不并入 0.7.22（留给 0.7.23+）**：task-14（warp 循环根因修复）、task-17（`world_stuck` 自愈）、task-18（职业选择自动化）、task-20（工具等级可观测）、task-24（UI 可见性）。它们都不在 run3 的关键路径上。
@@ -50,6 +50,17 @@ $py = "C:\Users\admin\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\
     `& $py tools\verify-run3.py --journal logs\longrun-3day-llm-run3.jsonl --days 3`
     `& $py tools\analyze-longrun.py --journal logs\longrun-3day-llm-run3.jsonl`
 11. **跑完立刻退出**（用户 m02833）：`& $py tools\stop-game.py`（或 `python -m agentfarm shutdown --force-after 30`）。
+
+### 3b. 验收不许只看账本（`tools\verify-run3.py` 的已知极限）
+
+`verify-run3.py` / `analyze-longrun.py` 都是**账本检查器，不是世界校验器**：账本自己自洽时（每天 `ended_by=sleep`、跨日、`verified=true`、`checks` 全真、`leftover==0`、`watered_outdoor=true`、`failed_steps == Σ stages.failed`）它们会判 VERIFIED，哪怕世界没变（deputy-lead 的负例 K 会把这条极限写成结论）。所以 run3 的验收**必须**同时附外部证据：
+
+- 存档 `%APPDATA%\StardewValley\Saves\Wahaha_450799035\Wahaha_450799035` 的 **mtime/size 前进**（每个跨日都应该动一次）；
+- `Game1.Date.TotalDays`（`observe` 的 clock.day/season/year）真变化，且与 journal 的 `day_end` 对齐；
+- SMAPI 日志里对应的 `Synchronizing 'NewDay' task...` / `SaveGame.Save` 行与时间窗；
+- 起跑基线 `tools\preflight.py --save-baseline` 的 JSON 与跑完的观测做差分。
+
+以上缺一条 ⇒ 结论只能写 `needs_review`，不许写"通过"。
 
 ## 4. 回退
 
