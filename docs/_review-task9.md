@@ -132,3 +132,16 @@ Lead 2026-10-13 给 `tools/verify-run3.py` 加了新口径：浇水证据只能�
 
 **由该口径推出的任务板闸门（已报 Lead）**：`checks.watered_outdoor` 由 **task-19** 写入（其标题即"run3 前置"），而 task-12（run3 真机）的 `blocked_by` 曾不含 task-19 ⇒ 完美 run3 也会被本工具判 needs_review / exit 1（neg-E 即实证），白烧唯一一次真机长跑。另 task-19 改 `mod\AgentFarm.Bridge\WorldSnapshot.cs` + `Contracts.cs`（加 `farm.dryCrops`）⇒ 必须在 `tools\deploy-mod.py` 装 0.7.22 **之前**落地，否则装机 Mod 不含该字段、版本断言错位。附带：task-17（blocked_by [task-11,task-15]）与 task-19（blocked_by [task-15]）会在 task-15 完成后**同时 ready 且都写 `longrun.py`+`farmwork.py`** ⇒ 需在依赖表上串行化。
 - 仍未闭合的**非阻塞** nit（沿用）：①`_tile_count()`（`:79-87`）对无 `tiles` 字段的历史账本返回 0 ⇒ 误报为「0 目标阶段 leftover」，fail-safe 但文案误导，run3 不受影响；②`checks`/`verified` 双双缺失且阶段记录缺 `tiles` 的账本，工具只能报「缺 verified」+疑似「0 目标 leftover」，无法还原真实遗留——这是账本本身不携带的信息，可接受。
+
+## 7.4 `env_block` 信息项的负例（"信息项不改变 exit"；2026-10-13 晚，task-22 rev4 落地前先建）
+
+背景：按 Lead 的 task-22 裁定，longrun 侧将新增 `env_fail` / `inconclusive_fail` 汇总与 stage 级 `env_block_count`/`inconclusive_count`，Lead 承诺 `tools/verify-run3.py` 只把它们当**信息项**（打印汇总、不进 `problems`、不改 exit code）。按要求把这条并入负例矩阵（生成器 `scratch\_review_neg_gen.py` 新增 mode `env_info_item` / `env_info_cannot_mask`）。
+
+| 账本 | 构造 | 期望 / 实测 |
+|---|---|---|
+| `scratch/review-neg-G-env-info-item.jsonl` | **合法绿日**（`verified=true`；`slept_by_us`/`no_hard_failures`/`crops_watered`/`day_justified`/`no_unmet_stages`/`watered_outdoor` 全 true；`failed_steps=0`；stage `leftover=0`）**外加**信息项：day 级 `env_block`/`env_block_count`/`inconclusive_count`、stage 级同名字段、每天一条 `env_fail` 事件（`statuses:["world_fading"]`，"已 clear_modals 后重跑并做成"） | **exit 0 / VERIFIED**（当前工具不读这些字段 ⇒ 天然通过；Lead 的汇总落地后此条是**回归守卫**：若汇总把 exit 改成 1 即回归） |
+| `scratch/review-neg-H-env-info-cannot-mask.jsonl` | 同样带 env 信息项，但**真实未完成**：`no_unmet_stages=false` 且 stage `leftover=5`（自述与阶段记录一致） | **exit 1 / needs_review** —— 信息项**不得**掩盖真问题 |
+
+全矩阵回归复跑（Lead 当前工具版本；命令 `& $py tools\verify-run3.py --journal <账本>`）：`scratch\journal-green.jsonl` = exit 0 / VERIFIED；`neg-A/B/C/D/E/F/H` = 全部 exit 1 / needs_review；真机 `logs\longrun-3day-llm-run2.jsonl` = exit 1 / needs_review。**无回归、无假通过。**
+
+（复现：`$env:PYTHONUTF8="1"; & $py scratch\_review_neg_gen.py` ⇒ 一次生成 8 个账本；生成器**必须**带 `PYTHONUTF8`，见 §7.3 末尾的坑。落成后的 `env_fail`/`env_block_count` 字段名以 task-22 实际实现为准 —— 若名称不同，本两条用例里的字段名要同步改。）

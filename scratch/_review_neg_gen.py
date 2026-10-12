@@ -103,6 +103,43 @@ def day_block(d: int, *, mode: str) -> list[dict]:
         end["failed_steps"] = 0
         end["stages"] = [{"stage": "water_area", "tiles": 32, "ok": 32, "skipped": 0,
                           "failed": 0, "stopped": "", "leftover": 0}]
+    elif mode == "env_info_item":
+        # neg-G：**合法绿日** + task-22/task-15④ 新增的 env 信息项（stage 级 env_block_count /
+        # day 级 env_fail 事件）。断言：信息项**不得**改变 exit code（仍 VERIFIED）。
+        end["verified"] = True
+        end["checks"] = {"slept_by_us": True, "no_hard_failures": True, "crops_watered": True,
+                         "day_justified": True, "no_unmet_stages": True, "watered_outdoor": True}
+        end["ok_steps"] = 32
+        end["skipped_steps"] = 0
+        end["failed_steps"] = 0
+        end["env_block"] = 1
+        end["env_block_count"] = 1
+        end["inconclusive_count"] = 0
+        end["stages"] = [{"stage": "water_area", "tiles": 32, "ok": 32, "skipped": 0,
+                          "failed": 0, "stopped": "", "leftover": 0,
+                          "env_block": 1, "env_block_count": 1, "inconclusive_count": 0}]
+        rows.insert(3, {"t": float(d * 600 + 300), "event": "env_fail", "day": ["1", "spring", d],
+                        "stage": "water_area", "tiles": [[60, 10]],
+                        "statuses": ["world_fading"], "count": 1,
+                        "note": "环境挡路，已 clear_modals 后重跑并做成"})
+    elif mode == "env_info_cannot_mask":
+        # neg-H：env 信息项 + **真实未完成**（自述与阶段记录一致地 leftover>0）。
+        # 断言：信息项不得把真问题盖掉（exit 必须仍为 1）。
+        end["verified"] = True
+        end["checks"] = {"slept_by_us": True, "no_hard_failures": True, "crops_watered": True,
+                         "day_justified": True, "no_unmet_stages": False, "watered_outdoor": True}
+        end["ok_steps"] = 10
+        end["skipped_steps"] = 0
+        end["failed_steps"] = 0
+        end["env_block"] = 1
+        end["env_block_count"] = 1
+        end["inconclusive_count"] = 0
+        end["stages"] = [{"stage": "plant_area", "tiles": 15, "ok": 10, "skipped": 0,
+                          "failed": 0, "stopped": "no_seed", "leftover": 5,
+                          "env_block": 1, "env_block_count": 1, "inconclusive_count": 0}]
+        rows.insert(3, {"t": float(d * 600 + 300), "event": "env_fail", "day": ["1", "spring", d],
+                        "stage": "plant_area", "tiles": [[60, 10]],
+                        "statuses": ["ui_modal"], "count": 1})
     else:
         raise SystemExit("unknown mode " + mode)
     rows.append(end)
@@ -123,7 +160,9 @@ def main() -> int:
                        ("missing_self_report", "review-neg-C-fallback-ok.jsonl"),
                        ("self_report_unmet_but_verified", "review-neg-D-unmet-but-verified.jsonl"),
                        ("watered_no_evidence", "review-neg-E-watered-no-evidence.jsonl"),
-                       ("watered_outdoor_false", "review-neg-F-watered-outdoor-false.jsonl")):
+                       ("watered_outdoor_false", "review-neg-F-watered-outdoor-false.jsonl"),
+                       ("env_info_item", "review-neg-G-env-info-item.jsonl"),
+                       ("env_info_cannot_mask", "review-neg-H-env-info-cannot-mask.jsonl")):
         path = os.path.join(HERE, name)
         with open(path, "w", encoding="utf-8") as fh:
             for row in build(mode):
