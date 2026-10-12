@@ -143,6 +143,7 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
     days = build_days(rows)
 
     problems: list[str] = []
+    infos: list[str] = []
     for d in days:
         name = d["key"]
         end_stats = d.get("end") or {}
@@ -187,15 +188,34 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         if checks.get("no_hard_failures") is False:
             problems.append(f"[{name}] checks.no_hard_failures=false（当天有硬失败步骤）")
         # 失败数一律以 day_end.stages 求和为准，并与 failed_steps 交叉核对（负例 B：只信自述）
+        # task-15 ④ / task-22 之后：日级 `failed_steps` 只数"目标仍未完成的失败"，而 stage 的
+        # `failed` 仍是全部失败步 ⇒ 允许差额，但**差额必须被环境挡路/无结论计数完全解释**；
+        # 解释不完就是自述在洗账（负例 B 的口径不变：delta 不能被解释 ⇒ 问题）。
+        sum_env = sum(int(s.get("env_block_count") or s.get("env_block") or 0) for s in stage_recs)
+        sum_incon = sum(int(s.get("inconclusive_count") or s.get("inconclusive") or 0) for s in stage_recs)
         failed_field = end_stats.get("failed_steps")
         if failed_field is None:
             failed_field = sum_failed or legacy_failed
-        elif sum_failed and int(failed_field) != sum_failed:
-            problems.append(
-                f"[{name}] 自述 failed_steps={failed_field} 与 day_end.stages 求和 {sum_failed} 不一致（账目不可信）"
-            )
+        else:
+            delta = sum_failed - int(failed_field)
+            if delta < 0:
+                problems.append(
+                    f"[{name}] 自述 failed_steps={failed_field} 比 day_end.stages 求和 {sum_failed} 还多（账目不可信）"
+                )
+            elif delta > sum_env + sum_incon:
+                problems.append(
+                    f"[{name}] 自述 failed_steps={failed_field} 比 day_end.stages 求和 {sum_failed} 少 {delta}，"
+                    f"而环境挡路 {sum_env} + 无结论 {sum_incon} 解释不完（账目不可信）"
+                )
+            elif delta:
+                infos.append(
+                    f"[{name}] failed_steps={failed_field} < stages 求和 {sum_failed}；差额 {delta} = "
+                    f"环境挡路 {sum_env} + 无结论 {sum_incon}（task-15 ④ 口径，不计为当天硬失败）"
+                )
         if int(failed_field or 0):
             problems.append(f"[{name}] 当天 stages 硬失败 {failed_field} 格")
+        if sum_env or sum_incon:
+            infos.append(f"[{name}] 环境挡路失败 {sum_env} 格、无结论失败 {sum_incon} 格（信息项，不改结论）")
         if d["verified"] is False:
             problems.append(f"[{name}] day_end verified=false")
         if d["sleep_fail"]:
@@ -284,6 +304,7 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         "decisions_llm": llm_true,
         "finish": {k: v for k, v in (finish or {}).items() if k != "_lineno"},
         "problems": problems,
+        "infos": infos,
         "verdict": "VERIFIED" if ok else "needs_review",
     }
     return ok, summary
@@ -327,6 +348,11 @@ def main(argv: list[str] | None = None) -> int:
     if summary["finish"]:
         print(f"finish: {summary['finish']}")
     print(f"尾部连续 VERIFIED 天数 {summary['verified_streak_tail']} / 要求 {summary['target_days']}")
+    if summary.get("infos"):
+        print("")
+        print("信息（不影响结论）：")
+        for i in summary["infos"]:
+            print(f"  - {i}")
     if summary["problems"]:
         print("")
         print("问题：")
