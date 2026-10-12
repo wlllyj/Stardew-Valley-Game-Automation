@@ -45,6 +45,14 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=10.0)
     args = ap.parse_args()
 
+    # 中文输出在非 UTF-8 控制台（cp1252/cp936）会 UnicodeEncodeError 直接崩在第一个 print 上
+    # （Lead 实测：未设 PYTHONUTF8 时 `preflight.py --expect 0.7.22` 抛 charmap 编码错误）。
+    # 与 tools\run-longrun.py 同口径：自配 stdout 编码，别指望调用方记得设环境变量。
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
     print(f"仓库：{REPO}")
     print(f"期望 Mod 版本：{args.expect}")
 
