@@ -62,6 +62,9 @@ $py = "C:\Users\admin\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\
 
 以上缺一条 ⇒ 结论只能写 `needs_review`，不许写"通过"。
 
+**`verify-run3.py` 已加固（Lead，2026-10-13，提交 `fd0ec6d`）**，加固后它除了语义检查还会查账本**内部自洽**：①`finish` 自身自洽（`code==0 ⇔ verified_streak>=days`）+ 与工具结论同向（仅当 `finish.days == --days` 可比时算问题）②`final_water.dry>0` 与 `checks.watered_outdoor=true` 互斥 ③跨日必须**恰好 +1 天**（按 28 天/季折绝对日序）④**0 步 VERIFIED 必须有"无活可做"证据**（`no_intents`/`plot_exhausted`/`policy_fallback` 事件，或 `sleep.reason`/`ended_reason` 以 `no_work`/`night`/`stamina` 开头）⑤`t` 回退与当天时间轴倒挂只记信息项（`t` 是 longrun 自己的 `time.time()`，时钟回拨会误杀真跑）。
+**加固后的已知盲区仍在**：完全自洽的伪造账本（K）、0 步但伪造了"无活可做"理由（K2）都会判 VERIFIED ⇒ 上面四条外部证据依然是硬要求。加固后的矩阵期望：exit 0 = green/G/I/K/K2；exit 1 = A–F/H/J/K3/K4/task11-modal-day/真机 run2（详见 `docs\_verify-run3-limits.md`）。
+
 ## 4. 回退
 
 - 装机时旧 dll/manifest 自动留 `.bak-<ts>`；回退 = 复制回两个文件 + `deploy-mod.py --skip-backup` 重装。
