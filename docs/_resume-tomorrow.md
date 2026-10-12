@@ -3,13 +3,22 @@
 > 本文是**收工快照**，只写"明天开工要用的东西"。`docs\_resume-prompt.md` 是 P2 时代的三步恢复法（仍然有效：单测 → `deploy-mod.py` → `run-plot.py`），但它的状态表已过期，以本文为准。
 > 目标不变：**P3 ⑥ —— 端到端自主完成「清障 → 开垦 → 播种 → 浇水」，连续 3 个游戏日无人工介入**（判据一律用 `observe?detail=full` 的 `tiles[]`/`inventory[]`/`money` 差分，回执不算证据）。
 
-## 0c. 2026-10-13 深夜停点（**最新，与下文冲突以本节为准**）
+## 0c. 2026-10-13 02:40 整理停当（**最新，与下文冲突以本节为准**）
 
-- 用户 `User said (m04528): "停下来了把？明天再搞"` ⇒ Lead 已 `interrupt_agent` 叫停 **dev-coder**（task-19 在做）与 **planner-dev**（task-31 取证在做），并已把 goal `goal-1ee4cda9` **pause**（rev5 / disarmed）⇒ **明天要在界面里 resume** 才会自动续跑。
-- **停点时的树（未提交）**：`brain/agentfarm/longrun.py`（+143）与 `tests/test_longrun.py`（+151）—— task-19 的 **`checks.watered_outdoor` + `day_end.final_water` 已写进代码**（`longrun.py:243` 字段、`:281-283` 落 journal、`:542-547` 口径 docstring、`:1883` 日级证据）；另有 planner-dev 的两个**只读**探针 `scratch\_probe_save_bed.py`、`scratch\_probe_save_raw.py`（未跟踪）。游戏未运行、`bridge.json` 不存在、存档未动。
+用户节奏：`User said (m04479)` goal 轮续跑 → `User said (m04528): "停下来了把？明天再搞"` → `User said (m07147): "重新整理一下，明天在继续任务"` ⇒ **今天到此为止，明天开工**。
+
+- **goal**：`goal-1ee4cda9-fdd4-4ba0-80cb-0c06902157eb` = **phase paused / disarmed（rev5）**，模型侧不能 resume ⇒ **明天要在界面里 resume**（或直接跟我说"继续"）。
+- **队友**：全部 **inactive**（dev-coder、planner-dev 已在被叫停时 `interrupt_agent`；无人在跑、无半截写入进行中）。
+- **环境（02:40 实测）**：游戏进程 0、`bridge.json` 不存在、17890 无监听；存档 `Wahaha_450799035` 3502298 B / mtime `2026-10-11 22:24:19` **未动**；装机 Mod **0.7.22**，`brain\agentfarm\bridge.py:39 MOD_VERSION_EXPECTED="0.7.22"` 与之相同。
+- **未提交的在制品（task-19，尚未验收）**：`brain/agentfarm/longrun.py`(+143) + `tests/test_longrun.py`(+151)：**`checks.watered_outdoor` + `day_end.final_water` 已写进代码**（字段 `longrun.py:243`、落 journal `:281-283`、口径 docstring `:542-547`、日级证据 `:1883`）。
 - **停点读数（Lead 亲跑）**：`py_compile brain\agentfarm\{longrun,farmwork}.py` exit 0；全量 **`Ran 290 tests / OK`**（基线 284 ⇒ 净增 6）。
-- **明天第一件事 = 让 deputy-lead 对 task-19 做独立验收**（它已待命，`grep watered_outdoor` 命中即做）：①四字段真名与语义（`watered_outdoor` / `final_water.scope` / `tiles` / `crops` / `dry`）②"没有任何户外快照 ⇒ False/缺省、**禁止默认 true**"③`farm.complete==false` 或旧 Mod 缺 `dryCrops` ⇒ 退回窗口口径 ④任务书 5 条假世界用例 ⑤与 `tools\verify-run3.py` 新闸门一致（通过形态 = `scope=="farm"` + `tiles>0` + `crops>0` + `dry==0` + `watered_outdoor==true`；窗口口径必须 `tiles>0`）。验收过 ⇒ 提交 ⇒ 再做 task-32 / task-34 / task-33（依赖见任务板）。
-- **明天顺序**：task-19 验收 → task-31 取证收尾（planner-dev 的 `docs\_il-bed-interaction.md`，被叫停时可能只写了一半）→ task-33（睡觉链路修复，按 31 结论）→ task-32（上限触顶不许早睡）+ task-34（逐格 `tile_step` 证据，U1）→ 冻结 **0.7.23** → machine-runner 真 3 日 run3 → `verify-run3.py` + `analyze-longrun.py` 双复核。
+- **task-31 取证未交付**：`docs\_il-bed-interaction.md` **不存在**（planner-dev 被叫停前只留下两个只读探针 `scratch\_probe_save_bed.py`、`scratch\_probe_save_raw.py`）⇒ 明天要**重派或续做**。
+- **明天开工 30 秒版**
+  1. `git status --short` + `python -m unittest discover -s tests`（期望 **290 OK**；上面两个 WIP 文件还在就说明停点没被别人动过）。
+  2. `python tools\deploy-mod.py --no-quit`（起游戏 + 自动读档）→ `python tools\preflight.py --expect 0.7.22`（**exit 0 才准跑真机**）。
+  3. **让 deputy-lead 独立验收 task-19**（它已待命，`grep watered_outdoor` 命中即做）：①四字段真名与语义（`watered_outdoor`/`final_water.scope`/`tiles`/`crops`/`dry`）②"没有任何户外快照 ⇒ False/缺省、**禁止默认 true**"③`farm.complete==false` 或旧 Mod 缺 `dryCrops` ⇒ 退回窗口口径 ④任务书 5 条假世界用例 ⑤与 `tools\verify-run3.py` 新闸门一致（通过形态 = `scope=="farm"` + `tiles>0` + `crops>0` + `dry==0` + `watered_outdoor==true`；窗口口径必须 `tiles>0`）。**验收过才提交**。
+- **继续顺序**：task-19 验收提交 → **task-31 取证**（重派 planner-dev）→ **task-33**（睡觉链路修复，按 31 结论；`blocked_by [task-31, task-19]`）→ **task-32**（上限触顶不许早睡）+ **task-34**（逐格 `tile_step` 证据，U1）→ 冻结 **0.7.23** → machine-runner 真 3 日 run3 → `verify-run3.py` + `analyze-longrun.py` 双复核 + 外部证据（存档 mtime/size、SMAPI `NewDay`/`SaveGame.Save`）。
+- **已提交（本段工作的完整链条）**：`dd7ea96`（0.7.22 冻结）→ `cd41905`（彩排收尾 + 条目 034 + §0b）→ `4f411ef`（deputy B4b 闸门 + `docs\_verify-run3-limits.md` v3 + log-analyst 复算口径 + **U3 修复** + 条目 034 三处数字修正）→ `4ff87a2`（§0b 更正 + 深夜派工 task-19/31/33/34）→ `02105d9`（§0c 停点）。
 
 ## 0b. 2026-10-13 凌晨收工更新（**与下文冲突时以本节为准**）
 
@@ -22,7 +31,7 @@
   - **外部证据**：彩排前后 `day` 都是 `spring 11`、存档 size/mtime **没动** ⇒ 跨日确实没发生（`scratch\rehearsal_state.py` 只读快照）。
 - **明天第一件事（顺序）**：**task-19**（`checks.watered_outdoor` + `day_end.final_water`，消费 `farm.dryCrops`；缺它 run3 必被自己的工具判 exit 1）→ **task-31**（只读取证：门格寻路 + 上床/提问）→ **task-33**（按 task-31 结论做修复；`blocked_by [task-31, task-19]`）→ **task-32**（上限触顶不许早睡）+ **task-34**（逐格 `tile_step` 证据落账，U1）→ 冻结 **0.7.23** → machine-runner 跑真 3 日 run3 → 双复核 + 四条外部证据。
 - **队友状态**：dev-coder 已**开工 task-19**（brain-only，是 run3 直接前置）；planner-dev 已**开工 task-31 的取证半边**（只写 `docs\_il-bed-interaction.md` + `scratch\`，不许碰源码）；deputy-lead 待命（`grep watered_outdoor` 在 `brain/` 命中即对 task-19 做独立验收）；log-analyst 只读待命（task-5 未开）；machine-runner 待命等 "deploy done"。
-- ⚠ **goal `goal-1ee4cda9` 已被用户 resume**（revision 4 / phase active / armed，round 8/60）⇒ 会自动续跑；本轮深夜续跑就是在 goal 轮里推进。
+- ⚠ **goal `goal-1ee4cda9` 已被用户 resume**（revision 4 / phase active / armed，round 8/60）⇒ 会自动续跑；本轮深夜续跑就是在 goal 轮里推进。**（已过时：用户随后叫停，见 §0c —— 现为 paused/disarmed rev5。）**
 - **已提交**：`cd41905`（彩排收尾 + 条目 034 + §0b + preflight 坑修）、**`4f411ef`**（deputy B4b 窗口口径闸门 + `docs\_verify-run3-limits.md` v3 + log-analyst 复算口径 + **`tools\verify-run3.py` 浇水检查提到 `sleep` 分支外（U3）** + 条目 034 三处数字修正）。
 - **U3 已修（我亲跑回归）**：`_water_problems()` 在 `ended_by=="sleep"` 与否则两条分支都调用 ⇒ 睡觉失败的日子不再静默跳过浇水验收；绿本/neg-G/I/S 仍 exit 0，A/B/E/R/K + 彩排 + run2 各 exit 1。
 - **一条观察**：后台长任务的 stdout/文件写是**块缓冲**（jsonl 攒到 2048 B 才落盘）⇒ 想边跑边看要加 `-u`。
