@@ -81,6 +81,28 @@ def day_block(d: int, *, mode: str) -> list[dict]:
         end["failed_steps"] = 0
         end["stages"] = [{"stage": "plant_area", "tiles": 15, "ok": 10, "skipped": 0,
                           "failed": 0, "stopped": "no_seed", "leftover": 5}]
+    elif mode == "watered_no_evidence":
+        # neg-E：自称睡过去了、crops_watered=true、其余全绿，但**整块没有 watered_outdoor**
+        # （Lead 2026-10-13 新口径：浇水证据只能来自 checks.watered_outdoor；缺失 ≠ 通过）。
+        end["verified"] = True
+        end["checks"] = {"slept_by_us": True, "no_hard_failures": True, "crops_watered": True,
+                         "day_justified": True, "no_unmet_stages": True}
+        end["ok_steps"] = 32
+        end["skipped_steps"] = 0
+        end["failed_steps"] = 0
+        end["stages"] = [{"stage": "water_area", "tiles": 32, "ok": 32, "skipped": 0,
+                          "failed": 0, "stopped": "", "leftover": 0}]
+    elif mode == "watered_outdoor_false":
+        # neg-F：字段在、但明说"睡前还有没浇的作物"，而 crops_watered 自述 true（窗口口径白过）。
+        end["verified"] = True
+        end["checks"] = {"slept_by_us": True, "no_hard_failures": True, "crops_watered": True,
+                         "day_justified": True, "no_unmet_stages": True,
+                         "watered_outdoor": False}
+        end["ok_steps"] = 32
+        end["skipped_steps"] = 0
+        end["failed_steps"] = 0
+        end["stages"] = [{"stage": "water_area", "tiles": 32, "ok": 32, "skipped": 0,
+                          "failed": 0, "stopped": "", "leftover": 0}]
     else:
         raise SystemExit("unknown mode " + mode)
     rows.append(end)
@@ -99,7 +121,9 @@ def main() -> int:
     for mode, name in (("no_verified", "review-neg-A-no-verified.jsonl"),
                        ("self_report_green", "review-neg-B-self-report-green.jsonl"),
                        ("missing_self_report", "review-neg-C-fallback-ok.jsonl"),
-                       ("self_report_unmet_but_verified", "review-neg-D-unmet-but-verified.jsonl")):
+                       ("self_report_unmet_but_verified", "review-neg-D-unmet-but-verified.jsonl"),
+                       ("watered_no_evidence", "review-neg-E-watered-no-evidence.jsonl"),
+                       ("watered_outdoor_false", "review-neg-F-watered-outdoor-false.jsonl")):
         path = os.path.join(HERE, name)
         with open(path, "w", encoding="utf-8") as fh:
             for row in build(mode):

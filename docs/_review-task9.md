@@ -116,4 +116,19 @@ Lead 的修复（我逐行读过 `verify-run3.py:150-204`）与实测结果一�
 
 - 修复确已落地且是**无条件**判定：`tools/verify-run3.py:201` `if unmet is False:` 与 `:193` 的一致性检查**并列**（不是 `elif`），注释 `:198-200` 明确写了「负例 D」与「不因自算结果与它一致而放行」。结构已用 read 工具逐行确认（`:185-212`）。
 - 复跑口径与 Lead 自报**完全一致**（6/6）。**判定：PASS**（neg-D 洞已堵，回归未破）。
+
+## 7.3 浇水证据新口径（`checks.watered_outdoor`）的负例矩阵（2026-10-13 上午）
+
+Lead 2026-10-13 给 `tools/verify-run3.py` 加了新口径：浇水证据只能来自 `day_end.checks.watered_outdoor`，**缺字段即算问题**（`tools/verify-run3.py:174-181`：`None` →「缺 farm 级/户外浇水证据：checks.watered_outdoor 未写（窗口 unwatered_crops 在室内恒 0，不作为证据；缺失 ≠ 通过）」；`False` →「checks.watered_outdoor=false（睡前还有没浇的作物）」）。窗口口径降级为辅助（`:182-185`）。我把这条并入负例矩阵（生成器 `scratch\_review_neg_gen.py` 新增 mode `watered_no_evidence` / `watered_outdoor_false`）。
+
+| 账本 | 实测 |
+|---|---|
+| `scratch/review-neg-E-watered-no-evidence.jsonl`（3 天：自称 sleep+跨日、`crops_watered=true`、`unwatered_crops=0`、`no_unmet_stages=true`、`failed=0`、`leftover=0`，**但整块没有 `watered_outdoor`**） | 每天 1 条「缺 farm 级/户外浇水证据」→ **exit 1 / needs_review**，**无多余误报**（口径精确） |
+| `scratch/review-neg-F-watered-outdoor-false.jsonl`（字段在但 `False`，`crops_watered` 仍自称 true） | 每天 1 条「checks.watered_outdoor=false（睡前还有没浇的作物）」→ **exit 1** |
+| `scratch/journal-green.jsonl` | 仍 **exit 0 / VERIFIED**（Lead 已同步 `scratch\mk_green_journal.py:36` 的 `watered_outdoor: true`）⇒ 正例未破 |
+| A/B/C/D（§7.1/§7.2） | 全部仍 **exit 1**，无回归 |
+
+**判定：PASS。** 注意 `scratch\_review_neg_gen.py` 在 pwsh 下必须带 `$env:PYTHONUTF8="1"`，否则 `print(path)` 会在中文路径上抛 `UnicodeEncodeError: 'charmap' codec`（脚本已写完文件但在打印时崩掉，后续 mode 不生成 ⇒ 会对不存在的账本报 exit 2）。
+
+**由该口径推出的任务板闸门（已报 Lead）**：`checks.watered_outdoor` 由 **task-19** 写入（其标题即"run3 前置"），而 task-12（run3 真机）的 `blocked_by` 曾不含 task-19 ⇒ 完美 run3 也会被本工具判 needs_review / exit 1（neg-E 即实证），白烧唯一一次真机长跑。另 task-19 改 `mod\AgentFarm.Bridge\WorldSnapshot.cs` + `Contracts.cs`（加 `farm.dryCrops`）⇒ 必须在 `tools\deploy-mod.py` 装 0.7.22 **之前**落地，否则装机 Mod 不含该字段、版本断言错位。附带：task-17（blocked_by [task-11,task-15]）与 task-19（blocked_by [task-15]）会在 task-15 完成后**同时 ready 且都写 `longrun.py`+`farmwork.py`** ⇒ 需在依赖表上串行化。
 - 仍未闭合的**非阻塞** nit（沿用）：①`_tile_count()`（`:79-87`）对无 `tiles` 字段的历史账本返回 0 ⇒ 误报为「0 目标阶段 leftover」，fail-safe 但文案误导，run3 不受影响；②`checks`/`verified` 双双缺失且阶段记录缺 `tiles` 的账本，工具只能报「缺 verified」+疑似「0 目标 leftover」，无法还原真实遗留——这是账本本身不携带的信息，可接受。

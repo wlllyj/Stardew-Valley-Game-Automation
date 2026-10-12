@@ -3,6 +3,16 @@
 > 本文是**收工快照**，只写"明天开工要用的东西"。`docs\_resume-prompt.md` 是 P2 时代的三步恢复法（仍然有效：单测 → `deploy-mod.py` → `run-plot.py`），但它的状态表已过期，以本文为准。
 > 目标不变：**P3 ⑥ —— 端到端自主完成「清障 → 开垦 → 播种 → 浇水」，连续 3 个游戏日无人工介入**（判据一律用 `observe?detail=full` 的 `tiles[]`/`inventory[]`/`money` 差分，回执不算证据）。
 
+## 0a. 2026-10-13 开工更新（**与下文冲突时以本节为准**）
+
+- **开工状态**（2026-10-13 上午实测）：游戏进程不存在、`bridge.json` 不存在、17890 无监听、存档 `Wahaha_450799035` size 3502298 / mtime `2026-10-11 22:24:19` 未改写；全量单测 **Ran 194 tests / OK**；工作树只有 dev-coder 的 5 个在制文件（`brain/agentfarm/bridge.py`、`brain/agentfarm/farmwork.py`、`mod/AgentFarm.Bridge/UseToolSkill.cs`、`tests/test_farmwork.py`、`tests/test_longrun.py`，+302/−35）。
+- **deputy-lead 对 task-7 的预检 = 绿**：`py_compile` exit 0、**194 OK**、`dotnet build` **0 警 0 错**；提醒最终验收要 `--no-incremental` 全量重建。
+- **任务板已改**（Lead 独占）：`task-12 blocked_by += task-19`（rev3，理由：task-19 才写 `checks.watered_outdoor`，缺它 run3 必被自己的工具判 exit 1）；`task-19 blocked_by=[task-15, task-17]`、`task-13 blocked_by=[task-17, task-19]`、`task-18 blocked_by=[task-11, task-21]`（串行化同文件写者）。**新的串行顺序见 §3**。
+- **新任务**：**task-21**（planner-dev：`LevelUpMenu` 职业选择能否程序安全驱动的探针，交付 `docs/_il-profession.md`，是 task-18 的前置）；**task-5** 由 log-analyst 继续（`docs/_il-sell-path.md`）。
+- **0.7.22 发布规则改为 Lead 独占**（详见 §3 末段）：一次装机 = task-7 + task-8 + task-19；bump 与部署都由 Lead 在 deputy 完整验收通过后执行。
+- **门槛更新已落 `tools/verify-run3.py`**：要求 `day_end.checks.watered_outdoor`（缺字段即算问题）。负例回归 7/7：绿账本 exit 0，neg-A/B/C/D/E/F 各 exit 1（E = 完美一天只缺该字段）。
+- ⚠ **goal `goal-1ee4cda9` 仍是 paused（disarmed）**：模型侧 resume 被拒（"the user must resume it"）⇒ **需要用户在界面里 resume**，否则本轮结束后不会自动续跑。今日进展见 `docs/00-开发日志.md` 条目 029。
+
 ## 0. 一句话状态
 
 Mod **0.7.21** 装机中（游戏**未运行**、桥文件不存在、端口 17890 无监听、存档未被改写——machine-runner 独立复核过）；单测 **194 OK**（dev-coder 昨晚收工前跑出，188 → +6）；`git status` 有 dev-coder 的 5 个 WIP 文件未提交（见 §4）；任务：task-7（dev-coder，已停点、**代码在树里但未 bump/manifest 仍 0.7.21**）、task-10（log-analyst，**已交付并 complete**）；已交付的分析 = task-3（run1 行为）、task-6（睡觉根因）、task-9 复核（deputy-lead，6 账本独立复跑 PASS）、**task-10（`docs\_tool-matrix.md` + `docs\_analyze-farmcounts.md`）**；**新增 task-19**（浇水/计数验收口径，run3 前置）、**task-20**（工具等级可观测 + clump 判据，不阻塞 run3）。**两条最硬的结论** = 睡觉失败机制（`docs\_il-sleep-path.md`）+ **我自己的验收工具曾"白过"浇水一项**（见 §6 / §8）。goal 已 pause（rev3 / disarmed），你说"继续"就 resume。
@@ -30,17 +40,17 @@ Mod **0.7.21** 装机中（游戏**未运行**、桥文件不存在、端口 178
 task-7 (Mod 0.7.22: 镰刀真挥 + Done() Grass 判据 + clear() 多刀)   ← dev-coder 已停点（代码在树里）
   → task-8  (sleep 跨日: 先让游戏弹提问再回答; Mod 早失败)          blocked_by task-7
   → task-11 (模态守卫: LevelUpMenu 关 / SaveGameMenu 只等)          blocked_by task-8
-  → task-15 (日级验收纳 no_unmet_stages + 买种子时机)               blocked_by task-11
-  → task-19 (浇水/计数验收口径: checks.watered_outdoor, run3 前置)   blocked_by task-15
-  → task-13 (bridge.json 字段容错)                                  blocked_by task-19
+  → task-15 (日级验收纳 no_unmet_stages + 买种子时机)               blocked_by task-7, task-11
   → task-17 (world_stuck 检测与自愈)                                blocked_by task-11, task-15
+  → task-19 (浇水/计数验收口径: checks.watered_outdoor, run3 前置)   blocked_by task-15, task-17
+  → task-13 (bridge.json 字段容错)                                  blocked_by task-17, task-19
   → task-14 (ensure_location 逐帧 warp 循环 + /v1/exec 带 skill 名)  blocked_by task-13, task-17
-分析链：task-6 ✅ → task-10 ✅ → task-5 (卖出/出货 IL 取证)
-run3 之后（不阻塞）：task-20 (工具等级可观测 + ResourceClump 工具/判据, blocked_by task-12)、
-                     task-18 (职业选择自动化, 耕种优先: Tiller → Artisan)
-真机：task-12 = run3 三日连跑（machine-runner，blocked_by task-7/8/9/11/15）——**必须等 Mod build 完 + Lead 部署完再 claim**
+分析链：task-6 ✅ → task-10 ✅ → task-5 (卖出/出货 IL 取证, log-analyst 进行中)
+职业链：task-21 (LevelUpMenu 职业选择探针, planner-dev) → task-18 (职业选择自动化, blocked_by task-11, task-21)
+run3 之后（不阻塞）：task-20 (工具等级可观测 + ResourceClump 工具/判据, blocked_by task-12)
+真机：task-12 = run3 三日连跑（machine-runner，blocked_by task-7/8/9/11/15/**19**）——**必须等 Mod build 完 + Lead 部署完再 claim**；缺 task-19 会让 run3 被自己的 `verify-run3.py` 判 exit 1（白烧唯一一次真机）
 ```
-**Mod bump 规则**：0.7.22 由链上**最后一个 Mod 改动者**统一 bump（task-19 会加 `farm.dryCrops` 字段、task-14 改 `MoveToLocationSkill`/`BridgeHost`），bump 后同步 `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED` 并 `dotnet build` 0 错 0 警；在那之前**不要部署当前 dll**（行为已变、版本号没变，部署了会让 preflight 的版本断言失去意义）。
+**Mod bump 规则（2026-10-13 更新，Lead 裁定）**：0.7.22 = **一次装机**的合并版本，内容 = task-7（镰刀真挥 + `Done()` Grass 判据 + 多刀）+ task-8（sleep 跨日/快速诚实失败）+ task-19（`farm.dryCrops`/Contracts 字段）；**bump `manifest.json`、同步 `MOD_VERSION_EXPECTED`、`tools/deploy-mod.py` 装机全部由 Lead 独占**，在链条全部落地且 deputy-lead 完整验收通过后一次执行；task-7/8/19 都**只改代码不 bump**（避免"版本号相同、内容不同"的假 0.7.22 —— v0.7.17 教训）。task-14 赶得上并入同版，赶不上 0.7.23 二次部署，不影响 run3 起跑。
 
 `task-9`（brain 账目/资源三处）已完成；`task-3`/`task-6` 已交付；`task-16` = deputy-lead 常设独立验收（每份 dev-coder 完工都要过它）。
 
