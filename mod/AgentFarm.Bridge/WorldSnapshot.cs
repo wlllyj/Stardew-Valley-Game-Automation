@@ -797,6 +797,9 @@ namespace AgentFarm.Bridge
             v.ActiveMenuText = UiRead.ActiveMenuText();
             v.DialogueResponses = UiRead.DialogueResponseTexts();
             v.DialogueIsQuestion = UiRead.DialogueIsQuestion();
+            // task-11：LevelUpMenu 是不是“职业选择弹窗”（不可逆）—— 脑要靠它决定能不能 dismiss。
+            // 非 LevelUpMenu / 读不到 时为 null（字段被省略），脑按“未知”处理（同样不 dismiss）。
+            v.ProfessionsToChoose = UiRead.ProfessionsToChoose();
 
             v.IsModal = v.ActiveMenu != null
                 || v.EventUp

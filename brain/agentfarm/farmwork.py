@@ -75,19 +75,29 @@ TILE_INERT_STATUSES = ("tool_ineffective", "precondition_failed")
 
 #: `use_tool` 回执里代表"**现在整个环境**不让动手"的状态码 ⇒ 记 failed 但**不封格**（下轮还能试）。
 #: `world_fading` = 屏幕渐黑/过场（Mod 侧 `fadeToBlack`/`nonWarpFade`，见 `UseToolSkill.Swing()` 的门卫）。
+#: `busy` = `MainThreadDispatcher.RejectBusy()`（mod/AgentFarm.Bridge/MainThreadDispatcher.cs:159-169）
+#:   在"已有技能正在执行"时**零成本快速拒绝**：任何 skill 都会拿到它（含 `use_tool`）。
+#:   它不是这一格的属性、也不是我们的错，下一秒队列空了就能成 ⇒ 必须算环境挡路。
+#:   真机触发时序很现实：run2 有两次 180s 客户端超时（Mod 还在跑长技能），期间任何新 exec 都回 busy。
 #: 这些码**全桥通用**（不止 `clear()`）：`MoveToLocationSkill`/`PlantSkill`/`StepMover` 都会回
 #: `no_save`/`ui_modal` ⇒ 分类必须按 `exc.status` 统一做，见 `_classify_status`。
-ENV_BLOCK_STATUSES = ("no_save", "ui_modal", "world_fading")
+ENV_BLOCK_STATUSES = ("no_save", "ui_modal", "world_fading", "busy")
 
 #: `use_tool` 回执里代表"请求发出去了、但**没拿到世界的结论**"的状态码（task-22）：
 #: `timeout` = 墙钟超时（可能一次都没挥出去）、`error` = Mod 侧异常/`ok=false` 却没给码。
+#: `stale` = `BridgeHost.cs:538-553`：调用方传的 `based_on_seq` 比 `Skills.StaleSeqThreshold` 旧
+#:   （协议上任何 skill 都可能，目前只有 `move_to*` 会带这个参数）⇒ 这是**我们自己传参错了**，
+#:   必须可见、必须占配额（连续 stale 应被限流成 `capped`、当天 needs_review），不能被当成
+#:   环境抖动无限免费重试。
 #: 这类**既不能**宣布"这一格干不动"（不许封格），**也不能**当没发生（它真烧了墙钟）
 #: ⇒ 记 failed + `inconclusive`：`longrun._mark_blocked` 跳过它，`_count_attempts` 仍计配额。
-#: ⚠️ 只有这两个码算"没结论"（Lead m01763）：回执 `ok` / 缺 status / Mod 的结论类码都是
-#: **真实回应**，世界没变就是"这一刀白挥"，走结论路径。
-#: ⚠️ 与 `TILE_INERT_STATUSES`/`ENV_BLOCK_STATUSES` **互斥**，三者并集覆盖 Mod 全部 status
-#: （单测 `test_status_classes_cover_mod_codes_are_disjoint` 钉住）。
-INCONCLUSIVE_STATUSES = frozenset({"timeout", "error"})
+#: ⚠️ 只有 `timeout`/`error`/`stale` 算"没结论"（Lead m01763 + task-28 N4-1）：回执 `ok` /
+#: 缺 status / Mod 的结论类码都是**真实回应**，世界没变就是"这一刀白挥"，走结论路径。
+#: ⚠️ 与 `TILE_INERT_STATUSES`/`ENV_BLOCK_STATUSES` **互斥**，三者并集覆盖的是
+#: **"bridge 层可能回给 brain 的通用码 + `use_tool` 自己的码"**（单测
+#: `test_status_classes_cover_mod_codes_are_disjoint` 钉住）；其它 skill 专属的码
+#: （如 `sleep_no_question`）**有意**落进兜底桶，由各自的调用点按语义处理。
+INCONCLUSIVE_STATUSES = frozenset({"timeout", "error", "stale"})
 
 #: `sleep` 回执里"游戏自己**没有**弹出睡觉提问"的状态码：Mod 拼不出 `Sleep` 前缀的应答键时
 #: **秒级**报它（不会再白等 3 分钟）。判据与 IL 定案见 `docs/_il-sleep-path.md`。
@@ -388,11 +398,18 @@ def _classify_status(status: str) -> tuple[bool, bool]:
     而 `longrun._count_attempts` **不带动作过滤** ⇒ 任何一次瞬时环境抖动都可能把该格推到
     `MAX_TILE_ATTEMPTS` → `capped` → `stage_exhausted` → 当天被杀。
 
-    三分类（互斥，并集覆盖 Mod 全部 status）：
-      * `ENV_BLOCK_STATUSES`    ⇒ `(True, False)`：**环境挡路**——不是这一格的问题，下轮还能试；
-      * `INCONCLUSIVE_STATUSES` ⇒ `(False, True)`：**没结论**——一次请求都没拿到证据，计配额不封格；
+    三分类（互斥；并集覆盖 **bridge 层通用码 + `use_tool` 的码**，其它 skill 专属码有意走兜底桶）：
+      * `ENV_BLOCK_STATUSES`    ⇒ `(True, False)`：**环境挡路**——不是这一格的问题，下轮还能试
+        （含 `busy`＝`MainThreadDispatcher.RejectBusy()`：任何 skill 都可能被"同一时刻只允许一个 exec"
+        零成本拒绝；也含 `no_save`/`ui_modal`/`world_fading`）；
+      * `INCONCLUSIVE_STATUSES` ⇒ `(False, True)`：**没结论**——`timeout`/`error`，以及 `stale`
+        （我们自己传了过旧的 `based_on_seq` ⇒ 我们的错，必须可见、必须占配额）；
       * 其余一切（`TILE_INERT_STATUSES`、空串、`ok`、以及类别未枚举的新码）
         ⇒ `(False, False)`：**Mod 真的回应了**——世界没变就算"这一刀白挥"，归 task-7 的结论路径。
+
+    防自旋（task-28 N4-1）：`env_block` 不占 `_count_attempts` 配额，所以**不能**只靠"不计配额"；
+    持续 `busy` 的有界策略在 `longrun._count_attempts`（同格同日连续被挡超过 `MAX_ENV_ATTEMPTS`
+    ⇒ 从下一次起按"没结论"占配额，最终 `capped` ⇒ 当天 needs_review）。
 
     裁定（Lead m01763）：`inconclusive` **只在"整轮一次真实请求都没发出去"时成立**。只要有一轮
     Mod 有回应（含"回执 ok 但观测没变"）并且达到了请求上限 ⇒ 仍按"挥满了没变"封格

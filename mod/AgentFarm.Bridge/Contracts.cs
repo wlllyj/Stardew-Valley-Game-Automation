@@ -510,6 +510,16 @@ namespace AgentFarm.Bridge
 
         /// <summary>当前对话框是不是“提问”（需要玩家选 Yes/No 之类）。</summary>
         [JsonPropertyName("dialogueIsQuestion")] public bool DialogueIsQuestion { get; set; }
+
+        /// <summary>
+        /// `LevelUpMenu` 的职业候选 id（索引 0 = 左框、索引 1 = 右框；公式与 id 表见
+        /// `docs\_il-profession.md` §2/§3）。**只在当前菜单是 `LevelUpMenu` 且反射读成功时出现**：
+        ///   * **空数组** ⇒ 普通升级弹窗（这一级没有职业可选）⇒ 脑可以放心 dismiss；
+        ///   * **非空**   ⇒ 职业选择弹窗：`exitThisMenu()` 会永久丢掉这次选择（不可逆）
+        ///                  ⇒ 脑**必须不 dismiss**，记证 + 当天停下等人（user 已拍板 Tiller/Artisan 路线）；
+        ///   * **字段缺失** ⇒ 读不到候选（旧 Mod 或字段改名）⇒ 脑按“未知”处理，一样不 dismiss（fail-safe）。
+        /// </summary>
+        [JsonPropertyName("professionsToChoose")] public int[] ProfessionsToChoose { get; set; }
     }
 
     internal sealed class LivenessView

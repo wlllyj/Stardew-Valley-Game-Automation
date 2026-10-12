@@ -34,7 +34,8 @@ from agentfarm.farmwork import (  # noqa: E402
     MAX_CLEAR_SWINGS, FarmWorker, STAGE_ACTION, StepResult, StageResult, seed_items,
 )
 from agentfarm.longrun import (  # noqa: E402
-    DEFAULT_LLM_MAX_TOKENS, MAX_TILE_ATTEMPTS, DayReport, LongRun, _till_blocked_by, plot_observe,
+    DEFAULT_LLM_MAX_TOKENS, ENDED_BY_MODAL, MAX_ENV_ATTEMPTS, MAX_TILE_ATTEMPTS, DayReport,
+    LongRun, _till_blocked_by, plot_observe,
 )
 from agentfarm.planner import BoundaryPlanner, TaskIntent, deterministic_plan  # noqa: E402
 
@@ -62,6 +63,9 @@ class FakeWorld:
         self.crops: dict[tuple[int, int], dict[str, bool]] = {}
         self.player_tile = [62, 14]
         self.is_in_bed = True
+        #: 当前地点名 —— `FarmWorker.ensure_location/sleep` 会读它（task-15 让真 `FarmWorker`
+        #: 也能在假世界里睡下去）。
+        self.location = "Farm"
         self.seq = 1
         self.sleeps = 0
         self.refills = 0
@@ -74,6 +78,13 @@ class FakeWorld:
         self.stuck: set[tuple[int, int]] = set()
         #: task-22：环境挡路 / 没结论的注入队列（见 `take_fail_status`）。
         self.fail_status: dict[tuple[int, int], str | list[str]] = {}
+        # ---- task-11：模态脚本（mode guard）----
+        #: 依次出现的 `ui` 片段；队首就是"现在挡路的模态"，`dismiss()` 关掉它就露下一个。
+        #: 片段里以 `_` 开头的键是脚本元数据（`_autoGoneAfterPolls`），不发给脑。
+        self.ui_script: list[dict] = []
+        self.dismiss_calls = 0
+        self.dismissed: list[str] = []
+        self.modal_polls = 0
         self.scythe = scythe
         self.inventory = [
             {"slot": 0, "id": "Axe", "qualifiedId": "(T)Axe", "name": "Axe", "stack": 1, "isTool": True},
@@ -109,15 +120,15 @@ class FakeWorld:
             "worldSeq": self.seq, "hasSaveLoaded": True,
             "clock": {"year": self.year, "season": self.season, "day": self.day,
                       "timeOfDay": self.time_of_day, "weather": "sunny", "weatherOnFarm": "sunny"},
-            "player": {"name": "测试员", "location": "Farm", "tile": list(self.player_tile), "facing": 2,
+            "player": {"name": "测试员", "location": self.location, "tile": list(self.player_tile), "facing": 2,
                        "stamina": self.stamina, "maxStamina": self.max_stamina, "money": self.money,
                        "isInBed": self.is_in_bed, "inventory": [dict(i) for i in self.inventory],
                        "wateringCan": {"present": True, "waterLeft": self.water_left,
                                        "max": 40, "bottomless": False, "upgradeLevel": 0}},
-            "location": {"name": "Farm", "isOutdoorFarm": True, "tiles": tiles, "tilesTruncated": False,
+            "location": {"name": self.location, "isOutdoorFarm": True, "tiles": tiles, "tilesTruncated": False,
                          "tillable": [list(t) for t in free], "refillTiles": [[70, 10], [70, 11]],
                          "refillTilesTruncated": False, "furniture": [], "doors": []},
-            "ui": {"isModal": False, "eventUp": False},
+            "ui": self.current_ui(),
             "liveness": {"worldAdvancing": True, "secondsSinceClockMoved": 1.0},
         }
 
@@ -142,6 +153,39 @@ class FakeWorld:
             self.fail_status.pop(tuple(tile), None)
         return status
 
+    # ---- task-11：模态脚本（模态守卫用）----
+    def current_ui(self) -> dict:
+        """当前挡路的 `ui` 片段（脚本队首），没有脚本就是干净世界。
+
+        `_autoGoneAfterPolls=N` = 这个模态**在玩家第 N 次看它之后自己消失**（第 N+1 次观察就看不到了），
+        用来复刻真机 `SaveGameMenu` 那种"只等不关、约 30s 自己走完"的行为。以 `_` 开头的键
+        是脚本元数据，不会发给脑。
+        """
+        if not self.ui_script:
+            return {"isModal": False, "eventUp": False}
+        head = self.ui_script[0]
+        auto = head.get("_autoGoneAfterPolls")
+        if auto is not None and self.modal_polls >= int(auto):
+            self.ui_script.pop(0)
+            self.modal_polls = 0
+            return self.current_ui()
+        self.modal_polls += 1
+        ui = {k: v for k, v in head.items() if not k.startswith("_")}
+        ui.setdefault("isModal", True)
+        ui.setdefault("eventUp", False)
+        return ui
+
+    def dismiss(self) -> dict:
+        """`dismiss_modal` 的假世界版：关掉队首模态（露出下一个）并如实返回回执。"""
+        self.dismiss_calls += 1
+        name = ""
+        if self.ui_script:
+            name = str(self.ui_script[0].get("activeMenu") or "")
+            self.ui_script.pop(0)
+        self.modal_polls = 0
+        self.dismissed.append(name)
+        return {"ok": True, "status": "ok", "worldResumed": True, "worldSeq": self.seq}
+
     def clear(self, tile):
         kind = self.blockers.get(tile)
         if kind is None:
@@ -155,11 +199,35 @@ class FakeWorld:
 
         `stuck` 里的格子模拟真机 run1 的镰刀白挥：回执 `status="tool_ineffective"`、
         世界一动不动。`swings` 记每格被挥了几次 —— task-4 的验收证据就在这里。
+
+        task-15 起**按工具真的改世界**：真 `FarmWorker.till/water` 走的是 `client.use_tool`
+        （不是 `FakeWorker` 的 `w.till/w.water`）；如果这里只删 `blockers`，环境重试的第 2 轮
+        就会落成"非环境失败"并占配额、还会被 `_mark_blocked` 封格（实测假红）。
         """
         t = tuple(tile)
         self.swings[t] = self.swings.get(t, 0) + 1
         if t in self.stuck:
             return {"ok": True, "status": "tool_ineffective", "reason": f"工具对 {t} 无效"}
+        if tool == "hoe":                                  # 镜像 `till()`
+            if t in self.dirt:
+                return {"ok": True, "status": "ok", "reason": "已经是耕地"}
+            if t not in self.tillable or t in self.blockers:
+                return {"ok": True, "status": "tool_ineffective", "reason": f"{t} 现在锄不了"}
+            self.dirt.add(t)
+            self.spend("till")
+            return {"ok": True, "status": "ok", "reason": "锄成耕地"}
+        if tool == "can":                                  # 镜像 `water()`
+            c = self.crops.get(t)
+            if c is None:
+                return {"ok": True, "status": "tool_ineffective", "reason": f"{t} 没有作物"}
+            if c["watered"]:
+                return {"ok": True, "status": "ok", "reason": "已经浇过"}
+            if self.water_left <= 0:
+                return {"ok": False, "status": "need_refill", "reason": "水壶空了"}
+            c["watered"] = True
+            self.water_left -= 1
+            self.spend("water")
+            return {"ok": True, "status": "ok", "reason": "浇过"}
         if self.blockers.pop(t, None) is None:
             return {"ok": True, "status": "ok", "reason": "挥了，但这格本来就没东西"}
         self.spend("clear")
@@ -297,11 +365,25 @@ class FakeClient:
         return self.w.obs()
 
     # ---- 供**真的** FarmWorker 直接驱动的两个动作（task-4 端到端复现用）----
-    def move_to(self, x, y, *, timeout_ms=None):
+    def move_to(self, x, y, *, timeout_ms=None, allow_bed=None):
         self.w.player_tile = [int(x), int(y)]
         if hasattr(self.w, "revealed"):
             self.w.revealed = True
         return {"ok": True, "status": "ok", "tile": [int(x), int(y)]}
+
+    # ---- task-15：真 `FarmWorker.sleep()` 要的三件套（`ensure_location` → 踩床 → `sleep`）----
+    def move_to_location(self, name, *, tile=None, timeout_ms=None):
+        """换地点名（`FarmWorker.ensure_location` 会**复核观测**里的 `location.name`）。"""
+        self.w.location = str(name)
+        return {"ok": True, "status": "ok", "location": str(name)}
+
+    def interact(self, tile, *, timeout_ms=None):
+        return {"ok": True, "status": "ok", "reason": "假世界：交互不影响跨日"}
+
+    def sleep(self, *, timeout_ms=None):
+        """真跨日：世界自己走 `w.sleep()`（day+1、体力回满、watered 清零）。"""
+        self.w.sleep()
+        return {"ok": True, "status": "ok", "day": self.w.day, "timeOfDay": self.w.time_of_day}
 
     def use_tool(self, tile, *, tool=None, timeout_ms=None):
         # task-22：真桥对 `ok=false` 是**抛** `BridgeError`（带 status）—— 注入队列复刻这条口径，
@@ -310,6 +392,10 @@ class FakeClient:
         if status:
             raise BridgeError(f"假世界注入：这一格这次没做成（{status}）", status=status)
         return self.w.use_tool(tuple(tile), tool)
+
+    # ---- task-11：模态守卫用 ----
+    def dismiss_modal(self, *, timeout_ms=5000):
+        return self.w.dismiss()
 
     # ---- 供**真** `FarmWorker.plant`/`sow` 驱动（task-22 的播种/浇水集成用例）----
     def plant(self, seed, tile, *, timeout_ms=None):
@@ -1178,7 +1264,11 @@ class TestAccountingTask9(unittest.TestCase):
                          ("till_area", 1, 1), ex[0])
 
     def test_no_seed_no_money_never_tills(self):
-        """种子 0 且钱 < 单价 ⇒ 三道口径都说"没活"，`run_stage` 一次都不被叫。"""
+        """种子 0 且钱 < 单价 ⇒ 三道口径都说"没活"，`run_stage` 一次都不被叫。
+
+        task-15 §② 追加：复核集合（`_leftover`）**也必须归零** —— 否则"0 目标 + leftover>0"
+        的阶段会被 `no_unmet_stages` 当成"没做完"，run3 开局就被自己判死。
+        """
         w = FakeWorld(weeds=0, seeds=0, money=5)
         w.dirt = {(60, 10)}              # 留一格已锄开的地：不设闸门时 plant_area 本会去播种
         run = make_run(w, target_days=1)
@@ -1186,11 +1276,12 @@ class TestAccountingTask9(unittest.TestCase):
         plot = next(p for p in run._plot_candidates(w.obs())
                     if (60, 10) in {tuple(t) for t in (p.get("tiles") or [])})
 
-        # ① 目标集合：两阶段都空（不是因为"本来就没地"——复核集合非空，见下）
+        # ① 目标集合：两阶段都空（不是因为"本来就没地"，地还在——但复核也照同口径归零）
         self.assertEqual(run._stage_tiles("till_area", w.obs(), plot), [])
         self.assertEqual(run._stage_tiles("plant_area", w.obs(), plot), [])
-        self.assertTrue(run._leftover("plant_area", w.obs(), plot),
-                        "地还在（复核看得见），是种子闸门把目标掐掉了")
+        self.assertEqual(run._leftover("plant_area", w.obs(), plot), [],
+                         "task-15 §②：0 目标的阶段 leftover 必须归零，别造出假剩余")
+        self.assertEqual(run._leftover("till_area", w.obs(), plot), [])
         # ② 守卫层同口径：这片地"没活"
         self.assertFalse(run._plot_has_work(w.obs(), [tuple(t) for t in plot["tiles"]]))
 
@@ -1201,12 +1292,21 @@ class TestAccountingTask9(unittest.TestCase):
         self.assertFalse(out.postcondition_met)
         self.assertNotEqual(out.terminal, "VERIFIED")
         self.assertNotIn("后置条件成立", out.reason)
+        self.assertEqual(rep.stages[-1]["leftover"], 0, rep.stages[-1])
         # 人话 + 判据都留下：播报一次、journal 带 seeds/money/单价
         self.assertTrue(any("不再开垦" in n for n in rep.notes), rep.notes)
         gate = [e for e in run.entries if e["event"] == "seed_gate"]
         self.assertEqual(len(gate), 1, run.entries)
         self.assertEqual((gate[0]["seeds"], gate[0]["money"], gate[0]["seed_price"]),
                          (0, 5, run.seed_price), gate[0])
+        # task-15 §③：`in_plot` 如实回答"是不是已经在田里才发现没种子"（最贵的那条路）
+        pt = tuple(run._snap()["player"]["tile"])
+        self.assertEqual(gate[0]["in_plot"], pt in {tuple(t) for t in plot["tiles"]}, gate[0])
+        run.seed_gate_noted.clear()
+        w.player_tile = list(plot["tiles"][0])
+        run._step_stage("till_area", w.obs(), plot, rep)
+        gate2 = [e for e in run.entries if e["event"] == "seed_gate"]
+        self.assertTrue(gate2[-1]["in_plot"], "人站在作业区里 ⇒ in_plot 必须为真")
 
     def test_default_max_tokens_is_16384(self):
         """提示词预算：默认 16384（三处同一个真值源），且降级要能标出"是不是被截断"。"""
@@ -1300,8 +1400,9 @@ class TestTask22EnvAccounting(unittest.TestCase):
     def _events(run: LongRun, event: str) -> list:
         return [e for e in run.entries if e["event"] == event]
 
-    def test_clear_env_block_retries_same_day_and_never_seals(self):
-        """渐黑挡了第一次清障 ⇒ 不封格、不占配额、如实未成立；下一轮同一天**真清掉**。"""
+    def test_clear_env_block_retried_inside_the_same_stage_call(self):
+        """渐黑挡了第一次清障 ⇒ **同一次 `_step_stage` 里就重跑同一批格子**（task-15 §④）、
+        事后做成 ⇒ 不封格、不占配额、**不算硬失败**。"""
         w = FakeWorld(weeds=0, seeds=0, money=0)
         w.blockers[(60, 10)] = "weed"
         w.fail_status[(60, 10)] = ["world_fading"]      # 只挡第一次，之后恢复正常
@@ -1310,8 +1411,10 @@ class TestTask22EnvAccounting(unittest.TestCase):
         plot = self._plot()
         rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
 
-        out1 = run._step_stage("clear_area", w.obs(), plot, rep)
-        self.assertFalse(out1.postcondition_met, out1.reason)
+        out = run._step_stage("clear_area", w.obs(), plot, rep)
+
+        self.assertNotIn((60, 10), w.blockers, "环境挡路只该延后，不该让这一格当天做不成")
+        self.assertTrue(out.postcondition_met, out.reason)
         self.assertNotIn((60, 10), run.blocked, "环境挡路不是这一格的属性")
         self.assertIsNone(run.tile_attempts.get((60, 10)), "环境挡路不占本日尝试配额")
         self.assertEqual(self._events(run, "blocked"), [], run.entries)
@@ -1319,11 +1422,16 @@ class TestTask22EnvAccounting(unittest.TestCase):
         self.assertEqual(len(env), 1, run.entries)
         self.assertEqual(env[0]["statuses"], ["world_fading"], env[0])
         self.assertEqual(env[0]["tiles"], 1, env[0])
-
-        out2 = run._step_stage("clear_area", w.obs(), plot, rep)
-        self.assertNotIn((60, 10), w.blockers, "环境挡路只该延后，不该让这一格当天做不成")
-        self.assertTrue(out2.postcondition_met, out2.reason)
-        self.assertNotIn((60, 10), run.blocked)
+        # §④ 要求 1：重试过程必须留痕（轮次/重跑格数/挡路模态/状态码）
+        retry = self._events(run, "env_retry")
+        self.assertEqual(len(retry), 1, run.entries)
+        self.assertEqual((retry[0]["stage"], retry[0]["round"], retry[0]["limit"],
+                          retry[0]["tiles"], retry[0]["statuses"], retry[0]["targets"]),
+                         ("clear_area", 1, run.max_env_retries, 1, ["world_fading"], [[60, 10]]), retry[0])
+        # §④ 要求 2：这一次环境挡路**不进硬失败**（目标已达成），但要单独说出来
+        stage = rep.stages[-1]
+        self.assertEqual((stage["failed"], stage["failed_any"]), (0, 1), stage)
+        self.assertIn("另有 1 次环境挡路已重试做成（不计硬失败）", out.reason)
 
     def test_inconclusive_spends_quota_and_caps_without_sealing(self):
         """一直没结论（全 timeout）⇒ 不封格但**占配额**；两轮后如实 `capped`、当天 needs_review。"""
@@ -1352,7 +1460,8 @@ class TestTask22EnvAccounting(unittest.TestCase):
         self.assertEqual(ex[-1]["capped"], 1, ex)
 
     def test_sow_env_block_never_seals_or_spends_quota(self):
-        """`sow`（plant_area）遇 `ui_modal` ⇒ 标记继承到底层、不封格、不吃配额。"""
+        """`sow`（plant_area）遇一次 `ui_modal` ⇒ 标记继承到底层、不封格、不吃配额；
+        模态收掉后重跑同一批格子，当天照样种下去（task-15 §④）。"""
         w = FakeWorld(weeds=0, seeds=10, money=500)
         w.dirt = {(60, 10)}
         w.fail_status[(60, 10)] = ["ui_modal"]
@@ -1365,13 +1474,15 @@ class TestTask22EnvAccounting(unittest.TestCase):
 
         self.assertNotIn((60, 10), run.blocked, "模态挡住播种 ≠ 这一格种不下去")
         self.assertIsNone(run.tile_attempts.get((60, 10)), "环境挡路不该占播种配额")
-        self.assertFalse(out.postcondition_met, out.reason)
+        self.assertTrue(out.postcondition_met, out.reason)
         env = self._events(run, "env_fail")
         self.assertEqual(len(env), 1, run.entries)
         self.assertEqual(env[0]["statuses"], ["ui_modal"], env[0])
+        self.assertEqual(len(self._events(run, "env_retry")), 1, run.entries)
 
     def test_water_env_block_never_spends_quota(self):
-        """`water` 遇 `world_fading` ⇒ 不封格且 `tile_attempts` 不增（`_count_attempts` 无动作过滤）。"""
+        """`water` 遇一次 `world_fading` ⇒ 不封格且 `tile_attempts` 不增（`_count_attempts` 无动作过滤）；
+        重跑之后真的浇上（task-15 §④）。"""
         w = FakeWorld(weeds=0, seeds=10, money=500)
         w.dirt = {(60, 10)}
         w.crops[(60, 10)] = {"watered": False, "ripe": False}
@@ -1385,11 +1496,363 @@ class TestTask22EnvAccounting(unittest.TestCase):
 
         self.assertIsNone(run.tile_attempts.get((60, 10)), "渐黑挡住浇水不该吃掉本日配额")
         self.assertNotIn((60, 10), run.blocked)
-        self.assertFalse(out.postcondition_met, out.reason)
+        self.assertTrue(out.postcondition_met, out.reason)
         env = self._events(run, "env_fail")
         self.assertEqual(len(env), 1, run.entries)
         self.assertEqual(env[0]["statuses"], ["world_fading"], env[0])
         self.assertEqual(env[0]["stage"], "water_area", env[0])
+        self.assertEqual(len(self._events(run, "env_retry")), 1, run.entries)
+
+
+class TestTask11ModalGuard(unittest.TestCase):
+    """task-11 模态守卫（真机：`LevelUpMenu` 把时钟冻住、整天静默卡死）。
+
+    三条硬口径：
+      * 普通 `LevelUpMenu`（`professionsToChoose` 空数组）⇒ dismiss，**可连关**；
+      * `SaveGameMenu`/`NewDaySavingMenu`（新一天的自动存档）⇒ **只等不关**，超时如实停下；
+      * `LevelUpMenu` 带职业候选（不可逆）或**读不到该字段**（旧 Mod / 未知）⇒ **绝不 dismiss**，
+        当天不判 VERIFIED（用户 m03224 拍板了职业路线，静默丢档不可接受）。
+    """
+
+    def _run(self, w: FakeWorld) -> LongRun:
+        run = make_run(w, target_days=1)
+        run.worker = FakeWorker(w)
+        run.client = FakeClient(w)
+        return run
+
+    @staticmethod
+    def _rep() -> DayReport:
+        return DayReport(day_key=("spring", 1, 9), started_at=0.0)
+
+    @staticmethod
+    def _events(run: LongRun, event: str) -> list[dict]:
+        return [e for e in run.entries if e["event"] == event]
+
+    def test_plain_levelup_dismissed_save_menu_only_waited(self):
+        """普通升级关掉、随后自走的存档模态只等不关 ⇒ 世界回干净、`dismiss_calls == 1`。"""
+        w = FakeWorld(weeds=0)
+        w.ui_script = [
+            {"activeMenu": "LevelUpMenu", "activeMenuText": "LevelUpMenu",
+             "professionsToChoose": []},
+            # `_autoGoneAfterPolls`：看两次之后就自己走完（复刻真机 SaveGameMenu 约 30s 自走）
+            {"activeMenu": "SaveGameMenu", "activeMenuText": "SaveGameMenu",
+             "_autoGoneAfterPolls": 2},
+        ]
+        run = self._run(w)
+        rep = self._rep()
+
+        obs, blocked = run._clear_modals(w.obs(), rep)
+
+        self.assertFalse(blocked, rep.ended_reason)
+        self.assertEqual(w.dismissed, ["LevelUpMenu"], "存档模态不许被 dismiss")
+        self.assertEqual(w.dismiss_calls, 1)
+        self.assertFalse(run._modal_info(obs)[0], "清完之后不该还有模态")
+        self.assertEqual(run._modal_info(obs)[1], "")
+        # 回执与判据都留痕：关一个、等走一个
+        dis = self._events(run, "modal_dismissed")
+        self.assertEqual(len(dis), 1, run.entries)
+        self.assertEqual((dis[0]["kind"], dis[0]["menu"]), ("levelup", "LevelUpMenu"), dis[0])
+        self.assertEqual(dis[0]["receipt"].get("ok"), True, dis[0])
+        self.assertEqual(len(self._events(run, "modal_gone")), 1, run.entries)
+        self.assertEqual(self._events(run, "modal_gone")[0]["menu"], "SaveGameMenu")
+
+    def test_consecutive_levelups_are_both_dismissed(self):
+        """多个技能同时升级会**连出** `LevelUpMenu` ⇒ 要一直关到干净。"""
+        w = FakeWorld(weeds=0)
+        w.ui_script = [
+            {"activeMenu": "LevelUpMenu", "professionsToChoose": []},
+            {"activeMenu": "LevelUpMenu", "professionsToChoose": []},
+        ]
+        run = self._run(w)
+        rep = self._rep()
+
+        obs, blocked = run._clear_modals(w.obs(), rep)
+
+        self.assertFalse(blocked, rep.ended_reason)
+        self.assertEqual(w.dismiss_calls, 2)
+        self.assertEqual(w.dismissed, ["LevelUpMenu", "LevelUpMenu"])
+        self.assertFalse(run._modal_info(obs)[0])
+
+    def test_profession_choice_is_never_dismissed_and_day_is_not_verified(self):
+        """职业选择弹窗（非空候选）⇒ 一次都不许 dismiss，当天 `blocked_modal` 且不判 VERIFIED。"""
+        w = FakeWorld(weeds=0, seeds=10, money=500)
+        w.ui_script = [{"activeMenu": "LevelUpMenu", "activeMenuText": "LevelUpMenu",
+                        "professionsToChoose": [0, 1]}]
+        run = self._run(w)
+
+        code = run.run()
+
+        self.assertEqual(code, 1, "被模态挡住 ⇒ 当天没跨日，非 0 收尾")
+        self.assertEqual(w.dismiss_calls, 0, "dismiss 职业弹窗 = 永久丢掉 Tiller/Artisan 选择")
+        pend = self._events(run, "levelup_profession_pending")
+        self.assertEqual(len(pend), 1, run.entries)
+        self.assertEqual(pend[0]["ids"], [0, 1], pend[0])
+        rep = run.days[0]
+        self.assertEqual(rep.ended_by, ENDED_BY_MODAL, rep.ended_reason)
+        self.assertFalse(rep.checks.get("no_blocking_modal", True), rep.checks)
+        self.assertFalse(rep.verified, f"{rep.checks} notes={rep.notes}")
+
+    def test_missing_professions_field_is_treated_as_unknown(self):
+        """字段缺失（旧 Mod / 反射失败）⇒ 按未知处理：不 dismiss、journal 记 `..._unknown`、不 VERIFIED。"""
+        w = FakeWorld(weeds=0)
+        w.ui_script = [{"activeMenu": "LevelUpMenu", "activeMenuText": "LevelUpMenu"}]   # 没有该字段
+        run = self._run(w)
+        rep = self._rep()
+
+        obs, blocked = run._clear_modals(w.obs(), rep)
+
+        self.assertTrue(blocked)
+        self.assertEqual(w.dismiss_calls, 0, "拿不准就不许动不可逆的东西")
+        self.assertEqual(rep.ended_by, ENDED_BY_MODAL)
+        unknown = self._events(run, "levelup_profession_unknown")
+        self.assertEqual(len(unknown), 1, run.entries)
+        self.assertEqual(unknown[0]["menu"], "LevelUpMenu")
+
+    def test_question_modal_dismissed_with_no_key_injection(self):
+        """开着提问（`dialogueIsQuestion`）⇒ 交给 Mod 的 dismiss（它的口径是"选否"）。"""
+        w = FakeWorld(weeds=0)
+        w.ui_script = [{"activeMenu": "DialogueBox", "dialogueIsQuestion": True,
+                        "dialogueResponses": ["是", "否"]}]
+        run = self._run(w)
+        rep = self._rep()
+
+        obs, blocked = run._clear_modals(w.obs(), rep)
+
+        self.assertFalse(blocked, rep.ended_reason)
+        self.assertEqual(w.dismiss_calls, 1)
+        dis = self._events(run, "modal_dismissed")
+        self.assertEqual(len(dis), 1, run.entries)
+        self.assertEqual(dis[0]["kind"], "question", dis[0])
+
+    def test_wait_only_modal_timeout_stops_the_day(self):
+        """只等不关的模态永远不消失（存档卡住）⇒ journal `modal_timeout` + 当天停下等人。"""
+        w = FakeWorld(weeds=0)
+        w.ui_script = [{"activeMenu": "SaveGameMenu", "activeMenuText": "SaveGameMenu"}]
+        run = self._run(w)
+        run.modal_wait_timeout_s = 0.0           # 不真等：第一次轮询就判超时
+        rep = self._rep()
+
+        obs, blocked = run._clear_modals(w.obs(), rep)
+
+        self.assertTrue(blocked)
+        self.assertEqual(w.dismiss_calls, 0, "存档模态绝不许 dismiss（会打断存档）")
+        self.assertEqual(rep.ended_by, ENDED_BY_MODAL)
+        to = self._events(run, "modal_timeout")
+        self.assertEqual(len(to), 1, run.entries)
+        self.assertEqual(to[0]["menu"], "SaveGameMenu")
+
+
+class _CountingClient(FakeClient):
+    """数 `use_tool` 次数的假桥 —— task-28 要证明"持续 busy 下请求次数有界"。"""
+
+    def __init__(self, world: FakeWorld) -> None:
+        super().__init__(world)
+        self.use_tool_calls = 0
+
+    def use_tool(self, tile, *, tool=None, timeout_ms=None):
+        self.use_tool_calls += 1
+        return super().use_tool(tile, tool=tool, timeout_ms=timeout_ms)
+
+
+class TestTask28BusySpin(unittest.TestCase):
+    """task-28（deputy-lead N4-1）：`busy` 算环境挡路、`stale` 算没结论，且**必须有界**。
+
+    `busy` = `MainThreadDispatcher.RejectBusy()`（"已有技能正在执行"，队列积压时零成本快速
+    拒绝，**任何 skill 都可能拿到**）。它不是"这一格干不动"，所以不许封格；但它也**不占**
+    `_count_attempts` 配额 ⇒ 若 Mod 一直回 busy，`_stage_tiles` 每轮都会把同一格重新选出来，
+    一天耗在同一格上。所以 `_count_attempts` 按格记 `env_streak`：连续被挡超过
+    `MAX_ENV_ATTEMPTS` 次后不再免费，按"没结论"占配额（`env_spin_capped` 留痕）。
+    """
+
+    @staticmethod
+    def _plot() -> dict:
+        return {"zone": "", "label": "", "anchor": [60, 10], "tiles": [(60, 10)], "note": ""}
+
+    @staticmethod
+    def _events(run: LongRun, event: str) -> list:
+        return [e for e in run.entries if e["event"] == event]
+
+    def _run(self, w: FakeWorld):
+        """真 `FarmWorker` + 数数假桥；**同时挂到 factories 上**——`run()` 会用工厂重建
+        `self.client`/`self.worker`，只赋值属性的话端到端用例会跑回 `FakeWorker`（task-28 踩过）。"""
+        client = _CountingClient(w)
+        worker = FarmWorker(client, log=lambda *_: None)
+        run = make_run(w, target_days=1, max_days=1,
+                       client_factory=lambda: client, worker_factory=lambda c: worker)
+        run.worker = worker
+        run.client = client
+        return run, client
+
+    def test_clear_busy_is_env_and_never_seals(self):
+        """`clear` 一次 `busy` ⇒ 不封格、不吃配额，收掉挡路之后重跑同一批格子**真清掉**（task-15 §④）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        w.fail_status[(60, 10)] = ["busy"]          # 只挡第一次：重试就该做成
+        run, client = self._run(w)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+
+        out = run._step_stage("clear_area", w.obs(), self._plot(), rep)
+
+        self.assertNotIn((60, 10), run.blocked, "队列积压不是这一格的属性")
+        self.assertIsNone(run.tile_attempts.get((60, 10)), "环境挡路不占本日尝试配额")
+        self.assertEqual(self._events(run, "blocked"), [], run.entries)
+        env = self._events(run, "env_fail")
+        self.assertEqual(len(env), 1, run.entries)
+        self.assertEqual(env[0]["statuses"], ["busy"], env[0])
+        self.assertNotIn((60, 10), w.blockers, "busy 只该延后，重试要真做掉")
+        self.assertTrue(out.postcondition_met, out.reason)
+        self.assertEqual(len(self._events(run, "env_retry")), 1, run.entries)
+
+    def test_till_busy_is_env_not_sealed(self):
+        """`till` 一次 `busy` ⇒ 不封格（否则 `_mark_blocked` 一道就把这一格判死一整天），重试后锄成 dirt。"""
+        w = FakeWorld(weeds=0, seeds=10, money=500)
+        w.fail_status[(60, 10)] = ["busy"]
+        run, client = self._run(w)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+
+        out = run._step_stage("till_area", w.obs(), self._plot(), rep)
+
+        self.assertNotIn((60, 10), run.blocked)
+        self.assertIsNone(run.tile_attempts.get((60, 10)))
+        env = self._events(run, "env_fail")
+        self.assertEqual([e["statuses"] for e in env], [["busy"]], run.entries)
+        self.assertIn((60, 10), w.dirt, "重试之后这一格该锄开了")
+        self.assertTrue(out.postcondition_met, out.reason)
+
+    def test_endless_busy_requests_are_bounded(self):
+        """**防自旋**：永远回 busy ⇒ 请求次数有上界、如实 `capped`、全程不封格。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        w.fail_status[(60, 10)] = "busy"          # 常量：永远回 busy
+        run, client = self._run(w)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        plot = self._plot()
+
+        out = None
+        for _ in range(10):                        # 有界循环：真无限的话这里也只会转 10 次
+            out = run._step_stage("clear_area", w.obs(), plot, rep)
+            if not run._stage_tiles("clear_area", w.obs(), plot):
+                break
+
+        # task-15 §④ 之后"一次 `_step_stage`"最多跑 `1 + max_env_retries` 轮（第 1 轮 + 2 轮重试），
+        # 配额到 `MAX_TILE_ATTEMPTS` 后 `_stage_tiles` 就空了。实测这次循环：
+        #   第 1 次 _step_stage = 3 次请求（env 免费 2 次 + 配额 1 次）
+        #   第 2 次 _step_stage = 3 次请求（重试 2 轮 + 配额推到 4）⇒ 共 6 次后目标集合为空。
+        per_call = 1 + run.max_env_retries
+        bound = per_call * (1 + MAX_TILE_ATTEMPTS)
+        self.assertEqual(client.use_tool_calls, 6,
+                         f"持续 busy 下请求次数必须恰好有界（实测 {client.use_tool_calls}，上界 {bound}；"
+                         f"免费 {MAX_ENV_ATTEMPTS} 次 + 配额 {MAX_TILE_ATTEMPTS} 次）")
+        self.assertLessEqual(client.use_tool_calls, bound)
+        self.assertEqual(run.tile_attempts.get((60, 10)), 4, "越界之后每次都占配额，直到封顶")
+        self.assertEqual(len(self._events(run, "env_retry")), 4, run.entries)
+        self.assertEqual(run.blocked, {}, "环境挡路永远不许写 blocked")
+        self.assertEqual(self._events(run, "blocked"), [], run.entries)
+        self.assertEqual(sum(int(s.get("proven_inert") or 0) for s in rep.stages), 0,
+                         "没有 `proven_inert` ⇒ 没把环境问题当成'这一格干不动'")
+        spin = self._events(run, "env_spin_capped")
+        self.assertEqual(len(spin), 1, run.entries)
+        self.assertEqual((spin[0]["tile"], spin[0]["limit"]), ([60, 10], MAX_ENV_ATTEMPTS), spin[0])
+        self.assertFalse(out.postcondition_met, out.reason)
+        self.assertEqual(out.terminal, "needs_review", out.reason)
+
+    def test_endless_busy_full_run_is_not_verified(self):
+        """端到端：`run()` 在持续 busy 下停下、非 0 收尾、当天 `verified=False`。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        w.fail_status[(60, 10)] = "busy"
+        run, client = self._run(w)
+
+        code = run.run()
+
+        self.assertNotEqual(code, 0, "一天没做成 ⇒ 不许 0 收尾")
+        bound = (1 + run.max_env_retries) * (1 + MAX_TILE_ATTEMPTS)
+        self.assertLessEqual(client.use_tool_calls, bound,
+                             f"请求次数必须有界，实测 {client.use_tool_calls}")
+        self.assertEqual(run.blocked, {}, "环境挡路永远不许写 blocked")
+        self.assertTrue(self._events(run, "env_retry"), run.entries)
+        self.assertTrue(self._events(run, "env_spin_capped"), run.entries)
+        self.assertFalse(run.days[0].verified, f"{run.days[0].checks} notes={run.days[0].notes}")
+
+
+class TestTask15DayAccounting(unittest.TestCase):
+    """task-15 §②/§③/§④：日级验收要看得见"未完成的阶段"，环境挡路不许把一整天判死。"""
+
+    @staticmethod
+    def _plot() -> dict:
+        return {"zone": "", "label": "", "anchor": [60, 10], "tiles": [(60, 10)], "note": ""}
+
+    @staticmethod
+    def _events(run: LongRun, event: str) -> list:
+        return [e for e in run.entries if e["event"] == event]
+
+    def _run_with(self, w: FakeWorld):
+        """真 `FarmWorker` + 数数假桥，并**同时挂到 factories**（`run()` 会重建，见 task-28 教训）。"""
+        client = _CountingClient(w)
+        worker = FarmWorker(client, log=lambda *_: None)
+        run = make_run(w, target_days=1, max_days=1,
+                       client_factory=lambda: client, worker_factory=lambda c: worker)
+        run.worker = worker
+        run.client = client
+        return run, client
+
+    def test_env_retry_exhausted_keeps_leftover_and_day_is_not_verified(self):
+        """§④ 要求 2 + §② ：环境挡路重试满 2 轮还是没做成 ⇒ leftover>0 ⇒
+        `no_unmet_stages=False`、`no_hard_failures=False`、当天不 VERIFIED，但**始终不封格**。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        w.fail_status[(60, 10)] = "world_fading"        # 一直渐黑：重试也做不成
+        run, client = self._run_with(w)
+
+        code = run.run()
+
+        self.assertNotEqual(code, 0, "一格没清掉 ⇒ 不许 0 收尾")
+        rep = run.days[0]
+        self.assertFalse(rep.verified, f"{rep.checks} notes={rep.notes}")
+        self.assertFalse(rep.checks["no_unmet_stages"], rep.checks)
+        self.assertFalse(rep.checks["no_hard_failures"], rep.checks)
+        self.assertEqual(run.blocked, {}, "环境挡路（渐黑）永远不许写成「这格干不动」")
+        self.assertGreaterEqual(len(self._events(run, "env_retry")), 2,
+                                "重试轮次要留痕（上限默认 2）")
+        stages = [s for s in rep.stages if s["stage"] == "clear_area"]
+        self.assertTrue(stages, rep.stages)
+        self.assertGreater(stages[-1]["leftover"], 0, stages[-1])
+        self.assertEqual(stages[-1]["proven_inert"], 0, stages[-1])
+
+    def test_zero_target_day_still_verifies_with_no_unmet_stages(self):
+        """§② ：只有"0 目标"的阶段（没种子又买不起）**不算未完成** ⇒ 当天仍可 VERIFIED。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.dirt = {(60, 10)}          # 地还在，但种子闸门把 till/plant 目标掐掉 ⇒ 0 目标阶段
+        run, _client = self._run_with(w)
+
+        code = run.run()
+
+        rep = run.days[0]
+        self.assertTrue(rep.checks["no_unmet_stages"], f"{rep.checks} stages={rep.stages}")
+        self.assertTrue(rep.checks["no_hard_failures"], rep.checks)
+        self.assertEqual(code, 0, f"没活可做而睡 ⇒ 该判达标：{rep.checks} notes={rep.notes}")
+        self.assertTrue(rep.verified, f"{rep.checks} notes={rep.notes}")
+
+    def test_env_retry_clears_the_blocking_modal(self):
+        """§④ 要求 3：`ui_modal` 挡路时**确实调用了模态守卫**，收掉之后重跑同一批格子做成。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        w.fail_status[(60, 10)] = ["ui_modal"]
+        w.ui_script = [{"activeMenu": "DialogueBox", "dialogueIsQuestion": True,
+                        "dialogueResponses": ["是", "否"]}]
+        run, _client = self._run_with(w)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+
+        out = run._step_stage("clear_area", w.obs(), self._plot(), rep)
+
+        self.assertEqual(w.dismiss_calls, 1, "模态挡路时要先收掉它，再重跑同一批格子")
+        retry = self._events(run, "env_retry")
+        self.assertEqual(len(retry), 1, run.entries)
+        self.assertEqual((retry[0]["modal"], retry[0]["statuses"]),
+                         ("DialogueBox", ["ui_modal"]), retry[0])
+        self.assertNotIn((60, 10), w.blockers, "收掉模态之后这一格该清掉")
+        self.assertTrue(out.postcondition_met, out.reason)
+        self.assertEqual(rep.stages[-1]["failed"], 0, rep.stages[-1])
 
 
 if __name__ == "__main__":

@@ -472,10 +472,15 @@ class TestClearSwingsUntilKindChanges(unittest.TestCase):
         self.assertIn("连挥", r.reason)
 
     def test_status_classes_cover_mod_codes_are_disjoint(self):
-        """三类 status 集合：**两两互斥** + **并集覆盖 Mod 会返回的全部 status**（task-22 ④）。
+        """三类 status 集合：**两两互斥** + 并集覆盖"bridge 层通用码 + `use_tool` 的码"（task-22 ④ / task-28）。
 
         `world_fading` 是 task-7 新增的"渐黑不可起手"码；`timeout`/`error` 是"一次都没挥出去/
-        没拿到结论"；剩下的是结论类。任何一类漏掉都会让格子被错误地封格或错误地吃配额。
+        没拿到结论"；`busy`（task-28）是 `MainThreadDispatcher.RejectBusy()` 的"已有技能在跑"；
+        `stale`（task-28）是我们传了过旧 `based_on_seq` 的**自己犯的错**；剩下的是结论类。
+        任何一类漏掉都会让格子被错误地封格或错误地吃配额。
+
+        ⚠️ 覆盖范围**不是**"Mod 全部 status"：其它 skill 专属的码（`sleep_no_question`、
+        `precondition_failed` 之外的 plant/buy 码……）**有意**落进兜底桶，由各自调用点处理。
         """
         from agentfarm import farmwork as fw
         env = set(fw.ENV_BLOCK_STATUSES)
@@ -487,20 +492,62 @@ class TestClearSwingsUntilKindChanges(unittest.TestCase):
         mod_codes = {
             "timeout", "world_fading", "tool_ineffective", "error",
             "no_save", "ui_modal", "precondition_failed",
+            "busy",       # MainThreadDispatcher.cs:159-169（task-28 N4-1）
+            "stale",      # BridgeHost.cs:538-553（based_on_seq 过旧）
         }
         self.assertEqual(mod_codes - (env | inert | incon), set(),
-                         "Mod 会返回的 status 必须被三类之一覆盖")
-        self.assertEqual(incon, {"timeout", "error"})
-        self.assertEqual(env, {"no_save", "ui_modal", "world_fading"})
+                         "bridge 通用码 + use_tool 的码必须被三类之一覆盖")
+        self.assertEqual(incon, {"timeout", "error", "stale"})
+        self.assertEqual(env, {"no_save", "ui_modal", "world_fading", "busy"})
         self.assertEqual(inert, {"tool_ineffective", "precondition_failed"})
-        # 只有 timeout/error 算"没结论"（Lead m01763）：回执 ok / 缺 status / 没见过的码都是
-        # **真实回应** ⇒ 世界没变就是"这一刀白挥"，走结论（封格）路径，不算 inconclusive。
+        # 只有 timeout/error/stale 算"没结论"（Lead m01763 + task-28）：回执 ok / 缺 status /
+        # 没见过的码都是**真实回应** ⇒ 世界没变就是"这一刀白挥"，走结论（封格）路径。
         self.assertEqual(fw._classify_status("ok"), (False, False))
         self.assertEqual(fw._classify_status(""), (False, False))
         self.assertEqual(fw._classify_status("brand_new_code"), (False, False))
         self.assertEqual(fw._classify_status("timeout"), (False, True))
         self.assertEqual(fw._classify_status("error"), (False, True))
+        self.assertEqual(fw._classify_status("stale"), (False, True))
         self.assertEqual(fw._classify_status("no_save"), (True, False))
+        # `busy` 必须算环境挡路（不是"这一格干不动"，也不占配额）：run2 真机 180s 超时期间
+        # 任何 exec 都会被零成本拒绝，把它当结论就会**白丢一天**。
+        self.assertEqual(fw._classify_status("busy"), (True, False))
+
+    def test_busy_is_env_and_never_seals_the_tile(self):
+        """`busy`（Mod 队列积压）⇒ 一次都不再补刀、`env_block=True`、**不许** `proven_inert`。"""
+        w = MiniWorld(records=[weed_rec((60, 10))], tillable=[(60, 10)],
+                      inventory=INV_WITH_SCYTHE, tools=TOOLS_WITH_SCYTHE)
+        w.fail_status[(60, 10)] = "busy"
+        r = make_worker(w).clear((60, 10))
+        self.assertEqual(len(w.calls), 1, "环境挡路就该立刻收手，不是连挥 4 刀")
+        self.assertTrue(r.env_block)
+        self.assertFalse(r.proven_inert)
+        self.assertFalse(r.inconclusive)
+        self.assertEqual(r.code, "failed", "failed 但当天不封格（下轮还能试）")
+        self.assertIn("busy", r.reason)
+
+    def test_till_busy_is_env_not_sealed(self):
+        """`till` 一次 `busy` ⇒ `env_block=True`、`proven_inert=False`（否则当天就被 `_mark_blocked` 封格）。"""
+        w = MiniWorld(records=[{"tile": [60, 10], "kind": "unknown", "standable": True}],
+                      tillable=[(60, 10)], inventory=INV_WITH_SCYTHE, tools=TOOLS_WITH_SCYTHE)
+        w.fail_status[(60, 10)] = "busy"
+        r = make_worker(w).till((60, 10))
+        self.assertTrue(r.env_block)
+        self.assertFalse(r.proven_inert)
+        self.assertEqual(r.code, "failed")
+        self.assertIn("busy", r.reason)
+
+    def test_stale_is_inconclusive_and_spends_quota(self):
+        """`stale`（我们传了过旧 `based_on_seq`）⇒ `inconclusive=True`（占配额、不封格）。"""
+        w = MiniWorld(records=[weed_rec((60, 10))], tillable=[(60, 10)],
+                      inventory=INV_WITH_SCYTHE, tools=TOOLS_WITH_SCYTHE)
+        w.fail_status[(60, 10)] = "stale"
+        r = make_worker(w).clear((60, 10))
+        self.assertTrue(r.inconclusive)
+        self.assertFalse(r.env_block)
+        self.assertFalse(r.proven_inert)
+        self.assertEqual(len(w.calls), MAX_CLEAR_SWINGS, "没结论要补刀到上限")
+        self.assertIn("stale", r.reason)
 
 
 class TestTillKeepsJudgement(unittest.TestCase):

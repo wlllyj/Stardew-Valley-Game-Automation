@@ -17,6 +17,15 @@
    如果喂给它**全农场**的计数（真机 245 个障碍），它会永远停在清障、永不进入开垦。
    所以本文件的每个决策都喂"**当天作业区（plot）的局部观测**"，只有"浇水/收获"这两件
    全局必须做完的事才用全量计数（`_plot_brief` 里就是干这个的）。
+
+【已知局限（task-15 §③；写在这里而不是写成断言）】
+- **种子闸门的时间成本**：`_preconditions` 在**每个决策之前**跑 ⇒ 正常路径是"**先买再动**"
+  （种子为 0 且钱够就 `worker.buy(shop=…)`），不会进了作业区才发现没种子。唯一的墙钟成本是
+  那一趟买种子的路（Mod 的 `BuySkill` 自己负责寻路/传送）——**本仓库没有实测数字，不编**：
+  它只在"种子 0 且钱够"时发生，一天最多一次、`buy_count` 粒；若这趟没成（店没开/太晚/钱不够），
+  当天后续由 `seed_gate`（journal 带 `in_plot`）收场：`in_plot=true` 表示"人已经在田里才发现
+  没种子"，那是最贵的路径（白走一趟 + 游戏内时间已经花掉）。这条局限由 Lead 记在开发日志里，
+  run3 之后再谈优化；`distance_to_shop` 这类拿不到的数字，一律写"未定"，不猜。
 """
 
 from __future__ import annotations
@@ -29,8 +38,8 @@ from types import SimpleNamespace
 from typing import Any, Callable, Iterable
 
 from .bridge import MOD_VERSION_EXPECTED, BridgeClient, BridgeError
-from .farmwork import (STAGE_ACTION, FarmWorker, StageResult, StepResult, seed_items,
-                       till_blocked_by)
+from .farmwork import (ENV_BLOCK_STATUSES, STAGE_ACTION, FarmWorker, StageResult, StepResult,
+                       seed_items, till_blocked_by)
 from .planner import (BoundaryPlanner, Brief, PlannerState, TaskIntent, TaskOutcome,
                       deterministic_plan)
 
@@ -60,6 +69,29 @@ WIDE_TASKS = ("water_area", "harvest")
 #: 主闸是 `blocked`（第一次"挥了没变/缺工具"就当天封格）；这个上限是**兜底不变量**：
 #: 任何一条没被 `blocked` 覆盖的失败路径（例如世界变了但没做成）也不许把同一格磨到天亮。
 MAX_TILE_ATTEMPTS = 2
+
+#: 【task-28 防自旋】同一格同一天**连续被环境挡住**（`env_block`：`busy`/`ui_modal`/`no_save`/
+#: `world_fading`）超过这个次数以后，就**不再免费**：从下一次起按"没结论"占 `MAX_TILE_ATTEMPTS`
+#: 配额。理由：`env_block` 不占配额是刻意的（环境抖动不该封格），但"Mod 一直回 busy"这种
+#: **持续**状态如果没有上限，`_stage_tiles` 每轮都会把同一格选出来 ⇒ 一天在同一个格上无限打转。
+#: 取 2（而不是 1）是为了给**真实**的瞬时抖动留余量：渐黑/模态通常一次就过去了；连续 3 次以上
+#: 还挡着的，判定为"今天这个世界不适合干这格"，让它如实落到 `capped`/`needs_review`。
+MAX_ENV_ATTEMPTS = 2
+
+#: 【task-11 模态守卫】**只等、绝不 dismiss** 的模态：新一天的自动存档。
+#: 真机实测（Lead 2026-10-11 22:2x）：`SaveGameMenu` 自己约 30s 走完 ⇒ `isModal=false`、
+#: `worldAdvancing=true`、存档 mtime/size 更新；dismiss 可能**打断存档**，所以只轮询不关。
+MODAL_WAIT_ONLY = ("SaveGameMenu", "NewDaySavingMenu")
+
+#: 等待型模态的自走完上限（秒）。真机约 30s，给 3 倍余量；超时就如实停下等人（见下文）。
+MODAL_WAIT_TIMEOUT_S = 90.0
+
+#: 一次日循环里最多关几个模态：多个技能同时升级会**连出** `LevelUpMenu`（实测可连出多个）。
+MODAL_MAX_DISMISS = 10
+
+#: 挡住当天、必须人来处理的模态（职业选择等不可逆操作）对应的 `ended_by`。
+#: 它同时让 `slept_by_us=false` ⇒ 当天**不判 VERIFIED**（宁可停下等人，也不静默丢档）。
+ENDED_BY_MODAL = "blocked_modal"
 
 
 def _dist(a: tuple[int, int], b: tuple[int, int]) -> int:
@@ -110,6 +142,23 @@ def statuses_of(step: StepResult) -> list[str]:
         if s and s not in uniq:
             uniq.append(s)
     return uniq
+
+
+def is_env_blocked(step: StepResult) -> bool:
+    """这一步是不是**环境挡路**（渐黑 / 模态 / 没存档 / Mod 忙）？
+
+    task-15 §④：环境类失败是"世界当时不让我动手"，**不是"这活没干成"** —— 它不该让整天
+    needs_review，而应该先收掉挡路的东西再重试同一批格子。
+
+    判据**只有一份**：`farmwork.ENV_BLOCK_STATUSES`（task-28 起含 `busy`）。首选
+    `StepResult.env_block`（`farmwork._mark_status` 正是按那份常量打上的标记）；对没带标记
+    但 code 全落在那份常量里的步（手写的假步/旧路径）再兜一层状态码判据。
+    **绝不在 longrun 里另抄一份状态码字符串**（两处口径必然漂移）。
+    """
+    if step.env_block:
+        return True
+    codes = statuses_of(step)
+    return bool(codes) and all(c in ENV_BLOCK_STATUSES for c in codes)
 
 
 #: "上一天未知"的哨兵日键：用来把**一天的第一次决策**顶到 `new_day` 边界上
@@ -174,7 +223,7 @@ class DayReport:
 
     day_key: tuple[int, str, int]
     started_at: float
-    ended_by: str = ""            # sleep / pass_out / stuck / time_limit / budget / stop / bridge_down
+    ended_by: str = ""            # sleep / pass_out / stuck / time_limit / budget / stop / bridge_down / blocked_modal
     ended_reason: str = ""
     plots: list[dict[str, Any]] = field(default_factory=list)
     stages: list[dict[str, Any]] = field(default_factory=list)
@@ -257,11 +306,14 @@ class LongRun:
         per_stage_tiles: int = 12,
         water_stage_tiles: int = 60,
         max_stage_rounds: int = 6,
+        max_env_retries: int = 2,
         water_min_stamina: float = 1.0,
         plot_walk_timeout_ms: int = 20000,
         max_refills_per_day: int = 4,
         max_plots_per_day: int = 10,
         supervise_every: int = 20,
+        modal_wait_timeout_s: float = MODAL_WAIT_TIMEOUT_S,
+        modal_max_dismiss: int = MODAL_MAX_DISMISS,
         report_dir: str | Path | None = None,
         journal_path: str | Path | None = None,
         log: Callable[[str], None] = print,
@@ -303,6 +355,12 @@ class LongRun:
         # 本阶段格数上限（`per_stage_tiles`）撞到后**接着跑**，直到没有目标为止 ——
         # 否则"一次只浇 12 格"会天天留下没浇的作物（真机 m01770 就是这么发生的）。
         self.max_stage_rounds = int(max_stage_rounds)
+        # task-15 §④：一轮 `run_stage` 里出现**环境挡路**（渐黑/模态/没存档/Mod 忙）时，先收掉
+        # 挡路的模态再重跑**同一批格子**，最多重试这么多轮。上限取 2：一次瞬时渐黑/一个弹窗
+        # 收掉后就会成功；同一批格子连挡 3 轮说明世界真的坏了（模态关不掉、Mod 一直 busy），
+        # 此时如实留给 `leftover` ⇒ `no_unmet_stages=False` ⇒ 当天 needs_review。
+        # 置 0 可关掉重试（单测与排障用）。
+        self.max_env_retries = int(max_env_retries)
         # 浇水的体力闸门单独放低到 1 点：当天种下的作物"没浇"是不可补的损失，
         # 必须允许在体力见底前把最后几格浇完（m01847/m01774）。
         self.water_min_stamina = float(water_min_stamina)
@@ -310,6 +368,9 @@ class LongRun:
         self.max_refills_per_day = int(max_refills_per_day)
         self.max_plots_per_day = int(max_plots_per_day)
         self.supervise_every = int(supervise_every)
+        # task-11 模态守卫：等待型模态的墙钟上限、一次最多关几个模态（可注入，便于单测）。
+        self.modal_wait_timeout_s = float(modal_wait_timeout_s)
+        self.modal_max_dismiss = int(modal_max_dismiss)
         self.report_dir = Path(report_dir) if report_dir else None
         self.journal_path = Path(journal_path) if journal_path else None
         self.log = log
@@ -342,6 +403,15 @@ class LongRun:
         # `blocked` 是"判据证明干不动"，这里是**不变量**：哪怕判据漏了某种情况，
         # 同一格一天也不会被发起第 3 次（用户 m01804 要的"不要白白浪费体力"）。
         self.tile_attempts: dict[tuple[int, int], int] = {}
+        # 本日每格"连续被环境挡住"的次数（task-28 防自旋）：超过 `MAX_ENV_ATTEMPTS` 后
+        # 不再免费，改为占 `tile_attempts` 配额 ⇒ 持续 `busy` 时请求次数有界、当天 needs_review。
+        # ⚠️ 键是**格子**，不是"格子+动作"：同一格上 `clear_area` 与 `water_area`（或 `till_area`）
+        # 共用同一条 streak。这是有意为之（`_stage_tiles`/`_count_attempts` 的记账都是按格的几何
+        # 口径，用户 m01804 要的"不要在同一格上白耗体力"也是按格说的），代价是"同一格先被渐黑挡一次、
+        # 后来浇水又被模态挡一次"会比按动作分账更早开始吃配额 —— 偏保守，可以接受。
+        self.env_streak: dict[tuple[int, int], int] = {}
+        # 已经为哪些格写过 `env_spin_capped`（同格只报一次，别每轮刷屏）。
+        self.env_spin_noted: set[tuple[int, int]] = set()
         # 本日已经播报过"没种子也没钱 ⇒ 不再开垦"的任务（`till_area`/`plant_area`）。
         # 只在第一次撞到时说一句，别每轮刷屏（task-9：run2 白锄 60 格、体力 270→74）。
         self.seed_gate_noted: set[str] = set()
@@ -719,9 +789,19 @@ class LongRun:
             return [t for t in local
                     if str((tmap.get(t) or {}).get("kind") or "") in ACTIONABLE_KINDS]
         if task == "till_area":
+            # task-15 §②（修法 A）：**种子闸门必须与 `_stage_tiles` 同口径**。
+            # 没种子又买不起时，锄地是纯烧体力（`_stage_tiles` 已经把目标掐成空），
+            # 后置条件复核若还报"还剩 N 格"，就会造出一轮"0 目标、leftover>0"的假剩余：
+            # run3 开局（14g、种完 0 种子）会被自己判死。留 `met=False`（没有进展）即可，
+            # 但**不制造剩余**。注意这与 `stage_exhausted` 的 leftover>0 语义不同：
+            # 那条是"该做的没做成"（task-9 条款①），这里只是"本来就不该做"。
+            if not self._seed_outlook(obs)[2]:
+                return []
             return [t for t in local
                     if t in tillable and not _till_blocked_by(tmap.get(t))]
         if task == "plant_area":
+            if not self._seed_outlook(obs)[2]:
+                return []  # 同上：没种子可播 ⇒ 没有"该播而没播"的剩余
             return [t for t in local
                     if str((tmap.get(t) or {}).get("kind") or "") == "dirt"
                     and not (tmap.get(t) or {}).get("crop")]
@@ -874,8 +954,11 @@ class LongRun:
           真机 run1 的两个 grass 格就是这么被连挥两次、真花体力的（用户 m01804）。
 
         **但两类失败不许封格**（task-22，两者都靠 `FarmWorker` 打的显式标记）：
-        - `s.env_block`（渐黑 / 模态 / 没存档）：环境挡路**不是**这一格的属性，世界好了这格还得做；
-        - `s.inconclusive`（超时 / 异常 / 没见过的码）：连结论都没拿到，更没资格判它"干不动"。
+        - `s.env_block`（渐黑 / 模态 / 没存档 / Mod 忙）：环境挡路**不是**这一格的属性，世界好了这格还得做；
+        - `s.inconclusive`（超时 / `stale`）：连结论都没拿到，更没资格判它"干不动"。
+          注意口径（task-22 裁定 A，见 `farmwork._classify_status`）：只有"整轮一次真实回应都没拿到"
+          才算 `inconclusive`；**未枚举的状态码按"Mod 真的回应过"处理**（走结论路径 —— Mod 回话了、
+          世界没变），不许塞进这个桶里当成"没拿到证据"。
           这两类如实卡在 `leftover` 里 ⇒ `met=False`、当天 needs_review。
         """
         before = self._tile_states(before_obs)
@@ -913,13 +996,36 @@ class LongRun:
 
         **`inconclusive` 仍计配额**：它不是"环境挡路"而是"连结论都没拿到"；持续如此应当被限流
         成 `capped`，让当天如实落进 needs_review，而不是无限重试磨到天亮。
+
+        **防自旋（task-28 N4-1）**：`env_block` 不占配额 ⇒ 若 Mod 持续回 `busy`（run2 真机就有
+        "180s 客户端超时期间任何 exec 都被 `RejectBusy` 快速拒绝"这种时序），`_stage_tiles` 每轮
+        都会把同一格重新选出来，一天就耗在同一格上。所以这里按格记 `env_streak`：
+        连续被挡**超过** `MAX_ENV_ATTEMPTS` 次之后，第 N+1 次起照样占 `tile_attempts` 配额
+        ⇒ 很快到 `MAX_TILE_ATTEMPTS` ⇒ 该格不再进目标、当天 `verified=False`（`capped` ⇒
+        `needs_review`），但**始终不写 `blocked`、不写 `proven_inert`**（环境挡路永远不等于
+        "这一格干不动"）。成功一次即清零。
         """
+        # 先清掉"这一轮真做成了"的格的连续被挡计数（成功即断链，下一格重新从 1 数起）。
+        for s in steps:
+            if s.ok and s.tile:
+                self.env_streak.pop(tuple(s.tile), None)
         for s in steps:
             if not s.tile or not (s.failed or s.proven_inert):
                 continue
-            if s.env_block:
-                continue
             key = tuple(s.tile)
+            if s.env_block:
+                streak = self.env_streak.get(key, 0) + 1
+                self.env_streak[key] = streak
+                if streak <= MAX_ENV_ATTEMPTS:
+                    continue
+                if key not in self.env_spin_noted:
+                    self.env_spin_noted.add(key)
+                    self._journal("env_spin_capped", tile=list(key), streak=streak,
+                                  limit=MAX_ENV_ATTEMPTS,
+                                  note="同一格连续被环境挡住超过上限 ⇒ 不再免费：按「没结论」"
+                                       "占本日尝试配额（不封格；持续如此会如实 capped/needs_review）")
+                self.tile_attempts[key] = self.tile_attempts.get(key, 0) + 1
+                continue
             self.tile_attempts[key] = self.tile_attempts.get(key, 0) + 1
 
     def _walk_into_plot(self, obs: dict[str, Any], plot: dict[str, Any]) -> bool:
@@ -958,13 +1064,31 @@ class LongRun:
                         f"⇒ 今天不再开垦/播种：{task} 没有目标（锄了也种不下去 = 纯烧体力）")
                 rep.notes.append(note)
                 self._say(f"  · {note}")
+                # task-15 §③：`in_plot` = 撞上这道闸门时**人是不是已经在作业区里**。
+                # 在田里才发现"没种子也没钱"是最贵的一种（白走一趟 + 游戏内时间已经过去），
+                # 而在田外撞上则只是"今天这活不存在"。真机上这条字段用来核对
+                # "买种子的时机够不够早"（`_preconditions` 是每个决策之前跑，够早；
+                # 唯一的墙钟成本是走到 SeedShop 的那段路，见模块 docstring 的已知局限）。
+                pt = FarmWorker.player_tile(obs)
+                in_plot = pt is not None and tuple(pt) in {tuple(t) for t in plot["tiles"]}
                 self._journal("seed_gate", stage=task, seeds=seeds, money=money,
-                              seed_price=self.seed_price, zone=self.zone_name)
+                              seed_price=self.seed_price, zone=self.zone_name, in_plot=in_plot)
         wmin = self.water_min_stamina if task == "water_area" else self.min_stamina
+        # task-15 §④：环境挡路（渐黑/模态/没存档/Mod 忙）**不是"这活没干成"**。遇到时先把
+        # 挡路的模态收掉（`_clear_modals`），再**重跑同一批格子**（`forced`），最多
+        # `max_env_retries` 轮。`env_retries` 是重试计数；`forced` 非空表示下一轮必须跑
+        # 这一批格子（而不是重算 `_stage_tiles` —— 那会在环境抖动时换一批、把"重试"变成"扩大"）。
+        env_retries = 0
+        forced: list[tuple[int, int]] | None = None
         while True:
-            attempts += 1
+            if forced is None:
+                attempts += 1
             snap = self._snap()
-            tiles = self._stage_tiles(task, snap, plot)
+            if forced is not None:
+                tiles = list(forced)
+                forced = None
+            else:
+                tiles = self._stage_tiles(task, snap, plot)
             if not tiles and not walked:
                 # 观测是**以玩家为中心**的：`tiles[]` 上限 400 且近处优先，`tillable[]` 同理。
                 # 站在别处问"这片地还有可锄的吗"，答案会是 0 —— 真机证据：浇完水站在田区另一头，
@@ -988,6 +1112,29 @@ class LongRun:
             # 被重新选中再白试一次（run1 的两格 grass 就是这么被连挥的）。
             self._count_attempts(res.steps)
             self._mark_blocked(snap, self._snap(), res.steps, rep)
+            # task-15 §④：本轮有**环境挡路**的失败步 ⇒ 先收模态、再重跑同一批格子。
+            # 判据只有一份（`is_env_blocked` → `farmwork.ENV_BLOCK_STATUSES`），不另抄状态码。
+            env_round = [s for s in res.steps if is_env_blocked(s)]
+            if env_round and env_retries < self.max_env_retries:
+                env_retries += 1
+                pre = self._snap()
+                modal_now = (pre.get("ui") or {}).get("activeMenu")
+                _obs2, modal_blocked = self._clear_modals(pre, rep)
+                self._journal(
+                    "env_retry", stage=task, zone=self.zone_name, round=env_retries,
+                    limit=self.max_env_retries, tiles=len(tiles),
+                    targets=[list(t) for t in tiles[:6]],
+                    modal=modal_now,
+                    statuses=sorted({x for s in env_round for x in statuses_of(s)}),
+                    note="环境挡路（渐黑/模态/没存档/Mod 忙）不是「这活没干成」⇒ 先收掉挡路模态，"
+                         "再重跑同一批格子；事后做成就没有硬失败")
+                if modal_blocked:
+                    # 模态关不掉（职业选择弹窗等）⇒ 当天到此为止：`rep.ended_by` 已被设成
+                    # `blocked_modal`，`_run_day` 会在 `_execute` 之后立刻收工。
+                    stopped = "blocked_modal"
+                    break
+                forced = tiles
+                continue
             if res.stopped == "need_refill" and attempts <= 2 and self.refills_today < self.max_refills_per_day:
                 rf = self.worker.refill_can()
                 self.refills_today += 1
@@ -1019,7 +1166,12 @@ class LongRun:
         # 另一条（task-9）：`leftover` **含被封格的格子**，所以"只剩干不动的格子"时 met=False ——
         # 封格只免掉重试，不许把失败洗成成功。
         met = bool(all_steps) and not leftover
-        failed = [s for s in all_steps if s.failed]
+        failed_any = [s for s in all_steps if s.failed]
+        # task-15 §④ 要求 2：日级硬失败只数**目标尚未完成**的失败。一次渐黑/一个弹窗之后
+        # 重试做成的格子不算硬失败（`leftover` 里没有它 = 目标已达成）；`tile is None` 的步
+        # （阶段级失败、没有具体格子）照旧算失败。
+        left_set = {tuple(t) for t in leftover}
+        failed = [s for s in failed_any if s.tile is None or tuple(s.tile) in left_set]
         skipped = [s for s in all_steps if s.skipped]
         oks = [s for s in all_steps if s.ok]
         inert = [s for s in all_steps if s.proven_inert]
@@ -1028,6 +1180,7 @@ class LongRun:
         rep.stages.append({
             "stage": task, "tiles": 0 if not all_steps else len({s.tile for s in all_steps if s.tile}),
             "ok": len(oks), "skipped": len(skipped), "failed": len(failed),
+            "failed_any": len(failed_any),
             "proven_inert": len(inert),
             "env_block": len(env_fail), "inconclusive": len(inconclusive),
             "stopped": stopped, "leftover": len(leftover),
@@ -1043,7 +1196,7 @@ class LongRun:
             self._journal("inconclusive_fail", stage=task, zone=self.zone_name,
                           tiles=len({tuple(s.tile) for s in inconclusive if s.tile}),
                           statuses=sorted({x for s in inconclusive for x in statuses_of(s)}),
-                          note="连续请求没拿到结论（超时/异常/未知码）⇒ 不封格，但占本日尝试配额")
+                          note="连续请求没拿到结论（超时/stale）⇒ 不封格，但占本日尝试配额")
         if not all_steps and not met:
             self._journal("stage_no_target", stage=task, leftover=len(leftover), zone=self.zone_name)
         error = None
@@ -1060,12 +1213,17 @@ class LongRun:
                           tiles=[list(t) for t in leftover[:6]], zone=self.zone_name)
         reason_bits = [f"作业区 {self.zone_name or '窗口'}",
                        f"目标 {len(all_steps)} 步：做成 {len(oks)}、跳过 {len(skipped)}、失败 {len(failed)}"]
+        if len(failed_any) > len(failed):
+            reason_bits.append(
+                f"另有 {len(failed_any) - len(failed)} 次环境挡路已重试做成（不计硬失败）")
         if inert:
             reason_bits.append(f"其中 {len(inert)} 格当场判据成立「干不动」已封到当天结束")
         if env_fail:
-            reason_bits.append(f"其中 {len(env_fail)} 格被环境挡住（渐黑/模态，不封格也不占配额）")
+            reason_bits.append(
+                f"其中 {len(env_fail)} 格被环境挡住（渐黑/模态/没存档/Mod 忙，不封格；"
+                f"重试后仍没做成才留在剩余里）")
         if inconclusive:
-            reason_bits.append(f"其中 {len(inconclusive)} 格没拿到结论（超时/异常，占配额但不封格）")
+            reason_bits.append(f"其中 {len(inconclusive)} 格没拿到结论（超时/stale，占配额但不封格）")
         if stopped:
             reason_bits.append(f"提前停：{stopped}")
         if met:
@@ -1285,6 +1443,147 @@ class LongRun:
             return "watchdog：" + "；".join(f"{f.code} {f.message}" for f in stop)
         return ""
 
+    # ------------------------------------------------------------------ 模态守卫（task-11）
+    @staticmethod
+    def _modal_info(obs: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+        """从观测里读“当前挡路的模态”：返回 `(isModal, activeMenu, ui)`。"""
+        ui = obs.get("ui") or {}
+        return bool(ui.get("isModal")), str(ui.get("activeMenu") or ""), ui
+
+    def _wait_modal_gone(self, menu: str, obs: dict[str, Any]) -> tuple[dict[str, Any], bool, float]:
+        """**只等不关**：轮询 `ui.isModal`，直到这个模态自己消失（或超时 / 换成了别的模态）。
+
+        返回 `(最新 obs, 是否已经消失, 等了多久秒)`。`gone=False` 只表示“等超时了”，
+        调用方必须据此停下等人 —— 超时的存档模态**绝不能**靠 dismiss 收场。
+        """
+        start = self.now()
+        limit = max(0.0, float(self.modal_wait_timeout_s))
+        self._journal("modal_wait_start", menu=menu, limit_s=limit,
+                      note="只等不关（新一天自动存档；dismiss 可能打断存档）")
+        while True:
+            self.sleep_fn(1.0)
+            try:
+                obs = self._snap()
+            except BridgeError as exc:
+                self._journal("modal_wait_error", menu=menu, reason=str(exc))
+                return obs, False, self.now() - start
+            is_modal, now_menu, _ui = self._modal_info(obs)
+            waited = self.now() - start
+            if not is_modal:
+                self._journal("modal_gone", menu=menu, waited_s=round(waited, 1))
+                return obs, True, waited
+            if now_menu and now_menu != menu:
+                # 模态换人了（例：存档刚走完、紧接着弹出升级菜单）⇒ 交给外层重新分派，不算超时
+                self._journal("modal_switched", was=menu, now=now_menu, waited_s=round(waited, 1))
+                return obs, True, waited
+            if waited >= limit:
+                self._journal("modal_timeout", menu=menu, waited_s=round(waited, 1), limit_s=limit,
+                              note="只等不关的模态超时（没敢 dismiss）⇒ 当天如实停下等人")
+                return obs, False, waited
+
+    def _dismiss_modal_once(self, menu: str, ui: dict[str, Any], *, kind: str) -> dict[str, Any]:
+        """关一次模态并重新观测（回执原文进 journal；世界是否真变了解除由后续观测回答）。"""
+        assert self.client is not None
+        menu_text = str(ui.get("activeMenuText") or "")
+        receipt = self.client.dismiss_modal()
+        self._actions += 1
+        self._journal("modal_dismissed", kind=kind, menu=menu, menuText=menu_text,
+                      receipt=receipt,
+                      note=("提问走 dismiss_modal 的选否口径（项目硬规则：永不注入确认键）"
+                            if kind == "question" else None))
+        self._say(f"  · 关掉挡路模态 {menu or '?'}（{kind}）"
+                  f"{'：' + menu_text if menu_text and menu_text != menu else ''}")
+        return self._snap()
+
+    def _clear_modals(self, obs: dict[str, Any], rep: DayReport) -> tuple[dict[str, Any], bool]:
+        """日循环每一步之前的**模态守卫**：把挡路的模态按三种处置清掉（task-11）。
+
+        返回 `(最新 obs, 是否必须停下来等人)`；第二种情况同时把 `rep.ended_by` 置成
+        `"blocked_modal"`（⇒ `slept_by_us=false` ⇒ 当天**不判 VERIFIED**）。
+
+        三种处置（判据只看观测，不看回执）：
+          * **wait-only**：`SaveGameMenu`/`NewDaySavingMenu` —— 新一天的自动存档，**绝不 dismiss**
+            （可能打断存档），轮询到它自己消失；超时记 `modal_timeout` 并停下等人。
+          * **dismiss**：普通 `LevelUpMenu`（`professionsToChoose` 为空数组=这一级没有职业可选）、
+            `GameMenu`、`DialogueBox`/提问、以及未知模态 ⇒ `dismiss_modal()`（Mod 侧对提问一律
+            走“选否”），journal 记 `modal_dismissed`（menu 名 + 回执）。
+          * **职业选择（不可逆，绝不动手）**：`LevelUpMenu` 且 `professionsToChoose` **非空**，
+            或该字段**缺失**（旧 Mod / 反射失败 = 未知）⇒ 只记录 + 停下等人。
+            依据 `docs\\_il-profession.md`：`exitThisMenu()` → `cleanupBeforeExit()` →
+            `RemoveLevelFromLevelList()` ⇒ 永久丢掉那次 Tiller/Artisan 选择（用户已拍板职业路线）。
+
+        【为什么每步之前都要查】`LevelUpMenu`/存档模态会让 `player.freezePause=100`、时钟不走，
+        整个长跑会静默卡死（用户真机看到过）；而且升级弹窗会**连出**多个，所以要循环到干净为止。
+        """
+        rounds = 0
+        while rounds < self.modal_max_dismiss:
+            is_modal, menu, ui = self._modal_info(obs)
+            if not is_modal:
+                return obs, False
+
+            # ① 提问（DialogueBox 开着提问时 isModal 为真）：走 Mod 的“选否”口径，绝不注入确认键
+            if ui.get("dialogueIsQuestion") or ui.get("dialogueResponses"):
+                try:
+                    obs = self._dismiss_modal_once(menu, ui, kind="question")
+                except BridgeError as exc:
+                    return self._modal_blocked(obs, rep, f"关不掉提问模态 {menu}：{exc}")
+                rounds += 1
+                continue
+
+            # ② 等待型（新一天的自动存档）：只等不关
+            if menu in MODAL_WAIT_ONLY:
+                obs, gone, waited = self._wait_modal_gone(menu, obs)
+                if gone:
+                    rounds += 1
+                    continue
+                rep.notes.append(f"{menu} 等了 {waited:.0f}s 仍不消失（存档/跨日模态，不敢关）")
+                return self._modal_blocked(
+                    obs, rep, f"{menu}：等了 {waited:.0f}s 仍不消失（可能存档没落盘）")
+
+            if menu == "LevelUpMenu":
+                ids = ui.get("professionsToChoose", None)
+                if ids is None:
+                    # 旧 Mod 或反射失败 ⇒ 按“未知”处理：不拿不确定性去赌不可逆操作
+                    self._journal("levelup_profession_unknown", menu=menu, menuText=ui.get("activeMenuText"),
+                                  note="观测里没有 professionsToChoose（旧 Mod / 反射失败）⇒ 未知："
+                                       "绝不 dismiss（关掉会永久丢职业选择）")
+                    rep.notes.append("LevelUpMenu 读不到 professionsToChoose ⇒ 按未知处理，不 dismiss，停下等人")
+                    return self._modal_blocked(obs, rep, "LevelUpMenu：读不到职业候选（字段缺失，未知）")
+                if len(ids) > 0:
+                    self._journal("levelup_profession_pending", menu=menu, ids=list(ids),
+                                  menuText=ui.get("activeMenuText"),
+                                  note="职业选择弹窗（不可逆）：dismiss = 永久丢档 ⇒ 只记录、停下等人来选")
+                    rep.notes.append(f"职业选择弹窗挡路（候选 {list(ids)}）⇒ 停下等人来选，不静默丢档")
+                    return self._modal_blocked(obs, rep, f"职业选择弹窗（候选 {list(ids)}）等人处理")
+                kind = "levelup"          # 空数组 = 普通升级弹窗，可以关
+            else:
+                kind = "menu"             # GameMenu / 未知模态
+
+            try:
+                obs = self._dismiss_modal_once(menu, ui, kind=kind)
+            except BridgeError as exc:
+                return self._modal_blocked(obs, rep, f"关不掉模态 {menu}：{exc}")
+            rounds += 1
+
+        # 循环到上限还有模态：不硬关，如实停下等人（连出十几个模态本身就不正常）
+        is_modal, menu, _ui = self._modal_info(obs)
+        if is_modal:
+            self._journal("modal_loop_capped", menu=menu, rounds=rounds,
+                          note=f"连关 {rounds} 个模态后还有模态 ⇒ 停下等人")
+            return self._modal_blocked(obs, rep, f"连关 {rounds} 个模态后仍被 {menu} 挡着")
+        return obs, False
+
+    def _modal_blocked(self, obs: dict[str, Any], rep: DayReport, reason: str
+                       ) -> tuple[dict[str, Any], bool]:
+        """把“必须人来处理”的模态写成当天的收尾：`blocked_modal` + 不判 VERIFIED。"""
+        rep.ended_by = ENDED_BY_MODAL
+        rep.ended_reason = reason
+        rep.notes.append(f"被模态挡住，停下等人：{reason}")
+        self._journal("modal_blocked", menu=(obs.get("ui") or {}).get("activeMenu"),
+                      reason=reason, note="不可逆/不敢关的模态 ⇒ 当天不判 VERIFIED，等人工处理")
+        self._say(f"× 被模态挡住，停下等人：{reason}")
+        return obs, True
+
     # ------------------------------------------------------------------ 一天
     def _run_day(self) -> DayReport:
         obs = self._snap()
@@ -1297,6 +1596,8 @@ class LongRun:
         self.idle_rounds = 0
         self.blocked = {}
         self.tile_attempts = {}
+        self.env_streak = {}
+        self.env_spin_noted = set()
         self.seed_gate_noted = set()
         self.no_target = set()
         self.no_target_global = set()
@@ -1328,6 +1629,12 @@ class LongRun:
                 break
             if FarmWorker.day_key(obs) != rep.day_key:
                 rep.ended_by, rep.ended_reason = "pass_out", "日期自己变了（游戏自动跨日或外部读档）"
+                break
+
+            # **模态守卫**（task-11）：`LevelUpMenu`/存档模态会把时间冻住（`player.freezePause=100`），
+            # 不先清掉的话后面所有技能都会被 `ui_modal` 拒绝、整天静默卡死。清到干净才谈决策。
+            obs, modal_blocked = self._clear_modals(obs, rep)
+            if modal_blocked:
                 break
 
             allow, code, text = self.sleep_guard(obs)
@@ -1430,9 +1737,32 @@ class LongRun:
 
         if not rep.final:
             rep.final = self._essence(last_obs)
+        # task-15 §②：阶段后置条件纳入日级验收 —— **只统计"有目标的阶段"**（`tiles > 0` 的 stage 条目）。
+        # 理由：`OBSERVE_REACH`（以玩家为中心、400 格上限）会让远处作业区先来一轮"0 目标"的阶段；
+        # 那种 leftover 是"这一阶段没该动的格子"，不是"该做的没做完"（`_leftover` 现在也按
+        # `_stage_tiles` 的同一道种子闸门口径把它记成 0），绝不能把 run3 开局判死。
+        # ⚠️ `stage_exhausted` 的 `leftover>0` 是**设计语义**（task-9 条款①：封格不免成功），
+        # 那些阶段有目标（`tiles>0`）⇒ 会被这条判死，正是要的效果。
+        # ⚠️ 口径（task-15 实测修正）：**按阶段种类取当天最后一次记录**再求和，而不是把所有
+        # 有目标阶段的 leftover 直接相加。实测（`scratch\probe_task15.py`，默认世界一天）：
+        # `plant_area` 会因为"钱只够买一批种子"先停一次（`stopped='no_seed'`、leftover 5/1），
+        # 随后买到种子又把同一批格子做完了 —— 直接相加会把"当天确实做完、世界完全达标"的
+        # 一天判成 needs_review（既有用例 `test_single_day_verified_and_world_changed` 因此
+        # 多跑一天）。阶段后置条件是**日级**的：同一阶段种类当天跑多轮时，以最后一轮为准。
+        # 已知局限（记录在案）：同一天同一阶段种类跨多片地时，前一片地未解决、后一片地干净
+        # 会互相遮蔽 —— 这种情况下 `stage_exhausted` journal 仍然在，交给复核。
+        last_by_stage: dict[str, dict] = {}
+        for s in rep.stages:
+            last_by_stage[str(s.get("stage") or "")] = s
+        unmet_leftover = sum(int(s.get("leftover") or 0) for s in last_by_stage.values()
+                             if int(s.get("tiles") or 0) > 0)
         rep.checks = {
             "slept_by_us": rep.ended_by == "sleep",
+            # task-11：被不可逆/不敢关的模态挡住（职业选择、存档超时）时，这一天**不算数**。
+            # 用户 m03224 拍板了职业路线：宁可停下等人，也不静默丢档。
+            "no_blocking_modal": rep.ended_by != ENDED_BY_MODAL,
             "no_hard_failures": rep.failed_steps == 0,
+            "no_unmet_stages": unmet_leftover == 0,
             "crops_watered": int(rep.final.get("unwatered_crops") or 0) == 0,
             "day_justified": (rep.ended_reason.split(":", 1)[0] in ("night", "stamina", "no_work", "no_plot")
                               if rep.ended_by == "sleep" else False),
@@ -1442,6 +1772,7 @@ class LongRun:
             f"[day] {rep.day_text} 结束：{rep.ended_by}"
             + (f"（{rep.ended_reason}）" if rep.ended_reason else "")
             + f" 阶段 {rep.stages_seen or '无'} 做成 {rep.ok_steps} 跳过 {rep.skipped_steps} 失败 {rep.failed_steps}"
+            + f" 未完成阶段剩 {unmet_leftover} 格（no_unmet_stages={unmet_leftover == 0}）"
             + f" → {'VERIFIED' if rep.verified else 'needs_review'} {rep.checks}"
         )
         self._journal("day_end", **rep.as_dict())
@@ -1540,7 +1871,9 @@ class LongRun:
                 break
             prev_key = self._last_day_key
             rep = self._run_day()
-            if rep.ended_by in ("bridge_down", "stop"):
+            if rep.ended_by in ("bridge_down", "stop", ENDED_BY_MODAL):
+                # `blocked_modal`（职业选择 / 存档模态超时）要**人来处理**：再跑一遍同一天没有意义，
+                # 只会把同一条 journal 又写一次。
                 self._say(f"× 停下：{rep.ended_by} {rep.ended_reason}")
                 break
             if prev_key is not None and self._last_day_key == prev_key:
@@ -1555,6 +1888,8 @@ class LongRun:
 
     def _finish(self, code: int) -> int:
         streak = self._verified_streak()
+        # task-15 §②：汇总行也要能一眼看到"有没有哪天留下了没做完的阶段"（`checks["no_unmet_stages"]`）。
+        unmet_days = [d.day_text for d in self.days if not d.checks.get("no_unmet_stages", True)]
         self.summary = {
             "code": code,
             "verified_streak": streak,
@@ -1563,11 +1898,14 @@ class LongRun:
             "actions": self._actions,
             "minutes": round(self._elapsed_minutes(), 2),
             "stages_seen": sorted({s for d in self.days for s in d.stages_seen}),
+            "no_unmet_stages": not unmet_days,
+            "unmet_days": unmet_days,
             "journal": str(self.journal_path) if self.journal_path else "",
             **({"prepare_error": self.summary["prepare_error"]} if self.summary.get("prepare_error") else {}),
         }
         self._journal("finish", code=code, verified_streak=streak, actions=self._actions,
-                      minutes=round(self._elapsed_minutes(), 2), stages_seen=self.summary["stages_seen"])
+                      minutes=round(self._elapsed_minutes(), 2), stages_seen=self.summary["stages_seen"],
+                      no_unmet_stages=not unmet_days, unmet_days=unmet_days)
         if self._jf is not None:
             try:
                 self._jf.close()
@@ -1577,5 +1915,7 @@ class LongRun:
         verdict_text = "VERIFIED" if code == 0 else ("起不来" if code == 2 else "needs_review")
         self._say(f"[run] {verdict_text}：尾部连续 {streak}/{self.target_days} 天 "
                   f"（共 {len(self.days)} 天，{self._actions} 个动作，{self.summary['minutes']} 分钟）"
+                  + f"；no_unmet_stages={not unmet_days}"
+                  + (f"（有未完成阶段的天：{'、'.join(unmet_days)}）" if unmet_days else "")
                   + (f"；准备失败：{self.summary['prepare_error']}" if self.summary.get("prepare_error") else ""))
         return code

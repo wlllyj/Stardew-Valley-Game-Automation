@@ -36,7 +36,12 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.21"   # v0.7.21：观测里补 player.wateringCan{present,waterLeft,max,
+MOD_VERSION_EXPECTED = "0.7.22"   # v0.7.22：UseToolSkill 对近战武器改走 Farmer.BeginUsingTool()
+                                 # （镰刀真挥）+ Done() 增 Grass 判据；sleep 拼不出 Sleep_Yes
+                                 # 前缀立刻 sleep_no_question（不再白等 180s）；farm.dryCrops；
+                                 # ui.professionsToChoose；模态守卫（职业非空停下等人）；
+                                 # brain 侧 busy→环境挡路、stale→无结论。
+                                 # v0.7.21：观测里补 player.wateringCan{present,waterLeft,max,
                                  # bottomless,upgradeLevel}（水在 WateringCan 上、不在 inventory）
                                  # 与 location.refillTiles[]（判据=游戏自己的
                                  # CanRefillWateringCanOnTile，扫全图、最多 24）——"连续 3 日浇水"
