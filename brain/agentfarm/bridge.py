@@ -36,7 +36,11 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.23"   # v0.7.23：睡觉跨日打通 —— SleepSkill 应答后**同一 tick 关框**
+MOD_VERSION_EXPECTED = "0.7.24"   # v0.7.24：经济闭环（shippingBin + ShipSkill "sell"：只调
+                                 # 游戏自己的 Farm.shipItem(Items[slot], player)，次日由游戏结算）
+                                 # + 长路径续跳（跳预算按 A* 步数、StuckFrames 90→180、
+                                 # 有位移可续跳 8s×8、ClampTimeoutFor 对 move_to_location 走 60000）。
+                                 # v0.7.23：睡觉跨日打通 —— SleepSkill 应答后**同一 tick 关框**
                                  # （原先只 answerDialogue 跑回调、DialogueBox 不收 ⇒ Game1.newDay
                                  # 已置位但提问框挂着、newDaySync 永远等不到保存）；成功判据改成
                                  # "日期前进 且 newDay 归位"；furniture[].bedCells（床的
