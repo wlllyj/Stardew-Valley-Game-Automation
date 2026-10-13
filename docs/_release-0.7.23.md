@@ -62,3 +62,19 @@ $py = "C:\Users\admin\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\
 
 - Mod：`mod\AgentFarm.Bridge\*.bak-<ts>` 与版本号可回溯；失误就 `git revert` 后重新 bump 一个**新版本号**（不覆盖旧版本号）。
 - 存档：`tools\deploy-mod.py` 每次装机前都备份（`%APPDATA%\StardewValley\Saves\_agentfarm-backup-*`）；run3 期间**不许重启续跑**，失败另起 run4。
+
+## 6. 实际执行记录（2026-10-13）
+
+| 步骤 | 命令 / 结果 |
+| --- | --- |
+| 冻结判据 | 无人在改源码 ✅；`--no-incremental` 0 警 0 错 ✅；全量 **309 OK** ✅；deputy `PASS-WITH-NITS` + NIT-3 后 `DELTA-PASS-WITH-NITS`（无必修）✅ |
+| 2 bump | `tools\_bump-mod-version.py 0.7.23 --note-file tools\_note-0723.txt` ⇒ manifest `0.7.22 → 0.7.23` |
+| 3 脑子版本 | `brain\agentfarm\bridge.py:39 MOD_VERSION_EXPECTED = "0.7.23"` |
+| 4 全量重建 | `dotnet build --nologo --no-incremental` ⇒ 0 警告 / 0 错误；`AgentFarm.Bridge.dll` **161280 B @18:44:03** |
+| 5 check-release | `python tools\check-release.py --expect 0.7.23` ⇒ **四项全绿**（含"工作树干净"）；提交 **`cd98799`** |
+| 6 部署 | `python tools\deploy-mod.py`（`logs\deploy-0.7.23.log`，rc=0）：dll 161280 / manifest 16258；`quit_game` 优雅退出 → 启动 flags=0x210 → 桥就绪 **`modVersion=0.7.23 port=17890`** → `load_save` 进 `Wahaha_450799035`（FarmHouse (9,9)） |
+| 7 preflight | `tools\preflight.py --expect 0.7.23` ⇒ 版本/读档/无模态 ✅、**户外 ❌**（起跑瞬间在 FarmHouse，属预期；`tileCount=1`、`tillableCount=0`） |
+| 9 verify-sleep-brain | `scratch\verify-sleep-brain.py --from-farm`（`logs\verify-sleep-brain-run1.log`，rc=0）⇒ `ensure_location("Farm") ok`；`worker.sleep()` **6.7s ok**；`spring 14 → 15` 恰好 +1；存档 3574697 → 3616556 B（mtime 18:30:53 → 18:45:20）⇒ **VERIFIED** |
+| 9b 复现 | `--times 2`（`logs\verify-sleep-brain-run2.log`）：`15 → 16`（6.3s，3641636 B）、`16 → 17`（6.2s，3678985 B）⇒ 0.7.23 上**连续 3 次跨日全 VERIFIED**，每次 6.2–6.7s |
+
+**踩坑（本版新增）**：无（部署一次过；`check-release` 第一次报红是"工作树有 15 项未提交"，提交 `cd98799` 后复跑即四项全绿——顺序必须是"先提交再 check-release 再装机"）。
