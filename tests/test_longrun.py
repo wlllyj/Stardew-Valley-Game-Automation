@@ -26,6 +26,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Iterable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "brain"))
 
@@ -461,6 +462,16 @@ class FakeWorker:
 
     def refill_can(self, *, timeout_ms=15000):
         st = self.w.refill()
+        self.steps.append(st)
+        return st
+
+    def water(self, tile, *, timeout_ms=15000):
+        """task-50：脑侧 `_water_far_dry` 要驱动"走到**观测窗口之外**那一格再浇"。
+
+        真 `FarmWorker.water()` 走 `client.use_tool(tool="can")`；假执行层直接落到
+        `FakeWorld.water()`（真改世界），这样"窗口外干格浇没浇成"仍由观测差分证明。
+        """
+        st = self.w.water(tuple(tile))
         self.steps.append(st)
         return st
 
@@ -2769,6 +2780,216 @@ class TestTask49CrossPlotNoWork(unittest.TestCase):
                          f"守卫一直说还有活 ⇒ 不许洗成 no_work：{rep.ended_reason}")
         self.assertLessEqual(run._actions, 40, f"动作数必须收敛：{run._actions}")
         self.assertLessEqual(run.resume_walks, run.max_plots_per_day)
+
+
+# --------------------------------------------------------------- task-50：窗口外干作物
+class DryTilesWorld(MyopicWorld):
+    """task-50 夹具：`farm.dryTiles` 报出"玩家观测窗口之外"的干作物坐标（run5 真机形态）。
+
+    三个关键点（缺一不可，否则用例证明不了 run5 那个 bug）：
+
+    * 观测仍是**以玩家为中心**的（`MyopicWorld`，半径 3）⇒ 远处的干格既看不见、
+      `location.tiles`/`tillable` 里也没有它 —— 这正是 run5 三天 `dry=1` 却
+      `leftover=0`、只能 `no_work` 收工的现场；
+    * `farm` 块**按真实作物状态现算**（`dryCrops`/`dryTiles`/`truncated`），所以
+      "走过去浇没浇成"能由 farm 口径的观测差分证明（生产代码的判据就是这条）；
+    * `with_dry_tiles=False` 复刻**旧 Mod**：没有坐标字段 ⇒ 脑侧不许把它当成"没有干格"。
+    """
+
+    def __init__(self, *, with_dry_tiles: bool = True, truncated: bool = False, **kw) -> None:
+        super().__init__(**kw)
+        self.with_dry_tiles = with_dry_tiles
+        self.truncated = truncated
+        self.watered_tiles: list[tuple[int, int]] = []
+
+    def obs(self) -> dict:
+        dry = sorted(t for t, c in self.crops.items() if not c["watered"])
+        self.farm = {"loaded": True, "complete": True, "crops": len(self.crops),
+                     "ripeCrops": sum(1 for c in self.crops.values() if c["ripe"]),
+                     "dryCrops": len(dry), "unwateredCrops": len(dry),
+                     "hoeDirt": len(self.dirt)}
+        if self.with_dry_tiles:
+            self.farm["dryTiles"] = [list(t) for t in dry[:64]]
+            self.farm["dryTilesTruncated"] = bool(self.truncated)
+        return super().obs()
+
+    def water(self, tile):
+        st = super().water(tile)
+        if st.ok:
+            self.watered_tiles.append(tuple(tile))
+        return st
+
+
+class NoWalkFarDryWorker(FakeWorker):
+    """`stand_next_to` 对指定格子永远失败 ⇒ 复刻"干作物在农场另一头、今天走不到"。"""
+
+    def __init__(self, world: DryTilesWorld, *, unreachable: Iterable[tuple[int, int]]) -> None:
+        super().__init__(world)
+        self.unreachable = {tuple(t) for t in unreachable}
+
+    def stand_next_to(self, tile, *, timeout_ms=15000):
+        if tuple(tile) in self.unreachable:
+            return False
+        return super().stand_next_to(tile, timeout_ms=timeout_ms)
+
+    def water(self, tile, *, timeout_ms=15000):
+        st = self.w.water(tuple(tile))
+        self.steps.append(st)
+        return st
+
+
+class LyingWaterWorker(FakeWorker):
+    """回执 `ok=true` 但**世界一动不动**（run1/run2 的"回执不算证据"形态）。
+
+    只覆写 `water()` 不够：日循环里 `_policy_intents` 看到未浇作物会强推 `water_area`，
+    而 `FakeWorker.run_stage` 会**真去浇**（落到 `FakeWorld.water()`）⇒ 这天会"合法地"
+    变达标，判据就证不出来了。所以 `run_stage` 一并哑掉：全天唯一动过手的地方就是
+    那次撒谎的 `water()`。
+    """
+
+    def run_stage(self, stage, tiles, *, min_stamina=12.0, max_steps=200):
+        return StageResult(stage=stage, tiles=list(tiles), stopped="world")
+
+    def water(self, tile, *, timeout_ms=15000):
+        return StepResult("water", tuple(tile), ok=True, reason="假回执：浇过了（其实没有）")
+
+
+class TestTask50FarDryTiles(unittest.TestCase):
+    """task-50：`farm.dryTiles` 让"窗口外那一格干作物"变得**可行动**。
+
+    为什么这条重要（run5 三天全挂的病灶）：脑侧观测只有玩家周围最近的 400 格，
+    农场另一头那 1 格干作物既看不见、也没有坐标 ⇒ `work_reasons` 拿不出目标 ⇒
+    `no_work` 收工（还白拿 `day_justified=true`），只有 `watered_outdoor` 把 `verified`
+    拽下来。Mod 补 `dryTiles` 坐标之后，脑侧必须**走过去浇**，走不到就 `stuck:` 点名坐标。
+
+    变异自检（`%TEMP%\\t50_mutate.py`，跑完即弃、不入库；基线 5/5 绿）：
+    - m50a（`_water_far_dry` 直接返回 False，等于没实现"跨窗口浇水"）⇒ 5 条全红；
+    - m50b（`_far_dry_tiles` 不认 `far_dry_given_up`，等于"永远重试"）⇒ 有界性 +
+      不可达两条红；
+    - m50c（判据把 Mod 回执 `st.ok` 算成证据）⇒ `test_ok_receipt_without_observation_change_is_never_watered`
+      红 —— 这正是 run1/run2 "回执 ok、世界没变" 的形态。
+    """
+
+    #: 离玩家 [62,14] 曼哈顿距离 5 > 半径 3 ⇒ 一开始不在观测窗口里（run5 的真实形态）。
+    FAR = (61, 10)
+
+    def _world(self, *, with_dry_tiles: bool = True, truncated: bool = False) -> DryTilesWorld:
+        w = DryTilesWorld(seeds=0, money=0, weeds=0, water_left=40,
+                          with_dry_tiles=with_dry_tiles, truncated=truncated)
+        w.dirt.add(self.FAR)
+        w.crops[self.FAR] = {"watered": False, "ripe": False}
+        w.player_tile = [62, 14]
+        return w
+
+    def _run_for(self, w, worker_factory, *, max_days: int = 2):
+        return make_run(w, target_days=1, max_days=max_days,
+                        client_factory=lambda: FakeClient(w),
+                        worker_factory=worker_factory)
+
+    def _events(self, run, event):
+        return [e for e in run.entries if e["event"] == event]
+
+    def test_far_dry_tile_is_walked_to_and_watered(self):
+        """①窗口外干格在 `farm.dryTiles` 里 ⇒ 真的走过去浇，farm 口径归零，绝不 `no_work` 洗白。"""
+        w = self._world()
+        # 跑之前那一格确实不在观测窗口里（否则这条用例证明不了"窗口外"）
+        self.assertNotIn(self.FAR, set(FarmWorker.tiles_of(w.obs())))
+        run = self._run_for(w, lambda _c: FakeWorker(w))
+
+        code = run.run()
+
+        rep = run.days[0]
+        self.assertEqual(code, 0, "唯一那格干作物被浇了 ⇒ 这天该达标")
+        self.assertEqual(w.watered_tiles, [self.FAR], "窗口外那格必须被真的浇到")
+        self.assertEqual(rep.final_water.get("dry"), 0, "farm 口径必须归零")
+        self.assertTrue(rep.checks.get("watered_outdoor"))
+        ev = self._events(run, "water_far")
+        self.assertEqual(len(ev), 1, f"应当恰有一次『走过去浇窗口外干格』：{ev}")
+        self.assertEqual(ev[0]["tile"], list(self.FAR))
+        self.assertTrue(ev[0]["ok"])
+        self.assertTrue(ev[0]["walked"])
+        self.assertTrue(ev[0]["watered"])
+        self.assertEqual((ev[0]["dry_before"], ev[0]["dry_after"]), (1, 0))
+        self.assertFalse(ev[0]["given_up"])
+
+    def test_ok_receipt_without_observation_change_is_never_watered(self):
+        """回执不算证据：回执 `ok=true` 但世界没变 ⇒ `ok=false`，当天绝不 VERIFIED。
+
+        这是全项目的铁律（run1 白挥、run3 连睡都是"回执 ok ≠ 世界变了"）。
+        """
+        w = self._world()
+        run = self._run_for(w, lambda _c: LyingWaterWorker(w))
+
+        code = run.run()
+
+        rep = run.days[0]
+        ev = self._events(run, "water_far")
+        self.assertTrue(ev, "应当至少试过一次")
+        self.assertTrue(ev[0]["receipt_ok"], "前提：执行层回执确实是 ok=true")
+        self.assertFalse(ev[0]["ok"], "世界没变 ⇒ 不许算浇过")
+        self.assertFalse(ev[0]["watered"])
+        self.assertEqual((ev[0]["dry_before"], ev[0]["dry_after"]), (1, 1))
+        self.assertNotEqual(code, 0, "干作物还在 ⇒ 不许报达标")
+        self.assertEqual(rep.final_water.get("dry"), 1)
+        self.assertFalse(rep.checks.get("watered_outdoor"))
+        self.assertFalse(str(rep.ended_reason).startswith("no_work"),
+                         f"干作物还在时不许 no_work 收工：{rep.ended_reason}")
+        self.assertTrue(str(rep.ended_reason).startswith("stuck:"), rep.ended_reason)
+        self.assertEqual(w.watered_tiles, [], "全场没有任何一条路径真的浇过")
+
+    def test_unreachable_far_dry_tile_ends_stuck_with_coordinates(self):
+        """②走不到 ⇒ 当天以 `stuck:` 收尾并**点名坐标**，绝不是 `no_work`。"""
+        w = self._world()
+        run = self._run_for(w, lambda _c: NoWalkFarDryWorker(w, unreachable=[self.FAR]),
+                            max_days=1)
+
+        code = run.run()
+
+        rep = run.days[0]
+        self.assertNotEqual(code, 0, "那一格始终干着 ⇒ 不许报达标")
+        self.assertTrue(str(rep.ended_reason).startswith("stuck:"),
+                        f"必须是 stuck 而不是 no_work：{rep.ended_reason}")
+        self.assertIn("[61, 10]", rep.ended_reason, "坐标必须点名（task-50 硬要求）")
+        self.assertIn("干作物", rep.ended_reason)
+        self.assertFalse(rep.checks.get("watered_outdoor"))
+        self.assertFalse(rep.checks.get("day_justified"))
+        ev = self._events(run, "water_far")
+        self.assertEqual(len(ev), 2, f"同一格最多试 {2} 次：{ev}")
+        self.assertFalse(any(e["walked"] for e in ev))
+        self.assertTrue(ev[-1]["given_up"])
+
+    def test_old_mod_without_dry_tiles_is_not_no_dry_tiles(self):
+        """③旧 Mod 没有 `dryTiles` ⇒ 不许当成"没有干格"：不判 `no_work`，但如实记"不可用"。"""
+        w = self._world(with_dry_tiles=False)
+        run = self._run_for(w, lambda _c: FakeWorker(w), max_days=1)
+
+        run.run()
+
+        rep = run.days[0]
+        self.assertFalse(str(rep.ended_reason).startswith("no_work"),
+                         f"缺字段不等于没活：{rep.ended_reason}")
+        self.assertTrue(str(rep.ended_reason).startswith("stuck:"), rep.ended_reason)
+        self.assertEqual(self._events(run, "water_far"), [], "没有坐标就没法行动，不该瞎走")
+        unavail = self._events(run, "water_far_unavailable")
+        self.assertEqual(len(unavail), 1, f"一天只提醒一次：{unavail}")
+        self.assertTrue(unavail[0]["loaded"])
+        self.assertEqual(unavail[0]["dryCrops"], 1)
+        self.assertTrue(run.far_dry_unavailable_noted)
+        self.assertFalse(rep.checks.get("watered_outdoor"))
+
+    def test_far_dry_retries_are_bounded_per_day(self):
+        """有界性：一直浇不成也不可能无限重试 —— 每格 2 次、动作数有上界。"""
+        w = self._world()
+        run = self._run_for(w, lambda _c: NoWalkFarDryWorker(w, unreachable=[self.FAR]),
+                            max_days=1)
+
+        run.run()
+
+        ev = self._events(run, "water_far")
+        self.assertEqual(len(ev), 2, f"每格一天最多 {2} 次：{len(ev)}")
+        self.assertLessEqual(run._actions, 40, f"整天动作数必须收敛：{run._actions}")
+        self.assertTrue(all(not e["ok"] for e in ev))
+        self.assertTrue(ev[-1]["given_up"])
 
 
 if __name__ == "__main__":

@@ -45,6 +45,7 @@ __all__ = [
     "FarmWorker",
     "StageResult",
     "StepResult",
+    "farm_dry_tiles",
     "seed_items",
     "till_blocked_by",
     "tool_missing_reason",
@@ -493,6 +494,42 @@ def seed_items(player: dict[str, Any]) -> list[tuple[str, str, int]]:
         out.append((sid, name, stack))
     out.sort(key=lambda t: (-t[2], t[0]))
     return out
+
+
+def farm_dry_tiles(obs: dict[str, Any]) -> tuple[list[tuple[int, int]], str]:
+    """Mod 报的"有作物且没浇"的格子坐标（`farm.dryTiles`，task-50）。
+
+    返回 `(格坐标列表, 状态)`，状态只有三种：
+
+    * `"ok"` —— 坐标可信且**没有**被上限截断；
+    * `"truncated"` —— 超过 Mod 的 64 条上限被截断（`dryTilesTruncated=true`）：
+      坐标可用，但**不许多浇、也不许当成"全部"**（总数以 `farm.dryCrops` 为准）；
+    * `"unavailable"` —— 旧 Mod 没有这个字段，或 `farm` 证据不可信
+      （`complete != true` / `loaded == false`）：**绝不许据此判"没有干格"**。
+
+    为什么需要它（run5 三天全挂的形态）：脑侧的观测只有玩家周围最近的 400 格
+    （`location.tilesTruncated=true`），农场另一头那 1 格干作物既看不到、也没坐标
+    ⇒ `work_reasons()` 拿不出目标 ⇒ `no_work` 收工 ⇒ `day_justified=true`，
+    只有 `watered_outdoor` 把 `verified` 拽下来。Mod 侧与 `dryCrops` 严格同一次扫描口径
+    （死苗也算"干"，刻意不过滤）。
+    """
+    farm = obs.get("farm") or {}
+    if farm.get("loaded") is False or farm.get("complete") is not True:
+        return [], "unavailable"
+    raw = farm.get("dryTiles")
+    if raw is None:
+        return [], "unavailable"
+    out: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for item in raw:
+        try:
+            t = (int(item[0]), int(item[1]))
+        except (TypeError, ValueError, IndexError, KeyError):
+            continue
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out, ("truncated" if farm.get("dryTilesTruncated") else "ok")
 
 
 class FarmWorker:

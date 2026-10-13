@@ -43,7 +43,7 @@ from typing import Any, Callable, Iterable
 
 from .bridge import MOD_VERSION_EXPECTED, BridgeClient, BridgeError
 from .farmwork import (ENV_BLOCK_STATUSES, STAGE_ACTION, FarmWorker, StageResult, StepResult,
-                       seed_items, till_blocked_by)
+                       farm_dry_tiles, seed_items, till_blocked_by)
 from .planner import (BoundaryPlanner, Brief, PlannerState, TaskIntent, TaskOutcome,
                       deterministic_plan)
 
@@ -81,6 +81,15 @@ MAX_TILE_ATTEMPTS = 2
 #: 取 2（而不是 1）是为了给**真实**的瞬时抖动留余量：渐黑/模态通常一次就过去了；连续 3 次以上
 #: 还挡着的，判定为"今天这个世界不适合干这格"，让它如实落到 `capped`/`needs_review`。
 MAX_ENV_ATTEMPTS = 2
+
+#: 【task-50】同一格"窗口外干作物"一天最多试几次（一次 = 走过去 + 浇一下）。
+#:
+#: 为什么要这个上限：`farm.dryTiles` 里的格子可能**根本走不到**（农场另一头、
+#: 被建筑/水塘隔开），而 `farm.dryCrops > 0` 又不允许判 `no_work`（run5 三天就是这么
+#: 全挂的）⇒ 没有上限就会"走过去-失败-再走过去"打到天亮。
+#: 取 2 与 `MAX_TILE_ATTEMPTS` 同口径：第一次多半是寻路的一次性抖动，第二次还不行就
+#: 认账（当天以 `stuck:` 收尾并点名坐标，而不是洗成"没活"）。
+FAR_DRY_MAX_TRIES = 2
 
 #: 【task-11 模态守卫】**只等、绝不 dismiss** 的模态：新一天的自动存档。
 #: 真机实测（Lead 2026-10-11 22:2x）：`SaveGameMenu` 自己约 30s 走完 ⇒ `isModal=false`、
@@ -491,6 +500,13 @@ class LongRun:
         self.leftover_targets: set[tuple[int, int]] = set()
         # 本日"为了看没做完的格子而往回走"的次数上限（防"来回跑"把一天走光）。
         self.resume_walks = 0
+        # 【task-50】窗口外干作物（Mod 的 `farm.dryTiles`）：每格试了几次、哪些已经认输。
+        # run5 三天 `farm.dryCrops` 恒剩 1、而每个作业区 `leftover=0` —— 那 1 格在玩家 400 格
+        # 观测窗口之外，脑侧连坐标都没有，只能 `no_work` 收工（`day_justified=true` 白拿）。
+        self.far_dry_tries: dict[tuple[int, int], int] = {}
+        self.far_dry_given_up: set[tuple[int, int]] = set()
+        # 本日是否已经播报过"旧 Mod 没给 dryTiles 坐标"（一天只提醒一次，不刷屏）。
+        self.far_dry_unavailable_noted = False
 
     # ------------------------------------------------------------------ 小工具
     def _mark_no_target(self, task: str) -> None:
@@ -613,6 +629,152 @@ class LongRun:
         if self._is_farm(obs):
             return None
         return self._farm_totals(obs)
+
+    # --------------------------------------------------- task-50：窗口外的干作物
+    @staticmethod
+    def _far_dry_outside(obs: dict[str, Any]) -> tuple[list[tuple[int, int]], str]:
+        """Mod 报了坐标、但**不在玩家观测窗口里**的干作物格（含已经认输的）。
+
+        与 `_far_dry_tiles` 的区别：这里**不过滤** `far_dry_given_up`。为什么要留着认输的格子：
+        当天最后以 `stuck:` 收尾时，`ended_reason` 必须**点名坐标**（task-50 硬要求：
+        "干格不可达 ⇒ `ended_reason` 以 `stuck:` 开头且含坐标"），所以报告口径与行动口径要分开。
+        """
+        tiles, status = farm_dry_tiles(obs)
+        if status == "unavailable":
+            return [], status
+        visible = FarmWorker.tiles_of(obs)
+        return [t for t in tiles if t not in visible], status
+
+    def _far_dry_tiles(self, obs: dict[str, Any]) -> tuple[list[tuple[int, int]], str]:
+        """**玩家窗口之外、今天还没认输**的干作物格（task-50，= 行动口径）。
+
+        返回 `(还没认输的格, 状态)`，状态来自 `farmwork.farm_dry_tiles`：
+        `"ok"` / `"truncated"` / `"unavailable"`。
+
+        为什么需要它：`farm.dryCrops > 0` 时守卫**不许**判 `no_work`（run5 三天全挂的形态），
+        但那一格常常不在玩家周围 400 格窗口里 ⇒ 光知道"还有 1 格干"没法行动。
+        Mod 的 `farm.dryTiles` 给了坐标，脑侧据此走过去，走进去之后该格自然进窗口，
+        再由 `FarmWorker.water()` 用观测差分判成交。
+
+        已经认输的格子（`far_dry_given_up`）不再返回 —— 防"走不到就无限重试"；
+        报告/收尾要坐标时用 `_far_dry_outside`（含认输的）。
+        状态 `"unavailable"`（旧 Mod / farm 证据不可信）时返回空列表，调用方**绝不许**
+        把它当成"没有干格"。
+        """
+        outside, status = self._far_dry_outside(obs)
+        if status == "unavailable":
+            return [], status
+        return [t for t in outside if t not in self.far_dry_given_up], status
+
+    def _far_dry_where(self, obs: dict[str, Any]) -> str:
+        """收尾/守卫文案里的"窗口外那几格在哪"（含坐标；认输的也点名，标"够不着"）。"""
+        outside, status = self._far_dry_outside(obs)
+        if status == "unavailable" or not outside:
+            return ""
+        given = [t for t in outside if t in self.far_dry_given_up]
+        mark = ""
+        if given and len(given) == len(outside):
+            mark = f"；已试 {FAR_DRY_MAX_TRIES} 次都够不着，当天不再重试"
+        elif given:
+            mark = "；其中一部分已试过够不着"
+        return (f"，其中 {len(outside)} 格在玩家窗口之外（Mod 报的坐标 "
+                f"{[list(t) for t in outside[:3]]}{mark}）")
+
+    def _far_dry_reason(self, obs: dict[str, Any], dry_f: int) -> str:
+        """窗口外干作物的"还有活"理由（带坐标；给守卫/`work_reasons` 共用，避免口径漂移）。"""
+        far, status = self._far_dry_tiles(obs)
+        where = self._far_dry_where(obs)
+        if far:
+            return f"农场口径还有 {dry_f} 格干作物{where} ⇒ 先走过去浇"
+        if status == "unavailable":
+            return (f"农场口径还有 {dry_f} 格干作物，但 farm.dryTiles 不可用（旧 Mod / "
+                    "farm 证据不可信）⇒ 不许判「没活」，先回农场再判")
+        if where:
+            return f"农场口径还有 {dry_f} 格干作物{where} ⇒ 想浇但走不到（不再重试）"
+        return f"农场口径还有 {dry_f} 格干作物（窗口里看不到坐标）"
+
+    def _water_far_dry(self, obs: dict[str, Any], rep: DayReport) -> bool:
+        """走过去浇一格"窗口外"的干作物（task-50）。返回 `True` = 本轮真动了一次手。
+
+        有界性：每格一天最多 `FAR_DRY_MAX_TRIES` 次（走过 + 浇水算一次）；两次都不成
+        就进 `far_dry_given_up`，当天不再试它 —— 于是 `_far_dry_tiles` 会变空、守卫
+        仍因 `farm.dryCrops > 0` 不放行 ⇒ `_run_day` 以 `stuck:` 收尾并点名坐标
+        （**绝不**是 `no_work`）。
+        """
+        assert self.worker is not None
+        far, status = self._far_dry_tiles(obs)
+        if not far:
+            if status == "unavailable" and not self.far_dry_unavailable_noted:
+                farm = obs.get("farm") or {}
+                self.far_dry_unavailable_noted = True
+                self._journal("water_far_unavailable", complete=farm.get("complete"),
+                              loaded=farm.get("loaded"), dryCrops=farm.get("dryCrops"),
+                              note="farm 说还有干作物，但没有 dryTiles 坐标（旧 Mod / 证据不可信）"
+                                   "⇒ 不判「没活」，按有活继续干（当天会以 stuck 如实收尾）")
+            return False
+        pt = FarmWorker.player_tile(obs) or far[0]
+        tile = min(far, key=lambda t: (_dist(t, pt), t[1], t[0]))
+        tries = int(self.far_dry_tries.get(tile, 0)) + 1
+        self.far_dry_tries[tile] = tries
+        self._actions += 1
+        before_farm = obs.get("farm") or {}
+        before_dry = int(before_farm.get("dryCrops") or 0)
+
+        walked, walk_note = True, ""
+        try:
+            walked = bool(self.worker.stand_next_to(tile, timeout_ms=30000))
+        except BridgeError as exc:
+            walked, walk_note = False, f"走过去失败：{exc}"
+        except Exception as exc:                      # pragma: no cover - 假 worker 的意外
+            walked, walk_note = False, f"走过去异常：{type(exc).__name__}: {exc}"
+
+        st: StepResult | None = None
+        err = ""
+        if walked:
+            try:
+                st = self.worker.water(tile)
+            except BridgeError as exc:
+                err = str(exc)
+            except Exception as exc:                  # pragma: no cover
+                err = f"{type(exc).__name__}: {exc}"
+
+        after_obs = obs
+        try:
+            after_obs = self._snap()
+        except BridgeError:
+            pass
+        after_tv = (FarmWorker.tiles_of(after_obs) or {}).get(tuple(tile)) or {}
+        after_farm = after_obs.get("farm") or {}
+        after_dry = int(after_farm.get("dryCrops") or 0)
+        watered = bool(after_tv.get("watered"))
+        # 判据**只看观测差分**（task-50 卡面：该格 `watered==true`，或 `farm.dryCrops` 下降）。
+        # 回执 `st.ok=True` **不算证据** —— run1/run2 都栽在"回执 ok、世界没变"上；
+        # 实测（`scratch\\_t50_probe.py` 场景④）：把回执算进来的话，"回执说浇了、壶没动、
+        # 世界没变"会被记成浇成功，当天还白拿 `verified`。
+        ok = watered or (before_dry > 0 and 0 <= after_dry < before_dry)
+        code = (st.code if st is not None else ("unreachable" if not walked else "error"))
+        receipt_ok = bool(st.ok) if st is not None else None
+
+        if not ok and tries >= FAR_DRY_MAX_TRIES:
+            self.far_dry_given_up.add(tile)
+        self._journal("water_far", tile=list(tile), ok=ok, code=code, try_=tries,
+                      limit=FAR_DRY_MAX_TRIES, walked=bool(walked), watered=watered,
+                      dry_before=before_dry, dry_after=after_dry, status=status,
+                      receipt_ok=receipt_ok,
+                      reason=(st.reason if st is not None else (walk_note or err)),
+                      receipt=(st.receipt if st is not None else err),
+                      given_up=bool(tile in self.far_dry_given_up),
+                      note="窗口外干作物：Mod 的 farm.dryTiles 给了坐标 ⇒ 走过去浇"
+                           "（farm.dryCrops>0 时不许 no_work 收工；判据=该格 watered 或 dryCrops 下降）")
+        if ok:
+            rep.notes.append(f"浇了窗口外那格干作物 {list(tile)}（第 {tries} 次尝试；"
+                             f"farm.dryCrops {before_dry}→{after_dry}）")
+            self._say(f"  · 浇窗口外干作物 {list(tile)}：{code}")
+        else:
+            rep.notes.append(f"窗口外干作物 {list(tile)} 没浇成（第 {tries}/{FAR_DRY_MAX_TRIES} 次）："
+                             f"{walk_note or err or (st.reason if st is not None else code)}"
+                             + ("；不再试这一格" if tile in self.far_dry_given_up else ""))
+        return True
 
     @staticmethod
     def _essence(obs: dict[str, Any]) -> dict[str, Any]:
@@ -1133,7 +1295,9 @@ class LongRun:
         if self._is_farm(obs) and totals is not None:
             dry_f, ripe_f = totals
             if dry_f > len(unwatered):
-                reasons.append(f"农场口径还有 {dry_f} 格干作物（当前窗口只看到 {len(unwatered)} 格）")
+                # 【task-50】干作物常常在玩家 400 格窗口之外 ⇒ 理由里带上 Mod 报的坐标，
+                # 否则"还有 1 格干"既没法行动、也没法在收尾时点名（run5 三天全挂的形态）。
+                reasons.append(self._far_dry_reason(obs, dry_f))
             if ripe_f > len(ripe):
                 reasons.append(f"农场口径还有 {ripe_f} 格熟作物（当前窗口只看到 {len(ripe)} 格）")
         # 【task-49】今天**已经见过、但还没做完**的格子（`_step_stage` 的 `leftover`）。
@@ -1245,12 +1409,15 @@ class LongRun:
                     f"农场口径还有 {ripe_f} 格熟作物（当前窗口没盖到，别处还有活），先去收")
             if dry_f > 0:
                 can, why = self._can_water(obs)
+                # 【task-50】那一格干作物常常在玩家窗口之外：把 Mod 报的坐标写进理由，
+                # 这样"当天以 stuck 收尾"时 `ended_reason` 能点名到底哪一格没浇成。
+                where = self._far_dry_where(obs)
                 if can and tod < 2500 and stam >= self.water_min_stamina:
                     return False, "keep_working", (
-                        f"农场口径还有 {dry_f} 格干作物（{why}），先把水浇完再谈收工")
+                        f"农场口径还有 {dry_f} 格干作物{where}（{why}），先把水浇完再谈收工")
                 if not can:
                     return True, "no_water", (
-                        f"农场口径还有 {dry_f} 格干作物，但{why}（想浇但无水；"
+                        f"农场口径还有 {dry_f} 格干作物{where}，但{why}（想浇但无水；"
                         "这不是「没活可做」，当天按 needs_review 如实收尾）")
         reasons = self.work_reasons(obs)
         if not reasons:
@@ -2084,6 +2251,10 @@ class LongRun:
         # 【task-49】跨片地的"今天还没做完"记账 + 回头看的次数上限，每天清零。
         self.leftover_targets = set()
         self.resume_walks = 0
+        # 【task-50】窗口外干作物的重试记账，每天清零（第二天壶/世界都变了，重新判）。
+        self.far_dry_tries = {}
+        self.far_dry_given_up = set()
+        self.far_dry_unavailable_noted = False
         # 【task-42】新的一天 ⇒ 清空出货白名单：昨天收获的东西昨天该出就出了，
         # 今天再拿白名单去卖会变成"卖一件不存在的东西"（`sellable_slots` 找不到就不动，但语义要干净）。
         if self.worker is not None:
@@ -2153,6 +2324,13 @@ class LongRun:
                 break
 
             self._preconditions(obs, rep)
+            # 【task-50】窗口外那 1 格干作物（run5 三天 `farm.dryCrops` 恒剩 1 的病灶）：
+            # Mod 的 `farm.dryTiles` 给了坐标 ⇒ **走过去浇**，别因为它不在窗口里就判 `no_work`。
+            # 每格每天最多 `FAR_DRY_MAX_TRIES` 次；两次都不成会进"认输"集合，之后
+            # `_far_dry_tiles` 变空 ⇒ 守卫仍因 `farm.dryCrops>0` 不放行 ⇒ 当天以
+            # `stuck:` 收尾并点名坐标（绝不洗成 `no_work`）。
+            if self._water_far_dry(obs, rep):
+                continue
             plot = self._ensure_plot(obs, rep)
             if plot is None:
                 # 【task-32】没有田区拿得出目标，但**守卫刚刚说还有活**（否则 line 上方的
@@ -2290,9 +2468,14 @@ class LongRun:
                 self._journal("idle", rounds=self.idle_rounds, zone=self.zone_name,
                               intents=[i.task for i in decision.intents], acted=acted)
                 if self.idle_rounds >= 3:
+                    # 【task-50】文案里补上"守卫为什么还说要干活"的**活证据**（含窗口外
+                    # 干作物的坐标）。决策逻辑一个字没动，只是让 `ended_reason` 能点名到底
+                    # 卡在哪一格 —— 卡面硬要求"干格不可达 ⇒ 当天 `stuck:` 且含坐标"。
+                    still = self.work_reasons(obs)
+                    why = ("；守卫仍说还有活：" + "；".join(still)) if still else ""
                     rep.ended_by, rep.ended_reason = "stuck", (
-                        f"连续 {self.idle_rounds} 轮世界没有任何变化（最后意图："
-                        f"{[i.task for i in decision.intents]}；策略说有进展：{acted}）")
+                        f"stuck:连续 {self.idle_rounds} 轮世界没有任何变化（最后意图："
+                        f"{[i.task for i in decision.intents]}；策略说有进展：{acted}）{why}")
                     break
                 self.sleep_fn(0.5)
             if self.supervise_every and self._actions and self._actions % self.supervise_every == 0:

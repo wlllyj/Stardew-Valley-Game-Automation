@@ -23,8 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "brain"))
 
 from agentfarm.bridge import BridgeError  # noqa: E402
 from agentfarm.farmwork import (  # noqa: E402
-    FarmWorker, KIND_TOOL, MAX_CLEAR_SWINGS, StepResult as SR, StageResult, till_blocked_by,
-    tool_missing_reason, tool_presence,
+    FarmWorker, KIND_TOOL, MAX_CLEAR_SWINGS, StepResult as SR, StageResult, farm_dry_tiles,
+    till_blocked_by, tool_missing_reason, tool_presence,
 )
 
 DROP = object()          # "这一格的障碍没了"（观测里那条记录消失）
@@ -1196,6 +1196,49 @@ class TestTask42Sell(unittest.TestCase):
         self.assertEqual(len(steps), 1)
         self.assertFalse(steps[0].ok)
         self.assertEqual(len(w.sell_calls), 1)
+
+
+class TestFarmDryTiles(unittest.TestCase):
+    """task-50：`farm.dryTiles`（Mod 报的窗口外干作物坐标）的**三态**读取。
+
+    run5 的病灶是"窗口外还有 1 格干作物，脑侧既看不见也没坐标 ⇒ `no_work` 收工"。
+    这三态必须分清：能用（ok）/ 只报了一部分（truncated）/ **不可用**（旧 Mod 缺字段）。
+    最后一态最关键：缺字段**不许**当成"没有干格"，但也不许瞎猜坐标去浇。
+    """
+
+    def test_ok_returns_deduped_tiles_in_report_order(self):
+        obs = {"farm": {"complete": True, "dryTiles": [[61, 10], [40, 3], [61, 10]]}}
+        tiles, status = farm_dry_tiles(obs)
+        self.assertEqual(tiles, [(61, 10), (40, 3)], "去重但保持 Mod 报的顺序（y→x 已排好）")
+        self.assertEqual(status, "ok")
+
+    def test_truncated_is_reported_as_such(self):
+        obs = {"farm": {"complete": True, "dryTiles": [[61, 10]],
+                        "dryTilesTruncated": True}}
+        tiles, status = farm_dry_tiles(obs)
+        self.assertEqual(tiles, [(61, 10)])
+        self.assertEqual(status, "truncated", "截断要如实说，免得把「报了 64 格」当全集")
+
+    def test_missing_or_untrusted_farm_is_unavailable_never_empty(self):
+        """旧 Mod / 未加载 / 没扫完 ⇒ `unavailable`，绝不等于"没有干格"。"""
+        cases = [
+            {},                                                        # 完全没有 farm 块
+            {"farm": {}},                                              # 老 Mod 的 farm 块
+            {"farm": {"complete": True}},                              # 有 complete、没 dryTiles
+            {"farm": {"complete": False, "dryTiles": [[61, 10]]}},     # 没扫完 ⇒ 不信
+            {"farm": {"loaded": False, "complete": True, "dryTiles": [[61, 10]]}},
+        ]
+        for obs in cases:
+            with self.subTest(obs=obs):
+                self.assertEqual(farm_dry_tiles(obs), ([], "unavailable"),
+                                 f"{obs} 必须判「不可用」，不许判成「没有干格」")
+
+    def test_dirty_entries_are_skipped_not_trusted(self):
+        obs = {"farm": {"complete": True,
+                        "dryTiles": [[61, 10], [61], "6,1", None, [61, "x"], [63, 12]]}}
+        tiles, status = farm_dry_tiles(obs)
+        self.assertEqual(tiles, [(61, 10), (63, 12)], "脏数据跳过，好数据照收")
+        self.assertEqual(status, "ok")
 
 
 if __name__ == "__main__":  # pragma: no cover
