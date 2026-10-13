@@ -30,10 +30,19 @@ import ctypes
 import datetime as _dt
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+# 控制台/管道编码兜底：Windows 上（尤其 cp1252 的 Store Python）打印中文会 UnicodeEncodeError，
+# 起跑器本身必须能在任何 shell 下把四要素打出来。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except Exception:  # pragma: no cover - 老 Python/被重定向的流
+        pass
 
 _ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_PYTHON = r"C:\Users\admin\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
@@ -41,7 +50,14 @@ _DEFAULT_PYTHON = r"C:\Users\admin\.dsh\dsh-runtimes\dsh-primary-runtime\depende
 _DETACHED_PROCESS = 0x00000008
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
 
-_TRACKED_FILES = ("brain/agentfarm/longrun.py", "brain/agentfarm/farmwork.py", "brain/agentfarm/bridge.py")
+_TRACKED_FILES = (
+    "brain/agentfarm/longrun.py",
+    "brain/agentfarm/farmwork.py",
+    "brain/agentfarm/bridge.py",
+    # run6 起「版本四要素」必须含 Mod 产物：dll 是真正跑在游戏里的那份，manifest 是版本号来源。
+    "mod/AgentFarm.Bridge/bin/Release/AgentFarm.Bridge.dll",
+    "mod/AgentFarm.Bridge/manifest.json",
+)
 
 
 def _alive(pid: int) -> bool:
@@ -158,11 +174,20 @@ def main(argv: list[str] | None = None) -> int:
                   "--days", str(args.days), "--size", str(args.size),
                   "--max-minutes", str(args.max_minutes), "--max-days", str(args.max_days),
                   "--journal", str(journal.relative_to(_ROOT)).replace("\\", "/")]
+    # 子进程环境显式写死：PYTHONUTF8=1（账本/console 里全是中文）+ PYTHONPATH=<root>/brain，
+    # 这样"起跑器被在哪个 shell、带不带 PYTHONPATH"调用都不影响长跑的 import 与编码。
+    child_env = dict(os.environ)
+    child_env["PYTHONUTF8"] = "1"
+    child_env["PYTHONIOENCODING"] = "utf-8"
+    _brain = str(_ROOT / "brain")
+    _pp = child_env.get("PYTHONPATH", "")
+    child_env["PYTHONPATH"] = _brain if not _pp else (_brain + os.pathsep + _pp)
     out_fh = open(console, "w", encoding="utf-8")
     err_fh = open(errlog, "w", encoding="utf-8")
     try:
         proc = subprocess.Popen(
-            argv_child, cwd=_ROOT, stdout=out_fh, stderr=err_fh, stdin=subprocess.DEVNULL,
+            argv_child, cwd=_ROOT, env=child_env, stdout=out_fh, stderr=err_fh,
+            stdin=subprocess.DEVNULL,
             creationflags=_DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP, close_fds=True,
         )
     finally:
