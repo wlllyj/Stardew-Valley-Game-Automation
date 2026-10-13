@@ -843,6 +843,55 @@ class TestOneDay(unittest.TestCase):
         self.assertEqual(run.days, [])
 
 
+class TestTask38DayProgressAfterSleepRetry(unittest.TestCase):
+    """【task-38】"上一天报告没跨日、这一天报告跨了"不许被 `no_day_progress` 误杀。
+
+    真机来源：0.7.23 彩排（`logs\\longrun-rehearsal-0.7.23.jsonl`）—— 22:10 第一次回家寻路超时
+    （`ended_by=sleep_failed`，游戏日仍是 spring 17），第二次（人已经走近）才跨到 spring 18。
+    旧代码把 `_last_day_key` 记成**睡前**那一天（`last_obs` 正是特意冻结的睡前快照），于是总控
+    看到"前一天报告结束在 17 日、这一天报告也结束在 17 日" ⇒ 误判"游戏日没有前进"当场停：
+    `--days 1` 靠 streak 侥幸仍返 0，`--days 3` 会在第 1 天就退出并判 1（run3 会白烧）。
+    """
+
+    def test_sleep_retry_after_a_failed_night_still_counts(self):
+        class FlakySleepWorld(FakeWorld):
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                self.fail_sleeps = 1
+                self.sleep_attempts = 0
+
+            def sleep(self):
+                self.sleep_attempts += 1
+                if self.fail_sleeps > 0:
+                    self.fail_sleeps -= 1
+                    self.unwatered_at_sleep.append(
+                        sum(1 for c in self.crops.values() if not c["watered"]))
+                    return StepResult("sleep", code="failed",
+                                      reason="回不了 FarmHouse：寻路超时（假世界第一次）")
+                return super().sleep()
+
+        # 没种子、没钱、没障碍 ⇒ 守卫按 `no_work` 放行睡觉，两次都发生在同一个游戏日里。
+        w = FlakySleepWorld(weeds=0, seeds=0, money=0)
+        # 真机口径的 farm 快照（0 作物 ⇒ dryCrops=0）：本世界没有任何 tile，空窗口按 task-19
+        # NIT-1 如实判 False，会把这天误伤成 needs_review —— 与 `test_no_buy_flag` 同一个坑。
+        w.farm = {"loaded": True, "complete": True, "crops": 0, "dryCrops": 0,
+                  "unwateredCrops": 0, "hoeDirt": 0}
+        run = make_run(w, target_days=1)
+        code = run.run()
+        self.assertEqual(code, 0, run.logs)
+        self.assertEqual(w.sleep_attempts, 2, "第一次失败后必须再试一次，不能当场收工")
+        self.assertEqual([d.ended_by for d in run.days], ["sleep_failed", "sleep"])
+        self.assertTrue(run.days[-1].verified, run.days[-1].checks)
+        self.assertFalse(any(e["event"] == "no_day_progress" for e in run.entries),
+                         "睡成功了就不许判'游戏日没有前进'（这正是彩排里那行误报）")
+        # task-38 第二半：睡后的**观测**（不是回执）必须落进账本 —— `final` 是睡前快照，
+        # `tools\verify-run3.py` 的跨日证据只能读 `day_after`。
+        self.assertEqual(run.days[-1].day_after, [1, "spring", 7])
+        self.assertIsNone(run.days[0].day_after, "没睡成的那天不许有睡后观测")
+        ends = [e for e in run.entries if e["event"] == "day_end"]
+        self.assertEqual(ends[-1]["day_after"], [1, "spring", 7])
+
+
 class TestDiscipline(unittest.TestCase):
     def test_sleep_intent_is_vetoed_while_work_remains(self):
         """慢脑说"睡"，但地里还有活 ⇒ 必须否决并记 intent_vetoed（用户 2026-10-11 的要求）。"""

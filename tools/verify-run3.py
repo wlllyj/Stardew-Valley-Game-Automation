@@ -10,8 +10,10 @@
 它只读 journal（JSONL，每行一条事件，字段含 event/t/day/...），核对：
 
 1. **跨日证据**：每个 `day_end` 的 `ended_by == "sleep"` 必须能在 journal 里找到
-   一次成功的 sleep（`event=="sleep" and ok==true`），且 `final.day` 与 `day_start` 的
-   day_key 不同 —— 回执不算证据，观测里的日期变化才算。
+   一次成功的 sleep（`event=="sleep" and ok==true`），且**睡后重新观测到的日期**与
+   `day_start` 的 day_key 不同 —— 回执不算证据，观测里的日期变化才算。
+   【task-38】权威字段是 `day_end.day_after`（睡后重取的观测）；旧账本/合成账本没有它时
+   才退回 `day_end.final.day`（那是**睡前**快照，"跨日"只有 `day_after` 才是真观测）。
 2. **睡前未浇为 0**：`day_end.final.unwatered_crops == 0`（全局口径）。
 3. **无硬失败**：当天 stages 的 failed 之和为 0。
 3b. **阶段后置条件成立**：优先读 `day_end.checks.no_unmet_stages`（task-15 起），读不到就
@@ -163,6 +165,8 @@ def build_days(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "ended_by": "",
                 "ended_reason": "",
                 "final": {},
+                "day_after": None,
+                "end_day": "?",
                 "sleep_ok": False,
                 "sleep_fail": 0,
                 "cross_day": False,
@@ -210,7 +214,17 @@ def build_days(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 )
             }
             fin_key = day_key({"final": cur["final"]}) if cur["final"] else "?"
-            cur["cross_day"] = bool(cur["final"]) and fin_key != cur["key"]
+            # task-38：`final` 是**睡前**快照（浇水的证据就存在它里面），拿它判跨日永远判不出
+            # 真账本的跨日（全天都写睡觉失败时才被"整段跳过浇水检查"遮住）。睡后重新观测到的
+            # 那一天在 `day_after` 里 —— 优先用它，其次才退回 `final`（兼容旧账本/合成账本）。
+            cur["day_after"] = row.get("day_after")
+            after_key = day_key({"final": {"day": cur["day_after"]}}) if cur["day_after"] else "?"
+            if after_key != "?":
+                cur["end_day"] = after_key
+                cur["cross_day"] = after_key != cur["key"]
+            else:
+                cur["end_day"] = fin_key
+                cur["cross_day"] = bool(cur["final"]) and fin_key != cur["key"]
             cur["end_lineno"] = row.get("_lineno")
     return days
 
@@ -333,7 +347,8 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
                 problems.append(f"[{name}] ended_by=sleep 但 journal 里没有一次成功的 sleep 证据")
             if not d["cross_day"]:
                 problems.append(
-                    f"[{name}] 缺跨日证据：final 的日期与 day_start 相同（final={d['final'].get('day')!r}）"
+                    f"[{name}] 缺跨日证据：睡后观测到的日期与 day_start 相同"
+                    f"（day_after={d.get('day_after')!r}、final={d['final'].get('day')!r}）"
                 )
             _water_problems()
         if checks.get("no_hard_failures") is False:
@@ -376,15 +391,16 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         # 跨日必须是"恰好 +1 天"（盲区 B5）：只判"字符串不一样"会把跨两天/跨月放过去。
         if d["ended_by"] == "sleep" and d["cross_day"]:
             o0 = _day_ordinal(d.get("start_day"))
-            o1 = _day_ordinal(d["final"].get("day"))
+            o1 = _day_ordinal(d.get("day_after") or d["final"].get("day"))
+            end_day_text = d.get("day_after") or d["final"].get("day")
             if o0 is None or o1 is None:
                 infos.append(
                     f"[{name}] 跨日天数无法核对（day 字段不是 [年,季,日]："
-                    f"start={d.get('start_day')!r} final={d['final'].get('day')!r}）"
+                    f"start={d.get('start_day')!r} end={end_day_text!r}）"
                 )
             elif o1 - o0 != 1:
                 problems.append(
-                    f"[{name}] 跨日不是恰好 +1 天（start={d.get('start_day')!r} → final={d['final'].get('day')!r}）"
+                    f"[{name}] 跨日不是恰好 +1 天（start={d.get('start_day')!r} → end={end_day_text!r}）"
                 )
         # 当天窗口 t_start <= t_end（盲区 B2）：同样只记信息项（自述时间戳，时钟回拨会误杀）
         t0, t1 = d.get("t_start"), d.get("t_end")

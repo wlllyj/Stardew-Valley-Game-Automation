@@ -261,6 +261,10 @@ class DayReport:
     #: 在室内（FarmHouse）恒为 0 —— run2 的 `checks.crops_watered=true` 就是这么白过的；两套仪器
     #: 绝不能混在同一列（log-analyst `docs\_analyze-farmcounts.md`，run2 的 31→8→21→32）。
     final_water: dict[str, Any] = field(default_factory=dict)
+    #: task-38：**睡成功后重新观测到的游戏日**（`[year, season, day]`）。`final` 是睡前快照，
+    #: 跨日证据必须靠这一条（`tools\verify-run3.py` 优先读它，其次才退回 `final`）；
+    #: 只在 `ended_by=="sleep"` 且睡后观测成功时非空 —— 它是**观测**，不是回执。
+    day_after: list[Any] | None = None
     verified: bool = False
 
     @property
@@ -301,6 +305,8 @@ class DayReport:
             # task-19：浇水证据单独一条，`tools\verify-run3.py` 靠 `day_end.final_water` 复核
             # 证据来自哪张快照（并与 `checks.watered_outdoor` 互检，盲区 B4）。
             "final_water": dict(self.final_water),
+            # task-38：睡后观测到的游戏日（跨日证据；`final` 是睡前快照，不能当跨日证据）
+            "day_after": list(self.day_after) if self.day_after else None,
             "ok_steps": self.ok_steps,
             "skipped_steps": self.skipped_steps,
             "failed_steps": self.failed_steps,
@@ -2000,12 +2006,32 @@ class LongRun:
             + f"（watered_outdoor={watered_outdoor}）"
             + f" → {'VERIFIED' if rep.verified else 'needs_review'} {rep.checks}"
         )
-        self._journal("day_end", **rep.as_dict())
-        # 记下"这一天结束时游戏处在哪一天"：总控用它判断游戏日有没有真的往前走
+        # 记下"这一天结束时游戏处在哪一天"：总控用它判断游戏日有没有真的往前走。
+        # 【task-38 真机教训（0.7.23 彩排 2026-10-13）】`last_obs` 常常是**睡前**那一张快照
+        # （`rep.final` 就是特意冻结的睡前证据）⇒ 睡成功之后必须重新取一次观测，否则
+        # `_last_day_key` 还停在旧的一天：总控看到"上一天报告结束在 17 日 / 这一天也结束在 17 日"
+        # 就误判"游戏日没有前进"当场停 —— `--days 1` 靠 streak 侥幸仍返 0，`--days 3` 会在第 1 天
+        # 就退出并判 1（run3 会白烧）。彩排日志里那行 `× 游戏日没有前进（sleep：night:…）`
+        # 就是它，而同一份回执明写"已跨日：spring 17日 → spring 18日"。
+        # 同一张"睡后快照"还要**落进账本**（`day_after`）：`rep.final` 是睡前观测，
+        # `tools\verify-run3.py` 靠 `final.day != day_start.day` 判跨日 ⇒ 真账本永远判不出跨日
+        # （之前只被"睡觉失败的日子整段跳过浇水检查"这层遮住没暴露）。这是**观测**不是回执。
         try:
-            self._last_day_key = tuple(FarmWorker.day_key(last_obs))
+            key_obs = last_obs
+            if rep.ended_by == "sleep":
+                try:
+                    fresh = self._snap()
+                except BridgeError as exc:  # pragma: no cover - 仅诊断
+                    self._journal("day_key_resnap_failed", error=str(exc))
+                    fresh = None
+                if fresh is not None:
+                    key_obs = fresh
+                    rep.day_after = [int(v) if str(v).isdigit() else str(v)
+                                     for v in FarmWorker.day_key(fresh)]
+            self._last_day_key = tuple(FarmWorker.day_key(key_obs))
         except Exception:  # pragma: no cover
             self._last_day_key = None
+        self._journal("day_end", **rep.as_dict())
         return rep
 
     # ------------------------------------------------------------------ 总控
