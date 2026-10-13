@@ -38,6 +38,13 @@
 - **新硬闸门**：`checks.unreachable_within_bound is False`（豁免越界）⇒ **problem** —— 这是"把真失败/不可动格混进不可达来洗白"的直接信号，必须人工核对 `unreachable_tiles`。
 - 防洗白不靠本条：**全格不可达 + 当天 0 成功动作**仍被上面的真空日闸门判红（task-52 再加一条：`ok_steps==0 且全部靠豁免` ⇒ `no_unmet_stages` 仍为 false）。
 
+**锄不动信息项（`tool_ineffective`，task-63，2026-10-14 Lead 补）**：`till` 被游戏拒绝（`UseToolSkill` 挥满 `MaxSwings` 恒 false 才报该 status）⇒ 按 task-63 **不算当天硬失败**（`skipped` + `proven_inert`），但账本必须自洽，且与不可达是**两笔各自扣减、互不掩护**。
+
+- 语义分界：**世界没变且 Mod 报 `tool_ineffective`** ⇒ 前置事实（豁免）；**Mod 回执 ok 但格子没变** ⇒ 仍记 `failed`（说谎的回执不许洗白）。
+- 账本字段：`day_end.refused`/`refused_tiles`/`refused_bound`/`refused_exempt`；`day_end.checks.refused_within_bound`（**总写** bool）；逐格 journal `tool_refused`、阶段级 `refused_stage`、日级 `refused_summary`。
+- 上界 `refused_bound = max(5, floor(0.2×attempted))`；`refused_exempt = min(bound, 仍在 leftover 的被拒格数)`。
+- 工具侧：`checks.refused_within_bound is False` ⇒ **problem**；journal 自算 `tool_refused` 逐格数 **多于**账本计数 ⇒ **problem**（账目不可信）；一致 ⇒ 只记 info。两笔豁免（`unreachable_exempt` + `refused_exempt`）在 `no_unmet_stages` 自算里**各自扣完**，且「两笔豁免把 leftover 扣到 0 但当天 0 成功动作」按防真空口径仍算 `no_unmet_stages=false`（镜像 `longrun` 的 `unmet_leftover == 0 and (有进展 or 两笔豁免都为 0)`）。
+
 **风险事件分级（`tools/verify-run3.py` 已实现，2026-10-14 Lead 补）**：`mod_version_mismatch`（版本与脑侧期望不一致）**升格为问题项** —— 版本不符的账本不能当验收证据。其余十类只记 info：`water_far_unavailable`（farm 说还有干作物却拿不到 `dryTiles` 坐标）、`farm_evidence_unavailable`、`sell_failed`、`zones_failed`、`day_key_resnap_failed`、`bridge_unavailable`、`env_spin_capped`、`budget_exhausted`、`day_cap`、`event_blocked`。
 
 ## 2. 连续性与外部证据
