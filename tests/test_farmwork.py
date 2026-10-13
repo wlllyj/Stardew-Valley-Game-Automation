@@ -23,8 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "brain"))
 
 from agentfarm.bridge import BridgeError  # noqa: E402
 from agentfarm.farmwork import (  # noqa: E402
-    FarmWorker, KIND_TOOL, MAX_CLEAR_SWINGS, StepResult as SR, StageResult, farm_dry_tiles,
-    till_blocked_by, tool_missing_reason, tool_presence,
+    NEIGHBORS, FarmWorker, KIND_TOOL, MAX_CLEAR_SWINGS, StepResult as SR, StageResult,
+    farm_dry_tiles, is_unreachable, till_blocked_by, tool_missing_reason, tool_presence,
 )
 
 DROP = object()          # "这一格的障碍没了"（观测里那条记录消失）
@@ -75,6 +75,10 @@ class MiniWorld:
         self.interacts = 0
         #: 非空 ⇒ `move_to_location` 照这个 reason 抛 `unreachable`（造"门走不通"的现场）。
         self.move_to_location_fail = ""
+        # ---- task-52：走不到的格子（没有落脚点 / 寻路到不了）----
+        #: 这些格**走不上去**：`MiniBridge.move_to` 抛 `BridgeError(status="unreachable")`
+        #: （真机 run5 那 8 格是 `stand_next_to` 直接判"四邻都站不过去"，脑侧连 Mod 都没问到）。
+        self.unwalkable: set[tuple[int, int]] = set()
         # ---- task-43：长距离进建筑（每跳预算与路径长度无关 + 两段式接近）----
         #: `move_to_location` 的**回执脚本**（按顺序 pop，空则照 `move_to_location_fail` 走）：
         #:   `{"fail": {"status": "timeout", "reason": "…warp 源格 (64,14)…剩余 52 步未走完"}}`
@@ -280,6 +284,11 @@ class MiniBridge:
     def move_to(self, x, y, *, timeout_ms=None, based_on_seq=None, allow_bed=False):
         self.w.moves.append({"tile": [int(x), int(y)], "allow_bed": bool(allow_bed)})
         tile = (int(x), int(y))
+        if tile in self.w.unwalkable:
+            # 【task-52】走不到的格子：真机是 Mod 回 `unreachable`（A* 没算出路径）
+            # ⇒ 脑侧 `stand_next_to` 四邻全抛 ⇒ 返回 False ⇒ `clear()/till()/water()/…`
+            # 记 `unreachable`（**不是** `failed`）。
+            raise BridgeError(f"走向 ({int(x)}, {int(y)}) 时寻路无法到达", status="unreachable")
         # 踩睡觉**触发格** ⇒ 游戏自己的 `performTouchAction("Sleep")` 弹出提问；真机回执是
         # `ui_modal`（`MoveToLocationSkill.Begin()` 的模态闸门先命中）—— 这是**命中信号**不是失败
         # （task-33 施工单第 2 条 / task-37 真机复核）。
@@ -1239,6 +1248,77 @@ class TestFarmDryTiles(unittest.TestCase):
         tiles, status = farm_dry_tiles(obs)
         self.assertEqual(tiles, [(61, 10), (63, 12)], "脏数据跳过，好数据照收")
         self.assertEqual(status, "ok")
+
+
+class TestTask52Unreachable(unittest.TestCase):
+    """task-52：`unreachable`（没有落脚点 / 寻路到不了）是**独立一类**，`failed` 对它为 False。
+
+    真机依据（run5 summer 1）：那天做成 109 步、`final_water.dry=0`，却因 8 格 `clear` 全报
+    「四邻都站不过去」⇒ `no_hard_failures=false` ⇒ 高产的一天拿不到 `verified`。
+    它**不是**成功：`longrun` 当天记进 `blocked`（当天不再白试、**次日重试**），日级豁免有上界。
+    """
+
+    def _worker_on(self, tile, *, unwalkable=None, fail_status=None):
+        w = MiniWorld(records=[weed_rec(tile)], inventory=INV_WITH_SCYTHE,
+                      tools=TOOLS_WITH_SCYTHE)
+        w.unwalkable = {tuple(t) for t in (unwalkable or [])}
+        if fail_status:
+            w.fail_status[tuple(tile)] = fail_status
+        return w, make_worker(w)
+
+    def test_stand_next_to_failure_is_unreachable_not_failed(self):
+        """四邻都站不过去 ⇒ `code=unreachable`、`failed=False`、`attempted=True`。"""
+        tile = (60, 10)
+        nb = [(tile[0] + dx, tile[1] + dy) for dx, dy in NEIGHBORS]
+        w, worker = self._worker_on(tile, unwalkable=nb)
+        r = worker.clear(tile)
+        self.assertEqual(r.code, "unreachable")
+        self.assertIs(r.failed, False, "走不到不是硬失败（run5 那 8 格就是这么被误判的）")
+        self.assertIs(r.unreachable, True)
+        self.assertIs(r.attempted, True, "它确实发起过（花了寻路与观察），不算 skip")
+        self.assertIn("四邻都站不过去", r.reason)
+        self.assertEqual(w.calls, [], "根本没挥出去：use_tool 一次都不许发")
+
+    def test_till_stand_next_to_failure_is_unreachable(self):
+        tile = (60, 10)
+        nb = [(tile[0] + dx, tile[1] + dy) for dx, dy in NEIGHBORS]
+        w = MiniWorld(records=[{"tile": list(tile), "kind": "unknown", "standable": True}],
+                      tillable=[tile], tools=TOOLS_WITH_SCYTHE)
+        w.unwalkable = {tuple(t) for t in nb}
+        r = make_worker(w).till(tile)
+        self.assertEqual(r.code, "unreachable")
+        self.assertIs(r.failed, False)
+        self.assertEqual(w.calls, [])
+
+    def test_mod_unreachable_status_is_classified_too(self):
+        """Mod 自己回 `unreachable`（A* 没算出路径）同样归这一类。"""
+        tile = (60, 10)
+        w, worker = self._worker_on(tile, fail_status="unreachable")
+        r = worker.clear(tile)
+        self.assertEqual(r.code, "unreachable")
+        self.assertIs(r.failed, False)
+        self.assertIn("走不到", r.reason)
+
+    def test_is_unreachable_reads_both_status_and_machine_wording(self):
+        self.assertTrue(is_unreachable("unreachable"))
+        self.assertTrue(is_unreachable("", "本跳试过的格子：(64,14)(source)=unreachable"))
+        self.assertTrue(is_unreachable("", "四邻都站不过去（没有落脚点）"))
+        self.assertTrue(is_unreachable("", "A* 未算出路径"))
+        self.assertFalse(is_unreachable("timeout"))
+        self.assertFalse(is_unreachable("tool_ineffective"))
+        self.assertFalse(is_unreachable(""))
+
+    def test_unreachable_step_is_not_in_failed_steps_and_survives_as_dict(self):
+        tile = (60, 10)
+        nb = [(tile[0] + dx, tile[1] + dy) for dx, dy in NEIGHBORS]
+        w, worker = self._worker_on(tile, unwalkable=nb)
+        r = worker.clear(tile)
+        stage = StageResult(stage="clear_area", tiles=[tile], steps=[r])
+        self.assertEqual(stage.failed_steps, [])
+        self.assertEqual(stage.unreachable_count, 1)
+        self.assertEqual(stage.as_dict()["unreachable"], 1)
+        self.assertIs(r.as_dict().get("unreachable"), True)
+        self.assertNotIn("proven_inert", r.as_dict(), "走不到不许被当成「证明干不动」")
 
 
 if __name__ == "__main__":  # pragma: no cover

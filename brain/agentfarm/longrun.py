@@ -287,6 +287,15 @@ class DayReport:
     #: 只在 `ended_by=="sleep"` 且睡后观测成功时非空 —— 它是**观测**，不是回执。
     day_after: list[Any] | None = None
     verified: bool = False
+    #: 【task-52】当天判为"走不到"（四邻都站不过去 / 寻路到不了）的**格数**与**逐格坐标**。
+    #: 字段名与 `tools\verify-run3.py` 的交叉核对口径逐字对齐（Lead m04925）：
+    #: `day_end.unreachable`（int）+ `day_end.unreachable_tiles`（`[[x,y],…]`）。
+    #: `unreachable_bound` = `max(5, floor(0.2 × attempted))`，`unreachable_exempt` = 真正从
+    #: `no_unmet_stages` 里扣掉的格数（≤ bound，且只扣还留在 leftover 里的不可达格）。
+    unreachable: int = 0
+    unreachable_tiles: list[Any] = field(default_factory=list)
+    unreachable_bound: int = 0
+    unreachable_exempt: int = 0
 
     @property
     def failed_steps(self) -> int:
@@ -331,6 +340,11 @@ class DayReport:
             "ok_steps": self.ok_steps,
             "skipped_steps": self.skipped_steps,
             "failed_steps": self.failed_steps,
+            # 【task-52】不可达：计数 + 逐格坐标 + 界与实扣（`tools\verify-run3.py` 交叉核对用）
+            "unreachable": self.unreachable,
+            "unreachable_tiles": [list(t) for t in self.unreachable_tiles],
+            "unreachable_bound": self.unreachable_bound,
+            "unreachable_exempt": self.unreachable_exempt,
         }
 
 
@@ -504,6 +518,12 @@ class LongRun:
         # 而人已经在 field_se，体力还剩 62.3）。这份记账让守卫知道"别处还有没做完的"，
         # 并让 `_resume_plot` 把人带回去再看一次（`resume_walks` 有上界，见 `_run_day`）。
         self.leftover_targets: set[tuple[int, int]] = set()
+        # 【task-52】当天累计的"走不到"格子（四邻都站不过去 / 寻路到不了）。为什么需要**累计**：
+        # 这些格一记进 `self.blocked`，后续轮次的 `_stage_tiles` 就把它们剔掉了 ⇒ 只看当轮
+        # `all_steps` 会看不到它们，而它们仍留在 `_leftover` 里（`_leftover` 刻意不排除 blocked）。
+        # 日级 `no_unmet_stages` 的有界豁免与账本 `unreachable` 都靠这份集合。
+        # **不跨日**：`_run_day` 每天清空 ⇒ 次日自动重试（不许像 `proven_inert` 那样永久封格）。
+        self.unreachable_day: set[tuple[int, int]] = set()
         # 本日"为了看没做完的格子而往回走"的次数上限（防"来回跑"把一天走光）。
         self.resume_walks = 0
         # 【task-50】窗口外干作物（Mod 的 `farm.dryTiles`）：每格试了几次、哪些已经认输。
@@ -1512,7 +1532,7 @@ class LongRun:
         return out
 
     def _mark_blocked(self, before_obs: dict[str, Any], after_obs: dict[str, Any],
-                      steps: list[StepResult], rep: DayReport) -> None:
+                      steps: list[StepResult], rep: DayReport, *, stage: str = "") -> None:
         """把"动了但世界没变"的格子记进 `self.blocked`：今天不再碰（一格最多白试一次）。
 
         只记 `till`/`clear`/`sow` 这类**主观能动**的动作。浇水失败不封格 —— "当天所有作物都浇过"
@@ -1535,14 +1555,35 @@ class LongRun:
         before = self._tile_states(before_obs)
         after = self._tile_states(after_obs)
         marked = 0
+        unreach_marked = 0
         for s in steps:
-            if not (s.failed or s.proven_inert) or not s.tile or s.action not in ("till", "clear", "sow"):
+            if not s.tile:
                 continue
+            if not s.unreachable:
+                # 旧口径不动：只有 `till`/`clear`/`sow` 这类**主观能动**的动作才记「动了没用」。
+                if not (s.failed or s.proven_inert) or s.action not in ("till", "clear", "sow"):
+                    continue
             if s.env_block or s.inconclusive:
                 # 环境挡路 / 没结论 ≠ 这一格干不动：不封格（记进 env_fail/inconclusive_fail 汇总）。
                 continue
             key = tuple(s.tile)
-            if key in self.blocked or before.get(key) != after.get(key):
+            if key in self.blocked:
+                continue
+            if s.unreachable:
+                # 【task-52】"走不到"也是**当天**别再白试（否则每一轮策略都重新要同一格、
+                # 每次都白花一次寻路/观察）；但它**不是**"这格干不动"（世界可能变好），
+                # 所以：① 只进当天的 `blocked`（`_run_day` 每天清空 ⇒ 次日自动重试）；
+                # ② reason 原样保留（含「四邻都站不过去」或 Mod 的 A* 原文）；
+                # ③ 逐格发 journal（`tools\verify-run3.py` 靠它自算/交叉核对）。
+                self.blocked[key] = f"{s.action} 走不到：{s.reason[:80]}"
+                self.unreachable_day.add(key)
+                unreach_marked += 1
+                self._journal("unreachable", tile=list(key), action=s.action, stage=stage,
+                              zone=self.zone_name, reason=s.reason[:200],
+                              note="四邻都站不过去/寻路到不了 ⇒ 当天不再白试（次日会重试）；"
+                                   "不算硬失败，日级另有有界豁免")
+                continue
+            if before.get(key) != after.get(key):
                 continue
             self.blocked[key] = f"{s.action} 无效：{s.reason[:80]}"
             marked += 1
@@ -1551,6 +1592,9 @@ class LongRun:
         if marked:
             rep.notes.append(
                 f"记下 {marked} 格「动了没用」的地，今天不再碰（共 {len(self.blocked)} 格）")
+        if unreach_marked:
+            rep.notes.append(
+                f"记下 {unreach_marked} 格「走不到」的地，今天不再白试（次日重试；不算硬失败）")
 
     def _count_attempts(self, steps: list[StepResult]) -> None:
         """统计"每格今天**白试**过几次"（`MAX_TILE_ATTEMPTS` 兜底不变量）。
@@ -1682,7 +1726,7 @@ class LongRun:
             # 若等到阶段结束才 `_mark_blocked`，同一格注定干不动的格子会在后续每一轮
             # 被重新选中再白试一次（run1 的两格 grass 就是这么被连挥的）。
             self._count_attempts(res.steps)
-            self._mark_blocked(snap, self._snap(), res.steps, rep)
+            self._mark_blocked(snap, self._snap(), res.steps, rep, stage=task)
             # task-15 §④：本轮有**环境挡路**的失败步 ⇒ 先收模态、再重跑同一批格子。
             # 判据只有一份（`is_env_blocked` → `farmwork.ENV_BLOCK_STATUSES`），不另抄状态码。
             env_round = [s for s in res.steps if is_env_blocked(s)]
@@ -1760,14 +1804,38 @@ class LongRun:
         inert = [s for s in all_steps if s.proven_inert]
         env_fail = [s for s in all_steps if s.env_block]
         inconclusive = [s for s in all_steps if s.inconclusive]
+        # 【task-52】"走不到"（没有落脚点/寻路到不了）：**不算失败**，单独计数 + 逐格留痕。
+        # `unreachable_in_leftover` 是"这些格里有多少还留在后置条件的剩余集合里" —— 日级
+        # `no_unmet_stages` 的有界豁免要靠它（只豁免真正走不到的那些格，不是整段 leftover）。
+        # 用**当天累计**的不可达集合（`self.unreachable_day`）而不是本轮的 `all_steps`：
+        # 真机 run5 的形态是"先有一轮试了 8 格全走不到（记进当天 blocked），其后每一轮
+        # `_stage_tiles` 都把这 8 格剔掉 ⇒ 后续轮次的 `all_steps` 为空、leftover 仍是那 8 格"
+        # —— 只看本轮的话，最后一条记录的 `unreachable_leftover` 会变成 0，豁免就失效了。
+        unreach_steps = [s for s in all_steps if s.unreachable]
+        unreach_tiles = sorted({tuple(s.tile) for s in unreach_steps if s.tile})
+        unreach_in_left = min(len(leftover),
+                              len([t for t in self.unreachable_day if t in left_set]))
+        attempted_steps = sum(1 for s in all_steps if s.attempted)
         rep.stages.append({
             "stage": task, "tiles": 0 if not all_steps else len({s.tile for s in all_steps if s.tile}),
             "ok": len(oks), "skipped": len(skipped), "failed": len(failed),
             "failed_any": len(failed_any),
             "proven_inert": len(inert),
             "env_block": len(env_fail), "inconclusive": len(inconclusive),
+            # 【task-52】账本字段名与 `tools\verify-run3.py` 的自算口径**逐字对齐**（Lead m04925）：
+            # `stages[i].unreachable`（int）+ `stages[i].unreachable_tiles`（[[x,y],…]）。
+            "unreachable": len(unreach_tiles),
+            "unreachable_tiles": [list(t) for t in unreach_tiles],
+            "unreachable_leftover": unreach_in_left,
+            "attempted": attempted_steps,
             "stopped": stopped, "leftover": len(leftover),
         })
+        if unreach_steps:
+            self._journal("unreachable_stage", stage=task, zone=self.zone_name,
+                          tiles=len(unreach_tiles), in_leftover=unreach_in_left,
+                          coords=[list(t) for t in unreach_tiles[:12]],
+                          note="走不到（没有落脚点/寻路到不了）⇒ 不算硬失败；"
+                               "日级豁免有上界，逐格坐标见 unreachable 事件")
         # task-22：环境挡路 / 没拿到结论都要**单独留痕**（它们不进 `blocked`，也不该藏在 failed 里）。
         # 每阶段最多两条，带 statuses 与格数；事后看 journal 就能分清"这格真干不动"和"世界当时在忙"。
         if env_fail:
@@ -1807,6 +1875,10 @@ class LongRun:
                 f"重试后仍没做成才留在剩余里）")
         if inconclusive:
             reason_bits.append(f"其中 {len(inconclusive)} 格没拿到结论（超时/stale，占配额但不封格）")
+        if unreach_steps:
+            reason_bits.append(
+                f"其中 {len(unreach_tiles)} 格走不到（四邻都站不过去/寻路到不了，不算硬失败；"
+                f"当天不再白试、次日重试）")
         if stopped:
             reason_bits.append(f"提前停：{stopped}")
         if met:
@@ -2268,6 +2340,7 @@ class LongRun:
         self.no_target_global = set()
         # 【task-49】跨片地的"今天还没做完"记账 + 回头看的次数上限，每天清零。
         self.leftover_targets = set()
+        self.unreachable_day = set()
         self.resume_walks = 0
         # 【task-50】窗口外干作物的重试记账，每天清零（第二天壶/世界都变了，重新判）。
         self.far_dry_tries = {}
@@ -2534,8 +2607,41 @@ class LongRun:
         last_by_stage: dict[str, dict] = {}
         for s in rep.stages:
             last_by_stage[str(s.get("stage") or "")] = s
-        unmet_leftover = sum(int(s.get("leftover") or 0) for s in last_by_stage.values()
-                             if int(s.get("tiles") or 0) > 0)
+        # 【task-52】不可达豁免（Lead m04621/m04925 钉死口径）：
+        #   * 上界 = `max(5, floor(0.2 × 当天 attempted 步数))`；`unreachable` 计数在这个界内
+        #     才不影响 `verified`，超了照实 needs_review（`unreachable_within_bound` 判据）；
+        #   * **同一豁免也要作用到 `no_unmet_stages`**：把已判"走不到"、且还留在 leftover 里的
+        #     格子从日级剩余里扣掉（否则 run5 那种"最后一个阶段轮次刚好以不可达格子收尾"会把
+        #     高产的一天判死）。扣的是**逐格坐标可查**的：每个不可达格都有 `unreachable` journal
+        #     （`_mark_blocked`）+ 阶段级 `unreachable_stage`/账本 `unreachable_tiles`。
+        #   * 防洗白：**全部目标不可达且当天 0 成功动作** ⇒ `no_unmet_stages` 仍为 False
+        #     （下面的 `made_any_progress` 合取项），不许靠豁免把真空日洗成达标。
+        attempted_steps = sum(int(s.get("attempted") or 0) for s in rep.stages)
+        unreachable_bound = max(5, int(0.2 * attempted_steps))
+        unreach_day: set[tuple[int, int]] = set(self.unreachable_day)
+        for s in rep.stages:
+            for t in (s.get("unreachable_tiles") or []):
+                try:
+                    unreach_day.add((int(t[0]), int(t[1])))
+                except (TypeError, ValueError, IndexError):
+                    continue
+        rep.unreachable = len(unreach_day)
+        rep.unreachable_tiles = [list(t) for t in sorted(unreach_day)]
+        rep.unreachable_bound = unreachable_bound
+        raw_unmet = sum(int(s.get("leftover") or 0) for s in last_by_stage.values()
+                        if int(s.get("tiles") or 0) > 0)
+        unreach_in_last = sum(int(s.get("unreachable_leftover") or 0) for s in last_by_stage.values()
+                              if int(s.get("tiles") or 0) > 0)
+        unreachable_exempt = min(unreachable_bound, unreach_in_last)
+        rep.unreachable_exempt = unreachable_exempt
+        unmet_leftover = max(0, raw_unmet - unreachable_exempt)
+        made_any_progress = rep.ok_steps > 0
+        if unreach_day:
+            self._journal("unreachable_summary", count=len(unreach_day), bound=unreachable_bound,
+                          attempted=attempted_steps, exempted=unreachable_exempt,
+                          raw_unmet=raw_unmet, unmet=unmet_leftover,
+                          tiles=[list(t) for t in sorted(unreach_day)[:12]],
+                          note="不可达豁免：界内不影响 verified；扣掉的格子在 leftover 里逐格可见")
         # 遮蔽可见性（Lead m02561 裁定 1）：同一阶段种类当天**更早**记录 leftover>0、**最后一条**
         # leftover==0 ⇒ "前一片地没做完、后一片地干净"的遮蔽发生了。**纯信息项**：不改 VERIFIED、
         # 不改退出码，只发 journal + 进 notes，让 run3 事后能人工复核。
@@ -2572,7 +2678,12 @@ class LongRun:
             # 用户 m03224 拍板了职业路线：宁可停下等人，也不静默丢档。
             "no_blocking_modal": rep.ended_by not in BLOCKING_ENDS,
             "no_hard_failures": rep.failed_steps == 0,
-            "no_unmet_stages": unmet_leftover == 0,
+            # 【task-52】"走不到"本身不算硬失败，但**有上界**：超过 `max(5, 20%×attempted)`
+            # 就不是"个别格子客观走不到"，而是"今天大片目标够不着" ⇒ 照实 needs_review。
+            "unreachable_within_bound": rep.unreachable <= unreachable_bound,
+            # task-52 防洗白：豁免只对"走不到"的格子生效，且**全部不可达 + 0 成功动作**时
+            # 不许靠豁免把 `no_unmet_stages` 洗成 True（真空日必须仍判不达标）。
+            "no_unmet_stages": unmet_leftover == 0 and (made_any_progress or unreachable_exempt == 0),
             "crops_watered": int(rep.final.get("unwatered_crops") or 0) == 0,
             # task-19：**唯一**浇水证据（卡面 §1；`tools\verify-run3.py` 缺这条即问题）。
             # 窗口口径的 `crops_watered` 只作旁证：它读的是 `_essence` 的窗口计数，在室内恒 0。
@@ -2587,6 +2698,8 @@ class LongRun:
             + (f"（{rep.ended_reason}）" if rep.ended_reason else "")
             + f" 阶段 {rep.stages_seen or '无'} 做成 {rep.ok_steps} 跳过 {rep.skipped_steps} 失败 {rep.failed_steps}"
             + f" 未完成阶段剩 {unmet_leftover} 格（no_unmet_stages={unmet_leftover == 0}）"
+            + (f" 走不到 {rep.unreachable} 格（豁免界 {unreachable_bound}、实扣 {unreachable_exempt}）"
+               if rep.unreachable else "")
             + f" 浇水 {water_info.get('scope')} 口径 干 {water_info.get('dry')}/{water_info.get('crops')}"
             + f"（watered_outdoor={watered_outdoor}）"
             + f" → {'VERIFIED' if rep.verified else 'needs_review'} {rep.checks}"

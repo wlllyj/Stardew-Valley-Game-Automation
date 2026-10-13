@@ -42,10 +42,14 @@ __all__ = [
     "SKIP_KINDS",
     "STAGE_ACTION",
     "TILE_INERT_STATUSES",
+    "UNREACHABLE_CODE",
+    "UNREACHABLE_HINTS",
+    "UNREACHABLE_STATUSES",
     "FarmWorker",
     "StageResult",
     "StepResult",
     "farm_dry_tiles",
+    "is_unreachable",
     "seed_items",
     "till_blocked_by",
     "tool_missing_reason",
@@ -101,6 +105,25 @@ ENV_BLOCK_STATUSES = ("no_save", "ui_modal", "world_fading", "busy")
 #: `test_status_classes_cover_mod_codes_are_disjoint` 钉住）；其它 skill 专属的码
 #: （如 `sleep_no_question`）**有意**落进兜底桶，由各自的调用点按语义处理。
 INCONCLUSIVE_STATUSES = frozenset({"timeout", "error", "stale"})
+
+#: 【task-52】**没有落脚点 / 寻路到不了**这一类失败的专属 `code`：与 `failed`/`env_block`/
+#: `inconclusive` 并列，`StepResult.failed` 对它为 **False**。
+#: 真机依据（run5 summer 1，`logs\longrun-3day-llm-run5.jsonl` t=809.5/917.59）：那天做成 109 步、
+#: `final_water.dry=0`、`no_unmet_stages=true`，却因为 8 格 `clear` 全报「四邻都站不过去」
+#: ⇒ `checks.no_hard_failures=false` ⇒ `verified=false`。那 8 格是**客观世界约束**
+#: （四周都不可站立），不是"循环坏了"的证据 —— 把它算成当天硬失败会让高产的一天永远拿不到
+#: `verified`。**但它也不是成功**：`longrun` 当天把它记进 `blocked`（当天不再白试、次日清空重试），
+#: 并单独计数 + 逐格坐标进 journal；日级豁免有上界（见 `longrun` 的 `unreachable_within_bound`），
+#: 且**全部目标不可达 + 0 成功动作仍然判不达标**。
+UNREACHABLE_CODE = "unreachable"
+
+#: Mod 侧表示"走不到/没算出路径"的 status（`MoveToLocationSkill`/`StepMover`/`Skills` 的
+#: `unreachable`）。脑侧解析回执原文时也用同一组关键字（`UNREACHABLE_HINTS`）。
+UNREACHABLE_STATUSES = ("unreachable",)
+
+#: 回执/reason 里出现这些字样 ⇒ 归到 `UNREACHABLE_CODE`（与 `tools\verify-run3.py` 的自算关键字
+#: **同一组**，Lead m04925 钉死；改这里必须同步改那边）。
+UNREACHABLE_HINTS = ("四邻都站不过去", "寻路无法到达", "无法到达", "A* 未算出路径", "unreachable")
 
 #: `sleep` 回执里"游戏自己**没有**弹出睡觉提问"的状态码：Mod 拼不出 `Sleep` 前缀的应答键时
 #: **秒级**报它（不会再白等 3 分钟）。判据与 IL 定案见 `docs/_il-sleep-path.md`。
@@ -332,7 +355,17 @@ class StepResult:
 
     @property
     def failed(self) -> bool:
+        """**真失败**：动作发了、世界没按后置条件变。
+
+        ⚠️ `unreachable`（task-52：四邻都站不过去 / 寻路到不了）**不是** `failed` —— 见
+        `UNREACHABLE_CODE` 的注释：那是客观世界约束，日级豁免另有上界与逐格留痕。
+        """
         return self.code == "failed"
+
+    @property
+    def unreachable(self) -> bool:
+        """【task-52】没有落脚点 / 寻路到不了 ⇒ 当天不再白试、次日重试、单独计数（不算硬失败）。"""
+        return self.code == UNREACHABLE_CODE
 
     @property
     def attempted(self) -> bool:
@@ -357,6 +390,8 @@ class StepResult:
             d["env_block"] = True
         if self.inconclusive:
             d["inconclusive"] = True
+        if self.unreachable:
+            d["unreachable"] = True
         return d
 
 
@@ -401,6 +436,15 @@ class StageResult:
         return sum(1 for s in self.steps if s.inconclusive)
 
     @property
+    def unreachable_steps(self) -> list[StepResult]:
+        """【task-52】没有落脚点 / 寻路到不了的步（**不算 `failed_steps`**）。"""
+        return [s for s in self.steps if s.unreachable]
+
+    @property
+    def unreachable_count(self) -> int:
+        return len(self.unreachable_steps)
+
+    @property
     def progress(self) -> bool:
         return self.ok_count > 0
 
@@ -412,6 +456,7 @@ class StageResult:
             "already": self.already_count,
             "skipped": self.skipped_count,
             "failed": len(self.failed_steps),
+            "unreachable": self.unreachable_count,
             "stopped": self.stopped,
             "stopped_reason": self.stopped_reason,
             "steps": [s.as_dict() for s in self.steps],
@@ -468,6 +513,23 @@ def _exc_status(exc: BaseException) -> str:
     而"网络/协议异常"恰恰是**最没有任何结论**的一种 ⇒ 必须归到 inconclusive。
     """
     return str(getattr(exc, "status", "") or "error")
+
+
+def is_unreachable(status: str, text: str = "") -> bool:
+    """【task-52】这一次失败是不是"走不到"（没有落脚点 / 寻路到不了）。
+
+    两个来源都要认：①Mod 的机器可读 `status`（`UNREACHABLE_STATUSES`）；
+    ②回执/reason 原文里的关键字（`UNREACHABLE_HINTS`，与 `tools\\verify-run3.py` 的自算
+    关键字**同一组** —— 真机 run5 那 8 格就是脑侧 `stand_next_to` 直接判的"四邻都站不过去"，
+    根本没走到 Mod 那一步，只能靠原文认）。
+
+    归类后由调用点把 `StepResult.code` 写成 `UNREACHABLE_CODE`：`failed` 对它为 False。
+    """
+    s = str(status or "").strip().lower()
+    if s in UNREACHABLE_STATUSES:
+        return True
+    blob = str(text or "")
+    return any(h.lower() in blob.lower() for h in UNREACHABLE_HINTS)
 
 
 def seed_items(player: dict[str, Any]) -> list[tuple[str, str, int]]:
@@ -941,7 +1003,9 @@ class FarmWorker:
             r.reason = f"判据说这格现在清不掉 ⇒ 不动手：{miss}；{_work_context(obs)}"
             return r
         if not self.stand_next_to(tile):
-            r.code, r.reason = "failed", "四邻都站不过去"
+            # 【task-52】四邻都站不过去 ⇒ 专属 `unreachable`（**不是** `failed`）：
+            # 当天 `longrun` 会记进 `blocked` 不再白试、次日自动重试，日级另有有界豁免。
+            r.code, r.reason = UNREACHABLE_CODE, "四邻都站不过去（没有落脚点）"
             return r
 
         tool = "scythe" if want_grass else "auto"
@@ -949,6 +1013,7 @@ class FarmWorker:
         statuses: list[str] = []    # 每次请求的 Mod status（进 after，供事后复核）
         conclusive = False          # Mod 说"这一格挥不动"（换遍工具/前置条件不成立）
         env_block = ""              # Mod 说"现在整个环境不让动手"
+        unreach = ""                # 【task-52】Mod 说"这一格走不到"（A* 没算出路径）
         swung = False               # 至少有一次请求**真的挥出去了**（回执 ok 但世界没变）
         for i in range(1, MAX_CLEAR_SWINGS + 1):
             status = ""
@@ -980,6 +1045,11 @@ class FarmWorker:
             if status in TILE_INERT_STATUSES:
                 conclusive = True
                 break
+            # 【task-52】"走不到"要单独成类：它不是"这一格干不动"（世界可能变好），
+            # 更不是"这一刀白挥"（我们根本没挥出去）—— Mod 连落脚点都没找到。
+            if is_unreachable(status, r.receipt):
+                unreach = status
+                break
             env, inconclusive = _classify_status(status)
             if env:
                 env_block = status
@@ -988,6 +1058,17 @@ class FarmWorker:
                 # 没拿到结论（超时/异常/没见过的码）：既不能封格，也不算"挥过了" ⇒ 补下一次请求。
                 continue
             swung = True            # 回执没报错而世界没变 ⇒ 这一刀是真白挥的
+
+        if unreach:
+            # 【task-52】寻路到不了：专属 `unreachable`（`failed` 为 False）。**不封格到明天**——
+            # `longrun` 只把它记进当天的 `blocked`（当天别重复白试、次日自动重试），
+            # 并在日级按有界口径决定要不要影响 `verified`（逐格坐标进 journal）。
+            r.code = UNREACHABLE_CODE
+            if isinstance(r.after, dict):
+                r.after = {**r.after, "requests": i, "statuses": list(statuses)}
+            r.reason = (f"第 {i} 次请求回「走不到」（{unreach}）：Mod 没找到落脚点/没算出路径 ⇒ "
+                        f"不算清障失败，也不算这一格干不动；{r.receipt}")
+            return r
 
         if env_block:
             # 环境问题（没存档/模态/渐黑）不是"这一格干不动"：记 failed、**不封格**，下轮可以再试。
@@ -1060,7 +1141,9 @@ class FarmWorker:
             r.reason = f"判据说这格现在锄不了 ⇒ 不动手：{why}"
             return r
         if not self.stand_next_to(tile):
-            r.code, r.reason = "failed", "四邻都站不过去"
+            # 【task-52】四邻都站不过去 ⇒ 专属 `unreachable`（**不是** `failed`）：
+            # 当天 `longrun` 会记进 `blocked` 不再白试、次日自动重试，日级另有有界豁免。
+            r.code, r.reason = UNREACHABLE_CODE, "四邻都站不过去（没有落脚点）"
             return r
 
         status = ""
@@ -1075,6 +1158,12 @@ class FarmWorker:
         if (tv or {}).get("kind") == "dirt":
             r.ok = True
             r.reason = "锄出耕地（kind → dirt）"
+            return r
+        if is_unreachable(status, r.receipt):
+            # 【task-52】走不到 ⇒ `unreachable`（不是 failed）：当天不重复白试、次日重试。
+            r.code = UNREACHABLE_CODE
+            r.reason = (f"锄地请求回「走不到」（{status}）：没有落脚点/没算出路径 ⇒ 不算硬失败；"
+                        f"kind={str((tv or {}).get('kind') or '未知')}；{r.receipt}")
             return r
         r.code = "failed"
         # 环境挡路（渐黑/模态）⇒ failed 但**不封格、不占配额**；超时/异常 ⇒ 不封格但占配额。
@@ -1112,7 +1201,9 @@ class FarmWorker:
             return r
 
         if not self.stand_next_to(tile):
-            r.code, r.reason = "failed", "四邻都站不过去"
+            # 【task-52】四邻都站不过去 ⇒ 专属 `unreachable`（**不是** `failed`）：
+            # 当天 `longrun` 会记进 `blocked` 不再白试、次日自动重试，日级另有有界豁免。
+            r.code, r.reason = UNREACHABLE_CODE, "四邻都站不过去（没有落脚点）"
             return r
         status = ""
         try:
@@ -1131,6 +1222,12 @@ class FarmWorker:
             return r
         if left <= 0:
             r.code, r.reason = "no_seed", f"种子 {sid} 用光且这一格没长出作物"
+            return r
+        if is_unreachable(status, r.receipt):
+            # 【task-52】走不到 ⇒ `unreachable`（不是 failed）：当天不重复白试、次日重试。
+            r.code = UNREACHABLE_CODE
+            r.reason = (f"播种请求回「走不到」（{status}）：没有落脚点/没算出路径 ⇒ 不算硬失败；"
+                        f"种子 {have}→{left}；{r.receipt}")
             return r
         r.code = "failed"
         _mark_status(r, status)     # 环境挡路 / 没结论 ⇒ 不封格（`sow` 会把这两个标记继承上去）
@@ -1192,7 +1289,9 @@ class FarmWorker:
             return r
 
         if not self.stand_next_to(tile):
-            r.code, r.reason = "failed", "四邻都站不过去"
+            # 【task-52】四邻都站不过去 ⇒ 专属 `unreachable`（**不是** `failed`）：
+            # 当天 `longrun` 会记进 `blocked` 不再白试、次日自动重试，日级另有有界豁免。
+            r.code, r.reason = UNREACHABLE_CODE, "四邻都站不过去（没有落脚点）"
             return r
         status = ""
         try:
@@ -1211,6 +1310,12 @@ class FarmWorker:
         # 环境挡路（渐黑/模态）/ 没结论 ⇒ 不封格（task-22：`_count_attempts` 不带动作过滤，
         # 所以浇水/收获/走路上的一次瞬时抖动同样不能吃掉当天配额）。
         _mark_status(r, status)
+        if is_unreachable(status, r.receipt):
+            # 【task-52】走不到 ⇒ `unreachable`（不是 failed）：当天不重复白试、次日重试。
+            r.code = UNREACHABLE_CODE
+            r.reason = (f"浇水请求回「走不到」（{status}）：没有落脚点/没算出路径 ⇒ 不算硬失败；"
+                        f"水 {left}→{left_after}；{r.receipt}")
+            return r
         # 回执报错但水确实少了 ⇒ 这一格其实浇上了（世界在前、回执在后）
         if left is not None and left_after is not None and left_after < left and tv is not None:
             r.code = "failed"
@@ -1240,7 +1345,9 @@ class FarmWorker:
             r.code, r.reason = "skipped", "还没成熟"
             return r
         if not self.stand_next_to(tile):
-            r.code, r.reason = "failed", "四邻都站不过去"
+            # 【task-52】四邻都站不过去 ⇒ 专属 `unreachable`（**不是** `failed`）：
+            # 当天 `longrun` 会记进 `blocked` 不再白试、次日自动重试，日级另有有界豁免。
+            r.code, r.reason = UNREACHABLE_CODE, "四邻都站不过去（没有落脚点）"
             return r
         status = ""
         try:
@@ -1267,6 +1374,12 @@ class FarmWorker:
             return r
         r.code = "failed"
         _mark_status(r, status)     # 渐黑/模态 ⇒ 不封格、不占配额；超时 ⇒ 不封格但占配额
+        if is_unreachable(status, r.receipt):
+            # 【task-52】走不到 ⇒ `unreachable`（不是 failed）：当天不重复白试、次日重试。
+            r.code = UNREACHABLE_CODE
+            r.reason = (f"收获请求回「走不到」（{status}）：没有落脚点/没算出路径 ⇒ 不算硬失败；"
+                        f"作物还在；{r.receipt}")
+            return r
         r.reason = (f"交互后作物还在（可能没摘到）{f'；Mod status={status}' if status else ''}")
         return r
 

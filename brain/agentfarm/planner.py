@@ -1120,6 +1120,10 @@ class BoundaryPlanner:
         finish_reason / duration_ms / attempts / rejected（被拒收的原因数组）/
         accepted（本次真正采用的意图数组）/ fallback（是否降级 + 原因）`。
         `fallback` 先占位，`_stamp_trace()` 按最终决策统一改写。
+
+        ⚠️ `t` 是**墙钟 unix 秒**（`time.time()`），与 journal 里那个**相对起跑的秒**
+        不同源，两者**不可直接相减**；跨文件关联一律用 `llm_trace_hash`（journal
+        `decision` 行里的那个 12 位 sha256）当键（Lead m05169 裁定①）。
         """
         meta = dict(self._last_ask_meta)
         prompt = str(user_text or "")

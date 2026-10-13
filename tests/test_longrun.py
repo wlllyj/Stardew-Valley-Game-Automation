@@ -3073,6 +3073,162 @@ class TestTask56LlmTraceWiring(unittest.TestCase):
             self.assertTrue([e for e in run.entries if e["event"] == "decision"])
 
 
+_NB4 = ((0, -1), (0, 1), (1, 0), (-1, 0))
+
+
+class _UnreachableClient(FakeClient):
+    """task-52：这些格**走不上去**（真机是 Mod 回 `unreachable`，或脑侧四邻全抛）。"""
+
+    def __init__(self, world: FakeWorld, *, unreachable=()) -> None:
+        super().__init__(world)
+        cells: set[tuple[int, int]] = set()
+        for t in unreachable:
+            t = (int(t[0]), int(t[1]))
+            cells.add(t)
+            cells.update((t[0] + dx, t[1] + dy) for dx, dy in _NB4)
+        self.unreachable_cells = cells
+
+    def move_to(self, x, y, *, timeout_ms=None, allow_bed=None):
+        if (int(x), int(y)) in self.unreachable_cells:
+            raise BridgeError(f"走向 ({int(x)}, {int(y)}) 时寻路无法到达", status="unreachable")
+        return super().move_to(x, y, timeout_ms=timeout_ms, allow_bed=allow_bed)
+
+    def buy(self, item, count=10, *, shop="SeedShop", timeout_ms=25000):
+        """真 `FarmWorker` 会走 `c.buy(...)`；`FakeClient` 没有，这里补上（落到 `FakeWorld.buy`）。"""
+        return self.w.buy(item, count, shop)
+
+
+class UnreachableWorld(FakeWorld):
+    """指定格子是世界里的障碍，但**四邻都走不到** —— run5 summer 1 那 8 格的复现。"""
+
+    def __init__(self, *, unreachable=(), **kw) -> None:
+        kw.setdefault("weeds", 0)
+        super().__init__(**kw)
+        self.unreachable = {tuple(t) for t in unreachable}
+        for t in sorted(self.unreachable):
+            self.blockers[t] = "weed"
+
+
+class TestTask52Unreachable(unittest.TestCase):
+    """task-52：run5 里「8 格 clear 走不到」把一整天判死（`no_hard_failures=false` ⇒ 不 VERIFIED）。
+
+    真机证据（`logs\\longrun-3day-llm-run5.jsonl` t=809.5/917.59，summer 1）：那天做成 109 步、
+    `final_water.dry=0`，却因 8 格 `clear` 报「四邻都站不过去」⇒ 达标线被一票否决。客观走不到
+    不是硬失败：当天记进 `blocked`（不再白试）、**次日重试**、日级豁免有 `max(5, 20%)` 上界，
+    且**不许把真空日洗成达标**（`ok_steps==0` 时豁免不生效）。
+
+    变异自检（**实测**，脚本 `%TEMP%\\t52_mutate.py`，跑完即弃；基线 10/10 绿）：
+    * `m52a`：把 `StepResult.unreachable` 换成恒 False（等于关掉归类，退回 failed）⇒ **7 条红**
+      （含 `test_eight_unreachable_tiles_do_not_break_an_otherwise_good_day`）。
+    * `m52b`：把 `LongRun._leftover` 改成排除 `self.blocked`（task-9 条款①明令禁止的洗白写法）
+      ⇒ **3 条红**，其中 `test_within_bound_but_zero_success_is_still_never_verified` 正是防这条的。
+    """
+
+    U8 = [(60, 10), (61, 10), (62, 10), (63, 10), (64, 10), (60, 11), (61, 11), (62, 11)]
+    WEEDS4 = [(60, 13), (62, 13), (64, 13), (61, 14)]
+
+    def _mixed_world(self) -> UnreachableWorld:
+        w = UnreachableWorld(unreachable=self.U8, seeds=10, money=500)
+        for t in self.WEEDS4:
+            w.blockers[t] = "weed"
+        return w
+
+    def _run(self, w: FakeWorld, **kw):
+        client = _UnreachableClient(w, unreachable=getattr(w, "unreachable", ()))
+        worker = FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+        kw.setdefault("target_days", 1)
+        kw.setdefault("max_days", 1)
+        run = make_run(w, client_factory=lambda: client, worker_factory=lambda c: worker, **kw)
+        run.worker = worker
+        run.client = client
+        return run, client
+
+    @staticmethod
+    def _events(run: LongRun, event: str) -> list:
+        return [e for e in run.entries if e.get("event") == event]
+
+    def test_eight_unreachable_tiles_do_not_break_an_otherwise_good_day(self):
+        """8 格走不到 + 其余全做成 ⇒ `no_hard_failures`/`no_unmet_stages` 都真、当天 VERIFIED。"""
+        w = self._mixed_world()
+        run, _ = self._run(w)
+        self.assertEqual(run.run(), 0)
+        rep = run.days[0]
+        self.assertEqual(rep.failed_steps, 0, rep.stages)
+        self.assertEqual(rep.unreachable, 8)
+        self.assertEqual({tuple(t) for t in rep.unreachable_tiles}, set(self.U8))
+        self.assertTrue(rep.checks["no_hard_failures"], rep.checks)
+        self.assertTrue(rep.checks["unreachable_within_bound"], rep.checks)
+        self.assertTrue(rep.checks["no_unmet_stages"], rep.checks)
+        self.assertTrue(rep.verified, f"{rep.checks} / stages={rep.stages}")
+        per = self._events(run, "unreachable")
+        self.assertEqual({tuple(e["tile"]) for e in per}, set(self.U8), per)
+        self.assertTrue(all(e["stage"] == "clear_area" for e in per))
+        self.assertTrue(all("四邻都站不过去" in str(e["reason"]) for e in per), per)
+        day_end = self._events(run, "day_end")[-1]
+        for key in ("unreachable", "unreachable_tiles", "unreachable_bound", "unreachable_exempt"):
+            self.assertIn(key, day_end, f"day_end 缺 {key}")
+        self.assertEqual(day_end["unreachable"], 8)
+        self.assertGreater(day_end["unreachable_bound"], 0)
+
+    def test_exceeding_the_bound_trips_the_check_and_kills_verification(self):
+        """8 格全走不到、0 成功 ⇒ 8 > `max(5, 20%×attempted)` ⇒ 越界判据亮、不得 VERIFIED。"""
+        w = UnreachableWorld(unreachable=self.U8, seeds=0, money=0)
+        run, _ = self._run(w)
+        run.run()
+        rep = run.days[0]
+        self.assertEqual(rep.ok_steps, 0)
+        self.assertIs(rep.checks["unreachable_within_bound"], False, rep.checks)
+        self.assertIs(rep.checks["no_unmet_stages"], False, rep.checks)
+        self.assertIs(rep.verified, False)
+        self.assertTrue(any("走不到" in n for n in rep.notes), rep.notes)
+
+    def test_within_bound_but_zero_success_is_still_never_verified(self):
+        """防真空：5 格走不到（正好在上界内）+ 0 成功 ⇒ 豁免不许把这一天洗成达标。"""
+        w = UnreachableWorld(unreachable=self.U8[:5], seeds=0, money=0)
+        run, _ = self._run(w)
+        run.run()
+        rep = run.days[0]
+        self.assertEqual(rep.ok_steps, 0)
+        self.assertEqual(rep.unreachable, 5)
+        self.assertGreaterEqual(rep.unreachable_bound, 5)
+        self.assertTrue(rep.checks["unreachable_within_bound"], rep.checks)
+        self.assertIs(rep.checks["no_unmet_stages"], False,
+                      "全走不到 + 0 成功：豁免再宽也不许自证")
+        self.assertIs(rep.verified, False)
+
+    def test_next_day_retries_the_same_unreachable_tiles(self):
+        """`blocked` 每天清空 ⇒ 次日必须**再试**（不许像 `proven_inert` 那样永久封格）。"""
+        w = self._mixed_world()
+        run, _ = self._run(w, target_days=2, max_days=3)
+        run.run()
+        self.assertGreaterEqual(len(run.days), 2)
+        self.assertEqual({tuple(t) for t in run.days[0].unreachable_tiles}, set(self.U8))
+        self.assertEqual({tuple(t) for t in run.days[1].unreachable_tiles}, set(self.U8),
+                         "次日没有重试这 8 格 ⇒ 变成了永久封格")
+        self.assertGreaterEqual(len(self._events(run, "unreachable")), 16)
+
+    def test_stage_counts_match_the_per_tile_journal(self):
+        """阶段账本与逐格 journal 必须同一组坐标，且`unreachable` 绝不进 `failed`。"""
+        two = [(60, 10), (61, 10)]
+        w = UnreachableWorld(unreachable=two, seeds=0, money=0)
+        w.blockers[(63, 13)] = "weed"
+        run, _ = self._run(w)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        plot = {"zone": "", "label": "", "anchor": [60, 10],
+                "tiles": [(60, 10), (61, 10), (63, 13)], "note": ""}
+        run._step_stage("clear_area", w.obs(), plot, rep)
+        st = rep.stages[-1]
+        self.assertEqual(st["unreachable"], 2, st)
+        self.assertEqual(st["failed"], 0, st)
+        self.assertEqual({tuple(t) for t in st["unreachable_tiles"]}, set(two))
+        self.assertGreaterEqual(st["attempted"], 3)
+        ev = self._events(run, "unreachable_stage")
+        self.assertEqual(len(ev), 1, ev)
+        self.assertEqual(ev[0]["tiles"], 2)
+        self.assertEqual(ev[0]["in_leftover"], 2)
+        self.assertEqual({tuple(t) for t in ev[0]["coords"]}, set(two))
+
+
 if __name__ == "__main__":
     unittest.main()
 
