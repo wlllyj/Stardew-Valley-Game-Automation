@@ -155,33 +155,58 @@ namespace AgentFarm.Bridge
                 answerNote = "提问对话框没有可读选项，直接关闭";
             }
 
-            // ---- 关闭：先 closeDialogue()，仍在才退回 exitThisMenu() ----
-            string closeNote = "";
-            if (IsActiveDialogue(box))
-            {
-                try { box.closeDialogue(); } catch { }
-                closeNote = "；closeDialogue() 关闭（复位 dialogueUp 与 player.CanMove）";
-            }
-            if (IsActiveDialogue(box))
-            {
-                try { box.exitThisMenu(); } catch { }
-                ClearDialogueFlag();
-                closeNote = "；closeDialogue() 未生效，已退回 exitThisMenu() 并复位 dialogueUp";
-            }
-
-            // 收尾：菜单已经没了，但 dialogueUp 还挂着残留标志 → 用唯一获准的那处状态写入兜住，
-            // 否则后续所有 move_to 都会一直吃 ui_modal（假“有对话框”）。
-            if (!IsActiveDialogue(box) && SafeBool(() => Game1.dialogueUp))
-            {
-                ClearDialogueFlag();
-                closeNote += "；并复位残留的 dialogueUp";
-            }
+            string closeNote = CloseDialogueBox(box);
 
             string head = isQuestion
                 ? $"已关闭对话框（选“{chosenText}”：{answerNote}{closeNote}）"
                 : $"已关闭对话（{answerNote}{closeNote}）";
 
             return Finish(true, "ok", $"{head}：“{question}”{convention}");
+        }
+
+        /// <summary>
+        /// 按**状态正确的顺序**关掉一个 <see cref="DialogueBox"/>：先 `closeDialogue()`
+        /// （复位 `Game1.dialogueUp` 与 `player.CanMove`），仍在才退回 `exitThisMenu()`，
+        /// 最后兜住残留的 `dialogueUp`。返回一句用于 reason 的说明。
+        ///
+        /// 【为什么抽出来且必须 internal（2026-10-13 task-33 真机定案）】
+        /// `SleepSkill` 在提问上答 Yes 之后**必须同一 tick 关框**：真机实测
+        /// `answerDialogue()` **只应答、不关框** ⇒ `Game1.newDay=True` 已经是既成事实，
+        /// 但提问框一直挂着、`newDaySync` 等不到保存 ⇒ 日期 180s 不动；关框后 ~3s 当天落地
+        /// （`logs\probe-bed-close-run1.log`）。两处（dismiss_modal 与 sleep）必须共用这一份顺序，
+        /// 绝不允许出现第二份“怎么关框”的实现 —— 关闭路径选错 API 就是 v2 那次永久卡死事故的根因。
+        /// </summary>
+        internal static string CloseDialogueBox(DialogueBox box)
+        {
+            string closeNote = "";
+            try
+            {
+                if (IsActiveDialogue(box))
+                {
+                    try { box.closeDialogue(); } catch { }
+                    closeNote = "closeDialogue() 关闭（复位 dialogueUp 与 player.CanMove）";
+                }
+                if (IsActiveDialogue(box))
+                {
+                    try { box.exitThisMenu(); } catch { }
+                    ClearDialogueFlag();
+                    closeNote = "closeDialogue() 未生效，已退回 exitThisMenu() 并复位 dialogueUp";
+                }
+
+                // 收尾：菜单已经没了，但 dialogueUp 还挂着残留标志 → 用唯一获准的那处状态写入兜住，
+                // 否则后续所有 move_to 都会一直吃 ui_modal（假“有对话框”）。
+                if (!IsActiveDialogue(box) && SafeBool(() => Game1.dialogueUp))
+                {
+                    ClearDialogueFlag();
+                    closeNote += (closeNote.Length > 0 ? "；" : "") + "并复位残留的 dialogueUp";
+                }
+            }
+            catch (Exception ex)
+            {
+                closeNote = "关框异常：" + ex.GetType().Name + ": " + ex.Message;
+            }
+
+            return string.IsNullOrEmpty(closeNote) ? "框已经不在了（无需关闭）" : closeNote;
         }
 
         /// <summary>

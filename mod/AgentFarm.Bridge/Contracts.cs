@@ -426,7 +426,9 @@ namespace AgentFarm.Bridge
     ///                 `isBed || !passable`。**`isBed` 单独列出来**是因为床是特例：
     ///                 它可踩（`passable` 可能为 true）但会触发睡觉确认框冻结世界时间，故显式拒绝；
     ///   * `type` / `name` —— 类名（如 `BedFurniture` / `Furniture`）与可读名。
-    ///     `name` 取 `DisplayName`（失败则退回 `Name`，再失败为 null）。
+    ///     `name` 取 `DisplayName`（失败则退回 `Name`，再失败为 null）；
+    ///   * `bedCells` —— **仅 `isBed`**：睡觉触发格候选（`TouchAction == "Sleep"`），
+    ///     见属性注释；非床为 null。踩 <see cref="Tile"/> 或 `interact(床)` 都不会引出睡觉提问。
     /// </summary>
     internal sealed class FurnitureView    {
         [JsonPropertyName("tile")] public int[] Tile { get; set; }
@@ -440,6 +442,22 @@ namespace AgentFarm.Bridge
 
         [JsonPropertyName("type")] public string Type { get; set; }
         [JsonPropertyName("name")] public string Name { get; set; }
+
+        /// <summary>
+        /// `isBed` 家具的**睡觉触发格**（1.6.15 里 `TouchAction == "Sleep"` 的那格；
+        /// 依据 `docs/_il-bed-interaction.md` §2.2/§2.6）。
+        ///
+        /// 【为什么单独给这一项】真机实测（`logs\probe-bed-recipe-run1.log`）：睡觉提问**只能**由玩家踩到
+        /// 这格引出（`GameLocation.UpdateWhenCurrentLocation → performTouchAction("Sleep")`），
+        /// 而它不是 <see cref="Tile"/>（床原点，本存档 (9,8) —— 踩它什么都不会发生，`interact` 也是静默 no-op）。
+        /// 触发格由 `bedTileOffset ∈ {0,1}` 决定且**逐帧可能翻转**（`BedFurniture.UpdateBedTile`），
+        /// 所以这里给的是**候选集合**（最多两格），由脑侧现算/逐个试。
+        ///
+        /// * 正常路径：用游戏自己的 `doesTileHaveProperty(x, y, "TouchAction", "Back") == "Sleep"`
+        ///   在床 bbox 里现算（权威，不受 offset 翻转影响）；
+        /// * 读不到/空表：非床家具为 `null`；床保留 `null` 时脑侧退回 `[[x, y+1], [x+1, y+1]]` 两个候选槽位。
+        /// </summary>
+        [JsonPropertyName("bedCells")] public int[][] BedCells { get; set; }
     }
 
     internal sealed class FarmView

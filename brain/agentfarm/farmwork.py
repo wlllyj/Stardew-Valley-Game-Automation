@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -110,9 +111,26 @@ SLEEP_FAIL_CODES = (
     "precondition_failed", "error",
 )
 
+#: 桥**自身**不可用（连不上 / 连接被重置 / 回执不是合法 JSON / 协议不匹配 / 读不到 `bridge.json`）
+#: —— 这些不是"游戏侧的业务失败"，而是"脑现在没法跟游戏说话"。
+#: NIT-3：`sleep()` 里命中它们统一报 `bridge_down`，与 `longrun` 的 `ended_by` 词表
+#: （`bridge_down`）以及 `bridge.py` 里 `quit_game` 的同一组码对齐；`timeout`/`stale`
+#: **不在此列**（那是"可能要重试"的环境抖动，别混成桥掉线）。
+BRIDGE_DOWN_STATUSES = (
+    "unreachable_bridge", "connection_broken", "bad_response",
+    "bridge_file_missing", "bridge_file_invalid", "schema_mismatch",
+)
+
 #: 睡觉提问的文本线索：只用来把"开着的提问"分类成 sleep/other（**写诊断用**），
 #: 不据此发送、也不据此拒绝任何请求（真值判定只认 `ui.dialogueIsQuestion` + Mod 回执）。
 SLEEP_QUESTION_HINTS = ("sleep", "睡觉", "上床", "就寝", "bed")
+
+#: 床**触发格**的兜底槽位（相对床原点的偏移）：真实触发格在床原点那一行的**下一行**
+#: （`tile_y == tileLocation.Y + 1`），`tile_x == tileLocation.X + bedTileOffset` 而
+#: `bedTileOffset ∈ {0, 1}` 会**逐帧翻转** ⇒ 候选就是 `(x+0, y+1)` 与 `(x+1, y+1)`。
+#: 依据 `docs/_il-bed-interaction.md` §2.2/§2.6。**只是兜底**：桥给了 `furniture[].bedCells`
+#: （用游戏自己的 `doesTileHaveProperty(..., "TouchAction", "Back") == "Sleep"` 现算）时一律优先用它。
+BED_CELL_FALLBACK = ((0, 1), (1, 1))
 
 #: 规划层的任务类型 → 执行层的动作。
 #: `plant_area` 走 `sow`（播种 + 立刻浇这一格），理由见 `FarmWorker.sow` 的 docstring。
@@ -477,10 +495,12 @@ class FarmWorker:
         *,
         seed: str | None = None,
         log: Callable[[str], None] = print,
+        pause: Callable[[float], None] = time.sleep,
     ) -> None:
         self.c = client
         self.seed = seed            # None = 每次播种时按背包里堆叠最多的种子现挑
         self.log = log
+        self.pause = pause          # 可注入的等待函数（单测里换成 no-op，绝不真睡）
         self.steps: list[StepResult] = []      # 全程流水（journal 用）
         self.walk_steps = 0
 
@@ -689,7 +709,12 @@ class FarmWorker:
         try:
             self.c.move_to_location(name, tile=tile, timeout_ms=timeout_ms)
         except BridgeError as exc:
-            r.code, r.reason, r.receipt = "failed", f"去 {name} 失败", _receipt(exc)
+            # task-33：Mod 的现场**原样带出来**（门的"本跳试过的格子 … unreachable"就在这里），
+            # 否则 run3 的日报只写"去 FarmHouse 失败"，看不出是门格判据的锅。
+            why = str(exc)[:300]
+            r.code = "failed"
+            r.reason = f"去 {name} 失败：{why}" if why else f"去 {name} 失败（Mod 没给原因）"
+            r.receipt = _receipt(exc)
             _mark_status(r, _exc_status(exc))       # 环境挡路 / 没结论 ⇒ 不封格
             return r
         obs = self.snap()
@@ -1141,8 +1166,163 @@ class FarmWorker:
                     return (int(xy[0]), int(xy[1]))
         return None
 
+    @staticmethod
+    def bed_cells(obs: dict[str, Any]) -> list[tuple[int, int]]:
+        """床的**睡觉触发格**候选（踩上去游戏才会弹出睡觉提问）；观测里没有床 ⇒ `[]`。
+
+        判据**只认两处**（`docs/_il-bed-interaction.md` §2.2/§2.6）：
+        * 优先 `furniture[].bedCells` —— 桥用游戏自己的
+          `doesTileHaveProperty(x, y, "TouchAction", "Back") == "Sleep"` 现算，权威，
+          且不受 `bedTileOffset` 逐帧翻转影响；
+        * 缺失/空表 ⇒ 退回床原点的两个兜底槽位 `BED_CELL_FALLBACK`（`(x, y+1)` / `(x+1, y+1)`）。
+
+        **绝不硬编码 (9,9)/(10,9)**：换个存档、换张床、甚至同一张床不同帧都可能不是那两格。
+        """
+        cells: list[tuple[int, int]] = []
+
+        def _add(xy: Any) -> bool:
+            if not isinstance(xy, (list, tuple)) or len(xy) < 2:
+                return False
+            try:
+                cell = (int(xy[0]), int(xy[1]))
+            except (TypeError, ValueError):
+                return False
+            if cell in cells:
+                return False
+            cells.append(cell)
+            return True
+
+        for f in FarmWorker.furniture_of(obs):
+            if not f.get("isBed"):
+                continue
+            got = False
+            raw = f.get("bedCells")
+            if isinstance(raw, (list, tuple)):
+                for c in raw:
+                    if _add(c):
+                        got = True
+            if got:
+                continue
+            base = f.get("tile")
+            if not isinstance(base, (list, tuple)) or len(base) < 2:
+                continue
+            try:
+                bx, by = int(base[0]), int(base[1])
+            except (TypeError, ValueError):
+                continue
+            for dx, dy in BED_CELL_FALLBACK:
+                _add((bx + dx, by + dy))
+        return cells
+
+    def _cell_order(self, cells: list[tuple[int, int]], obs: dict[str, Any]) -> list[tuple[int, int]]:
+        """把触发格候选按"离玩家近"排序（不改变集合，只决定先试哪一格）。"""
+        pt = self.player_tile(obs) or (0, 0)
+        return sorted(cells, key=lambda t: abs(t[0] - pt[0]) + abs(t[1] - pt[1]))
+
+    def _walk_off(self, avoid: set[tuple[int, int]], obs: dict[str, Any],
+                  *, timeout_ms: int = 8000) -> tuple[bool, str]:
+        """**先走离床格一步**，再去踩触发格。
+
+        【为什么必须多这一步】游戏只认"**移动中**踩到触发格"：`performTouchAction` 的 `"Sleep"` 分支
+        有一道 `if (!Game1.player.hasMoved) skip`（`Farmer.hasMoved` 只在 `MovePositionImpl` 里置位）。
+        人已经站在触发格上时再 `move_to` 同一格是空操作 ⇒ 提问永远不弹（真机配方：先走 (8,9) 再踩 (10,9)）。
+
+        挑"四邻里不在 `avoid` 内、且观测说能站"的格子（观测没提到的排最后，交给 Mod 自己拒绝）。
+        """
+        pt = self.player_tile(obs)
+        if pt is None:
+            return False, "读不到玩家所在格，没法先走离床格"
+        tiles = self.tiles_of(obs)
+        cands = [t for t in ((pt[0] + dx, pt[1] + dy) for dx, dy in NEIGHBORS) if t not in avoid]
+        if not cands:
+            return False, f"四邻全在床格 {sorted(avoid)} 里，没法「先动过」"
+
+        def rank(t: tuple[int, int]) -> tuple[int, int]:
+            tv = tiles.get(t)
+            if tv is None:
+                return (1, 0)                       # 观测没这一格：让 Mod 自己判
+            return (0 if tv.get("standable") else 2, 0)
+
+        tried: list[str] = []
+        for t in sorted(cands, key=rank):
+            try:
+                self.c.move_to(t[0], t[1], timeout_ms=timeout_ms)
+                self.walk_steps += 1
+                return True, f"已先走离床格一步到 {t}（满足 Farmer.hasMoved 前置）"
+            except BridgeError as exc:
+                tried.append(f"{t}:{_exc_status(exc) or 'failed'}")
+        return False, f"床边没有可站的非床格（试过 {'、'.join(tried)}）"
+
+    def _step_onto(self, cell: tuple[int, int], *, timeout_ms: int = 10000) -> tuple[bool, str]:
+        """踩上睡觉触发格。
+
+        **`ui_modal` 回执是命中信号，不是失败**（task-33 真机定案）：踩中触发格的同一帧，游戏自己把
+        `Go to sleep for the night?` 弹出来 ⇒ 世界被冻结 ⇒ `move_to` 必然以 `ui_modal` 收场。
+        把它当失败重试会永远走不到"应答"那一步。
+        """
+        try:
+            self.c.move_to(cell[0], cell[1], allow_bed=True, timeout_ms=timeout_ms)
+            self.walk_steps += 1
+            return True, f"已踩触发格 {cell}（回执 ok；若提问还没弹，下面会再等一次观测）"
+        except BridgeError as exc:
+            status = _exc_status(exc)
+            if status == "ui_modal":
+                self.walk_steps += 1
+                return True, (f"已踩触发格 {cell}：回执 ui_modal = **命中信号**"
+                              "（睡觉提问被自己弹出来了，世界冻结是预期行为）")
+            return False, f"踩触发格 {cell} 失败：{_receipt(exc)}"
+
+    def _await_question(self, obs: dict[str, Any], *, rounds: int = 4,
+                        step_s: float = 0.3) -> tuple[bool, str, dict[str, Any]]:
+        """踩上触发格之后再等几帧观测：提问是**下一帧**由 `performTouchAction` 弹出来的。
+
+        返回 `(ready, why, obs)`；`rounds=0` 或已 ready 时不等待（单测里 `pause` 是 no-op）。
+        """
+        ready, why = self.sleep_ready(obs)
+        for _ in range(max(0, int(rounds))):
+            if ready:
+                break
+            self.pause(step_s)
+            obs = self.snap()
+            ready, why = self.sleep_ready(obs)
+        return ready, why, obs
+
+    def _dismiss_question(self) -> str:
+        """**兜底关框**：Mod 的 `SleepSkill` 已在同一 tick 关框，这里是它没做到时的最后一道。
+
+        真机定案：答 Yes 之后 `Game1.newDay` 已经置位，日期不动只是因为提问框还挂着
+        ⇒ 关框后 ~3s 当天落地。没有 `dismiss_modal`（旧桥/假件）就如实说明，绝不抛。
+        """
+        fn = getattr(self.c, "dismiss_modal", None)
+        if fn is None:
+            return "桥客户端没有 dismiss_modal（跳过兜底关框）"
+        try:
+            res = fn(timeout_ms=5000)
+        except BridgeError as exc:
+            return f"兜底关框失败：{_receipt(exc)}"
+        except Exception as exc:                     # noqa: BLE001 - 关框失败不能拖垮睡觉
+            return f"兜底关框异常：{type(exc).__name__}: {exc}"
+        if isinstance(res, dict):
+            reason = str(res.get("reason") or "")
+            return f"兜底关框：{reason[:200] if reason else res.get('status') or 'ok'}"
+        return "兜底关框：已发出"
+
+    def _await_day_change(self, day_before: tuple, obs: dict[str, Any], *,
+                          rounds: int = 12, step_s: float = 0.5) -> dict[str, Any]:
+        """关框之后再等日期前进（**绝不重发 sleep**；重发会把已置位的 newDay 流程搅乱）。
+
+        真机 ~3s 落地；这里给 ~6s（`rounds × step_s`）。Mod 的 `sleep` 调用本身已经阻塞等到
+        `Date.TotalDays` 前进或超时，所以这条循环主要是"Mod 回 timeout 但我们刚关完框"的补救。
+        """
+        for _ in range(max(0, int(rounds))):
+            if self.day_key(obs) != day_before:
+                return obs
+            self.pause(step_s)
+            obs = self.snap()
+        return obs
+
     def sleep(self, *, home: str = "FarmHouse", timeout_ms: int = 15000) -> StepResult:
-        """睡觉跨日：回家 → **踩到床格**引出游戏自己的提问 → 确认（提问/在床上）→ `sleep` 应答。
+        """睡觉跨日：回家 → 走到床边 → 先走离床一步 → **踩睡觉触发格** → 提问开才 `sleep` 应答。
 
         【为什么必须由脑主动做】真机发现：世界加载状态下**时间照走**，闲置到 02:00 游戏会
         自动 pass-out 睡觉 —— 那是"没人管"的结果，不是自动化。主动睡觉才是跨日正路，
@@ -1152,69 +1332,122 @@ class FarmWorker:
         * `GameLocation.answerDialogueAction` 是**字面量分派**：只有 `"Sleep_Yes"` 会走到
           `startSleep()`，别的键**静默 no-op**（回执 ok 完全不代表游戏做了事）
           ⇒ 判据只能是观测差分。
-        * 引出提问的正路是让游戏自己 `checkAction(bed)`：**踩到床格**
-          （`move_to(bed, allow_bed=True)`）。旧实现 `stand_next_to(bed)` + `interact(bed)`
-          在真机上**从未**把提问弹出来（run2 全日志 `answerDialogue(` 出现 0 次）。
+        * 引出提问的**唯一**正路是踩到床的 `TouchAction == "Sleep"` **触发格**
+          （`GameLocation.UpdateWhenCurrentLocation → performTouchAction`）。旧实现
+          `stand_next_to(bed)` + `interact(bed)` 已被真机彻底否掉：对 6 个床占位格逐个
+          `interact`（=游戏 `checkAction`）全部返回 False、`dialogueIsQuestion` 恒 false
+          —— 它是**静默 no-op**，不是"差一点"（task-33 施工单第 1 条 / task-31 §2.5）。
+        * 触发格不硬编码：优先桥的 `furniture[].bedCells`，缺失退回 `BED_CELL_FALLBACK`
+          （`(x, y+1)` / `(x+1, y+1)`）；踩中时 `move_to` 回 `ui_modal` 是**命中信号**。
+        * 游戏还要求这一帧"真的移动过"（`Farmer.hasMoved`）⇒ 站在触发格上要先**走离**一步再踩。
         * 判据**不是** `isInBed`（见 `sleep_ready`）；提问没弹出来时 Mod 会**秒级**回
           `sleep_no_question`（携 `lastQuestionKey`/`isInBed`/`activeMenu` 诊断），所以这里
           不再白等 180s（Mod 侧跨日预算也从 120s 收到 15s）。
+        * 答 Yes 之后 **Mod 在同一 tick 关框**（`answerDialogue()` 本身不关框，这是 run2 卡住的真因）；
+          Mod 回 `timeout` 时脑侧再 `dismiss_modal()` 兜底 + 等日期前进，**绝不重发 `sleep`**。
+
+        【NIT-3（deputy-lead 验收）：桥中途沉默不许 traceback 穿出】本函数只做两件事：
+        * 把整段流程交给 `_sleep_impl()`；
+        * 任何 `BridgeError`（以及观测解析之类的意外异常）都转成**有界**的 `StepResult`：
+          `ok=False`、`code=<桥的 status，缺省 "bridge_down">`，reason 带
+          `day_before`/`time_before`/`isInBed`/最后一步；**若异常发生在跨日之后**（观测显示
+          `day_key` 已变）仍按成功返回，reason 注明"跨日已发生，之后桥失败"。
+        这样 run3 里桥掉线也不会以 traceback 结束本轮 —— 日报照旧落盘，证据不断。
         """
         r = StepResult(action="sleep")
+        state: dict[str, Any] = {"day_before": None, "stage": "开始", "diag": []}
+        try:
+            return self._sleep_impl(r, home=home, timeout_ms=timeout_ms, state=state)
+        except BridgeError as exc:
+            return self._sleep_bridge_fail(r, exc, state)
+        except Exception as exc:                   # noqa: BLE001 - 观测解析等意外同样不许穿出
+            return self._sleep_bridge_fail(r, exc, state, fallback_status="bridge_down")
+
+    def _sleep_impl(self, r: StepResult, *, home: str, timeout_ms: int,
+                    state: dict[str, Any]) -> StepResult:
+        """`sleep()` 的主体；异常一律由外层 wrapper 的 `_sleep_bridge_fail()` 收口。"""
         obs = self.snap()
         day_before = self.day_key(obs)
+        state["day_before"] = day_before
+        state["stage"] = "已取到初始观测"
         r.before = self._sleep_probe(obs)
         loc = str((obs.get("location") or {}).get("name") or "")
         if loc != home:
+            state["stage"] = f"去 {home}（ensure_location）"
             mv = self.ensure_location(home, timeout_ms=30000)
             if not mv.ok:
                 r.code, r.reason, r.receipt = "failed", f"回不了 {home}：{mv.reason}", mv.receipt
                 return r
             obs = self.snap()
 
-        # ① 用游戏自己的路径把睡觉提问引出来：**踩到床格**（allow_bed=True 才不会被 Mod 拒绝）
-        diag: list[str] = []
-        bed = self.bed_tile(obs)
+        # ① 用游戏自己的路径把睡觉提问引出来：走到床边 → 先动一步 → 踩触发格。
+        diag = state["diag"]
+        cells = self.bed_cells(obs)
+        if not cells:
+            diag.append("观测里没有 isBed 家具（furniture[].bedCells / tile 都读不到）")
         ready, why = self.sleep_ready(obs)
-        if bed is not None and not ready:
-            try:
-                self.c.move_to(bed[0], bed[1], allow_bed=True, timeout_ms=10000)
-                diag.append(f"已踩床格 {bed}（allow_bed=True，引出游戏自己的 checkAction）")
-            except BridgeError as exc:
-                diag.append(f"踩床格 {bed} 失败：{_receipt(exc)}")
-            obs = self.snap()
-            ready, why = self.sleep_ready(obs)
-        if bed is not None and not ready:
-            # 兜底：站床边 + interact（旧路径，真机没成功过，但便宜、且能给出更明确的原因）
-            if self.stand_next_to(bed):
-                try:
-                    self.c.interact(bed, timeout_ms=8000)
-                    diag.append("兜底 interact(床) 已发出")
-                except BridgeError as exc:
-                    diag.append(f"兜底 interact(床) 失败：{_receipt(exc)}")
+        if cells and not ready:
+            state["stage"] = "床边：先走离一步再踩触发格"
+            avoid = set(cells)
+            if self.player_tile(obs) in avoid:
+                _moved, note = self._walk_off(avoid, obs)
+                diag.append(note)
                 obs = self.snap()
-                ready, why = self.sleep_ready(obs)
-            else:
-                diag.append("床边站不过去")
-        # 判据没满足也**照发一次**：真值判定留给 Mod（它会秒级报 sleep_no_question），
-        # 脑不能凭一个可能过时的快照替游戏决定"睡不了"。
-        why = why if ready else f"{why} —— 仍请求一次，由 Mod 判定"
+            for cell in self._cell_order(cells, obs):
+                _hit, note = self._step_onto(cell)
+                diag.append(note)
+                obs = self.snap()
+                ready, why, obs = self._await_question(obs)
+                if ready:
+                    break
+        if not ready:
+            # 走到床边、踩过触发格仍然没有提问 ⇒ **立即**如实失败（绝不白等）：
+            # 真机上这时再发应答就是静默 no-op；Mod 侧同样会秒级回 sleep_no_question。
+            state["stage"] = "没有引出睡觉提问"
+            r.code = SLEEP_NO_QUESTION
+            r.reason = (f"没有引出睡觉提问 ⇒ 判据说现在睡不了：{why}"
+                        f"；触发格候选 {cells or '—'}"
+                        f"；脑侧现场：{'；'.join(diag) if diag else '—'}"
+                        f"；观测：{self._sleep_probe(obs)}")
+            return r
 
+        state["stage"] = "已引出提问，正在发 sleep 应答"
         try:
             res = self.c.sleep(timeout_ms=timeout_ms)
         except BridgeError as exc:
             raw = str(getattr(exc, "status", "") or "")
-            status = raw or "failed"
+            if not raw or raw == "bridge_down" or raw in BRIDGE_DOWN_STATUSES:
+                # NIT-3：这不是"游戏/Mod 的业务失败"，而是桥本身没了 ⇒ 交给外层统一收口
+                # （有界返回 + "请按桥掉线处理"），不走"兜底关框"这种同样需要桥的补救。
+                raise
+            status = raw
             r.code = status if status in SLEEP_FAIL_CODES else "failed"
             # task-22：睡觉也可能撞上渐黑/模态/没存档（全桥通用码）——按同一口径打标，
             # 免得"任意 skill 的一次瞬时环境抖动"这句话在 sleep 上是假的。
             _mark_status(r, raw)
             r.receipt = _receipt_long(exc)
             r.reason = f"睡觉失败（{status}，脑侧判据：{why}）：{str(exc)[:300]}"
-            if diag:
-                r.reason += f"；脑侧现场：{'；'.join(diag)}"
+            # ② 兜底关框 + 等日期（**不重发 sleep**）：Mod 回 timeout 时，真因多半就是
+            # "答了 Yes、`Game1.newDay` 已置位、但提问框还挂着" ⇒ 关框 ~3s 就能当天落地。
+            diag.append(self._dismiss_question())
+            state["stage"] = "sleep 回失败，正在兜底关框/等日期"
+            obs = self._await_day_change(day_before, self.snap())
+            day_after = self.day_key(obs)
+            r.after = self._sleep_probe(obs)
+            if day_after != day_before:
+                r.ok = True
+                r.code = ""
+                r.env_block = False
+                r.inconclusive = False
+                r.reason = (f"已跨日（Mod 回执={status}，跨日由**关框兜底**促成）："
+                            f"{day_before[1]} {day_before[2]}日 → {day_after[1]} {day_after[2]}日"
+                            f"；脑侧现场：{'；'.join(diag)}")
+                return r
+            r.reason += f"；脑侧现场：{'；'.join(diag)}"
             return r
 
-        obs = self.snap()
+        state["stage"] = "sleep 回执已到，正在等日期前进"
+        obs = self._await_day_change(day_before, self.snap())
         day_after = self.day_key(obs)
         r.after = self._sleep_probe(obs)
         r.receipt = _receipt_of(res)
@@ -1229,6 +1462,49 @@ class FarmWorker:
         r.reason = (f"日期没变（还是 {day_after[1]} {day_after[2]}日，timeOfDay={self.time_of_day(obs)}）"
                     f"；脑侧判据：{why}；脑侧现场：{'；'.join(diag) if diag else '—'}"
                     + (f"；Mod 回执：{r.receipt}" if r.receipt else ""))
+        return r
+
+    def _sleep_bridge_fail(self, r: StepResult, exc: BaseException, state: dict[str, Any],
+                           *, fallback_status: str = "") -> StepResult:
+        """把"睡觉过程中桥失败"收成**有界**的 `StepResult`（NIT-3 / deputy-lead task-33 验收）。
+
+        两条硬规则：
+        1. **绝不抛**：回到调用方时永远是一个 `StepResult`（`ok=False`、`code=<status 或 bridge_down>`），
+           reason 里留下 `day_before`/最后一步/脑侧现场，`after` 里留下 `stage`；
+        2. **不许吞掉"日期真的变了"**：桥是在跨日**之后**才死的 ⇒ 仍按成功返回
+           （判据是观测差分，不是桥还活着）。
+        """
+        status = _exc_status(exc) if isinstance(exc, BridgeError) else ""
+        if status in BRIDGE_DOWN_STATUSES:
+            status = "bridge_down"                 # 桥自己没了 ⇒ 统一码，别让 run3 只看到 connection_broken
+        status = status or fallback_status or "bridge_down"
+        day_before = state.get("day_before")
+        stage = str(state.get("stage") or "未知")
+        diag = "；".join(state.get("diag") or []) or "—"
+        try:
+            obs = self.snap()
+            day_after = self.day_key(obs)
+            if day_before is not None and day_after != day_before:
+                r.ok = True
+                r.code = ""
+                r.env_block = False
+                r.inconclusive = False
+                r.after = {**self._sleep_probe(obs), "stage": stage}
+                r.reason = (f"已跨日（{day_before[1]} {day_before[2]}日 → "
+                            f"{day_after[1]} {day_after[2]}日），之后桥失败：{status}: {str(exc)[:200]}"
+                            f"；最后一步={stage}；脑侧现场：{diag}")
+                return r
+            r.after = {**self._sleep_probe(obs), "stage": stage}
+        except Exception as exc2:                  # noqa: BLE001 - 连观测都拿不到 ⇒ 只能报桥掉线
+            diag = f"{diag}；失败后再观测也失败：{type(exc2).__name__}: {exc2}"
+            r.after = {"day_before": list(day_before) if day_before else None, "stage": stage}
+        r.ok = False
+        r.code = status
+        _mark_status(r, status)                    # 环境类（no_save/ui_modal/world_fading/busy）照旧打标
+        r.receipt = _receipt_long(exc) if isinstance(exc, BridgeError) else ""
+        r.reason = (f"睡觉过程中桥失败：{status}: {str(exc)[:200]}"
+                    f"（跨日未完成，请按桥掉线处理）；最后一步={stage}；脑侧现场：{diag}"
+                    + ("" if isinstance(exc, BridgeError) else f"；异常类型={type(exc).__name__}"))
         return r
 
     # ------------------------------------------------------------- 买种子

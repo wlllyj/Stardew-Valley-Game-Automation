@@ -312,7 +312,11 @@ namespace AgentFarm.Bridge
                     $"目标格 {StepMover.FormatTile(this._targetTile)} 坐标为负数，非法", 0);
 
             if (StepMover.UiBlocked())
-                return this.Fail("ui_modal", "当前有菜单/对话/过场打开，无法移动（请先关闭模态）", 0);
+                return this.Fail("ui_modal",
+                    "当前有菜单/对话/过场打开，无法移动（请先关闭模态）。"
+                    + "⚠ 若这是脑侧刚踩上床的睡觉触发格（`TouchAction=\"Sleep\"`）引出的提问，"
+                    + "它是**命中信号**而不是失败：应答 + 关框（SleepSkill 同一 tick 做）之后世界就恢复",
+                    0);
 
             this._startLocation = StepMover.CurrentLocationName();
             if (string.IsNullOrEmpty(this._startLocation))
@@ -857,30 +861,11 @@ namespace AgentFarm.Bridge
             {
                 string tag = (e == primary) ? "" : "alt_";
 
-                this.AddCandidate(list, loc, maxX, maxY, e.Source, e, tag + "source");
-
-                // ---- 门格走不上去时：走到能站的邻居，再"朝门里推"（2026-10-11 真机发现）----
-                //
-                // 症状：`goto FarmHouse` 报 hop_failed，角色走到门前那格 (64,15) 站定、地点没变；
-                // 真值：门格 = 农舍这栋 Building 的 `getPointForHumanDoor()` = (64,14)，
-                // A* 到 (64,14) 直接无解（那是墙上的门）。而**门的触发在"移动进门的碰撞判定"里**，
-                // 站着不动永远不会触发 ⇒ 必须像玩家一样"往门里挤"。
                 bool sourceStandable = false;
                 try { sourceStandable = StepMover.Standable(loc, e.Source, true, out Furniture _); } catch { }
 
-                // 沿"玩家来的方向"穿过源格：人要撞到门上才会被传送，站上去有时不算。
-                int dx = e.Source.X - playerTile.X;
-                int dy = e.Source.Y - playerTile.Y;
-                if (dx != 0 || dy != 0)
-                {
-                    Point step = (Math.Abs(dx) >= Math.Abs(dy))
-                        ? new Point(Math.Sign(dx), 0)
-                        : new Point(0, Math.Sign(dy));
-                    this.AddCandidate(list, loc, maxX, maxY,
-                        new Point(e.Source.X + step.X, e.Source.Y + step.Y), e, tag + "cross");
-                }
-
-                // 源格四邻：有些门只认"贴着"，站上去反而不行
+                // 源格四邻（按到玩家的曼哈顿距离排序）+ 其中**真的能站**的那些。
+                // 门候选（door_push）与"贴着门挤"两条路都要用这一份，所以先算出来。
                 var neighbors = new List<Point>
                 {
                     new Point(e.Source.X, e.Source.Y - 1),
@@ -895,13 +880,49 @@ namespace AgentFarm.Bridge
                     return ca.CompareTo(cb);
                 });
 
-                bool anyNeighbor = false;
+                var standableNeighbors = new List<Point>();
                 foreach (Point n in neighbors)
                 {
                     bool standable = false;
                     try { standable = StepMover.Standable(loc, n, true, out Furniture _); } catch { standable = false; }
-                    if (!standable) continue;
+                    if (standable) standableNeighbors.Add(n);
+                }
 
+                // ---- 【task-33 真机定案】门边：**先**给"站到可站邻居 + 朝门里推"的候选 ----
+                //
+                // 彩排逐字（`logs/...`，task-31 §3.3）：走 Farm → FarmHouse 时第一个候选就是
+                // `(64,14)(source)=unreachable`，随后 `(65,14)(cross)=unreachable` ——
+                // 每跳预算 8 秒全烧在这些**注定走不上**的候选上，`door_push`（唯一真能把人送进门的
+                // 那一类）排在最后，根本没轮到就 `timeout` 了。
+                //
+                // 真值：warp 的 `Edge.Source` 是**触发区锚点**（`LocationGraph.Edge` 注释已写明
+                // "不等于可站格"），门的触发在"玩家像素矩形撞进触发区"里（`isCollidingWithWarp`），
+                // 站着不动永远不触发 ⇒ 对 `IsDoor` 的边，正确顺序是：
+                // ①站到可站邻居 ②`PushInto = e.Source`（朝门里挤）③之后才轮到"直接走源格"这类兜底。
+                if (e.IsDoor)
+                {
+                    foreach (Point n in standableNeighbors)
+                        this.AddCandidate(list, loc, maxX, maxY, n, e, tag + "door_push", e.Source);
+                }
+
+                this.AddCandidate(list, loc, maxX, maxY, e.Source, e, tag + "source");
+
+                // 沿"玩家来的方向"穿过源格：人要撞到门上才会被传送，站上去有时不算。
+                int dx = e.Source.X - playerTile.X;
+                int dy = e.Source.Y - playerTile.Y;
+                if (dx != 0 || dy != 0)
+                {
+                    Point step = (Math.Abs(dx) >= Math.Abs(dy))
+                        ? new Point(Math.Sign(dx), 0)
+                        : new Point(0, Math.Sign(dy));
+                    this.AddCandidate(list, loc, maxX, maxY,
+                        new Point(e.Source.X + step.X, e.Source.Y + step.Y), e, tag + "cross");
+                }
+
+                // 源格四邻：有些门只认"贴着"，站上去反而不行
+                bool anyNeighbor = false;
+                foreach (Point n in standableNeighbors)
+                {
                     if (this.AddCandidate(list, loc, maxX, maxY, n, e, tag + "neighbor")) anyNeighbor = true;
                     this.AddCandidate(list, loc, maxX, maxY, e.Source, e, tag + "retry");
                 }
@@ -919,20 +940,16 @@ namespace AgentFarm.Bridge
                     }
                 }
 
-                // 门格走不上去（或这条边本来就是"门"）⇒ 走到能站的邻居，然后**朝门里推**。
+                // 门格走不上去 ⇒ 走到能站的邻居，然后**朝门里推**。
                 //
                 // 【为什么门边要无条件加】`StepMover.Standable` 只懂家具/放置物/水面/地形，
                 // **看不懂地图的墙与建筑** —— 农舍的门格 (64,14) 会被它判成"可站"，
                 // 于是只生成"走到门口站定"的候选，而站着永远不会触发门（真机实测两次 hop_failed）。
-                if (e.IsDoor || !sourceStandable)
+                // `IsDoor` 的边已经在上面**最前**加过一遍了，这里只补非门的源格不可站的情况。
+                if (!e.IsDoor && !sourceStandable)
                 {
-                    foreach (Point n in neighbors)
-                    {
-                        bool here = false;
-                        try { here = StepMover.Standable(loc, n, true, out Furniture _); } catch { }
-                        if (!here) continue;
+                    foreach (Point n in standableNeighbors)
                         this.AddCandidate(list, loc, maxX, maxY, n, e, tag + "door_push", e.Source);
-                    }
                 }
             }
 
@@ -1016,6 +1033,13 @@ namespace AgentFarm.Bridge
             string landTxt = primary != null ? StepMover.FormatTile(primary.Landing) : "?";
             string tried = this._attemptText.Count > 0 ? string.Join("；", this._attemptText) : "（没有可用的候选格）";
 
+            // 【task-33】门的源格是**触发区锚点**，不是可站格：报错里必须说清这一点，
+            // 否则读日志的人会以为「这一格走不到」是地图问题（彩排时就是这么被误导的）。
+            string doorNote = (primary != null && primary.IsDoor)
+                ? "；⚠ 这是**门**：warp 源格是触发区锚点、不是可站格（判断「能不能站」的 StepMover 看不懂地图墙与建筑），"
+                  + "正确走法是站到门旁的可站格再朝门里挤（door_push 候选已提到最前）"
+                : "";
+
             string status;
             string reason;
 
@@ -1060,7 +1084,7 @@ namespace AgentFarm.Bridge
 
             this.CloseRunningHop(status, reason);
             return this.Fail(status,
-                reason + $"；本次共走 {this._hops.Count} 跳，当前停在 {this._observedLocation}", elapsed);
+                reason + doorNote + $"；本次共走 {this._hops.Count} 跳，当前停在 {this._observedLocation}", elapsed);
         }
 
         private string JoinTiles(List<Point> tiles)

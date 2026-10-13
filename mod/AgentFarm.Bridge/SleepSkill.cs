@@ -42,8 +42,17 @@ namespace AgentFarm.Bridge
     ///   对 Enter/Space 没有应答语义，会经 `Options.actionButton` 变成 `receiveLeftClick(0,0,true)`＝确认当前项，
     ///   真机事故记录见 ModalDismiss 类注释）。
     ///
-    /// 【成功判据：日期真的前进了】`Game1.Date.TotalDays` 变大。
+    /// 【成功判据：日期真的前进了 + `Game1.newDay` 已归位】`Game1.Date.TotalDays` 变大。
     /// 回执里的说法只是声明；脑必须用 observe 复核（`clock.day` 变了、体力回满）。
+    ///
+    /// 【为什么"答了 Yes"还要**同一 tick 关框**（task-33 真机定案）】
+    /// 真机配方（`logs\probe-bed-close-run1.log`）：踩到床的 `TouchAction="Sleep"` 格 ⇒ 弹出
+    /// `Go to sleep for the night?`；用游戏自己的 `answerDialogue()` 答 Yes 之后，
+    /// `Game1.newDay` **立刻**变 true（跨日已经启动），但日期 180s 都不动 —— 因为
+    /// `answerDialogue()` **只应答、不关框**，而 `newDaySync` 要等提问框收掉才会推进到保存/换天。
+    /// 同一 tick 按游戏自己的顺序关框（`ModalDismiss.CloseDialogueBox`）后 ~3s 当天落地。
+    /// 所以：①应答后立刻关框；②等跨日期间每 tick 检查一次（newDay 置位而框还在 ⇒ 再关，最多
+    /// `CloseBoxMaxTries` 次）；③**关框前绝不重发 `sleep`**（会把已置位的 newDay 流程搅乱）。
     /// 跨日要淡黑 + 存档 + 换天：实测 ~1.8s（task-6 PASS 探针），默认预算 **15 秒**
     /// （旧值 120s：run2 两次失败各白等 180s 才回报）。仍可用 `timeout_ms` 放宽，
     /// 但"没有提问"这条路现在是秒级失败，不会再走到超时。
@@ -63,6 +72,13 @@ namespace AgentFarm.Bridge
         private const int DefaultTimeoutMs = 15000;
         private const int MaxTimeoutMs = 300000;
 
+        /// <summary>
+        /// 等待跨日期间"发现 newDay 已置位但框还挂着"时，最多主动关框几次（幂等，纯兜底；
+        /// 正常路径由 <see cref="FireSleepRequest"/> 在同一 tick 就关掉了）。
+        /// 取 3：关框本身不消耗预算，但真出了别的问题时不该让它无限刷日志。
+        /// </summary>
+        private const int CloseBoxMaxTries = 3;
+
         private readonly WorldObserver _world;
         private readonly IMonitor _monitor;
         private readonly int _timeoutMs;
@@ -74,6 +90,7 @@ namespace AgentFarm.Bridge
         private int _timeBefore = -1;
         private string _trigger = "(未发起)";
         private string _triggerNote = "";
+        private int _closeTries;
 
         public SleepSkill(ExecRequest req, WorldObserver world, IMonitor monitor)
         {
@@ -153,8 +170,13 @@ namespace AgentFarm.Bridge
                         + $"当前地点 {StepMover.CurrentLocationName()} 的 lastQuestionKey="
                         + $"{(string.IsNullOrEmpty(LastQuestionKey()) ? "(空)" : LastQuestionKey())}；"
                         + $"诊断：{this.Diagnose()}。"
-                        + "先让玩家**踩到床格**触发游戏自己的 checkAction(bed)"
-                        + "（脑侧 move_to(allow_bed=true)），等提问弹出来再 sleep",
+                        + "睡觉提问只能由**玩家踩到床的 `TouchAction=\"Sleep\"` 触发格**引出"
+                        + "（`GameLocation.UpdateWhenCurrentLocation → performTouchAction`），"
+                        + "而且要求这一帧真的移动过（`Farmer.hasMoved`）；"
+                        + "`interact(床格)` 在 1.6.15 是静默 no-op。"
+                        + "脑侧做法：现算触发格（`furniture[].bedCells`）→ 先走离床格一步 → "
+                        + "`move_to(触发格, allow_bed=true)`（命中时回执就是 `ui_modal`，那是**命中信号**）→ "
+                        + "等提问弹出来再 sleep",
                         this.Elapsed());
 
                 // 跨 tick：这一 tick 只负责"把睡觉发起出去"，跨日要等淡黑 + 存档 + 换天。
@@ -164,18 +186,39 @@ namespace AgentFarm.Bridge
             // ---------------- 等跨日 ----------------
             int dayNow = SafeTotalDays();
 
+            // 【task-33 真机定案】答 Yes 之后 `Game1.newDay=True` 就已经是既成事实，日期之所以不动
+            // 只是因为**提问框还挂着**（`newDaySync` 等不到保存）。所以每 tick 都检查一次：
+            // 只要 newDay 已置位、而框还在，就按游戏自己的顺序把它关掉（幂等，最多 CloseBoxMaxTries 次）。
+            if (SafeNewDay() && this._closeTries < CloseBoxMaxTries)
+            {
+                this._closeTries++;
+                string closeNote = CloseActiveQuestionBox(
+                    "等待跨日时 newDay 已置位但日期不动");
+                this._monitor?.Log($"sleep：关框第 {this._closeTries} 次（{closeNote}）");
+            }
+
             if (this._dayBefore >= 0 && dayNow > this._dayBefore)
-                return this.Ok(this.Elapsed());
+            {
+                // 日期前进 ⇒ 跨日已发生。但**还要等 newDay 归位**（存档/换天收尾），
+                // 否则脑侧立刻接着干活会撞上还在切场景的世界。
+                if (!SafeNewDay())
+                    return this.Ok(this.Elapsed());
+            }
 
             long elapsed = this.Elapsed();
             if (elapsed > this._timeoutMs)
             {
+                bool newDayStill = SafeNewDay();
                 return this.Fail("timeout",
                     $"已发起睡觉（{this._trigger}）但 {elapsed}ms 内日期没有前进"
                     + $"（发起时第 {this._dayBefore} 天，现在第 {dayNow} 天）"
                     + $"；当前诊断：{this.Diagnose()}"
                     + $"（默认预算 {DefaultTimeoutMs}ms；确认真跨日需要更久时可放宽 timeout_ms）"
-                    + "。可能原因：睡觉提问没被应答 / 跨日流程被打断 / 世界被模态挡住；"
+                    + (newDayStill
+                        ? "。⚠ `Game1.newDay` 仍是 true ⇒ **跨日流程已经启动、只是没收尾**："
+                          + "真机上这一般是睡觉提问框没被关掉（`answerDialogue()` 只应答不关框），"
+                          + "脑侧可用 `dismiss_modal` 兜底关框后再 observe 看日期；"
+                        : "。可能原因：睡觉提问没被应答 / 跨日流程被打断 / 世界被模态挡住；")
                     + "需要外部恢复（脑可先 dismiss_modal 再看，或重启游戏）",
                     elapsed);
             }
@@ -271,12 +314,39 @@ namespace AgentFarm.Bridge
                 Response chosen = responses[index];
                 chosenText = chosen?.responseText ?? chosen?.responseKey ?? "";
                 note = ModalDismiss.AnswerWith(chosen);
+
+                // 【task-33 真机定案：答了 Yes 必须**同一 tick**关框】
+                // `answerDialogue()` 只应答、不关框 ⇒ `Game1.newDay` 已经是 true，但提问框一直挂着，
+                // `newDaySync` 等不到保存/换天 ⇒ 日期 180s 不动（真机 `probe-bed-close-run1.log`）。
+                // 按游戏自己的顺序关掉（`closeDialogue()` → 仍在才 `exitThisMenu()`），~3s 当天落地。
+                note += "；关框：" + ModalDismiss.CloseDialogueBox(box);
                 return true;
             }
             catch (Exception ex)
             {
                 note = "读对话选项异常：" + ex.GetType().Name + ": " + ex.Message;
                 return false;
+            }
+        }
+
+        /// <summary>
+        /// 把当前开着的对话框按游戏自己的顺序关掉（没有框 ⇒ 返回一句说明，不报错）。
+        ///
+        /// 【用途】等待跨日期间的兜底：`Game1.newDay` 已经置位、日期却不动 ⇒ 通常是提问框没关掉。
+        /// 只走 <see cref="ModalDismiss.CloseDialogueBox"/> 那一份顺序，绝不自己拼关闭逻辑。
+        /// 异常一律吞掉并写进返回值：关框失败不能让技能崩，脑侧还有 `dismiss_modal` 兜底。
+        /// </summary>
+        private static string CloseActiveQuestionBox(string why)
+        {
+            try
+            {
+                DialogueBox box = Game1.activeClickableMenu as DialogueBox;
+                if (box == null) return "当前没有对话框（不用关）";
+                return $"（{why}）" + ModalDismiss.CloseDialogueBox(box);
+            }
+            catch (Exception ex)
+            {
+                return "关框异常：" + ex.GetType().Name + ": " + ex.Message;
             }
         }
 
@@ -370,6 +440,15 @@ namespace AgentFarm.Bridge
         private static int SafeTimeOfDay()
         {
             try { return Game1.timeOfDay; } catch { return -1; }
+        }
+
+        /// <summary>
+        /// `Game1.newDay`（跨日流程是否还在跑）。读不到按 **false** 处理：宁可早报成功让脑侧
+        /// observe 复核，也不要因为反射失败把已经跨完日的技能拖到超时。
+        /// </summary>
+        private static bool SafeNewDay()
+        {
+            try { return Game1.newDay; } catch { return false; }
         }
 
         private string Diagnose()

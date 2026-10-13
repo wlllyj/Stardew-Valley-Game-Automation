@@ -735,10 +735,51 @@ namespace AgentFarm.Bridge
                 try { item.Type = f.GetType().Name; } catch { item.Type = null; }
                 item.Name = SafeFurnitureName(f);
 
+                // 只有床才去算睡觉触发格（其余家具保持 null，别让脑侧误以为"可以上床"）。
+                if (item.IsBed) item.BedCells = ReadBedCells(loc, item.Tile);
+
                 list.Add(item);
             }
 
             return list.ToArray();
+        }
+
+        /// <summary>
+        /// 床的**睡觉触发格**：用**游戏自己的** `doesTileHaveProperty(x, y, "TouchAction", "Back", false) == "Sleep"`
+        /// 在床原点那一行的下一行上现算（依据 `docs/_il-bed-interaction.md` §2.2/§2.6：
+        /// `tile_y == tileLocation.Y + 1`，`tile_x == tileLocation.X + bedTileOffset`，
+        /// `bedTileOffset ∈ {0,1}` 且**逐帧可能翻转** —— 所以这里把两个槽位都查一遍，谁命中给谁）。
+        ///
+        /// 【为什么必须由桥算，而不是让脑侧猜】真机实证：踩床原点 (9,8) 什么都不会发生、
+        /// `interact(床)` 是静默 no-op；唯一入口是 `TouchAction == "Sleep"` 那格（本存档 (10,9)）。
+        /// 硬编码坐标换个存档就错，而 `bedTileOffset` 又随时可能变 ⇒ 只有这条现算的路是对的。
+        ///
+        /// 一个都没命中（地图没打这个属性 / API 读不到）⇒ 退回两个上下文槽位
+        /// `[[x, y+1], [x+1, y+1]]`：脑侧照样会逐个试，试不到就如实报 `sleep_no_question`。
+        /// </summary>
+        private static int[][] ReadBedCells(GameLocation loc, int[] tile)
+        {
+            if (loc == null || tile == null || tile.Length < 2) return null;
+
+            var hits = new List<int[]>();
+            try
+            {
+                for (int dx = 0; dx <= 1; dx++)
+                {
+                    int x = tile[0] + dx;
+                    int y = tile[1] + 1;
+                    string touch = null;
+                    try { touch = loc.doesTileHaveProperty(x, y, "TouchAction", "Back", false); } catch { }
+                    if (!string.IsNullOrEmpty(touch)
+                        && string.Equals(touch.Trim(), "Sleep", StringComparison.OrdinalIgnoreCase))
+                        hits.Add(new[] { x, y });
+                }
+            }
+            catch { }
+
+            if (hits.Count > 0) return hits.ToArray();
+
+            return new[] { new[] { tile[0], tile[1] + 1 }, new[] { tile[0] + 1, tile[1] + 1 } };
         }
 
         /// <summary>

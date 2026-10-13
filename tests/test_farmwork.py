@@ -52,20 +52,37 @@ class MiniWorld:
         #: 这一格固定回哪个失败状态码（`tool_ineffective` / `no_save` / …）；给 list 则按顺序发。
         self.fail_status: dict[tuple[int, int], str | list[str]] = {}
         self.counts: dict[tuple[int, int], int] = {}                # 每格被挥了几次
-        # ---- 睡觉（task-8）：床、提问、跨日 ----
+        # ---- 睡觉（task-8 / task-33）：床、**触发格**、提问、跨日 ----
         self.location_name = "FarmHouse"      # 默认已在卧室 ⇒ 省掉 ensure_location 那段
-        self.bed = (62, 13)
+        self.bed = (62, 13)                   # 床**原点**（踩它什么都不会发生，真机定案）
+        #: 睡觉**触发格**（`TouchAction == "Sleep"`）：踩中才会弹出提问。
+        #: 默认给两格候选，对应桥的 `furniture[].bedCells`（task-33 起观测里有这一项）。
+        self.bed_cells = [(62, 14), (63, 14)]
+        #: 关掉提问框之后日期会不会跟着前进（真机定案：会，~3s；置 False 用来测"仍不动"）。
+        self.dismiss_finishes_day = True
+        self.dismiss_calls = 0
+        self.dismiss_errors: list[str] = []   # 每次 dismiss_modal 的说明（单测直接看）
         self.day = 9
         self.tod = 1300
         self.in_bed = False
         self.question: str | None = None       # None / "sleep" / "other"
-        #: 踩床格（`allow_bed=True`）能不能引出游戏自己的提问 —— 真机 run2 就是**没引出来**。
+        #: 踩**触发格**（`allow_bed=True`）能不能引出游戏自己的提问 —— 真机 run2 就是**没引出来**。
         self.step_opens_question = True
         #: Mod `SleepSkill.Step()` 的离线替身：cross / no_day / no_question / timeout
         self.sleep_mode = "cross"
         self.moves: list[dict] = []            # 每一次 move_to（含 allow_bed）
         self.sleep_calls: list[int | None] = []
         self.interacts = 0
+        #: 非空 ⇒ `move_to_location` 照这个 reason 抛 `unreachable`（造"门走不通"的现场）。
+        self.move_to_location_fail = ""
+        # ---- NIT-3：桥**中途沉默**（睡觉过程中掉线）----
+        #: 非空 ⇒ 让 `observe` 抛 `BridgeError(status=observe_fail_status)`。
+        self.observe_fail_status = ""
+        #: "mid" = 第 2 次观察起每次都抛（踩床途中桥死）；"after_sleep" = `sleep` 回执后的
+        #: 第一次观察抛一次（跨日已发生、之后桥死）。
+        self.observe_fail_mode = ""
+        self.observe_calls = 0
+        self.observe_failed_once = False
 
     # ---- 观测 ----
     def obs(self) -> dict:
@@ -85,6 +102,7 @@ class MiniWorld:
                          "tillable": [list(t) for t in sorted(self.tillable)],
                          "refillTiles": [],
                          "furniture": [{"tile": list(self.bed), "isBed": True,
+                                        "bedCells": [list(c) for c in self.bed_cells],
                                         "name": "Bed", "furnitureType": "bed"}]},
             # `ui` 块（v3 起才有）：睡觉判据看的就是它（`dialogueIsQuestion`）。
             "ui": {"activeMenu": ("DialogueBox" if self.question else None),
@@ -122,6 +140,9 @@ class MiniWorld:
                 status="timeout")
         if self.sleep_mode == "no_day":
             return                      # 回执 ok，但日期不动 ⇒ 脑必须记 failed
+        if self.sleep_mode == "bridge_down":
+            # 桥在"发 sleep"这一步就没了（NIT-3）：异常要变成有界返回，不许穿出 sleep()。
+            raise BridgeError("sleep 请求发不出去：桥连接中断", status="connection_broken")
         if self.in_bed or self.question == "sleep":
             self.day += 1
             self.tod = 600
@@ -181,19 +202,58 @@ class MiniBridge:
         self.w = world
 
     def observe(self, detail: str = "summary", *, timeout=None):
-        return self.w.obs()
+        w = self.w
+        w.observe_calls += 1
+        if w.observe_fail_status:
+            if w.observe_fail_mode == "mid" and w.observe_calls >= 2:
+                raise BridgeError("observe 失败：桥连接中断（模拟踩床途中掉线）",
+                                  status=w.observe_fail_status)
+            if (w.observe_fail_mode == "after_sleep" and w.sleep_calls
+                    and not w.observe_failed_once):
+                w.observe_failed_once = True
+                raise BridgeError("observe 失败：桥连接中断（模拟跨日之后掉线）",
+                                  status=w.observe_fail_status)
+        return w.obs()
 
     def move_to(self, x, y, *, timeout_ms=None, based_on_seq=None, allow_bed=False):
         self.w.moves.append({"tile": [int(x), int(y)], "allow_bed": bool(allow_bed)})
-        self.w.player_tile = [int(x), int(y)]
-        # 踩到床格 ⇒ 游戏自己的 `checkAction(bed)` 会弹出睡觉提问（`allow_bed=False` 时 Mod 直接拒绝）。
-        if allow_bed and (int(x), int(y)) == self.w.bed and self.w.step_opens_question:
+        tile = (int(x), int(y))
+        # 踩睡觉**触发格** ⇒ 游戏自己的 `performTouchAction("Sleep")` 弹出提问；真机回执是
+        # `ui_modal`（`MoveToLocationSkill.Begin()` 的模态闸门先命中）—— 这是**命中信号**不是失败
+        # （task-33 施工单第 2 条 / task-37 真机复核）。
+        if allow_bed and self.w.step_opens_question and tile in self.w.bed_cells:
+            self.w.player_tile = [int(x), int(y)]
             self.w.in_bed = True
             self.w.question = "sleep"
+            raise BridgeError(
+                "移动过程中被菜单/对话/过场打断，已停止移动"
+                f"（当前 DialogueBox，目标 {x},{y}）", status="ui_modal")
+        # 床**原点**格：真机踩它什么都不会发生（静默 no-op），不许当触发格。
+        self.w.player_tile = [int(x), int(y)]
         return {"ok": True, "status": "ok"}
+
+    def dismiss_modal(self, *, timeout_ms=None):
+        """`dismiss_modal`：关掉挂着的提问框。真机定案：关框 ~3s 内当天落地。"""
+        self.w.dismiss_calls += 1
+        note = "已关掉提问框"
+        if self.w.question is not None:
+            self.w.question = None
+            self.w.in_bed = False
+            if self.w.dismiss_finishes_day:
+                self.w.day += 1
+                self.w.tod = 600
+                note += f"；关框后当天落地（第 {self.w.day} 天）"
+            else:
+                note += "；关框后日期仍没动"
+        else:
+            note += "（当时没有提问框）"
+        self.w.dismiss_errors.append(note)
+        return {"ok": True, "status": "ok", "reason": note}
 
     def move_to_location(self, location, *, tile=None, timeout_ms=None, based_on_seq=None,
                          allow_bed=False):
+        if self.w.move_to_location_fail:
+            raise BridgeError(self.w.move_to_location_fail, status="unreachable")
         self.w.location_name = str(location)
         return {"ok": True, "status": "ok"}
 
@@ -233,7 +293,9 @@ INV_WITH_SCYTHE = [
 
 
 def make_worker(world: MiniWorld) -> FarmWorker:
-    return FarmWorker(MiniBridge(world), log=lambda _s: None)
+    # `pause` 注入 no-op：`_await_question`/`_await_day_change` 的等待轮询绝不能真睡（否则每条
+    # 睡觉用例白等好几秒）。
+    return FarmWorker(MiniBridge(world), log=lambda _s: None, pause=lambda _s: None)
 
 
 def grass_rec(tile=(60, 10)) -> dict:
@@ -649,10 +711,12 @@ class TestWorkContext(unittest.TestCase):
 
 
 class TestSleepCrossDay(unittest.TestCase):
-    """task-8：睡觉走"踩床引出游戏自己的提问"，失败要快、要把 Mod 回执原文带出来。
+    """task-8 + task-33：睡觉走"先走离床一步 → 踩**触发格** → 游戏自己弹提问 → 应答"。
 
-    真机 run2 的教训：`interact(bed)` 从来没把提问弹出来（全日志 `answerDialogue(` 0 次），
-    Mod 却照样白等 180s ⇒ 日期一天没跨。所以这里的断言全是"上床方式 / 失败多快 / 现场留没留"。
+    真机 run2 的教训：`interact(bed)`/踩床**原点**从来没把提问弹出来（全日志 `answerDialogue(` 0 次），
+    Mod 却照样白等 180s ⇒ 日期一天没跨。task-33 的真机配方（`docs/_il-bed-interaction.md`）：
+    触发格是 `TouchAction == "Sleep"` 的那格（本存档 (9,9)/(10,9)，**绝不是床原点 (9,8)**），
+    踩中时 `move_to` 回 `ui_modal` = **命中信号**；答 Yes 后提问框不关就永远不落地。
     """
 
     def test_steps_onto_bed_then_crosses_day(self):
@@ -660,14 +724,20 @@ class TestSleepCrossDay(unittest.TestCase):
         r = make_worker(w).sleep()
         self.assertTrue(r.ok, r.reason)
         self.assertEqual(w.day, 10)
-        # 必须先**踩到床格**（allow_bed=True）—— 那是唯一能引出游戏自己 checkAction(bed) 的路。
-        self.assertTrue(any(m["allow_bed"] and tuple(m["tile"]) == w.bed for m in w.moves), w.moves)
+        # ① 先**走离**床格一步（游戏只认"移动中"踩到触发格：`Farmer.hasMoved` 前置）。
+        off = [m for m in w.moves if not m["allow_bed"]]
+        self.assertTrue(off, w.moves)
+        self.assertNotIn(tuple(off[0]["tile"]), w.bed_cells, w.moves)
+        # ② 再踩**触发格**（allow_bed=True 是必须的：桥把床判为 blocking）。
+        self.assertTrue(any(m["allow_bed"] and tuple(m["tile"]) in w.bed_cells for m in w.moves), w.moves)
+        # ③ 踩中的回执是 `ui_modal` ⇒ 命中信号，不许当失败。
+        self.assertIn("命中信号", r.reason)
+        self.assertIn("触发格", r.reason)
         self.assertEqual(w.sleep_calls, [15000])          # 预算已从 180s 收到 15s
         self.assertEqual(r.before["isInBed"], False)
         self.assertEqual(r.before["question"], "none")
         self.assertEqual(r.after["day"][2], 10)
         self.assertIn("已跨日", r.reason)
-        self.assertIn("踩床格", r.reason)                  # 走了哪条路要能一眼看出来
 
     def test_travels_home_before_stepping_on_bed(self):
         w = MiniWorld()
@@ -677,30 +747,48 @@ class TestSleepCrossDay(unittest.TestCase):
         self.assertEqual(w.location_name, "FarmHouse")
         self.assertEqual(w.day, 10)
 
-    def test_no_question_fails_fast_with_mod_现场(self):
-        """没引出提问 ⇒ Mod 秒级 `sleep_no_question`，而且现场（lastQuestionKey/isInBed）要带出来。"""
+    def test_no_question_fails_fast_without_asking_mod(self):
+        """踩了触发格仍然没提问 ⇒ 脑侧**立即**判 `sleep_no_question`，连 `sleep` 请求都不发。
+
+        真机 run2 的 180s 就白等在这种情形上（Mod 侧另有 15s 上限；这里只管"别白等、别盲发"）。
+        """
         w = MiniWorld()
-        w.step_opens_question = False          # 踩床也没弹出提问（真机 run2 的实情）
-        w.sleep_mode = "no_question"
+        w.step_opens_question = False          # 踩了触发格也没弹出提问（真机 run2 的实情）
         r = make_worker(w).sleep()
         self.assertFalse(r.ok)
-        self.assertEqual(r.code, "sleep_no_question")     # Mod 的 status 原样透传，不许折成 failed
-        self.assertEqual(r.receipt.split(":")[0], "sleep_no_question")
-        for probe in ("lastQuestionKey", "isInBed", "activeClickableMenu"):
-            self.assertIn(probe, r.reason)
-        self.assertEqual(w.sleep_calls[-1], 15000)        # 请求预算 ≤15s：不许再白等 3 分钟
-        self.assertEqual(w.interacts, 1)                  # 兜底 interact(床) 发过（旧路径）
+        self.assertEqual(r.code, "sleep_no_question")     # 与 Mod 的码同名，调用方一处判据
+        self.assertFalse(r.receipt)                       # 没发请求 ⇒ 没有 Mod 回执
+        self.assertEqual(w.sleep_calls, [])               # **绝不盲发**（IL 上是静默 no-op）
+        self.assertEqual(w.interacts, 0)                  # 旧的 interact(床) 兜底已删除
+        self.assertIn("触发格候选", r.reason)
         self.assertIn("脑侧现场", r.reason)
         self.assertFalse(r.proven_inert)
 
-    def test_timeout_keeps_mod_diagnosis(self):
+    def test_timeout_then_dismiss_rescues_the_day(self):
+        """Mod 回 timeout（答了 Yes、`newDay` 已置位、框还挂着）⇒ 脑侧 `dismiss_modal` 兜底**促成**跨日。
+
+        真机定案（`logs/probe-bed-close-run1.log`）：关框 ~3s 当天落地 ⇒ 不许把这种情形记成失败。
+        """
         w = MiniWorld()
         w.sleep_mode = "timeout"
+        r = make_worker(w).sleep()
+        self.assertTrue(r.ok, r.reason)
+        self.assertEqual(w.dismiss_calls, 1)
+        self.assertEqual(w.day, 10)
+        self.assertIn("关框兜底", r.reason)
+        self.assertEqual(r.code, "")
+
+    def test_timeout_without_day_change_stays_timeout(self):
+        """关框也没救回来 ⇒ 如实 `timeout`，且 Mod 的 `Diagnose()` 原文要留在 reason 里。"""
+        w = MiniWorld()
+        w.sleep_mode = "timeout"
+        w.dismiss_finishes_day = False
         r = make_worker(w).sleep()
         self.assertFalse(r.ok)
         self.assertEqual(r.code, "timeout")
         self.assertIn("newDaySync", r.reason)             # Diagnose() 的原文进 reason
         self.assertTrue(r.receipt)
+        self.assertEqual(w.dismiss_calls, 1)
 
     def test_ok_receipt_without_day_change_is_failed(self):
         """回执说成了但日期没动 ⇒ 必须 failed：判据只认观测差分（IL 定案：回执只是声明）。"""
@@ -721,6 +809,85 @@ class TestSleepCrossDay(unittest.TestCase):
         self.assertTrue(r.ok, r.reason)
         self.assertEqual(w.moves, [])
         self.assertEqual(r.before["isInBed"], True)
+
+    # ---- 触发格从哪来（task-33 第 5 条：不许硬编码 (9,9)/(10,9)）----
+
+    def test_bed_cells_prefer_bridge_over_fallback(self):
+        """桥报的 `furniture[].bedCells` 是权威（它用游戏自己的 `doesTileHaveProperty` 现算）。"""
+        w = MiniWorld()
+        w.bed_cells = [(62, 14)]                 # 只有一格是真的（另一格这一帧不是触发格）
+        self.assertEqual(FarmWorker.bed_cells(w.obs()), [(62, 14)])
+
+    def test_bed_cells_fall_back_to_two_slots_when_bridge_silent(self):
+        """旧 Mod / 桥没报 `bedCells` ⇒ 退回床原点的两个兜底槽位（`(x,y+1)`/`(x+1,y+1)`）。"""
+        from agentfarm.farmwork import BED_CELL_FALLBACK
+        w = MiniWorld()
+        obs = w.obs()
+        obs["location"]["furniture"][0].pop("bedCells")
+        self.assertEqual(FarmWorker.bed_cells(obs), [(62 + dx, 13 + dy) for dx, dy in BED_CELL_FALLBACK])
+
+    def test_bed_found_from_furniture_even_when_absent_from_tiles(self):
+        """床格常常**不在** `location.tiles[]` 里（不可站/不可动就不上报）⇒ 判据必须只看 furniture。"""
+        w = MiniWorld()                          # records 默认空
+        self.assertNotIn((62, 13), [tuple(r["tile"]) for r in w.records])   # tiles 里没有床
+        self.assertEqual(FarmWorker.bed_cells(w.obs()), [(62, 14), (63, 14)])
+
+    def test_door_failure_receipt_is_reported_verbatim(self):
+        """门走不通时（`Edge.Source` 是触发锚点、不是可站格）Mod 的现场要**原样**上报，不许吞。
+
+        ⚠ C# 侧"门旁可站格优先"（`MoveToLocationSkill.BuildCandidates`）没法用 Python 单测钉住，
+        这里只钉住脑侧不吞回执：真机配方见 task-33 第 4 条。
+        """
+        door_note = ("第 1 跳失败（timeout）：走向 Farm → FarmHouse 的 warp 源格 (64,14) 超时；"
+                     "本跳试过的格子：(64,14)(source)=unreachable、(65,14)(cross)=unreachable")
+        w = MiniWorld()
+        w.location_name = "Farm"
+        w.move_to_location_fail = door_note
+        r = make_worker(w).sleep()
+        self.assertFalse(r.ok)
+        self.assertIn("(64,14)", r.reason)
+        self.assertIn("(65,14)", r.reason)
+        self.assertEqual(w.sleep_calls, [])      # 人到不了床边 ⇒ 不发 sleep
+
+    # ---- NIT-3：桥中途沉默 ⇒ 有界返回，不许 traceback 穿出（deputy-lead task-33 验收）----
+
+    def test_bridge_down_mid_bed_step_returns_bounded_result(self):
+        """NIT-3①：**踩床途中**桥死 ⇒ 不抛异常，`ok=False` + `code="bridge_down"` + 最后一步。"""
+        w = MiniWorld()
+        w.observe_fail_status = "bridge_down"
+        w.observe_fail_mode = "mid"              # 第 1 次观察（初始 snap）成功，之后每次抛
+        r = make_worker(w).sleep()               # ← 会抛的话这条用例直接 ERROR
+        self.assertFalse(r.ok)
+        self.assertEqual(r.code, "bridge_down")
+        self.assertIn("睡觉过程中桥失败", r.reason)
+        self.assertIn("跨日未完成，请按桥掉线处理", r.reason)
+        self.assertIn("最后一步=", r.reason)
+        self.assertIn("先走离一步再踩触发格", r.reason)     # 现场说明"死在哪一步"
+        self.assertEqual(w.day, 9)                        # 确实没跨日
+        self.assertNotEqual(r.after.get("stage"), None)
+
+    def test_bridge_down_after_day_change_still_counts_as_crossed(self):
+        """NIT-3②：跨日**已经发生**之后桥才死 ⇒ 仍按成功返回（判据是观测差分，不看桥活着）。"""
+        w = MiniWorld()
+        w.observe_fail_status = "bridge_down"
+        w.observe_fail_mode = "after_sleep"      # sleep 回执之后那次观察抛，且只抛一次
+        r = make_worker(w).sleep()
+        self.assertTrue(r.ok, r.reason)
+        self.assertEqual(w.day, 10)
+        self.assertIn("已跨日", r.reason)
+        self.assertIn("之后桥失败", r.reason)
+        self.assertEqual(r.code, "")
+
+    def test_sleep_call_bridge_down_is_bounded_and_normalized(self):
+        """NIT-3③：桥自己的码（`connection_broken`）也要折成 `bridge_down`，且不走"兜底关框"。"""
+        w = MiniWorld()
+        w.sleep_mode = "bridge_down"             # MiniWorld.do_sleep 抛 status="connection_broken"
+        r = make_worker(w).sleep()
+        self.assertFalse(r.ok)
+        self.assertEqual(r.code, "bridge_down")
+        self.assertIn("睡觉过程中桥失败", r.reason)
+        self.assertEqual(w.dismiss_calls, 0)     # 桥都死了 ⇒ 不做需要桥的补救
+        self.assertEqual(w.day, 9)
 
 
 if __name__ == "__main__":  # pragma: no cover

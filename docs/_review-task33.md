@@ -112,6 +112,49 @@
 | INFO-2 | `SleepSkill.cs:449 SafeNewDay()` | 读不到 `Game1.newDay` 按 `false`（=宁可早报成功） | 已有 docstring 说明，脑侧用观测差分复核 | 否 |
 | INFO-3 | `WorldSnapshot.cs:760` | `bedCells` 是**候选集合**而非唯一真值（`bedTileOffset` 逐帧翻转） | 设计如此；脑侧 `_cell_order` 逐个试 | 否 |
 
+### §8.1 NIT-3 delta 复核（2026-10-13 晚，dev-coder 修 `snap()` 穿出之后）
+
+对象：`brain/agentfarm/farmwork.py` = `6957707d03c391ad992a56b61d62d68f51901d40e511ac24db96e5111340b93e`、
+`tests/test_farmwork.py` = `f5088bc6e7fc04b1633391c179d00214e21543bf35fbde036533da0ab9c9b9cc`（与 dev-coder 自报逐字一致）。
+
+**① 读数**：`py_compile` exit 0；全量 **`Ran 309 tests / OK`**（306 + 3 条新用例）；6 个 Mod 文件哈希与上一轮**逐字一致**（⇒ 未重跑 `dotnet build`，二进制输入未变）；仍只有那 8 个文件在制（`git diff --stat HEAD` = 755/120）。
+
+**② wrapper 拆分与词表对照（逐行核）**
+
+| 位置 | 词表 | 含 `timeout`? |
+|---|---|---|
+| `brain/agentfarm/farmwork.py:119-122 BRIDGE_DOWN_STATUSES` | `unreachable_bridge`/`connection_broken`/`bad_response`/`bridge_file_missing`/`bridge_file_invalid`/`schema_mismatch` | **否** |
+| `brain/agentfarm/longrun.py:1724-1729` | **catch-all**：`_snap()` 抛**任何** `BridgeError` ⇒ `ended_by="bridge_down"` | 是（连 `no_save` 也算） |
+| `brain/agentfarm/bridge.py:816`（`quit_game` 折叠"回执收不到"） | `connection_broken`/`bad_response`/`unreachable_bridge`/`timeout` | 是 |
+
+⇒ 三处**不同构**。对 sleep 这条路径，新代码行为正确：`_sleep_impl:1419` 只在 `not raw`（空 status）/`raw=="bridge_down"`/`raw in BRIDGE_DOWN_STATUSES` 时 `raise`，**`timeout`/`stale` 不在其中且非空 ⇒ 不 re-raise**，继续走原"打标 + `dismiss_modal` 兜底关框 + 等日期"。
+探针 `scratch/_d33_stale_probe.py`（把 `MiniWorld.do_sleep` 换成抛指定 status 的 `BridgeError`，共 12 态）：
+
+| status | 异常穿出? | 走哪条路 | `dismiss_calls` | `code` |
+|---|---|---|---|---|
+| `timeout`/`stale`/`no_save`/`ui_modal`/`world_fading`/`busy`/`error` | 否 | 原逻辑兜底 | 1 | `""`（当天被兜底关框救回 ⇒ `ok=True`；探针预置了开着的提问，属假世界行为，不是产品结论） |
+| `connection_broken`/`unreachable_bridge`/`bad_response`/`schema_mismatch` | 否 | bridge-fail | 0（不做需要桥的补救） | `bridge_down` |
+| 空 status（生产不可达：`bridge.py` 每个 `raise` 都带 status） | 否 | bridge-fail | 0 | `error` + `inconclusive=True`（`_exc_status:454-460` 明确把"没 status"归 inconclusive） |
+
+**③ 三条新用例能证伪（变异实验，`scratch/_t33_mutate.py` 新增 m4–m7，只在副本注入）**
+
+| 变异 | 注入点 | 结果 |
+|---|---|---|
+| `m4_bridgedown_not_success`（跨日也不算成功） | `_sleep_bridge_fail:1487` 条件置假 | ✅ 红：`test_bridge_down_after_day_change_still_counts_as_crossed` |
+| `m5_no_normalize`（桥码不折成 `bridge_down`） | `:1478-1479` | ✅ 红：`test_sleep_call_bridge_down_is_bounded_and_normalized`（`connection_broken` 原样漏出） |
+| `m6_no_wrapper`（去掉外层收口 = NIT-3 的病本身） | `sleep():1361-1364` 改成 `raise` | ✅ 三条全红（ERROR：异常穿出） |
+| `m7_fake_success`（连观测都拿不到时假装成功） | `:1498-1500` 改成 `ok=True; return` | ✅ 红：`test_bridge_down_mid_bed_step_returns_bounded_result` |
+| 对照（未注入） | — | `Ran 3 / OK`；变异后生产哈希不变 |
+
+⚠ 诚实记录：`m5` 只让**第三条**用例变红 —— 第一条的假桥抛的 status 字面就是 `"bridge_down"`（`tests/test_farmwork.py:857`），归一与否都得到同一码 ⇒ 它钉的是"不许穿出"，归一由第三条钉。任务书"另两条必须红"与实际不完全一致，非缺陷。
+
+**④ 边界检查**：`_sleep_bridge_fail` 全方法**只有 1 次** `self.snap()`（`:1485`，无 `while`/`for`）⇒ 不是重试风暴；`day_before is None` 或 `day_after == day_before` ⇒ 一律 `ok=False` 如实失败（`m7` 证明被用例钉住）；`day_after` 取不到时 `after = {"day_before": …, "stage": …}` 仍带现场；`receipt = _receipt_long(exc)`（非 BridgeError 为空并在 reason 补 `异常类型=`）；reason 三段齐全（`status` + `跨日未完成，请按桥掉线处理` + `最后一步=<stage>` + `脑侧现场=<diag>`）。
+
+**⑤ delta 判定：`DELTA-PASS-WITH-NITS`（无必修项）** —— NIT-3 已按验收要求收口：桥中途沉默 ⇒ 有界 `StepResult`、不穿出、桥自身码归一成 `bridge_down`、跨日已发生仍算成功、连观测都拿不到时如实失败。
+- **NIT-4（新增，既有粗粒度，非本 delta 引入，不阻塞冻结）**：`longrun.py:1724-1729` 的 `bridge_down` 是 catch-all，会把一次 `_snap()` **HTTP 超时**（`bridge.py:466 status="timeout"`）也记成 `ended_by="bridge_down"`，而 `tools/verify-run3.py` 把 `bridge_down` 当**异常事件**算问题 ⇒ 环境抖动会被升级成账本异常。建议后续把该处也按 `BRIDGE_DOWN_STATUSES` 过滤（并统一三处词表），排 0.7.23 之后。
+
 ## §9 结论
 
 条款 1–7 全部通过；跨日链路的关键语义（`ui_modal`=命中信号、先走离床一步、同 tick 关框、判据=观测差分）在代码、用例与我的独立探针三处一致；`dotnet build --no-incremental` 0 警 0 错、全量 306 OK。唯一建议在冻结 0.7.23 前修的是 **NIT-3**（桥中途沉默时让 `sleep()` 有界返回而不是抛穿），其余为文案/留档项。C# 侧的"同 tick 关框"与"门候选提前"没有自动化测试，本轮以逐行 diff + 真机日志引用为准，属已知局限。
+
+**补（2026-10-13 晚）**：NIT-3 已由 dev-coder 修完（`sleep()` 加 wrapper + `_sleep_bridge_fail` 收口），delta 复核见 **§8.1 = DELTA-PASS-WITH-NITS（无必修项）**，全量 **309 OK**，Mod 6 文件哈希未变 ⇒ 0.7.23 可冻结；唯一遗留是既有的 NIT-4（`longrun` 的 `bridge_down` catch-all 粒度），排 0.7.23 之后。

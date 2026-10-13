@@ -36,7 +36,13 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.22"   # v0.7.22：UseToolSkill 对近战武器改走 Farmer.BeginUsingTool()
+MOD_VERSION_EXPECTED = "0.7.23"   # v0.7.23：睡觉跨日打通 —— SleepSkill 应答后**同一 tick 关框**
+                                 # （原先只 answerDialogue 跑回调、DialogueBox 不收 ⇒ Game1.newDay
+                                 # 已置位但提问框挂着、newDaySync 永远等不到保存）；成功判据改成
+                                 # "日期前进 且 newDay 归位"；furniture[].bedCells（床的
+                                 # TouchAction="Sleep" 触发格，逐帧在 x/x+1 翻转）；门格不再当 A* 目标
+                                 # （door_push 候选提到该边最前）。
+                                 # v0.7.22：UseToolSkill 对近战武器改走 Farmer.BeginUsingTool()
                                  # （镰刀真挥）+ Done() 增 Grass 判据；sleep 拼不出 Sleep_Yes
                                  # 前缀立刻 sleep_no_question（不再白等 180s）；farm.dryCrops；
                                  # ui.professionsToChoose；模态守卫（职业非空停下等人）；

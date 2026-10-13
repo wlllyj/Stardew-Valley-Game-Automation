@@ -447,7 +447,12 @@ namespace AgentFarm.Bridge
                     return this.Ok(0, $"已在该格 {FormatTile(_target)}（无需移动）");
 
                 if (StepMover.UiBlocked())
-                    return this.Fail("ui_modal", "当前有菜单/对话/过场打开，无法移动（请先关闭模态）", 0);
+                    return this.Fail("ui_modal",
+                        "当前有菜单/对话/过场打开，无法移动（请先关闭模态）。"
+                        + "⚠ 若脑侧**刚刚踩上床的睡觉触发格**（`TouchAction=\"Sleep\"`），"
+                        + "这个 ui_modal 是**命中信号**（提问框被自己弹出来了），不是失败："
+                        + "应答之后同一 tick 就会关框（SleepSkill），脑侧不要据此重试 move_to",
+                        0);
 
                 if (_target.X < 0 || _target.Y < 0)
                     return this.Fail("precondition_failed", $"目标格 {FormatTile(_target)} 坐标为负数，非法", 0);
