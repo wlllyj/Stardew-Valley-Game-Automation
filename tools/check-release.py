@@ -141,6 +141,14 @@ def main() -> int:
     ap.add_argument("--skip-tests", action="store_true", help="跳过全量单测")
     args = ap.parse_args()
 
+    # 自配 stdout 编码：冻结链在 cp1252 控制台（未设 PYTHONUTF8）会因中文/emoji 抛
+    # UnicodeEncodeError（2026-10-14 `_bump-mod-version.py` 实测同类崩法）。
+    # 与 tools\preflight.py / run-longrun.py 同口径：别指望调用方记得设环境变量。
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
     if not REPO.is_dir():
         print(f"仓库根不存在：{REPO}")
         return 2

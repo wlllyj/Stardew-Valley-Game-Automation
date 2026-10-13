@@ -18,12 +18,20 @@ import argparse
 import json
 import pathlib
 import re
+import sys
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 MANIFEST = REPO / "mod" / "AgentFarm.Bridge" / "manifest.json"
 
 
 def main() -> int:
+    # 自配 stdout 编码：否则在 cp1252 控制台（未设 PYTHONUTF8）打印中文说明会抛
+    # UnicodeEncodeError —— 版本已经写盘、却在最后一句 print 崩掉（2026-10-14 0.7.25 冻结时实测）。
+    # 与 tools\preflight.py / run-longrun.py 同口径：别指望调用方记得设环境变量。
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     ap = argparse.ArgumentParser()
     ap.add_argument("version", help="新版本号，如 0.7.20")
     ap.add_argument("--note-file", default=None, help="UTF-8 文本文件：要插到 Description 开头的说明")
