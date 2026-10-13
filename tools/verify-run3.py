@@ -211,6 +211,8 @@ def build_days(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "outcomes",
                     "notes",
                     "final_water",
+                    "unreachable",
+                    "unreachable_tiles",
                 )
             }
             fin_key = day_key({"final": cur["final"]}) if cur["final"] else "?"
@@ -243,6 +245,28 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
     for r in rows:
         if r.get("event") == "stage_midway_leftover":
             midway_by_day.setdefault(day_key(r), []).append(r)
+
+    # task-52（Lead 2026-10-14）：`unreachable`（四邻都站不过去 / A* 算不出路）按政策**不算当天
+    # 硬失败**。本工具不判世界，只做两件事：①把账本里的 unreachable 计数报成信息项；
+    # ②用 journal 里带"站不过去/寻路无法到达"字样的事件**独立自算**一遍，两者对不上就如实记
+    # 信息项（缺失 ≠ 通过：字段缺了也要有自算值说话；防洗白靠"全不可达 + 0 成功"由真空日闸门兜）。
+    _UNREACH_MARKS = ("四邻都站不过去", "寻路无法到达", "无法到达", "unreachable", "A* 未算出路径")
+    unreach_by_day: dict[str, int] = {}
+    unreach_tiles_by_day: dict[str, set[tuple[Any, Any]]] = {}
+    _cur_key: str | None = None
+    for r in rows:
+        if r.get("event") == "day_start":
+            _cur_key = day_key(r)
+            continue
+        if _cur_key is None or r.get("event") not in ("blocked", "stage_exhausted", "unreachable"):
+            continue
+        blob = " ".join(str(r.get(k) or "") for k in ("reason", "note", "tile", "tiles"))
+        if not any(m in blob for m in _UNREACH_MARKS):
+            continue
+        unreach_by_day[_cur_key] = unreach_by_day.get(_cur_key, 0) + 1
+        tile = r.get("tile")
+        if isinstance(tile, (list, tuple)) and len(tile) >= 2:
+            unreach_tiles_by_day.setdefault(_cur_key, set()).add((tile[0], tile[1]))
 
     # 0. 时间轴自洽（deputy-lead `docs/_verify-run3-limits.md` 盲区 B2）：t 回退只记信息项。
     #    理由：t 是 longrun 自己的 time.time() 读数，系统时钟回拨（NTP）会让真长跑也"回退"，
@@ -383,6 +407,32 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
             problems.append(f"[{name}] 当天 stages 硬失败 {failed_field} 格")
         if sum_env or sum_incon:
             infos.append(f"[{name}] 环境挡路失败 {sum_env} 格、无结论失败 {sum_incon} 格（信息项，不改结论）")
+        # task-52：不可达格豁免（信息项，不改结论）。账本字段缺省时用 journal 自算值说话。
+        self_unreach = unreach_by_day.get(name, 0)
+        self_tiles = len(unreach_tiles_by_day.get(name) or ())
+        sum_unreach = sum(int(s.get("unreachable") or 0) for s in stage_recs)
+        day_unreach = end_stats.get("unreachable")
+        field_unreach: int | None = None
+        if isinstance(day_unreach, (int, float)):
+            field_unreach = int(day_unreach)
+        elif sum_unreach:
+            field_unreach = sum_unreach
+        if field_unreach is not None or self_unreach:
+            src = f"{field_unreach}" if field_unreach is not None else "未写"
+            infos.append(
+                f"[{name}] 不可达（四邻都站不过去/A* 算不出路）账本={src}、journal 自算={self_unreach} 次"
+                f"/{self_tiles} 格（task-52 政策：不计当天硬失败；本行只供复核）"
+            )
+        if field_unreach is not None and self_unreach and field_unreach != self_unreach:
+            infos.append(
+                f"[{name}] 不可达计数账本={field_unreach} 与 journal 自算={self_unreach} 不一致"
+                "（信息项：同一格可能多次重试，或 journal 按日去重）"
+            )
+        if checks.get("no_hard_failures") is False and self_unreach and int(failed_field or 0):
+            infos.append(
+                f"[{name}] 当天有 {failed_field} 格硬失败，其中含不可达 {self_unreach} 次：task-52 之后"
+                "不可达应被豁免，请核对 checks.no_hard_failures（豁免后仍 false 才算真失败）"
+            )
         if d["verified"] is False:
             problems.append(f"[{name}] day_end verified=false")
         if d["sleep_fail"]:

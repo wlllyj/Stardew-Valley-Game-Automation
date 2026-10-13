@@ -29,6 +29,13 @@
 - 完全没有任何阶段记录 ⇒ 必须有 `no_work` / `night` / `stamina` 收尾理由或 `excuse` 事件，否则**判红**。
 - 成功动作 `< 5` 步、或只涉及一个阶段 ⇒ **只出 info**（合法但偏弱的一天，供复核时人读）。
 
+**不可达信息项（`tools/verify-run3.py` 已实现，2026-10-14 Lead 补）**：`unreachable`（"四邻都站不过去 / A* 算不出路"）按 task-52 **不计当天硬失败**，但账本必须自洽。
+
+- 账本字段：`day_end.unreachable`（当天次数）与 `day_end.unreachable_tiles`（逐格 `[[x,y],…]`）；`day_end.stages[i].unreachable` 同理。
+- 工具侧独立自算：扫 journal 里 `blocked`/`stage_exhausted`/`unreachable` 事件中含"四邻都站不过去 / 寻路无法到达 / 无法到达 / A* 未算出路径"字样的行（逐格去重）。
+- 两者都存在且**不相等** ⇒ 只记 **info**（同一格可能多次重试）；**账本未写字段**但自算 > 0 ⇒ 也记 info（缺失 ≠ 通过，必须有自算值说话）。
+- 防洗白不靠本条：**全格不可达 + 当天 0 成功动作**仍被上面的真空日闸门判红。
+
 ## 2. 连续性与外部证据
 
 - **尾部连续 3 天**：`verified == true` 且 `ended_by == "sleep"` 且 `day_after` 比 `day_key` **恰好 +1 天**。
