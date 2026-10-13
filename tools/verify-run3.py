@@ -597,6 +597,7 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         ("budget_exhausted", "预算用尽收尾"),
         ("day_cap", "触发 max-days 上限收尾"),
         ("event_blocked", "游戏事件挂住（硬停等人）"),
+        ("llm_trace_failed", "LLM 留痕写盘失败（决策照常，只是没原文可复盘）"),
     ):
         n = events.get(code, 0)
         if n:
@@ -623,6 +624,30 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
             f"LLM 兜底 {llm_fallback} 条：发起过模型调用但最终没用模型结果"
             f"（`source != llm`，多为截断/拒收后的 deterministic_fallback）"
         )
+
+    # 留痕完整性（task-56）：账本声称的 `llm_trace` 必须真的落在盘上，且行数与引用数一一对应。
+    # 只记 info：留痕是**复盘材料**，缺了不影响当天是否达标，但 run6 复盘必须有它。
+    decision_traces = [r for r in decisions if str(r.get("llm_trace") or "")]
+    llm_traced = len(decision_traces)
+    traced_paths: dict[str, int] = {}
+    for r in decision_traces:
+        p = str(r.get("llm_trace"))
+        traced_paths[p] = traced_paths.get(p, 0) + 1
+    for p, claimed in sorted(traced_paths.items()):
+        if not os.path.exists(p):
+            infos.append(f"留痕缺失：账本引用了 {p}，但文件不存在（{claimed} 条决策没有可复盘的原文）")
+            continue
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                lines = sum(1 for line in fh if line.strip())
+        except OSError as exc:  # pragma: no cover - 只有权限/占用这类环境问题
+            infos.append(f"留痕读不出：{p}（{exc}）")
+            continue
+        if lines != claimed:
+            infos.append(
+                f"留痕行数与引用数不符：{p} 实际 {lines} 行、账本引用 {claimed} 条"
+                f"（多/少都说明留痕与决策不是一一对应）"
+            )
 
     # finish 自述必须与本工具的结论同向（盲区 B1：K3 账本自称 code=1/streak=0 却全绿）
     def _ok_now() -> bool:

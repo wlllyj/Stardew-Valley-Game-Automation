@@ -69,6 +69,7 @@
 - 判据里说"LLM 覆盖"一律指 **`decisions_llm_used`**；`decisions_llm` 只作旁证。
 - run2 L17 = `llm=true` + `source=deterministic_fallback` + `fallback=llm_error:truncated` ⇒ **不算模型产出**。
 - 两数不等的账本，`tools/verify-run3.py` 会把差额记成 info（不改结论），`tools/analyze-longrun.py` 必须在头部点名该行号。
+- **留痕完整性**（task-56）：账本 `decision[].llm_trace` 引用的 `<journal>-llm.jsonl` 必须**真的在盘上**，且文件行数与引用条数一一对应；缺失/行数不符都记 info（复盘材料不全，不影响当天是否达标），`llm_trace_failed` 事件也列进风险信息项。
 
 ## 4. run6 起跑与收口纪律
 

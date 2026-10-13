@@ -232,6 +232,44 @@ class TestVerifyRun3(unittest.TestCase):
         self.assertEqual(s["decisions_llm"], 0)
         self.assertEqual(s["decisions_llm_used"], 0)
 
+    # ------------------------------------------------------------ 留痕完整性（task-56）
+    def test_missing_trace_file_is_info(self):
+        """账本引用了一个不存在的留痕文件 ⇒ 只记 info，不改结论（复盘材料缺了 ≠ 当天不达标）。"""
+        rows = green_rows()
+        rows.insert(1, {"event": "decision", "llm": True, "source": "llm", "t": 5.0,
+                        "_lineno": 2, "llm_trace": "logs/_no_such_trace_file.jsonl",
+                        "llm_trace_hash": "abc123"})
+        ok, s = self.check(rows)
+        self.assertTrue(ok, f"缺留痕不该判红：{s.get('problems')}")
+        self.assertTrue(any("留痕缺失" in i for i in s["infos"]), s["infos"])
+
+    def test_trace_line_count_must_match_references(self):
+        """留痕行数与账本引用数不符（多/少）都要记 info —— 否则"一一对应"只是口号。"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = pathlib.Path(td) / "run6-llm.jsonl"
+            p.write_text('{"a":1}\n', encoding="utf-8")  # 只有 1 行
+            rows = green_rows()
+            for i in (1, 2):
+                rows.insert(i, {"event": "decision", "llm": True, "source": "llm", "t": float(i),
+                                "_lineno": 10 + i, "llm_trace": str(p), "llm_trace_hash": "h"})
+            ok, s = self.check(rows)
+            self.assertTrue(ok, f"行数不符只记 info：{s.get('problems')}")
+            self.assertTrue(any("留痕行数与引用数不符" in i for i in s["infos"]), s["infos"])
+
+    def test_matching_trace_lines_are_silent(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = pathlib.Path(td) / "run6-llm.jsonl"
+            p.write_text('{"a":1}\n{"b":2}\n', encoding="utf-8")
+            rows = green_rows()
+            for i in (1, 2):
+                rows.insert(i, {"event": "decision", "llm": True, "source": "llm", "t": float(i),
+                                "_lineno": 10 + i, "llm_trace": str(p), "llm_trace_hash": "h"})
+            ok, s = self.check(rows)
+            self.assertTrue(ok)
+            self.assertFalse(any("留痕" in i for i in s["infos"]), s["infos"])
+
 
 if __name__ == "__main__":
     unittest.main()
