@@ -27,6 +27,12 @@
 8. `python tools\deploy-mod.py --no-quit` ⇒ 记录 dll/manifest 字节数与桥 `modVersion=0.7.25`。
 9. `python tools\preflight.py --expect 0.7.25 --save-baseline logs\run6-baseline.json` ⇒ 四项全绿（版本/已读档/户外农场/无模态）。
 
+### 2.1 执行记录（2026-10-14，Lead 实做）
+
+- STEP 3 实测踩到一个**新坑**：`_bump-mod-version.py` 在 cp1252 控制台（未设 `PYTHONUTF8`）里**版本已写盘、最后一句 `print` 却抛 `UnicodeEncodeError`**（字符 `；`）⇒ 退出码 1 但 manifest 已改。已给 `tools\_bump-mod-version.py` 与 `tools\check-release.py` 补**自配 UTF-8 stdout**（与 `preflight.py`/`run-longrun.py` 同口径，提交见 §2 STEP 6 那笔）。核对 manifest 时**别只看退出码，要 `json.load` 读 Version**。
+- STEP 3–8 结果：manifest `0.7.24 → 0.7.25`（note 列出 task-50/51/52/63/56）；`bridge.py:39 = "0.7.25"`；build **0 警 0 错**；提交 **`e381e58`**（冻结点）+ **`31cb3cd`**（预置脚本/工具 UTF-8）；`check-release --expect 0.7.25` **六项全绿**（`Ran 455 tests` OK、树干净）；`deploy-mod --no-quit` ⇒ dll **170496 B** / manifest **18426 B**、桥 `modVersion=0.7.25 port=17890`、`load_save ok` 进 `Wahaha_450799035`（FarmHouse (9,9)）。
+- STEP 9 结果：`goto Farm`（Farm (64,15)）后 preflight **四项全绿**，基线写 `logs\run6-baseline.json`；关键值 `day [1,summer,4] tod 630`、money **956**、`seeds []`、`crops 35`、**`deadCrops 33`**（task-51 新字段真机可见）、`dryCrops 0`（天气 `lightning`）、`waterLeft 23`、`tillableCount 146`。
+
 ## 3 run6 起跑（machine-runner，task-57）
 
 **首选：用 Lead 的脱离式起跑器**（把"版本四要素 + 独立进程 + PID 文件 + 90 秒体检"一次做完；`DETACHED_PROCESS` 起，父进程/agent 回合结束不会连带收掉它）：
@@ -65,7 +71,7 @@ Start-Process -FilePath <python.exe> -ArgumentList '-u','tools\run-longrun.py','
 
 ## 6 已知遗留（不阻塞 run6）
 
-- run6 仍缺"播种腿"的种子钱：钱 14g、种子 0 ⇒ task-55（卖余料换钱）排在本版之后。
+- ~~run6 仍缺"播种腿"的种子钱：钱 14g、种子 0~~ ⇒ **本轮已由操作员预置解决**（§7.1：出货 6 叠 + 睡一夜 ⇒ money **956g**，起跑后脑自己 `buy` 种子）；**结构性修复仍是 task-55**（脑侧自己卖余料 + 分叠/记账，避免把家底整叠卖空）。
 - task-53（农场级待清障/待开垦格数）未做 ⇒ 观测窗口外仍有"看不见的活"（但不会再被写成 `no_work`）。
 - task-14 逐帧 warp 活锁未修 ⇒ 每次 `goto Farm` 仍会刷 `Warping to Farm`，并可能勾出剧情事件（task-41 会硬停等人）。
 - Mod 无 C# 测试工程 ⇒ Mod 侧新逻辑靠 build + 真机验收。
@@ -83,3 +89,12 @@ Start-Process -FilePath <python.exe> -ArgumentList '-u','tools\run-longrun.py','
 5. 之后 3 个游戏日**全程无人介入**；预置发生在起跑前，不计入"无人介入"。
 
 **红线**：预置只允许用 `sell` / `sleep` / `buy` 三条已验收路径；**绝不** `Money +=`、绝不手改存档、绝不直接塞背包。每一步留 `logs/` 证据，并在 `docs\_run6-evidence.md` 第 0 段如实写明"操作员预置：卖了什么、卖了几个、到账多少"。
+
+### 7.1 执行记录（2026-10-14，Lead 实做）
+
+- 预置脚本 `scratch\run6-preseed.py`（新，可复现；`--dry-run` 先看计划）。走游戏自己的 `Farm.shipItem`，**整叠**出货 6 叠，6/6 观测差分确认（槽位空 + 箱件数 0→6）：
+  `(O)535 Geode×1`、`(O)390 Stone×104`、`(O)388 Wood×72`、`(O)771 Fiber×115`、`(O)382 Coal×11`、`(O)330 Clay×13`。
+- 收款：`scratch\verify-sleep-brain.py --from-farm` 睡一夜 **summer 3 → summer 4**（tod 840→600），**money 14 → 956g**（次日游戏自己结算；预置出货当天 money 不变，符合设计）。
+- ⚠️ **缺口（比 §7 原计划更严）**：Mod `ShipSkill` 出货的是 `Items[slot]` **整叠**，没有"只卖超额部分"的能力 ⇒ **"每 id 保留 K=10"在操作员层也做不到**（这次是整叠卖掉）。这正是 task-55 要在脑侧解决的形态（要么先分叠、要么按 id 记账免得把家底卖空）。
+- ⚠️ **task-47 U2 数据点**：本次 summer 3→4 的日终保存**即使关掉 `ShippingMenu` 也没落盘**（存档仍 `3696701 B / 2026-10-13T20:37:37.898`；关框后 `worldAdvancing=true` 但无 `SaveGame.Save()` 行）⇒ 起点存档 mtime 是旧的；按 `docs\_run6-criteria.md` §2 口径（有日终菜单时"存档未动"不判失败也不判通过）处理，但 evidence 里要如实点名。
+- 起跑前状态即 §2.1 STEP 9 的基线：`money 956` / `seeds []` ⇒ 起跑后**脑自己**会 `buy` 种子（该路径 run5 实测过：`114→14` 买 5 包 `472`）。
