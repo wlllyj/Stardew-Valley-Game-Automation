@@ -51,6 +51,9 @@ rem 跨地点移动（按游戏真值的 warp 图 + 建筑门做 BFS；--tile �
 tools\agentfarm.cmd goto Farm
 
 rem 从标题界面读档 / 让游戏自己退出（换 Mod dll 必须重启游戏，这两条配对使用）
+rem shutdown --force-after 的退出码（判活是三态的：不知道 ≠ 已退出）：
+rem   0 = 已确认退出（pid 判死，或超时后强杀成功）
+rem   1 = 等满仍未能确认退出，或无法强杀（缺 pid / 强杀返回失败 / 强杀抛异常），请人工确认
 tools\agentfarm.cmd load
 tools\agentfarm.cmd shutdown --force-after 30
 

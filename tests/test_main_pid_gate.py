@@ -41,6 +41,8 @@ class _Recorder:
         self.lines: list[str] = []
         self.slept: list[float] = []
         self.killed: list[int] = []
+        # task-29：强杀兜底的返回值/异常都要能注入（免得"杀了但没死"被报成成功退出）
+        self.kill_result: object = True
 
     # 与 await_game_exit 的注入点一一对应
     def out(self, line: str) -> None:
@@ -51,7 +53,9 @@ class _Recorder:
 
     def kill(self, pid: int) -> bool:
         self.killed.append(pid)
-        return True
+        if isinstance(self.kill_result, BaseException):
+            raise self.kill_result
+        return bool(self.kill_result)
 
     @property
     def text(self) -> str:
@@ -144,6 +148,41 @@ class AwaitGameExitTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(rec.slept, [])
         self.assertEqual(rec.killed, [24444])
+
+
+class KillFallbackHonestyTest(unittest.TestCase):
+    """task-29：强杀兜底也不许谎报成功 —— 旧写法丢掉 `kill()` 的返回值，
+    `taskkill` 失败时照样 `return 0`，等于"我杀了但它没死"被报成成功退出。
+
+    退出码语义：0 = 已确认退出（pid 判死 / 强杀成功）；1 = 等满仍未确认退出或无法强杀，请人工确认。
+    """
+
+    def test_kill_returning_false_is_not_success(self) -> None:
+        rec = _Recorder()
+        rec.kill_result = False                          # taskkill 退出码非 0
+        with mock.patch.object(main_mod, "pid_alive", return_value=True):
+            rc = rec.gate(_info(24444), 1)
+        self.assertEqual(rc, 1)                          # **核心断言**：不许报成功
+        self.assertEqual(rec.killed, [24444])            # 但确实试过了
+        self.assertIn("未成功", rec.text)
+        self.assertFalse(rec.declared_exit)
+
+    def test_kill_raising_becomes_failure_not_traceback(self) -> None:
+        rec = _Recorder()
+        rec.kill_result = OSError("taskkill 不在 PATH")
+        with mock.patch.object(main_mod, "pid_alive", return_value=True):
+            rc = rec.gate(_info(24444), 1)               # 异常不许穿出去变 traceback
+        self.assertEqual(rc, 1)                          # 也不许吞成 0
+        self.assertIn("未成功", rec.text)
+        self.assertIn("OSError", rec.text)               # 但要如实说明为什么杀不了
+
+    def test_kill_returning_true_is_confirmed_exit(self) -> None:
+        rec = _Recorder()
+        with mock.patch.object(main_mod, "pid_alive", return_value=True):
+            rc = rec.gate(_info(24444), 1)
+        self.assertEqual(rc, 0)
+        self.assertEqual(rec.killed, [24444])
+        self.assertFalse(rec.declared_exit)              # 强杀成功 ≠ 观测到"已退出"，只是确认已处理
 
 
 class BridgeRespondsProbeTest(unittest.TestCase):

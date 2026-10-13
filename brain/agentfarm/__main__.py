@@ -529,8 +529,15 @@ def await_game_exit(
       * `None`  ⇒ **不知道**（`bridge.json` 缺 `pid`，或平台不支持）= 既不是"活着"，也**不是"已退出"**：
         绝不走"已退出"分支。此时改用 `bridge_responds()`（HTTP `health()`）取独立证据——桥还在应答
         ⇒ 进程显然还活着，继续等；桥不应答 ⇒ 也**只是"没有证据"**，照样把时间等完。
-    超时后：`pid` 是正整数 → 强杀并返回 0；**`pid` 未知 → 老实报"存活未知、无法强杀"并返回 1**
+    超时后：`pid` 是正整数 → 强杀；**强杀返回真才算成功**（旧写法把 `kill()` 的返回值丢掉，
+    `taskkill` 失败时照样 `return 0`，等于"报了成功但游戏还挂着"——task-29 修掉）。
+    **`pid` 未知 → 老实报"存活未知、无法强杀"并返回 1**
     （本模块的原则是"只报告事实，不美化失败"：没能确认进程消失就不能报成功）。
+
+    【退出码语义】（同时写进 `README.md` 的 `shutdown --force-after` 那段与 CLI `--help`）：
+      * `0` = **已确认退出**（`pid_alive` 判死，或强杀成功）；
+      * `1` = **等满仍未能确认退出，或无法强杀，请人工确认** —— 缺 pid、强杀返回假、强杀抛异常、
+        桥既不响应又无法按 pid 判定，全部归这里。
 
     【为什么需要这个函数】旧写法 `if pid_alive(info.pid) is not True:` 把 `None` 一并当成"已退出"，
     于是 `bridge.json` 缺 `pid` 时会**立刻** `return 0`，跳过整个强杀兜底 —— 无人值守时游戏可能还挂着，
@@ -559,7 +566,16 @@ def await_game_exit(
             f"请手动确认进程是否还在")
         return 1
     out(f"{WARN} 等了 {ticks}s 进程仍在（pid {pid}），强杀")
-    kill(int(pid))
+    try:
+        killed = bool(kill(int(pid)))
+    except Exception as exc:  # noqa: BLE001 - 兜底路径：异常也不许穿出去变 traceback
+        out(f"{FAIL} 强杀抛异常：{type(exc).__name__}: {exc}")
+        killed = False
+    if not killed:
+        # task-29：**"我杀了但它没死"绝不能报成功** —— 无人值守部署脚本会据此以为游戏已经关了。
+        out(f"{FAIL} 强杀未成功，进程可能仍在运行（pid={pid}）：请人工确认")
+        return 1
+    out(f"{OK} 强杀成功（pid {pid}）")
     return 0
 
 
@@ -787,9 +803,12 @@ def build_parser() -> argparse.ArgumentParser:
     ld.add_argument("--timeout-ms", type=int, default=60000, dest="timeout_ms")
     ld.set_defaults(func=cmd_load)
 
-    sd = sub.add_parser("shutdown", help="让游戏自己退出（quit_game）——与 load 配对构成无人值守重启闭环")
+    sd = sub.add_parser("shutdown", help="让游戏自己退出（quit_game）——与 load 配对构成无人值守重启闭环；"
+                                         "退出码：0=已确认退出（pid 判死或强杀成功）"
+                                         " 1=等满仍未能确认退出/无法强杀，请人工确认")
     sd.add_argument("--force-after", type=int, default=0, dest="force_after",
-                    help="等多少秒后仍没退出就强杀（0=不等待也不强杀）")
+                    help="等多少秒后仍没退出就强杀（0=不等待也不强杀）。退出码：0=已确认退出"
+                         "（pid 判死或强杀成功）；1=等满仍未能确认退出，或缺 pid/强杀失败，请人工确认")
     sd.add_argument("--no-force", action="store_true", dest="no_force",
                     help="只发退出请求，绝不强杀")
     sd.set_defaults(func=cmd_shutdown)
