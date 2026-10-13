@@ -185,6 +185,45 @@ class TestVerifyRun3(unittest.TestCase):
         self.assertTrue(ok, f"计数不一致只许记 info：{s.get('problems')}")
         self.assertTrue(any("不一致" in i for i in s["infos"]), s["infos"])
 
+    def test_unreachable_exemption_explains_leftover(self):
+        """task-52：账本把"不可达且在上界内"的遗留格从 unmet 里扣掉 ⇒ 自算也必须扣同一笔，
+        否则 run6 会被误判成「check 与自算不一致」。"""
+        rows = tweak(
+            green_rows(),
+            "day_end",
+            stages=[stage(tiles=10, ok=8, leftover=2)],
+            ok_steps=8,
+            unreachable=2,
+            unreachable_bound=5,
+            unreachable_exempt=2,
+            attempted=10,
+        )
+        ok, s = self.check(rows)
+        self.assertTrue(ok, f"豁免已解释 leftover，不该判红：{s.get('problems')}")
+        self.assertFalse(any("no_unmet_stages" in p for p in s["problems"]), s["problems"])
+
+    def test_unreachable_leaves_unexplained_leftover_as_problem(self):
+        """同一构造但不给 `unreachable_exempt` ⇒ 那 2 格遗留无人解释 ⇒ 必须判红。"""
+        rows = tweak(
+            green_rows(),
+            "day_end",
+            stages=[stage(tiles=10, ok=8, leftover=2)],
+            ok_steps=8,
+            unreachable=2,
+            unreachable_bound=5,
+            attempted=10,
+        )
+        ok, s = self.check(rows)
+        self.assertFalse(ok, "没写豁免就必须把遗留格算作没做完")
+        self.assertTrue(any("no_unmet_stages" in p for p in s["problems"]), s["problems"])
+
+    def test_unreachable_over_bound_is_problem(self):
+        """`checks.unreachable_within_bound=false` ＝ 豁免越界 ⇒ 洗白风险，必须判红。"""
+        rows = tweak(green_rows(), "day_end", checks={"unreachable_within_bound": False})
+        ok, s = self.check(rows)
+        self.assertFalse(ok)
+        self.assertTrue(any("unreachable_within_bound" in p for p in s["problems"]), s["problems"])
+
     def test_single_day_green_is_not_enough_for_three(self):
         ok, s = self.check(green_rows(days=1), days=3)
         self.assertFalse(ok)

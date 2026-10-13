@@ -215,6 +215,9 @@ def build_days(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "final_water",
                     "unreachable",
                     "unreachable_tiles",
+                    "unreachable_bound",
+                    "unreachable_exempt",
+                    "attempted",
                 )
             }
             fin_key = day_key({"final": cur["final"]}) if cur["final"] else "?"
@@ -419,11 +422,30 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
             field_unreach = int(day_unreach)
         elif sum_unreach:
             field_unreach = sum_unreach
+        # task-52 的豁免上界/实扣（账本优先，缺失时按 max(5, 20%×attempted) 自算）
+        attempted_total = int(end_stats.get("attempted") or 0)
+        if not attempted_total:
+            attempted_total = sum(int(s.get("attempted") or 0) for s in stage_recs)
+        _bound = end_stats.get("unreachable_bound")
+        if not isinstance(_bound, (int, float)):
+            _bound = max(5, int(0.2 * attempted_total)) if attempted_total else 5
+        bound = int(_bound)
+        _exempt = end_stats.get("unreachable_exempt")
+        if not isinstance(_exempt, (int, float)):
+            _exempt = min(bound, self_unreach) if (self_unreach or field_unreach) else 0
+        unreach_exempt = max(0, int(_exempt))
         if field_unreach is not None or self_unreach:
             src = f"{field_unreach}" if field_unreach is not None else "未写"
             infos.append(
                 f"[{name}] 不可达（四邻都站不过去/A* 算不出路）账本={src}、journal 自算={self_unreach} 次"
-                f"/{self_tiles} 格（task-52 政策：不计当天硬失败；本行只供复核）"
+                f"/{self_tiles} 格、豁免上界 bound={bound}（attempted={attempted_total}）、实际扣除 exempt={unreach_exempt}"
+                "（task-52 政策：不计当天硬失败；本行只供复核）"
+            )
+        # 硬闸门：豁免越界＝洗白风险（把"真失败"混进不可达或抬高 attempted 分母）
+        if checks.get("unreachable_within_bound") is False:
+            problems.append(
+                f"[{name}] checks.unreachable_within_bound=false（不可达豁免超出上界 bound={bound}）"
+                "⇒ 可能把真失败/不可动格混进不可达来洗白，必须人工核对 unreachable_tiles"
             )
         if field_unreach is not None and self_unreach and field_unreach != self_unreach:
             infos.append(
@@ -554,12 +576,16 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
                     f"[{name}] VERIFIED 但只涉及一个阶段（{sorted(_kinds)}）⇒ 供复核"
                 )
 
-        # 3b. 阶段后置条件：无论 checks.no_unmet_stages 在不在，都按 day_end.stages 自算并比对
+        # 3b. 阶段后置条件：无论 checks.no_unmet_stages 在不在，都按 day_end.stages 自算并比对。
+        # task-52 起：账本会把"当天不可达且在上界内"的遗留格从 unmet 里扣掉 ⇒ 自算值也必须扣同一笔，
+        # 否则 run6 会被误判成"自述与自算不一致"。
         unmet = checks.get("no_unmet_stages")
-        if unmet is not None and bool(unmet) != (leftover_targeted == 0):
+        effective_leftover = max(0, leftover_targeted - unreach_exempt)
+        if unmet is not None and bool(unmet) != (effective_leftover == 0):
             problems.append(
                 f"[{name}] checks.no_unmet_stages={unmet} 与自算不一致"
-                f"（有目标阶段遗留 leftover={leftover_targeted} 格）"
+                f"（有目标阶段遗留 leftover={leftover_targeted} 格，扣掉不可达豁免 {unreach_exempt} 后"
+                f"剩 {effective_leftover} 格）"
             )
         # 自述说"有阶段没做完"就一律算问题，**不因自算结果与它一致而放行**
         # （deputy-lead 负例 D：checks.no_unmet_stages=false 与 stages.leftover=5 一致地没做完，
@@ -569,8 +595,11 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
                 f"[{name}] checks.no_unmet_stages=false（有阶段后置条件未成立"
                 f"；自算有目标阶段 leftover={leftover_targeted} 格）"
             )
-        if unmet is None and leftover_targeted:
-            problems.append(f"[{name}] 当天有阶段遗留目标 leftover={leftover_targeted}（阶段没做完）")
+        if unmet is None and effective_leftover:
+            problems.append(
+                f"[{name}] 当天有阶段遗留目标 leftover={effective_leftover}"
+                f"（阶段没做完；已扣不可达豁免 {unreach_exempt}）"
+            )
         if leftover_zero_target:
             problems.append(
                 f"[{name}] 0 目标阶段 leftover={leftover_zero_target}"

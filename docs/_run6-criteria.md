@@ -34,7 +34,9 @@
 - 账本字段：`day_end.unreachable`（当天次数）与 `day_end.unreachable_tiles`（逐格 `[[x,y],…]`）；`day_end.stages[i].unreachable` 同理。
 - 工具侧独立自算：扫 journal 里 `blocked`/`stage_exhausted`/`unreachable` 事件中含"四邻都站不过去 / 寻路无法到达 / 无法到达 / A* 未算出路径"字样的行（逐格去重）。
 - 两者都存在且**不相等** ⇒ 只记 **info**（同一格可能多次重试）；**账本未写字段**但自算 > 0 ⇒ 也记 info（缺失 ≠ 通过，必须有自算值说话）。
-- 防洗白不靠本条：**全格不可达 + 当天 0 成功动作**仍被上面的真空日闸门判红。
+- **豁免口径（task-52，2026-10-14 Lead 补）**：账本新增 `day_end.unreachable_bound`（上界 `max(5, floor(0.2×attempted))`）、`day_end.unreachable_exempt`（当天实际从 `unmet` 扣掉的格数）、`day_end.attempted`；`stages[i]` 增 `unreachable_tiles`/`unreachable_leftover`/`attempted`。工具的自算比对**先扣同一笔豁免再比** `checks.no_unmet_stages`（否则合法豁免会被误判成"自述与自算不一致"）。
+- **新硬闸门**：`checks.unreachable_within_bound is False`（豁免越界）⇒ **problem** —— 这是"把真失败/不可动格混进不可达来洗白"的直接信号，必须人工核对 `unreachable_tiles`。
+- 防洗白不靠本条：**全格不可达 + 当天 0 成功动作**仍被上面的真空日闸门判红（task-52 再加一条：`ok_steps==0 且全部靠豁免` ⇒ `no_unmet_stages` 仍为 false）。
 
 **风险事件分级（`tools/verify-run3.py` 已实现，2026-10-14 Lead 补）**：`mod_version_mismatch`（版本与脑侧期望不一致）**升格为问题项** —— 版本不符的账本不能当验收证据。其余十类只记 info：`water_far_unavailable`（farm 说还有干作物却拿不到 `dryTiles` 坐标）、`farm_evidence_unavailable`、`sell_failed`、`zones_failed`、`day_key_resnap_failed`、`bridge_unavailable`、`env_spin_capped`、`budget_exhausted`、`day_cap`、`event_blocked`。
 
@@ -44,8 +46,8 @@
 - 存档 `Wahaha_450799035` 的 **size 与 mtime 应前进**（对应 SMAPI `SaveGame.Save() called/completed`）。
   **口径按 task-47 定案（`docs/_il-newday-save.md`）更正**：落盘唯一通道是 `SaveGameMenu.update` 的 master 分支；`SaveGameMenu` 只在
   `Game1.showEndOfNightStuff()` 且 **`endOfNightMenus.Count == 0`** 时被创建 ⇒ **当天早晨有日终菜单（`ShippingMenu`＝有货要结算 / `LevelUpMenu` / `Billboard`）时，存档是被设计延后的**。
-  因此：**跨日 ≠ 落盘**；有日终菜单而"存档未动"**既不能判失败、也不能判通过**（记账本与存档一致 + 三源对账器的 P3c 容差）；**没有任何日终菜单却缺 `SaveGame.Save() called.` 且存档未动 = 异常**。
-  以「跨日 +1 + 账本一致」为主判据（P3a 每次跨日必有 `Synchronizing 'NewDay' task`；P3b 有 Save 必有 NewDay；P3c NewDay 无 Save 记 info，连续 ≥2 天才升 problem）。
+  因此：**跨日 ≠ 落盘**。豁免**有期限**（2026-10-14 采纳 log-analyst 建议，task-61）：①有日终菜单且**未观测到菜单被关掉** ⇒ 存档未动只记 **info**（设计性延后）；②**已观测到菜单被关掉**（`activeMenu` 变 null，或转 `SaveGameMenu` 后消失）**而其后 1–2 秒内仍无 `SaveGame.Save() called.`** ⇒ 转**待查/异常**（run5 的 25→26 出货那次正属此形态，见 `docs/_il-newday-save.md` §2.5/§4）；③**没有任何日终菜单却缺 `SaveGame.Save() called.` 且存档未动 = 异常**（原样）。
+  以「跨日 +1 + 账本一致」为主判据（P3a 每次跨日必有 `Synchronizing 'NewDay' task`；P3b 有 Save 必有 NewDay；P3c NewDay 无 Save：**未观测到菜单被关**记 info，**已关仍无 Save** 记 problem/待查，连续 ≥2 次同样升 problem）。
 - SMAPI `Synchronizing 'NewDay'` 计数与账本跨日次数**同向**。
 - `finish.code == 0`、`verified_streak >= 3`、0 次 `bridge_down` / `watchdog_stop` / `modal_timeout` / `no_day_progress`。
 
