@@ -47,7 +47,8 @@
 
 ## 4. run5 的验收口径（比 run4 **多两条**）
 
-- 同 run4：尾部连续 3 天 `ended_by=="sleep"` 且 `verified==true`、`checks.day_justified==true`、0 掉线/崩溃、exit 0；每天 `day_end.final.location == "Farm"`。
+- 同 run4：尾部连续 3 天 `ended_by=="sleep"` 且 `verified==true`、`checks.day_justified==true`、0 掉线/崩溃、exit 0。
+- ⚠️ **口径更正（Lead，2026-10-13 夜）**：**删掉**原来那条 `每天 day_end.final.location == "Farm"` —— `final` 是**睡前**快照，而正常成功的一天就是"走回 FarmHouse → 上床 → 睡"，位置本来就可能是 `FarmHouse`，照原口径判会把成功的一天判失败。run4/run3 真正的病灶是"**在室内用玩家窗口口径认定 `no_work`，而户外还有干作物**"。替代判据：**`ended_reason` 以 `no_work` 开头的日子必须 `final_water.dry == 0`**（`dry > 0` ⇒ 判失败；已实现进 `tools\verify-run3.py` 的新闸门）。
 - **新增 ①经济闭环可核查**：至少一次 `ship` 成功（背包 stack 减少 + `farm.shippingBin[]` 增加），且**次日** `money` 增量 == 该物 `sellToStorePrice(-1) × stack`（两个快照的 `day`/`timeOfDay` 都要贴）。
 - **新增 ②四步全链**：至少一天里同时出现 `clear_area`（清障 ok>0）、`till_area`（开垦 ok>0）、`plant_area`（播种 ok>0，`crop` 出现）、`water_area`（浇水 ok>0）—— 这才是 P3 ⑥ 原话的"清障→开垦→播种→浇水"。
 
@@ -75,3 +76,12 @@
 - 全仓 `git grep -rn "Money +="`：**只有注释与文档命中，没有任何一处写入**。
 - **与 §2 的差异（如实说明）**：§2 设想复用 `ExecArgs.Item` 传物品 id；实际改成 `slot` + 白名单 —— 因为 `removeItemFromInventory` 是引用相等，按 id 反而容易复制物品。另外 `shippingBin` 放在 `WorldSnapshot` 顶层而非 `FarmView`（见上）。
 - **P3 装机后建议核三条**：①`farm.shippingBin.count` 差分与 `player.inventory[].slot` 变空；②**次日** `money` 增量 == 该物 `sellToStorePrice(-1) × stack`（两个快照的 `day`/`timeOfDay` 都要贴）；③白名单负例：工具/种子槽必须回 `not_whitelisted`（用 `--whitelist` 只给收获物）。
+
+### 6.3 装机记录（Lead，2026-10-13 20:03）
+
+- **Lead 独立复核**（不复用作者的读数）：`git show --stat e818195` 改动面 = brain 四文件 + mod 六文件 + 两个测试 + 本发布文档；全量 `unittest discover -s tests` ⇒ **`Ran 346 tests / OK`**；`git grep "Money *+="` 在 `brain/`+`mod/` 里**只命中注释/文档**。
+- **冻结**：`python tools\_bump-mod-version.py 0.7.24 --note-file tools\_note-0724.txt`（`manifest.json` 0.7.23 → 0.7.24）+ `brain\agentfarm\bridge.py:39 MOD_VERSION_EXPECTED = "0.7.24"`；`dotnet build .\mod\AgentFarm.Bridge\AgentFarm.Bridge.csproj -c Release --nologo --no-incremental` ⇒ **0 警告 0 错误**；提交 **`ff25ee7`**。
+- **`check-release --expect 0.7.24` ⇒ exit 0 全绿**：manifest==brain、dll 20:00:37 不比源码（`ShipSkill.cs` 19:50:47）旧、py_compile 20 文件、`Ran 346 OK`、工作树干净。
+- **装机**：`python tools\deploy-mod.py --no-quit` ⇒ 0.7.23 → 0.7.24；`AgentFarm.Bridge.dll` **169472 B**、`manifest.json` 17316 B；`[5] 桥已就绪 modVersion=0.7.24 port=17890`；`[6] load_save ok：已进入存档“Wahaha_450799035”（当前地点 FarmHouse (9,9)）`；EXIT=0。
+- **代码层独立验收**：deputy-lead 出 `docs\_review-e818195.md` ⇒ **PASS-WITH-NITS，无必修项**；两条 NIT 落成 **task-46**（`farmwork.sell` 的 `ok` 判据补"`shippingBin.count` 增加"；混合背包 + 白名单非空只卖收获物的证伪用例），`blocked_by: task-45`（run5 跑完才动工，避免证据版本说不清）；NIT-5 基线口径更正为 **328 + 18 = 346**。
+- **真机验收 + run5**：task-45 派给 machine-runner（`docs\_run5-evidence.md`）。已知早期证据：`logs\run5-baseline.json`（20:04:30）= `day=[1,"spring",26]`、**`money` 14 → 114**、`activeMenu=ShippingMenu`、`worldSeq=179` ⇒ 出货到账链在真机上确实走通。
