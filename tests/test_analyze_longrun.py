@@ -1063,6 +1063,146 @@ class TestUnreachableAccounting(unittest.TestCase):
         self.assertFalse(any("不可达（四邻" in a["text"] for a in rep["advice"]))
 
 
+class TestRefusedAccounting(unittest.TestCase):
+    """task-63/task-66：被**游戏拒绝**（till 的 `tool_ineffective`/`precondition_failed`）的三级留痕、
+    独立豁免上界与硬闸门。口径与 `tools\\verify-run3.py:518-521` 同向：
+
+      * `tool_refused` / `refused_stage` / `refused_summary` = 5 环境挡路信息项（**不计当天硬失败**、
+        当天封格、**次日重试**），**不并进"该做没做"**；
+      * 日级 `refused_bound = max(5, 20%×attempted)`；`checks.refused_within_bound=false` ⇒ 0 类红；
+      * 与 task-52 的 `unreachable` 是**两套集合 / 两套界**，各自扣减、**不许互相掩护**；
+      * `day_end.refused*` / `checks.refused_within_bound` 缺失 ⇒ 只进【无法判定】（缺失 ≠ 通过）。
+    """
+
+    R_TILE = {"event": "tool_refused", "t": 4.0, "tile": [72, 51], "action": "till",
+              "stage": "till_area", "zone": "field_ne", "status": "tool_ineffective",
+              "kind": "grass", "reason": "锄不动（这一格还是 grass）"}
+    R_TILE2 = {"event": "tool_refused", "t": 4.05, "tile": [73, 51], "action": "till",
+               "stage": "till_area", "zone": "field_ne", "status": "tool_ineffective",
+               "kind": "grass", "reason": "锄不动（这一格还是 grass）"}
+    R_STAGE = {"event": "refused_stage", "t": 4.1, "stage": "till_area", "zone": "field_ne",
+               "tiles": 3, "in_leftover": 3, "coords": [[72, 51], [73, 51], [74, 51]],
+               "note": "阶段收尾：被游戏拒绝的格"}
+    R_SUM = {"event": "refused_summary", "t": 9.5, "count": 3, "bound": 5, "attempted": 20,
+             "exempted": 3, "raw_unmet": 3, "unmet": 0,
+             "tiles": [[72, 51], [73, 51], [74, 51]], "note": "日级拒绝豁免上界"}
+    BASE_CHECKS = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                   "crops_watered": True, "day_justified": True, "no_unmet_stages": True,
+                   "watered_outdoor": True, "unreachable_within_bound": True}
+
+    def _report(self, events, name):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=1)
+
+    def _events(self, *, bound_ok=True, refused=3, bound=5, stage_refused=3, stage_failed=0,
+                stage_ok=5, env_block=0, failed_steps=0, with_fields=True, extra_events=()):
+        stage = {"stage": "till_area", "tiles": 3, "ok": stage_ok, "skipped": 0,
+                 "failed": stage_failed, "proven_inert": 0, "env_block": env_block,
+                 "inconclusive": 0, "stopped": "", "leftover": 0}
+        if stage_refused is not None:
+            stage["refused"] = stage_refused
+        overrides = {
+            "ended_reason": "night", "verified": bool(bound_ok), "failed_steps": failed_steps,
+            "stages": [stage],
+            "checks": dict(self.BASE_CHECKS, refused_within_bound=bound_ok),
+            "final_water": {"t": 590.0, "location": "Farm", "tiles": 84, "crops": 31, "dry": 0,
+                            "scope": "farm"},
+        }
+        if with_fields:
+            overrides.update({
+                "refused": refused, "refused_bound": bound,
+                "refused_exempt": min(refused, bound),
+                "refused_tiles": [[72, 51], [73, 51], [74, 51]],
+            })
+        return integrity_ledger(
+            extra_events=[self.R_TILE, self.R_STAGE, self.R_SUM] + list(extra_events),
+            day_end_overrides=overrides)
+
+    def test_events_have_buckets_and_are_not_unmapped(self):
+        for name in ("tool_refused", "refused_stage", "refused_summary"):
+            self.assertIn(name, mod.EVENT_BUCKETS, f"task-66 的 {name} 没有桶 ⇒ 计数会漏")
+        for bucket in ("tool_refused", "refused_stages", "refused_summaries"):
+            self.assertIn(bucket, mod.NEW_EVENT_BUCKETS, "新桶要在头部'新事件计数'里可见")
+        rep = self._report(self._events(), "refused.jsonl")
+        self.assertEqual(rep["unmapped_events"], {},
+                         f"task-66 三个事件都已进桶，不许再出现未映射：{rep['unmapped_events']}")
+
+    def test_inside_bound_is_info_only_and_visible(self):
+        rep = self._report(self._events(), "refused_ok.jsonl")
+        env = rep["env_inconclusive"]
+        self.assertEqual(env["refused_events"], 1)
+        self.assertEqual(env["refused_tile_count"], 1)
+        self.assertEqual(env["refused_stage_events"], 1)
+        self.assertEqual(env["refused_summary_events"], 1)
+        self.assertEqual(env["refused_count"], 3)
+        self.assertEqual(env["refused_bound"], 5)
+        self.assertEqual(env["refused_exempt"], 3)
+        self.assertEqual(env["refused_attempted"], 20)
+        self.assertIs(env["refused_within_bound"], True)
+        subs = subjects(rep["categories"]["environment"])
+        self.assertIn("environment:refused", subs)
+        self.assertIn("environment:refused_stage", subs)
+        self.assertNotIn("manual:check:refused_within_bound",
+                         subjects(rep["categories"]["manual"]))
+        for s in subjects(rep["categories"]["missed"]):
+            self.assertNotIn("refused", s, "被游戏拒绝是环境挡路信息项，不该进'该做没做'")
+        text = mod.render_text(rep, 50)
+        self.assertIn("游戏拒绝", text)
+        self.assertIn("exempt=3", text)
+        self.assertTrue(any("被游戏拒绝" in a["text"] for a in rep["advice"]))
+        self.assertNotIn("missed:stage_account", subjects(rep["categories"]["missed"]))
+
+    def test_over_bound_is_manual_red(self):
+        rep = self._report(self._events(bound_ok=False, refused=9, bound=5), "refused_bad.jsonl")
+        subs = subjects(rep["categories"]["manual"])
+        self.assertIn("manual:check:refused_within_bound", subs)
+        text = mod.render_text(rep, 50)
+        self.assertIn("refused_within_bound=false", text)
+        self.assertTrue(any("0 类红" in a["text"] for a in rep["advice"]))
+
+    def test_missing_fields_is_undecidable_not_pass(self):
+        rep = self._report(integrity_ledger(), "refused_absent.jsonl")
+        env = rep["env_inconclusive"]
+        self.assertEqual(env["refused_events"], 0)
+        self.assertIsNone(env["refused_count"])
+        self.assertIsNone(env["refused_within_bound"])
+        self.assertNotIn("manual:check:refused_within_bound",
+                         subjects(rep["categories"]["manual"]))
+        self.assertTrue(any("day_end.refused" in u for u in rep["undecidable"]),
+                        "缺字段必须进【无法判定】，不许静默丢弃：" + "; ".join(rep["undecidable"]))
+        self.assertFalse(any("被游戏拒绝（tool_ineffective" in a["text"] for a in rep["advice"]))
+
+    def test_refused_and_unreachable_counts_do_not_mix(self):
+        unreach = [
+            {"event": "unreachable", "t": 5.0, "tile": [10, 10], "action": "till",
+             "stage": "till_area", "zone": "field_ne", "reason": "四邻都站不过去", "note": ""},
+            {"event": "unreachable", "t": 5.1, "tile": [11, 10], "action": "till",
+             "stage": "till_area", "zone": "field_ne", "reason": "四邻都站不过去", "note": ""},
+        ]
+        rep = self._report(self._events(extra_events=[self.R_TILE2] + unreach), "both.jsonl")
+        env = rep["env_inconclusive"]
+        self.assertEqual(env["refused_tile_count"], 2, "拒绝格只认 tool_refused 的坐标")
+        self.assertEqual(env["unreachable_tile_count"], 2, "不可达格只认 unreachable 的坐标")
+        subs = subjects(rep["categories"]["environment"])
+        self.assertIn("environment:refused", subs)
+        self.assertIn("environment:unreachable", subs)
+
+    def test_refused_is_not_part_of_stage_account_allowance(self):
+        """账目差额解释口径与 `tools\\verify-run3.py:388-404` 逐字一致：只认 env_block + inconclusive。
+
+        拒绝格被 `refused_exempt` 扣掉后本就不该出现在 `stages[].failed`；不许拿 `refused` 去把差额
+        洗平（两套豁免互不掩护）。
+        """
+        ok = self._report(self._events(stage_refused=3, stage_failed=5, failed_steps=3, env_block=2),
+                          "refused_delta_ok.jsonl")
+        self.assertNotIn("missed:stage_account", subjects(ok["categories"]["missed"]))
+        bad = self._report(self._events(stage_refused=3, stage_failed=5, failed_steps=3, env_block=0),
+                           "refused_delta_bad.jsonl")
+        self.assertIn("missed:stage_account", subjects(bad["categories"]["missed"]),
+                      "refused 不许进账目差额口径（verify-run3.py:388-404 只认 env+inconclusive）")
+
+
 class TestVacuumDayGate(unittest.TestCase):
     """task-64（Lead m02981）：真空日闸门与 `tools/verify-run3.py:604-625` 同口径、不许更宽。
 

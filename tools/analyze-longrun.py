@@ -11,7 +11,9 @@
   5. 环境挡路（env_fail，statuses=busy/渐黑/模态/没存档）、**自旋到上限**（env_spin_capped：
      同一格被挡住超过 MAX_ENV_ATTEMPTS=2 后改按"没结论"占配额）、**不可达**（unreachable /
      unreachable_stage / unreachable_summary，task-52：四邻都站不过去 / A* 算不出路；政策是
-     **不计当天硬失败**、当天记 blocked、**次日重试**，日级豁免有上界 max(5, 20%×attempted)）
+     **不计当天硬失败**、当天记 blocked、**次日重试**，日级豁免有上界 max(5, 20%×attempted)）、
+     **被游戏拒绝**（tool_refused / refused_stage / refused_summary，task-63/task-66：
+     till 的 tool_ineffective/precondition_failed；政策同上但**独立起界**，两套豁免不许互相掩护）
      与没拿到结论（inconclusive_fail，占配额 ⇒ "配额被吃掉 N 格"）
 外加：每天一行摘要、3-8 条带证据行的改进建议、"本账本无法判定"清单。
 
@@ -40,6 +42,12 @@
     max(5, 20%×attempted)）⇒ 0 类红（豁免越界＝可能把真失败当"走不到"洗白）；
     `unreachable`/`unreachable_stage`/`unreachable_summary` 本身只作信息项、**不并进"该做没做"**
     （tools\verify-run3.py:415-448 同向：上界内是 info、越界才是 problem）。
+  * 被游戏拒绝（task-63/task-66）：`checks.refused_within_bound=false`（当天被拒绝格数超过
+    max(5, 20%×attempted)）⇒ 0 类红 `manual:check:refused_within_bound`（可能把真失败混进
+    "游戏拒绝"洗白）；`tool_refused`/`refused_stage`/`refused_summary` 本身只作信息项（5 环境挡路）、
+    **不并进"该做没做"**，日级看 `refused_bound`/`refused_exempt`（与 `unreachable`
+    **独立起界、各自扣减、不许互相掩护**）；`day_end.refused*` / `checks.refused_within_bound`
+    **缺失 ⇒ 只进【无法判定】**（缺失 ≠ 通过；tools\verify-run3.py:518-521 同向）。
   * 事件映射不许漂移（Lead m02395）：brain 里 `_journal("<name>"` 的**每个**事件名都要在
     `EVENT_BUCKETS` 里有桶（结构性事件 `day_start`/`day_end`/`finish` 除外，见 `STRUCTURAL_EVENTS`）；
     账本里出现没桶的事件 ⇒ 报告头部逐条点名（名字×次数+行号）+ 建议 0a，**绝不静默丢弃**。
@@ -111,6 +119,10 @@ CHECK_MEANING = {
     # task-52：不可达豁免的**硬上界**（与 tools\verify-run3.py:445-448 同向：越界直接判 problem）
     "unreachable_within_bound": "当天'unreachable'格数超过上界 max(5, 20%×attempted)"
                                 "—— 可能把真失败/不可动格混进不可达来洗白，必须人工核对 unreachable_tiles",
+    # task-63/task-66：被**游戏拒绝**（till 的 tool_ineffective / precondition_failed）的硬上界
+    "refused_within_bound": "当天'被游戏拒绝'的格数超过上界 max(5, 20%×attempted)"
+                            "—— 可能把真失败混进'游戏拒绝'来洗白，必须人工核对 refused_tiles"
+                            "（与 unreachable 是两套独立豁免，互不掩护）",
 }
 # 账本里"应该有、但没有就只能写无法判定"的字段/事件
 FIELD_PROBES = [
@@ -157,6 +169,20 @@ FIELD_PROBES = [
      "真正从 no_unmet_stages 里扣掉的不可达格数（task-52：先扣它再比 checks.no_unmet_stages）"),
     ("day_end.checks.unreachable_within_bound", "unreachable_within_bound",
      "不可达计数是否在上界内（task-52；false ⇒ 可能把真失败当不可达洗白，verify-run3 判 problem）"),
+    # task-63/task-66：被游戏拒绝（till 的 tool_ineffective/precondition_failed）的三级留痕 + 日级豁免
+    ("event:refused_summary", "refused_summary",
+     "日级拒绝汇总（task-63：count/bound/attempted/exempted/raw_unmet/unmet；tiles 可查）"),
+    ("day_end.refused", "refused",
+     "当天被游戏拒绝的格数（task-63；与 refused_bound/refused_exempt 互检）"),
+    ("day_end.refused_tiles", "refused_tiles",
+     "当天被拒绝的格坐标 [[x,y],…]（task-63；越界时人工核对用）"),
+    ("day_end.refused_bound", "refused_bound",
+     "拒绝豁免上界 max(5, 20%×attempted)（task-63）"),
+    ("day_end.refused_exempt", "refused_exempt",
+     "真正从 no_unmet_stages 里扣掉的拒绝格数（task-63；与 unreachable_exempt 各自扣减）"),
+    ("day_end.checks.refused_within_bound", "refused_within_bound",
+     "拒绝计数是否在上界内（task-63；false ⇒ 可能把真失败当'游戏拒绝'洗白，verify-run3 判 problem；"
+     "缺失 ≠ 通过）"),
 ]
 OUTCOME_RE = re.compile(
     r"目标\s*(\d+)\s*步：做成\s*(\d+)、跳过\s*(\d+)、失败\s*(\d+)"
@@ -262,6 +288,13 @@ EVENT_BUCKETS = {
     "unreachable": "unreachable",
     "unreachable_stage": "unreachable_stages",
     "unreachable_summary": "unreachable_summaries",
+    # --- task-63/task-66：`till` 被**游戏拒绝**（tool_ineffective/precondition_failed）的三级留痕。
+    #     政策：不算当天硬失败、当天封格、**次日重试**；日级豁免有上界 max(5, 20%×attempted)；
+    #     与 task-52 的 unreachable 是**两套集合、两套界**，各自扣减、互不掩护
+    #     （tools\verify-run3.py:518-521 同向：越界才是 problem）。
+    "tool_refused": "tool_refused",
+    "refused_stage": "refused_stages",
+    "refused_summary": "refused_summaries",
     # --- task-64：`stage` 是**独立事件**形态的阶段记录（brain 现在把阶段写进 `day_end.stages`；
     #     但对照夹具/旧账本可能用独立事件）⇒ 收进桶，供真空日闸门统计 Σ stage.ok。
     "stage": "stage_events",
@@ -283,6 +316,8 @@ NEW_EVENT_BUCKETS = (
     "watchdog_stops", "mod_version_mismatch", "llm_trace_failures", "no_day_progress",
     # task-52：不可达三级留痕（一眼看出哪几格/哪个阶段/当天豁免多少）
     "unreachable", "unreachable_stages", "unreachable_summaries",
+    # task-66：被游戏拒绝（till 的 tool_ineffective）三级留痕
+    "tool_refused", "refused_stages", "refused_summaries",
 )
 
 
@@ -1130,6 +1165,20 @@ def cat_manual(sessions, top):
                         subject="manual:check:unreachable_within_bound",
                     )
                 )
+            # task-63/task-66：拒绝豁免越界 = 洗白风险（把真失败混进"游戏拒绝"）
+            if checks.get("refused_within_bound") is False:
+                out.append(
+                    finding(
+                        lineno, "day_end",
+                        f"必须人工介入：checks.refused_within_bound=false"
+                        f"（refused={ev.get('refused')}、bound={ev.get('refused_bound')}、"
+                        f"exempt={ev.get('refused_exempt')}）—— "
+                        f"{CHECK_MEANING.get('refused_within_bound')}",
+                        hint="与 verify-run3.py:518-521 同向：豁免越界 ⇒ 可能把真失败当'游戏拒绝'；"
+                             "人工核对 refused_tiles 的坐标（与 unreachable 两套独立豁免）",
+                        subject="manual:check:refused_within_bound",
+                    )
+                )
     return out[:top] if top else out
 
 
@@ -1233,6 +1282,50 @@ def cat_environment(sessions, top):
                     hint="in_leftover>0 的格就是日级 exemption 要扣的对象；扣完仍不成立由 "
                          "checks.no_unmet_stages 说话",
                     subject="environment:unreachable_stage",
+                )
+            )
+        # task-63/task-66：被**游戏拒绝**（till 的 tool_ineffective / precondition_failed）＝ 环境挡路的
+        # 第四种形态：不是"格子走不到"（不可达），而是世界的前置事实（不可锄的地 / 工具等级不够）拒绝执行。
+        # 政策与 task-52 同形但**独立起界**（refused_bound = max(5, 20%×attempted)）：两套豁免各自扣减、
+        # 互不掩护；本工具只作信息项（不并进"该做没做"），是否真做成由 checks.no_unmet_stages
+        # **先扣 refused_exempt** 后说话（tools\verify-run3.py:518-521：越界才是 problem）。
+        refused_events = sess["tool_refused"]
+        if refused_events or sess["refused_stages"] or sess["refused_summaries"]:
+            r_tile_set = set()
+            for _, ev in refused_events:
+                tile = as_list(ev.get("tile"))
+                if len(tile) == 2:
+                    r_tile_set.add((as_int(tile[0]), as_int(tile[1])))
+            rtiles = sorted(r_tile_set)
+            rstages = sorted({str(ev.get("stage") or "?") for _, ev in refused_events})
+            rstatus = sorted({str(ev.get("status") or "?") for _, ev in refused_events})
+            rsummary = sess["refused_summaries"][-1][1] if sess["refused_summaries"] else {}
+            rfirst = (refused_events or sess["refused_stages"] or sess["refused_summaries"])[0][0]
+            out.append(
+                finding(
+                    rfirst, "tool_refused",
+                    f"被游戏拒绝（不计当天硬失败）：{len(refused_events)} 次 / {len(rtiles)} 格"
+                    f"（阶段 {rstages or '-'}；status {rstatus or '-'}；"
+                    f"坐标 {[list(t) for t in rtiles[:6]]}{'…' if len(rtiles) > 6 else ''}）；"
+                    f"日级 count={rsummary.get('count')}、bound={rsummary.get('bound')}、"
+                    f"attempted={rsummary.get('attempted')}、raw_unmet={rsummary.get('raw_unmet')}、"
+                    f"exempted={rsummary.get('exempted')}、unmet={rsummary.get('unmet')}",
+                    hint="task-63：世界拒绝（tool_ineffective/precondition_failed）不是'我试了没做成'；"
+                         "当天封格、次日重试；与 unreachable 是两套独立豁免、互不掩护，"
+                         "越界由 checks.refused_within_bound=false 判红（本工具 0 类）",
+                    subject="environment:refused",
+                )
+            )
+        for lineno, ev in sess["refused_stages"]:
+            out.append(
+                finding(
+                    lineno, "refused_stage",
+                    f"阶段级拒绝：{ev.get('stage')} @ zone={ev.get('zone')} 有 "
+                    f"{as_int(ev.get('tiles'))} 格被游戏拒绝（其中还留在 leftover 的 "
+                    f"{as_int(ev.get('in_leftover'))} 格；坐标 {as_list(ev.get('coords'))[:6]}）",
+                    hint="in_leftover>0 的格就是日级 refused_exempt 要扣的对象；扣完仍不成立由 "
+                         "checks.no_unmet_stages 说话",
+                    subject="environment:refused_stage",
                 )
             )
     return out[:top] if top else out
@@ -1358,6 +1451,23 @@ def build_advice(report, top=8):
                        if env.get("unreachable_within_bound") is False
                        else "上界内属正常（与 verify-run3.py:415-448 同向）"),
             "lines": env.get("unreachable_lines") or [],
+        })
+    # 0f) 被游戏拒绝（task-63/task-66：till 的 tool_ineffective / precondition_failed）——世界的前置事实
+    # 拒绝执行，不算当天硬失败、当天封格、次日重试；与 unreachable 两套独立豁免，越界进 0 类红。
+    if env.get("refused_events") or env.get("refused_summary_events"):
+        _r_tiles = env.get("refused_tiles") or []
+        _r_marks = (f"count={env.get('refused_count')}、bound={env.get('refused_bound')}、"
+                    f"attempted={env.get('refused_attempted')}、exempt={env.get('refused_exempt')}")
+        advice.append({
+            "text": f"被游戏拒绝（tool_ineffective/precondition_failed）×{env['refused_events']} 次 / "
+                    f"{env.get('refused_tile_count', 0)} 格（{_r_tiles[:top] or '-'}）：task-63 政策是"
+                    f"不计当天硬失败、当天封格、次日重试；日级豁免 {_r_marks}"
+                    f"（与 unreachable 独立起界、不许互相掩护）；"
+                    + ("⚠ checks.refused_within_bound=false ⇒ 0 类红：豁免越界（可能把真失败当"
+                       "「游戏拒绝」洗白），必须人工核对这些坐标"
+                       if env.get("refused_within_bound") is False
+                       else "上界内属正常（与 verify-run3.py:518-521 同向）"),
+            "lines": env.get("refused_lines") or [],
         })
     # 1) 睡觉失败
     sleep_failed = [f for f in report["categories"]["sleep"] if f["subject"] == "sleep:failed"]
@@ -1779,6 +1889,12 @@ def build_report(rows, path, args, bad_lines):
     unreach_tiles = set()
     unreach_stage_lines = []
     unreach_summary_lines = []
+    # task-63/task-66：被"游戏拒绝"（till 的 tool_ineffective/precondition_failed）——与不可达**并列但
+    # 分开计数**（两套集合、两套界，不许互相掩护）。
+    refused_lines = []
+    refused_tiles = set()
+    refused_stage_lines = []
+    refused_summary_lines = []
     t_regressions = []
     for sess in all_sessions:
         idx = _stage_outcome_index(sess)
@@ -1806,6 +1922,14 @@ def build_report(rows, path, args, bad_lines):
                 unreach_tiles.add((as_int(tile[0]), as_int(tile[1])))
         unreach_stage_lines.extend(ln for ln, _ in sess["unreachable_stages"])
         unreach_summary_lines.extend(ln for ln, _ in sess["unreachable_summaries"])
+        # task-63/task-66：被游戏拒绝的三级留痕（逐格 / 阶段 / 日级汇总）
+        for ln, ev in sess["tool_refused"]:
+            refused_lines.append(ln)
+            tile = ev.get("tile")
+            if isinstance(tile, (list, tuple)) and len(tile) == 2:
+                refused_tiles.add((as_int(tile[0]), as_int(tile[1])))
+        refused_stage_lines.extend(ln for ln, _ in sess["refused_stages"])
+        refused_summary_lines.extend(ln for ln, _ in sess["refused_summaries"])
         # `t` 只该单调不减；回退只记信息项（verify-run3.py 同口径，不当失败）
         prev_t = None
         for ln, ev in sess["events"]:
@@ -1836,6 +1960,17 @@ def build_report(rows, path, args, bad_lines):
             "exempted": _last_day_end.get("unreachable_exempt"),
         }
     _u_checks = as_dict(_last_day_end.get("checks"))
+    # task-63/task-66：被"游戏拒绝"的日级豁免汇总（优先 `refused_summary` 事件，缺失时退回最后一天
+    # day_end 的字段）——与 unreachable 各算各的，两套豁免不互相掩护。
+    refused_summaries = [ev for s in all_sessions for _, ev in s["refused_summaries"]]
+    if refused_summaries:
+        _r_sum = as_dict(refused_summaries[-1])
+    else:
+        _r_sum = {
+            "count": _last_day_end.get("refused"),
+            "bound": _last_day_end.get("refused_bound"),
+            "exempted": _last_day_end.get("refused_exempt"),
+        }
     report["manual_intervention"] = {
         "total": len(manual_all),
         "red_lines": sorted({f["line"] for f in manual_all if f["line"] is not None}),
@@ -1881,6 +2016,25 @@ def build_report(rows, path, args, bad_lines):
         "unreachable_raw_unmet": _u_sum.get("raw_unmet"),
         "unreachable_unmet": _u_sum.get("unmet"),
         "unreachable_within_bound": _u_checks.get("unreachable_within_bound"),
+        # task-63/task-66：被游戏拒绝（till 的 tool_ineffective/precondition_failed）＝ 环境挡路第四形态。
+        # 政策：不计当天硬失败、当天封格、次日重试；日级豁免上界 max(5, 20%×attempted)，
+        # 与 unreachable **独立起界**（各自的 bound/exempt）；越界由 checks.refused_within_bound=false
+        # 进 0 类红（tools\verify-run3.py:518-521 把它判 problem ⇒ 两边同向）。
+        "refused_events": sum(len(s["tool_refused"]) for s in all_sessions),
+        "refused_tiles": sorted([list(t) for t in refused_tiles]),
+        "refused_tile_count": len(refused_tiles),
+        "refused_lines": sorted(set(refused_lines)),
+        "refused_stage_events": sum(len(s["refused_stages"]) for s in all_sessions),
+        "refused_stage_lines": sorted(set(refused_stage_lines)),
+        "refused_summary_events": sum(len(s["refused_summaries"]) for s in all_sessions),
+        "refused_summary_lines": sorted(set(refused_summary_lines)),
+        "refused_count": _r_sum.get("count"),
+        "refused_bound": _r_sum.get("bound"),
+        "refused_attempted": _r_sum.get("attempted"),
+        "refused_exempt": _r_sum.get("exempted"),
+        "refused_raw_unmet": _r_sum.get("raw_unmet"),
+        "refused_unmet": _r_sum.get("unmet"),
+        "refused_within_bound": _u_checks.get("refused_within_bound"),
         "statuses": sorted(statuses),
     }
     # `t` 回退（只记信息项）
@@ -1999,6 +2153,11 @@ MAPPING_TEXT = [
      "5 环境挡路（信息项：**不计当天硬失败**、当天记 blocked、**次日重试**；日级豁免有上界 "
      "max(5, 20%×attempted)，`checks.unreachable_within_bound=false` ⇒ 0 必须人工介入"
      "（豁免越界＝可能把真失败当不可达洗白，verify-run3.py:415-448 判 problem ⇒ 两边同向））"),
+    ("tool_refused / refused_stage / refused_summary（task-63/task-66）",
+     "5 环境挡路（信息项：**不计当天硬失败**、当天封格、**次日重试**；与 unreachable 是两套独立豁免"
+     "（各自的 bound/exempt，不许互相掩护），`checks.refused_within_bound=false` ⇒ 0 必须人工介入"
+     "（豁免越界＝可能把真失败当「游戏拒绝」洗白，verify-run3.py:518-521 判 problem ⇒ 两边同向）；"
+     "`day_end.refused*` / `checks.refused_within_bound` 缺失 ⇒【无法判定】，绝不当通过）"),
     ("day_end.verified=True + 有阶段记录 + Σ stage.ok==0（task-64）",
      "2 白做（红）：自称 VERIFIED 但当天成功动作 0 步（0 步不能自证做过事）。与 "
      "verify-run3.py:604-625 的真空日闸门同口径、**不许更宽**：有阶段记录时不吃 no_intents/"
@@ -2104,6 +2263,14 @@ def render_text(report, top):
               f"attempted={env.get('unreachable_attempted')}、exempt={env.get('unreachable_exempt')}"
             + ("  ⚠ checks.unreachable_within_bound=false ⇒ 0 类红"
                if env.get("unreachable_within_bound") is False else ""))
+    # task-63/task-66：被游戏拒绝（不计当天硬失败、当天封格、次日重试；日级豁免有上界，越界进 0 类红）
+    if env.get("refused_events") or env.get("refused_summary_events"):
+        add(f"游戏拒绝: {env.get('refused_events', 0)} 次 / {env.get('refused_tile_count', 0)} 格"
+            + (f"（tiles={env.get('refused_tiles')[:8]}）" if env.get("refused_tiles") else "")
+            + f"；日级 count={env.get('refused_count')}、bound={env.get('refused_bound')}、"
+              f"attempted={env.get('refused_attempted')}、exempt={env.get('refused_exempt')}"
+            + ("  ⚠ checks.refused_within_bound=false ⇒ 0 类红"
+               if env.get("refused_within_bound") is False else ""))
     t_reg = report.get("t_regressions") or []
     if t_reg:
         add(f"t 回退: {len(t_reg)} 次（信息项，行 {[r['line'] for r in t_reg][:8]}"

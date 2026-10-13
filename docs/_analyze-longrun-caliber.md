@@ -119,10 +119,44 @@ run2 的 `decisions_llm=7` 里有 1 条是兜底：`logs\longrun-3day-llm-run2.j
   事件同样计数且不落未映射 / 弱日只记信息项 + `ok>=5` 干净 / 缺字段只进无法判定）。
 - 顺带：`EVENT_BUCKETS` 同步收了 dev task-63 的 `clear_dead_scope`（只计数，等 run6 形态再定分类）。
 
+## 3.7 被游戏拒绝（task-63 / task-66，dev commit `0d4d1c0` / Lead `2f088d9`）—— 环境挡路的第四种形态
+
+- 事件（brain 钉死）：逐格 `tool_refused`（`tile`/`action`/`stage`/`zone`/`status`/`kind`/`reason`）、
+  阶段级 `refused_stage`（`stage`/`zone`/`tiles`/`in_leftover`/`coords`）、日级 `refused_summary`
+  （`count`/`bound`/`attempted`/`exempted`/`raw_unmet`/`unmet`/`tiles`）。
+  三个名字都进了 `EVENT_BUCKETS`（桶名 `tool_refused` / `refused_stages` / `refused_summaries`）
+  和 `NEW_EVENT_BUCKETS` ⇒ 不落 `unmapped_events`（漂移单测 `TestEventMappingDrift` 现在过）。
+- **归因**：`till` 被游戏拒绝（`tool_ineffective` / `precondition_failed`）是**世界的前置事实**
+  （不可锄的地 / 工具等级不够），不是"我试了没做成" ⇒ 本工具归 **5 环境挡路信息项**
+  （`environment:refused` 逐日聚合 + `environment:refused_stage` 逐阶段），**不计当天硬失败、
+  不并进"该做没做"**；政策是当天封格、**次日重试**。
+- **两套豁免互不掩护**：`unreachable`（task-52）与 `refused`（task-63）各有自己的
+  `bound = max(5, 20%×attempted)` 与 `exempt`，各自从 `no_unmet_stages` 里扣减；
+  本工具的账目差额口径仍与 `tools\verify-run3.py:388-404` 逐字一致（**只认
+  `env_block`+`inconclusive`**）⇒ 拿 `refused` 去把 `stages[].failed` 差额洗平会被判
+  `missed:stage_account`（有单测证伪）。
+- **硬闸门（同向）**：`day_end.checks.refused_within_bound === false` ⇒ 本工具 0 类红
+  `manual:check:refused_within_bound`（文案含 count/bound/exempt，提示人工核对 `refused_tiles`）；
+  `tools\verify-run3.py:518-521` 把它判 problem「锄不动豁免超出上界 bound=…」⇒ 两边同向。
+- **缺失行为**：`day_end.refused*` / `checks.refused_within_bound` 缺失 ⇒ 只进【无法判定】
+  （6 条探针：`event:refused_summary`、`day_end.refused`/`_tiles`/`_bound`/`_exempt`、
+  `day_end.checks.refused_within_bound`），**缺失 ≠ 通过**、也不静默丢弃。
+- **交叉核对（合成账本，留档 `scratch\_t66_*`）**：`scratch\_mk_refused.py` 造
+  `scratch\_ledger_refused_ok.jsonl`（count=3/bound=5/exempt=3/true）与
+  `scratch\_ledger_refused_bad.jsonl`（count=9/bound=5/exempt=5/false）：
+  界内 ⇒ 我 rc=0（0 红）、它只有一条复核信息行；越界 ⇒ 我 rc=1（3 红，含
+  `manual:check:refused_within_bound`）、它 problem「checks.refused_within_bound=false」⇒ 同向。
+- 5 个既有账本判决**不变**：green 0 / run2 1（red=19） / run3 1（red=17） / run5 1（red=62） /
+  vacuum 1（red=3），与 `verify-run3.py` 并排 rc 一致（0/1/1/1/1）。
+- 单测：`tests\test_analyze_longrun.py::TestRefusedAccounting`（6 条：两桶+不落未映射 /
+  界内只 info 且可见 / 越界 ⇒ 0 类红 / 缺字段 ⇒ 无法判定不通过 / refused 与 unreachable
+  计数不串 / refused 不进账目差额口径）。
+
 ## 4. 复核命令
 
 ```
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run5.jsonl   # 有红 ⇒ rc=1（--advisory 才恒 0）
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run5.jsonl   # 判决权威（rc=1 needs_review）
-python -m unittest discover -s tests        # 当前 438 OK
+python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
+python -m unittest discover -s tests        # 当前 455 OK
 ```
