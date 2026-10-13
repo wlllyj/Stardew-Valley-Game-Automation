@@ -2173,6 +2173,109 @@ class TestTask32PlotsCap(unittest.TestCase):
         self.assertFalse(is_justified_end("stuck", "no_work:…"))
 
 
+class MorningIndoorWorld(FakeWorld):
+    """睡完**醒在屋里**的假世界（run3 真实现场：`final.location='FarmHouse'`、`tile=[9,9]`）。
+
+    跨日把玩家丢回 FarmHouse：室内窗口一格都看不见（`tiles=[]`/`tillable=[]`），而 `farm`
+    块仍是全场口径（`dryCrops` = 假世界里没浇的作物数）—— 正是 run3 里"窗口说没活、
+    farm 说还有 33 格干作物"的那对矛盾读数。
+    """
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.goto_calls = 0
+
+    def sleep(self):
+        st = super().sleep()
+        self.location, self.is_outdoor_farm = "FarmHouse", False
+        self.player_tile = [9, 9]
+        return st
+
+    def obs(self):
+        crops = list(self.crops.values())
+        dry = sum(1 for c in crops if not c.get("watered"))
+        ripe = sum(1 for c in crops if c.get("ripe"))
+        # 真机 `FarmScan` 的 farm 口径：全场作物（与窗口无关）。`unwateredCrops` 数的是
+        # `NeedsWatering`、**不是**干格数，所以只信 `dryCrops`/`ripeCrops`。
+        self.farm = {"loaded": True, "complete": True, "crops": len(crops),
+                     "dryCrops": dry, "ripeCrops": ripe,
+                     "unwateredCrops": dry, "hoeDirt": len(self.dirt)}
+        o = super().obs()
+        if not self.is_outdoor_farm:
+            o["location"]["tiles"] = []
+            o["location"]["tillable"] = []
+            o["location"]["furniture"] = []
+        return o
+
+
+class MorningIndoorWorker(FakeWorker):
+    """`ensure_location` 真的换地点（`FakeWorker` 的版本是空动作，测不了"回农场"）。"""
+
+    def ensure_location(self, name, *, tile=None, timeout_ms=30000):
+        self.w.goto_calls += 1
+        self.w.location = str(name)
+        self.w.is_outdoor_farm = (str(name) == "Farm")
+        self.w.player_tile = [62, 14]
+        return StepResult("move_to_location", ok=True, reason=f"回到 {name}")
+
+
+class TestMorningIndoor(unittest.TestCase):
+    """run3 真 bug：睡醒在 FarmHouse ⇒ 窗口 `crops=0` ⇒ 判 `no_work`，连睡 4 天。
+
+    **变异自检**（临时把 A 或 B 单独关掉，本类必须红；脚本 `scratch\\_t32b_mutate.py`，实测 2026-10-13）：
+      * 变异 A（`_ensure_on_farm` 改成直接 `return obs`）⇒ `test_wakes_up_indoor_and_goes_back_to_the_farm`
+        红：`run.run()` 返回 1（`AssertionError: 1 != 0`）—— 第 2 天人在屋里，守卫因 farm 口径
+        "还有活"否决了睡觉，而 `_ensure_plot`/`_work_spot_plot` 在室内窗口拿不出任何目标 ⇒
+        当天以 `stuck:守卫说还有活（…）但没有任何作业区拿得出目标` 收尾、不可验证（`goto_calls==0`）。
+      * 变异 B（`_farm_scope_work` 恒 `None`）⇒ `test_no_work_is_never_asserted_from_an_indoor_window`
+        红：`sleep_guard` 直接放行 `(True, 'no_work', '确实找不到可做的活…')` —— 这就是 run3
+        连睡 4 天的判据本身。
+    """
+
+    def _two_days(self):
+        w = MorningIndoorWorld(weeds=0, seeds=0, money=0)
+        t = (61, 10)
+        w.dirt.add(t)                       # ⚠ 必须同时进 dirt 才进观测
+        w.crops[t] = {"watered": False, "ripe": False}
+        run = make_run(w, target_days=2, max_days=3,
+                       client_factory=lambda: FakeClient(w),
+                       worker_factory=lambda c: MorningIndoorWorker(w))
+        return w, run
+
+    def test_wakes_up_indoor_and_goes_back_to_the_farm(self):
+        w, run = self._two_days()
+        code = run.run()
+        reps = run.days
+        self.assertEqual(code, 0, run.logs)
+        self.assertEqual(len(reps), 2, [r.day_text for r in reps])
+        # ① 不许出现"`no_work` 却还有干作物"的一天（run3 的连睡就是这条被违反）
+        for rep in reps:
+            if rep.ended_reason.split(":", 1)[0] == "no_work":
+                self.assertEqual(int((rep.final_water or {}).get("dry") or 0), 0,
+                                 f"{rep.day_text}：{rep.ended_reason}｜{rep.final_water}")
+        # ② 跨日后必须真的回过农场（worker 计数 + journal）
+        self.assertGreaterEqual(w.goto_calls, 1, run.logs)
+        self.assertTrue([e for e in run.entries
+                         if e["event"] == "goto_farm" and e.get("where") == "day_start"], run.entries)
+        # ③ 两天都 VERIFIED（第 2 天正是"睡醒在屋里"那一天）
+        self.assertTrue(all(r.verified for r in reps), [r.checks for r in reps])
+
+    def test_no_work_is_never_asserted_from_an_indoor_window(self):
+        """C：人在室内 + farm 说还有干作物 ⇒ `sleep_guard` 必须否决，不许放行 `no_work`。"""
+        w, run = self._two_days()
+        run.worker = MorningIndoorWorker(w)
+        w.location, w.is_outdoor_farm = "FarmHouse", False
+        obs = w.obs()                        # 室内窗口（tiles=[]）、farm.dryCrops=1
+        self.assertFalse(run._is_farm(obs))
+        allow, code, text = run.sleep_guard(obs)
+        self.assertFalse(allow, (allow, code, text))
+        self.assertEqual(code, "keep_working")
+        self.assertIn("人在室内", text)
+        self.assertIn("先回农场", text)
+        self.assertTrue(run.work_reasons(obs), run.work_reasons(obs))   # B：farm 口径也算"有活"
+        self.assertEqual(run._farm_scope_work(obs), (1, 0), obs.get("farm"))
+
+
 if __name__ == "__main__":
     unittest.main()
 

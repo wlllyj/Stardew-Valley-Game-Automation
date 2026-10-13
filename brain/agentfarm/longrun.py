@@ -524,6 +524,47 @@ class LongRun:
     def _is_farm(self, obs: dict[str, Any]) -> bool:
         return bool((obs.get("location") or {}).get("isOutdoorFarm"))
 
+    def _ensure_on_farm(self, obs: dict[str, Any], rep: DayReport) -> dict[str, Any]:
+        """【run3 真 bug】当天开工前把人带回户外农场；失败**不吞**（notes + journal）。
+
+        睡醒默认在 FarmHouse（室内），而所有作业判据（`work_reasons`/`_ensure_plot`/
+        `_stage_tiles`）都只看**玩家窗口**：室内窗口 `crops=0` ⇒ 会判成"没活"⇒ 连睡好几天，
+        账本里 `ended_reason` 是 `no_work` 而 `final_water` 还是 `dry=33/33`（自相矛盾）。
+        回不去时**不假装成功**：如实记 notes，当天由守卫/策略层按"不在农场"处理。
+        """
+        if self._is_farm(obs):
+            return obs
+        assert self.worker is not None
+        st = self.worker.ensure_location(self.farm)
+        self._actions += 1
+        self._journal("goto_farm", ok=st.ok, code=st.code, reason=st.reason,
+                      where="day_start", before=st.before, after=st.after, receipt=st.receipt)
+        if not st.ok:
+            rep.notes.append(f"回不去 {self.farm}：{st.reason}")
+            self._say(f"  × 回 {self.farm} 失败：{st.reason}")
+            return obs
+        self._say(f"  · 回到 {self.farm}：{st.reason}")
+        try:
+            return self._snap()
+        except BridgeError as exc:
+            rep.notes.append(f"回到 {self.farm} 之后观测失败：{exc}")
+            return obs
+
+    def _farm_scope_work(self, obs: dict[str, Any]) -> tuple[int, int] | None:
+        """`farm` 块的"还有活"读数 `(dry, ripe)`；`None` = 此刻不是可用证据。
+
+        只有在**人不在户外农场**时才有意义：此刻窗口观测只覆盖室内（`crops=0`），用它判
+        "有没有活"必然误判。字段口径按 `mod\\AgentFarm.Bridge\\Contracts.cs` 的 `FarmView`：
+        **`dryCrops` 才是"干着的作物格数"**，`unwateredCrops` 数的是 `NeedsWatering` 的作物
+        （run3 里它整天 32→32，不能拿来判"今天浇完没有"）。
+        """
+        if self._is_farm(obs):
+            return None
+        farm = obs.get("farm") or {}
+        if farm.get("complete") is not True or farm.get("loaded") is False:
+            return None                     # 旧 Mod / 未加载（全 0）⇒ 不算证据
+        return (int(farm.get("dryCrops") or 0), int(farm.get("ripeCrops") or 0))
+
     @staticmethod
     def _essence(obs: dict[str, Any]) -> dict[str, Any]:
         """观测要点（差分/成绩单用）：只留"够判断"的字段，别把整个快照塞进日志。"""
@@ -986,6 +1027,16 @@ class LongRun:
         seeds, money, can_plant = self._seed_outlook(obs)
         if seeds <= 0 and can_plant:
             reasons.append(f"没种子但钱够（{money}g ≥ {self.seed_price}g），该去买")
+        # 【run3 真 bug B】人不在农场时，窗口观测只覆盖室内 ⇒ 上面两条必然为空。
+        # 真值在 `farm` 块（`complete=true` 时 `dryCrops`/`ripeCrops` 是全农场口径）：
+        # 有干作物/熟作物就是"还有活"，而且第一件事是**先回农场**（见 `_ensure_on_farm`）。
+        farm_work = self._farm_scope_work(obs)
+        if farm_work is not None:
+            dry, ripe = farm_work
+            if dry > 0:
+                reasons.append(f"人不在农场，但 farm 口径还有 {dry} 格干作物（先回去浇）")
+            if ripe > 0:
+                reasons.append(f"人不在农场，但 farm 口径还有 {ripe} 格熟作物（先回去收）")
         for cand in self._plot_candidates(obs):
             if self._plot_has_work(obs, cand["tiles"]):
                 reasons.append(f"{cand.get('zone') or '附近'}还有地要清/开/种")
@@ -1031,6 +1082,16 @@ class LongRun:
                 )
         if stam < self.min_stamina:
             return True, "stamina", f"体力 {stam:g} < {self.min_stamina:g}"
+        # 【run3 真 bug C】"没活"这条放行理由**必须在户外农场观测上成立**：人在室内
+        # （睡醒在 FarmHouse）时窗口 `crops=0`，而 `farm` 口径可能还有一堆干作物 ——
+        # 此时一律否决（先回农场），绝不允许把"人没到地里"当成"地里没活"。
+        farm_work = self._farm_scope_work(obs)
+        if farm_work is not None and (farm_work[0] > 0 or farm_work[1] > 0):
+            loc = str((obs.get("location") or {}).get("name") or "?")
+            return False, "keep_working", (
+                f"人在室内（{loc}）、farm 口径还有 {farm_work[0]} 格干作物 / "
+                f"{farm_work[1]} 格熟作物，先回农场再说"
+            )
         reasons = self.work_reasons(obs)
         if not reasons:
             return True, "no_work", "确实找不到可做的活（地里的活干完了、也没法/没必要买种子）"
@@ -1780,6 +1841,13 @@ class LongRun:
                       stamina=ess["stamina"], money=ess["money"], crops=ess["crops"],
                       unwatered=ess["unwatered_crops"], location=ess["location"],
                       weather=FarmWorker.weather(obs))
+
+        # 【run3 真 bug：醒在屋里就再也不去农场】`_prepare()` 只在 `run()` 启动时回农场一次，
+        # 之后每个游戏日都在 FarmHouse 醒来（run3：`final.location='FarmHouse'`、`tile=[9,9]`、
+        # `isInBed=true`、`timeOfDay=600`），整天拿**室内窗口**当观测 ⇒ `work_reasons`/
+        # `_ensure_plot` 全判"没活" ⇒ 连睡 4 天，`final_water` farm 口径还是 `dry=33/33`。
+        # 所以每天第一张观测之后、进主循环之前必须先回农场；失败**不吞**（notes + journal）。
+        obs = self._ensure_on_farm(obs, rep)
 
         last_obs = obs
         # task-19：当天**最后一个户外农场快照**（窗口口径浇水证据的来源）。日终再问必然是室内的
