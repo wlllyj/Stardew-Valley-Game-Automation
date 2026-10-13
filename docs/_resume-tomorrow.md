@@ -3,7 +3,25 @@
 > 本文是**收工快照**，只写"明天开工要用的东西"。`docs\_resume-prompt.md` 是 P2 时代的三步恢复法（仍然有效：单测 → `deploy-mod.py` → `run-plot.py`），但它的状态表已过期，以本文为准。
 > 目标不变：**P3 ⑥ —— 端到端自主完成「清障 → 开垦 → 播种 → 浇水」，连续 3 个游戏日无人工介入**（判据一律用 `observe?detail=full` 的 `tiles[]`/`inventory[]`/`money` 差分，回执不算证据）。
 
-## 0c. 2026-10-13 02:40 整理停当（**最新，与下文冲突以本节为准**）
+## 0d. 2026-10-14 收工（**最新，与下文冲突以本节为准**）
+
+用户节奏：`User said (m10163)`：「完成现有的任务后，跑一次真实的游戏运行，然后结束今天的事情，总结整理今天的进展，明天再继续」⇒ **今天到此为止，明天继续**。
+
+- **状态（收工实测）**：Mod **0.7.25 已冻结并装机**（`manifest.json` 0.7.25 + `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED="0.7.25"`，dll 170496 B / manifest 18426 B）；**游戏已优雅退出**（`tools/stop-game.py`，原 pids=[27276]）、`bridge.json` 已删、17890 无监听；存档 `Wahaha_450799035` 最后一次落盘 = summer 2（20:22:58）——summer 3 的落盘被日终菜单推迟，`dismiss_modal` 关掉 `ShippingMenu` 后仍未落盘（task-47 的 U2 未定项，`docs/_il-newday-save.md`）。
+- **今天的真实运行 = run6**（`logs/longrun-3day-llm-run6.jsonl`，21:41:21 起跑、**37.2 秒**、exit 1、**0/3 天**）：summer 4 两轮都 `ended_by=stuck`（连续 3 轮世界无变化）、`verified=false`。证据 = `docs/_run6-evidence.md`（含 42 格坐标）。三个真缺陷 ⇒ 明天的活：
+  1. **采购硬编码春季种子 472** ⇒ 夏季 SeedShop 无货，`buy` 6 次全 `item_not_sold`（货架是 Melon/Tomato/Blueberry/Pepper/Wheat/Radish/Poppy/Spangle）⇒ **task-67**（dev-coder，今天在制并收尾）：按季/按在售清单选种；缺种子诚实记 `no_seed_for_sale` / `seed_unavailable_today`。
+  2. **枯死作物全被杂物包围**：`clear_dead` 0 成功、42 格「四邻都站不过去」> bound 8 ⇒ `checks.unreachable_within_bound=false` ⇒ **task-68**（`blocked_by task-67`）：planner 死锁守卫 + 前沿优先/先清四邻，不许一回合 0 动作。
+  3. **守卫死锁指纹**：`idle{rounds:3}` + `stage_exhausted{clear_dead,leftover:30,doomed:30}` + 唯一阶段 ok 全 0 ⇒ 口径已落 `docs/_analyze-longrun-caliber.md` §3.8（**task-69 已 completed**，`13f5a16`，全量 459 OK）。
+- **今晚落盘**：`docs/_run6-criteria.md`（判据）、`docs/_release-0.7.26.md`（下一版清单：task-67/68 + 收尾项）、`docs/00-开发日志.md` 条目 047；提交 `d290509`（**verify-run3 同日重试按会话计数**，修掉 run6 上假"不可达不一致" + 2 条回归用例）、`735f4e4`（条目 047）、`9cc4f3c`（0.7.26 发布文档）、`ffda30a`/`fcf0116`（run6 证据）、`13f5a16`（task-69）。
+- **队友与板面**：dev-coder 在收尾 task-67（已发收工窗口令：做不完就提交 WIP，绝不留脏树）；log-analyst 待命（**task-70** = analyze-longrun 收 `no_seed_for_sale`/`seed_unavailable_today` 两个新桶，`blocked_by task-67`；全量当前唯一红就是这条漂移测试）；machine-runner 待命（run7 命令已备）；deputy-lead 在做 **task-54**（task-50/51/52/63 对抗验收 + 打穿豁免洗白通道）。
+- **明天开工 30 分钟版**：
+  1. `git status --short` + `python -m unittest discover -s tests`（若 dev-coder 交了 task-67，唯一红应是 `TestEventMappingDrift` ⇒ 归 task-70）。
+  2. 收 task-67 → 派 task-70（log-analyst）→ task-68（依赖 67）→ 收 task-54。
+  3. 全绿后冻结 **0.7.26**：`tools/_note-0726.txt`（首串必须是 `v0.7.26`）→ `python tools/_bump-mod-version.py 0.7.26 --note-file tools/_note-0726.txt` → 改 `brain/agentfarm/bridge.py:39` → `dotnet build .\mod\AgentFarm.Bridge\AgentFarm.Bridge.csproj -c Release --nologo --no-incremental`（0 警 0 错）→ 提交 → `git add -A`（未跟踪 `scratch/*.py` 会被当成脏树）→ `python tools/check-release.py --expect 0.7.26` → `python tools/deploy-mod.py --no-quit` → `python tools/preflight.py --expect 0.7.26 --save-baseline logs/run7-baseline.json`。
+  4. **脱离式起跑**（DSH 托管后台作业会在回合边界被连根收掉，run4 只跑 13 秒）：`python tools/start-detached-longrun.py --journal logs/longrun-3day-llm-run7.jsonl --expect-version 0.7.26`（先 `--dry-run` 看四要素）→ `tools/verify-run3.py` + `tools/analyze-longrun.py` 双复核 + `scratch/run6-snapshot.py` 外部快照。
+  5. ⚠ goal `goal-1ee4cda9-fdd4-4ba0-80cb-0c06902157eb` = **phase paused / disarmed**（模型侧不能 resume）⇒ 明天在界面里 resume，或直接对我说「继续」。
+
+## 0c. 2026-10-13 02:40 整理停当（**与下文冲突以本节为准**）
 
 用户节奏：`User said (m04479)` goal 轮续跑 → `User said (m04528): "停下来了把？明天再搞"` → `User said (m07147): "重新整理一下，明天在继续任务"` ⇒ **今天到此为止，明天开工**。
 
