@@ -516,6 +516,33 @@ namespace AgentFarm.Bridge
         /// 只在 <see cref="Complete"/> == true（整场 Farm 分帧扫描跑完）时可信。
         /// </summary>
         [JsonPropertyName("dryCrops")] public int DryCrops { get; set; }
+
+        /// <summary>
+        /// **干作物格的坐标**（`[[x, y], …]`）。坐标是**农场地图格坐标**，与 <see cref="DryCrops"/>
+        /// 同一次扫描口径：`HoeDirt.crop != null &amp;&amp; !HoeDirt.isWatered()`。
+        ///
+        /// 【为什么需要】脑侧能看到的只有玩家周围最近的 400 格（`location.tiles[]`，
+        /// 且带 `tilesTruncated=true`），农场另一头那 1 格干作物既看不到也没坐标
+        /// ⇒ run5 三天 `final_water.dry` 恒为 1、`watered_outdoor=false`（task-50）。
+        ///
+        /// 【与 <see cref="DryCrops"/> 严格同口径】**死苗也算**（`Crop.dead` 的格子本来也能浇水，
+        /// 且 `dryCrops` 把它们计入"干"）。Mod 侧刻意**不做任何过滤**：过滤会让两个字段将来对不上账
+        /// （Lead 2026-10-13 更正）。要不要浇死苗由脑侧按"能不能省"决定；清死苗走 task-51，
+        /// 清掉之后 <see cref="DryCrops"/> 自然下降。
+        ///
+        /// 排序：先 `y` 再 `x`（确定性，便于测试与人工核对）。
+        /// 上限 <see cref="FarmScanCache.DryTilesMax"/> = 64 条；超出时坐标列表截断并置
+        /// <see cref="DryTilesTruncated"/> = true（**计数仍以 <see cref="DryCrops"/> 为准**）。
+        /// 只在 <see cref="Complete"/> == true（整场 Farm 跑完一轮）时可信；旧 Mod 无此字段 ⇒ null。
+        /// </summary>
+        [JsonPropertyName("dryTiles")] public int[][] DryTiles { get; set; }
+
+        /// <summary>
+        /// <see cref="DryTiles"/> 是否因超过 64 条上限被截断。
+        /// **null = 旧 Mod 没有这个字段**（脑侧此时不许把"没给坐标"当成"没有干格"）。
+        /// </summary>
+        [JsonPropertyName("dryTilesTruncated")] public bool? DryTilesTruncated { get; set; }
+
         [JsonPropertyName("weeds")] public int Weeds { get; set; }
         [JsonPropertyName("stones")] public int Stones { get; set; }
         [JsonPropertyName("twigs")] public int Twigs { get; set; }

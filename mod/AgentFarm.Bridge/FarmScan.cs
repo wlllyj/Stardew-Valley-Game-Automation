@@ -30,6 +30,16 @@ namespace AgentFarm.Bridge
         /// <summary>统计结果的软生存期（秒）。超过就重扫一轮。</summary>
         private const double FreshSeconds = 2.0;
 
+        /// <summary>
+        /// `farm.dryTiles` 的坐标上限（task-50）。
+        ///
+        /// 【为什么是 64】干作物是"今天没浇完"的**待办清单**，正常农场一轮也就十几到几十格；
+        /// 64 条 × 2 个 int 的 JSON 完全可以接受，而超过 64 说明整个农场都没浇（脑侧
+        /// 本来也只能一小片一小片做，先做最近的即可）⇒ 截断并置 `dryTilesTruncated=true`，
+        /// **计数仍以 `dryCrops` 为准**（脑侧不许拿截断列表当"全部"）。
+        /// </summary>
+        public const int DryTilesMax = 64;
+
         // ---- 游戏内 ID 常量（1.6.x 的 ItemId 风格字符串）----
         private static readonly HashSet<string> MachineIds = new HashSet<string>(StringComparer.Ordinal)
         {
@@ -61,6 +71,9 @@ namespace AgentFarm.Bridge
         private int _partialIndex;
         private List<KeyValuePair<Microsoft.Xna.Framework.Vector2, TerrainFeature>> _terrain = new List<KeyValuePair<Microsoft.Xna.Framework.Vector2, TerrainFeature>>();
         private List<KeyValuePair<Microsoft.Xna.Framework.Vector2, SObject>> _objects = new List<KeyValuePair<Microsoft.Xna.Framework.Vector2, SObject>>();
+
+        /// <summary>本轮扫到的干作物格坐标（task-50；发布时排序 + 截断）。</summary>
+        private readonly List<int[]> _dryTiles = new List<int[]>();
 
         private FarmView _acc = NewAccumulator();
         private FarmView _published;         // 最近一次完整结果（网络线程只读）
@@ -95,6 +108,7 @@ namespace AgentFarm.Bridge
             _partialIndex = 0;
             _terrain = new List<KeyValuePair<Microsoft.Xna.Framework.Vector2, TerrainFeature>>();
             _objects = new List<KeyValuePair<Microsoft.Xna.Framework.Vector2, SObject>>();
+            _dryTiles.Clear();
             _acc = NewAccumulator();
         }
 
@@ -156,7 +170,8 @@ namespace AgentFarm.Bridge
 
                     while (budget > 0 && _partialIndex < _terrain.Count)
                     {
-                        AccumulateTerrain(_terrain[_partialIndex].Value);
+                        // task-50：把坐标一起传进去（KVP 的 Key 就是该格坐标）
+                        AccumulateTerrain(_terrain[_partialIndex]);
                         _partialIndex++;
                         budget--;
                     }
@@ -203,14 +218,46 @@ namespace AgentFarm.Bridge
                 _scanSeq = worldSeq;
                 _acc.Complete = true;
                 _acc.ScanSeq = worldSeq;
+                PublishDryTiles();
                 Volatile.Write(ref _published, _acc);
                 _publishedAtUtc = DateTime.UtcNow;
                 ResetCycle();
             }
         }
 
-        private void AccumulateTerrain(TerrainFeature tf)
+        /// <summary>
+        /// 把本轮扫到的干作物格坐标排序 + 截断后写进待发布的 <see cref="_acc"/>（task-50）。
+        ///
+        /// * 排序：先 `y` 再 `x`（确定性）；坐标是**农场地图格坐标**，与 `dryCrops` 同一次扫描。
+        /// * 截断：超过 <see cref="DryTilesMax"/> 只保留前 N 条并置 `DryTilesTruncated = true`。
+        /// * 任何异常都不许影响统计发布：退回空数组 + `DryTilesTruncated = true`（不确定就说不确定）。
+        /// </summary>
+        private void PublishDryTiles()
         {
+            try
+            {
+                var ordered = new List<int[]>(_dryTiles);
+                ordered.Sort((a, b) => a[1] != b[1] ? a[1] - b[1] : a[0] - b[0]);
+                bool truncated = false;
+                if (ordered.Count > DryTilesMax)
+                {
+                    truncated = true;
+                    ordered = ordered.GetRange(0, DryTilesMax);
+                }
+
+                _acc.DryTiles = ordered.ToArray();
+                _acc.DryTilesTruncated = truncated;
+            }
+            catch
+            {
+                _acc.DryTiles = new int[0][];
+                _acc.DryTilesTruncated = true;
+            }
+        }
+
+        private void AccumulateTerrain(KeyValuePair<Microsoft.Xna.Framework.Vector2, TerrainFeature> entry)
+        {
+            TerrainFeature tf = entry.Value;
             if (tf == null) return;
 
             if (tf is HoeDirt dirt)
@@ -240,7 +287,14 @@ namespace AgentFarm.Bridge
                     // 上面那个 UnwateredCrops 用的是 needsWatering()，它不看浇水状态（docs\_analyze-farmcounts.md）。
                     try
                     {
-                        if (!dirt.isWatered()) _acc.DryCrops++;
+                        if (!dirt.isWatered())
+                        {
+                            _acc.DryCrops++;
+                            // task-50：把坐标也带上（脑侧只有玩家周围 400 格窗口，看不到农场另一头）。
+                            // 口径与 dryCrops 严格一致：只判 !isWatered()，**死苗也照报**
+                            // （Lead 2026-10-13 更正：Mod 侧不许自作主张过滤，否则两个字段对不上账）。
+                            _dryTiles.Add(new[] { (int)entry.Key.X, (int)entry.Key.Y });
+                        }
                     }
                     catch { }
                 }
