@@ -80,8 +80,30 @@ namespace AgentFarm.Bridge
     /// </summary>
     internal sealed class StepMover
     {
-        /// <summary>寻路时“角色连着多少帧像素位置没变”判为卡死（60fps 下约 1.5 秒）。</summary>
-        public const int StuckFrames = 90;
+        /// <summary>
+        /// 寻路时“连着多少帧既没动像素、也没换格”判为卡死（60fps 下约 3 秒）。
+        ///
+        /// 【task-43 为什么从 90 提到 180】卡面 rev3 的口径是
+        /// **“有进展就不许放弃，只有连续 ~3s 玩家格不变才判 `stuck` 早退”**。
+        /// run4 实证：同一候选两次 8s 分别剩 52 / 16 步（人在稳定推进，≈4.5 格/s），
+        /// 旧代码却在 8s 预算一到就 `timeout` 并换候选 ⇒ 两次后放弃。
+        /// 判定用“像素动过 **或** 玩家格变过”（走路是逐像素推进，只盯像素在慢速移动下会误判）。
+        /// </summary>
+        public const int StuckFrames = 180;
+
+        /// <summary>
+        /// 【task-43】预算用尽但**人还在推进**时，一次续多少毫秒（真机实测 ≈4.5 格/s）。
+        ///
+        /// 【为什么必须续】run4 实证：`Farm [47,29]` → 农舍门口 A* 真实路径 ≈ **88 步**
+        /// （直线 31 格，被草/石/枝/树逼得绕路 3 倍），而旧代码每跳固定 8000ms ——
+        /// 同一候选连走两次分别剩 52 步、16 步，**人在稳定推进**，却两次都被判 `timeout`；
+        /// 14:48 的两个日报告都因此 `sleep_failed`。所以判据必须是
+        /// **“玩家格还在变 / 剩余步数还在减”就续跳，只有连续 ~3s 玩家格不变才判卡死**。
+        /// </summary>
+        public const int ExtensionMs = 8000;
+
+        /// <summary>一次行走最多续预算几次（防"绕圈子一直走"；超出后仍如实报 `timeout`）。</summary>
+        public const int MaxBudgetExtensions = 8;
 
         /// <summary>
         /// 【着陆契约修复】到达目标格之后，还要**连续**多少帧“像素位置没动”才算真的站定
@@ -106,18 +128,35 @@ namespace AgentFarm.Bridge
 
         private readonly GameLocation _loc;
         private readonly Point _target;
-        private readonly int _timeoutMs;
+        private int _timeoutMs;
         private readonly string _label;
 
         /// <summary>上一 tick 的像素位置（用来判“这一帧到底动没动”）。</summary>
         private Vector2 _lastTickPosition;
         private int _stuckFrames;
 
+        /// <summary>上一 tick 的**玩家格**（task-43：格变了也算进展，慢速走路时比像素更稳）。</summary>
+        private Point _lastTilePoint;
+
+        /// <summary>本条行走已经续过几次预算（task-43：上限 <see cref="MaxBudgetExtensions"/>，防绕圈）。</summary>
+        private int _extensions;
+
         /// <summary>连续“在目标格上且像素没动”的帧数（见 <see cref="SettleFrames"/>）。</summary>
         private int _settleFrames;
 
         /// <summary>A* 给出的剩余步数（发起时捕获，仅用于失败时的诊断文案）。</summary>
         public int PathSteps { get; private set; }
+
+        /// <summary>
+        /// 把本次行走的时间预算**抬高**（只增不减）。
+        ///
+        /// 【task-43】真实剩余步数只有 <see cref="Begin"/> 跑完 A* 才知道，而 `Tick` 是拿
+        /// `elapsed > 预算` 判超时的 ⇒ 发起后抬高完全来得及，不必为了拿步数跑两遍 A*。
+        /// </summary>
+        public void RaiseBudget(int ms)
+        {
+            if (ms > this._timeoutMs) this._timeoutMs = ms;
+        }
 
         public Point Target => _target;
         public GameLocation Location => _loc;
@@ -160,6 +199,8 @@ namespace AgentFarm.Bridge
                 }
 
                 this._lastTickPosition = Game1.player.Position;
+                this._lastTilePoint = Game1.player.TilePoint;
+                this._extensions = 0;
                 this._stuckFrames = 0;
                 this._settleFrames = 0;
 
@@ -232,15 +273,48 @@ namespace AgentFarm.Bridge
                         + $"目标 {FormatTile(this._target)}），已停止");
                 }
 
-                // 3) 超时：必须停止寻路，绝不能把玩家卡在控制器里
+                // 3) 【task-43】进展证据：像素动过 **或** 玩家格变过 ⇒ 刷新"卡死"计数。
+                //    走路是逐像素推进（慢速移动时单帧位移可能不到 2px），所以"格变没变"比像素更可靠。
+                Point nowTile = Game1.player.TilePoint;
+                bool movedPixels = deltaSq > 4f;
+                bool movedTile = nowTile != this._lastTilePoint;
+                if (movedTile) this._lastTilePoint = nowTile;
+                if (movedPixels || movedTile) this._stuckFrames = 0;
+                else this._stuckFrames++;
+
+                // 3b) 刷新诊断用的"剩余步数"（A* 路径在缩短 ⇒ 失败文案能看出人在推进）。
+                try
+                {
+                    if (Game1.player.controller is PathFindController pc)
+                    {
+                        int left = pc.pathToEndPoint?.Count ?? this.PathSteps;
+                        if (left > 0) this.PathSteps = left;
+                    }
+                }
+                catch
+                {
+                    // 拿不到就保持旧值：这里只是诊断文案，不参与任何判据
+                }
+
+                // 4) 超时：预算用尽时**先看有没有进展** —— task-43 的核心口径。
+                //    run4 实证：真实路径 ≈88 步（A* 被草/石/枝/树逼得绕路 3 倍），旧代码每跳固定 8000ms，
+                //    而玩家 8s 能从"剩 52 步"走到"剩 16 步"（≈4.5 格/s）⇒ 人在稳定推进却被判 `timeout`。
+                //    口径：**只要还在推进就续预算**（一次 <see cref="ExtensionMs"/>，最多
+                //    <see cref="MaxBudgetExtensions"/> 次）；真正没进展由下面的卡死判据（~3s）收尾。
                 if (elapsedMs >= this._timeoutMs)
                 {
+                    if (this._stuckFrames == 0 && this._extensions < MaxBudgetExtensions)
+                    {
+                        this._extensions++;
+                        this._timeoutMs = (int)elapsedMs + ExtensionMs;
+                        return MoveOutcome.Running();   // 续跳：绝不打断正在推进的行走
+                    }
                     HaltPlayer();
                     return new MoveOutcome(MoveStopKind.Timeout,
                         $"{this._label} 超时（{this._timeoutMs}ms，剩余 {this.PathSteps} 步未走完），已停止寻路");
                 }
 
-                // 4) 模态/过场打断
+                // 5) 模态/过场打断
                 if (!PlayerFree() || Game1.activeClickableMenu != null || EventOrDialogue())
                 {
                     HaltPlayer();
@@ -248,20 +322,12 @@ namespace AgentFarm.Bridge
                         "移动过程中被菜单/对话/过场打断，已停止寻路");
                 }
 
-                // 5) 卡死检测：像素位置长时间不变
-                if (deltaSq > 4f)
+                // 6) 卡死检测：约 3 秒没有位移也没换格 ⇒ 真卡住，早退（不烧满预算）
+                if (this._stuckFrames > StuckFrames)
                 {
-                    this._stuckFrames = 0;
-                }
-                else
-                {
-                    this._stuckFrames++;
-                    if (this._stuckFrames > StuckFrames)
-                    {
-                        HaltPlayer();
-                        return new MoveOutcome(MoveStopKind.Blocked,
-                            $"角色在 {FormatTile(this._target)} 途中被挡住（约 {StuckFrames / 60.0:0.0} 秒没有位移），已停止寻路");
-                    }
+                    HaltPlayer();
+                    return new MoveOutcome(MoveStopKind.Blocked,
+                        $"角色在 {FormatTile(this._target)} 途中被挡住（约 {StuckFrames / 60.0:0.0} 秒没有位移），已停止寻路");
                 }
 
                 return MoveOutcome.Running();   // 继续走

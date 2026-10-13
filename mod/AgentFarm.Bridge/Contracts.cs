@@ -113,6 +113,12 @@ namespace AgentFarm.Bridge
 
         /// <summary>v3 新增：游戏级暂停/时间状态（诊断“看起来正常但世界停摆”用）。</summary>
         [JsonPropertyName("game")] public GameStateView Game { get; set; }
+
+        /// <summary>
+        /// v0.7.24 新增：出货箱内容（task-42）。`shipItem` 的**唯一客观判据**：
+        /// 钱要等下一次 `NewDay` 才结算，在那之前只能看"东西真的进箱了没有"。
+        /// </summary>
+        [JsonPropertyName("shippingBin")] public ShippingBinView ShippingBin { get; set; }
     }
 
     internal sealed class ClockView
@@ -338,6 +344,36 @@ namespace AgentFarm.Bridge
 
         /// <summary>是不是工具（`Tool` 子类）。</summary>
         [JsonPropertyName("isTool")] public bool IsTool { get; set; }
+    }
+
+    /// <summary>
+    /// 出货箱视图（task-42 新增，快照 v0.7.24）。
+    ///
+    /// 【为什么必须新增它 —— docs/_il-sell-path.md §6 U1】
+    /// `Farm.shipItem` 是把物品**搬进箱子**，钱要等**下一次 `NewDay`** 才结算
+    /// （`_newDayAfterFade` 里 `player.Money = player.Money + total`）。
+    /// 在那之前，唯一的"东西真的进箱了"的证据就是箱子的内容 ⇒ 没有这个字段，
+    /// 脑侧“卖出成功”的判据就只能看回执（回执不算证据）。
+    ///
+    /// 【为什么不是塞进 `farm`】`FarmView` 读的是后台扫描线程的缓存（可能过期/跨线程），
+    /// 而箱子是**主线程当帧**的真值，所以放在快照顶层由 `WorldSnapshot.Read()` 现读。
+    /// </summary>
+    internal sealed class ShippingBinView
+    {
+        /// <summary>箱子对象是否拿得到（`Farm.getShippingBin(player)` 非 null）。</summary>
+        [JsonPropertyName("present")] public bool Present { get; set; }
+
+        /// <summary>箱子里**非空**物品件数。</summary>
+        [JsonPropertyName("count")] public int Count { get; set; }
+
+        /// <summary>箱内物品（槽位/ qualifiedId / 数量；只报非空的）。</summary>
+        [JsonPropertyName("items")] public ItemView[] Items { get; set; }
+
+        /// <summary>`Farm.lastItemShipped` 的 qualifiedId（没有则是空串）。</summary>
+        [JsonPropertyName("lastItemShipped")] public string LastItemShipped { get; set; }
+
+        /// <summary>该存档是否用独立钱包（决定箱子是玩家个人箱还是共享箱）。</summary>
+        [JsonPropertyName("separateWallets")] public bool SeparateWallets { get; set; }
     }
 
     /// <summary>单格清单项（快照 v0.7.4 / `agentfarm-world/6` 新增，仅 `detail=full`）。</summary>
@@ -629,6 +665,25 @@ namespace AgentFarm.Bridge
         /// <c>Utility.TryOpenShopMenu(shopId, ...)</c> 去查 <c>Data/Shops</c>，Mod 不解析它。
         /// </summary>
         [JsonPropertyName("shop")] public string Shop { get; set; }
+
+        /// <summary>
+        /// <c>sell</c> 专用：要出货的**背包槽位下标**（task-42）。
+        ///
+        /// 【为什么必须给槽位而不是物品名】`Farm.shipItem(item, who)` 内部的
+        /// `Farmer.removeItemFromInventory` 用的是 `Items.IndexOf(which)`（**引用相等**）⇒
+        /// 必须把**背包里那个实例**交出去；脑侧只报"要卖什么名字"，Mod 就必须反过来在背包里
+        /// 找"第一件同名的"——那可能不是脑想卖的那一件（品质/堆叠不同）。槽位是唯一无歧义的指认。
+        /// </summary>
+        [JsonPropertyName("slot")] public int? Slot { get; set; }
+
+        /// <summary>
+        /// <c>sell</c> 专用：**白名单**（`QualifiedItemId`，如 `(O)24`、`(O)472`）。
+        ///
+        /// 【纪律】只做**允许列表**，绝不做"除了工具都能卖"的黑名单：脑侧只把
+        /// `harvest()` 当天亲眼见过"进了背包"的 qualifiedId 放进来；空数组 = 一件都不许卖
+        /// （Mod 直接拒绝），避免"上游 bug 把种子/工具卖了"。
+        /// </summary>
+        [JsonPropertyName("sellWhitelist")] public string[] SellWhitelist { get; set; }
     }
 
     /// <summary>

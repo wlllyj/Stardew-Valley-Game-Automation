@@ -344,6 +344,25 @@ class DeterministicPlanTests(unittest.TestCase):
         self.assertTrue(P.deterministic_plan(make_brief()))
         self.assertTrue(P.deterministic_plan(make_brief(has_save=False, stamina=0.0)))
 
+    def test_sellable_loot_ships_before_tilling_or_planting(self):
+        """task-42：今天亲手收获的东西**先出掉**（卖了才有钱买种子），且排在开垦/播种前。
+
+        `sellable` 不是观测推出来的字段（白名单在 `FarmWorker.harvested`，由长跑控制器注入），
+        所以这里钉死两件事：①它 >0 时才出现 `ship`；②它排在"清障/开垦/播种"之前。
+        """
+        brief = make_brief(counts=make_counts(tillable=12, dirt=9, plantable=9), sellable=3)
+        intent = P.deterministic_plan(brief)[0]
+        self.assertEqual(intent.task, "ship")
+        self.assertIn("3 件", intent.reason)
+        self.assertIn("NewDay", intent.expected_evidence)
+        no_loot = make_brief(counts=make_counts(tillable=12, dirt=9, plantable=9), sellable=0)
+        self.assertNotEqual(P.deterministic_plan(no_loot)[0].task, "ship")
+
+    def test_dry_crops_still_outrank_shipping(self):
+        """浇水永远第一优先：地里有干作物时不许先去卖东西。"""
+        brief = make_brief(counts=make_counts(dirt=9, crops=9, unwatered_crops=4), sellable=3)
+        self.assertEqual(P.deterministic_plan(brief)[0].task, "water_area")
+
 
 # --------------------------------------------------------- 终态只有两个
 class TerminalStateTests(unittest.TestCase):

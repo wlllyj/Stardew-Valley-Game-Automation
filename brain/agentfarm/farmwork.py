@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -144,6 +145,14 @@ STAGE_ACTION = {
 
 #: 邻格顺序（上/下/右/左）：站到目标格四邻之一再动手。
 NEIGHBORS = ((0, -1), (0, 1), (1, 0), (-1, 0))
+
+#: 【task-43】从 `move_to_location` 的失败回执里取"warp 源格 (x,y)"与"剩余 N 步"。
+#: 真机原文（run4，`docs/_run4-evidence.md` §153）：
+#: `第 1 跳失败（timeout）：走向 Farm → FarmHouse 的 warp 源格 (64,14) 超时（单跳预算 8000ms 或整体剩余时间用尽）`
+#: 以及 StepMover 的 `超时（8000ms，剩余 58 步未走完），已停止寻路`。
+#: 用来做**两段式**接近：先 `move_to` 到源格旁边的可站格，再重发一次 `move_to_location`。
+_WARP_SOURCE_RE = re.compile(r"warp\s*源格\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)")
+_REMAINING_STEPS_RE = re.compile(r"剩余\s*(\d+)\s*步")
 
 #: 没写明的种子的兜底（真机背包里 472 是防风草种子；但代码**不硬编码**，只在挑种子时用它排序）。
 DEFAULT_SEED_HINTS = ("seed", "种子")
@@ -503,6 +512,11 @@ class FarmWorker:
         self.pause = pause          # 可注入的等待函数（单测里换成 no-op，绝不真睡）
         self.steps: list[StepResult] = []      # 全程流水（journal 用）
         self.walk_steps = 0
+        # 【task-42 出货白名单】今天**亲眼**看到"收获后进了背包"的 qualifiedId → 件数。
+        # 只有这里出现过的东西才允许出货（`sell` 的 `whitelist` 就来自它）：铁律是"只走白名单、
+        # 绝不做'除工具以外都能卖'的黑名单"——黑名单一旦上游有 bug，种子/工具/任务物品都会被卖掉。
+        # `reset_harvested()` 由长跑控制器在每天开始时调用。
+        self.harvested: dict[str, int] = {}
 
     # ------------------------------------------------------------------ 观测
     def snap(self) -> dict[str, Any]:
@@ -699,23 +713,122 @@ class FarmWorker:
         r.ok = True
         return r
 
+    # ------------------------------------------- 跨地点（task-43：失败后两段式接近）
+    @staticmethod
+    def _warp_source_of(text: str) -> tuple[int, int] | None:
+        """从 Mod 失败回执里取"warp 源格 (x,y)"（原文见 `_WARP_SOURCE_RE` 的注释）。"""
+        m = _WARP_SOURCE_RE.search(str(text or ""))
+        return (int(m.group(1)), int(m.group(2))) if m else None
+
+    @staticmethod
+    def _remaining_steps_of(text: str) -> int | None:
+        """从 Mod 失败回执里取"剩余 N 步"（`超时（8000ms，剩余 58 步未走完）`）。"""
+        m = _REMAINING_STEPS_RE.search(str(text or ""))
+        return int(m.group(1)) if m else None
+
+    @classmethod
+    def _neighbour_to_walk(cls, obs: dict[str, Any], tile: tuple[int, int]) -> tuple[int, int] | None:
+        """门/warp 源格旁边**能站**的一格：先信观测 `standable`，观测没覆盖就交给 Mod 去试。
+
+        观测窗口只覆盖玩家周围（半径见 `OBSERVE_REACH`），而源格可能在窗口边缘之外 ⇒
+        "观测里没有这一格"不等于"不能站"（能不能站只有游戏的地图知道）。四邻**全被观测
+        明确标成不可站**时才返回 None（那种情况下不该硬走，如实报）。
+        """
+        tiles = cls.tiles_of(obs)
+        ranked: list[tuple[int, tuple[int, int]]] = []
+        for dx, dy in NEIGHBORS:
+            t = (int(tile[0]) + dx, int(tile[1]) + dy)
+            tv = tiles.get(t)
+            if tv is None:
+                ranked.append((1, t))                  # 观测没覆盖 ⇒ 交给 Mod 去试
+            elif tv.get("standable") is True:
+                ranked.append((0, t))                  # 观测明说能站 ⇒ 首选
+            else:
+                ranked.append((2, t))                  # 观测说不能站 ⇒ 最后考虑
+        if not ranked or ranked[0][0] == 2:
+            return None
+        ranked.sort(key=lambda item: item[0])
+        return ranked[0][1]
+
+    def _location_failed(self, r: StepResult, name: str, exc: Exception,
+                         src: tuple[int, int] | None, steps: int | None,
+                         diag: list[str]) -> None:
+        """如实落账：Mod 原文 + `warp 源格` + `剩余 N 步` + 脑侧现场（人在哪）+ 两段式做过什么。"""
+        why = str(exc)[:300]
+        r.code = "failed"
+        r.receipt = _receipt(exc) if isinstance(exc, BridgeError) else ""
+        try:
+            obs = self.snap()
+            where = f"{self.player_tile(obs)}（{str((obs.get('location') or {}).get('name') or '?')}）"
+        except BridgeError as exc2:
+            where = f"读不到（失败后再观测也失败：{str(exc2)[:120]}）"
+        bits = [f"去 {name} 失败：{why}" if why else f"去 {name} 失败（Mod 没给原因）"]
+        if src is not None:
+            bits.append(f"Mod 报的 warp 源格 {src}")
+        if steps is not None:
+            bits.append(f"剩余 {steps} 步未走完")
+        bits.append(f"脑侧现场：人在 {where}")
+        if diag:
+            bits.append("；".join(diag))
+        r.reason = "；".join(bits)
+        _mark_status(r, _exc_status(exc))               # 环境挡路 / 没结论 ⇒ 不封格
+
     def ensure_location(self, name: str, *, tile: tuple[int, int] | None = None,
-                        timeout_ms: int = 30000) -> StepResult:
+                        timeout_ms: int = 60000) -> StepResult:
+        """走到另一个地点；**失败后做一次两段式重试**（task-43）。
+
+        run4 的致命卡点：从田里 `Farm [47,29]` 回农舍，A* 真实路径 ≈88 步（被草/石/枝/树逼得
+        绕路 3 倍），而 Mod 每跳只有 8s ⇒ 门口那一跳必然 `timeout`，两次睡觉都是 `sleep_failed`。
+        现在：①`timeout_ms` 默认 **60000**（Mod 侧 `move_to_location` 上限同步放宽到 60000）；
+        ②失败回执里 Mod 会报出"走向 X → Y 的 warp 源格 (a,b) 超时（单跳预算 …ms，剩余 N 步未走完）"，
+        脑侧据此**先走到源格旁边的可站格**，再**只重试一次** `move_to_location`（上限 1 次，防自旋）。
+        Mod 侧同时改成"有进展就续跳"，所以单跳不再因为"路径长"而假超时。
+        """
         r = StepResult(action="move_to_location", tile=tile)
         obs = self.snap()
         if str((obs.get("location") or {}).get("name") or "") == name:
             r.ok, r.code, r.reason = True, "already", f"已经在 {name}"
             return r
+        diag: list[str] = []
         try:
             self.c.move_to_location(name, tile=tile, timeout_ms=timeout_ms)
         except BridgeError as exc:
-            # task-33：Mod 的现场**原样带出来**（门的"本跳试过的格子 … unreachable"就在这里），
-            # 否则 run3 的日报只写"去 FarmHouse 失败"，看不出是门格判据的锅。
-            why = str(exc)[:300]
-            r.code = "failed"
-            r.reason = f"去 {name} 失败：{why}" if why else f"去 {name} 失败（Mod 没给原因）"
-            r.receipt = _receipt(exc)
-            _mark_status(r, _exc_status(exc))       # 环境挡路 / 没结论 ⇒ 不封格
+            src = self._warp_source_of(str(exc))
+            steps = self._remaining_steps_of(str(exc))
+            if src is not None:
+                try:
+                    side = self._neighbour_to_walk(self.snap(), src)
+                except BridgeError as exc_obs:
+                    side = None
+                    diag.append(f"失败后观测也失败，没法找源格邻居：{str(exc_obs)[:120]}")
+                if side is None:
+                    diag.append(f"Mod 报的 warp 源格 {src} 四邻没有可站格，没法两段式接近")
+                else:
+                    try:
+                        mv = self.move_to(side, timeout_ms=30000)
+                        diag.append(f"两段式：先 move_to({side[0]},{side[1]})→"
+                                    f"{'ok' if mv.ok else (mv.code or 'failed')}")
+                        if mv.ok:
+                            retry_ms = max(15000, int(timeout_ms) // 2)
+                            self.c.move_to_location(name, tile=tile, timeout_ms=retry_ms)
+                            diag.append(f"两段式：重发 move_to_location（预算 {retry_ms}ms）")
+                    except BridgeError as exc2:
+                        diag.append(f"两段式重试仍失败：{str(exc2)[:200]}")
+                        self._location_failed(r, name, exc, src, steps, diag)
+                        return r
+            else:
+                diag.append("回执里没有 warp 源格，没法两段式接近")
+            try:
+                obs = self.snap()
+            except BridgeError as exc_obs:
+                diag.append(f"失败后再观测也失败：{str(exc_obs)[:120]}")
+                obs = None
+            now = str(((obs or {}).get("location") or {}).get("name") or "")
+            if now == name:
+                r.ok = True
+                r.reason = f"已到 {name}（两段式救回：{'；'.join(diag)}）"
+                return r
+            self._location_failed(r, name, exc, src, steps, diag)
             return r
         obs = self.snap()
         now = str((obs.get("location") or {}).get("name") or "")
@@ -1082,6 +1195,7 @@ class FarmWorker:
         obs = self.snap()
         tv = self.tile_view(obs, tile)
         r.before = self.tile_essence(tv)
+        inv_before = self._inventory_counts(self.player_of(obs))
         if not (tv or {}).get("crop"):
             r.code, r.reason = "skipped", "这一格没有作物"
             return r
@@ -1101,13 +1215,169 @@ class FarmWorker:
         tv = self.tile_view(obs, tile)
         r.after = self.tile_essence(tv)
         if not (tv or {}).get("crop"):
+            # 【task-42】判据之外再记一件事：**背包真的多了什么**。出货白名单只认这份差分
+            # （回执不算证据），所以"收成了但没进背包"必须如实写出来 —— 否则出货那一步
+            # 会去卖一件根本没进过背包的东西。
+            gained = self._loot_delta(inv_before, self._inventory_counts(self.player_of(obs)))
+            for qid, n in gained.items():
+                self.harvested[qid] = self.harvested.get(qid, 0) + int(n)
+            if gained:
+                r.after = {**(r.after or {}), "harvested": gained}
+                r.reason = f"作物已收走（crop 变空）；进背包：{gained}"
+            else:
+                r.reason = "作物已收走（crop 变空）；⚠ 背包没有新增物品（收货可能丢了，不能出货）"
             r.ok = True
-            r.reason = "作物已收走（crop 变空）"
             return r
         r.code = "failed"
         _mark_status(r, status)     # 渐黑/模态 ⇒ 不封格、不占配额；超时 ⇒ 不封格但占配额
         r.reason = (f"交互后作物还在（可能没摘到）{f'；Mod status={status}' if status else ''}")
         return r
+
+    # ------------------------------------------------------------- task-42：出货（卖出）
+    @staticmethod
+    def _slot_of(item: dict[str, Any]) -> int | None:
+        """物品视图的槽位（**0 是合法槽位**，所以不能用 `or -1` 那种写法）。"""
+        try:
+            return int(item.get("slot"))
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+    @staticmethod
+    def _inventory_counts(player: dict[str, Any]) -> dict[str, int]:
+        """背包按 qualifiedId 汇总件数（缺口/新增都用它算差分）。"""
+        out: dict[str, int] = {}
+        for it in player.get("inventory") or []:
+            if not isinstance(it, dict):
+                continue
+            qid = str(it.get("qualifiedId") or it.get("id") or it.get("name") or "")
+            if not qid:
+                continue
+            out[qid] = out.get(qid, 0) + int(it.get("stack") or 0)
+        return out
+
+    @classmethod
+    def _loot_delta(cls, before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
+        """收获前后背包差分：只报**变多**的 qualifiedId —— 这就是出货白名单的唯一真源。"""
+        out: dict[str, int] = {}
+        for qid, n in (after or {}).items():
+            d = int(n) - int((before or {}).get(qid, 0))
+            if d > 0:
+                out[qid] = d
+        return out
+
+    def reset_harvested(self) -> None:
+        """每天开始时清空白名单（昨天的收获不该今天再卖一遍）。"""
+        self.harvested = {}
+
+    def sellable_slots(self, obs: dict[str, Any]) -> list[int]:
+        """背包里**今天亲手收获、还有剩**的槽位（升序）。
+
+        判据 = 该格物品的 qualifiedId 在白名单里。**不接受**任何"除了工具都能卖"的推断：
+        白名单空 ⇒ 一格都不出。
+        """
+        qids = {str(q) for q in (self.harvested or {}) if q}
+        if not qids:
+            return []
+        out: list[int] = []
+        for it in self.player_of(obs).get("inventory") or []:
+            if not isinstance(it, dict):
+                continue
+            qid = str(it.get("qualifiedId") or it.get("id") or "")
+            if qid not in qids:
+                continue
+            if int(it.get("stack") or 0) <= 0:
+                continue
+            slot = self._slot_of(it)
+            if slot is None:
+                continue
+            out.append(slot)
+        return sorted(out)
+
+    def sell(self, slot: int, *, whitelist: list[str] | None = None,
+             timeout_ms: int = 8000) -> StepResult:
+        """把背包某一格放进出货箱（`sell`，Mod ≥ 0.7.24）。判据 = **观测差分**。
+
+        为什么判据不是钱：`Farm.shipItem(item, who)` 只把物品搬进箱子，钱由**下一次 `NewDay`**
+        结算（`player.Money = player.Money + total`）。所以本方法：
+        ① 只看"那一格真的空了 + 该 qualifiedId 总数下降"；② **绝不写 `Money +=`**（铁律）。
+
+        为什么必须给**槽位**：Mod 侧取的是 `Game1.player.Items[slot]` 那个实例，因为游戏自己的
+        `removeItemFromInventory` 用**引用相等**找物品；传副本会变成"原物不动、副本进箱"。
+        """
+        r = StepResult(action="sell")
+        obs = self.snap()
+        player = self.player_of(obs)
+        allow = [str(x) for x in (whitelist if whitelist is not None else sorted(self.harvested))]
+        item: dict[str, Any] | None = None
+        for it in player.get("inventory") or []:
+            if not isinstance(it, dict):
+                continue
+            if self._slot_of(it) == int(slot):
+                item = it
+                break
+        qid = str((item or {}).get("qualifiedId") or (item or {}).get("id") or "")
+        counts_before = self._inventory_counts(player)
+        n_before = int(counts_before.get(qid, 0))
+        r.before = {"slot": int(slot), "qid": qid, "name": str((item or {}).get("name") or ""),
+                    "stack": int((item or {}).get("stack") or 0), "count": n_before,
+                    "money": self.money(obs), "whitelist": allow}
+        if item is None:
+            r.code, r.reason = "empty_slot", f"背包槽位 {slot} 是空的"
+            return r
+        status = ""
+        try:
+            self.c.sell(slot, whitelist=allow, timeout_ms=timeout_ms)
+        except BridgeError as exc:
+            status = _exc_status(exc)
+            r.receipt = _receipt(exc)
+        obs = self.snap()
+        player = self.player_of(obs)
+        counts_after = self._inventory_counts(player)
+        n_after = int(counts_after.get(qid, 0))
+        still = any(
+            isinstance(it, dict)
+            and str(it.get("qualifiedId") or it.get("id") or "") == qid
+            and self._slot_of(it) == int(slot)
+            for it in player.get("inventory") or []
+        )
+        bin_items = ((obs.get("shippingBin") or {}).get("items") or [])
+        r.after = {"slot": int(slot), "qid": qid, "count": n_after, "money": self.money(obs),
+                   "shipping_bin": len(bin_items)}
+        if (not still) and n_after < n_before:
+            r.ok = True
+            r.reason = (f"已出货槽位 {slot} 的 {qid}（背包 {n_before}→{n_after}，"
+                        f"出货箱 {len(bin_items)} 件）；钱要等下一次 NewDay 才由游戏结算"
+                        f"（当前 {self.money(obs)}g）")
+            # 白名单跟随实际剩余量：出掉多少就减多少，出光即移除（防止明天再卖一件不存在的东西）
+            if qid:
+                if n_after > 0:
+                    self.harvested[qid] = n_after
+                else:
+                    self.harvested.pop(qid, None)
+            return r
+        r.code = "failed"
+        _mark_status(r, status)     # 渐黑/模态 ⇒ 不封格、不占配额；超时 ⇒ 不封格但占配额
+        r.reason = (f"出货没有生效（槽位 {slot} 的 {qid}：背包 {n_before}→{n_after}，"
+                    f"槽位{'仍有该物品' if still else '已空'}"
+                    f"{f'；Mod status={status}' if status else ''}）")
+        return r
+
+    def sell_loot(self, *, timeout_ms: int = 8000, max_items: int = 24) -> list[StepResult]:
+        """把今天收获的东西按白名单出一遍（**有界**：最多 `max_items` 格）。
+
+        每出一件都重新 observe（槽位会变），第一件失败就停手 —— 失败原因如实带回去，
+        由上层决定要不要记 needs_review。空手时直接返回空列表（不产生任何动作）。
+        """
+        out: list[StepResult] = []
+        for _ in range(max(0, int(max_items))):
+            slots = self.sellable_slots(self.snap())
+            if not slots:
+                break
+            st = self.sell(slots[0], timeout_ms=timeout_ms)
+            out.append(st)
+            if not st.ok:
+                break
+        return out
 
     # ------------------------------------------------------------- 补水
     def refill_can(self, *, timeout_ms: int = 15000) -> StepResult:

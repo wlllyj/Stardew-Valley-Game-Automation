@@ -2533,6 +2533,107 @@ class TestTask41CannotGoHome(unittest.TestCase):
         self.assertEqual(len(run.days), 1, [d.day_text for d in run.days])
 
 
+class _ShippingWorker(FakeWorker):
+    """带"出货白名单"的假执行层（task-42）：白名单只由 `harvest()` 亲手喂进来。"""
+
+    def __init__(self, world: FakeWorld, *, loot: tuple[str, ...] = ("(O)24",)) -> None:
+        super().__init__(world)
+        self.loot = list(loot)
+        self.ship_calls = 0
+
+    def sellable_slots(self, obs):
+        return [5] * len(self.loot)
+
+    def sell_loot(self, *, timeout_ms=8000, max_items=24):
+        self.ship_calls += 1
+        out: list[StepResult] = []
+        for qid in list(self.loot):
+            self.loot.remove(qid)
+            st = StepResult("sell", None, ok=True, code="ok",
+                            reason="已放进出货箱（钱要下一次 NewDay 才结算）")
+            st.before = {"slot": 5, "qid": qid, "name": "Parsnip", "stack": 1,
+                         "count": 1, "shipping_bin": 0, "money": 500}
+            st.after = {"slot": 5, "qid": qid, "count": 0, "shipping_bin": 1, "money": 500}
+            st.receipt = f"slot=5 qid={qid}"
+            out.append(st)
+        return out
+
+
+class TestTask42Ship(unittest.TestCase):
+    """task-42：`ship` 意图的接线与账本（用户 m08335"一分钱也没挣到"）。
+
+    这里钉死的是**接线**而不是出货技能本身（技能在 `tests/test_farmwork.py::TestTask42Sell`）：
+    ① `ship` 意图真的会调到 `worker.sell_loot()` 并写 journal `sell`；
+    ② 白名单为空 ⇒ 计划里**不出现** `ship`（绝不"背包里有东西就卖"）；
+    ③ 账本必须说清"钱要等下一次 NewDay"，免得看日报告的人以为没生效。
+    """
+
+    @staticmethod
+    def _plot() -> dict:
+        return {"zone": "", "label": "", "anchor": [62, 14], "tiles": [(62, 14)], "note": ""}
+
+    def test_ship_intent_ships_loot_and_journals_it(self):
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = make_run(w, target_days=1)
+        run.worker = _ShippingWorker(w)
+        run.client = FakeClient(w)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        decision = SimpleNamespace(intents=[
+            TaskIntent("ship", "anchor:current_location", "卖了才有钱买种子", "箱子件数上升")])
+        acted = run._execute(decision, w.obs(), self._plot(), rep)
+        self.assertTrue(acted)
+        self.assertEqual(run.worker.ship_calls, 1)
+        sells = [e for e in run.entries if e.get("event") == "sell"]
+        self.assertEqual(len(sells), 1, run.entries)
+        self.assertTrue(sells[0]["ok"])
+        self.assertEqual(sells[0]["slot"], 5)
+        self.assertEqual(sells[0]["qid"], "(O)24")
+        self.assertEqual(sells[0]["before"]["money"], 500)
+        self.assertEqual(sells[0]["after"]["money"], 500)      # 钱当天不变是**正常**的
+        self.assertTrue(any("NewDay" in n for n in rep.notes), rep.notes)
+        self.assertEqual(run._actions, 1)
+
+    def test_plan_offers_ship_only_when_whitelist_is_not_empty(self):
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = make_run(w, target_days=1)
+        run.worker = _ShippingWorker(w)
+        run.client = FakeClient(w)
+        obs = w.obs()
+        brief = run._plot_brief(obs, self._plot())
+        self.assertEqual(brief.sellable, 1)
+        self.assertEqual(deterministic_plan(brief)[0].task, "ship")
+
+        run.worker = _ShippingWorker(w, loot=())
+        brief2 = run._plot_brief(obs, self._plot())
+        self.assertEqual(brief2.sellable, 0)
+        self.assertNotEqual(deterministic_plan(brief2)[0].task, "ship")
+
+    def test_failed_ship_is_journalled_and_never_blocks_the_day(self):
+        """出货失败 ⇒ 记 `sell_failed`、当天照常继续（不许因为卖不掉就撂挑子）。"""
+
+        class _Broken(_ShippingWorker):
+            def sell_loot(self, *, timeout_ms=8000, max_items=24):
+                self.ship_calls += 1
+                st = StepResult("sell", None, ok=False, code="failed",
+                                reason="出货没有生效：Mod status=timeout")
+                st.before = {"slot": 5, "qid": "(O)24", "name": "Parsnip", "stack": 1,
+                             "count": 1, "shipping_bin": 0, "money": 500}
+                st.after = {"slot": 5, "qid": "(O)24", "count": 1, "shipping_bin": 0, "money": 500}
+                return [st]
+
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = make_run(w, target_days=1)
+        run.worker = _Broken(w)
+        run.client = FakeClient(w)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        decision = SimpleNamespace(intents=[
+            TaskIntent("ship", "anchor:current_location", "卖了才有钱买种子", "箱子件数上升")])
+        self.assertFalse(run._execute(decision, w.obs(), self._plot(), rep))
+        self.assertEqual(len([e for e in run.entries if e.get("event") == "sell"]), 1)
+        self.assertEqual(len([e for e in run.entries if e.get("event") == "sell_failed"]), 1)
+        self.assertTrue(any("没能出货" in n or "失败" in n for n in rep.notes), rep.notes)
+
+
 if __name__ == "__main__":
     unittest.main()
 

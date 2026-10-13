@@ -75,6 +75,12 @@ class MiniWorld:
         self.interacts = 0
         #: 非空 ⇒ `move_to_location` 照这个 reason 抛 `unreachable`（造"门走不通"的现场）。
         self.move_to_location_fail = ""
+        # ---- task-43：长距离进建筑（每跳预算与路径长度无关 + 两段式接近）----
+        #: `move_to_location` 的**回执脚本**（按顺序 pop，空则照 `move_to_location_fail` 走）：
+        #:   `{"fail": {"status": "timeout", "reason": "…warp 源格 (64,14)…剩余 52 步未走完"}}`
+        #:   `{"ok": True}`（真的把 `location_name` 换掉）
+        self.move_to_location_script: list[dict] = []
+        self.move_to_location_calls: list[dict] = []   # 每次调用的 location/tile/timeout_ms
         # ---- NIT-3：桥**中途沉默**（睡觉过程中掉线）----
         #: 非空 ⇒ 让 `observe` 抛 `BridgeError(status=observe_fail_status)`。
         self.observe_fail_status = ""
@@ -83,13 +89,26 @@ class MiniWorld:
         self.observe_fail_mode = ""
         self.observe_calls = 0
         self.observe_failed_once = False
+        # ---- task-42：出货箱（`sell`）----
+        #: 出货箱里的条目（`obs()["shippingBin"]["items"]` 直接反映它）。
+        self.shipping_bin: list[dict] = []
+        self.sell_calls: list[dict] = []          # 每次 `sell` 请求的参数
+        #: "ship" = 真把那一格搬进箱子；"no_effect" = 回执 ok 但世界一动不动；
+        #: 其它非空值 ⇒ 抛 `BridgeError(status=...)`（造"没拿到结论"的现场）。
+        self.sell_mode = "ship"
+        # ---- task-42：收获（`interact` 真的把作物摘下来并放一件进背包）----
+        #: 摘下来的作物进背包的条目（None ⇒ 收获成功但**什么都没进背包**，用来测白名单不许凭空生成）。
+        self.harvest_item: dict | None = {"slot": 5, "id": "24", "qualifiedId": "(O)24",
+                                          "name": "Parsnip", "stack": 1, "isTool": False}
+        self.harvests: list[tuple[int, int]] = []
 
     # ---- 观测 ----
     def obs(self) -> dict:
         player: dict = {"name": "测试员", "tile": list(self.player_tile),
                         "stamina": self.stamina, "money": 500,
                         "farmingLevel": self.farming_level,
-                        "inventory": [dict(i) for i in self.inventory]}
+                        "inventory": [dict(i) if isinstance(i, dict) else None
+                                      for i in self.inventory]}
         if self.tools is not None:
             player["tools"] = dict(self.tools)
         player["isInBed"] = self.in_bed
@@ -112,7 +131,50 @@ class MiniWorld:
                    "dialogueResponses": (["Yes", "No"] if self.question else []),
                    "dialogueIsQuestion": self.question is not None,
                    "isModal": self.question is not None},
+            # 出货箱（task-42）：快照顶层的 `shippingBin`（Mod 的 `ReadShippingBin()`）。
+            "shippingBin": {"present": True, "count": len(self.shipping_bin),
+                            "items": [dict(i) for i in self.shipping_bin],
+                            "lastItemShipped": "", "separateWallets": False},
         }
+
+    def harvest(self, tile: tuple[int, int]) -> None:
+        """Mod `interact` 的离线替身（只对成熟作物）：摘掉作物，按 `harvest_item` 决定进不进背包。"""
+        self.harvests.append((int(tile[0]), int(tile[1])))
+        found = False
+        for r in self.records:
+            if tuple(r["tile"]) == (int(tile[0]), int(tile[1])) and r.get("crop"):
+                found = True
+                r.pop("crop", None)
+                r.pop("ripe", None)
+        if found and self.harvest_item:
+            self.inventory.append(dict(self.harvest_item))
+
+    def ship(self, slot: int, whitelist) -> dict:
+        """Mod `ShipSkill` 的离线替身：白名单外拒绝；白名单内把**那一格整件**搬进箱子。
+
+        真机纪律（`docs/_il-sell-path.md`）：钱当天**不变**（下一次 `NewDay` 才结算），
+        所以这里也绝不动 `money` —— 正好用来证明脑侧判据不是"钱变了"。
+        """
+        self.sell_calls.append({"slot": int(slot),
+                                "whitelist": [str(x) for x in (whitelist or [])]})
+        if self.sell_mode and self.sell_mode not in ("ship", "no_effect"):
+            raise BridgeError(f"sell 失败（{self.sell_mode}）：没有拿到结论",
+                              status=str(self.sell_mode))
+        if not (0 <= int(slot) < len(self.inventory)):
+            raise BridgeError("槽位越界", status="bad_args")
+        item = self.inventory[int(slot)]
+        if item is None:
+            raise BridgeError("槽位是空的", status="empty_slot")
+        allow = [str(x) for x in (whitelist or [])]
+        qid = str(item.get("qualifiedId") or item.get("id") or "")
+        if not allow or qid not in allow:
+            raise BridgeError(f"{qid} 不在白名单里", status="not_whitelisted")
+        if str(self.sell_mode) == "no_effect":
+            return {"ok": True, "status": "ok", "reason": "回执说卖了，其实什么都没动"}
+        # 真出货：整格搬走（真机 `shipItem` 没有"出一部分"的能力）
+        self.inventory[int(slot)] = None
+        self.shipping_bin.append(dict(item))
+        return {"ok": True, "status": "ok", "reason": "已放进出货箱（钱等 NewDay）"}
 
     def do_sleep(self) -> None:
         """Mod `SleepSkill` 的离线替身：**只有"人已在床上 / 提问已弹出"才可能跨日**。
@@ -252,6 +314,16 @@ class MiniBridge:
 
     def move_to_location(self, location, *, tile=None, timeout_ms=None, based_on_seq=None,
                          allow_bed=False):
+        self.w.move_to_location_calls.append(
+            {"location": str(location), "tile": tile, "timeout_ms": timeout_ms,
+             "allow_bed": bool(allow_bed)})
+        # task-43：按脚本发回执（造"长路径单跳超时 + warp 源格 + 剩余 N 步"的现场）。
+        if self.w.move_to_location_script:
+            step = self.w.move_to_location_script.pop(0)
+            fail = step.get("fail")
+            if fail:
+                raise BridgeError(str(fail.get("reason") or "move_to_location 失败"),
+                                  status=str(fail.get("status") or "timeout"))
         if self.w.move_to_location_fail:
             raise BridgeError(self.w.move_to_location_fail, status="unreachable")
         self.w.location_name = str(location)
@@ -259,6 +331,8 @@ class MiniBridge:
 
     def interact(self, tile=None, *, timeout_ms=None):
         self.w.interacts += 1
+        if tile is not None:
+            self.w.harvest(tuple(tile))       # task-42：收获真的把作物摘下来（并可能进背包）
         return {"ok": True, "status": "ok"}
 
     def sleep(self, *, timeout_ms=None):
@@ -274,6 +348,10 @@ class MiniBridge:
             raise BridgeError(str(res.get("reason") or res.get("status") or "use_tool 失败"),
                               status=str(res.get("status") or "error"))
         return res
+
+    def sell(self, slot, *, whitelist=None, timeout_ms=None):
+        """`sell`（task-42）：真桥对拒绝/失败是**抛** `BridgeError`（带 `status`），这里照做。"""
+        return self.w.ship(int(slot), whitelist)
 
 
 TOOLS_WITH_SCYTHE = {"axe": True, "pickaxe": True, "hoe": True, "wateringCan": True,
@@ -888,6 +966,236 @@ class TestSleepCrossDay(unittest.TestCase):
         self.assertIn("睡觉过程中桥失败", r.reason)
         self.assertEqual(w.dismiss_calls, 0)     # 桥都死了 ⇒ 不做需要桥的补救
         self.assertEqual(w.day, 9)
+
+
+class TestTask43LongPathRecovery(unittest.TestCase):
+    """task-43：长距离进建筑走不到 ⇒ 两段式接近 + 默认 60000ms + 有界重试。
+
+    真机证据（run4，Lead 现场三连复现）：从田里 `Farm [47,29]` 回农舍，A* 真实路径 ≈88 步
+    （被草/石/枝/树逼得绕路 3 倍），Mod 每跳只有 8s ⇒ 门口那一跳 `timeout（8000ms，剩余 58 步
+    未走完）`，两次睡觉都 `sleep_failed`；同一候选连走两次分别剩 52/16 步 ⇒ **人在推进**。
+    Mod 侧改成"跳预算按剩余步数 + 有进展就续跳"（`MoveToLocationSkill.HopBudget` /
+    `StepMover.Tick`，本仓库没有 C# 测试工程，那部分由 build + 真机三连命令验收）；
+    本用例类钉住的是**脑侧契约**：能解析回执、只重试一次、默认 60000、失败原因如实落账。
+    """
+
+    def _worker(self, w: MiniWorld) -> FarmWorker:
+        return make_worker(w)
+
+    def _long_path_fail(self, *, src=(64, 14), steps=52, status="timeout"):
+        """Mod 失败回执的原文（照 run4/Lead 复现的措辞）。"""
+        return {"fail": {
+            "status": status,
+            "reason": (f"第 1 跳失败（{status}）：走向 Farm → FarmHouse 的 warp 源格 "
+                       f"({src[0]},{src[1]}) 超时（单跳预算 8000ms，剩余 {steps} 步未走完）。"),
+        }}
+
+    def test_timeout_is_recovered_by_two_phase_approach(self):
+        """①长路径单跳超时 ⇒ 先走到 warp 源格旁的可站格，再只重试一次 ⇒ 到达。"""
+        w = MiniWorld()
+        w.location_name = "Farm"
+        w.move_to_location_script = [self._long_path_fail(), {"ok": True}]
+        r = self._worker(w).ensure_location("FarmHouse")
+        self.assertTrue(r.ok, r.reason)
+        self.assertEqual(w.location_name, "FarmHouse")
+        self.assertIn("两段式救回", r.reason)
+        # 第一次 60000（task-43 新默认），重试用一半预算（≥15000）⇒ 必 ≤ 第一次
+        calls = w.move_to_location_calls
+        self.assertEqual([c["timeout_ms"] for c in calls], [60000, 30000])
+        self.assertEqual(len(calls), 2)                     # 只重试一次，绝不风暴
+        # 先接近：四邻里挑一格（观测没覆盖 ⇒ 按 NEIGHBORS 第一顺位 (64,13)）
+        self.assertTrue(any(m["tile"] == [64, 13] for m in w.moves), w.moves)
+
+    def test_default_request_budget_is_sixty_seconds(self):
+        """③Mod 侧单请求上限 60000 ⇒ 脑侧默认也必须传 60000（否则 30s 又饿死）。"""
+        w = MiniWorld()
+        w.location_name = "Farm"
+        w.move_to_location_script = [{"ok": True}]
+        r = self._worker(w).ensure_location("FarmHouse")
+        self.assertTrue(r.ok)
+        self.assertEqual(w.move_to_location_calls[0]["timeout_ms"], 60000)
+
+    def test_both_attempts_failing_is_bounded_and_honest(self):
+        """④两次都超时 ⇒ 有界停手（恰 2 次请求），原因带 剩余步数/warp 源格/玩家坐标。"""
+        w = MiniWorld()
+        w.location_name = "Farm"
+        w.move_to_location_script = [self._long_path_fail(steps=52),
+                                     self._long_path_fail(steps=16)]
+        r = self._worker(w).ensure_location("FarmHouse")
+        self.assertFalse(r.ok)
+        self.assertEqual(r.code, "failed")
+        self.assertTrue(r.inconclusive)                     # timeout ⇒ 没结论（不封格、不占额）
+        self.assertEqual(len(w.move_to_location_calls), 2)  # 有界：1 次 + 1 次重试
+        self.assertIn("剩余 16 步未走完", r.reason)
+        self.assertIn("(64,14)", r.reason)
+        self.assertIn("脑侧现场：人在", r.reason)
+        self.assertIn("两段式", r.reason)
+        self.assertTrue(r.receipt)
+
+    def test_receipt_without_source_tile_is_still_bounded(self):
+        """没有 `warp 源格` 的回执（例如 `unreachable`）⇒ 不做两段式，如实记明原因。"""
+        w = MiniWorld()
+        w.location_name = "Farm"
+        w.move_to_location_script = [{"fail": {"status": "unreachable",
+                                               "reason": "本跳试过的格子：(64,14)=unreachable"}}]
+        r = self._worker(w).ensure_location("FarmHouse")
+        self.assertFalse(r.ok)
+        self.assertEqual(len(w.move_to_location_calls), 1)
+        self.assertIn("回执里没有 warp 源格", r.reason)
+        self.assertIn("脑侧现场：人在", r.reason)
+
+    def test_neighbour_pick_prefers_observed_standable(self):
+        """源格四邻里，观测**明说能站**的那一格优先（不许乱赌）。"""
+        w = MiniWorld()
+        w.location_name = "Farm"
+        # 观测里 (64,15) 可站、(65,14) 不可站；NEIGHBORS 顺序是 上/下/右/左
+        w.records = [{"tile": [64, 15], "kind": "dirt", "standable": True},
+                     {"tile": [65, 14], "kind": "stone", "standable": False, "blocking": True}]
+        obs = w.obs()
+        self.assertEqual(FarmWorker._neighbour_to_walk(obs, (64, 14)), (64, 15))
+
+    def test_neighbour_pick_gives_up_when_all_four_are_blocked(self):
+        """四邻全被观测标成不可站 ⇒ 不硬走（返回 None，让上层如实报失败）。"""
+        w = MiniWorld()
+        w.records = [{"tile": [64, 13], "kind": "stone", "standable": False, "blocking": True},
+                     {"tile": [64, 15], "kind": "stone", "standable": False, "blocking": True},
+                     {"tile": [65, 14], "kind": "stone", "standable": False, "blocking": True},
+                     {"tile": [63, 14], "kind": "stone", "standable": False, "blocking": True}]
+        self.assertIsNone(FarmWorker._neighbour_to_walk(w.obs(), (64, 14)))
+
+    def test_receipt_parsers_read_the_real_machine_wording(self):
+        """回执解析必须认 run4/Lead 复现的逐字措辞。"""
+        text = ("第 1 跳失败（timeout）：走向 Farm → FarmHouse 的 warp 源格 (64,14) 超时"
+                "（单跳预算 8000ms，剩余 58 步未走完）。本跳试过的格子：(64,14)(source)=unreachable")
+        self.assertEqual(FarmWorker._warp_source_of(text), (64, 14))
+        self.assertEqual(FarmWorker._remaining_steps_of(text), 58)
+        self.assertIsNone(FarmWorker._warp_source_of("没有源格的老回执"))
+        self.assertIsNone(FarmWorker._remaining_steps_of("没有步数的老回执"))
+
+
+class TestTask42Sell(unittest.TestCase):
+    """task-42 出货闭环：**白名单只认"亲眼看见进了背包"的东西**，判据只看观测差分。
+
+    用户 m08335 的原话是"怎么到现在一分钱也没挣到呀？"，但修法**不是**让脑去点钱：
+    钱只能由游戏下一次 `NewDay` 结算，所以这里钉死三件事：
+    ① 收货没进背包 ⇒ 不进白名单（不许凭空生成"可卖物"）；
+    ② 白名单外的东西（工具/种子/建材）一格都不许出；
+    ③ 回执 ok 但世界没动 ⇒ 如实记失败（回执只是声明）。
+    """
+
+    def _worker(self, w: MiniWorld) -> FarmWorker:
+        return make_worker(w)
+
+    @staticmethod
+    def _ripe(tile=(62, 15)) -> dict:
+        return {"tile": list(tile), "kind": "dirt", "feature": "HoeDirt", "crop": "24",
+                "ripe": True, "watered": True, "standable": True, "actionable": True}
+
+    def test_harvest_records_loot_only_when_inventory_grows(self):
+        """①作物摘下来 + 背包多了一件 ⇒ 进白名单；只摘下来而背包没多 ⇒ **不进**白名单。"""
+        w = MiniWorld(records=[self._ripe()])
+        worker = self._worker(w)
+        st = worker.harvest((62, 15))
+        self.assertTrue(st.ok)
+        self.assertEqual(worker.harvested, {"(O)24": 1})
+        self.assertEqual((st.after or {}).get("harvested"), {"(O)24": 1})
+        self.assertIn("进背包", st.reason)
+
+        w2 = MiniWorld(records=[self._ripe()])
+        w2.harvest_item = None                      # 收了，但什么都没进背包（真机有这种丢货情形）
+        worker2 = self._worker(w2)
+        st2 = worker2.harvest((62, 15))
+        self.assertTrue(st2.ok)
+        self.assertEqual(worker2.harvested, {})
+        self.assertIn("背包没有新增物品", st2.reason)
+
+    def test_sell_loot_ships_whitelisted_loot_and_shrinks_the_list(self):
+        """②白名单里的东西**整件**进箱；工具在旁边一动不动；**钱当天不变**（等 NewDay 结算）。"""
+        w = MiniWorld()
+        w.inventory = [
+            {"slot": 0, "id": "24", "qualifiedId": "(O)24", "name": "Parsnip",
+             "stack": 2, "isTool": False},
+            {"slot": 1, "id": "47", "qualifiedId": "(W)47", "name": "Scythe",
+             "stack": 1, "isTool": True},
+        ]
+        worker = self._worker(w)
+        worker.harvested = {"(O)24": 2}
+        steps = worker.sell_loot()
+        self.assertEqual(len(steps), 1)
+        st = steps[0]
+        self.assertTrue(st.ok)
+        self.assertEqual(w.sell_calls[0]["whitelist"], ["(O)24"])
+        self.assertEqual(w.sell_calls[0]["slot"], 0)
+        self.assertEqual(len(w.shipping_bin), 1)
+        self.assertEqual(w.shipping_bin[0]["qualifiedId"], "(O)24")
+        self.assertIsNone(w.inventory[0])
+        self.assertEqual(w.inventory[1]["qualifiedId"], "(W)47")   # 工具没被动
+        self.assertEqual(worker.harvested, {})                      # 出光 ⇒ 白名单清空
+        # 钱当天不变：判据必须落在背包/箱子差分上，而不是钱
+        self.assertEqual(st.before["money"], 500)
+        self.assertEqual(st.after["money"], 500)
+        self.assertIn("NewDay", st.reason)
+        self.assertIn("出货箱", st.reason)
+
+    def test_whitelist_empty_means_not_one_item_is_shipped(self):
+        """③白名单空 ⇒ 连一次请求都不发（绝不做"除工具以外都能卖"的黑名单）。"""
+        w = MiniWorld()
+        w.inventory = [{"slot": 0, "id": "24", "qualifiedId": "(O)24", "name": "Parsnip",
+                        "stack": 3, "isTool": False}]
+        worker = self._worker(w)
+        self.assertEqual(worker.sellable_slots(w.obs()), [])
+        self.assertEqual(worker.sell_loot(), [])
+        self.assertEqual(w.sell_calls, [])
+        self.assertEqual(w.shipping_bin, [])
+
+    def test_not_whitelisted_is_reported_with_status_and_receipt(self):
+        """④白名单外的物品：Mod 回 `not_whitelisted` ⇒ 如实失败、背包不变、回执留着。"""
+        w = MiniWorld()
+        w.inventory = [{"slot": 0, "id": "47", "qualifiedId": "(W)47", "name": "Scythe",
+                        "stack": 1, "isTool": True}]
+        worker = self._worker(w)
+        st = worker.sell(0, whitelist=["(O)24"])
+        self.assertFalse(st.ok)
+        self.assertEqual(st.code, "failed")
+        self.assertTrue(st.receipt)
+        self.assertIn("not_whitelisted", st.receipt)
+        self.assertIn("出货没有生效", st.reason)
+        self.assertEqual(st.before["count"], 1)
+        self.assertEqual(st.after["count"], 1)
+        self.assertEqual(len(w.shipping_bin), 0)
+
+    def test_ok_receipt_without_world_change_is_never_ok(self):
+        """⑤回执 ok 但格子没空、箱子没变 ⇒ 判失败（回执只是声明）。"""
+        w = MiniWorld()
+        w.inventory = [{"slot": 0, "id": "24", "qualifiedId": "(O)24", "name": "Parsnip",
+                        "stack": 1, "isTool": False}]
+        w.sell_mode = "no_effect"
+        worker = self._worker(w)
+        worker.harvested = {"(O)24": 1}
+        st = worker.sell(0, whitelist=["(O)24"])
+        self.assertFalse(st.ok)
+        self.assertEqual(st.code, "failed")
+        self.assertIn("出货没有生效", st.reason)
+        self.assertEqual(len(w.shipping_bin), 0)
+        self.assertEqual(worker.harvested, {"(O)24": 1})     # 失败不洗白名单
+        self.assertEqual(st.after["shipping_bin"], 0)
+
+    def test_sell_loot_stops_at_the_first_failure(self):
+        """⑥第一件就失败 ⇒ 停手（有界，不把剩下的格子一个个撞上去）。"""
+        w = MiniWorld()
+        w.inventory = [
+            {"slot": 0, "id": "24", "qualifiedId": "(O)24", "name": "Parsnip",
+             "stack": 1, "isTool": False},
+            {"slot": 1, "id": "24", "qualifiedId": "(O)24", "name": "Parsnip",
+             "stack": 1, "isTool": False},
+        ]
+        w.sell_mode = "timeout"
+        worker = self._worker(w)
+        worker.harvested = {"(O)24": 2}
+        steps = worker.sell_loot()
+        self.assertEqual(len(steps), 1)
+        self.assertFalse(steps[0].ok)
+        self.assertEqual(len(w.sell_calls), 1)
 
 
 if __name__ == "__main__":  # pragma: no cover

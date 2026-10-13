@@ -81,6 +81,7 @@ TASK_KINDS: tuple[str, ...] = (
     "plant_area",       # 播种
     "water_area",       # 浇水
     "harvest",          # 收获成熟作物
+    "ship",             # 出货（把今天亲手收获的东西放进农场出货箱，task-42）
     "recover_stamina",  # 体力恢复（进食/睡觉）
     "sleep",            # 收工过夜（跨日）
     "wait_for_save",    # 存档没加载，先读档
@@ -424,6 +425,10 @@ class Brief:
     areas: tuple[str, ...] = ()
     #: 每个田区一行人间可读摘要（可锄/待清理/已有作物/待浇水/远近），同样**不含坐标**。
     area_lines: tuple[str, ...] = ()
+    #: 【task-42】背包里**今天亲手收获、可以出货**的件数。它**不是**从观测推出来的：
+    #: 白名单在 `FarmWorker.harvested` 里（"哪一件是我们自己收进背包的"只有执行层知道），
+    #: 长跑控制器把它**注入**进来。所以这个数在直接调 `from_observe()` 的场合恒为 0。
+    sellable: int = 0
 
     # ---- 派生量（确定性策略用） ----
     @property
@@ -472,6 +477,7 @@ class Brief:
         target_tiles: int = 9,
         areas: Iterable[str] = (),
         area_lines: Iterable[str] = (),
+        sellable: int = 0,
     ) -> "Brief":
         """从 `detail=full` 快照生成简报。
 
@@ -582,6 +588,7 @@ class Brief:
             time_of_day=int(clock["timeOfDay"]) if isinstance(clock.get("timeOfDay"), (int, float)) else None,
             areas=tuple(str(a) for a in areas if a),
             area_lines=tuple(str(a) for a in area_lines if a),
+            sellable=int(sellable or 0),
         )
 
 
@@ -792,6 +799,17 @@ def deterministic_plan(brief: Brief) -> tuple[TaskIntent, ...]:
             "harvest", "tiles.ripe",
             f"有 {brief.counts.get('ripe', 0)} 格作物成熟了，先收掉腾地",
             "location.tiles[].ripe 的格子数量下降",
+        ),)
+
+    # 【task-42】收获之后立刻出货（用户 m08335："怎么到现在一分钱也没挣到呀"）。
+    # 位置按"当天不做就永久亏"排：钱要**下一次 NewDay** 才结算，越早进箱越早到账；
+    # 而清障/开垦/播种任何一天都能做。`sellable` 是执行层注入的白名单件数（不是观测推出来的），
+    # 为 0 时这一条根本不会出现 ⇒ 不会凭空下令卖东西。
+    if int(brief.sellable) > 0:
+        return (TaskIntent(
+            "ship", "anchor:current_location",
+            f"背包里有 {brief.sellable} 件今天亲手收获、可以出货的东西（卖了才有钱买种子）",
+            "shippingBin.count 上升、背包里对应物品减少（钱要下一次 NewDay 才变）",
         ),)
 
     if brief.blockers > 0:

@@ -55,3 +55,23 @@
 
 - 装机旧文件留 `.bak-<ts>`（`tools\deploy-mod.py` 自带）；`manifest.json` 与 `bridge.py:39` 必须成对回退。
 - 存档不参与回退（`save-backups/` 有备份）；**不许重启续跑**，失败就另起 run6 并说明。
+
+## 6. 执行记录（dev-coder，2026-10-13 夜；装机章由 Lead 写）
+
+### 6.1 task-43 长路径跳预算（run4 唯一硬卡点：田里回不到屋门口）
+- **Mod**：`MoveToLocationSkill.cs` —— 跳预算公式 `Clamp(4000 + 500×剩余步数, 8000, 门 30000 / 普通 20000)`，且**不超过整体剩余时间**；`Begin()` 用 A* 真实剩余步数重算并 `RaiseBudget`（发出去之后才知道步数，所以只能"先给下限、随后抬高"）；`ClampBudget` 上限 **60000**；超时文案带「单跳预算 Nms / 剩余 N 步」便于事后对账。
+- **Mod**：`StepMover.cs` —— `RaiseBudget`；`StuckFrames` 90 → **180**（≈3s）；`Tick` 判定顺序改为「进展证据 → 超时+**续跳** → 模态 → 卡死」：只要玩家格变了或像素位移 >4f 就清零卡死帧，超时可续（`ExtensionMs = 8000`，最多 8 次）⇒ **有进展就绝不算失败**，只有真正 ~3s 不动才 `blocked`。
+- **Mod**：`Skills.cs` —— `ClampTimeoutFor` 对 `move_to_location` 走 `MoveToLocationSkill.ClampBudget`（否则内部仍被 30s 卡住，传 60000 无效）。
+- **brain**：`farmwork.ensure_location` 默认 `timeout_ms=60000` + **两段式**（解析回执里的 `warp 源格 (a,b)` 与 `剩余 N 步` → 先 `move_to` 到源格的可站四邻 → 只重试一次）；`bridge.move_to_location` 默认 60000。
+- **单测**：`tests/test_farmwork.py::TestTask43LongPathRecovery`（7 条：两段式救回 / 默认 60000 / 两次都超时有界且如实 / 无源格不硬猜 / 四邻优先级 / 全堵则放弃 / 回执逐字解析）。
+- **读数**：`dotnet build .\AgentFarm.Bridge.csproj -c Release --nologo` ⇒ **0 警告 0 错误**；全量 `unittest discover -s tests` ⇒ **346 OK**。
+- **已知缺口（装机前请知悉）**：仓库**没有 C# 测试工程**（只有 `AgentFarm.Bridge.csproj` 与 `scratch/`、`tools/` 探针工程）⇒ 卡面 §5 里"预算数值/续跳"三条无法用单测覆盖，只能靠 build + 真机三连命令验收；脑侧契约（回执解析、默认 60000、有界两次）已用 Python 用例钉死。真机验收建议照 Lead 的三连：`goto Farm` → `move 47 29 --timeout-ms 30000` → `goto FarmHouse`（应 20–30s 内 ok）。
+
+### 6.2 task-42 经济闭环（收成 → 出货箱 → 次日到账）
+- **Mod**：新增 `ShipSkill.cs`（单 tick 同步技能，**不加入** `BridgeHost.IsLongTaskSkill`）：入参 `slot` + `sellWhitelist`（**白名单为空 ⇒ 一件不卖**）；只调 **public** 的 `Farm.shipItem(item, Game1.player)`，传的是 `Game1.player.Items[slot]` **那个实例**（`removeItemFromInventory` 用引用相等，传 `getOne()` 副本会变成"原物不动、副本进箱"次日多拿一份钱）；判据 = `Items[slot] == null` 且箱子件数/lastItemShipped 变化；**绝不碰 `player.Money`**。
+- **Mod**：`Contracts.cs` 新增顶层 `ShippingBinView{present,count,items,lastItemShipped,separateWallets}` + `ExecArgs.slot/sellWhitelist`；`WorldSnapshot.cs` 新增 `ReadShippingBin()`（主线程当帧真值），**刻意不塞进 `FarmView`**（那个读后台扫描线程缓存，会陈旧）。
+- **brain**：`bridge.sell(slot, whitelist=…)`；`farmwork` 新增 `harvested` 白名单（`harvest()` 按**背包差分**记账：只摘下来而背包没多 ⇒ 不进白名单）、`sellable_slots()`/`sell()`/`sell_loot()`（判据 = 槽位不再有该物 + 该 qualifiedId 总数下降；钱当天不变属**预期**）；`planner`：`Brief.sellable`（不是观测推出来的，由控制器注入）+ `TASK_KINDS` 加 `ship`，确定性顺序变为 `wait_for_save → 体力 → water → harvest → **ship** → clear/till/plant → review`；`longrun`：`_plot_brief` 注入 sellable、`_execute` 接 `ship` → `_ship_loot`（journal `sell`/`sell_failed`，note 写明"钱要等下一次 NewDay"）、日重置 `reset_harvested()`。
+- **单测**：`tests/test_farmwork.py::TestTask42Sell`（6 条）、`tests/test_longrun.py::TestTask42Ship`（3 条）、`tests/test_planner.py` 两条（ship 优先于开垦/播种、干作物仍优先于 ship）。
+- 全仓 `git grep -rn "Money +="`：**只有注释与文档命中，没有任何一处写入**。
+- **与 §2 的差异（如实说明）**：§2 设想复用 `ExecArgs.Item` 传物品 id；实际改成 `slot` + 白名单 —— 因为 `removeItemFromInventory` 是引用相等，按 id 反而容易复制物品。另外 `shippingBin` 放在 `WorldSnapshot` 顶层而非 `FarmView`（见上）。
+- **P3 装机后建议核三条**：①`farm.shippingBin.count` 差分与 `player.inventory[].slot` 变空；②**次日** `money` 增量 == 该物 `sellToStorePrice(-1) × stack`（两个快照的 `day`/`timeOfDay` 都要贴）；③白名单负例：工具/种子槽必须回 `not_whitelisted`（用 `--whitelist` 只给收获物）。

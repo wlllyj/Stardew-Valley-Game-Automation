@@ -358,6 +358,7 @@ class LongRun:
         water_stage_tiles: int = 60,
         max_stage_rounds: int = 6,
         max_env_retries: int = 2,
+        sell_timeout_ms: int = 8000,
         water_min_stamina: float = 1.0,
         plot_walk_timeout_ms: int = 20000,
         max_refills_per_day: int = 4,
@@ -412,6 +413,9 @@ class LongRun:
         # 此时如实留给 `leftover` ⇒ `no_unmet_stages=False` ⇒ 当天 needs_review。
         # 置 0 可关掉重试（单测与排障用）。
         self.max_env_retries = int(max_env_retries)
+        # task-42 出货（`sell`）的 HTTP 超时：单 tick 同步技能（Mod 一次调用即完成），
+        # 不需要像 `sleep`/`buy` 那样等菜单；给 8s 足够（可注入，便于单测把假桥拖慢的场景收紧）。
+        self.sell_timeout_ms = int(sell_timeout_ms)
         # 浇水的体力闸门单独放低到 1 点：当天种下的作物"没浇"是不可补的损失，
         # 必须允许在体力见底前把最后几格浇完（m01847/m01774）。
         self.water_min_stamina = float(water_min_stamina)
@@ -883,8 +887,15 @@ class LongRun:
         # `skip=self.blocked`：今天已证明干不动的格子**不能**再算进 blockers/tillable，
         # 否则"执行层拿不出目标、策略还在喊去干"⇒ 每轮空转（真机 run1 的两格 grass）。
         local_obs = plot_observe(obs, tiles, skip=self.blocked)
+        sellable = 0
+        try:
+            if self.worker is not None:
+                sellable = len(self.worker.sellable_slots(obs))
+        except Exception:
+            sellable = 0
         full = Brief.from_observe(obs, consecutive_failures=self.fail_streak,
-                                  last_failure=self.last_failure, target_tiles=self.target_tiles_base)
+                                  last_failure=self.last_failure, target_tiles=self.target_tiles_base,
+                                  sellable=sellable)
         local = Brief.from_observe(local_obs, consecutive_failures=self.fail_streak,
                                    last_failure=self.last_failure, target_tiles=self.target_tiles_base)
 
@@ -940,6 +951,9 @@ class LongRun:
             target_tiles=capacity,
             areas=areas,
             area_lines=area_lines,
+            # 【task-42】出货白名单件数来自执行层（`FarmWorker.harvested`），
+            # 而它挂在 `full` 上 ⇒ 必须显式搬过来，否则 `ship` 意图永远不会出现。
+            sellable=full.sellable,
         )
 
     def _stage_tiles(self, task: str, obs: dict[str, Any], plot: dict[str, Any]) -> list[tuple[int, int]]:
@@ -1666,6 +1680,10 @@ class LongRun:
                 self._journal("load_save", ok=st.ok, reason=st.reason)
                 acted = acted or st.ok
                 continue
+            if task == "ship":
+                acted = self._ship_loot(obs, rep) or acted
+                obs = self._snap()
+                continue
             if task in STAGE_ACTION:
                 acted = self._run_stage_intent(intent, obs, plot, rep) or acted
                 obs = self._snap()
@@ -1673,6 +1691,40 @@ class LongRun:
             self._journal("intent_unknown", task=task)
             rep.notes.append(f"未知意图 {task}（跳过）")
         return acted
+
+    def _ship_loot(self, obs: dict[str, Any], rep: DayReport) -> bool:
+        """【task-42】把今天亲手收获的东西按白名单放进出货箱（`ship` 意图的执行体）。
+
+        三条纪律，全部来自 `docs/_il-sell-path.md` 与用户 m08335：
+
+        * **白名单空 ⇒ 一步不动**：`worker.sell_loot()` 自己会返回空列表，绝不"看到背包里有东西就卖"；
+        * **绝不写 `Money +=`**：钱只由游戏下一次 `NewDay` 结算（`player.Money = player.Money + total`），
+          所以这一步的判据是"背包那格真的空了 + 出货箱件数变了"，钱当天不变是**正常**的；
+        * 每一件都 journal 一条 `sell`（`before`/`after` 全是观测真值），失败如实带 reason 回去。
+        """
+        assert self.worker is not None
+        steps = self.worker.sell_loot(timeout_ms=self.sell_timeout_ms)
+        if not steps:
+            return False
+        for st in steps:
+            before = st.before if isinstance(st.before, dict) else {}
+            self._journal("sell", ok=st.ok, code=st.code,
+                          slot=before.get("slot"), qid=before.get("qid"),
+                          stack=before.get("stack"), before=st.before, after=st.after,
+                          reason=st.reason, receipt=st.receipt)
+        self._actions += len(steps)
+        good = [s for s in steps if s.ok]
+        bad = [s for s in steps if not s.ok]
+        if good:
+            total = sum(int((s.before or {}).get("stack") or 0) for s in good)
+            note = f"出货 {len(good)} 件（{total} 个）进箱；钱要等下一次 NewDay 才由游戏结算"
+            rep.notes.append(note)
+            self._say(f"  · {note}")
+        if bad:
+            rep.notes.append(f"出货失败：{bad[0].reason}")
+            self._say(f"  × 出货失败：{bad[0].reason}")
+            self._journal("sell_failed", reason=bad[0].reason, code=bad[0].code)
+        return bool(good)
 
     def _review(self, obs: dict[str, Any], rep: DayReport) -> None:
         """任务后复盘（用户 m00707 要的"干完一段就让大模型看看对不对、接下来干什么"）。
@@ -1917,6 +1969,13 @@ class LongRun:
         self.seed_gate_noted = set()
         self.no_target = set()
         self.no_target_global = set()
+        # 【task-42】新的一天 ⇒ 清空出货白名单：昨天收获的东西昨天该出就出了，
+        # 今天再拿白名单去卖会变成"卖一件不存在的东西"（`sellable_slots` 找不到就不动，但语义要干净）。
+        if self.worker is not None:
+            try:
+                self.worker.reset_harvested()
+            except Exception:
+                pass
         recovered = 0            # 今天"换了一片地"的次数（本片拿不出目标时）
         # **一天的第一次决策必须是"跨日边界"**（用户 m01860：该由大模型先判断今天做什么）。
         # `detect_boundary` 判 new_day 的依据是"state 里的 day_key 与当前简报不同"，而且**两边都得

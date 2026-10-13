@@ -181,6 +181,7 @@ namespace AgentFarm.Bridge
             snap.Ui = ReadUi();
             snap.Liveness = ReadLiveness();
             snap.Game = ReadGame();
+            snap.ShippingBin = ReadShippingBin();   // task-42：出货箱内容（shipItem 的唯一客观判据）
 
             return new WorldSnapshotViewResult { Body = snap, WorldSeq = _worldSeq };
         }
@@ -285,17 +286,62 @@ namespace AgentFarm.Bridge
                 {
                     Item it = items[i];
                     if (it == null) continue;
-                    var iv = new ItemView { Slot = i };
-                    try { iv.Id = it.ItemId; } catch { }
-                    try { iv.QualifiedId = it.QualifiedItemId; } catch { }
-                    try { iv.Name = it.DisplayName ?? it.Name; } catch { }
-                    try { iv.Stack = it.Stack; } catch { }
-                    try { iv.IsTool = it is Tool; } catch { }
-                    list.Add(iv);
+                    list.Add(ItemToView(it, i));
                 }
             }
             catch { }
             return list.ToArray();
+        }
+
+        /// <summary>把一件物品做成视图（背包与出货箱共用，task-42 抽出来复用）。</summary>
+        private static ItemView ItemToView(Item it, int slot)
+        {
+            var iv = new ItemView { Slot = slot };
+            try { iv.Id = it.ItemId; } catch { }
+            try { iv.QualifiedId = it.QualifiedItemId; } catch { }
+            try { iv.Name = it.DisplayName ?? it.Name; } catch { }
+            try { iv.Stack = it.Stack; } catch { }
+            try { iv.IsTool = it is Tool; } catch { }
+            return iv;
+        }
+
+        /// <summary>
+        /// 出货箱内容（task-42，快照 v0.7.24）。**主线程当帧**真值。
+        ///
+        /// 【为什么必须有】`Farm.shipItem(item, who)` 只把物品搬进箱子，钱要等**下一次
+        /// `NewDay`** 结算（`Game1._newDayAfterFade`：`player.Money = player.Money + total`）。
+        /// 结算之前，"卖出是否真的发生"唯一的客观证据就是箱子内容 —— 回执不算证据
+        /// （见 `docs/_il-sell-path.md` §6 U1）。
+        ///
+        /// 【箱子是哪一只】`Farm.getShippingBin(player)`：`useSeparateWallets` 时是玩家个人箱，
+        /// 否则是共享箱；两者在 `Farm..ctor` 里都会 new，正常存档一定非 null（拿不到就报 present=false）。
+        /// </summary>
+        private static ShippingBinView ReadShippingBin()
+        {
+            var v = new ShippingBinView();
+            try
+            {
+                Farm farm = null;
+                try { farm = Game1.getFarm(); } catch { }
+                if (farm == null || Game1.player == null) return v;
+                try { v.SeparateWallets = Game1.player.useSeparateWallets; } catch { }
+                var bin = farm.getShippingBin(Game1.player);
+                if (bin == null) return v;
+                v.Present = true;
+                var list = new List<ItemView>();
+                for (int i = 0; i < bin.Count; i++)
+                {
+                    Item it = bin[i];
+                    if (it == null) continue;
+                    list.Add(ItemToView(it, i));
+                }
+                v.Items = list.ToArray();
+                v.Count = list.Count;
+                try { v.LastItemShipped = farm.lastItemShipped?.QualifiedItemId ?? ""; }
+                catch { v.LastItemShipped = ""; }
+            }
+            catch { }
+            return v;
         }
 
         private static ToolsView ReadTools(Farmer p)

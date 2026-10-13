@@ -84,6 +84,9 @@ namespace AgentFarm.Bridge
                 // 跨日 = 淡黑 + 存档 + 换天，合法地比"走一格"慢得多（上限 300 秒）
                 case "sleep":
                     return SleepSkill.ClampBudget(timeoutMs);
+                // 长距离多跳（走几十步再进建筑）：30s 装不下，task-43 放宽到 60s
+                case "move_to_location":
+                    return MoveToLocationSkill.ClampBudget(timeoutMs);
                 default:
                     return ClampTimeout(timeoutMs);
             }
@@ -285,6 +288,19 @@ namespace AgentFarm.Bridge
                 case "buy":
                     return new BuySkill(req, world, monitor).Step;
 
+                // 【task-42】`sell`：把**白名单内**的一格背包物品放进**出货箱**（用户 m08335：一分钱也没挣到）。
+                //
+                // 【纪律】与 buy 同一条：**绝不自己写 `Money +=`**。只调游戏自己的
+                // `Farm.shipItem(item, Game1.player)`；钱由**下一次 NewDay** 结算
+                // （`Game1._newDayAfterFade` 里 `player.Money = player.Money + total`）。
+                // 所以判据不是钱变了（当天根本不变），而是"那件东西真的离开背包了"。
+                // 详细 IL 证据链与三个坑（引用相等 / 整叠出货 / Halt 副作用）见 ShipSkill 类注释，
+                // 以及 docs/_il-sell-path.md。
+                //
+                // 单 tick 同步技能：不加入 BridgeHost.IsLongTaskSkill。
+                case "sell":
+                    return new ShipSkill(req, world, monitor).Step;
+
                 default:
                     // 未实现的技能：合法请求但还没有实现（区别于 unknown_skill）。
                     return () => new ExecResponse
@@ -293,7 +309,7 @@ namespace AgentFarm.Bridge
                         Status = "not_implemented",
                         Skill = skill,
                         Reason = $"技能“{skill}”尚未实现（已实现：noop、move_to、move_to_location、"
-                               + "dismiss_modal、load_save、quit_game、interact、use_tool、select_item、plant、sleep、buy）",
+                               + "dismiss_modal、load_save、quit_game、interact、use_tool、select_item、plant、sleep、buy、sell）",
                     };
             }
         }
@@ -303,11 +319,10 @@ namespace AgentFarm.Bridge
         {
             // 已实现
             "noop", "move_to", "dismiss_modal", "move_to_location", "load_save", "quit_game", "interact", "use_tool",
-            "select_item", "plant", "sleep", "buy",
+            "select_item", "plant", "sleep", "buy", "sell",
             // 架构 §5.3 规划中（返回 not_implemented，便于“脑”一次性看清缺口）
             "exit_building", "harvest",
             "pickup_debris", "collect_machine", "refill_watering_can", "talk",
-            "sell",
         };
 
         public static bool IsKnownSkill(string skill) => skill != null && KnownSkills.Contains(skill);

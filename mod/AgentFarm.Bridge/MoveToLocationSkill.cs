@@ -79,8 +79,32 @@ namespace AgentFarm.Bridge
     /// </summary>
     internal sealed class MoveToLocationSkill
     {
-        /// <summary>单跳的默认时间预算（还会被"整体剩余时间"再夹一次，绝不会越过总预算）。</summary>
+        /// <summary>
+        /// 单跳预算的**下限**（还会被"整体剩余时间"再夹一次，绝不会越过总预算）。
+        ///
+        /// 【task-43 修正：预算必须与路径长度相关】run4 实证（2026-10-13 19:38）：
+        /// 从田里 `Farm [47,29]` 走回 `FarmHouse` 门口那一跳 **剩余 58 步**，而旧代码每一跳固定 8000ms
+        /// ⇒ 必然超时（游戏里 1 格约 0.3–0.7s，58 步要 20–40s）。两个日报告都因此 `sleep_failed`：
+        /// `去 FarmHouse 失败：[timeout] … warp 源格 (64,14) 超时（单跳预算 8000ms…剩余 58 步未走完）`。
+        /// 现在按 **A* 真实剩余步数**给预算（见 <see cref="HopBudget"/>）：卡面口径
+        /// `Clamp(4000 + 500 × 剩余步数, 8000, 30000)`（真机实测 ≈4.5 格/s；88 步 ⇒ 理论上 48s，
+        /// 所以上限取 30000ms ≈ 能跑 135 格），下限仍是本常量、
+        /// 上限普通跳 <see cref="WalkHopMaxMs"/> / 门跳 <see cref="DoorHopMaxMs"/>，
+        /// 并且**绝不超过整体剩余预算**。
+        /// </summary>
         private const int HopTimeoutMs = 8000;
+
+        /// <summary>普通跳的预算上限（task-43 卡面第 3 条：其余跳 8000–20000）。</summary>
+        private const int WalkHopMaxMs = 20000;
+
+        /// <summary>门/建筑跳的预算上限（进出门要淡出+切换地图，合法地更慢；卡面：门跳允许到 30000）。</summary>
+        private const int DoorHopMaxMs = 30000;
+
+        /// <summary>每多走一步多给多少毫秒预算（task-43 卡面：真机实测 ≈4.5 格/s ⇒ 500ms/步留余量）。</summary>
+        private const int HopMsPerStep = 500;
+
+        /// <summary>起步预算（task-43 卡面口径 `4000 + 500 × 步数` 的常数项）。</summary>
+        private const int HopBaseMs = 4000;
 
         /// <summary>传送落地后先等几个 tick 再走下一跳（等世界稳定，见类注释第三节）。</summary>
         private const int SettleTicks = 2;
@@ -155,6 +179,8 @@ namespace AgentFarm.Bridge
         private int _candidateIndex;
         private StepMover _mover;
         private GameLocation _hopLocation;   // 这一跳所在的地图（发起时捕获，避免中途读串图）
+        private int _hopBudgetMs;            // 当前跳**实际**给的预算（task-43：写进失败 reason）
+        private int _hopSteps;               // 当前跳 A* 真实剩余步数（task-43：写进失败 reason）
         private StepMover _finalMover;
         private DateTime _finalStartedAtUtc;
         private Point _pushTarget;        // 门口动作/挤压的目标格（门格）
@@ -165,11 +191,23 @@ namespace AgentFarm.Bridge
         private readonly List<string> _attemptStatuses = new List<string>();
         private readonly List<string> _attemptText = new List<string>();
 
+        /// <summary>超时上限（task-43）：`move_to_location` 是**长距离多跳**技能，30s 装不下"走 58 步再进门"。</summary>
+        public const int MaxTimeoutMs = 60000;
+
+        /// <summary>把请求里的超时夹进本技能自己的区间（task-43；此前被 <see cref="Skills.ClampTimeout"/> 的 30s 卡住）。</summary>
+        public static int ClampBudget(int? timeoutMs)
+        {
+            int v = timeoutMs ?? Skills.TimeoutDefaultMs;
+            if (v < Skills.TimeoutMinMs) v = Skills.TimeoutMinMs;
+            if (v > MaxTimeoutMs) v = MaxTimeoutMs;
+            return v;
+        }
+
         public MoveToLocationSkill(ExecRequest req, WorldObserver world, IMonitor monitor)
         {
             this._world = world;
             this._monitor = monitor;
-            this._timeoutMs = Skills.ClampTimeout(req?.TimeoutMs);
+            this._timeoutMs = ClampBudget(req?.TimeoutMs);
             this._targetLocation = req?.Args?.Location;
 
             int[] tile = req?.Args?.Tile;
@@ -431,6 +469,34 @@ namespace AgentFarm.Bridge
             return this.StartCandidate(elapsed);
         }
 
+        /// <summary>
+        /// 这一跳该给多少预算：<c>clamp(4000 + 500 × 剩余步数, 8000, 上限)</c>，再夹"整体剩余时间"。
+        ///
+        /// 【task-43】旧代码写死 8000ms ⇒ 长路径必假超时（run4 的 58 步）。步数优先用 A* 的
+        /// <see cref="StepMover.PathSteps"/>（`Begin()` 之后才有），发起前只拿得到直线距离估算。
+        /// </summary>
+        private int HopBudget(int steps, long remaining, bool doorHop)
+        {
+            int cap = doorHop ? DoorHopMaxMs : WalkHopMaxMs;
+            long want = HopBaseMs + (long)HopMsPerStep * Math.Max(steps, 0);
+            if (want < HopTimeoutMs) want = HopTimeoutMs;
+            if (want > cap) want = cap;
+            if (want > remaining) want = remaining;   // 绝不越过整体预算
+            if (want < Skills.TimeoutMinMs) want = Skills.TimeoutMinMs;
+            return (int)want;
+        }
+
+        /// <summary>拿不到 A* 步数时的退化估算（曼哈顿距离；只用于 `Begin()` 之前）。</summary>
+        private int EstimateSteps(Point tile)
+        {
+            try
+            {
+                Point p = Game1.player.TilePoint;
+                return Math.Abs(p.X - tile.X) + Math.Abs(p.Y - tile.Y);
+            }
+            catch { return 0; }
+        }
+
         /// <summary>依次尝试候选格；能起路就返回 null，全部不行则把这一跳判失败。</summary>
         private object StartCandidate(long elapsed)
         {
@@ -438,16 +504,22 @@ namespace AgentFarm.Bridge
             {
                 HopCandidate c = this._candidates[this._candidateIndex];
                 long remaining = this._timeoutMs - elapsed;
-                int budget = (int)Math.Min(HopTimeoutMs, remaining);
-                if (budget < Skills.TimeoutMinMs) budget = Skills.TimeoutMinMs;
+                bool doorHop = c.Edge != null && c.Edge.IsDoor;
+                int budget = this.HopBudget(this.EstimateSteps(c.Tile), remaining, doorHop);
 
                 var mover = new StepMover(this._hopLocation ?? Game1.currentLocation, c.Tile, budget, this.HopLabel());
                 MoveOutcome o = mover.Begin();
 
                 if (o.Kind == MoveStopKind.Running)
                 {
+                    // A* 已经算出**真实剩余步数**：用它把预算抬到该有的值（需求 1 的落点）。
+                    // StepMover 只在 Tick 里比 `elapsed > 预算`，所以 Begin() 之后抬高完全来得及。
+                    int want = this.HopBudget(mover.PathSteps, remaining, doorHop);
+                    mover.RaiseBudget(want);
+                    this._hopBudgetMs = want;
+                    this._hopSteps = mover.PathSteps;
                     this._mover = mover;
-                    this.Note("walking", c, "started");
+                    this.Note("walking", c, $"started（剩余 {mover.PathSteps} 步，预算 {want}ms）");
                     return null;   // 交给后续 tick 推进
                 }
 
@@ -687,13 +759,18 @@ namespace AgentFarm.Bridge
             }
 
             long remaining = this._timeoutMs - elapsed;
-            int budget = (int)Math.Min(HopTimeoutMs, remaining);
-            if (budget < Skills.TimeoutMinMs) budget = Skills.TimeoutMinMs;
+            // task-43：收尾这段也是"走路"，同样按剩余步数给预算（门跳上限不适用，用普通上限）。
+            int budget = this.HopBudget(this.EstimateSteps(this._targetTile), remaining, false);
 
             var mover = new StepMover(Game1.currentLocation, this._targetTile, budget, "move_to_location 收尾");
             MoveOutcome o = mover.Begin();
             if (o.Kind != MoveStopKind.Running)
                 return this.Fail(o.Status, o.Reason, elapsed);
+
+            int finalWant = this.HopBudget(mover.PathSteps, remaining, false);
+            mover.RaiseBudget(finalWant);
+            this._hopBudgetMs = finalWant;
+            this._hopSteps = mover.PathSteps;
 
             this._finalMover = mover;
             this._finalStartedAtUtc = DateTime.UtcNow;
@@ -1062,8 +1139,13 @@ namespace AgentFarm.Bridge
             else if (this._attemptStatuses.Contains("timeout"))
             {
                 status = "timeout";
+                // task-43：把**实际给的预算**和 **A* 剩余步数**写进 reason（旧文案写死 8000 会误导：
+                // 看不出是"预算与路径长度无关"还是"真的走不动"）。脑侧 `ensure_location` 会解析这两个数。
+                string budgetTxt = this._hopBudgetMs > 0
+                    ? $"单跳预算 {this._hopBudgetMs}ms，剩余 {this._hopSteps} 步未走完"
+                    : $"单跳预算 {HopTimeoutMs}ms 或整体剩余时间用尽";
                 reason = $"第 {this._hops.Count} 跳失败（timeout）：走向 {from} → {to} 的 warp 源格 {srcTxt} 超时"
-                    + $"（单跳预算 {HopTimeoutMs}ms 或整体剩余时间用尽）。本跳试过的格子：{tried}";
+                    + $"（{budgetTxt}）。本跳试过的格子：{tried}";
             }
             else if (this._reachedNearTiles.Count > 0)
             {

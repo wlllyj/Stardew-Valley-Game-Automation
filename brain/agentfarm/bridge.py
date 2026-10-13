@@ -617,7 +617,7 @@ class BridgeClient:
         location: str,
         *,
         tile: tuple[int, int] | None = None,
-        timeout_ms: int = 30000,
+        timeout_ms: int = 60000,
         based_on_seq: int | None = None,
         allow_bed: bool = False,
     ) -> dict[str, Any]:
@@ -637,6 +637,11 @@ class BridgeClient:
         失败状态码：`precondition_failed`（地点不存在/坐标为负/目标格有阻挡家具）、
         `unreachable_no_route`（warp 图上无路）、`hop_failed`（走到触发格但没传送）、
         `unreachable`、`blocked`、`timeout`、`ui_modal`、`no_save`。
+
+        【task-43】默认 `timeout_ms=60000`：run4 实证从田里回农舍 A* 真实路径 ≈88 步
+        （被草/石/枝/树逼得绕路 3 倍，≈20–30s），30s 会被整体预算卡死。失败回执里会带
+        `单跳预算 …ms，剩余 N 步未走完` 与 `warp 源格 (x,y)`，`farmwork.ensure_location`
+        据此做**两段式**接近（先 `move_to` 到源格旁可站格，再只重试一次）。
         """
         args: dict[str, Any] = {"location": location}
         if tile is not None:
@@ -800,6 +805,33 @@ class BridgeClient:
             {"item": item, "count": int(count), "shop": shop},
             timeout_ms=timeout_ms,
         )
+
+    def sell(
+        self,
+        slot: int,
+        *,
+        whitelist: list[str] | tuple[str, ...] | None = None,
+        timeout_ms: int = 8000,
+    ) -> dict[str, Any]:
+        """**把背包某一格放进出货箱**（`sell`，Mod ≥ 0.7.24，task-42）。
+
+        `slot`：背包槽位下标（**0 起**）—— 必须给槽位而不是物品名，因为游戏自己的
+        `Farmer.removeItemFromInventory` 用**引用相等**找物品（`Items.IndexOf(which)`），
+        只有槽位能无歧义指认"背包里那一件"（传副本会变成"原物不动、副本进箱"，次日多拿一份钱）。
+        `whitelist`：**允许列表**（qualifiedId，如 `(O)24`）。**空 = 一件都不卖**：
+        脑侧只把当天 `harvest()` 亲眼收获进背包的 qualifiedId 放进来，绝不做"除工具以外都能卖"的黑名单。
+
+        ⚠️ **钱当天不会变**：`Farm.shipItem` 只把物品搬进箱子，钱由**下一次 `NewDay`** 结算
+        （`Game1._newDayAfterFade`：`player.Money = player.Money + total`）。
+        Mod 的判据是"那一格真的空了"，不是钱变了 —— **回执只是声明**，
+        验收要用 observe 差分看 `shippingBin.count` / `shippingBin.items[]`（结算后再看 `player.money`）。
+        失败状态码：`bad_args` / `empty_slot` / `not_whitelisted` / `not_sellable` / `quest_item` /
+        `big_craftable` / `empty_stack` / `sell_no_effect` / `error`。
+        """
+        args: dict[str, Any] = {"slot": int(slot)}
+        if whitelist:
+            args["sellWhitelist"] = [str(x) for x in whitelist]
+        return self.exec_skill("sell", args, timeout_ms=timeout_ms)
 
     def quit_game(self, *, timeout_ms: int = 3000) -> dict[str, Any]:
         """让**游戏自己退出**（quit_game，Mod ≥ 0.7.0）。
