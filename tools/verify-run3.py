@@ -572,10 +572,33 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         ("watchdog_stop", "watchdog 判定 STOP"),
         ("modal_timeout", "模态等待超时"),
         ("no_day_progress", "跨日没有推进"),
+        # task-50 期间 Lead 补：**版本不符**的账本不能当验收证据（"版本号相同内容不同"的
+        # v0.7.17 教训）⇒ 升格为问题项，不是信息项。
+        ("mod_version_mismatch", "Mod 版本与脑侧期望不一致（该账本不能当验收证据）"),
     ):
         n = events.get(code, 0)
         if n:
             problems.append(f"journal 里出现 {label} ×{n}")
+
+    # 3d. 其余风险事件只记信息项（Lead 2026-10-14 补）：它们不直接判失败，但 run6 复盘必须
+    #     看得见 —— 尤其 `water_far_unavailable`（farm 说还有干作物、但拿不到 dryTiles 坐标）
+    #     与 `farm_evidence_unavailable`（室内 + farm 口径不可用），这两条正是 run5 连睡病灶的
+    #     相邻风险面；`sell_failed` 是经济闭环的失败面。
+    for code, label in (
+        ("water_far_unavailable", "窗口外干作物拿不到坐标（旧 Mod/证据不可信）"),
+        ("farm_evidence_unavailable", "室内且 farm 口径不可用（守卫按有活处理）"),
+        ("sell_failed", "出货（sell）失败"),
+        ("zones_failed", "田区划分失败（LLM 田区提示不可用）"),
+        ("day_key_resnap_failed", "睡后重新观测失败（跨日证据可能缺）"),
+        ("bridge_unavailable", "bridge 瞬时不可用（已重试）"),
+        ("env_spin_capped", "同格环境挡路触顶（不再免费重试）"),
+        ("budget_exhausted", "预算用尽收尾"),
+        ("day_cap", "触发 max-days 上限收尾"),
+        ("event_blocked", "游戏事件挂住（硬停等人）"),
+    ):
+        n = events.get(code, 0)
+        if n:
+            infos.append(f"风险事件：{label} ×{n}（信息项，不改结论）")
 
     streak = 0
     for d in reversed(days):
