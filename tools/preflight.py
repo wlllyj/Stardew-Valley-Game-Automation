@@ -114,8 +114,15 @@ def main() -> int:
         "money": worker.money(obs),
         "isInBed": worker.is_in_bed(obs),
         "seeds": [[i, n, s] for i, n, s in seeds],
+        # task-12 要求基线必须能回答"会不会弹职业选择"与"浇水真值"两个问题
+        "farmingLevel": (worker.player_of(obs) or {}).get("farmingLevel"),
         "crops": dig(obs, "farm", "crops"),
         "unwateredCrops": dig(obs, "farm", "unwateredCrops"),
+        # farm.dryCrops 才是"今天没浇的格数"（farm.unwateredCrops 不是，见 docs/_analyze-farmcounts.md）；
+        # complete==false 时 farm.* 计数不可用，scanSeq 用于判断这张扫描是不是新的。
+        "dryCrops": dig(obs, "farm", "dryCrops"),
+        "farmComplete": dig(obs, "farm", "complete", default=None),
+        "farmScanSeq": dig(obs, "farm", "scanSeq", default=None),
         "waterLeft": worker.water_left(obs),
         "tillableCount": len(worker.tillable_of(obs)),
         "tileCount": len(worker.tiles_of(obs)),
