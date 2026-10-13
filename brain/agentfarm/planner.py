@@ -937,21 +937,29 @@ ChatFn = Callable[..., Any]
 DEFAULT_MAX_LLM_ATTEMPTS = 2
 
 
-def _usage_dict(value: Any) -> dict[str, int]:
-    """【task-56】把 `llm.Usage`（或任何同名字段的映射）拍成留痕用的纯 dict。
+def _usage_dict(value: Any) -> dict[str, int | None]:
+    """【task-56】把 `llm.Usage`（或任何同名字段的映射）拍成留痕口径 `{prompt,completion,total}`。
 
-    认不出来就返回空 dict —— 留痕只负责如实记录，**绝不因为读不到用量而影响决策**。
+    **取不到的写 `None`**（卡面要求 null），绝不臆造 0 —— 留痕只负责如实记录，
+    也绝不因为读不到用量影响决策。
     """
     if value is None:
-        return {}
-    out: dict[str, int] = {}
-    for key in ("prompt_tokens", "completion_tokens", "reasoning_tokens", "cached_tokens", "total_tokens"):
-        num = getattr(value, key, None)
-        if num is None and isinstance(value, Mapping):
-            num = value.get(key)
-        if isinstance(num, (int, float)):
-            out[key] = int(num)
-    return out
+        return {"prompt": None, "completion": None, "total": None}
+
+    def pick(*names: str) -> int | None:
+        for name in names:
+            num = getattr(value, name, None)
+            if num is None and isinstance(value, Mapping):
+                num = value.get(name)
+            if isinstance(num, (int, float)):
+                return int(num)
+        return None
+
+    return {
+        "prompt": pick("prompt_tokens", "prompt"),
+        "completion": pick("completion_tokens", "completion"),
+        "total": pick("total_tokens", "total"),
+    }
 
 
 class BoundaryPlanner:
@@ -1067,11 +1075,11 @@ class BoundaryPlanner:
                 attempts = attempt
                 rejection = self._describe_failure(exc)
                 traces.append(self._trace_record(boundary, user_text, attempt,
-                                                 accepted=False, rejected=[rejection]))
+                                                 accepted_intents=(), rejected=[rejection]))
                 break
             attempts = attempt
             traces.append(self._trace_record(boundary, user_text, attempt,
-                                             accepted=bool(intents), rejected=list(found)))
+                                             accepted_intents=intents, rejected=list(found)))
             if intents:
                 decision = PlannerDecision(
                     boundary=boundary, intents=tuple(intents), source=SOURCE_LLM,
@@ -1102,14 +1110,16 @@ class BoundaryPlanner:
         user_text: str,
         attempt: int,
         *,
-        accepted: bool,
+        accepted_intents: Sequence[TaskIntent],
         rejected: Sequence[str],
     ) -> dict[str, Any]:
         """【task-56】攒一条待落盘的留痕记录（真实 LLM 调用的现场）。
 
         字段与卡面逐字对齐：`t / boundary / model / prompt_chars / prompt（>8000 截断 +
-        prompt_truncated）/ raw / usage / finish_reason / duration_ms / attempts / rejected /
-        accepted / fallback`。`fallback` 先占位，`_stamp_trace()` 按最终决策统一改写。
+        prompt_truncated）/ raw / usage（`{prompt,completion,total}`，取不到写 null）/
+        finish_reason / duration_ms / attempts / rejected（被拒收的原因数组）/
+        accepted（本次真正采用的意图数组）/ fallback（是否降级 + 原因）`。
+        `fallback` 先占位，`_stamp_trace()` 按最终决策统一改写。
         """
         meta = dict(self._last_ask_meta)
         prompt = str(user_text or "")
@@ -1121,12 +1131,12 @@ class BoundaryPlanner:
             "prompt": prompt[:LLM_TRACE_MAX_PROMPT_CHARS],
             "prompt_truncated": len(prompt) > LLM_TRACE_MAX_PROMPT_CHARS,
             "raw": str(meta.get("raw") or ""),
-            "usage": dict(meta.get("usage") or {}),
+            "usage": dict(meta.get("usage") or {"prompt": None, "completion": None, "total": None}),
             "finish_reason": str(meta.get("finish_reason") or ""),
             "duration_ms": int(meta.get("duration_ms") or 0),
             "attempts": int(attempt),
             "rejected": [str(x) for x in rejected],
-            "accepted": bool(accepted),
+            "accepted": [i.as_dict() for i in accepted_intents],
             "fallback": False,
         }
 
@@ -1135,12 +1145,17 @@ class BoundaryPlanner:
 
         写盘失败**绝不影响决策**：错误只放在 `decision.llm_trace_error` 里，由控制器记一条
         `llm_trace_failed` journal。确定性决策（`traces` 为空）不写任何文件。
+        `fallback` 写"是否降级 + 原因"：没降级是 `False`，降级则是可读的原因串。
         """
         if not traces:
             return decision
         degraded = decision.source != SOURCE_LLM
+        fallback_value: Any = False
+        if degraded:
+            reason = str(decision.fallback_reason or "").strip()
+            fallback_value = f"{decision.source}: {reason}" if reason else decision.source
         for record in traces:
-            record["fallback"] = bool(degraded)
+            record["fallback"] = fallback_value
         path_text, last_hash, error = self._write_traces(traces)
         # `PlannerDecision` 是 frozen dataclass ⇒ 用 `replace()` 派生新对象（不许原地改）。
         return replace(decision, llm_trace=path_text, llm_trace_hash=last_hash, llm_trace_error=error)

@@ -848,13 +848,13 @@ class LlmTraceTests(unittest.TestCase):
             self.assertEqual(rec["boundary"], P.BOUNDARY_NEW_DAY)
             self.assertEqual(rec["model"], "deepseek-flash")
             self.assertEqual(rec["attempts"], 1)
-            self.assertEqual(rec["accepted"], True)
-            self.assertEqual(rec["fallback"], False)
+            self.assertEqual([i["task"] for i in rec["accepted"]], ["till_area"])
+            self.assertIs(rec["fallback"], False)             # 没降级 ⇒ False（不是空串）
             self.assertEqual(rec["rejected"], [])
             self.assertEqual(rec["raw"], valid_payload())
             self.assertEqual(rec["finish_reason"], "stop")
-            self.assertEqual(rec["usage"]["prompt_tokens"], 11)
-            self.assertEqual(rec["usage"]["completion_tokens"], 22)
+            # 卡面口径 `{prompt,completion,total}`
+            self.assertEqual(rec["usage"], {"prompt": 11, "completion": 22, "total": 33})
             self.assertEqual(rec["prompt"], chat.calls[0][1]["content"])
             self.assertEqual(rec["prompt_chars"], len(rec["prompt"]))
             self.assertEqual(rec["prompt_truncated"], False)
@@ -869,13 +869,15 @@ class LlmTraceTests(unittest.TestCase):
     def test_over_8000_chars_prompt_is_truncated_and_flagged(self):
         rec = P.BoundaryPlanner(llm_chat=FakeChat(""), llm_trace_path=None)._trace_record(
             P.BOUNDARY_NEW_DAY, "长" * (P.LLM_TRACE_MAX_PROMPT_CHARS + 500), 2,
-            accepted=False, rejected=["x"])
+            accepted_intents=(), rejected=["x"])
         self.assertEqual(len(rec["prompt"]), P.LLM_TRACE_MAX_PROMPT_CHARS)
         self.assertEqual(rec["prompt_truncated"], True)
         self.assertEqual(rec["prompt_chars"], P.LLM_TRACE_MAX_PROMPT_CHARS + 500)
         self.assertEqual(rec["attempts"], 2)
-        self.assertEqual(rec["accepted"], False)
+        self.assertEqual(rec["accepted"], [])
         self.assertEqual(rec["rejected"], ["x"])
+        # 没拿到 LlmResult（纯字符串 seam）⇒ 用量写 null，绝不臆造 0
+        self.assertEqual(rec["usage"], {"prompt": None, "completion": None, "total": None})
 
     def test_trace_write_failure_never_changes_the_decision(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -896,8 +898,10 @@ class LlmTraceTests(unittest.TestCase):
             decision = planner.decide(self.boundary_state(), till_brief(day_key=(1, "spring", 6)))
             self.assertEqual(decision.source, P.SOURCE_DETERMINISTIC_FALLBACK)
             rec = json.loads(path.read_text(encoding="utf-8").strip().splitlines()[0])
-            self.assertEqual(rec["accepted"], False)
-            self.assertEqual(rec["fallback"], True)                   # 这次决策最终降级了
+            self.assertEqual(rec["accepted"], [])
+            # 降级时 `fallback` 是"是 + 原因"的可读串（没降级时是 False）
+            self.assertIn("deterministic_fallback", rec["fallback"])
+            self.assertIn("llm_error:network", rec["fallback"])
             self.assertEqual(rec["raw"], "")
             self.assertTrue(rec["rejected"][0].startswith("llm_error:network"))
 

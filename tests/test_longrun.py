@@ -3046,8 +3046,8 @@ class TestTask56LlmTraceWiring(unittest.TestCase):
             # 每行 trace 都是一次**真实**调用：行数 == 假 seam 被调次数（不多不少）
             self.assertEqual(len(lines), chat.calls)
             recs = [json.loads(ln) for ln in lines]
-            self.assertTrue(all(r["accepted"] is False for r in recs))
-            self.assertTrue(all(r["fallback"] is True for r in recs))
+            self.assertTrue(all(r["accepted"] == [] for r in recs))
+            self.assertTrue(all(r["fallback"] for r in recs))    # 降级 ⇒ 可读原因串（真值）
 
     def test_llm_trace_failed_is_journalled_when_the_path_is_unusable(self):
         """写盘失败：决策照常跑完，journal 多一条 `llm_trace_failed`（用户才不会以为有留痕）。"""
