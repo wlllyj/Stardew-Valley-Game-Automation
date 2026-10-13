@@ -70,3 +70,16 @@ Start-Process -FilePath <python.exe> -ArgumentList '-u','tools\run-longrun.py','
 - task-14 逐帧 warp 活锁未修 ⇒ 每次 `goto Farm` 仍会刷 `Warping to Farm`，并可能勾出剧情事件（task-41 会硬停等人）。
 - Mod 无 C# 测试工程 ⇒ Mod 侧新逻辑靠 build + 真机验收。
 - LLM 留痕 `<journal>-llm.jsonl` **只追加、不轮转/不封顶**（task-56，Lead 2026-10-14 裁定）：run6 三天量级可接受，长跑（>10 天）再谈上限；`raw` 原样记录不截断（受 `max_tokens=16384` 天然约束）；`t` 是墙钟 unix 秒，**跨文件关联一律以 `llm_trace_hash` 为键**。
+
+## 7 run6 起跑前的操作员预置（Lead 执行，起跑前完成）
+
+**目的**：让 run6 真的能演示"播种腿"，而不是像 run5 那样因为"钱 14g、种子 0"整跑只剩清障+浇水（任务书 ⑥ 的四个动作 = 清障→开垦→播种→浇水）。
+
+**做法（全部走已真机验收过的路径；不改代码、不动 `mod/`、不手改存档）**：
+1. `python tools\preflight.py --expect 0.7.25 --save-baseline logs\run6-baseline.json` —— 同时记录 `money` / `seeds` / `inventory` / `farm` 计数基线。
+2. 若 `seeds_total == 0`：用 `scratch\verify-sell-brain.py` 把 run5 清障/开垦攒下的余料（石/木/纤维/黏土/煤等，**每个 id 保留 K=10**；工具/武器/种子/建材一律不卖）送进出货箱 —— 这是那批被清掉的资源变成的钱。判据一律观测差分（槽位空 + 箱件数增加），钱要等跨日才到账。
+3. `python scratch\verify-sleep-brain.py`（已 VERIFIED 的"踩触发格"配方）睡一天收款；外部证据三项：`clock.day` +1、存档 size/mtime 前进、`timeOfDay` 回 ≈06:00。
+4. 复核 `money ≥ 20g` 且 `seeds_total == 0` ⇒ 起跑后**脑自己**会 `buy` 种子并播种（该路径 run5 实测过：`114→14` 买 5 包 `472`）。
+5. 之后 3 个游戏日**全程无人介入**；预置发生在起跑前，不计入"无人介入"。
+
+**红线**：预置只允许用 `sell` / `sleep` / `buy` 三条已验收路径；**绝不** `Money +=`、绝不手改存档、绝不直接塞背包。每一步留 `logs/` 证据，并在 `docs\_run6-evidence.md` 第 0 段如实写明"操作员预置：卖了什么、卖了几个、到账多少"。
