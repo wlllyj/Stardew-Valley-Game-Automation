@@ -9,8 +9,10 @@
   3. 无效挥动（stages[].failed 按 action 分组 + blocked 记账的格与理由）
   4. 睡觉时机（睡前体力/时刻/还有活；sleep 失败与 intent_vetoed）
   5. 环境挡路（env_fail，statuses=busy/渐黑/模态/没存档）、**自旋到上限**（env_spin_capped：
-     同一格被挡住超过 MAX_ENV_ATTEMPTS=2 后改按"没结论"占配额）与没拿到结论（inconclusive_fail，
-     占配额 ⇒ "配额被吃掉 N 格"）
+     同一格被挡住超过 MAX_ENV_ATTEMPTS=2 后改按"没结论"占配额）、**不可达**（unreachable /
+     unreachable_stage / unreachable_summary，task-52：四邻都站不过去 / A* 算不出路；政策是
+     **不计当天硬失败**、当天记 blocked、**次日重试**，日级豁免有上界 max(5, 20%×attempted)）
+     与没拿到结论（inconclusive_fail，占配额 ⇒ "配额被吃掉 N 格"）
 外加：每天一行摘要、3-8 条带证据行的改进建议、"本账本无法判定"清单。
 
 与 `tools\\verify-run3.py` 的关系：两者**独立读数、交叉核对**。本工具只做分析、不判验收；
@@ -19,7 +21,8 @@
   * 0 个阶段却自称 VERIFIED 必须有"无活可做"的证据（`no_intents`/`plot_exhausted`/
     `policy_fallback` 事件，或 sleep/ended_reason 以 `no_work`/`night`/`stamina` 开头）；
   * `failed_steps` 与 `sum(stages[].failed)` 的差额必须被 `env_block(+count)` + `inconclusive(+count)`
-    完全解释（否则"账目不可信"）；
+    完全解释（否则"账目不可信"；`unreachable` **不在**这个差额口径里 —— verify-run3.py:388-404 只认前两者，
+    不可达格被 exempt 后本就不该出现在 `stages[].failed`）；
   * 浇水证据（task-19/task-36，与 `tools\verify-run3.py` 四个闸门同向）：`checks.watered_outdoor`
     **缺失 = 红（缺失 ≠ 通过）**、`false` = 红、`true` + `final_water.scope=="window"` + `tiles==0` = 红
     （当天没有户外快照 ⇒ 这个 true 没有证据来源）、`true` + `final_water.dry>0` = 红（自相矛盾）；
@@ -33,6 +36,10 @@
     `final` 还停在 `day_start` 那一天时只能记【无法判定】（`final` 是**睡前**快照，
     真机 0.7.23 彩排就是这一档：回执写"已跨日 spring 17→18"、`final` 还是 17 日 ⇒ **缺失 ≠ 没做**）；
   * `t` 回退只记信息项；环境挡路**不算硬失败**。
+  * 不可达豁免（task-52）：`checks.unreachable_within_bound=false`（当天不可达格数超过
+    max(5, 20%×attempted)）⇒ 0 类红（豁免越界＝可能把真失败当"走不到"洗白）；
+    `unreachable`/`unreachable_stage`/`unreachable_summary` 本身只作信息项、**不并进"该做没做"**
+    （tools\verify-run3.py:415-448 同向：上界内是 info、越界才是 problem）。
   * 事件映射不许漂移（Lead m02395）：brain 里 `_journal("<name>"` 的**每个**事件名都要在
     `EVENT_BUCKETS` 里有桶（结构性事件 `day_start`/`day_end`/`finish` 除外，见 `STRUCTURAL_EVENTS`）；
     账本里出现没桶的事件 ⇒ 报告头部逐条点名（名字×次数+行号）+ 建议 0a，**绝不静默丢弃**。
@@ -96,6 +103,9 @@ CHECK_MEANING = {
                        "窗口 unwatered_crops 在室内恒 0，不作证据）",
     # task-15：阶段后置条件未成立的显式汇总（缺失时本工具按 day_end.stages 自算兜底）
     "no_unmet_stages": "有目标阶段留下了没做完的格子（leftover>0）",
+    # task-52：不可达豁免的**硬上界**（与 tools\verify-run3.py:445-448 同向：越界直接判 problem）
+    "unreachable_within_bound": "当天'unreachable'格数超过上界 max(5, 20%×attempted)"
+                                "—— 可能把真失败/不可动格混进不可达来洗白，必须人工核对 unreachable_tiles",
 }
 # 账本里"应该有、但没有就只能写无法判定"的字段/事件
 FIELD_PROBES = [
@@ -129,6 +139,19 @@ FIELD_PROBES = [
     # task-11：缺失只能算"没记账"，绝不能当"没被模态挡过"（verify-run3.py 同口径）。
     ("day_end.checks.no_blocking_modal", "no_blocking_modal",
      "当天是否被'不敢关/不可逆'的模态挡住（task-11 新增）"),
+    # task-52：不可达（四邻都站不过去 / A* 算不出路）的三级留痕与日级豁免证据
+    ("event:unreachable_summary", "unreachable_summary",
+     "日级不可达汇总（task-52：count/bound/attempted/exempted/raw_unmet/unmet；tiles 可查）"),
+    ("day_end.unreachable", "unreachable",
+     "当天不可达格数（task-52；与 unreachable_bound/unreachable_exempt 互检）"),
+    ("day_end.unreachable_tiles", "unreachable_tiles",
+     "当天不可达格坐标 [[x,y],…]（task-52；越界时人工核对用）"),
+    ("day_end.unreachable_bound", "unreachable_bound",
+     "不可达豁免上界 max(5, 20%×attempted)（task-52）"),
+    ("day_end.unreachable_exempt", "unreachable_exempt",
+     "真正从 no_unmet_stages 里扣掉的不可达格数（task-52：先扣它再比 checks.no_unmet_stages）"),
+    ("day_end.checks.unreachable_within_bound", "unreachable_within_bound",
+     "不可达计数是否在上界内（task-52；false ⇒ 可能把真失败当不可达洗白，verify-run3 判 problem）"),
 ]
 OUTCOME_RE = re.compile(
     r"目标\s*(\d+)\s*步：做成\s*(\d+)、跳过\s*(\d+)、失败\s*(\d+)"
@@ -228,6 +251,12 @@ EVENT_BUCKETS = {
     "mod_version_mismatch": "mod_version_mismatch",
     "llm_trace_failed": "llm_trace_failures",
     "no_day_progress": "no_day_progress",
+    # --- task-52：不可达（四邻都站不过去 / A* 算不出路）三级留痕。政策：**不计当天硬失败**、
+    #     当天记 blocked、**次日重试**，日级豁免有上界 max(5, 20%×attempted)
+    #     （tools\verify-run3.py:254-258/415-448 同口径：越界才是 problem）。
+    "unreachable": "unreachable",
+    "unreachable_stage": "unreachable_stages",
+    "unreachable_summary": "unreachable_summaries",
 }
 
 #: 结构性事件：由报告的其他字段单独统计（day_start/day_end 切会话与验收、finish 自述），
@@ -242,6 +271,8 @@ NEW_EVENT_BUCKETS = (
     "buys", "env_retries", "intent_unknowns", "zones_failed", "day_key_resnap_failed",
     "load_saves", "llm_on", "day_caps", "budget_exhausted", "bridge_unavailable",
     "watchdog_stops", "mod_version_mismatch", "llm_trace_failures", "no_day_progress",
+    # task-52：不可达三级留痕（一眼看出哪几格/哪个阶段/当天豁免多少）
+    "unreachable", "unreachable_stages", "unreachable_summaries",
 )
 
 
@@ -603,6 +634,9 @@ def cat_missed(sessions, top):
             sum_failed = sum(as_int(s.get("failed")) for s in stages)
             sum_env = sum(as_int(s.get("env_block_count") or s.get("env_block")) for s in stages)
             sum_incon = sum(as_int(s.get("inconclusive_count") or s.get("inconclusive")) for s in stages)
+            # task-62：**不**把 `unreachable` 计入差额解释 —— tools\verify-run3.py:388-404 只认
+            # env_block + inconclusive（账目差额口径以它为准；不可达格本来就不该出现在
+            # `stages[].failed` 里：它们被 exempt 后已从 leftover 移除）。
             delta = sum_failed - as_int(failed_field)
             if delta < 0:
                 out.append(
@@ -619,8 +653,8 @@ def cat_missed(sessions, top):
                         lineno, "day_end",
                         f"账目不可信：自述 failed_steps={failed_field} 比 stages[].failed 求和 {sum_failed} 少 {delta}，"
                         f"而 env_block={sum_env} + inconclusive={sum_incon} 解释不完",
-                        hint="差额必须被环境挡路/无结论计数完全解释，否则是自述在洗账"
-                             "（verify-run3.py 同口径）别把环境挡路当硬失败",
+                        hint="差额必须被环境挡路/无结论计数完全解释（verify-run3.py:388-404 同口径，"
+                             "别把环境挡路和走不到当硬失败；`unreachable` 不在这个差额口径里）",
                         subject="missed:stage_account",
                     )
                 )
@@ -1026,6 +1060,20 @@ def cat_manual(sessions, top):
                         subject="manual:check:no_blocking_modal",
                     )
                 )
+            # task-52：不可达豁免越界 = 洗白风险（把真失败/不可动格混进 unreachable）
+            if checks.get("unreachable_within_bound") is False:
+                out.append(
+                    finding(
+                        lineno, "day_end",
+                        f"必须人工介入：checks.unreachable_within_bound=false"
+                        f"（unreachable={ev.get('unreachable')}、bound={ev.get('unreachable_bound')}、"
+                        f"exempt={ev.get('unreachable_exempt')}）—— "
+                        f"{CHECK_MEANING.get('unreachable_within_bound')}",
+                        hint="与 verify-run3.py:445-448 同向：豁免越界 ⇒ 可能把真失败当不可达；"
+                             "人工核对 unreachable_tiles 的坐标",
+                        subject="manual:check:unreachable_within_bound",
+                    )
+                )
     return out[:top] if top else out
 
 
@@ -1088,6 +1136,47 @@ def cat_environment(sessions, top):
                     hint="不是'格子干不动'（不封格），但一直 busy/渐黑会把这一格推到 capped ⇒ 当天 "
                          "needs_review；先对着同 stage 的 env_fail.statuses 看当时在忙什么",
                     subject="environment:env_spin_capped",
+                )
+            )
+        # task-52：不可达（四邻都站不过去 / A* 算不出路）＝ 环境挡路的第三种形态。
+        # 政策：**不计当天硬失败**、当天记 blocked、**次日重试**；日级豁免有上界 max(5, 20%×attempted)。
+        # 本工具只把它数成信息项（不并进"该做没做"）：是否真做成由 checks.no_unmet_stages
+        # **先扣 unreachable_exempt** 后说话（tools\verify-run3.py:254-258/415-448 同口径；越界才是 problem）。
+        unreach_events = sess["unreachable"]
+        if unreach_events or sess["unreachable_stages"] or sess["unreachable_summaries"]:
+            tile_set = set()
+            for _, ev in unreach_events:
+                tile = as_list(ev.get("tile"))
+                if len(tile) == 2:
+                    tile_set.add((as_int(tile[0]), as_int(tile[1])))
+            tiles = sorted(tile_set)
+            stages = sorted({str(ev.get("stage") or "?") for _, ev in unreach_events})
+            summary = sess["unreachable_summaries"][-1][1] if sess["unreachable_summaries"] else {}
+            first = (unreach_events or sess["unreachable_stages"] or sess["unreachable_summaries"])[0][0]
+            out.append(
+                finding(
+                    first, "unreachable",
+                    f"不可达（不计当天硬失败）：{len(unreach_events)} 次 / {len(tiles)} 格"
+                    f"（阶段 {stages or '-'}；坐标 {[list(t) for t in tiles[:6]]}"
+                    f"{'…' if len(tiles) > 6 else ''}）；日级 count={summary.get('count')}、"
+                    f"bound={summary.get('bound')}、attempted={summary.get('attempted')}、"
+                    f"raw_unmet={summary.get('raw_unmet')}、exempted={summary.get('exempted')}、"
+                    f"unmet={summary.get('unmet')}",
+                    hint="task-52：当天记 blocked、次日重试；豁免上界 max(5, 20%×attempted)，"
+                         "越界由 checks.unreachable_within_bound=false 判红（本工具 0 类）",
+                    subject="environment:unreachable",
+                )
+            )
+        for lineno, ev in sess["unreachable_stages"]:
+            out.append(
+                finding(
+                    lineno, "unreachable_stage",
+                    f"阶段级不可达：{ev.get('stage')} @ zone={ev.get('zone')} 有 "
+                    f"{as_int(ev.get('tiles'))} 格走不到（其中还留在 leftover 的 "
+                    f"{as_int(ev.get('in_leftover'))} 格；坐标 {as_list(ev.get('coords'))[:6]}）",
+                    hint="in_leftover>0 的格就是日级 exemption 要扣的对象；扣完仍不成立由 "
+                         "checks.no_unmet_stages 说话",
+                    subject="environment:unreachable_stage",
                 )
             )
     return out[:top] if top else out
@@ -1198,6 +1287,21 @@ def build_advice(report, top=8):
                     f"改按'没结论'占配额）：本身是信息项，但要一眼看出是哪几格在反复被挡"
                     f"（{tiles[:top] or '-'}）；同一格反复出现就先查渐黑/模态循环",
             "lines": env.get("env_spin_lines") or [],
+        })
+    # 0e) 不可达（task-52：四邻都站不过去 / A* 算不出路）——不计当天硬失败、次日重试，但豁免有上界
+    if env.get("unreachable_events") or env.get("unreachable_summary_events"):
+        _u_tiles = env.get("unreachable_tiles") or []
+        _u_marks = (f"count={env.get('unreachable_count')}、bound={env.get('unreachable_bound')}、"
+                    f"attempted={env.get('unreachable_attempted')}、exempt={env.get('unreachable_exempt')}")
+        advice.append({
+            "text": f"不可达（四邻都站不过去 / A* 算不出路）×{env['unreachable_events']} 次 / "
+                    f"{env.get('unreachable_tile_count', 0)} 格（{_u_tiles[:top] or '-'}）：task-52 政策是"
+                    f"不计当天硬失败、当天记 blocked、次日重试；日级豁免 {_u_marks}；"
+                    + ("⚠ checks.unreachable_within_bound=false ⇒ 0 类红：豁免越界（可能把真失败当"
+                       "不可达洗白），必须人工核对这些坐标"
+                       if env.get("unreachable_within_bound") is False
+                       else "上界内属正常（与 verify-run3.py:415-448 同向）"),
+            "lines": env.get("unreachable_lines") or [],
         })
     # 1) 睡觉失败
     sleep_failed = [f for f in report["categories"]["sleep"] if f["subject"] == "sleep:failed"]
@@ -1556,6 +1660,12 @@ def build_report(rows, path, args, bad_lines):
     statuses = set()
     env_spin_lines = []
     env_spin_tiles = set()
+    # task-52：不可达（四邻都站不过去 / A* 算不出路）——不计当天硬失败、当天记 blocked、次日重试；
+    # 日级豁免有上界 max(5, 20%×attempted)，越界由 checks.unreachable_within_bound 说话。
+    unreach_lines = []
+    unreach_tiles = set()
+    unreach_stage_lines = []
+    unreach_summary_lines = []
     t_regressions = []
     for sess in all_sessions:
         idx = _stage_outcome_index(sess)
@@ -1575,6 +1685,14 @@ def build_report(rows, path, args, bad_lines):
             tile = ev.get("tile")
             if isinstance(tile, (list, tuple)) and len(tile) == 2:
                 env_spin_tiles.add((as_int(tile[0]), as_int(tile[1])))
+        # task-52：不可达三级留痕（逐格 / 阶段 / 日级汇总）
+        for ln, ev in sess["unreachable"]:
+            unreach_lines.append(ln)
+            tile = ev.get("tile")
+            if isinstance(tile, (list, tuple)) and len(tile) == 2:
+                unreach_tiles.add((as_int(tile[0]), as_int(tile[1])))
+        unreach_stage_lines.extend(ln for ln, _ in sess["unreachable_stages"])
+        unreach_summary_lines.extend(ln for ln, _ in sess["unreachable_summaries"])
         # `t` 只该单调不减；回退只记信息项（verify-run3.py 同口径，不当失败）
         prev_t = None
         for ln, ev in sess["events"]:
@@ -1589,6 +1707,22 @@ def build_report(rows, path, args, bad_lines):
     env_blocked_total = sum(len(s["env_fails"]) for s in all_sessions) + sum(
         len(s["env_spins"]) for s in all_sessions
     )
+    # task-52：不可达的日级豁免汇总（优先 `unreachable_summary` 事件，缺失时退回最后一天 day_end 的字段）
+    unreach_summaries = [ev for s in all_sessions for _, ev in s["unreachable_summaries"]]
+    _last_day_end = {}
+    for _sess in reversed(all_sessions):
+        if _sess["day_ends"]:
+            _last_day_end = as_dict(_sess["day_ends"][-1][1])
+            break
+    if unreach_summaries:
+        _u_sum = as_dict(unreach_summaries[-1])
+    else:
+        _u_sum = {
+            "count": _last_day_end.get("unreachable"),
+            "bound": _last_day_end.get("unreachable_bound"),
+            "exempted": _last_day_end.get("unreachable_exempt"),
+        }
+    _u_checks = as_dict(_last_day_end.get("checks"))
     report["manual_intervention"] = {
         "total": len(manual_all),
         "red_lines": sorted({f["line"] for f in manual_all if f["line"] is not None}),
@@ -1615,6 +1749,25 @@ def build_report(rows, path, args, bad_lines):
         "env_spin_lines": sorted(set(env_spin_lines)),
         "env_spin_tiles": sorted([list(t) for t in env_spin_tiles]),
         "env_blocked_total": env_blocked_total,
+        # task-52：不可达（四邻都站不过去 / A* 算不出路）＝ 环境挡路的第三种形态。
+        # 政策：**不计当天硬失败**、当天记 blocked、**次日重试**；日级豁免上界 max(5, 20%×attempted)。
+        # 本工具只作信息项；越界由 checks.unreachable_within_bound=false 进 0 类红
+        # （tools\verify-run3.py:415-448 把它判 problem ⇒ 两边同向）。
+        "unreachable_events": sum(len(s["unreachable"]) for s in all_sessions),
+        "unreachable_tiles": sorted([list(t) for t in unreach_tiles]),
+        "unreachable_tile_count": len(unreach_tiles),
+        "unreachable_lines": sorted(set(unreach_lines)),
+        "unreachable_stage_events": sum(len(s["unreachable_stages"]) for s in all_sessions),
+        "unreachable_stage_lines": sorted(set(unreach_stage_lines)),
+        "unreachable_summary_events": sum(len(s["unreachable_summaries"]) for s in all_sessions),
+        "unreachable_summary_lines": sorted(set(unreach_summary_lines)),
+        "unreachable_count": _u_sum.get("count"),
+        "unreachable_bound": _u_sum.get("bound"),
+        "unreachable_attempted": _u_sum.get("attempted"),
+        "unreachable_exempt": _u_sum.get("exempted"),
+        "unreachable_raw_unmet": _u_sum.get("raw_unmet"),
+        "unreachable_unmet": _u_sum.get("unmet"),
+        "unreachable_within_bound": _u_checks.get("unreachable_within_bound"),
         "statuses": sorted(statuses),
     }
     # `t` 回退（只记信息项）
@@ -1715,6 +1868,10 @@ MAPPING_TEXT = [
      "【无法判定】**，不许把'没写成'当'没做'（final 是睡前快照）"),
     ("plots_capped / work_spot",
      "顶部统计：作业区软上限触顶 / 收尾作业区（信息项，不改 VERIFIED；task-32）"),
+    ("unreachable / unreachable_stage / unreachable_summary（task-52）",
+     "5 环境挡路（信息项：**不计当天硬失败**、当天记 blocked、**次日重试**；日级豁免有上界 "
+     "max(5, 20%×attempted)，`checks.unreachable_within_bound=false` ⇒ 0 必须人工介入"
+     "（豁免越界＝可能把真失败当不可达洗白，verify-run3.py:415-448 判 problem ⇒ 两边同向））"),
     ("finish",
      "收尾自述：code/verified_streak 必须自身自洽、并与正文 verified 天数同向（不同向 ⇒ 自述在洗账）"),
     ("t 回退",
@@ -1795,6 +1952,14 @@ def render_text(report, top):
         + (f"（tiles={env.get('env_spin_tiles')}）" if env.get("env_spin_tiles") else "")
         + f"；没拿到结论: {env.get('inconclusive_events', 0)} 条（配额被吃掉 {env.get('inconclusive_tiles', 0)} 格）"
         + (f"；statuses={env.get('statuses')}" if env.get("statuses") else ""))
+    # task-52：不可达（不计当天硬失败、次日重试；日级豁免有上界，越界进 0 类红）
+    if env.get("unreachable_events") or env.get("unreachable_summary_events"):
+        add(f"不可达: {env.get('unreachable_events', 0)} 次 / {env.get('unreachable_tile_count', 0)} 格"
+            + (f"（tiles={env.get('unreachable_tiles')[:8]}）" if env.get("unreachable_tiles") else "")
+            + f"；日级 count={env.get('unreachable_count')}、bound={env.get('unreachable_bound')}、"
+              f"attempted={env.get('unreachable_attempted')}、exempt={env.get('unreachable_exempt')}"
+            + ("  ⚠ checks.unreachable_within_bound=false ⇒ 0 类红"
+               if env.get("unreachable_within_bound") is False else ""))
     t_reg = report.get("t_regressions") or []
     if t_reg:
         add(f"t 回退: {len(t_reg)} 次（信息项，行 {[r['line'] for r in t_reg][:8]}"

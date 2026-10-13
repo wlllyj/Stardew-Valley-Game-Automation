@@ -950,5 +950,115 @@ class TestEventMappingDrift(unittest.TestCase):
                               f"{path}: 兜底数必须出现在头部（LLM 覆盖率不能虚高）")
 
 
+class TestUnreachableAccounting(unittest.TestCase):
+    """task-52：不可达（四邻都站不过去 / A* 算不出路）的三级留痕与日级豁免上界。
+
+    口径（与 `tools/verify-run3.py:415-448` 同向）：
+      * `unreachable` / `unreachable_stage` / `unreachable_summary` = **环境挡路信息项**：
+        **不计当天硬失败**、当天记 blocked、次日重试；
+      * 日级豁免有上界 `max(5, 20%×attempted)`：`checks.unreachable_within_bound=false` ⇒ 0 类红；
+      * 阶段账目差额允许被 `unreachable_count` 解释（不判"账目不可信"）。
+    """
+
+    U_TILE = {"event": "unreachable", "t": 4.0, "tile": [72, 51], "action": "clear",
+              "stage": "clear_area", "zone": "field_ne", "reason": "四邻都站不过去",
+              "note": "当天记 blocked、次日重试"}
+    U_STAGE = {"event": "unreachable_stage", "t": 4.1, "stage": "clear_area", "zone": "field_ne",
+               "tiles": 3, "in_leftover": 3, "coords": [[72, 51], [73, 51], [74, 51]],
+               "note": "阶段收尾：走不到的格"}
+    U_SUM = {"event": "unreachable_summary", "t": 9.5, "count": 3, "bound": 5, "attempted": 20,
+             "exempted": 3, "raw_unmet": 3, "unmet": 0,
+             "tiles": [[72, 51], [73, 51], [74, 51]], "note": "日级豁免上界"}
+
+    def _report(self, events, name):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=1)
+
+    def _events(self, *, bound_ok=True, unreach=3, bound=5, stage_unreach=3, stage_failed=3,
+                failed_steps=0, with_fields=True):
+        stage = {"stage": "clear_area", "tiles": 3, "ok": 0, "skipped": 0, "failed": stage_failed,
+                 "proven_inert": 0, "env_block": 0, "inconclusive": 0, "stopped": "", "leftover": 0}
+        if stage_unreach is not None:
+            stage["unreachable_count"] = stage_unreach
+        overrides = {
+            "ended_reason": "night", "verified": bool(bound_ok), "failed_steps": failed_steps,
+            "stages": [stage],
+            "checks": {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                       "crops_watered": True, "day_justified": True, "no_unmet_stages": True,
+                       "unreachable_within_bound": bound_ok},
+        }
+        if with_fields:
+            overrides.update({
+                "unreachable": unreach, "unreachable_bound": bound,
+                "unreachable_exempt": min(unreach, bound),
+                "unreachable_tiles": [[72, 51], [73, 51], [74, 51]],
+            })
+        return integrity_ledger(extra_events=[self.U_TILE, self.U_STAGE, self.U_SUM],
+                                day_end_overrides=overrides)
+
+    def test_three_events_have_buckets_and_are_not_unmapped(self):
+        for name in ("unreachable", "unreachable_stage", "unreachable_summary"):
+            self.assertIn(name, mod.EVENT_BUCKETS, f"task-52 的 {name} 没有桶 ⇒ 计数会漏")
+        rep = self._report(self._events(), "unreach.jsonl")
+        self.assertEqual(rep["unmapped_events"], {},
+                         f"task-52 的三个事件都已进桶，不许再出现未映射：{rep['unmapped_events']}")
+        for bucket in ("unreachable", "unreachable_stages", "unreachable_summaries"):
+            self.assertIn(bucket, mod.NEW_EVENT_BUCKETS, "新桶要在头部'新事件计数'里可见")
+
+    def test_inside_bound_is_info_only_and_visible(self):
+        rep = self._report(self._events(stage_unreach=0, stage_failed=0), "unreach_ok.jsonl")
+        env = rep["env_inconclusive"]
+        self.assertEqual(env["unreachable_events"], 1)
+        self.assertEqual(env["unreachable_tile_count"], 1)
+        self.assertEqual(env["unreachable_stage_events"], 1)
+        self.assertEqual(env["unreachable_summary_events"], 1)
+        self.assertEqual(env["unreachable_count"], 3)
+        self.assertEqual(env["unreachable_bound"], 5)
+        self.assertEqual(env["unreachable_exempt"], 3)
+        self.assertEqual(env["unreachable_attempted"], 20)
+        self.assertIs(env["unreachable_within_bound"], True)
+        subs = subjects(rep["categories"]["environment"])
+        self.assertIn("environment:unreachable", subs)
+        self.assertIn("environment:unreachable_stage", subs)
+        self.assertNotIn("manual:check:unreachable_within_bound", subjects(rep["categories"]["manual"]))
+        # 信息项：不许并进"该做没做"
+        for s in subjects(rep["categories"]["missed"]):
+            self.assertNotIn("unreachable", s, "不可达是环境挡路信息项，不该进'该做没做'")
+        text = mod.render_text(rep, 50)
+        self.assertIn("不可达", text)
+        self.assertTrue(any("不可达" in a["text"] for a in rep["advice"]))
+        self.assertIn("exempt=3", text)
+        # 上界内且账目自洽（stages[].failed 不含被豁免格）⇒ 不出现"账目不可信"
+        self.assertNotIn("missed:stage_account", subjects(rep["categories"]["missed"]))
+
+    def test_unreachable_is_not_part_of_stage_account_allowance(self):
+        """账目差额口径与 `tools\\verify-run3.py:388-404` 逐字一致：只认 env_block + inconclusive。
+
+        把不可达格计进 `stages[].failed`（正常实现不会：exempt 后它们已从 leftover 移除）⇒ 差额
+        解释不完 ⇒ 两边同向判红，**不许**用 `unreachable` 去把它洗平。
+        """
+        rep = self._report(self._events(stage_unreach=3), "unreach_delta.jsonl")
+        self.assertIn("missed:stage_account", subjects(rep["categories"]["missed"]),
+                      "unreachable 不许进账目差额口径（verify-run3.py:388-404 只认 env+inconclusive）")
+
+    def test_over_bound_is_manual_red(self):
+        rep = self._report(self._events(bound_ok=False, unreach=9, bound=5), "unreach_bad.jsonl")
+        subs = subjects(rep["categories"]["manual"])
+        self.assertIn("manual:check:unreachable_within_bound", subs)
+        text = mod.render_text(rep, 50)
+        self.assertIn("unreachable_within_bound=false", text)
+        self.assertTrue(any("0 类红" in a["text"] for a in rep["advice"]))
+
+    def test_missing_task52_fields_render_nothing_and_never_pass_by_accident(self):
+        rep = self._report(integrity_ledger(), "unreach_absent.jsonl")
+        env = rep["env_inconclusive"]
+        self.assertEqual(env["unreachable_events"], 0)
+        self.assertIsNone(env["unreachable_count"])
+        self.assertIsNone(env["unreachable_within_bound"])
+        self.assertNotIn("manual:check:unreachable_within_bound", subjects(rep["categories"]["manual"]))
+        self.assertFalse(any("不可达（四邻" in a["text"] for a in rep["advice"]))
+
+
 if __name__ == "__main__":
     unittest.main()
