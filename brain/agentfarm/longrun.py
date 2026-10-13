@@ -296,6 +296,16 @@ class DayReport:
     unreachable_tiles: list[Any] = field(default_factory=list)
     unreachable_bound: int = 0
     unreachable_exempt: int = 0
+    #: 【task-63】当天被**游戏拒绝**（`tool_ineffective`/`precondition_failed`）的**格数**与
+    #: **逐格坐标**：这些格记 `skipped`+`proven_inert`（不算硬失败、当天封格、次日重试），
+    #: 但豁免**有界** —— `refused_bound = max(5, floor(0.2 × attempted))`，超界当天照实
+    #: `no_hard_failures=false`（防"游戏全拒绝"换个 verified）。
+    #: `refused_exempt` = 真正从 `no_unmet_stages` 里扣掉的格数（≤ bound，只扣仍在 leftover 的）。
+    #: 与 task-52 的 `unreachable*` 是**两套独立计数**、互不覆盖（各自有界、各自逐格留痕）。
+    refused: int = 0
+    refused_tiles: list[Any] = field(default_factory=list)
+    refused_bound: int = 0
+    refused_exempt: int = 0
 
     @property
     def failed_steps(self) -> int:
@@ -345,6 +355,11 @@ class DayReport:
             "unreachable_tiles": [list(t) for t in self.unreachable_tiles],
             "unreachable_bound": self.unreachable_bound,
             "unreachable_exempt": self.unreachable_exempt,
+            # 【task-63】被游戏拒绝：计数 + 逐格坐标 + 界与实扣（与 `unreachable*` 独立）
+            "refused": self.refused,
+            "refused_tiles": [list(t) for t in self.refused_tiles],
+            "refused_bound": self.refused_bound,
+            "refused_exempt": self.refused_exempt,
         }
 
 
@@ -526,6 +541,11 @@ class LongRun:
         # 日级 `no_unmet_stages` 的有界豁免与账本 `unreachable` 都靠这份集合。
         # **不跨日**：`_run_day` 每天清空 ⇒ 次日自动重试（不许像 `proven_inert` 那样永久封格）。
         self.unreachable_day: set[tuple[int, int]] = set()
+        # 【task-63】当天被**游戏拒绝**的格子（`tool_ineffective`/`precondition_failed`）。与
+        # `unreachable_day` 同形但**独立**：拒绝格同样记 `proven_inert` 当天封格，而这里累计的是
+        # "今天到底有多少格被游戏拒绝" —— 日级豁免按 `refused_bound` 有界，超界照实 `needs_review`。
+        # **不跨日**：`_run_day` 每天清空 ⇒ 次日自动重试（例：工具等级够了就能锄了）。
+        self.refused_day: set[tuple[int, int]] = set()
         # 本日"为了看没做完的格子而往回走"的次数上限（防"来回跑"把一天走光）。
         self.resume_walks = 0
         # 【task-50】窗口外干作物（Mod 的 `farm.dryTiles`）：每格试了几次、哪些已经认输。
@@ -1577,6 +1597,7 @@ class LongRun:
         after = self._tile_states(after_obs)
         marked = 0
         unreach_marked = 0
+        refused_marked = 0
         for s in steps:
             if not s.tile:
                 continue
@@ -1604,6 +1625,20 @@ class LongRun:
                               note="四邻都站不过去/寻路到不了 ⇒ 当天不再白试（次日会重试）；"
                                    "不算硬失败，日级另有有界豁免")
                 continue
+            if s.refused:
+                # 【task-63】被**游戏拒绝**（`tool_ineffective`/`precondition_failed`）：世界给的
+                # 前置事实（不可锄的地 / 工具等级不够），不是"我试了没做成" ⇒ 当天封格（次日自动
+                # 重试），逐格 journal `tool_refused` 带 `status`/`kind` 供工具交叉核对；日级豁免
+                # 另有 `refused_bound` 上界（超界照实 `no_hard_failures=false`）。
+                # 与 `unreachable`（task-52）**分开累计**，两套豁免互不覆盖。
+                self.blocked[key] = f"{s.action} 被游戏拒绝：{s.reason[:80]}"
+                self.refused_day.add(key)
+                refused_marked += 1
+                self._journal("tool_refused", tile=list(key), action=s.action, stage=stage,
+                              zone=self.zone_name, status=s.status,
+                              kind=str((s.after or {}).get("kind") or "未知"),
+                              reason=s.reason[:200])
+                continue
             if before.get(key) != after.get(key):
                 continue
             self.blocked[key] = f"{s.action} 无效：{s.reason[:80]}"
@@ -1616,6 +1651,10 @@ class LongRun:
         if unreach_marked:
             rep.notes.append(
                 f"记下 {unreach_marked} 格「走不到」的地，今天不再白试（次日重试；不算硬失败）")
+        if refused_marked:
+            rep.notes.append(
+                f"记下 {refused_marked} 格「游戏拒绝」的地，今天不再白试（次日重试；不算硬失败，"
+                f"但有界）")
 
     def _count_attempts(self, steps: list[StepResult]) -> None:
         """统计"每格今天**白试**过几次"（`MAX_TILE_ATTEMPTS` 兜底不变量）。
@@ -1849,6 +1888,12 @@ class LongRun:
         unreach_tiles = sorted({tuple(s.tile) for s in unreach_steps if s.tile})
         unreach_in_left = min(len(leftover),
                               len([t for t in self.unreachable_day if t in left_set]))
+        # 【task-63】"被游戏拒绝"（`tool_ineffective`/`precondition_failed`）：不算硬失败，
+        # 但单独计数 + 逐格留痕；与 `unreachable` 完全独立（两套集合、两套界）。
+        refused_steps = [s for s in all_steps if s.refused]
+        refused_tiles = sorted({tuple(s.tile) for s in refused_steps if s.tile})
+        refused_in_left = min(len(leftover),
+                              len([t for t in self.refused_day if t in left_set]))
         attempted_steps = sum(1 for s in all_steps if s.attempted)
         rep.stages.append({
             "stage": task, "tiles": 0 if not all_steps else len({s.tile for s in all_steps if s.tile}),
@@ -1861,6 +1906,10 @@ class LongRun:
             "unreachable": len(unreach_tiles),
             "unreachable_tiles": [list(t) for t in unreach_tiles],
             "unreachable_leftover": unreach_in_left,
+            # 【task-63】被游戏拒绝：同样的三段式（计数 / 逐格坐标 / 还留在 leftover 的格数）
+            "refused": len(refused_tiles),
+            "refused_tiles": [list(t) for t in refused_tiles],
+            "refused_leftover": refused_in_left,
             "attempted": attempted_steps,
             "stopped": stopped, "leftover": len(leftover),
         })
@@ -1870,6 +1919,12 @@ class LongRun:
                           coords=[list(t) for t in unreach_tiles[:12]],
                           note="走不到（没有落脚点/寻路到不了）⇒ 不算硬失败；"
                                "日级豁免有上界，逐格坐标见 unreachable 事件")
+        if refused_steps:
+            self._journal("refused_stage", stage=task, zone=self.zone_name,
+                          tiles=len(refused_tiles), in_leftover=refused_in_left,
+                          coords=[list(t) for t in refused_tiles[:12]],
+                          note="游戏拒绝（tool_ineffective/precondition_failed）⇒ 不算硬失败、"
+                               "当天封格次日重试；日级豁免有上界，逐格见 tool_refused 事件")
         # task-22：环境挡路 / 没拿到结论都要**单独留痕**（它们不进 `blocked`，也不该藏在 failed 里）。
         # 每阶段最多两条，带 statuses 与格数；事后看 journal 就能分清"这格真干不动"和"世界当时在忙"。
         if env_fail:
@@ -2376,6 +2431,8 @@ class LongRun:
         # 【task-49】跨片地的"今天还没做完"记账 + 回头看的次数上限，每天清零。
         self.leftover_targets = set()
         self.unreachable_day = set()
+        # 【task-63】被游戏拒绝的格子同样每天清零 ⇒ 次日自动重试（工具等级/前置条件可能变了）。
+        self.refused_day = set()
         self.resume_walks = 0
         # 【task-50】窗口外干作物的重试记账，每天清零（第二天壶/世界都变了，重新判）。
         self.far_dry_tries = {}
@@ -2669,8 +2726,37 @@ class LongRun:
                               if int(s.get("tiles") or 0) > 0)
         unreachable_exempt = min(unreachable_bound, unreach_in_last)
         rep.unreachable_exempt = unreachable_exempt
-        unmet_leftover = max(0, raw_unmet - unreachable_exempt)
+        # 【task-63】被**游戏拒绝**（`tool_ineffective`/`precondition_failed`）：与"走不到"同形态
+        # 但**独立起界**（`refused_bound = max(5, floor(0.2 × attempted))`）：
+        #   * 界内 ⇒ 从 `no_unmet_stages` 里扣掉"仍留在 leftover 的拒绝格"（否则 run5 那种
+        #     "目标池落进几格不可锄的地"会把做了 100+ 步的一天判死）；
+        #   * 超界 ⇒ 照实 `no_hard_failures=false`（`refused_within_bound` 判据）—— 不许靠
+        #     "游戏全拒绝"换来一个 verified；
+        #   * 两套豁免**各自扣减、互不覆盖**（拒绝格与不可达格是两批坐标、两套集合）。
+        refused_bound = max(5, int(0.2 * attempted_steps))
+        refused_day: set[tuple[int, int]] = set(self.refused_day)
+        for s in rep.stages:
+            for t in (s.get("refused_tiles") or []):
+                try:
+                    refused_day.add((int(t[0]), int(t[1])))
+                except (TypeError, ValueError, IndexError):
+                    continue
+        rep.refused = len(refused_day)
+        rep.refused_tiles = [list(t) for t in sorted(refused_day)]
+        rep.refused_bound = refused_bound
+        refused_in_last = sum(int(s.get("refused_leftover") or 0) for s in last_by_stage.values()
+                              if int(s.get("tiles") or 0) > 0)
+        refused_exempt = min(refused_bound, refused_in_last)
+        rep.refused_exempt = refused_exempt
+        unmet_leftover = max(0, raw_unmet - unreachable_exempt - refused_exempt)
         made_any_progress = rep.ok_steps > 0
+        if refused_day:
+            self._journal("refused_summary", count=len(refused_day), bound=refused_bound,
+                          attempted=attempted_steps, exempted=refused_exempt,
+                          raw_unmet=raw_unmet, unmet=unmet_leftover,
+                          tiles=[list(t) for t in sorted(refused_day)[:12]],
+                          note="游戏拒绝的格：当天封格、次日重试；界内不影响 verified，"
+                               "超界照实 needs_review（与 unreachable 两套独立计数）")
         if unreach_day:
             self._journal("unreachable_summary", count=len(unreach_day), bound=unreachable_bound,
                           attempted=attempted_steps, exempted=unreachable_exempt,
@@ -2712,13 +2798,18 @@ class LongRun:
             # task-11：被不可逆/不敢关的模态挡住（职业选择、存档超时）时，这一天**不算数**。
             # 用户 m03224 拍板了职业路线：宁可停下等人，也不静默丢档。
             "no_blocking_modal": rep.ended_by not in BLOCKING_ENDS,
-            "no_hard_failures": rep.failed_steps == 0,
+            "no_hard_failures": rep.failed_steps == 0 and rep.refused <= refused_bound,
             # 【task-52】"走不到"本身不算硬失败，但**有上界**：超过 `max(5, 20%×attempted)`
             # 就不是"个别格子客观走不到"，而是"今天大片目标够不着" ⇒ 照实 needs_review。
             "unreachable_within_bound": rep.unreachable <= unreachable_bound,
+            # 【task-63】游戏拒绝同样**有上界**（防"游戏全拒绝"换个 verified）。该键**总是**写、
+            # 总是 bool（`tools\verify-run3.py` 按 `is False` 判 problem）。
+            "refused_within_bound": rep.refused <= refused_bound,
             # task-52 防洗白：豁免只对"走不到"的格子生效，且**全部不可达 + 0 成功动作**时
             # 不许靠豁免把 `no_unmet_stages` 洗成 True（真空日必须仍判不达标）。
-            "no_unmet_stages": unmet_leftover == 0 and (made_any_progress or unreachable_exempt == 0),
+            # task-63 把同一条防洗白扩到 `refused`：两组豁免都非空且 0 成功 ⇒ 仍不达标。
+            "no_unmet_stages": unmet_leftover == 0 and (
+                made_any_progress or (unreachable_exempt == 0 and refused_exempt == 0)),
             "crops_watered": int(rep.final.get("unwatered_crops") or 0) == 0,
             # task-19：**唯一**浇水证据（卡面 §1；`tools\verify-run3.py` 缺这条即问题）。
             # 窗口口径的 `crops_watered` 只作旁证：它读的是 `_essence` 的窗口计数，在室内恒 0。
@@ -2732,9 +2823,11 @@ class LongRun:
             f"[day] {rep.day_text} 结束：{rep.ended_by}"
             + (f"（{rep.ended_reason}）" if rep.ended_reason else "")
             + f" 阶段 {rep.stages_seen or '无'} 做成 {rep.ok_steps} 跳过 {rep.skipped_steps} 失败 {rep.failed_steps}"
-            + f" 未完成阶段剩 {unmet_leftover} 格（no_unmet_stages={unmet_leftover == 0}）"
+            + f" 未完成阶段剩 {unmet_leftover} 格（no_unmet_stages={rep.checks.get('no_unmet_stages')}）"
             + (f" 走不到 {rep.unreachable} 格（豁免界 {unreachable_bound}、实扣 {unreachable_exempt}）"
                if rep.unreachable else "")
+            + (f" 游戏拒绝 {rep.refused} 格（豁免界 {refused_bound}、实扣 {refused_exempt}）"
+               if rep.refused else "")
             + f" 浇水 {water_info.get('scope')} 口径 干 {water_info.get('dry')}/{water_info.get('crops')}"
             + f"（watered_outdoor={watered_outdoor}）"
             + f" → {'VERIFIED' if rep.verified else 'needs_review'} {rep.checks}"

@@ -3326,6 +3326,158 @@ class TestTask51ClearDead(unittest.TestCase):
         self.assertEqual(top(dead=3, sellable=5, blockers=2), "clear_dead", "清障排在最后")
 
 
+class RefusedWorld(FakeWorld):
+    """【task-63】这些 tillable 格子被**游戏拒绝**（真机 run5 的 4 格不可锄：`kind=未知`）。
+
+    真机形态：Mod 对 `use_tool` 回 `tool_ineffective`（"挥满 `MaxSwings=6` 仍拒绝这个工具动这格"），
+    观测纹丝不动。`FakeClient.use_tool` 会把它抛成 `BridgeError(status="tool_ineffective")`，
+    逼脑侧按 `exc.status` 分类 —— 这正是本卡要的复现路径。
+    """
+
+    def __init__(self, *, refused=(), tillable=None, **kw) -> None:
+        kw.setdefault("weeds", 0)
+        super().__init__(**kw)
+        self.refused = {tuple(t) for t in refused}
+        if tillable is not None:
+            self.tillable = {tuple(t) for t in tillable}
+        for t in sorted(self.refused):
+            self.fail_status[t] = "tool_ineffective"     # str ⇒ 每次请求都拒绝
+
+
+class _RefusalClient(FakeClient):
+    """真 `FarmWorker` 会走 `c.buy(...)`（`FakeClient` 没有）⇒ 补一个落到 `FakeWorld.buy`。"""
+
+    def buy(self, item, count=10, *, shop="SeedShop", timeout_ms=25000):
+        return self.w.buy(item, count, shop)
+
+
+class TestTask63Refused(unittest.TestCase):
+    """【task-63】`till` 的 `tool_ineffective`（游戏拒绝）不算硬失败。
+
+    真机 run5 `spring 26`：4 格 `till` 回 `tool_ineffective`（`(38,20)(38,19)(37,20)(37,19)`、
+    `kind=未知`、体力 140→102）被判 `failed` ⇒ 当天 `no_hard_failures=false`。但那是**世界给的
+    前置事实**（游戏自己拒绝这个工具动这格），与项目纪律"跳过 ≠ 失败，前者不污染终态"一致 ⇒
+    记 `skipped`+`proven_inert`（当天封格、次日重试），日级豁免按 `refused_bound = max(5, 20%×attempted)`
+    **有界**（超界照实 `no_hard_failures=false`），且与 task-52 的 `unreachable` 两套计数**互不覆盖**。
+
+    变异自检（**实测**，脚本 `%TEMP%\\t63_mutate.py`，跑完即弃；基线 `TestTask63Refused`
+    （farmwork 4 条 + longrun 5 条共 9 条）全绿）：
+    * `m63a`：把 `till()` 的拒绝分支关掉（`status ∈ TILE_INERT_STATUSES` 退回 `failed`）⇒ **7 条红**。
+    * `m63b`：把上界去掉（`refused_within_bound` 恒 True、`no_hard_failures` 不计 refused）
+      ⇒ **1 条红**（`test_exceeding_the_bound_trips_the_check_and_kills_verification`）。
+    """
+
+    REFUSED3 = [(60, 10), (61, 10), (62, 10)]
+    FIVE = [(60, 10), (61, 10), (62, 10), (63, 10), (64, 10)]
+
+    def _run(self, w: FakeWorld, *, client=None, **kw):
+        client = client if client is not None else _RefusalClient(w)
+        worker = FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+        kw.setdefault("target_days", 1)
+        kw.setdefault("max_days", 1)
+        run = make_run(w, client_factory=lambda: client, worker_factory=lambda c: worker, **kw)
+        run.worker = worker
+        run.client = client
+        return run
+
+    @staticmethod
+    def _events(run: LongRun, event: str) -> list:
+        return [e for e in run.entries if e.get("event") == event]
+
+    def test_refused_tiles_do_not_hard_fail_an_otherwise_good_day(self):
+        """3 格被游戏拒绝 + 其余全做成 ⇒ `failed_steps==0`、`refused_within_bound` 真、当天 VERIFIED。"""
+        w = RefusedWorld(refused=self.REFUSED3, seeds=10, money=500)
+        run = self._run(w)
+        self.assertEqual(run.run(), 0, [d.checks for d in run.days])
+        rep = run.days[0]
+        self.assertEqual(rep.failed_steps, 0, rep.stages)
+        self.assertEqual(rep.refused, 3, rep.stages)
+        self.assertEqual({tuple(t) for t in rep.refused_tiles}, set(self.REFUSED3))
+        self.assertTrue(rep.checks["refused_within_bound"], rep.checks)
+        self.assertIs(rep.checks["no_hard_failures"], True, rep.checks)
+        self.assertIs(rep.checks["no_unmet_stages"], True,
+                      "拒绝格在界内 ⇒ 不许因为「还剩 3 格」把好日子判死")
+        self.assertTrue(rep.verified, f"{rep.checks} / {rep.stages}")
+        per = self._events(run, "tool_refused")
+        self.assertEqual({tuple(e["tile"]) for e in per}, set(self.REFUSED3), per)
+        self.assertTrue(all(e["status"] == "tool_ineffective" for e in per), per)
+        self.assertTrue(all("游戏判定这格锄不动" in str(e["reason"]) for e in per), per)
+        day_end = self._events(run, "day_end")[-1]
+        for key in ("refused", "refused_tiles", "refused_bound", "refused_exempt"):
+            self.assertIn(key, day_end, f"day_end 缺 {key}")
+        self.assertEqual(day_end["refused"], 3)
+        self.assertGreater(day_end["refused_bound"], 0)
+
+    def test_exceeding_the_bound_trips_the_check_and_kills_verification(self):
+        """25 格全被拒绝、0 成功 ⇒ 25 > `max(5, 20%×attempted)` ⇒ 越界判据亮、不得 VERIFIED。"""
+        all_tiles = [(60 + i, 10 + j) for i in range(5) for j in range(5)]
+        w = RefusedWorld(refused=all_tiles, seeds=10, money=500)
+        run = self._run(w)
+        run.run()
+        rep = run.days[0]
+        self.assertEqual(rep.ok_steps, 0, rep.stages)
+        self.assertGreater(rep.refused, rep.refused_bound, (rep.refused, rep.refused_bound))
+        self.assertIs(rep.checks["refused_within_bound"], False, rep.checks)
+        self.assertIs(rep.checks["no_hard_failures"], False,
+                      "超界不许靠「游戏全拒绝」换来 no_hard_failures=true")
+        self.assertIs(rep.verified, False)
+
+    def test_within_bound_but_zero_success_is_still_never_verified(self):
+        """防真空：5 格被拒绝（正好在上界内）+ 0 成功 ⇒ 豁免不许把这一天洗成达标。"""
+        w = RefusedWorld(refused=self.FIVE, seeds=10, money=500, tillable=self.FIVE)
+        run = self._run(w)
+        run.run()
+        rep = run.days[0]
+        self.assertEqual(rep.ok_steps, 0, rep.stages)
+        self.assertEqual(rep.refused, 5)
+        self.assertTrue(rep.checks["refused_within_bound"], rep.checks)
+        self.assertIs(rep.checks["no_unmet_stages"], False,
+                      "全是拒绝 + 0 成功：豁免再宽也不许自证")
+        self.assertIs(rep.verified, False)
+
+    def test_next_day_retries_the_same_refused_tiles(self):
+        """`blocked` 每天清空 ⇒ 次日必须**再试**（工具等级/前置条件可能变了，不许永久封格）。"""
+        refused = [(60, 10), (61, 10)]
+        # 只留 4 格可开垦（2 格被拒 + 2 格正常）：第二天不会有"一片还没浇完的作物"把一整天
+        # 都吃掉，`till_area` 一定轮得到这 2 格（否则测的就不是"次日重试"了）。
+        w = RefusedWorld(refused=refused, seeds=10, money=500,
+                         tillable=[(60, 10), (61, 10), (62, 10), (63, 10)])
+        run = self._run(w, target_days=2, max_days=3)
+        run.run()
+        self.assertGreaterEqual(len(run.days), 2, run.days)
+        self.assertEqual({tuple(t) for t in run.days[0].refused_tiles}, set(refused))
+        self.assertEqual({tuple(t) for t in run.days[1].refused_tiles}, set(refused),
+                         "次日没有重试这 2 格 ⇒ 变成了永久封格")
+        self.assertGreaterEqual(len(self._events(run, "tool_refused")), 4)
+        self.assertEqual(len(self._events(run, "refused_summary")), 2, run.entries)
+
+    def test_refused_and_unreachable_are_counted_separately(self):
+        """两套豁免**互不覆盖**：被拒绝的格与走不到的格各记各的，journal/账本都不串。"""
+        refused = [(60, 10), (61, 10)]
+        unreach = [(63, 12)]
+        w = RefusedWorld(refused=refused, seeds=10, money=500)
+        w.blockers[unreach[0]] = "weed"
+        client = _UnreachableClient(w, unreachable=unreach)
+        run = self._run(w, client=client)
+        run.run()
+        rep = run.days[0]
+        self.assertEqual(rep.refused, 2, rep.stages)
+        self.assertEqual({tuple(t) for t in rep.refused_tiles}, set(refused))
+        self.assertEqual(rep.unreachable, 1, rep.stages)
+        self.assertEqual({tuple(t) for t in rep.unreachable_tiles}, set(unreach))
+        self.assertEqual(rep.failed_steps, 0, rep.stages)
+        refused_ev = {tuple(e["tile"]) for e in self._events(run, "tool_refused")}
+        unreach_ev = {tuple(e["tile"]) for e in self._events(run, "unreachable")}
+        self.assertEqual(refused_ev, set(refused), run.entries)
+        self.assertEqual(unreach_ev, set(unreach), run.entries)
+        self.assertEqual(refused_ev & unreach_ev, set())
+        sums = self._events(run, "refused_summary")
+        self.assertEqual(len(sums), 1, run.entries)
+        self.assertEqual(sums[0]["count"], 2)
+        self.assertNotEqual(sums[0]["exempted"], rep.unreachable_exempt + 999,
+                            "两套豁免各扣各的：refused_summary 只报 refused 的实扣")
+
+
 if __name__ == "__main__":
     unittest.main()
 

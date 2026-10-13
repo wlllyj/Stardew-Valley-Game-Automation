@@ -351,6 +351,9 @@ class StepResult:
     code: str = "ok"          # ok / already / skipped / failed / no_seed / need_refill / no_target
     reason: str = ""          # 人话：为什么是这个结论（**含判据**）
     receipt: str = ""         # 回执摘要（**只是诊断**，不作为证据）
+    #: 【task-63】Mod 回执里的 `status` 原文（只诊断/留痕用：`tool_refused` journal 要带它，
+    #: 让人能一眼看到"是游戏拒绝（`tool_ineffective`）而不是我挥了没效果"）。
+    status: str = ""
     before: Any = None        # 动作前的观测要点（差分左半）
     after: Any = None         # 动作后的观测要点（差分右半）
     #: **这一格今天已被观测证明干不动**：缺工具 / 有 feature 或 objId 挡着 / 挥了世界没变。
@@ -362,6 +365,11 @@ class StepResult:
     #: **没有结论**（`timeout`/`error`/任何没见过的码，task-22）：不许封格，但**仍占配额**
     #: —— 它真烧了墙钟；持续如此就该被限流成 `capped`，当天如实 `needs_review`。
     inconclusive: bool = False
+    #: 【task-63】**游戏拒绝了这个工具对这一格动手**（`tool_ineffective`/`precondition_failed`）：
+    #: 它是"世界给的前置事实"，不是"我试了没做成" ⇒ 记 `skipped` + `proven_inert`（当天封格、
+    #: 次日重试），**不算硬失败**；但日级另有**有界**豁免（`refused_bound`），防"游戏全拒绝"
+    #: 换一个 verified。与 task-52 的 `unreachable` 是**两套独立计数**、互不覆盖。
+    refused: bool = False
 
     @property
     def skipped(self) -> bool:
@@ -394,6 +402,8 @@ class StepResult:
             d["reason"] = self.reason
         if self.receipt:
             d["receipt"] = self.receipt
+        if self.status:
+            d["status"] = self.status
         if self.before is not None:
             d["before"] = self.before
         if self.after is not None:
@@ -406,6 +416,8 @@ class StepResult:
             d["inconclusive"] = True
         if self.unreachable:
             d["unreachable"] = True
+        if self.refused:
+            d["refused"] = True
         return d
 
 
@@ -459,6 +471,15 @@ class StageResult:
         return len(self.unreachable_steps)
 
     @property
+    def refused_steps(self) -> list[StepResult]:
+        """【task-63】被游戏拒绝的步（`skipped`+`proven_inert`，**不算 `failed_steps`**）。"""
+        return [s for s in self.steps if s.refused]
+
+    @property
+    def refused_count(self) -> int:
+        return len(self.refused_steps)
+
+    @property
     def progress(self) -> bool:
         return self.ok_count > 0
 
@@ -471,6 +492,7 @@ class StageResult:
             "skipped": self.skipped_count,
             "failed": len(self.failed_steps),
             "unreachable": self.unreachable_count,
+            "refused": self.refused_count,
             "stopped": self.stopped,
             "stopped_reason": self.stopped_reason,
             "steps": [s.as_dict() for s in self.steps],
@@ -1325,6 +1347,7 @@ class FarmWorker:
         except BridgeError as exc:
             status = _exc_status(exc)
             r.receipt = _receipt(exc)
+        r.status = status
         obs = self.snap()
         tv = self.tile_view(obs, tile)
         r.after = self.tile_essence(tv)
@@ -1336,6 +1359,21 @@ class FarmWorker:
             # 【task-52】走不到 ⇒ `unreachable`（不是 failed）：当天不重复白试、次日重试。
             r.code = UNREACHABLE_CODE
             r.reason = (f"锄地请求回「走不到」（{status}）：没有落脚点/没算出路径 ⇒ 不算硬失败；"
+                        f"kind={str((tv or {}).get('kind') or '未知')}；{r.receipt}")
+            return r
+        if status in TILE_INERT_STATUSES:
+            # 【task-63】游戏**拒绝**了这个工具对这一格动手（`tool_ineffective`= 挥满
+            # `MaxSwings` 仍 `BeginUsingTool` 恒 false；`precondition_failed`= 工具/前置不满足）：
+            # 这是"世界给的前置事实"，不是"我试了没做成" ⇒ 记 `skipped` + `proven_inert`
+            # （当天封格、次日重试），**不算硬失败**。`longrun` 另按 `refused_bound` 有界豁免 +
+            # 逐格 journal `tool_refused`，防"游戏全拒绝"换一个 verified。
+            #
+            # ⚠️ 与下面那条**必须分开**：Mod 回执 `ok`（status 为空/`ok`）但格子没变 = 真"挥了
+            # 没效果"，仍记 `failed`（本分支要求 `status ∈ TILE_INERT_STATUSES`）。
+            r.code = "skipped"
+            r.proven_inert = True
+            r.refused = True
+            r.reason = (f"游戏判定这格锄不动（Mod status={status}）⇒ 不是硬失败；"
                         f"kind={str((tv or {}).get('kind') or '未知')}；{r.receipt}")
             return r
         r.code = "failed"

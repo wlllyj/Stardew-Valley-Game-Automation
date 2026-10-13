@@ -776,6 +776,69 @@ class TestTillKeepsJudgement(unittest.TestCase):
         self.assertIn("身上工具", r.reason)
 
 
+class TestTask63Refused(unittest.TestCase):
+    """【task-63】游戏**拒绝**（`tool_ineffective`/`precondition_failed`）≠"我试了没做成"。
+
+    真机 run5 `spring 26`：4 格 `till` 回 `tool_ineffective` 被判 `failed` ⇒ 当天
+    `no_hard_failures=false` ⇒ 连续 3 日的验收必挂。而 `tool_ineffective` 的语义是"游戏挥满
+    `MaxSwings=6` 仍拒绝这个工具对这格动手"（`UseToolSkill.cs` / `Contracts.cs:269`）—— 这是
+    **世界给的前置事实**，只能记 `skipped`+`proven_inert`（当天封格、次日重试），日级另按
+    `refused_bound = max(5, floor(0.2×attempted))` 有界豁免。
+
+    ⚠️ 与它**必须分开**的一条：Mod 回执 `ok` 但世界没变 = 真"挥了没效果" ⇒ 仍 `failed`。
+    """
+
+    def test_game_refusal_is_skipped_and_proven_inert(self):
+        w = MiniWorld(records=[{"tile": [60, 10], "kind": "unknown"}], tillable=[(60, 10)],
+                      inventory=INV_WITH_SCYTHE, tools=TOOLS_WITH_SCYTHE)
+        w.fail_status[(60, 10)] = "tool_ineffective"
+        r = make_worker(w).till((60, 10))
+        self.assertEqual((r.code, r.ok), ("skipped", False))
+        self.assertTrue(r.proven_inert)
+        self.assertTrue(r.refused)
+        self.assertFalse(r.failed, r.reason)
+        self.assertEqual(r.status, "tool_ineffective")
+        self.assertIn("游戏判定这格锄不动", r.reason)
+        self.assertIn("tool_ineffective", r.reason)
+        self.assertEqual(w.calls, [((60, 10), "hoe")], "被拒绝也只挥一次，不许每轮重试")
+
+    def test_precondition_failed_is_also_a_refusal(self):
+        w = MiniWorld(records=[{"tile": [60, 10], "kind": "unknown"}], tillable=[(60, 10)],
+                      inventory=INV_WITH_SCYTHE, tools=TOOLS_WITH_SCYTHE)
+        w.fail_status[(60, 10)] = "precondition_failed"
+        r = make_worker(w).till((60, 10))
+        self.assertTrue(r.refused)
+        self.assertFalse(r.failed, r.reason)
+        self.assertEqual(r.status, "precondition_failed")
+
+    def test_ok_receipt_but_world_unchanged_is_still_failed(self):
+        """回执说成了、格子没变 ⇒ 仍 `failed`（真"挥了没效果"，与"游戏拒绝"分开）。"""
+        w = MiniWorld(records=[{"tile": [60, 10], "kind": "unknown"}], tillable=[(60, 10)],
+                      inventory=INV_WITH_SCYTHE, tools=TOOLS_WITH_SCYTHE)
+        w.result[(60, 10)] = "unknown"          # 回执 ok，但 kind 没变
+        r = make_worker(w).till((60, 10))
+        self.assertEqual((r.code, r.failed), ("failed", True))
+        self.assertFalse(r.refused)
+        self.assertFalse(r.proven_inert)
+        self.assertEqual(r.status, "")
+
+    def test_refused_is_visible_in_step_and_stage_dicts(self):
+        r = SR("till", (60, 10), code="skipped", proven_inert=True, refused=True,
+               status="tool_ineffective", reason="游戏判定这格锄不动（Mod status=tool_ineffective）")
+        d = r.as_dict()
+        self.assertTrue(d["refused"])
+        self.assertEqual(d["status"], "tool_ineffective")
+        # 没被拒绝的步不许写这两个键（免得工具把"拒绝"当默认）
+        plain = SR("till", (60, 10), code="failed", reason="挥了没变").as_dict()
+        self.assertNotIn("refused", plain)
+        self.assertNotIn("status", plain)
+        st = StageResult(stage="till_area", tiles=[(60, 10)], steps=[r])
+        self.assertEqual(st.refused_count, 1)
+        self.assertEqual(st.refused_steps, [r])
+        self.assertEqual(st.failed_steps, [], "被拒绝的格**不算**硬失败")
+        self.assertEqual(st.as_dict()["refused"], 1)
+
+
 class TestStepResult(unittest.TestCase):
     def test_attempted_semantics(self):
         """`attempted` = "这一格的动作被发起过"：纯跳过（没花体力）不算。"""
