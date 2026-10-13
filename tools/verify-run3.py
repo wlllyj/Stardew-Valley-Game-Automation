@@ -262,12 +262,15 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
     # ②用 journal 里带"站不过去/寻路无法到达"字样的事件**独立自算**一遍，两者对不上就如实记
     # 信息项（缺失 ≠ 通过：字段缺了也要有自算值说话；防洗白靠"全不可达 + 0 成功"由真空日闸门兜）。
     _UNREACH_MARKS = ("四邻都站不过去", "寻路无法到达", "无法到达", "unreachable", "A* 未算出路径")
-    unreach_by_day: dict[str, int] = {}
-    unreach_tiles_by_day: dict[str, set[tuple[Any, Any]]] = {}
-    _cur_key: str | None = None
+    # ⚠ 会话级计数（不是日级）：`build_days` 按 `day_start` 切会话，**同一天重试**会产生两条
+    # 同 key 的日记录（run6 就是 summer 4 跑了两轮）。日级汇总会把两轮合计（84）去比单轮账本
+    # （各 42）⇒ 假"不一致"。这里用 (day_key, start_lineno) 精确定位到会话。
+    unreach_by_day: dict[tuple[str, Any], int] = {}
+    unreach_tiles_by_day: dict[tuple[str, Any], set[tuple[Any, Any]]] = {}
+    _cur_key: tuple[str, Any] | None = None
     for r in rows:
         if r.get("event") == "day_start":
-            _cur_key = day_key(r)
+            _cur_key = (day_key(r), r.get("_lineno"))
             continue
         if _cur_key is None or r.get("event") not in ("blocked", "stage_exhausted", "unreachable"):
             continue
@@ -283,12 +286,12 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
     # **不算当天硬失败** ⇒ 逐格 journal `tool_refused` / 日级 `refused_summary`。与 task-52 的
     # unreachable 是**两套独立口径**：这里只做"账本计数 vs journal 自算"的信息项 + 一条硬闸门
     # （`checks.refused_within_bound is False` ⇒ 上界越界 = 洗白风险）。缺字段只记信息项，不当通过。
-    refused_by_day: dict[str, int] = {}
-    refused_tiles_by_day: dict[str, set[tuple[Any, Any]]] = {}
-    _cur_key2: str | None = None
+    refused_by_day: dict[tuple[str, Any], int] = {}
+    refused_tiles_by_day: dict[tuple[str, Any], set[tuple[Any, Any]]] = {}
+    _cur_key2: tuple[str, Any] | None = None
     for r in rows:
         if r.get("event") == "day_start":
-            _cur_key2 = day_key(r)
+            _cur_key2 = (day_key(r), r.get("_lineno"))
             continue
         if _cur_key2 is None or r.get("event") != "tool_refused":
             continue
@@ -317,6 +320,8 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
 
     for d in days:
         name = d["key"]
+        # 会话键（同一天重试时两条日记录同 key、不同 start_lineno）：自算计数必须按会话比。
+        sess = (name, d.get("start_lineno"))
         end_stats = d.get("end") or {}
         checks = d.get("checks") or {}
         stage_recs = [s for s in (end_stats.get("stages") or []) if isinstance(s, dict)]
@@ -437,8 +442,8 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         if sum_env or sum_incon:
             infos.append(f"[{name}] 环境挡路失败 {sum_env} 格、无结论失败 {sum_incon} 格（信息项，不改结论）")
         # task-52：不可达格豁免（信息项，不改结论）。账本字段缺省时用 journal 自算值说话。
-        self_unreach = unreach_by_day.get(name, 0)
-        self_tiles = len(unreach_tiles_by_day.get(name) or ())
+        self_unreach = unreach_by_day.get(sess, 0)
+        self_tiles = len(unreach_tiles_by_day.get(sess) or ())
         sum_unreach = sum(int(s.get("unreachable") or 0) for s in stage_recs)
         day_unreach = end_stats.get("unreachable")
         field_unreach: int | None = None
@@ -482,8 +487,8 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
                 "不可达应被豁免，请核对 checks.no_hard_failures（豁免后仍 false 才算真失败）"
             )
         # task-63：`till` 被游戏拒绝（tool_ineffective）的日级豁免 —— 与上面 unreachable 独立计数。
-        self_refused = refused_by_day.get(name, 0)
-        self_refused_tiles = len(refused_tiles_by_day.get(name) or ())
+        self_refused = refused_by_day.get(sess, 0)
+        self_refused_tiles = len(refused_tiles_by_day.get(sess) or ())
         sum_refused = sum(int(s.get("refused") or 0) for s in stage_recs)
         day_refused = end_stats.get("refused")
         field_refused: int | None = int(day_refused) if isinstance(day_refused, (int, float)) else (

@@ -457,6 +457,59 @@ class TestVerifyRun3(unittest.TestCase):
         self.assertFalse(any("自算不一致" in p for p in s["problems"]), s["problems"])
         self.assertFalse(ok, "全被豁免且 0 成功的一天不可能构成达标链")
 
+    # ---------------------------------------------- 同日重试：自算计数必须按"会话"而不是按"日"比
+    def test_same_day_retry_does_not_fake_unreachable_mismatch(self):
+        """run6 实测形态：同一天跑两轮，每轮 `day_end.unreachable=2`，逐格事件两会话各 2 条。
+
+        日级合并会拿 4 去比单轮的 2 ⇒ 假"账本与自算不一致"。本用例锁死"按会话比"。
+        """
+        d = [1, "summer", 4]
+        rows: list[dict] = []
+        for i in range(2):
+            rows += [
+                day_start(d, t=i * 100.0, lineno=1 + i * 10),
+                {"event": "unreachable", "t": i * 100.0 + 10, "_lineno": 2 + i * 10,
+                 "tile": [60 + i, 20], "reason": "四邻都站不过去（没有落脚点）"},
+                {"event": "unreachable", "t": i * 100.0 + 11, "_lineno": 3 + i * 10,
+                 "tile": [61 + i, 20], "reason": "四邻都站不过去（没有落脚点）"},
+                sleep_ok(t=i * 100.0 + 20, reason="no_work:确实找不到可做的活", lineno=4 + i * 10),
+                day_end(d, None, t=i * 100.0 + 30, ok_steps=0, verified=False,
+                        ended_by="stuck", ended_reason="stuck:连续 3 轮世界没有任何变化",
+                        stages=[stage("clear_dead", tiles=2, ok=0, skipped=0, leftover=2)],
+                        checks={"no_unmet_stages": False, "no_hard_failures": True,
+                                "unreachable_within_bound": True, "refused_within_bound": True},
+                        unreachable=2, unreachable_bound=5, unreachable_exempt=2,
+                        refused=0, refused_bound=5, refused_exempt=0),
+            ]
+        ok, s = self.check(rows, days=3)
+        self.assertFalse(ok, "0 跨日、同一天两轮 stuck 不可能是达标跑")
+        self.assertFalse(
+            any("不可达计数账本" in i and "不一致" in i for i in s["infos"]), s["infos"]
+        )
+        self.assertTrue(any("不可达" in i and "自算=2 次/2 格" in i for i in s["infos"]), s["infos"])
+
+    def test_same_day_retry_still_catches_real_missing_unreachable_count(self):
+        """反向：journal 里有不可达事件、但账本 `unreachable` 少写 ⇒ 仍要报"不一致"（防缺失当通过）。"""
+        d = [1, "summer", 4]
+        rows: list[dict] = [
+            day_start(d, t=0.0, lineno=1),
+            {"event": "unreachable", "t": 10.0, "_lineno": 2, "tile": [60, 20],
+             "reason": "四邻都站不过去（没有落脚点）"},
+            sleep_ok(t=20.0, reason="no_work:确实找不到可做的活", lineno=3),
+            day_end(d, None, t=30.0, ok_steps=0, verified=False, ended_by="stuck",
+                    ended_reason="stuck:连续 3 轮世界没有任何变化",
+                    stages=[stage("clear_dead", tiles=1, ok=0, skipped=0, leftover=1)],
+                    checks={"no_unmet_stages": False, "no_hard_failures": True,
+                            "unreachable_within_bound": True, "refused_within_bound": True},
+                    unreachable=0, unreachable_bound=5, unreachable_exempt=0,
+                    refused=0, refused_bound=5, refused_exempt=0),
+        ]
+        ok, s = self.check(rows, days=1)
+        self.assertFalse(ok)
+        self.assertTrue(
+            any("不可达计数账本" in i and "不一致" in i for i in s["infos"]), s["infos"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
