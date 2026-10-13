@@ -152,11 +152,63 @@ run2 的 `decisions_llm=7` 里有 1 条是兜底：`logs\longrun-3day-llm-run2.j
   界内只 info 且可见 / 越界 ⇒ 0 类红 / 缺字段 ⇒ 无法判定不通过 / refused 与 unreachable
   计数不串 / refused 不进账目差额口径）。
 
+## 3.8 守卫死锁类失败（task-69：run6 = `summer 4` 的 37 秒快速失败）
+
+**形态**：脑侧守卫要求一个**现实不可满足**的条件（run6：「没种子但钱够 ⇒ 该去买」，而夏季 SeedShop
+不卖硬编码的 `472`=防风草）⇒ 策略每轮都回到同一动作、世界零变化 ⇒ `ended_by=stuck`。
+既不是环境挡路、也不是硬失败，**重跑无用**，必须改守卫条件（task-67 买种子按在售清单 /
+task-68 枯死作物可达性）。
+
+**run6 指纹（逐条可 grep，`logs\longrun-3day-llm-run6.jsonl`，143 行）**
+
+| 指纹 | run6 实测 | 行 |
+|---|---|---|
+| 空转到第 3 轮 | `idle{rounds:3, acted:false}` ×2 | L68、L139 |
+| 收尾方式 | `day_end.ended_by="stuck"`（两条日报告都是） | L70、L141 |
+| 购买连续失败、**同一回执** | `buy{ok:false, code:"failed", receipt:"item_not_sold: …"}` ×6 | L2、37、56、73、108、127 |
+| 唯一实体阶段全 0 成功 | `stage_exhausted{stage:"clear_dead", leftover:30, doomed:30, capped:0}` | L66、L137 |
+| 不可达越界 | `unreachable_summary{count:42, bound:8, attempted:42, exempted:8, unmet:46}` ⇒ `checks.unreachable_within_bound=false` | L69、L140 |
+| 自述死因 | `no_day_progress.reason = "stuck:连续 3 轮世界没有任何变化…守卫仍说还有活：没种子但钱够（956g ≥ 20g），该去买"` | L142 |
+| 同日重试 | 2 个 `day_start`/`day_end` 都是 `[1,"summer",4]`、`day_after=null` ⇒ **1 个日历日**，不算跨日 | L1/L71、L70/L141 |
+
+grep 配方（run7 起快速定位）：
+
+```
+# 1) 死锁三件套：stuck / 空转到第 3 轮 / 自述
+rg -n '"ended_by": ?"stuck"|"rounds": ?3|连续 3 轮世界没有任何变化' logs\longrun-*.jsonl
+# 2) 守卫要的条件是不是现实不可满足（买不到同一物品）
+rg -o '"event": ?"buy".{0,200}' logs\longrun-*.jsonl
+# 3) 唯一实体阶段全 0 ok（doomed=走不到 / capped=配额到顶，两者差别要看 stage_exhausted 字段）
+rg -n '"stage_exhausted".{0,140}' logs\longrun-*.jsonl
+# 4) 不可达越界（豁免把真失败洗白的风险）
+rg -n '"unreachable_within_bound": ?false' logs\longrun-*.jsonl
+```
+
+**本工具怎么报（task-69 新增）**
+- 头部 `同日重试: N 个会话只有 M 个不同日历日（…；**不算跨日、不算多天**；起跑行 […]）`——
+  多份 `day_end` 来自同日重试，不是跨日；`ended_by != sleep` 时跨日证据一律 `n/a`，绝不发 `missed:cross_day`。
+- 头部 `购买: N 次（成功 a / 没成交 b）；回执 item_not_sold×b ⚠ 同一回执连续失败 ⇒ 守卫死锁嫌疑（行 […]）`——
+  **`buy` 桶存在 ≠ 买成了**：`ok=false`（或 `code` 非 ok）如实计成"没成交"，**回执码优先于桥的 `code`**
+  （run6 的 `code` 恒为 `failed`，真正的指纹是 `receipt` 前缀 `item_not_sold`）。
+- 建议 0g「购买没成交 ×N」+ 0h「同一天重复起跑 ×N」（排在最前，不会被 `--top` 截掉）。
+- `buy` 没成交**不判红**（它不是验收口径违规，而是死因之一）；判红仍靠 checks 与 `stuck` 这类硬结论。
+
+**与 `tools\verify-run3.py` 的分工（run6 实测同向）**：它 `needs_review`（problem：两条日报告的
+`ended_by=stuck`、`verified=false`、`unreachable_within_bound=false`、`no_unmet_stages=false`，
+外加 info「跨日没有推进 ×1」）；本工具 rc=1、0/3 VERIFIED、0 类红 2 条
+（`manual:check:unreachable_within_bound` ×2）+【1 该做没做】12 条 +【5 环境挡路】10 条。
+两边都把两个会话读成**同一个日历日**（`summer 4`），都不判通过。
+
+**判据（可写进 run7 口径）**：当天出现 `ended_by=stuck`（或 `idle{rounds≥3}`），且
+**没有任何成交类动作**（`buy`/`sell` 全失败或 0 次），且唯一实体阶段的 `ok` 全 0
+⇒ 判"守卫死锁"：不判通过、重跑无效、必须改守卫条件或数据（种子 id / 在售清单 / 可达性）。
+
 ## 4. 复核命令
 
 ```
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run5.jsonl   # 有红 ⇒ rc=1（--advisory 才恒 0）
-python tools\verify-run3.py      --journal logs\longrun-3day-llm-run5.jsonl   # 判决权威（rc=1 needs_review）
+python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run6.jsonl   # run6：守卫死锁 + 同日重试
+python tools\verify-run3.py      --journal logs\longrun-3day-llm-run6.jsonl   # 判决权威（rc=1 needs_review）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
-python -m unittest discover -s tests        # 当前 455 OK
+python -m unittest discover -s tests        # 当前 459 OK
 ```

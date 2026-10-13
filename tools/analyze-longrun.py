@@ -1412,6 +1412,26 @@ def build_advice(report, top=8):
                     "fail-closed 路径（verify-run3.py 同判 problem）",
             "lines": [ln for ln, _ in no_work_dry if ln is not None],
         })
+    # 0g) 购买没成交（task-69：run6 守卫死锁的指纹之一；桶 `buys` 存在 ≠ 买成了）
+    buy = report.get("buy") or {}
+    if buy.get("failed"):
+        codes = "、".join(f"{k}×{v}" for k, v in sorted((buy.get("codes") or {}).items())) or "无 code"
+        advice.append({
+            "text": f"购买没成交 ×{buy['failed']}（{codes}；共 {buy['total']} 次）"
+                    + ("：同一回执反复出现 ⇒ 守卫要的条件现实不可满足（守卫死锁嫌疑：先查 task-67 的"
+                       "「按在售清单买」与 sleep_guard 的「没种子但钱够 ⇒ 该去买」是否互为闭环）"
+                       if buy.get("same_receipt") else "：先看钱/背包/货架是否真的满足"),
+            "lines": buy.get("failed_lines") or [],
+        })
+    # 0h) 同一天重复起跑（task-69：run6 是 stuck 后同日重试；不许读成跨日/多天）
+    sdr = report.get("same_day_retries") or {}
+    if sdr:
+        advice.append({
+            "text": f"同一天重复起跑 ×{sdr['sessions']}（去重后只有 {sdr['distinct_days']} 个日历日："
+                    f"{'、'.join(sdr['labels'])}）：账本会有多份 day_end，别读成跨日/多天；"
+                    "先看上一轮为什么卡住（stuck / 守卫死锁）",
+            "lines": sdr.get("retry_lines") or [],
+        })
     # 0c) 环境挡路 / 没拿到结论（task-22 记账）
     env = report.get("env_inconclusive") or {}
     if env.get("env_fail_events"):
@@ -1775,6 +1795,60 @@ def build_report(rows, path, args, bad_lines):
             "outcomes": len(sess["outcomes"]),
             "blocked": len(sess["blocked"]),
         })
+    # task-69：同一天重复起跑（run6：stuck 后同日重试）——呈现必须正确：
+    # 去重后按"日历日"数，**不算跨日、不算多天**（跨日证据只对 ended_by=sleep 生效）。
+    distinct_labels = []
+    for d in days:
+        if d["label"] not in distinct_labels:
+            distinct_labels.append(d["label"])
+    same_day_retries = None
+    if days and len(distinct_labels) < len(days):
+        same_day_retries = {
+            "sessions": len(days),
+            "distinct_days": len(distinct_labels),
+            "labels": distinct_labels,
+            "retry_lines": [d["start_line"] for d in days],
+        }
+    # task-69：`buy` 事件（run6 死因之一）的如实计数 —— 桶 `buys` 早就有（Lead m02395），
+    # 但它既不在 `NEW_EVENT_BUCKETS`、也没有专门呈现 ⇒ run6 的 6 次「没成交（item_not_sold）」
+    # 在报告里是隐形的。这里把"没成交"如实计成**失败**（绝不因为事件存在就当成功）。
+    buy_ok = 0
+    buy_failed = 0
+    buy_unknown = 0
+    buy_codes = {}
+    buy_failed_lines = []
+    buy_sample = ""
+    for ln, ev in rows:
+        if ev.get("event") != "buy":
+            continue
+        ok = ev.get("ok")
+        code = str(ev.get("code") or "")
+        receipt = str(ev.get("receipt") or "")
+        # 回执码优先（run6：`receipt` = "item_not_sold: [item_not_sold] (HTTP 200) …"）——
+        # 它才是"为什么没成交"的指纹；`code` 只是桥的粗分类（run6 恒为 "failed"）。
+        receipt_code = receipt.split(":")[0].strip() if ":" in receipt else ""
+        code_eff = receipt_code or code
+        if ok is True:
+            buy_ok += 1
+        elif ok is False or code not in ("", "ok", "success"):
+            buy_failed += 1
+            buy_failed_lines.append(ln)
+            buy_codes[code_eff or "?"] = buy_codes.get(code_eff or "?", 0) + 1
+            if not buy_sample:
+                buy_sample = str(ev.get("reason") or "")[:220]
+        else:
+            buy_unknown += 1
+    buy_counts = {
+        "total": buy_ok + buy_failed + buy_unknown,
+        "ok": buy_ok,
+        "failed": buy_failed,
+        "unknown": buy_unknown,
+        "failed_lines": buy_failed_lines,
+        "codes": buy_codes,
+        # 同一回执连续失败 = 守卫要的条件现实不可满足（守卫死锁）的指纹
+        "same_receipt": buy_failed >= 2 and len(buy_codes) == 1,
+        "sample_reason": buy_sample,
+    }
     finish = None
     for lineno, ev in rows:
         if ev.get("event") == "finish":
@@ -1846,6 +1920,9 @@ def build_report(rows, path, args, bad_lines):
         "failed_steps_total": failed_steps_total,
         "decision_counts": decision_counts,
         "weak_days": weak_days,
+        # task-69：同日重试的呈现 + buy 事件的成/败计数（跑 run6 复核用）
+        "same_day_retries": same_day_retries,
+        "buy": buy_counts,
         "unmapped_events": unmapped_events,
         "no_day_progress": [
             {"line": ln, "reason": ev.get("reason"), "ended_by": ev.get("ended_by")}
@@ -2185,6 +2262,11 @@ def render_text(report, top):
     add(f"天: --days {report['days_requested']}；day_start {report['day_start_count']} 次、day_end {report['day_end_count']} 次")
     add(f"VERIFIED: {report['verified_days']}/{report['days_requested']} 天"
         f"（day_end 中 verified=true {report['verified_days']} 次）")
+    # task-69：同一天重复起跑（run6：stuck 后同日重试）——不许读成跨日/多天
+    sdr = report.get("same_day_retries") or {}
+    if sdr:
+        add(f"同日重试: {sdr['sessions']} 个会话只有 {sdr['distinct_days']} 个不同日历日"
+            f"（{'、'.join(sdr['labels'])}；**不算跨日、不算多天**；起跑行 {sdr['retry_lines']}）")
     add(f"步数合计: ok {report['ok_steps_total']} / skipped {report['skipped_steps_total']} "
         f"/ failed {report['failed_steps_total']}")
     nd = report["no_day_progress"]
@@ -2194,6 +2276,15 @@ def render_text(report, top):
     add(f"blocked: {blocked} 条（{blocked_detail}）；其中理由含 grass 的 {report['blocked_grass']} 条"
         + ("（草格无效挥动）" if report["blocked_grass"] else ""))
     add(f"sleep: {report['events'].get('sleep', 0)} 次（ok {report['sleep_ok']} / failed {report['sleep_failed']}）")
+    # task-69：`buy` 的成/败计数（run6 的 6 次没成交此前在报告里是隐形的；绝不把"事件存在"当成功）
+    buy = report.get("buy") or {}
+    if buy.get("total"):
+        add(f"购买: {buy['total']} 次（成功 {buy.get('ok', 0)} / 没成交 {buy.get('failed', 0)}"
+            + (f" / 未知 {buy['unknown']}" if buy.get("unknown") else "") + "）"
+            + ("；回执 " + "、".join(f"{k}×{v}" for k, v in sorted((buy.get("codes") or {}).items()))
+               if buy.get("codes") else "")
+            + (f"  ⚠ 同一回执连续失败 ⇒ 守卫死锁嫌疑（行 {buy.get('failed_lines', [])[:6]}）"
+               if buy.get("same_receipt") else ""))
     # task-32：两种新事件形态的计数（信息项）；task-38：跨日证据覆盖度
     pc, ws = report["events"].get("plots_capped", 0), report["events"].get("work_spot", 0)
     add(f"软上限/收尾: plots_capped {pc} 次（作业区配额到顶，信息项）；work_spot {ws} 次（收尾作业区）")

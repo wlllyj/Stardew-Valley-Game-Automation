@@ -1378,5 +1378,103 @@ class TestExitCodes(unittest.TestCase):
         self.assertIn("wasted:verified_zero_steps", text)
 
 
+RUN6 = os.path.join(ROOT, "logs", "longrun-3day-llm-run6.jsonl")
+
+
+class TestSameDayRetryAndBuyAccounting(unittest.TestCase):
+    """task-69（Lead）：run6 的两处呈现。
+
+    ① 同一天重复起跑：2 个会话只有 1 个不同日历日 ⇒ 不许读成跨日/多天（跨日证据只对
+       ``ended_by=sleep`` 生效），也不许因此发 ``missed:cross_day``。
+    ② ``buy`` 事件：桶 ``buys`` 存在 ≠ 买成了；「没成交（receipt=item_not_sold）」必须如实
+       计成**失败**，同一回执连续失败 = 守卫死锁指纹（run6 死因）。
+    """
+
+    def _report(self, events, name, days=1):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=days)
+
+    def _stuck_end(self):
+        return {
+            "event": "day_end", "t": 9.0, "day": MODAL_DAY, "day_text": "1年 spring 12日",
+            "ended_by": "stuck", "ended_reason": "stuck", "verified": False,
+            "checks": {"slept_by_us": False, "no_blocking_modal": True, "no_hard_failures": True,
+                       "crops_watered": True, "day_justified": False},
+            "stages": [], "outcomes": [], "ok_steps": 0, "skipped_steps": 0, "failed_steps": 0,
+            "final": final(MODAL_DAY),
+        }
+
+    def test_same_day_retry_is_one_calendar_day(self):
+        rep = self._report([
+            day_start(MODAL_DAY),
+            self._stuck_end(),
+            day_start(MODAL_DAY),
+            self._stuck_end(),
+            {"event": "finish", "t": 9.5, "code": 1, "verified_streak": 0, "actions": 3,
+             "minutes": 0.1},
+        ], "same_day.jsonl", days=3)
+        sdr = rep["same_day_retries"]
+        self.assertEqual(sdr["sessions"], 2)
+        self.assertEqual(sdr["distinct_days"], 1, "同一个日历日的两次起跑只能算 1 天")
+        self.assertEqual(sdr["retry_lines"], [1, 3])
+        text = mod.render_text(rep, 50)
+        self.assertIn("同日重试: 2 个会话只有 1 个不同日历日", text)
+        self.assertIn("不算跨日、不算多天", text)
+        # ended_by=stuck 不是 sleep ⇒ 跨日证据一律 n/a，绝不发 missed:cross_day
+        self.assertTrue(all(d["cross_day_verdict"] == "n/a" for d in rep["days"]))
+        self.assertNotIn("missed:cross_day", rep["red"]["subjects"])
+        self.assertEqual(rep["verified_days"], 0)
+        self.assertIn("同一天重复起跑 ×2", " ".join(a["text"] for a in rep["advice"]))
+
+    def test_buy_failure_is_counted_as_failure_not_success(self):
+        bad = {"event": "buy", "t": 1.0, "ok": False, "code": "failed",
+               "receipt": "item_not_sold: [item_not_sold] (HTTP 200) 商店「SeedShop」里没有「472」。",
+               "reason": "没成交：物品 0→0，钱 956→956；回执=item_not_sold"}
+        rep = self._report(integrity_ledger(extra_events=[
+            dict(bad), dict(bad, t=2.0),
+        ]), "buy_bad.jsonl")
+        b = rep["buy"]
+        self.assertEqual((b["total"], b["ok"], b["failed"]), (2, 0, 2))
+        self.assertEqual(b["codes"], {"item_not_sold": 2},
+                         "回执码优先于桥的粗分类 code=failed")
+        self.assertTrue(b["same_receipt"])
+        self.assertEqual(b["failed_lines"], [2, 3])
+        text = mod.render_text(rep, 50)
+        self.assertIn("购买: 2 次（成功 0 / 没成交 2）", text)
+        self.assertIn("item_not_sold×2", text)
+        self.assertIn("守卫死锁嫌疑", text)
+        self.assertIn("购买没成交 ×2", " ".join(a["text"] for a in rep["advice"]))
+
+    def test_buy_success_is_not_flagged(self):
+        rep = self._report(integrity_ledger(extra_events=[
+            {"event": "buy", "t": 1.0, "ok": True, "code": "ok", "receipt": "ok",
+             "reason": "买成了"},
+        ]), "buy_ok.jsonl")
+        b = rep["buy"]
+        self.assertEqual((b["ok"], b["failed"], b["unknown"]), (1, 0, 0))
+        self.assertFalse(b["same_receipt"])
+        text = mod.render_text(rep, 50)
+        self.assertIn("购买: 1 次（成功 1 / 没成交 0）", text)
+        self.assertNotIn("守卫死锁嫌疑", text)
+        self.assertNotIn("购买没成交", " ".join(a["text"] for a in rep["advice"]))
+
+    @unittest.skipUnless(os.path.exists(RUN6), "run6 账本不在（logs\\longrun-3day-llm-run6.jsonl）")
+    def test_real_run6_buy_and_unmapped(self):
+        rep = report_for(RUN6, days=3)
+        self.assertEqual(rep["unmapped_events"], {},
+                         "run6 的每个事件名都必须有桶（含 clear_dead_scope / buy / idle）")
+        b = rep["buy"]
+        self.assertEqual((b["total"], b["ok"], b["failed"]), (6, 0, 6))
+        self.assertEqual(b["codes"], {"item_not_sold": 6})
+        self.assertTrue(b["same_receipt"])
+        self.assertEqual(rep["same_day_retries"]["distinct_days"], 1)
+        self.assertEqual(rep["verified_days"], 0)
+        text = mod.render_text(rep, 50)
+        self.assertIn("item_not_sold×6", text)
+        self.assertIn("同日重试", text)
+        self.assertIn("守卫死锁嫌疑", text)
+
+
 if __name__ == "__main__":
     unittest.main()
