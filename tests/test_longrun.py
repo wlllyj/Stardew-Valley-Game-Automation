@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import tempfile
@@ -31,6 +32,7 @@ from typing import Iterable
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "brain"))
 
 from agentfarm.bridge import MOD_VERSION_EXPECTED, BridgeError  # noqa: E402
+from agentfarm.llm import LlmError  # noqa: E402
 from agentfarm.farmwork import (  # noqa: E402
     MAX_CLEAR_SWINGS, FarmWorker, STAGE_ACTION, StepResult, StageResult, seed_items,
 )
@@ -521,6 +523,17 @@ def make_run(world: FakeWorld | None = None, **kw) -> LongRun:
     run = LongRun(**params)
     run.logs = logs
     return run
+
+
+class _BoomChat:
+    """【task-56】假 LLM seam：每次调用都抛 `LlmError`（**真的调了一次**，但绝不联网）。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, messages, **kwargs):
+        self.calls += 1
+        raise LlmError("单测假 seam：故意失败（不联网）", status="network")
 
 
 # --------------------------------------------------------------------------- 测试
@@ -2990,6 +3003,74 @@ class TestTask50FarDryTiles(unittest.TestCase):
         self.assertLessEqual(run._actions, 40, f"整天动作数必须收敛：{run._actions}")
         self.assertTrue(all(not e["ok"] for e in ev))
         self.assertTrue(ev[-1]["given_up"])
+
+
+class TestTask56LlmTraceWiring(unittest.TestCase):
+    """【task-56】长跑把"决策留痕"接起来：journal 路径 ⇒ `<stem>-llm.jsonl` ⇒ planner。
+
+    真实 LLM 调用的现场由 planner 落一行 JSON；`decision` journal 只多两个字段
+    （路径 + 该行 sha256 前 12 位）。这里用**抛 `LlmError` 的假 seam**：它也算"真的调了一次"
+    （进入 `_ask` 即计数），所以既能验证留痕链路，又完全不联网。
+    """
+
+    def test_decision_journal_carries_trace_path_and_hash(self):
+        w = FakeWorld(weeds=4, seeds=10, money=500)
+        chat = _BoomChat()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / "run-llm-test.jsonl"
+            run = make_run(w, target_days=1, max_days=1, journal_path=str(journal),
+                           llm_enabled=True, planner=BoundaryPlanner(
+                               llm_chat=chat, llm_enabled=True, max_llm_attempts=1))
+            # 钉住一个边界：上一次的 task 种类与本次确定性首选不同 ⇒ 必然问一次 LLM
+            run.state.last_task_kind = "review"
+
+            run.run()
+
+            trace_path = Path(tmp) / "run-llm-test-llm.jsonl"
+            self.assertTrue(trace_path.exists(), "留痕文件必须写在 journal 旁边（同前缀 + -llm）")
+            rows = [e for e in run.entries if e["event"] == "decision"]
+            called = [e for e in rows if e.get("llm_trace")]
+            self.assertTrue(called, f"边界上的 decision 行必须带 llm_trace：{rows[:2]}")
+            row = called[0]
+            self.assertEqual(row["llm_trace"], str(trace_path))
+            # 既有字段语义一个字没动
+            self.assertIn(row["source"], ("llm", "deterministic_fallback"))
+            self.assertIn("intents", row)
+            # 哈希必须就是 trace 文件里对应那一行的 sha256 前 12 位
+            lines = trace_path.read_text(encoding="utf-8").strip().splitlines()
+            self.assertTrue(lines)
+            hashes = {hashlib.sha256(ln.encode("utf-8")).hexdigest()[:12] for ln in lines}
+            for called_row in called:
+                self.assertIn(called_row["llm_trace_hash"], hashes)
+            # 每行 trace 都是一次**真实**调用：行数 == 假 seam 被调次数（不多不少）
+            self.assertEqual(len(lines), chat.calls)
+            recs = [json.loads(ln) for ln in lines]
+            self.assertTrue(all(r["accepted"] is False for r in recs))
+            self.assertTrue(all(r["fallback"] is True for r in recs))
+
+    def test_llm_trace_failed_is_journalled_when_the_path_is_unusable(self):
+        """写盘失败：决策照常跑完，journal 多一条 `llm_trace_failed`（用户才不会以为有留痕）。"""
+        w = FakeWorld(weeds=4, seeds=10, money=500)
+        chat = _BoomChat()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # 把"留痕文件"指向一个目录 ⇒ 写盘必失败，但 journal 本身照常写
+            journal = Path(tmp) / "run-llm-test.jsonl"
+            run = make_run(w, target_days=1, max_days=1, journal_path=str(journal),
+                           llm_enabled=True, planner=BoundaryPlanner(
+                               llm_chat=chat, llm_enabled=True, max_llm_attempts=1))
+            run.state.last_task_kind = "review"
+            run.planner.set_trace_path(Path(tmp))            # 目录，不是文件
+
+            run.run()
+
+            failed = [e for e in run.entries if e["event"] == "llm_trace_failed"]
+            self.assertTrue(failed, "写盘失败必须留下 llm_trace_failed")
+            self.assertTrue(failed[0]["reason"])
+            # 决策本身没被影响：该问的问了、该降级降级了
+            self.assertGreaterEqual(chat.calls, 1)
+            self.assertTrue([e for e in run.entries if e["event"] == "decision"])
 
 
 if __name__ == "__main__":

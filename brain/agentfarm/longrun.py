@@ -437,6 +437,12 @@ class LongRun:
         self.modal_max_dismiss = int(modal_max_dismiss)
         self.report_dir = Path(report_dir) if report_dir else None
         self.journal_path = Path(journal_path) if journal_path else None
+        # 【task-56】决策留痕落点 = 与 journal 同前缀的 `<stem>-llm.jsonl`（planner 不知道 journal
+        # 在哪，所以由控制器推导后回填；planner 不支持回填就退化成"不留痕"，绝不影响决策）。
+        self.llm_trace_path = self._derive_llm_trace_path(self.journal_path)
+        trace_setter = getattr(self.planner, "set_trace_path", None)
+        if callable(trace_setter):
+            trace_setter(self.llm_trace_path)
         self.log = log
         self.now = now
         self.sleep_fn = sleep_fn
@@ -537,6 +543,18 @@ class LongRun:
     def _snap(self) -> dict[str, Any]:
         assert self.worker is not None
         return self.worker.snap()
+
+    @staticmethod
+    def _derive_llm_trace_path(journal_path: Path | None) -> Path | None:
+        """【task-56】`logs/run6.jsonl` ⇒ `logs/run6-llm.jsonl`（日记旁边放决策留痕）。
+
+        journal 为 None 时不落痕（一次性 `agentfarm plan` 之类不需要文件）。
+        """
+        if journal_path is None:
+            return None
+        suffix = journal_path.suffix or ".jsonl"
+        stem = journal_path.name[: -len(journal_path.suffix)] if journal_path.suffix else journal_path.name
+        return journal_path.with_name(f"{stem}-llm{suffix}")
 
     def _elapsed_minutes(self) -> float:
         return (self.now() - self.started) / 60.0
@@ -2380,7 +2398,17 @@ class LongRun:
                           # 单独一个布尔位：截断是**配置问题**（该调大 token 预算），
                           # 和网络/校验失败混在一个字符串里事后分不清（task-9）。
                           truncated=bool(getattr(decision, "truncated", False)),
+                          # 【task-56】决策留痕：真实 LLM 调用的 trace 文件 + 该决策最后一行
+                          # 的 sha256 前 12 位（确定性决策是空串；既有字段语义一字未动）。
+                          llm_trace=getattr(decision, "llm_trace", "") or "",
+                          llm_trace_hash=getattr(decision, "llm_trace_hash", "") or "",
                           zone=self.zone_name)
+            # 【task-56】留痕写盘失败**不影响决策**，但要留下账：否则"用户以为有留痕、其实没有"。
+            trace_error = getattr(decision, "llm_trace_error", "") or ""
+            if trace_error:
+                self._journal("llm_trace_failed", reason=trace_error,
+                              path=getattr(decision, "llm_trace", "") or str(self.llm_trace_path or ""),
+                              boundary=decision.boundary, zone=self.zone_name)
             decision, policy_note = self._apply_policy(decision, obs)
             if policy_note:
                 self._journal("policy", note=policy_note,
@@ -2651,6 +2679,9 @@ class LongRun:
                       "（任务意图 + 具名田区），格坐标与动作序列由代码按当下观测落。"
                       f"非边界不问（token 上限 {self.llm_max_tokens}）。")
             self._journal("llm_on", max_tokens=self.llm_max_tokens,
+                          # 【task-56】留痕文件路径也记在这里：事后想核对"决策到底问了什么"
+                          # 就能直接从 journal 找到旁边那个 -llm.jsonl。
+                          llm_trace=str(self.llm_trace_path or ""),
                           note="每天首次决策 + 阶段切换/失败上升时才联网")
         else:
             self._say("i 边界决策的大模型已关闭：全程走确定性策略（代码政策：浇水优先、"

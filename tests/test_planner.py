@@ -23,15 +23,17 @@ import 本身不发请求。
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "brain"))
 
 from agentfarm import planner as P  # noqa: E402
-from agentfarm.llm import LlmError, LlmResult  # noqa: E402
+from agentfarm.llm import LlmError, LlmResult, Usage  # noqa: E402
 
 
 # --------------------------------------------------------------------------- 工具
@@ -812,6 +814,110 @@ class FarmAreasTests(unittest.TestCase):
         # 没有具名田区时提示词必须**明说**（否则模型会瞎编田区名，白烧一次重问）
         messages = P.build_messages(brief, boundary=P.BOUNDARY_NEW_DAY)
         self.assertIn("本轮没有具名田区", messages[0]["content"])
+
+
+class LlmTraceTests(unittest.TestCase):
+    """【task-56 决策留痕】每次**真实** LLM 调用落一行 JSON，`decision` 上带路径 + 哈希。
+
+    用户今天问的原话是"每次决策有没有记录和反馈机制"⇒ 留痕只负责**如实记录**：
+    它绝不能改变决策逻辑，写盘失败也必须照常返回决策（只把原因挂在 `llm_trace_error`）。
+    """
+
+    def boundary_state(self) -> P.PlannerState:
+        return P.PlannerState(day_key=(1, "spring", 5), last_task_kind="till_area", last_seen_failures=0)
+
+    def test_real_call_writes_one_line_with_every_field(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run-llm.jsonl"
+            chat = FakeChat(LlmResult(content=valid_payload(), model="deepseek-flash",
+                                      finish_reason="stop",
+                                      usage=Usage(prompt_tokens=11, completion_tokens=22), elapsed_ms=7))
+            planner = P.BoundaryPlanner(llm_chat=chat, max_llm_attempts=1, llm_trace_path=path)
+            decision = planner.decide(self.boundary_state(), till_brief(day_key=(1, "spring", 6)))
+
+            self.assertEqual(decision.source, P.SOURCE_LLM)
+            lines = path.read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(lines), 1)
+            rec = json.loads(lines[0])
+            # 卡面点名的字段一个不少、一个不多（多出来的都是没被要求的臆造）
+            self.assertEqual(set(rec), {
+                "t", "boundary", "model", "prompt_chars", "prompt", "prompt_truncated",
+                "raw", "usage", "finish_reason", "duration_ms", "attempts",
+                "rejected", "accepted", "fallback",
+            })
+            self.assertEqual(rec["boundary"], P.BOUNDARY_NEW_DAY)
+            self.assertEqual(rec["model"], "deepseek-flash")
+            self.assertEqual(rec["attempts"], 1)
+            self.assertEqual(rec["accepted"], True)
+            self.assertEqual(rec["fallback"], False)
+            self.assertEqual(rec["rejected"], [])
+            self.assertEqual(rec["raw"], valid_payload())
+            self.assertEqual(rec["finish_reason"], "stop")
+            self.assertEqual(rec["usage"]["prompt_tokens"], 11)
+            self.assertEqual(rec["usage"]["completion_tokens"], 22)
+            self.assertEqual(rec["prompt"], chat.calls[0][1]["content"])
+            self.assertEqual(rec["prompt_chars"], len(rec["prompt"]))
+            self.assertEqual(rec["prompt_truncated"], False)
+            self.assertIsInstance(rec["t"], float)
+            self.assertGreaterEqual(rec["duration_ms"], 0)
+            # decision 上的两个新字段：路径 + **该行**的 sha256 前 12 位
+            self.assertEqual(decision.llm_trace, str(path))
+            self.assertEqual(decision.llm_trace_hash,
+                             hashlib.sha256(lines[0].encode("utf-8")).hexdigest()[:12])
+            self.assertEqual(decision.llm_trace_error, "")
+
+    def test_over_8000_chars_prompt_is_truncated_and_flagged(self):
+        rec = P.BoundaryPlanner(llm_chat=FakeChat(""), llm_trace_path=None)._trace_record(
+            P.BOUNDARY_NEW_DAY, "长" * (P.LLM_TRACE_MAX_PROMPT_CHARS + 500), 2,
+            accepted=False, rejected=["x"])
+        self.assertEqual(len(rec["prompt"]), P.LLM_TRACE_MAX_PROMPT_CHARS)
+        self.assertEqual(rec["prompt_truncated"], True)
+        self.assertEqual(rec["prompt_chars"], P.LLM_TRACE_MAX_PROMPT_CHARS + 500)
+        self.assertEqual(rec["attempts"], 2)
+        self.assertEqual(rec["accepted"], False)
+        self.assertEqual(rec["rejected"], ["x"])
+
+    def test_trace_write_failure_never_changes_the_decision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            planner = P.BoundaryPlanner(llm_chat=FakeChat(valid_payload()), max_llm_attempts=1,
+                                        llm_trace_path=Path(tmp))   # 指向一个目录 ⇒ 写盘必失败
+            decision = planner.decide(self.boundary_state(), till_brief(day_key=(1, "spring", 6)))
+            self.assertEqual(decision.source, P.SOURCE_LLM)          # 决策照常
+            self.assertEqual(decision.intents[0].task, "till_area")
+            self.assertTrue(decision.llm_trace_error)                 # 但失败如实带出来
+            self.assertEqual(decision.llm_trace_hash, "")
+
+    def test_llm_error_still_leaves_a_trace_line(self):
+        """**失败的那次调用也要留痕**：否则"为什么降级"只能靠猜。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run-llm.jsonl"
+            planner = P.BoundaryPlanner(llm_chat=FakeChat(LlmError("超时", status="network")),
+                                        max_llm_attempts=1, llm_trace_path=path)
+            decision = planner.decide(self.boundary_state(), till_brief(day_key=(1, "spring", 6)))
+            self.assertEqual(decision.source, P.SOURCE_DETERMINISTIC_FALLBACK)
+            rec = json.loads(path.read_text(encoding="utf-8").strip().splitlines()[0])
+            self.assertEqual(rec["accepted"], False)
+            self.assertEqual(rec["fallback"], True)                   # 这次决策最终降级了
+            self.assertEqual(rec["raw"], "")
+            self.assertTrue(rec["rejected"][0].startswith("llm_error:network"))
+
+    def test_no_trace_when_no_real_call(self):
+        """确定性决策（无边界 / 关掉 LLM）一行都不许写。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run-llm.jsonl"
+            # ①常规区间：连 seam 都不碰
+            steady = P.PlannerState(day_key=(1, "spring", 5), last_task_kind="till_area",
+                                    last_seen_failures=0)
+            planner = P.BoundaryPlanner(llm_chat=FakeChat(valid_payload()), llm_trace_path=path)
+            self.assertEqual(planner.decide(steady, till_brief(day_key=(1, "spring", 5))).source,
+                             P.SOURCE_DETERMINISTIC)
+            # ②边界 + 开关关掉：`llm_disabled`，同样不碰网络、不留痕
+            off = P.BoundaryPlanner(llm_chat=FakeChat(valid_payload()), llm_enabled=False,
+                                    llm_trace_path=path)
+            self.assertEqual(off.decide(self.boundary_state(), till_brief(day_key=(1, "spring", 6))).source,
+                             P.SOURCE_DETERMINISTIC_FALLBACK)
+            self.assertEqual(off.llm_chat.call_count, 0)
+            self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":

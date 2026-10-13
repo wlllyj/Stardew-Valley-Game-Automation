@@ -45,9 +45,12 @@ LLM 挂掉时它照常给出可执行的任务意图，所以"降级"只是少�
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import time
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 __all__ = [
@@ -66,6 +69,7 @@ __all__ = [
     "parse_intents", "extract_json",
     # 策略与调用
     "deterministic_plan", "PROMPT_BRIEF_MAX_CHARS", "build_messages", "default_llm_chat",
+    "LLM_TRACE_MAX_PROMPT_CHARS",
     "BoundaryPlanner", "PLAN_SCHEMA_EXAMPLE",
 ]
 
@@ -373,6 +377,10 @@ def parse_intents(
 #: 简报文本上限（§5.5 要求 ≤2 KB；超了截断，宁缺勿滥）
 PROMPT_BRIEF_MAX_CHARS = 2048
 
+#: 【task-56】决策留痕里 `prompt` 字段的上限：超过就截断，并把 `prompt_truncated` 置真。
+#: 留痕是给人事后复盘用的，一句 prompt 写进 JSONL 前必须有个硬上限（否则一行能到几百 KB）。
+LLM_TRACE_MAX_PROMPT_CHARS = 8000
+
 #: 需要清掉的障碍种类（`tiles[].kind`）
 OBSTACLE_KINDS: tuple[str, ...] = ("weed", "twig", "stone", "tree", "fruitTree", "clump", "grass", "bush")
 
@@ -669,6 +677,13 @@ class PlannerDecision:
     #: 单独留一个布尔位，是为了让长跑的 journal 能一眼区分"网络/校验失败"和"提示词太长、
     #: 该调大 token 预算"——后者是配置问题，重试多少次都一样（task-9）。
     truncated: bool = False
+    #: 【task-56 决策留痕】真实 LLM 调用的 trace 文件路径 + 该决策最后一条 trace 行的
+    #: sha256 前 12 位（`decision` journal 只加这两个字段）。确定性决策 / 没配 trace 时为 ""。
+    llm_trace: str = ""
+    llm_trace_hash: str = ""
+    #: 【task-56】写 trace 失败的原因（成功/未配置时为空）。**失败绝不影响决策**：
+    #: 控制器看到它就记一条 `llm_trace_failed` journal，决策本身照常返回。
+    llm_trace_error: str = ""
 
     @property
     def task_kind(self) -> str | None:
@@ -922,6 +937,23 @@ ChatFn = Callable[..., Any]
 DEFAULT_MAX_LLM_ATTEMPTS = 2
 
 
+def _usage_dict(value: Any) -> dict[str, int]:
+    """【task-56】把 `llm.Usage`（或任何同名字段的映射）拍成留痕用的纯 dict。
+
+    认不出来就返回空 dict —— 留痕只负责如实记录，**绝不因为读不到用量而影响决策**。
+    """
+    if value is None:
+        return {}
+    out: dict[str, int] = {}
+    for key in ("prompt_tokens", "completion_tokens", "reasoning_tokens", "cached_tokens", "total_tokens"):
+        num = getattr(value, key, None)
+        if num is None and isinstance(value, Mapping):
+            num = value.get(key)
+        if isinstance(num, (int, float)):
+            out[key] = int(num)
+    return out
+
+
 class BoundaryPlanner:
     """边界决策状态机 + LLM 适配 seam + 输出校验 + 确定性降级。
 
@@ -954,6 +986,10 @@ class BoundaryPlanner:
         temperature: float | None = 0.0,
         max_llm_attempts: int = DEFAULT_MAX_LLM_ATTEMPTS,
         brief_max_chars: int = PROMPT_BRIEF_MAX_CHARS,
+        # 【task-56】决策留痕文件：**由控制器按 journal 路径推导后传进来**，planner 绝不自己
+        # 猜路径（真机是 `<journal 去掉 .jsonl>-llm.jsonl`）。None = 不留痕（单测/`agentfarm plan`
+        # 这类一次性调用不需要文件）。
+        llm_trace_path: str | Path | None = None,
     ) -> None:
         # 只有"没注入"时才落到默认实现；注入了假实现就绝不会碰 llm.chat
         self.llm_chat: ChatFn = llm_chat or default_llm_chat
@@ -965,6 +1001,14 @@ class BoundaryPlanner:
         self.brief_max_chars = int(brief_max_chars)
         # 本次 decide 里真实发生的 seam 调用次数（进入 _ask 即 +1，抛异常也算"调了一次"）
         self._calls_seen = 0
+        # 【task-56】留痕落点 + 上一次 `_ask` 的元数据（raw/usage/finish_reason/duration_ms）。
+        # 后者在 `_ask` 抛异常时也要有值，所以先置空、`_ask` 每次覆盖。
+        self.llm_trace_path: Path | None = Path(llm_trace_path) if llm_trace_path else None
+        self._last_ask_meta: dict[str, Any] = {}
+
+    def set_trace_path(self, path: str | Path | None) -> None:
+        """【task-56】控制器在拿到 journal 路径后回填留痕文件（planner 不知道 journal 在哪）。"""
+        self.llm_trace_path = Path(path) if path else None
 
     # ---- 边界判定 ----
     def detect_boundary(self, state: PlannerState, brief: Brief) -> str | None:
@@ -1008,6 +1052,9 @@ class BoundaryPlanner:
             self._advance(state, brief, boundary=boundary, regime_kind=regime_kind, chosen_kind=decision.task_kind)
             return decision
 
+        # 【task-56】留痕：每次**真实** LLM 调用攒一条记录，决策定稿后一次性落盘
+        # （这样 `fallback` 反映的是"这次决策最终有没有降级"，而不是每条各猜各的）。
+        traces: list[dict[str, Any]] = []
         refused: list[str] = []
         for attempt in range(1, self.max_llm_attempts + 1):
             messages = build_messages(brief, boundary=boundary, problems=refused or None, max_chars=self.brief_max_chars)
@@ -1019,14 +1066,19 @@ class BoundaryPlanner:
             except Exception as exc:  # noqa: BLE001 - LlmError / 任何异常都降级，不崩
                 attempts = attempt
                 rejection = self._describe_failure(exc)
+                traces.append(self._trace_record(boundary, user_text, attempt,
+                                                 accepted=False, rejected=[rejection]))
                 break
             attempts = attempt
+            traces.append(self._trace_record(boundary, user_text, attempt,
+                                             accepted=bool(intents), rejected=list(found)))
             if intents:
                 decision = PlannerDecision(
                     boundary=boundary, intents=tuple(intents), source=SOURCE_LLM,
                     llm_called=True, fallback_reason=None, problems=(), prompt_chars=prompt_chars,
                     attempts=attempt,
                 )
+                decision = self._stamp_trace(decision, traces)
                 self._advance(state, brief, boundary=boundary, regime_kind=regime_kind, chosen_kind=decision.task_kind)
                 return decision
             refused = list(found)
@@ -1039,10 +1091,77 @@ class BoundaryPlanner:
             rejection=rejection,
             truncated=bool(rejection and "truncated" in rejection),
         )
+        decision = self._stamp_trace(decision, traces)
         self._advance(state, brief, boundary=boundary, regime_kind=regime_kind, chosen_kind=decision.task_kind)
         return decision
 
     # ---- 内部 ----
+    def _trace_record(
+        self,
+        boundary: str | None,
+        user_text: str,
+        attempt: int,
+        *,
+        accepted: bool,
+        rejected: Sequence[str],
+    ) -> dict[str, Any]:
+        """【task-56】攒一条待落盘的留痕记录（真实 LLM 调用的现场）。
+
+        字段与卡面逐字对齐：`t / boundary / model / prompt_chars / prompt（>8000 截断 +
+        prompt_truncated）/ raw / usage / finish_reason / duration_ms / attempts / rejected /
+        accepted / fallback`。`fallback` 先占位，`_stamp_trace()` 按最终决策统一改写。
+        """
+        meta = dict(self._last_ask_meta)
+        prompt = str(user_text or "")
+        return {
+            "t": round(time.time(), 3),
+            "boundary": boundary,
+            "model": str(meta.get("model") or self.model or ""),
+            "prompt_chars": len(prompt),
+            "prompt": prompt[:LLM_TRACE_MAX_PROMPT_CHARS],
+            "prompt_truncated": len(prompt) > LLM_TRACE_MAX_PROMPT_CHARS,
+            "raw": str(meta.get("raw") or ""),
+            "usage": dict(meta.get("usage") or {}),
+            "finish_reason": str(meta.get("finish_reason") or ""),
+            "duration_ms": int(meta.get("duration_ms") or 0),
+            "attempts": int(attempt),
+            "rejected": [str(x) for x in rejected],
+            "accepted": bool(accepted),
+            "fallback": False,
+        }
+
+    def _stamp_trace(self, decision: PlannerDecision, traces: list[dict[str, Any]]) -> PlannerDecision:
+        """【task-56】把本次决策攒下的 trace 落盘，并把路径/哈希/失败原因挂到 decision 上。
+
+        写盘失败**绝不影响决策**：错误只放在 `decision.llm_trace_error` 里，由控制器记一条
+        `llm_trace_failed` journal。确定性决策（`traces` 为空）不写任何文件。
+        """
+        if not traces:
+            return decision
+        degraded = decision.source != SOURCE_LLM
+        for record in traces:
+            record["fallback"] = bool(degraded)
+        path_text, last_hash, error = self._write_traces(traces)
+        # `PlannerDecision` 是 frozen dataclass ⇒ 用 `replace()` 派生新对象（不许原地改）。
+        return replace(decision, llm_trace=path_text, llm_trace_hash=last_hash, llm_trace_error=error)
+
+    def _write_traces(self, traces: Sequence[Mapping[str, Any]]) -> tuple[str, str, str]:
+        """追加写 trace（一行一次真实调用）。返回 `(路径, 最后一行 sha256 前 12 位, 失败原因)`。"""
+        path = self.llm_trace_path
+        if path is None:
+            return "", "", ""
+        last_hash = ""
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                for record in traces:
+                    line = json.dumps(dict(record), ensure_ascii=False, default=str)
+                    fh.write(line + "\n")
+                    last_hash = hashlib.sha256(line.encode("utf-8")).hexdigest()[:12]
+        except Exception as exc:  # noqa: BLE001 - 留痕失败绝不许影响决策
+            return str(path), last_hash, f"{type(exc).__name__}: {exc}"[:300]
+        return str(path), last_hash, ""
+
     def _ask(
         self,
         messages: Sequence[Mapping[str, str]],
@@ -1050,12 +1169,32 @@ class BoundaryPlanner:
         allowed_anchors: Sequence[str],
         allowed_refs: Sequence[str] = (),
     ) -> tuple[list[TaskIntent], list[str]]:
-        """调一次 seam（**进入即计数**，抛异常也算"真的调了一次"），再解析校验。"""
+        """调一次 seam（**进入即计数**，抛异常也算"真的调了一次"），再解析校验。
+
+        【task-56】顺带把这次调用的元数据（`raw/usage/finish_reason/duration_ms`）记进
+        `self._last_ask_meta` —— 抛异常时也先记再抛，留痕才不会漏掉失败的那次。
+        """
         chat = self.llm_chat
         kwargs: dict[str, Any] = {"model": self.model, "max_tokens": self.max_tokens, "temperature": self.temperature}
         self._calls_seen += 1
-        result = chat(messages, **kwargs)
+        started = time.monotonic()
+        try:
+            result = chat(messages, **kwargs)
+        except BaseException:
+            self._last_ask_meta = {
+                "model": self.model, "raw": "", "usage": {}, "finish_reason": "",
+                "duration_ms": int((time.monotonic() - started) * 1000),
+            }
+            raise
+        duration_ms = int((time.monotonic() - started) * 1000)
         content = result if isinstance(result, str) else getattr(result, "content", None)
+        self._last_ask_meta = {
+            "model": str(getattr(result, "model", "") or self.model or ""),
+            "raw": "" if content is None else str(content),
+            "usage": _usage_dict(getattr(result, "usage", None)),
+            "finish_reason": str(getattr(result, "finish_reason", "") or ""),
+            "duration_ms": duration_ms or int(getattr(result, "elapsed_ms", 0) or 0),
+        }
         if content is None:
             return [], [f"llm_result_without_content:{type(result).__name__}"]
         return parse_intents(content, allowed_anchors=allowed_anchors, allowed_refs=allowed_refs)
