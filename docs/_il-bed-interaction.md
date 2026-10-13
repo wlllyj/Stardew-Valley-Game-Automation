@@ -6,7 +6,7 @@
 
 ## 0. 一句话结论
 
-* **A**：睡觉提问**只能**由"玩家**踩到床的 TouchAction 格**"引出 —— `BedFurniture.DoesTileHaveProperty` 只对**一格**返回 `TouchAction=Sleep`，即 `(床tileLocation.X + bedTileOffset, 床tileLocation.Y + 1)`。本存档床在 `(9,8)`、`bedTileOffset` 由玩家 Pixel X 与床 bbox 中心 `640` 决定 ⇒ 触发格是 **(10,9)**（从右侧靠近时才是 (9,9)）。脑侧现在踩的 `(9,8)` 是**床的碰撞格**（A\* 必然 `unreachable`），而 `interact(床)` 走的 `checkAction → Furniture.checkForAction` 在 1.6.15 **根本没有床/睡觉分支** —— 这两条路都注定弹不出提问。
+* **A**：睡觉提问**只能**由"玩家**踩到床的 TouchAction 格**"引出 —— `BedFurniture.DoesTileHaveProperty` 只对**一格**返回 `TouchAction=Sleep`，即 `(床tileLocation.X + bedTileOffset, 床tileLocation.Y + 1)`。本存档床在 `(9,8)`、`bedTileOffset` 由玩家 Pixel X 与床 bbox 中心 `640` 决定 ⇒ 触发格是 **(10,9)**（从右侧靠近时才是 (9,9)）。脑侧现在踩的 `(9,8)` 是**床的碰撞格**（A\* 必然 `unreachable`），而 `interact(床)` 走的 `checkAction → Furniture.checkForAction` 在 1.6.15 **根本没有床/睡觉分支** —— 这两条路都注定弹不出提问。**真机已复现（2026-10-13，见 §2.7）**：先走离床格到 (8,9)、再踩 **(10,9)** 才会弹提问；且 `sleep` 应答 Yes 后 `answerDialogue()` **不关提问框**，必须再 `dismiss_modal()` 关框，日期才会在 ~3s 内落地 —— 这是真机上唯一卡住的一步。
 * **B**：`MoveToLocationSkill.BuildCandidates` 把 **warp 的 source 触发格本身当作 A\* 走路目标**（`MoveToLocationSkill.cs:860`，`retry` 在 `:906`），而判"这格能不能站"用的 `StepMover.Standable` 看不懂地图墙/建筑（该文件 `:924-926` 自己写了这件事）。农舍门格 (64,14) 是墙上的门 ⇒ 前两个候选（`source`/`cross`）必然 `unreachable`，白烧单跳预算；真正可行的是排在后面的 `door_push`（`:927-936`，走到邻居再"朝门里推"）。
 
 ## 1. 交付口径与证据清单
@@ -25,6 +25,7 @@
 | `il-cqd.txt` | `FIND|createQuestionDialogue` = 74 个调用方法 |
 | `ilscan-touch.txt` | `ILSCAN|…|TouchAction` 调用面 |
 | `logs/longrun-rehearsal-0.7.22.jsonl` | 彩排现场（L50、L112 两条 sleep 失败，逐字见 §3.3） |
+| `logs/probe-bed-{live,live2,sleep,close,recipe}-run1.log` | Lead 2026-10-13 真机五探针（UTF-16LE）；UTF-8 副本 `scratch\t37_probe-bed-*.txt`（转换脚本 `scratch\_t37_clean_logs.py`），逐字结论见 §2.7 |
 
 复跑命令（Python 绝对路径，见 §6）。
 
@@ -58,7 +59,7 @@ GameLocation.performTouchAction(String[], Vector2)   // 字符串分派："Sleep
 
 **这解释了 `docs\_analyze-sleep-fail.md` 的 U4**（"`checkAction`/`checkForAction` 里查不到 `Sleep` 字面量"）：`Sleep` 这个字面量在 **`GameLocation.performTouchAction`**（`il-bed-5.txt` 第 157 行）与 **`BedFurniture.DoesTileHaveProperty`**（`il-bed-1.txt` 第 1128 行）里，**都不在** `checkAction`/`checkForAction` 的调用路径上。提问不是"按出来的"，是"踩出来的"。
 
-顺带一个可用于验收的事实：`createQuestionDialogue` 的第 3 个实参（dialog key）就是 `"Sleep"`（IL_1008）⇒ 提问真的弹出来时，Mod 报的 `lastQuestionKey` 应当读到 `Sleep`（**本机未验证**，run3 可作判据）。
+顺带一个**已被真机否掉**的判据：`createQuestionDialogue` 的第 3 个实参（dialog key）确实是 `"Sleep"`（IL_1008），但真机上提问开着时 Mod 报的 `lastQuestionKey` 是 **`None`**（§2.7 探针 #2/#3/#5）⇒ **验收判据改用 `ui.dialogueIsQuestion` + `ui.dialogueResponses`**，别等 `lastQuestionKey == "Sleep"`。
 
 ### 2.2 触发格的精确算法（`bedTileOffset`）
 
@@ -142,9 +143,38 @@ foreach tile in bedTiles(fromBbox):        // x: bbox.X/64 .. +width, y: bbox.Y/
 if (sleepTile == null) return Fail("bed_no_sleep_tile", "这张床不暴露 Sleep 触发格（double/child 床或自定义床）");
 ```
 
-**动作序列（脑侧，仍走现有桥 API）**：`move_to(sleepTile.X, sleepTile.Y, allow_bed=True)` → 等观测出现 `lastQuestionKey == "Sleep"`（或 `dialogueIsQuestion=true`）→ `sleep` 应答。若 `move_to` 报 `unreachable`，退一步：先站到触发格紧邻的可站格，再 `move_to` 触发格（游戏 A\* 应能到，见 §2.4）；**别再退回 `interact`**。
+**动作序列（脑侧，仍走现有桥 API；真机定案见 §2.7）**：先 `move_to(床外一格)` 满足 `hasMoved` → `move_to(sleepTile.X, sleepTile.Y, allow_bed=True)`（回执 `ui_modal` 算成功）→ 等观测 `ui.dialogueIsQuestion=true` → `sleep` 应答 → **再 `dismiss_modal()` 关框**（不关框日期永远不动）。若 `move_to` 报 `unreachable`，退一步：先站到触发格紧邻的可站格，再 `move_to` 触发格（游戏 A\* 应能到，见 §2.4）；**别再退回 `interact`**。
 
-**桥侧最小补强（可选但推荐）**：在 `observe` 的家具条目里补一个 `sleepTile`（就是上面那格的坐标），或直接在 `location.tiles[]` 里把返回 `TouchAction` 的格子标出来 —— 让脑侧不必知道 `bedTileOffset` 这套上下文规则。另外 `ui` 里把提问的 dialog key 原样报出来（现成的 `lastQuestionKey` 即可），验收判据就变成"看到 `Sleep`"。
+**桥侧最小补强（可选但推荐）**：在 `observe` 的家具条目里补一个 `sleepTile`（就是上面那格的坐标），或直接在 `location.tiles[]` 里把返回 `TouchAction` 的格子标出来 —— 让脑侧不必知道 `bedTileOffset` 这套上下文规则。另外 `ui` 里把提问的 dialog key 原样报出来（**注意**：真机上 `lastQuestionKey` 读不到，见 §2.7 ⇒ 验收判据用 `ui.dialogueIsQuestion`）。
+
+### 2.7 真机验证（Lead，2026-10-13）★
+
+Lead 在 0.7.22 + 本存档（`spring 11` 起）上把 §2.1/§2.2 的判据逐格跑通，并连跑两次跨日。原始日志是 UTF-16LE（`read` 工具会判成 binary），我用 `scratch\_t37_clean_logs.py` 去 ANSI + 转 UTF-8 成副本 `scratch\t37_probe-bed-*.txt` 后逐条读过：
+
+| 日志 | 结论（逐字读过） |
+| --- | --- |
+| `logs\probe-bed-live-run1.log` | 探针 #1：对床的 6 个占位格 `[[9,8],[9,9],[9,10],[10,8],[10,9],[10,10]]` 逐个 `interact`（= 游戏 `checkAction`）**全部返回 False**、`dialogueIsQuestion=false`、`lastQuestionKey=None` ⇒ §2.5 的 U4 结论被真机判死：入口不是 `interact`。 |
+| `logs\probe-bed-live2-run1.log` | 探针 #2：`(9,8)`/`(9,10)`/`(10,8)` A\* `unreachable`；`(9,9)` 站得上但**不弹提问**；踩 **`(10,9)`** 时 `move_to` 回 `ui_modal`（`"移动过程中被菜单/对话/过场打断，已停止寻路"`），随后 `dialogueIsQuestion=true`、`dialogueResponses=['Yes','No']`、`activeMenuText="Go to sleep for the night?"`、`lastQuestionKey=None`。 |
+| `logs\probe-bed-sleep-run1.log` | 探针 #3：只发 `sleep`（答 Yes）⇒ 回执 `timeout`，诊断 `isInBed=True, Game1.newDay=True, pauseTime=600, activeMenu=DialogueBox, dialogueUp=True, canMove=False, newDaySync.readyForSave?=True, hasSaved?=False` ⇒ **`Game1.newDay` 已置位（`doSleep → Game1.NewDay(0f)` 确实执行）但 180s 日期不动**。 |
+| `logs\probe-bed-close-run1.log` | 探针 #4：`dismiss_modal()`（游戏自己的关框路径：`answerDialogue("No")` + `closeDialogue()`，回执 `worldResumed=true`）⇒ **spring 11 → 12**、`SaveGameMenu`、存档 3502298 → **3515386** B、mtime 2026-10-11 22:24:19 → **2026-10-13 18:15:25**。 |
+| `logs\probe-bed-recipe-run1.log` | 探针 #5：整条配方连跑第二次 ⇒ **spring 12 → 13**（`t+0.0s` 还是 12、`t+3.4s` 变 13）、存档 3515386 → **3547073** B、mtime → **18:16:10**，`VERIFIED`。 |
+
+**真机定案的五步配方**（task-33 照此施工）：
+
+```
+1. move_to(床外一格)               // 本机 (9,9) → (8,9)：满足 Farmer.hasMoved，并离开床格
+2. move_to(触发格, allow_bed=True) // 本机 (10,9)：回执 ui_modal 是【成功】信号，不是失败
+3. 观测 ui.dialogueIsQuestion      // 本机 true；dialogueResponses=['Yes','No']
+4. sleep（answerDialogue Yes）     // 观测 Game1.newDay == true
+5. dismiss_modal()                 // ★ 必须关框：answerDialogue() 不会关
+   → 等 Game1.Date.TotalDays 前进 + 存档 size/mtime 前进（本机 0.2s ~ 3.4s）
+```
+
+第 5 步是 task-31 没写出来、真机上唯一卡住的地方：`sleep` 的 `answerDialogue(Yes)` 只把 `Game1.newDay` 置位、提问框仍挂着（`activeMenu=DialogueBox, dialogueUp=True, canMove=False`）⇒ `newDaySync` 等不到"框关了才存"，所以日期 180s 不动；**关框后 0.2s（`close` 探针首采样）/ `t+3.4s`（`recipe` 探针）日期就前进**。⇒ 别把"日期没动"当跨日失败去重发 `sleep`；`sleep` 失败后应当先 `dismiss_modal` 再看。
+
+**观测口径修正（真机反例）**：提问开着时 `location.lastQuestionKey` 是 **`None`**，不是 `"Sleep"`（§2.1 末尾那条判据作废）⇒ 判据用 **`ui.dialogueIsQuestion` + `ui.dialogueResponses`**；Mod 兜底 path ②（`BuildSleepAnswerKey`）在真机不可用。
+
+**本机环境事实**（task-33 写默认值时可参考）：床 bbox `[576,512,128,192]`、`passable=false`、占位格 6 格；触发格命中 **(10,9)** —— 从 (8,9) 靠近时 `Position.X < bbox.Center.X(=640)` ⇒ `bedTileOffset=1`，与 §2.2/§2.3 的推算完全一致；`(9,9)`（offset=0 的那格）同样站得上但**不是**这一刻的触发格。跨日落地后玩家被送到 `tile=[9,9]`、`tod=600`。
 
 ## 3. B —— Farm → FarmHouse 的门格为什么被当成 A\* 目标
 
@@ -211,17 +241,17 @@ gameMode=3, timeOfDay=1230, newDaySync.readyForSave?=True, newDaySync.hasSaved?=
 
 状态码说明（`FailHopExhausted`，`:1010-1064`）：优先级 `hop_failed(真站到过)` > `blocked` > **`timeout`** > `hop_failed(走近过)` > `unreachable`。第 1 天报 `timeout` ⇒ 后面还有别的候选被判了 timeout（walk 到某个候选把 8000ms 用完了），前两条 `unreachable` 只是被这条优先级盖住。
 
-## 4. 未定项 / 还缺什么证据
+## 4. 未定项 / 还缺什么证据（2026-10-13 更新，含真机结案）
 
-1. **第 1 天那条 receipt 在 `logs/` 里被截断到约 160 字符**（我另外写了 `scratch\_peek_sleep_fail.py` 直读 JSONL，结果同样被截）⇒ 看不到第 3 个候选之后的尝试列表。**证据缺口**：run3 前建议让回执里的"本跳试过的格子"不要截断（或 Mod 侧改成结构化 `attempts[]`），否则分不清"没走到 door_push"和"door_push 也没触发"。
-2. `door_push` 在 Farm→FarmHouse 这条边上**是否被真正执行过**（有没有进入 Push 阶段），彩排里没有直接证据（见第 1 条）。
-3. `bedTileOffset` 现场值未由运行时核对（本存档按 bbox 中心 + 玩家 X 推出 (10,9)）；建议 run3 用 §2.6 的 `doesTileHaveProperty` 口径交叉验证，而不是断言 (10,9)。
-4. 中文档位下 `Strings\Locations:FarmHouse_Bed_GoToSleep` 的实际文案未抓（不影响逻辑，只影响"回报菜单文本"）。
-5. `createQuestionDialogue(..., "Sleep", ...)` 的 dialog key 与 Mod 报的 `lastQuestionKey` 是否同一个值 —— 未知，待 run3 一看即知。
+1. **仍开放（证据缺口）**：彩排第 1 天的 receipt 在 `logs/` 里被截断到约 160 字符（`scratch\_peek_sleep_fail.py` 直读 JSONL 同样被截）⇒ 看不到第 3 个候选之后的尝试列表。run3 前建议让"本跳试过的格子"不要截断，或 Mod 侧改成结构化 `attempts[]`，否则分不清"没走到 door_push"和"door_push 也没触发"。
+2. **仍开放**：`door_push` 在 Farm→FarmHouse 这条边上**是否被真正执行过**（有没有进入 Push 阶段），彩排里没有直接证据（见第 1 条）。
+3. **真机结案（值）/ 仍需暴露（接口）**：`bedTileOffset` 现场值已定 —— 先走到 (8,9) ⇒ `offset=1` ⇒ 触发格 **(10,9)**，`probe-bed-live2` 命中。但**桥不让脑侧读 offset**，脑侧仍只能押两格 ⇒ **task-33 要在 `observe` 的床条目里暴露 `bedCells`**（`doesTileHaveProperty(..., "TouchAction", "Back") == "Sleep"` 的所有格），或按 §2.6 现算。
+4. **结案**：`hasMoved` 门槛由"先走离床格一步"满足 —— 真机 (8,9) → (10,9) 两次都弹出提问，无需伪造输入（`probe-bed-live2` / `probe-bed-recipe`）。
+5. **结案（反例）**：`lastQuestionKey` 判据作废 —— 真机提问开着时它是 `None`；判据改用 `ui.dialogueIsQuestion`(+`ui.dialogueResponses`)，Mod 兜底 path ②（`BuildSleepAnswerKey`）真机不可用。文案问题一并结案：本机弹的是英文 `"Go to sleep for the night?"`（游戏语言 = 英文），与逻辑无关。
 
 ## 5. 给 task-33 的一句话口径
 
-**睡觉**：目标格永远是 `doesTileHaveProperty(x, y, "TouchAction", "Back") == "Sleep"` 的那一格（本存档 = 床 (9,8) 的 `y+1` 行、x 由 `bedTileOffset` 决定 ⇒ (10,9) 或 (9,9)，**绝不是 (9,8)**）；走它、等到 `lastQuestionKey == "Sleep"`、再应答 —— 不要再退回 `interact`。
+**睡觉**（真机定案，照 §2.7 的五步走）：目标格永远是 `doesTileHaveProperty(x, y, "TouchAction", "Back") == "Sleep"` 的那一格（本存档 = 床 (9,8) 的 `y+1` 行、x 由 `bedTileOffset` 决定 ⇒ 从左侧靠近是 **(10,9)**、从右侧是 (9,9)，**绝不是 (9,8)**）；顺序必须是「先走离床格一步（满足 `hasMoved`）→ `move_to(触发格, allow_bed=True)`（回执 `ui_modal` 算成功）→ 等 `ui.dialogueIsQuestion` → `sleep` 答 Yes → **`dismiss_modal()` 关框** → 等日期 + 存档前进」；不要再退回 `interact`，也不要在关框前因为"日期没动"重发 `sleep`。
 **门**：`Edge.Source` 是**触发锚点**不是走路目标（`MoveToLocationSkill.cs:860/:906` 的混同），墙上的门格 A\* 必然无解；要么把 `door_push` 提到同边候选最前面，要么在第一个候选 `unreachable` 后直接跳到 `door_push`，别把 8000ms 单跳预算花在"站到墙上"。
 
 ## 6. 复跑命令
@@ -235,6 +265,7 @@ $py = "C:\Users\admin\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\
 & $py scratch\run_il_probe.py scratch\il-bed-intersect.txt "StardewValley.Objects.BedFurniture|IntersectsForCollision" "StardewValley.Objects.Furniture|GetBoundingBox"
 & $py scratch\_probe_save_bed.py          # 存档侧家具/warps/doors
 & $py scratch\_peek_sleep_fail.py         # 彩排两条 sleep 失败
+& $py scratch\_t37_clean_logs.py          # logs\probe-bed-*-run1.log（UTF-16LE）转 UTF-8 副本到 scratch\
 ```
 
 反射/枚举/ILSCAN 用 `scratch\profession-probe\bin\Release\net6.0\ProfessionProbe.exe "<游戏目录>" <out> "<TypeSpec>"`（TypeSpec：`Type|kw`、`?substr`、`INVOKE|Type|Method|args`、`ILDEC|Type|Method`、`ILSCAN|Type|Member`）。
