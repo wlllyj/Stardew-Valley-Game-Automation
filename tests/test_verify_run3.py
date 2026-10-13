@@ -373,5 +373,45 @@ class TestVerifyRun3(unittest.TestCase):
         self.assertFalse(any("三腿覆盖" in i for i in s["infos"]), s["infos"])
 
 
+    # ------------------------------------------------------------ task-63：锄不动（tool_ineffective）豁免
+    def test_refused_within_bound_false_is_a_problem(self):
+        """防洗白：账本自称"游戏全拒绝"并越界 ⇒ 必须判红（不能靠拒绝换一个达标日）。"""
+        rows = green_rows()
+        for i, r in enumerate(rows):
+            if r.get("event") == "day_end" and r["final"]["day"][2] == 11:
+                rows[i] = day_end(r["final"]["day"], r["day_after"], dry=0,
+                                  checks={"refused_within_bound": False},
+                                  refused=9, refused_bound=5)
+        ok, s = self.check(rows)
+        self.assertFalse(ok, "拒绝豁免越界必须判红")
+        self.assertTrue(any("refused_within_bound" in p for p in s["problems"]), s["problems"])
+
+    def test_tool_refused_journal_newer_than_ledger_is_a_problem(self):
+        """账目可信：journal 有 `tool_refused` 事件而账本计数更少 ⇒ 判红。"""
+        rows = green_rows()
+        rows.insert(2, {"event": "tool_refused", "t": 50.0, "_lineno": 90,
+                        "tile": [38, 20], "status": "tool_ineffective"})
+        for i, r in enumerate(rows):
+            if r.get("event") == "day_end" and r["final"]["day"][2] == 10:
+                rows[i] = day_end(r["final"]["day"], r["day_after"], dry=0,
+                                  refused=0, refused_bound=5)
+        ok, s = self.check(rows)
+        self.assertFalse(ok, "账本拒绝计数少于 journal 自算 ⇒ 账目不可信")
+        self.assertTrue(any("拒绝计数" in p for p in s["problems"]), s["problems"])
+
+    def test_tool_refused_matching_ledger_is_only_info(self):
+        """口径一致时只记信息项，不改结论（绿账本仍达标）。"""
+        rows = green_rows()
+        rows.insert(2, {"event": "tool_refused", "t": 50.0, "_lineno": 90,
+                        "tile": [38, 20], "status": "tool_ineffective"})
+        for i, r in enumerate(rows):
+            if r.get("event") == "day_end" and r["final"]["day"][2] == 10:
+                rows[i] = day_end(r["final"]["day"], r["day_after"], dry=0,
+                                  refused=1, refused_bound=5)
+        ok, s = self.check(rows)
+        self.assertTrue(ok, s.get("problems"))
+        self.assertTrue(any("锄不动被拒" in i for i in s["infos"]), s["infos"])
+
+
 if __name__ == "__main__":
     unittest.main()

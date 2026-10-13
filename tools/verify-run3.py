@@ -217,6 +217,12 @@ def build_days(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "unreachable_tiles",
                     "unreachable_bound",
                     "unreachable_exempt",
+                    # task-63：`tool_ineffective`（游戏拒绝该工具动这格）的日级有界豁免
+                    # —— 与 task-52 的 unreachable 是两套独立口径，各自留痕。
+                    "refused",
+                    "refused_tiles",
+                    "refused_bound",
+                    "refused_exempt",
                     "attempted",
                 )
             }
@@ -272,6 +278,24 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         tile = r.get("tile")
         if isinstance(tile, (list, tuple)) and len(tile) >= 2:
             unreach_tiles_by_day.setdefault(_cur_key, set()).add((tile[0], tile[1]))
+
+    # task-63（Lead 2026-10-14）：`till` 的 `tool_ineffective`（游戏拒绝该工具动这格）按政策
+    # **不算当天硬失败** ⇒ 逐格 journal `tool_refused` / 日级 `refused_summary`。与 task-52 的
+    # unreachable 是**两套独立口径**：这里只做"账本计数 vs journal 自算"的信息项 + 一条硬闸门
+    # （`checks.refused_within_bound is False` ⇒ 上界越界 = 洗白风险）。缺字段只记信息项，不当通过。
+    refused_by_day: dict[str, int] = {}
+    refused_tiles_by_day: dict[str, set[tuple[Any, Any]]] = {}
+    _cur_key2: str | None = None
+    for r in rows:
+        if r.get("event") == "day_start":
+            _cur_key2 = day_key(r)
+            continue
+        if _cur_key2 is None or r.get("event") != "tool_refused":
+            continue
+        refused_by_day[_cur_key2] = refused_by_day.get(_cur_key2, 0) + 1
+        tile = r.get("tile")
+        if isinstance(tile, (list, tuple)) and len(tile) >= 2:
+            refused_tiles_by_day.setdefault(_cur_key2, set()).add((tile[0], tile[1]))
 
     # 0. 时间轴自洽（deputy-lead `docs/_verify-run3-limits.md` 盲区 B2）：t 回退只记信息项。
     #    理由：t 是 longrun 自己的 time.time() 读数，系统时钟回拨（NTP）会让真长跑也"回退"，
@@ -456,6 +480,40 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
             infos.append(
                 f"[{name}] 当天有 {failed_field} 格硬失败，其中含不可达 {self_unreach} 次：task-52 之后"
                 "不可达应被豁免，请核对 checks.no_hard_failures（豁免后仍 false 才算真失败）"
+            )
+        # task-63：`till` 被游戏拒绝（tool_ineffective）的日级豁免 —— 与上面 unreachable 独立计数。
+        self_refused = refused_by_day.get(name, 0)
+        self_refused_tiles = len(refused_tiles_by_day.get(name) or ())
+        sum_refused = sum(int(s.get("refused") or 0) for s in stage_recs)
+        day_refused = end_stats.get("refused")
+        field_refused: int | None = int(day_refused) if isinstance(day_refused, (int, float)) else (
+            sum_refused or None
+        )
+        _rbound = end_stats.get("refused_bound")
+        if not isinstance(_rbound, (int, float)):
+            _rbound = max(5, int(0.2 * attempted_total)) if attempted_total else 5
+        rbound = int(_rbound)
+        if field_refused is not None or self_refused:
+            src_r = f"{field_refused}" if field_refused is not None else "未写"
+            infos.append(
+                f"[{name}] 锄不动被拒（tool_ineffective）账本={src_r}、journal 自算={self_refused} 次"
+                f"/{self_refused_tiles} 格、豁免上界 bound={rbound}（task-63 政策：不计当天硬失败；本行只供复核）"
+            )
+        if field_refused is not None and self_refused and field_refused != self_refused:
+            if field_refused >= self_refused:
+                infos.append(
+                    f"[{name}] 拒绝计数账本={field_refused} ≥ journal 自算={self_refused}"
+                    "（信息项：同一格可能被拒两次）"
+                )
+            else:
+                problems.append(
+                    f"[{name}] 拒绝计数账本={field_refused} < journal 自算={self_refused}"
+                    "（journal 里有 tool_refused 事件而账本没记 ⇒ 账目不可信）"
+                )
+        if checks.get("refused_within_bound") is False:
+            problems.append(
+                f"[{name}] checks.refused_within_bound=false（锄不动豁免超出上界 bound={rbound}）"
+                "⇒ 可能把真失败混进「游戏拒绝」来洗白，必须人工核对 refused_tiles"
             )
         if d["verified"] is False:
             problems.append(f"[{name}] day_end verified=false")
