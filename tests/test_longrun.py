@@ -66,6 +66,10 @@ class FakeWorld:
         #: 当前地点名 —— `FarmWorker.ensure_location/sleep` 会读它（task-15 让真 `FarmWorker`
         #: 也能在假世界里睡下去）。
         self.location = "Farm"
+        #: task-19：`location.isOutdoorFarm`（浇水证据要区分室内/户外快照）与 `farm` 块
+        #: （`FarmView` 的字段）。默认为空 ⇒ 走窗口口径，既有用例不受影响。
+        self.is_outdoor_farm = True
+        self.farm: dict | None = None
         self.seq = 1
         self.sleeps = 0
         self.refills = 0
@@ -125,9 +129,12 @@ class FakeWorld:
                        "isInBed": self.is_in_bed, "inventory": [dict(i) for i in self.inventory],
                        "wateringCan": {"present": True, "waterLeft": self.water_left,
                                        "max": 40, "bottomless": False, "upgradeLevel": 0}},
-            "location": {"name": self.location, "isOutdoorFarm": True, "tiles": tiles, "tilesTruncated": False,
+            "location": {"name": self.location, "isOutdoorFarm": self.is_outdoor_farm, "tiles": tiles,
+                         "tilesTruncated": False,
                          "tillable": [list(t) for t in free], "refillTiles": [[70, 10], [70, 11]],
                          "refillTilesTruncated": False, "furniture": [], "doors": []},
+            # task-19：真机观测里 `farm` 永远存在（未加载时 loaded=false/complete=true/全 0）。
+            "farm": dict(self.farm) if self.farm else {},
             "ui": self.current_ui(),
             "liveness": {"worldAdvancing": True, "secondsSinceClockMoved": 1.0},
         }
@@ -783,6 +790,12 @@ class TestOneDay(unittest.TestCase):
 
     def test_no_buy_flag(self):
         w = FakeWorld(weeds=0, seeds=0, money=100)
+        # 真机观测里 `farm` **永远存在**（`FarmScan` 每次扫描都发；未加载时 loaded=false/complete=true/全 0）。
+        # 这个假世界一块障碍/耕地都没有 ⇒ `location.tiles` 是空列表；若同时不给 `farm`，这一天就只剩
+        # "空窗口"这一条证据，而空窗口已按 task-19 NIT-1 如实判 False ⇒ 会把"本来就没作物可浇"的
+        # 合法零工作日误判成 needs_review。补一份真机口径的 farm 快照（0 作物 ⇒ dryCrops=0 ⇒ 浇水证据成立）。
+        w.farm = {"loaded": True, "complete": True, "crops": 0, "dryCrops": 0,
+                  "unwateredCrops": 0, "hoeDirt": 0}
         run = make_run(w, target_days=1, allow_buy=False)
         code = run.run()
         self.assertEqual(code, 0, run.logs)
@@ -1853,6 +1866,165 @@ class TestTask15DayAccounting(unittest.TestCase):
         self.assertNotIn((60, 10), w.blockers, "收掉模态之后这一格该清掉")
         self.assertTrue(out.postcondition_met, out.reason)
         self.assertEqual(rep.stages[-1]["failed"], 0, rep.stages[-1])
+
+
+class TestTask19WaterEvidence(unittest.TestCase):
+    """task-19：日级浇水证据 `checks.watered_outdoor` + `day_end.final_water` 的双口径。
+
+    真值只有两处：`farm.dryCrops`（全农场 `crop!=null && !HoeDirt.isWatered()`）或**当天最后一张
+    `isOutdoorFarm==true` 快照**的逐格 `watered`。窗口计数在室内（FarmHouse）恒 0 —— run2 的
+    `checks.crops_watered=true` 就是这么白过的，所以它只作旁证、不算证据。
+    """
+
+    def _run(self, w: FakeWorld) -> LongRun:
+        return make_run(w, target_days=1, max_days=1)
+
+    @staticmethod
+    def _events(run: LongRun, event: str) -> list:
+        return [e for e in run.entries if e["event"] == event]
+
+    def _with_crop(self, *, watered: bool) -> FakeWorld:
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.dirt.add((60, 10))
+        w.crops[(60, 10)] = {"ripe": False, "watered": watered}
+        return w
+
+    @staticmethod
+    def _indoor(w: FakeWorld) -> dict:
+        """玩家回到 FarmHouse：窗口 tiles/crops 恒 0（run2 日终的真实处境）。"""
+        obs = w.obs()
+        obs["location"] = {"name": "FarmHouse", "isOutdoorFarm": False, "tiles": [],
+                           "tillable": [], "furniture": [], "doors": []}
+        return obs
+
+    def test_indoor_final_snapshot_does_not_white_pass(self):
+        """① 最后一张是室内快照、户外快照里有未浇作物 ⇒ `watered_outdoor=False`（**不许白过**）。"""
+        w = self._with_crop(watered=False)
+        run = self._run(w)
+
+        ok, info = run._water_evidence(self._indoor(w), outdoor_obs=w.obs(),
+                                       outdoor_t=12.5, outdoor_name="Farm")
+
+        self.assertFalse(ok, info)
+        self.assertEqual(info["scope"], "window", info)
+        self.assertEqual((info["crops"], info["dry"]), (1, 1), info)
+        self.assertGreater(info["tiles"], 0, info)
+
+    def test_all_watered_is_true(self):
+        """② 全部浇过 ⇒ True（窗口口径也要有 coverage：`tiles>0`）。"""
+        w = self._with_crop(watered=True)
+        run = self._run(w)
+
+        ok, info = run._water_evidence(self._indoor(w), outdoor_obs=w.obs(),
+                                       outdoor_t=12.5, outdoor_name="Farm")
+
+        self.assertTrue(ok, info)
+        self.assertEqual(info["scope"], "window", info)
+        self.assertEqual((info["crops"], info["dry"]), (1, 0), info)
+        self.assertGreater(info["tiles"], 0, info)
+
+    def test_farm_incomplete_or_old_mod_falls_back_to_window(self):
+        """③ `farm.complete==false`（扫没扫完）或旧 Mod 没有 `dryCrops` ⇒ 退回窗口口径，
+        **绝不采信 farm 的 0**。"""
+        w = self._with_crop(watered=False)
+        run = self._run(w)
+        obs = w.obs()
+        obs["farm"] = {"loaded": True, "complete": False, "crops": 5, "dryCrops": 0,
+                       "unwateredCrops": 5, "hoeDirt": 5}
+
+        ok, info = run._water_evidence(obs, outdoor_obs=w.obs(), outdoor_t=3.0, outdoor_name="Farm")
+
+        self.assertFalse(ok, "complete=false 时 dryCrops=0 是「没扫完」，不是「没干格」")
+        self.assertEqual(info["scope"], "window", info)
+        self.assertGreater(info["tiles"], 0, info)
+        # 旧 Mod（没有 dryCrops 字段）同理
+        obs["farm"] = {"loaded": True, "complete": True, "crops": 5, "unwateredCrops": 5, "hoeDirt": 5}
+        ok2, info2 = run._water_evidence(obs, outdoor_obs=w.obs(), outdoor_t=3.0, outdoor_name="Farm")
+        self.assertFalse(ok2, info2)
+        self.assertEqual(info2["scope"], "window", info2)
+
+    def test_no_outdoor_snapshot_is_false_never_default_true(self):
+        """④ 没有任何户外快照 ⇒ 如实 False + notes 说明（**禁止默认 true**）；
+        `farm.loaded==false`（Mod 未加载时 `complete=true` 且全 0）同样不是证据。"""
+        w = self._with_crop(watered=True)      # 作物其实浇好了，但没有户外快照 ⇒ 依然不许自称浇过
+        run = self._run(w)
+
+        ok, info = run._water_evidence(self._indoor(w))
+
+        self.assertFalse(ok, info)
+        self.assertEqual(info["scope"], "window", info)
+        self.assertEqual((info["tiles"], info["dry"]), (0, None), info)
+        self.assertIn("没有任何 location.isOutdoorFarm==true 的快照", info["note"])
+        # farm 未加载：complete=true 但 loaded=false、全 0 ⇒ 不许当成"没干格"（户外快照里明明有未浇作物）
+        w2 = self._with_crop(watered=False)
+        run2 = self._run(w2)
+        obs = w2.obs()
+        obs["farm"] = {"loaded": False, "complete": True, "crops": 0, "dryCrops": 0, "hoeDirt": 0}
+        ok2, info2 = run2._water_evidence(obs, outdoor_obs=w2.obs(), outdoor_t=1.0, outdoor_name="Farm")
+        self.assertFalse(ok2, "farm 没加载时的 0 不是证据")
+        self.assertEqual(info2["scope"], "window", info2)
+
+    def test_empty_outdoor_window_is_false_never_true(self):
+        """④b NIT-1：户外快照存在但窗口 **0 格** ⇒ 逐格判据 `len(dry_t)==0` 恒真，
+        必须如实 False + notes 说明（空窗口不是"全浇过"的证据）。"""
+        w = self._with_crop(watered=True)
+        run = self._run(w)
+        obs = w.obs()
+        obs["location"] = {"name": "Farm", "isOutdoorFarm": True, "tiles": [],
+                           "tillable": [], "furniture": [], "doors": []}
+        obs["farm"] = {"loaded": True, "complete": False, "crops": 0, "hoeDirt": 0}
+
+        ok, info = run._water_evidence(obs, outdoor_obs=obs, outdoor_t=9.0, outdoor_name="Farm")
+
+        self.assertFalse(ok, "0 格窗口下 dry 必然为 0，不许据此自称浇过")
+        self.assertEqual(info["scope"], "window", info)
+        self.assertEqual((info["tiles"], info["crops"], info["dry"]), (0, 0, 0), info)
+        self.assertIn("没有任何户外窗口观测格", info["note"])
+
+    def test_farm_scope_uses_dry_crops(self):
+        """⑤ `farm.complete==true` ⇒ 以 `dryCrops` 为唯一证据（`scope=="farm"`、
+        `tiles=farm.hoeDirt`、`crops=farm.crops`）。"""
+        w = self._with_crop(watered=False)
+        run = self._run(w)
+        obs = w.obs()
+        obs["farm"] = {"loaded": True, "complete": True, "crops": 5, "dryCrops": 3,
+                       "unwateredCrops": 5, "hoeDirt": 5}
+
+        ok, info = run._water_evidence(obs, outdoor_obs=w.obs(), outdoor_t=5.0, outdoor_name="Farm")
+
+        self.assertFalse(ok, info)
+        self.assertEqual(info["scope"], "farm", info)
+        self.assertEqual((info["tiles"], info["crops"], info["dry"]), (5, 5, 3), info)
+        # dryCrops 归零 ⇒ True（即使 `unwateredCrops` 还是 5：那个不是干格数）
+        obs["farm"] = dict(obs["farm"], dryCrops=0)
+        ok2, info2 = run._water_evidence(obs, outdoor_obs=w.obs(), outdoor_t=5.0, outdoor_name="Farm")
+        self.assertTrue(ok2, info2)
+        self.assertEqual((info2["scope"], info2["dry"]), ("farm", 0), info2)
+
+    def test_day_end_carries_watered_outdoor_and_final_water(self):
+        """端到端：`day_end` 事件里 `checks.watered_outdoor` 与 `final_water` 的键名逐字对齐
+        `tools\\verify-run3.py` 的闸门（farm 口径要 `tiles>0/crops>0/dry==0`）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.farm = {"loaded": True, "complete": True, "crops": 25, "dryCrops": 0,
+                  "unwateredCrops": 25, "hoeDirt": 25}
+        client = _CountingClient(w)
+        worker = FarmWorker(client, log=lambda *_: None)
+        run = make_run(w, target_days=1, max_days=1,
+                       client_factory=lambda: client, worker_factory=lambda c: worker)
+        run.worker = worker
+        run.client = client
+
+        run.run()
+
+        rep = run.days[0]
+        self.assertIs(rep.checks["watered_outdoor"], True, rep.checks)
+        fw = rep.final_water
+        self.assertTrue({"t", "location", "tiles", "crops", "dry", "scope"} <= set(fw), fw)
+        self.assertEqual((fw["scope"], fw["tiles"], fw["crops"], fw["dry"]), ("farm", 25, 25, 0), fw)
+        self.assertNotIn("unwateredCrops", fw, "两套仪器不许混列")
+        end = self._events(run, "day_end")[-1]
+        self.assertEqual(end["final_water"], fw)
+        self.assertIs(end["checks"]["watered_outdoor"], True, end["checks"])
 
 
 if __name__ == "__main__":

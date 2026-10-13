@@ -9,7 +9,11 @@
 
 【三条铁律（否则长跑会自己骗自己）】
 1. **一天算不算数，只看观测**：`ended_by == "sleep"`（我们主动睡的，不是被系统 pass-out）
-   + 当天没有 `failed` 步骤 + 睡前观测里 `unwatered_crops == 0`。回执不参与判定。
+   + 当天没有 `failed` 步骤 + **日级浇水证据通过**（task-19：`checks.watered_outdoor` —— 只有
+   `farm.complete==true` 时的 `farm.dryCrops==0`，或当天最后一张户外农场快照里逐格
+   `watered==false` 的作物数为 0，才算证据；窗口口径的 `unwatered_crops` 是**旁证**，
+   它读 ≤400 格的玩家窗口、在 FarmHouse 里恒 0 —— run2 的 `checks.crops_watered=true` 就是这么
+   白过的）。回执不参与判定。
 2. **"没事就睡"是不允许的**：只有三种情况放行睡觉 —— 到深夜（`sleep_at`）、体力见底、
    确实找不到任何能干的活（连买种子都做不了）。其余一律**否决并记账**（用户 2026-10-11 的原话：
    "体力还有这么多，田里还有很多需要清理的，直接睡觉不是浪费了吗"）。
@@ -231,6 +235,12 @@ class DayReport:
     notes: list[str] = field(default_factory=list)
     checks: dict[str, bool] = field(default_factory=dict)
     final: dict[str, Any] = field(default_factory=dict)
+    #: task-19：**浇水证据**（`{t, location, tiles, crops, dry, scope}`），`scope ∈ {"farm","window"}`。
+    #: `tiles/crops/dry` 是**所用那套口径下**的读数（farm 口径注明来自 `farm.dryCrops`）。
+    #: 为什么不塞进 `final`：`final` 的 `crops`/`unwatered_crops` 是**窗口口径**（≤400 格、以玩家为中心），
+    #: 在室内（FarmHouse）恒为 0 —— run2 的 `checks.crops_watered=true` 就是这么白过的；两套仪器
+    #: 绝不能混在同一列（log-analyst `docs\_analyze-farmcounts.md`，run2 的 31→8→21→32）。
+    final_water: dict[str, Any] = field(default_factory=dict)
     verified: bool = False
 
     @property
@@ -268,6 +278,9 @@ class DayReport:
             "outcomes": list(self.outcomes),
             "notes": list(self.notes),
             "final": dict(self.final),
+            # task-19：浇水证据单独一条，`tools\verify-run3.py` 靠 `day_end.final_water` 复核
+            # 证据来自哪张快照（并与 `checks.watered_outdoor` 互检，盲区 B4）。
+            "final_water": dict(self.final_water),
             "ok_steps": self.ok_steps,
             "skipped_steps": self.skipped_steps,
             "failed_steps": self.failed_steps,
@@ -505,7 +518,87 @@ class LongRun:
             "tillable": len(loc.get("tillable") or []),
             "waterLeft": (p.get("wateringCan") or {}).get("waterLeft"),
             "seeds": [list(x) for x in seed_items(p)],
+            # task-19：上面 `crops`/`unwatered_crops` 是**窗口口径**（≤400 格、以玩家为中心；在室内恒 0），
+            # 这里逐字标注，并把 `farm.*` 读数整体放进**独立命名空间** —— 两套仪器不混列。
+            "counts_scope": "window",
+            "farm": {k: (obs.get("farm") or {}).get(k)
+                     for k in ("loaded", "complete", "crops", "dryCrops", "unwateredCrops", "hoeDirt")},
         }
+
+    # ------------------------------------------------------------ 浇水证据（task-19）
+    def _water_evidence(self, obs: dict[str, Any], *, outdoor_obs: dict[str, Any] | None = None,
+                        outdoor_t: float = 0.0, outdoor_name: str | None = None
+                        ) -> tuple[bool, dict[str, Any]]:
+        """日级浇水证据：真值只有 `farm.dryCrops`（全农场）或**最后一个户外快照**的逐格 `watered`。
+
+        背景（log-analyst `docs\\_analyze-farmcounts.md`，IL 定案）：窗口 `location.tiles[]`（≤400 格、
+        按离玩家距离截断）在**室内恒 0**，run2 的 `checks.crops_watered=true` 就是这么白过的；而
+        `farm.unwateredCrops` 用的是 `HoeDirt.needsWatering()`（只看 `CropData.NeedsWatering`、完全不看
+        浇水状态），也不是干格数。真值只有两处：`farm.dryCrops`（= 全农场 `crop != null &&
+        !HoeDirt.isWatered()`，task-23/0.7.22 加）和逐格 `tiles[].watered`（`HoeDirt.isWatered()`）。
+
+        口径选择（逐字对齐 `tools\\verify-run3.py` 的闸门，字段名不许改）：
+        * `farm.complete == true` 且 `farm.loaded != false` 且 `farm.dryCrops` 存在 ⇒ **farm 口径**：
+          `watered_outdoor = (dryCrops == 0)`；`tiles` 记 `farm.hoeDirt`（该次全农场扫描清点到的耕地格数）、
+          `crops` 记 `farm.crops`（两键都是 >0 的可查读数，便于 Lead 手工复核）。
+          `complete == false`（扫描没走完）或**旧 Mod 没有 `dryCrops` 字段**时**不得**把 0 当
+          "没有作物/没有干格" ⇒ 一律退回窗口口径（卡面 §4）。
+        * 否则用**当天最后一个 `location.isOutdoorFarm == true`** 的快照逐格统计（`scope="window"`，
+          `tiles` = 该窗口覆盖的格数）；一天都没有户外快照且 farm 口径不可用 ⇒ `watered_outdoor=False`
+          + `note` 说明（**禁止默认 true**，卡面 §5④）—— 如实判"没证据 ⇒ 不算浇过"。
+
+        ⚠️ 本函数**永远返回 bool**（`tools\verify-run3.py` 把"缺字段"直接当问题），拿不到证据时给
+        `False` 而不是省略字段。
+        """
+        t_now = round(float(self.now() - self.started), 3)
+        loc_now = str((obs.get("location") or {}).get("name") or "")
+        farm = obs.get("farm") or {}
+        if (farm.get("complete") is True and farm.get("loaded") is not False
+                and farm.get("dryCrops") is not None):
+            dry = int(farm.get("dryCrops") or 0)
+            crops = int(farm.get("crops") or 0)
+            tiles = int(farm.get("hoeDirt") or 0)
+            info: dict[str, Any] = {
+                "t": t_now,
+                "location": outdoor_name or "Farm",
+                "tiles": tiles,
+                "crops": crops,
+                "dry": dry,
+                "scope": "farm",
+                "note": ("farm 口径：dry 来自 farm.dryCrops（全农场 crop!=null && !HoeDirt.isWatered()），"
+                         f"tiles=farm.hoeDirt={tiles}、crops=farm.crops={crops}；"
+                         f"farm.unwateredCrops={farm.get('unwateredCrops')} 不是干格数、不参与判定"),
+            }
+            if crops == 0:
+                info["note"] += "；本日 farm 口径 0 作物（无作物可浇，dry 恒 0）"
+            return dry == 0, info
+        if outdoor_obs is None:
+            info = {
+                "t": t_now, "location": loc_now, "tiles": 0, "crops": 0, "dry": None,
+                "scope": "window",
+                "note": ("当天没有任何 location.isOutdoorFarm==true 的快照，且 farm 口径不可用"
+                         f"（complete={farm.get('complete')!r}/loaded={farm.get('loaded')!r}/"
+                         f"dryCrops={farm.get('dryCrops')!r}）⇒ 没有逐格浇水证据，如实判 False"
+                         "（禁止默认 true）"),
+            }
+            return False, info
+        win = FarmWorker.tiles_of(outdoor_obs)
+        crops_t = [t for t, v in win.items() if v.get("crop")]
+        dry_t = [t for t in crops_t if not win[t].get("watered")]
+        info = {
+            "t": round(float(outdoor_t), 3),
+            "location": outdoor_name or str((outdoor_obs.get("location") or {}).get("name") or ""),
+            "tiles": len(win), "crops": len(crops_t), "dry": len(dry_t), "scope": "window",
+            "note": (f"window 口径：用当天最后一张户外快照（覆盖 {len(win)} 格、其中作物 {len(crops_t)} 格）"
+                     "逐格 watered 判据；farm.complete==false 或旧 Mod 没有 farm.dryCrops 时才走这条"),
+        }
+        if not win:
+            # NIT-1（deputy-lead `docs\_review-task19.md`）：空窗口下 `len(dry_t) == 0` **恒真**，
+            # 与上面那句 note 自相矛盾 ⇒ 必须在这里就把结论钉成 False，不许"0 格也自称浇过"。
+            info["note"] += ("；本天没有任何户外窗口观测格（覆盖 0 格）⇒ 不能据此自称浇过"
+                             "（空窗口下逐格判据恒真，故如实判 False）")
+            return False, info
+        return len(dry_t) == 0, info
 
     # ------------------------------------------------------------------ 选地
     def _zones(self, obs: dict[str, Any]) -> list[Any]:
@@ -1616,6 +1709,13 @@ class LongRun:
                       weather=FarmWorker.weather(obs))
 
         last_obs = obs
+        # task-19：当天**最后一个户外农场快照**（窗口口径浇水证据的来源）。日终再问必然是室内的
+        # （`isOutdoorFarm=false`、窗口 crops 恒 0）⇒ 必须边走边记，否则「睡前有没有没浇的作物」
+        # 这件事永远白过。
+        outdoor_obs = obs if self._is_farm(obs) else None
+        outdoor_t = 0.0
+        outdoor_name = (str((obs.get("location") or {}).get("name") or "")
+                        if outdoor_obs is not None else None)
         while True:
             if self._budget_exhausted():
                 rep.ended_by, rep.ended_reason = "budget", (
@@ -1630,6 +1730,12 @@ class LongRun:
             if FarmWorker.day_key(obs) != rep.day_key:
                 rep.ended_by, rep.ended_reason = "pass_out", "日期自己变了（游戏自动跨日或外部读档）"
                 break
+
+            # task-19：边走边记"最后一张户外快照"（窗口口径浇水证据的取样点）。
+            if self._is_farm(obs):
+                outdoor_obs = obs
+                outdoor_t = self.now() - self.started
+                outdoor_name = str((obs.get("location") or {}).get("name") or "")
 
             # **模态守卫**（task-11）：`LevelUpMenu`/存档模态会把时间冻住（`player.freezePause=100`），
             # 不先清掉的话后面所有技能都会被 `ui_modal` 拒绝、整天静默卡死。清到干净才谈决策。
@@ -1750,12 +1856,44 @@ class LongRun:
         # 一天判成 needs_review（既有用例 `test_single_day_verified_and_world_changed` 因此
         # 多跑一天）。阶段后置条件是**日级**的：同一阶段种类当天跑多轮时，以最后一轮为准。
         # 已知局限（记录在案）：同一天同一阶段种类跨多片地时，前一片地未解决、后一片地干净
-        # 会互相遮蔽 —— 这种情况下 `stage_exhausted` journal 仍然在，交给复核。
+        # 会互相遮蔽 —— 遮蔽现在**留痕**（下面的 `stage_midway_leftover`），交给复核。
+        # **权威定义**（Lead m02561 裁定 1；`tools\verify-run3.py` 的自算口径已对齐成同一句）：
+        #   「当天**每个阶段种类的最后一条记录**里 leftover 之和为 0」
         last_by_stage: dict[str, dict] = {}
         for s in rep.stages:
             last_by_stage[str(s.get("stage") or "")] = s
         unmet_leftover = sum(int(s.get("leftover") or 0) for s in last_by_stage.values()
                              if int(s.get("tiles") or 0) > 0)
+        # 遮蔽可见性（Lead m02561 裁定 1）：同一阶段种类当天**更早**记录 leftover>0、**最后一条**
+        # leftover==0 ⇒ "前一片地没做完、后一片地干净"的遮蔽发生了。**纯信息项**：不改 VERIFIED、
+        # 不改退出码，只发 journal + 进 notes，让 run3 事后能人工复核。
+        midway: dict[str, dict] = {}
+        for i, s in enumerate(rep.stages):
+            name = str(s.get("stage") or "")
+            if int(s.get("tiles") or 0) <= 0 or int(s.get("leftover") or 0) <= 0:
+                continue
+            midway[name] = {"stage": name, "tiles": int(s.get("tiles") or 0),
+                            "leftover": int(s.get("leftover") or 0), "round": i + 1}
+        for name, mid in midway.items():
+            last = last_by_stage.get(name)
+            if last is None or int(last.get("leftover") or 0) != 0:
+                continue
+            self._journal("stage_midway_leftover", **mid,
+                          note=("同一阶段种类当天更早一轮还剩格子、最后一轮 leftover==0 ⇒ 日级判定取"
+                                "最后一轮；若那批格子属于另一片地则存在遮蔽，请人工复核 `stage_exhausted`"))
+            rep.notes.append(
+                f"阶段 {name} 中途剩 {mid['leftover']}/{mid['tiles']} 格、当天最后一轮已归零"
+                f"（stage_midway_leftover，当天第 {mid['round']} 条阶段记录）")
+        # task-19：日级浇水证据。**唯一证据**是 `checks.watered_outdoor`（farm.dryCrops 或当天最后一个
+        # 户外快照逐格 watered）；窗口口径的 `crops_watered` 保留但只作旁证（室内恒 0，会白过）。
+        watered_outdoor, water_info = self._water_evidence(
+            last_obs, outdoor_obs=outdoor_obs, outdoor_t=outdoor_t, outdoor_name=outdoor_name)
+        rep.final_water = water_info
+        if not watered_outdoor:
+            rep.notes.append(
+                "浇水证据不足/未浇完：" + str(water_info.get("note") or "")
+                + f"（scope={water_info.get('scope')}、tiles={water_info.get('tiles')}、"
+                  f"crops={water_info.get('crops')}、dry={water_info.get('dry')}）")
         rep.checks = {
             "slept_by_us": rep.ended_by == "sleep",
             # task-11：被不可逆/不敢关的模态挡住（职业选择、存档超时）时，这一天**不算数**。
@@ -1764,6 +1902,9 @@ class LongRun:
             "no_hard_failures": rep.failed_steps == 0,
             "no_unmet_stages": unmet_leftover == 0,
             "crops_watered": int(rep.final.get("unwatered_crops") or 0) == 0,
+            # task-19：**唯一**浇水证据（卡面 §1；`tools\verify-run3.py` 缺这条即问题）。
+            # 窗口口径的 `crops_watered` 只作旁证：它读的是 `_essence` 的窗口计数，在室内恒 0。
+            "watered_outdoor": bool(watered_outdoor),
             "day_justified": (rep.ended_reason.split(":", 1)[0] in ("night", "stamina", "no_work", "no_plot")
                               if rep.ended_by == "sleep" else False),
         }
@@ -1773,6 +1914,8 @@ class LongRun:
             + (f"（{rep.ended_reason}）" if rep.ended_reason else "")
             + f" 阶段 {rep.stages_seen or '无'} 做成 {rep.ok_steps} 跳过 {rep.skipped_steps} 失败 {rep.failed_steps}"
             + f" 未完成阶段剩 {unmet_leftover} 格（no_unmet_stages={unmet_leftover == 0}）"
+            + f" 浇水 {water_info.get('scope')} 口径 干 {water_info.get('dry')}/{water_info.get('crops')}"
+            + f"（watered_outdoor={watered_outdoor}）"
             + f" → {'VERIFIED' if rep.verified else 'needs_review'} {rep.checks}"
         )
         self._journal("day_end", **rep.as_dict())
