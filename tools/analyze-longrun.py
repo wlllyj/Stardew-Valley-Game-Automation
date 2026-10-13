@@ -301,6 +301,10 @@ def cross_day_evidence(start_day, end):
         （+1 = `crossed`，否则 `wrong`）；`final` 还停在 `day_start` 那一天、或缺失 ⇒ `undecidable`。
         理由：`final` 是**睡前**快照，拿它判"没跨日"就是 task-38 要修的那个假报警
         （真机 0.7.23 彩排：回执写"已跨日 spring 17→18"、`final` 还是 17 日）⇒ **缺失 ≠ 没做**。
+
+    与 `tools\\verify-run3.py` 的分工（Lead m01934 裁定：保持不同向）：它把缺失记 problem
+    （验收入口，必须贯彻"缺失 ≠ 通过"），这里记 `undecidable`（行为分析口径）。两者都**不把缺失
+    当通过**，只是严重度标签不同；run3 的真账本一定有 `day_after`，这个分歧只出现在旧/合成账本上。
     """
     if not isinstance(end, dict) or end.get("ended_by") != "sleep":
         return CROSS_DAY_NA, None, None

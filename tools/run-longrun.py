@@ -56,6 +56,9 @@ def main() -> int:
     ap.add_argument("--max-plots", type=int, default=10, dest="max_plots",
                     help="一天最多**新开**几片地（task-32 起是软配额：配额到顶但区内还有活时会继续干，"
                          "只是不再换新片；默认 10）")
+    ap.add_argument("--max-days", type=int, default=None, dest="max_days",
+                    help="最多试几个日报告（默认 = max(要求天数×2, 要求天数+2)；睡失败会重试同一天、"
+                         "每次都算一个日报告 ⇒ 想留重试余量就显式调大，例如 --days 3 --max-days 9）")
     ap.add_argument("--min-stamina", type=float, default=12.0, dest="min_stamina",
                     help="体力低于这个值就收工睡觉（默认 12）")
     ap.add_argument("--sleep-at", type=int, default=2200, dest="sleep_at",
@@ -109,6 +112,7 @@ def main() -> int:
         min_stamina=args.min_stamina,
         sleep_at=args.sleep_at,
         max_minutes=args.max_minutes,
+        max_days=args.max_days,
         max_plots_per_day=args.max_plots,
         report_dir=args.report_dir,
         journal_path=journal,
