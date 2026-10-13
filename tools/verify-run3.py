@@ -432,6 +432,20 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
                 f"[{name}] checks.watered_outdoor=true 但账本没写 final_water"
                 "（无法核对证据来源；缺证据 ≠ 通过，也不额外判问题）"
             )
+        # run3 病灶专用判据（Lead 2026-10-13，取代先前那条会误报的"final.location 必须是 Farm"）：
+        # 以 no_work 收尾的一天，睡前**不许还有干作物**。背景：run3 的 spring 19–22 四天都是
+        # "人在 FarmHouse（窗口口径），把户外 33 格干作物当成'今天没活'"，于是连续 4 天连睡、
+        # 时钟空转、账本还一路 ok。正常的成功一天是"走回 FarmHouse → 上床 → 睡"，所以
+        # `final.location` 本来就可能是 FarmHouse —— 位置不是判据，**"no_work 却有干作物"才是**。
+        _end_reason = str(d.get("ended_reason") or "")
+        if _end_reason.startswith("no_work") and isinstance(fw, dict):
+            _dry = fw.get("dry")
+            if isinstance(_dry, (int, float)) and _dry > 0:
+                problems.append(
+                    f"[{name}] ended_reason 以 no_work 开头，但 final_water.dry={_dry}"
+                    "（户外还有干作物却判\"今天没活\" ⇒ run3 连睡病复发；"
+                    "查 `_farm_scope_work`/`work_reasons` 的 fail-closed 路径，见 task-41 第 10 条）"
+                )
         # 0 步也能 VERIFIED（盲区 B6）：当天一个阶段都没有、却自称达标 ⇒ 必须有"确实无活可做"的
         # 证据（no_intents / plot_exhausted / policy_fallback / sleep 理由是 no_work/night/stamina），
         # 否则不允许用"什么都没做"换一天达标（负例 K2）。
