@@ -493,6 +493,11 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         if not isinstance(_rbound, (int, float)):
             _rbound = max(5, int(0.2 * attempted_total)) if attempted_total else 5
         rbound = int(_rbound)
+        # task-63 的实扣（账本优先；缺失时按 min(bound, 被拒格数) 自算，与 longrun 同口径）
+        _rexempt = end_stats.get("refused_exempt")
+        if not isinstance(_rexempt, (int, float)):
+            _rexempt = min(rbound, self_refused) if (self_refused or field_refused) else 0
+        refused_exempt = max(0, int(_rexempt))
         if field_refused is not None or self_refused:
             src_r = f"{field_refused}" if field_refused is not None else "未写"
             infos.append(
@@ -635,15 +640,21 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
                 )
 
         # 3b. 阶段后置条件：无论 checks.no_unmet_stages 在不在，都按 day_end.stages 自算并比对。
-        # task-52 起：账本会把"当天不可达且在上界内"的遗留格从 unmet 里扣掉 ⇒ 自算值也必须扣同一笔，
-        # 否则 run6 会被误判成"自述与自算不一致"。
+        # task-52/63 起：账本会把"当天不可达且在上界内"与"被游戏拒绝且在上界内"的遗留格从 unmet 里
+        # **各自**扣掉 ⇒ 自算值也必须扣同样两笔，否则 run6 会被误判成"自述与自算不一致"。
+        # 另有一条与 longrun 同义的防真空：扣完为 0、但当天没有任何成功动作、且两笔豁免都非零时，
+        # 账本会写 no_unmet_stages=false（不能靠"全被豁免"换一个达标日）。
         unmet = checks.get("no_unmet_stages")
-        effective_leftover = max(0, leftover_targeted - unreach_exempt)
-        if unmet is not None and bool(unmet) != (effective_leftover == 0):
+        effective_leftover = max(0, leftover_targeted - unreach_exempt - refused_exempt)
+        _progress = int(_ok_self or 0) > 0
+        _vacuum_exempt = effective_leftover == 0 and not _progress and (unreach_exempt + refused_exempt) > 0
+        expected_unmet = (effective_leftover == 0) and not _vacuum_exempt
+        if unmet is not None and bool(unmet) != expected_unmet:
             problems.append(
                 f"[{name}] checks.no_unmet_stages={unmet} 与自算不一致"
-                f"（有目标阶段遗留 leftover={leftover_targeted} 格，扣掉不可达豁免 {unreach_exempt} 后"
-                f"剩 {effective_leftover} 格）"
+                f"（有目标阶段遗留 leftover={leftover_targeted} 格，扣掉不可达豁免 {unreach_exempt}"
+                f" + 锄不动豁免 {refused_exempt} 后剩 {effective_leftover} 格、当天成功动作 {_ok_self}"
+                f"；期望 {expected_unmet}）"
             )
         # 自述说"有阶段没做完"就一律算问题，**不因自算结果与它一致而放行**
         # （deputy-lead 负例 D：checks.no_unmet_stages=false 与 stages.leftover=5 一致地没做完，
@@ -656,7 +667,7 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         if unmet is None and effective_leftover:
             problems.append(
                 f"[{name}] 当天有阶段遗留目标 leftover={effective_leftover}"
-                f"（阶段没做完；已扣不可达豁免 {unreach_exempt}）"
+                f"（阶段没做完；已扣不可达豁免 {unreach_exempt} + 锄不动豁免 {refused_exempt}）"
             )
         if leftover_zero_target:
             problems.append(

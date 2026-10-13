@@ -412,6 +412,51 @@ class TestVerifyRun3(unittest.TestCase):
         self.assertTrue(ok, s.get("problems"))
         self.assertTrue(any("锄不动被拒" in i for i in s["infos"]), s["infos"])
 
+    # ---------------------------------------------- task-52+63：两笔豁免都要从 unmet 里各自扣掉
+    def test_both_exemptions_are_subtracted_from_unmet(self):
+        """leftover 2 格、别人不可达 1 格 + 锄不动 1 格、当天有成功动作 ⇒ 不许报"自算不一致"。
+
+        这是 run6 最可能踩的误报：longrun 写 `no_unmet_stages=true`（两笔豁免各自扣完为 0），
+        而工具若只扣 unreachable 一笔，就会把合法的一天判成"自述与自算不一致"。
+        """
+        rows: list[dict] = []
+        for i in range(3):
+            d = [1, "spring", 10 + i]
+            nd = [1, "spring", 11 + i]
+            stages = [stage("till_area", tiles=3, ok=1, skipped=2, leftover=2)]
+            rows += [
+                day_start(d, t=i * 300.0), sleep_ok(t=i * 300.0 + 100),
+                day_end(d, nd, t=i * 300.0 + 200, ok_steps=1, stages=stages,
+                        checks={"unreachable_within_bound": True, "refused_within_bound": True},
+                        unreachable=1, unreachable_bound=5, unreachable_exempt=1,
+                        refused=1, refused_bound=5, refused_exempt=1),
+            ]
+        rows.append(finish())
+        ok, s = self.check(rows)
+        self.assertFalse(any("自算不一致" in p for p in s["problems"]), s["problems"])
+        self.assertTrue(ok, s.get("problems"))
+
+    def test_vacuum_exempt_day_is_not_a_mismatch(self):
+        """全被豁免 + 0 成功动作：longrun 会写 `no_unmet_stages=false`（防真空），工具不许当成"自算不一致"。"""
+        rows: list[dict] = []
+        for i in range(3):
+            d = [1, "spring", 10 + i]
+            nd = [1, "spring", 11 + i]
+            stages = [stage("clear_area", tiles=3, ok=0, skipped=3, leftover=3)]
+            rows += [
+                day_start(d, t=i * 300.0), sleep_ok(t=i * 300.0 + 100),
+                day_end(d, nd, t=i * 300.0 + 200, ok_steps=0, stages=stages, verified=False,
+                        started_by="sleep",
+                        checks={"no_unmet_stages": False, "no_hard_failures": False,
+                                "unreachable_within_bound": True, "refused_within_bound": True},
+                        unreachable=3, unreachable_bound=5, unreachable_exempt=3,
+                        refused=0, refused_bound=5, refused_exempt=0),
+            ]
+        rows.append(finish(code=1, streak=0))
+        ok, s = self.check(rows)
+        self.assertFalse(any("自算不一致" in p for p in s["problems"]), s["problems"])
+        self.assertFalse(ok, "全被豁免且 0 成功的一天不可能构成达标链")
+
 
 if __name__ == "__main__":
     unittest.main()
