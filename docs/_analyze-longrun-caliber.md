@@ -28,6 +28,37 @@ run2 的 `decisions_llm=7` 里有 1 条是兜底：`logs\longrun-3day-llm-run2.j
 `decision` 只有 `source`/`llm`/`boundary`/`truncated`/`fallback` 五键，**没有 token/usage** ⇒
 本工具不报 token 消耗（`tests\test_analyze_longrun.py::TestDecisionSourceAccounting` :546）。
 
+## 1.5 退出码（task-65，Lead m03207）—— 工具不能"永远绿"
+
+默认**严格**：`0` = 本工具没抓到红；`1` = 有红；`2` = 跑不动（读不到 journal / 空账本 / 参数错）。
+`--advisory` 保留老行为（恒 `0`，只当诊断用）。`--help` 里写同一段话（`parse_args` 的 epilog）。
+
+"红"的口径（`is_red_finding()`）= 下面三类之一：
+
+- `manual:*` —— 0 类"必须人工介入（红）"（模态挡住 / 职业选择 / `no_blocking_modal=false` /
+  `unreachable_within_bound=false`）；
+- `missed:*` —— 1 类"该做没做"（含 `missed:check:*`、`missed:no_work_with_dry`、`missed:cross_day`、账目差额）；
+- 显式判红的 `wasted:*` —— `verified_zero_steps`、`verified_without_work`、`whitewash*`、
+  `water_contradiction`、`water_scope_empty`、`finish_incoherent`、`finish_vs_days`
+  （`wasted:leftover:*` **不算红**：它是"没做完"，由 `missed:*` 说话）。
+
+**计数走全量、不走 `report["categories"]`**（后者被 `--top` 截断）—— 否则会出现"有红但 rc=0"的假绿。
+`--json` 里新增 `report["red"] = {total, subjects, lines, advisory}`。
+
+改前/改后 rc 对照（同一本账本，两工具并排；判决权威仍是 `verify-run3.py`）：
+
+| 账本 | analyze 改前 | analyze 改后 | `--advisory` | verify-run3 |
+|---|---|---|---|---|
+| `scratch\journal-green.jsonl` | 0 | **0**（red=0） | 0 | 0 / VERIFIED |
+| `logs\longrun-3day-llm-run2.jsonl` | 0 | **1**（red=19） | 0 | 1 / needs_review |
+| `logs\longrun-3day-llm-run3.jsonl` | 0 | **1**（red=17） | 0 | 1 / needs_review |
+| `logs\longrun-3day-llm-run5.jsonl` | 0 | **1**（red=62） | 0 | 1 / needs_review |
+| `scratch\_t5x_vacuum.jsonl` | 0 | **1**（red=3） | 0 | 1 / needs_review |
+
+⚠ 改后 run2/run3/run5/vacuum 变 `1` **不是回归**，是语义修正（改前那个 `0` 是"恒 0"假绿）。
+**本工具的退出码只表达"有没有红"，不表达"整跑是否达标"**；达标看 `verify-run3.py` 与
+`docs\_run6-criteria.md`。单测：`tests\test_analyze_longrun.py::TestExitCodes`。
+
 ## 2. 事件映射不许漂移（Lead m02395）
 
 - brain 里 `_journal("<name>"` 的**每个**事件名都要在 `EVENT_BUCKETS` 里有桶；
@@ -91,7 +122,7 @@ run2 的 `decisions_llm=7` 里有 1 条是兜底：`logs\longrun-3day-llm-run2.j
 ## 4. 复核命令
 
 ```
-python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run5.jsonl
-python tools\verify-run3.py      --journal logs\longrun-3day-llm-run5.jsonl
-python -m unittest discover -s tests        # 当前 428 OK
+python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run5.jsonl   # 有红 ⇒ rc=1（--advisory 才恒 0）
+python tools\verify-run3.py      --journal logs\longrun-3day-llm-run5.jsonl   # 判决权威（rc=1 needs_review）
+python -m unittest discover -s tests        # 当前 438 OK
 ```

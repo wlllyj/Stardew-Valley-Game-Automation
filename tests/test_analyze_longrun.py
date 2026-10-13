@@ -5,7 +5,8 @@
 判据分三层：
   1. 真实账本：run2 必须自动重现 5 项验收事实；run1（缺 day_end/finish）必须不崩且如实标注"无法判定"。
   2. 自造账本：全绿的一天不能报问题；cancel→fallback 与"leftover 却自称 verified"必须被点名。
-  3. CLI 契约：不可读/空账本退出码 2；`--json` 能产出可解析 JSON（含 mapping）。
+  3. CLI 契约：不可读/空账本退出码 2；`--json` 能产出可解析 JSON（含 mapping）；
+     退出码见 task-65：0 = 无红、1 = 有红、2 = 跑不动（`--advisory` 恒 0）。
 
 跑法：python -m unittest discover -s tests
 """
@@ -302,10 +303,12 @@ class TestModalAndEnvironmentEvents(unittest.TestCase):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             code = mod.main(["--journal", self.path, "--days", "1", "--json"])
-        self.assertEqual(code, 0)
+        # task-65：这本账本有红（模态/职业选择）⇒ 默认严格 rc=1；JSON 结构与旧键都不变
+        self.assertEqual(code, 1)
         payload = json.loads(buf.getvalue())
         self.assertIn("manual_intervention", payload)
         self.assertIn("env_inconclusive", payload)
+        self.assertGreaterEqual(payload["red"]["total"], 1)
         for key in ("manual", "missed", "wasted", "ineffective", "sleep", "environment"):
             self.assertIn(key, payload["categories"])
             self.assertIn(key, payload["categories_total"])
@@ -1128,6 +1131,111 @@ class TestVacuumDayGate(unittest.TestCase):
         self.assertNotIn("wasted:verified_zero_steps", subjects(rep["categories"]["wasted"]))
         undec = " ".join(rep["undecidable"])
         self.assertIn("既没有 stages 也没有 ok_steps", undec)
+
+
+VACUUM = os.path.join(ROOT, "scratch", "_t5x_vacuum.jsonl")
+
+
+class TestExitCodes(unittest.TestCase):
+    """task-65（Lead）：退出码必须能表达"有红"（默认严格），否则就是"工具永远绿"。
+
+    语义：``0`` = 无红；``1`` = 有红（`manual:*` / `missed:*` / 显式判红的 `wasted:*`）；
+    ``2`` = 跑不动（读不到账本 / 空账本 / 参数错）；``--advisory`` 保留老行为（恒 0）。
+    判决权威仍是 `tools\\verify-run3.py`：本工具的退出码只表达"有没有红"。
+    """
+
+    def _run(self, argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = mod.main(argv)
+        return rc, buf.getvalue()
+
+    def _vacuum_ledger(self, name):
+        # 与 scratch\_t5x_vacuum.jsonl 同形：verified=true + **独立 stage 事件** ok=0 ⇒ 白做（红）
+        stage = {"event": "stage", "t": 5.0, "stage": "water_area", "tiles": 3, "ok": 0,
+                 "skipped": 0, "failed": 0, "leftover": 0}
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return write_ledger(tmp.name, name, integrity_ledger(
+            extra_events=[stage],
+            day_end_overrides={
+                "verified": True,
+                "checks": {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                           "crops_watered": True, "day_justified": True},
+            }))
+
+    def _green_ledger(self, name):
+        # 真·0 红：浇水证据齐（watered_outdoor=true + farm 口径 final_water/dry=0）、有活干、无红条
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return write_ledger(tmp.name, name, integrity_ledger(day_end_overrides={
+            "verified": True, "ended_reason": "night",
+            "checks": {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                       "crops_watered": True, "day_justified": True, "watered_outdoor": True,
+                       "no_unmet_stages": True},
+            "final_water": {"t": 9.0, "location": "Farm", "tiles": 84, "crops": 31, "dry": 0,
+                            "scope": "farm"},
+        }))
+
+    def test_no_red_ledger_exits_zero(self):
+        path = self._green_ledger("exit_green.jsonl")
+        rc, text = self._run(["--journal", path])
+        self.assertEqual(rc, 0, "0 红的账本必须 rc=0")
+        self.assertIn("退出码: 0", text)
+        self.assertIn("有红 0 条", text)
+
+    def test_red_ledger_exits_one(self):
+        path = self._vacuum_ledger("exit_vacuum.jsonl")
+        rc, text = self._run(["--journal", path])
+        self.assertEqual(rc, 1, "有红必须返回 1（工具不能永远绿）")
+        self.assertIn("退出码: 1", text)
+        self.assertIn("wasted:verified_zero_steps", text)
+
+    def test_advisory_keeps_old_zero(self):
+        path = self._vacuum_ledger("exit_advisory.jsonl")
+        rc, text = self._run(["--journal", path, "--advisory"])
+        self.assertEqual(rc, 0)
+        self.assertIn("--advisory 已开 ⇒ 恒 0", text)
+
+    def test_bad_journal_exits_two(self):
+        rc, _ = self._run(["--journal", os.path.join(ROOT, "scratch", "_no_such_ledger_t65.jsonl")])
+        self.assertEqual(rc, 2)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        empty = os.path.join(tmp.name, "empty.jsonl")
+        with open(empty, "w", encoding="utf-8"):
+            pass
+        rc2, _ = self._run(["--journal", empty])
+        self.assertEqual(rc2, 2, "空账本 ⇒ 2（没有可解析事件）")
+
+    def test_help_documents_the_three_codes_and_authority(self):
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx:
+            with contextlib.redirect_stdout(buf):
+                mod.parse_args(["--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        text = buf.getvalue()
+        self.assertIn("0 = 没有红", text)
+        self.assertIn("2 = 跑不动", text)
+        self.assertIn("判决权威仍是 tools\\verify-run3.py", text)
+        self.assertIn("--advisory", text)
+
+    def test_red_rule_and_report_key(self):
+        rep = report_for(self._green_ledger("exit_green_rule.jsonl"))
+        self.assertEqual(rep["red"]["total"], 0)
+        self.assertFalse(rep["red"]["advisory"])
+        self.assertTrue(mod.is_red_finding({"subject": "manual:modal_blocked"}))
+        self.assertTrue(mod.is_red_finding({"subject": "missed:check:watered_outdoor"}))
+        self.assertTrue(mod.is_red_finding({"subject": "wasted:verified_zero_steps"}))
+        self.assertTrue(mod.is_red_finding({"subject": "wasted:whitewash:clear_area"}))
+        self.assertFalse(mod.is_red_finding({"subject": "environment:env_fail"}))
+        self.assertFalse(mod.is_red_finding({"subject": "wasted:leftover:clear_area"}))
+
+    @unittest.skipUnless(os.path.exists(VACUUM), "Lead 的真空夹具不在（scratch\\_t5x_vacuum.jsonl）")
+    def test_real_vacuum_fixture_exits_one(self):
+        rc, text = self._run(["--journal", VACUUM])
+        self.assertEqual(rc, 1)
+        self.assertIn("wasted:verified_zero_steps", text)
 
 
 if __name__ == "__main__":

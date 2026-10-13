@@ -319,6 +319,28 @@ def as_num(value, default=0.0):
         return default
 
 
+#: task-65（Lead）：退出码口径 —— "有红"= 必须人工介入（`manual:*`）或"该做没做"（`missed:*`）
+#: 或 `wasted:` 里显式判红的那几类（洗白/0 步 VERIFIED/浇水自相矛盾或不可采信/账目自述不一致）。
+RED_SUBJECT_PREFIXES = ("manual:", "missed:")
+RED_SUBJECTS = (
+    "wasted:verified_zero_steps",
+    "wasted:verified_without_work",
+    "wasted:whitewash",
+    "wasted:water_contradiction",
+    "wasted:water_scope_empty",
+    "wasted:finish_incoherent",
+    "wasted:finish_vs_days",
+)
+
+
+def is_red_finding(item):
+    """这条 finding 算不算"红"（退出码 1 的依据）。口径写进 `--help` 与口径卡 §1.5。"""
+    subject = str((item or {}).get("subject") or "")
+    if subject.startswith(RED_SUBJECT_PREFIXES):
+        return True
+    return any(subject == s or subject.startswith(s + ":") for s in RED_SUBJECTS)
+
+
 def finding(line, event, summary, hint="", subject=""):
     return {
         "line": line,
@@ -1882,6 +1904,20 @@ def build_report(rows, path, args, bad_lines):
     }
     report["advice"] = build_advice(report)
     report["undecidable"] = build_undecidable(rows, sessions, prelude, report)
+    # task-65：退出码（默认：有红 ⇒ 1 / 0 红 ⇒ 0 / 跑不动 ⇒ 2；`--advisory` 恒 0）。
+    # **计数必须走全量**：`report["categories"]` 被 `--top` 截断过，拿它当计数源会出现
+    # "有红但退出码 0"的假绿（与 task-60 浇水建议同一教训）。
+    red_all = []
+    for items in (cat_manual(all_sessions, 0),
+                  cat_missed(sessions, 0),
+                  cat_wasted(sessions, 0) + cat_self_report(report)):
+        red_all.extend(item for item in items if is_red_finding(item))
+    report["red"] = {
+        "total": len(red_all),
+        "subjects": sorted({str(item.get("subject")) for item in red_all}),
+        "lines": sorted({item["line"] for item in red_all if item.get("line") is not None}),
+        "advisory": bool(getattr(args, "advisory", False)),
+    }
     return report
 
 
@@ -2045,6 +2081,14 @@ def render_text(report, top):
         f"；必须人工介入（红）{red_total} 条"
         + ("  ⚠ 当天不判通过" if red_total else "")
         + (f"；by_event={mi.get('by_event')}" if mi.get("by_event") else ""))
+    # task-65：退出码自述（默认严格：有红 ⇒ 1）；判决权威仍是 verify-run3.py
+    rc_info = report.get("red") or {}
+    rc_total = int(rc_info.get("total") or 0)
+    rc_rc = 0 if rc_info.get("advisory") else (1 if rc_total else 0)
+    add(f"退出码: {rc_rc}" + ("（--advisory 已开 ⇒ 恒 0）" if rc_info.get("advisory") else "")
+        + f"；有红 {rc_total} 条"
+        + (f"（{', '.join(rc_info.get('subjects') or [])}）" if rc_total else "")
+        + "；0=无红 / 1=有红 / 2=跑不动；判决权威仍是 tools\\verify-run3.py")
     env = report.get("env_inconclusive") or {}
     add(f"环境挡路: {env.get('env_fail_events', 0)} 条（{env.get('env_fail_tiles', 0)} 格，"
         f"其中 {env.get('env_fail_unfinished_tiles', 0)} 格所在阶段最终没做成）；"
@@ -2155,13 +2199,24 @@ def render_text(report, top):
 # ---------------------------------------------------------------- CLI
 def parse_args(argv):
     parser = argparse.ArgumentParser(
-        description="长跑账本行为分析器：四类判定（该做没做/白做/无效挥动/睡觉时机）+ 证据行号 + 建议"
+        description="长跑账本行为分析器：四类判定（该做没做/白做/无效挥动/睡觉时机）+ 证据行号 + 建议",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "退出码（task-65）：0 = 没有红；1 = 有红（`manual:*` 或 `missed:*` 或显式判红的\n"
+            "                     `wasted:*`：洗白 / 0 步却 VERIFIED / 浇水矛盾 / 账目自述不一致）；\n"
+            "                  2 = 跑不动（读不到 journal、空账本、参数错）。\n"
+            "`--advisory` 诊断模式：无论有没有红都返回 0（老行为）。\n"
+            "**判决权威仍是 tools\\verify-run3.py**：本工具是四路复核之一，退出码只表达\n"
+            "\"有没有红\"，不表达\"整跑是否达标\"（达标看 verify-run3 的 0/1/2 与 docs\\_run6-criteria.md）。"
+        ),
     )
     parser.add_argument("--journal", default=None,
                         help="账本路径（默认取 logs\\longrun-*.jsonl 里 mtime 最新）")
     parser.add_argument("--days", type=int, default=3, help="领跑天数（只用于 'X/N 天 VERIFIED' 的分母）")
     parser.add_argument("--top", type=int, default=10, help="每类明细最多显示条数（默认 10）")
     parser.add_argument("--json", action="store_true", help="输出机器可读 JSON（同结构）")
+    parser.add_argument("--advisory", action="store_true",
+                        help="诊断模式：恒返回 0（默认严格：有红 ⇒ 1）")
     parser.add_argument("--stamina-full", type=float, default=270.0, help="满体力（默认 270，用于睡觉时机判定）")
     parser.add_argument("--sleep-pct", type=float, default=0.60,
                         help="睡前体力比例超过它就判'体力还充裕就睡了'（默认 0.60）")
@@ -2192,7 +2247,10 @@ def main(argv=None):
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print(render_text(report, args.top))
-    return 0
+    red_total = int((report.get("red") or {}).get("total") or 0)
+    if args.advisory:
+        return 0
+    return 1 if red_total else 0
 
 
 if __name__ == "__main__":
