@@ -17,7 +17,7 @@
 ## 2 冻结与装机（Lead 独占，链条冻结后一次做完）
 
 1. 确认 `task-50/51/52/56` 全部 completed、工作树干净、`git log -1` 记录 HEAD。
-2. 写 `tools\_note-0725.txt`（中文单行：本版四张卡一句话）。
+2. `tools\_note-0725.txt` **已预写**（四张卡一句话）；冻结前对照最终交付复核一遍，哪张卡没进本版就改这一句。⚠️ **文件必须以 `v0.7.25` 开头** —— 否则 `_bump-mod-version.py` 只打印一行"说明文件应以 v0.7.25 开头"的告警并**原样保留旧 Version**（本轮已在临时副本上实测，见 STEP 3 的预演）。
 3. `python tools\_bump-mod-version.py 0.7.25 --note-file tools\_note-0725.txt`
 4. 改 `brain\agentfarm\bridge.py` 的 `MOD_VERSION_EXPECTED = "0.7.25"`（注释列本版内容）。
 5. `dotnet build .\mod\AgentFarm.Bridge\AgentFarm.Bridge.csproj -c Release --nologo --no-incremental` ⇒ **0 警 0 错**。
