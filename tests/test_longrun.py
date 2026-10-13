@@ -34,8 +34,9 @@ from agentfarm.farmwork import (  # noqa: E402
     MAX_CLEAR_SWINGS, FarmWorker, STAGE_ACTION, StepResult, StageResult, seed_items,
 )
 from agentfarm.longrun import (  # noqa: E402
-    DEFAULT_LLM_MAX_TOKENS, ENDED_BY_MODAL, JUSTIFIED_END_REASONS, MAX_ENV_ATTEMPTS,
-    MAX_TILE_ATTEMPTS, DayReport, LongRun, _till_blocked_by, is_justified_end, plot_observe,
+    DEFAULT_LLM_MAX_TOKENS, ENDED_BY_EVENT, ENDED_BY_MODAL, JUSTIFIED_END_REASONS,
+    MAX_ENV_ATTEMPTS, MAX_TILE_ATTEMPTS, DayReport, LongRun, _till_blocked_by, is_justified_end,
+    plot_observe,
 )
 from agentfarm.planner import BoundaryPlanner, TaskIntent, deterministic_plan  # noqa: E402
 
@@ -2274,6 +2275,262 @@ class TestMorningIndoor(unittest.TestCase):
         self.assertIn("先回农场", text)
         self.assertTrue(run.work_reasons(obs), run.work_reasons(obs))   # B：farm 口径也算"有活"
         self.assertEqual(run._farm_scope_work(obs), (1, 0), obs.get("farm"))
+
+
+class TestTask41EventBlocked(unittest.TestCase):
+    """task-41：`ui.eventUp=true`（游戏事件/剧情对话）**一律硬停**，绝不代游戏做选择。
+
+    真机证据（2026-10-13 19:16–19:19，run4 起跑前）：农场里弹出流浪宠物认养事件
+    （`eventUp=true`、`DialogueBox`「Hello Jay!」、`worldAdvancing=false` 135 秒零推进）。
+    Mod 用游戏自己的 `closeDialogue()` 关掉第一句时，事件反而把它算作"这句说完了"而**推进**
+    一句；事件里带 `Yes/No` 时还会被 `ModalDismiss` 默认选"否" —— 两条都不可逆、账本看不出来。
+    ⇒ 政策：`eventUp=true` 时 **一次都不动手**，当天 `blocked_event` 停下等人。
+    `eventUp=false` 的老四类行为（提问/普通对话/LevelUpMenu/存档只等）一字不改。
+
+    变异自检（2026-10-13，`%TEMP%\\t41_mutate.py`）：去掉 `eventUp` 判断（`_event_blocked` 直接
+    `(obs, False)`）⇒ 本类 `test_event_dialogue_…` 与 `test_event_question_…` **两条皆红**；
+    基线（无变异）7/7 绿。
+    """
+
+    def _run(self, w: FakeWorld) -> LongRun:
+        run = make_run(w, target_days=1)
+        run.worker = FakeWorker(w)
+        run.client = FakeClient(w)
+        return run
+
+    @staticmethod
+    def _rep() -> DayReport:
+        return DayReport(day_key=("spring", 1, 9), started_at=0.0)
+
+    @staticmethod
+    def _events(run: LongRun, event: str) -> list[dict]:
+        return [e for e in run.entries if e["event"] == event]
+
+    def test_event_dialogue_is_never_dismissed_and_day_is_not_verified(self):
+        """①`eventUp=true` + 普通 DialogueBox ⇒ 不 dismiss、`blocked_event`、`run()` 非 0。"""
+        w = FakeWorld(weeds=0, seeds=10, money=500)
+        w.ui_script = [{"activeMenu": "DialogueBox", "activeMenuText": "Hello Jay!",
+                        "dialogueResponses": [], "dialogueIsQuestion": False, "eventUp": True}]
+        run = self._run(w)
+
+        code = run.run()
+
+        self.assertEqual(code, 1, run.logs)
+        self.assertEqual(w.dismiss_calls, 0, "游戏事件一次都不许关（关框=替游戏做选择）")
+        ev = self._events(run, "event_blocked")
+        self.assertEqual(len(ev), 1, run.entries)
+        self.assertEqual((ev[0]["activeMenu"], ev[0]["activeMenuText"]),
+                         ("DialogueBox", "Hello Jay!"), ev[0])
+        self.assertEqual(ev[0]["dialogueResponses"], [], ev[0])
+        self.assertEqual(ev[0]["dialogueIsQuestion"], False, ev[0])
+        self.assertIsNotNone(ev[0]["tile"], ev[0])
+        self.assertIsInstance(ev[0]["timeOfDay"], int, ev[0])
+        self.assertIsNotNone(ev[0]["worldSeq"], ev[0])
+        rep = run.days[0]
+        self.assertEqual(rep.ended_by, ENDED_BY_EVENT, rep.ended_reason)
+        self.assertFalse(rep.checks.get("no_blocking_modal", True), rep.checks)
+        self.assertFalse(rep.verified, f"{rep.checks} notes={rep.notes}")
+        self.assertTrue(any("eventUp" in n for n in rep.notes), rep.notes)
+        # `run()` 早退：不许对同一天再来一遍（同一条 journal 会写两次）
+        self.assertEqual(len(run.days), 1, [d.day_text for d in run.days])
+
+    def test_event_question_is_never_answered(self):
+        """②`eventUp=true` + **提问**对话 ⇒ 同样一次都不许碰（否则被默认选"否"）。"""
+        w = FakeWorld(weeds=0)
+        w.ui_script = [{"activeMenu": "DialogueBox", "activeMenuText": "领养这只宠物吗？",
+                        "dialogueIsQuestion": True, "dialogueResponses": ["Yes", "No"],
+                        "eventUp": True}]
+        run = self._run(w)
+        rep = self._rep()
+
+        obs, blocked = run._clear_modals(w.obs(), rep)
+
+        self.assertTrue(blocked)
+        self.assertEqual(w.dismiss_calls, 0, "事件里的提问绝不许代选（Mod 口径是选否）")
+        self.assertEqual(rep.ended_by, ENDED_BY_EVENT)
+        self.assertEqual(len(self._events(run, "event_blocked")), 1, run.entries)
+        self.assertEqual(len(self._events(run, "modal_dismissed")), 0, run.entries)
+        self.assertTrue(run._modal_info(obs)[0], "事件还开着：不许假装清干净了")
+
+    def test_eventup_false_plain_dialogue_still_dismissed_once(self):
+        """③回归：`eventUp=false` 的普通 DialogueBox 仍按 cancel 关掉一次。"""
+        w = FakeWorld(weeds=0)
+        w.ui_script = [{"activeMenu": "DialogueBox", "activeMenuText": "普通对话",
+                        "eventUp": False}]
+        run = self._run(w)
+        rep = self._rep()
+
+        obs, blocked = run._clear_modals(w.obs(), rep)
+
+        self.assertFalse(blocked, rep.ended_reason)
+        self.assertEqual(w.dismiss_calls, 1)
+        self.assertEqual(len(self._events(run, "event_blocked")), 0, run.entries)
+
+    def test_eventup_false_sleep_question_still_goes_the_old_way(self):
+        """④回归：`eventUp=false` + 睡觉提问 ⇒ 仍走 Mod 的"选否"口径（老行为不改）。"""
+        w = FakeWorld(weeds=0)
+        w.ui_script = [{"activeMenu": "DialogueBox", "activeMenuText": "上床睡觉？",
+                        "dialogueIsQuestion": True, "dialogueResponses": ["是", "否"],
+                        "eventUp": False}]
+        run = self._run(w)
+        rep = self._rep()
+
+        obs, blocked = run._clear_modals(w.obs(), rep)
+
+        self.assertFalse(blocked, rep.ended_reason)
+        self.assertEqual(w.dismiss_calls, 1)
+        dis = self._events(run, "modal_dismissed")
+        self.assertEqual(len(dis), 1, run.entries)
+        self.assertEqual(dis[0]["kind"], "question", dis[0])
+
+
+class _IndoorNoFarmEvidenceWorld(FakeWorld):
+    """室内 + `farm` 证据不可用（`complete=false`/`loaded=false`）的假世界（task-41 NIT-2）。
+
+    室内窗口按真机口径**是空的**（`location.tiles/tillable/furniture` 全清）⇒ `_ensure_plot`/
+    `_work_spot_plot`/`_near_player_plot` 都拿不出目标；`farm` 块又不可用 ⇒ 判据只能 fail-closed。
+    复刻 run3 那 4 天：若 `sleep_guard` 退回窗口口径，就会放行 `no_work` 连睡。
+    """
+
+    def __init__(self, **kw) -> None:
+        super().__init__(**kw)
+        self.farm = {"loaded": False, "complete": False, "crops": 0,
+                     "dryCrops": None, "ripeCrops": None}
+
+    def obs(self) -> dict:
+        obs = super().obs()
+        obs["player"]["location"] = "FarmHouse"
+        obs["location"]["name"] = "FarmHouse"
+        obs["location"]["isOutdoorFarm"] = False
+        obs["location"]["tiles"] = []
+        obs["location"]["tillable"] = []
+        obs["location"]["furniture"] = []
+        return obs
+
+
+class TestTask41FarmEvidenceFailClosed(unittest.TestCase):
+    """task-41 NIT-2：室内 + farm 证据不可用 ⇒ **fail-closed**，绝不放行 `no_work`。
+
+    为什么必须这么严（Lead rev4 §10 的硬要求）：`_run_day` 里 `why` 是
+    `("no_work" if not reasons else "stuck:守卫说还有活（…）")` ⇒ 只要 `work_reasons()` **没给出**
+    这条理由，`reasons` 为空就会落回 `no_work`，run3 连睡 4 天的路径原地复活（改了等于没改）。
+    有界性**不靠** `idle_rounds`：`spot is None` 那条单次分支一天只走一次、不空转。
+
+    变异自检（2026-10-13，`%TEMP%\\t41_mutate.py`）：m41a（`sleep_guard` 把 fail-closed 退回
+    `no_work` 放行）与 m41b（`_farm_scope_work` 恒 None 且 `work_reasons()` 不加那条理由）
+    ⇒ 本类**两条用例皆红**（后者正是 rev4 §10 说的"只改 sleep_guard 等于没改"）；基线 7/7 绿。
+    """
+
+    @staticmethod
+    def _events(run: LongRun, event: str) -> list[dict]:
+        return [e for e in run.entries if e["event"] == event]
+
+    def test_indoor_without_farm_evidence_never_says_no_work(self):
+        w = _IndoorNoFarmEvidenceWorld(weeds=0, seeds=0, money=0)
+        run = make_run(w, target_days=1)
+        run.worker = FakeWorker(w)
+        run.client = FakeClient(w)
+        obs = w.obs()
+
+        allow, code, text = run.sleep_guard(obs)
+
+        self.assertFalse(allow, (allow, code, text))
+        self.assertEqual(code, "keep_working")
+        self.assertNotEqual(code, "no_work")
+        self.assertIn("farm 证据不可用", text)
+        # `work_reasons()` 也必须给出这条（否则 `_run_day` 的 `why` 会落回 `no_work`）
+        reasons = run.work_reasons(obs)
+        self.assertTrue(any("farm 证据不可用" in r for r in reasons), reasons)
+        ev = self._events(run, "farm_evidence_unavailable")
+        self.assertEqual(len(ev), 1, run.entries)
+        self.assertEqual((ev[0]["complete"], ev[0]["loaded"], ev[0]["location"]),
+                         (False, False, "FarmHouse"), ev[0])
+
+    def test_day_never_ends_with_no_work_when_farm_evidence_is_missing(self):
+        """整日跑完：`ended_reason` 前缀**不是** `no_work`（m41a/m41b 两态变异都该在这条上红）。"""
+        w = _IndoorNoFarmEvidenceWorld(weeds=0, seeds=0, money=0)
+        run = make_run(w, target_days=1, max_days=1)
+
+        code = run.run()
+
+        self.assertEqual(code, 1, run.logs)
+        rep = run.days[0]
+        self.assertNotEqual(rep.ended_reason.split(":", 1)[0], "no_work",
+                            f"run3 连睡路径复活：{rep.ended_reason}｜notes={rep.notes}")
+        self.assertFalse(rep.checks.get("day_justified", True),
+                         f"白天被当成正当收工了：{rep.ended_reason}｜{rep.checks}")
+        self.assertFalse(rep.verified, f"{rep.checks} notes={rep.notes}")
+        self.assertEqual(len(self._events(run, "farm_evidence_unavailable")), 1, run.entries)
+
+
+class FlipIndoorWorld(FakeWorld):
+    """`_prepare` 期间"人在农场"（好让它别失败），日循环一开始就翻成室内（复刻 run3 睡醒现场）。"""
+
+    def __init__(self, **kw) -> None:
+        super().__init__(**kw)
+        self.obs_calls = 0
+
+    def obs(self) -> dict:
+        self.obs_calls += 1
+        if self.obs_calls > 1:            # 第 1 次是 `_prepare()` 的观测
+            self.location = "FarmHouse"
+            self.is_outdoor_farm = False
+        return super().obs()
+
+
+class _CannotGoHomeWorker(FakeWorker):
+    """`ensure_location` 恒失败（回不去农场）+ `run_stage` 一格都动不了（世界指纹不变）。
+
+    后者让日循环走到 `idle_rounds>=3` ⇒ 当天如实 `stuck`（task-41 NIT-1 的"动作数有界"）。
+    """
+
+    def __init__(self, world: FakeWorld) -> None:
+        super().__init__(world)
+        self.goto_calls = 0
+
+    def ensure_location(self, name, *, tile=None, timeout_ms=30000):
+        self.goto_calls += 1
+        return StepResult("move_to_location", ok=False, code="timeout",
+                          reason=f"去 {name} 失败：timeout（本跳试过的格子：(64,14)=unreachable）")
+
+    def run_stage(self, stage, tiles, *, min_stamina=12.0, max_steps=200):
+        steps = [StepResult(STAGE_ACTION.get(stage, stage), tuple(t), ok=False, code="failed",
+                            reason="假世界：这一格干不动") for t in tiles]
+        return StageResult(stage=stage, steps=steps, stopped="", stopped_reason="")
+
+
+class TestTask41CannotGoHome(unittest.TestCase):
+    """task-41 NIT-1：把"回不去农场"分支固化成用例（不许只靠探针）。"""
+
+    @staticmethod
+    def _events(run: LongRun, event: str) -> list[dict]:
+        return [e for e in run.entries if e["event"] == event]
+
+    def test_cannot_go_home_ends_stuck_with_one_failed_goto(self):
+        w = FlipIndoorWorld(weeds=4, seeds=10, money=500)
+        # farm 证据可用（不是 NIT-2 那条路）：这里要测的是"回不去农场 + 干不动 ⇒ 如实 stuck"
+        w.farm = {"loaded": True, "complete": True, "crops": 0, "dryCrops": 0,
+                  "ripeCrops": 0, "unwateredCrops": 0, "hoeDirt": 0}
+        run = make_run(w, target_days=1, max_days=1,
+                       client_factory=lambda: FakeClient(w),
+                       worker_factory=lambda c: _CannotGoHomeWorker(w))
+
+        code = run.run()
+
+        self.assertEqual(code, 1, run.logs)
+        rep = run.days[0]
+        goto = self._events(run, "goto_farm")
+        self.assertEqual(len(goto), 1, run.entries)
+        self.assertEqual(goto[0].get("where"), "day_start", goto[0])
+        self.assertFalse(goto[0]["ok"], goto[0])
+        self.assertEqual(goto[0]["code"], "timeout", goto[0])
+        self.assertTrue(any("回不去 Farm" in n for n in rep.notes), rep.notes)
+        self.assertEqual(rep.ended_by, "stuck", rep.ended_reason)
+        self.assertFalse(rep.verified, f"{rep.checks} notes={rep.notes}")
+        # 有界：一天只有一次 goto 尝试；动作数被 `idle_rounds>=3` 那三条决策轮钉住
+        # （本夹具实测 26：3 轮 × 每轮至多 `per_stage_tiles` 步；deputy 探针的 4 是零障碍夹具）。
+        self.assertLessEqual(run.summary.get("actions", 0), 40, run.summary.get("actions"))
+        self.assertEqual(len(run.days), 1, [d.day_text for d in run.days])
 
 
 if __name__ == "__main__":

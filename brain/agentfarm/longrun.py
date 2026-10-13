@@ -97,6 +97,18 @@ MODAL_MAX_DISMISS = 10
 #: 它同时让 `slept_by_us=false` ⇒ 当天**不判 VERIFIED**（宁可停下等人，也不静默丢档）。
 ENDED_BY_MODAL = "blocked_modal"
 
+#: 【task-41】`ui.eventUp == true`（游戏事件/剧情对话挂住）对应的 `ended_by`。
+#: 真机证据（2026-10-13 19:16–19:19，run4 起跑前）：农场里的流浪宠物认养事件让
+#: `eventUp=true` + `DialogueBox`「Hello Jay!」+ `worldAdvancing=false` **135 秒零推进**；
+#: 而 Mod 用游戏自己的 `closeDialogue()` 去关第一句时，事件反而把它算作“这句说完了”而
+#: **推进**到下一句；若事件里带 `Yes/No`，`ModalDismiss` 的选否口径还会替玩家**默认选“否”**。
+#: 两条都不可逆、账本也看不出来 ⇒ 政策改成：**事件一律视为阻断模态，一次都不动手**。
+ENDED_BY_EVENT = "blocked_event"
+
+#: 两个“阻断型”收尾：都要人来处理 ⇒ 当天 `slept_by_us=false`、`no_blocking_modal=false`
+#: ⇒ `verified=false`，且 `run()` 当场早退（同一天再跑一遍没有意义）。
+BLOCKING_ENDS = (ENDED_BY_MODAL, ENDED_BY_EVENT)
+
 
 def _dist(a: tuple[int, int], b: tuple[int, int]) -> int:
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
@@ -432,6 +444,9 @@ class LongRun:
         self.plots_today = 0
         # 【task-32】当天是否已经播报过 `plots_capped`（作业区软上限触顶）。一天只记一次。
         self.plots_capped_noted = False
+        # 【task-41 NIT-2】当天是否已经播报过 `farm_evidence_unavailable`（室内 + farm 证据不可用
+        # ⇒ fail-closed，绝不放行 `no_work`）。一天只记一次，免得每轮刷同一条 journal。
+        self.farm_evidence_noted = False
         self.refills_today = 0
         self.idle_rounds = 0
         self.fail_streak = 0
@@ -1037,11 +1052,37 @@ class LongRun:
                 reasons.append(f"人不在农场，但 farm 口径还有 {dry} 格干作物（先回去浇）")
             if ripe > 0:
                 reasons.append(f"人不在农场，但 farm 口径还有 {ripe} 格熟作物（先回去收）")
+        elif not self._is_farm(obs):
+            # 【task-41 NIT-2，Lead rev4 §10 硬要求】人在室内、而 `farm` 证据不可用
+            # （`complete` 不为 true / `loaded` 为 false）⇒ 这条理由**必须出现在这里**：
+            # `_run_day` 里 `why = ("no_work" if not reasons else "stuck:守卫说还有活（…）")`
+            # ⇒ 理由缺失就会落回 `no_work`，run3 连睡 4 天的路径原地复活。
+            reasons.append(self._farm_evidence_reason(obs))
         for cand in self._plot_candidates(obs):
             if self._plot_has_work(obs, cand["tiles"]):
                 reasons.append(f"{cand.get('zone') or '附近'}还有地要清/开/种")
                 break
         return reasons
+
+    def _farm_evidence_reason(self, obs: dict[str, Any]) -> str:
+        """室内 + `farm` 证据不可用时的"还有活"理由（task-41 NIT-2，fail-closed）。
+
+        为什么这算"还有活"：**不知道**地里干没干 ⇒ 绝不许据此判"没活可做"（run3 连睡 4 天就是这么来的）。
+        有界性**不靠** `idle_rounds`（它只在走完 `_execute` 且世界指纹没变时才涨）：`_run_day` 的
+        `spot = _work_spot_plot(...) or _near_player_plot(...)` 为 `None` 那条**单次分支**会直接
+        `<ended_by>="stuck"` + `break`，一天只走一次、不空转。
+        journal `farm_evidence_unavailable` 每天最多一条（`self.farm_evidence_noted`）。
+        """
+        farm = obs.get("farm") or {}
+        loc = str((obs.get("location") or {}).get("name") or "?")
+        if not self.farm_evidence_noted:
+            self._journal("farm_evidence_unavailable", complete=farm.get("complete"),
+                          loaded=farm.get("loaded"), location=loc,
+                          note="人在室内但 farm 证据不可用（complete/loaded）⇒ 不许判 no_work；"
+                               "先回农场再判，当天拿不出目标则以 stuck 如实收尾（一天只走一次，不空转）")
+            self.farm_evidence_noted = True
+        return (f"人在室内（{loc}）且 farm 证据不可用（farm.complete={farm.get('complete')!r}/"
+                f"loaded={farm.get('loaded')!r}）⇒ farm 口径不算证据，先回农场再判有没有活")
 
     def _can_water(self, obs: dict[str, Any]) -> tuple[bool, str]:
         """还能不能继续浇：有壶，且壶里有水（或能去补水 / 无尽壶）。
@@ -1092,6 +1133,10 @@ class LongRun:
                 f"人在室内（{loc}）、farm 口径还有 {farm_work[0]} 格干作物 / "
                 f"{farm_work[1]} 格熟作物，先回农场再说"
             )
+        if farm_work is None and not self._is_farm(obs):
+            # 【task-41 NIT-2】证据不可用 ⇒ fail-closed：**绝不**退回窗口口径放行 `no_work`
+            # （run3 那 4 天连睡就是这么来的）。理由与 `work_reasons` 共用一份实现，避免口径漂移。
+            return False, "keep_working", self._farm_evidence_reason(obs)
         reasons = self.work_reasons(obs)
         if not reasons:
             return True, "no_work", "确实找不到可做的活（地里的活干完了、也没法/没必要买种子）"
@@ -1355,9 +1400,10 @@ class LongRun:
                     note="环境挡路（渐黑/模态/没存档/Mod 忙）不是「这活没干成」⇒ 先收掉挡路模态，"
                          "再重跑同一批格子；事后做成就没有硬失败")
                 if modal_blocked:
-                    # 模态关不掉（职业选择弹窗等）⇒ 当天到此为止：`rep.ended_by` 已被设成
-                    # `blocked_modal`，`_run_day` 会在 `_execute` 之后立刻收工。
-                    stopped = "blocked_modal"
+                    # 模态关不掉（职业选择弹窗等）/ 游戏事件挂住（task-41）⇒ 当天到此为止：
+                    # `rep.ended_by` 已被设成 `blocked_modal` 或 `blocked_event`，
+                    # `_run_day` 会在 `_execute` 之后立刻收工。
+                    stopped = rep.ended_by or ENDED_BY_MODAL
                     break
                 forced = tiles
                 continue
@@ -1728,6 +1774,10 @@ class LongRun:
         `"blocked_modal"`（⇒ `slept_by_us=false` ⇒ 当天**不判 VERIFIED**）。
 
         三种处置（判据只看观测，不看回执）：
+          * **游戏事件（硬停，task-41）**：`ui.eventUp == true` ⇒ **一次都不动手**。关框会替游戏
+            推进剧情（实测：`closeDialogue()` 让事件把第一句算作"说完了"）、事件里的 `Yes/No`
+            还会被默认选"否"，两条都不可逆 ⇒ `ended_by="blocked_event"`、停下等人（详见
+            `_event_blocked`）。
           * **wait-only**：`SaveGameMenu`/`NewDaySavingMenu` —— 新一天的自动存档，**绝不 dismiss**
             （可能打断存档），轮询到它自己消失；超时记 `modal_timeout` 并停下等人。
           * **dismiss**：普通 `LevelUpMenu`（`professionsToChoose` 为空数组=这一级没有职业可选）、
@@ -1746,6 +1796,11 @@ class LongRun:
             is_modal, menu, ui = self._modal_info(obs)
             if not is_modal:
                 return obs, False
+
+            # ⓪ **游戏事件**（`ui.eventUp == true`）：一律硬停，绝不代游戏做决定（task-41）。
+            # 放在最前面：事件往往就是个 `DialogueBox`，先判提问/普通对话框就会把它关掉。
+            if ui.get("eventUp") is True:
+                return self._event_blocked(obs, rep)
 
             # ① 提问（DialogueBox 开着提问时 isModal 为真）：走 Mod 的“选否”口径，绝不注入确认键
             if ui.get("dialogueIsQuestion") or ui.get("dialogueResponses"):
@@ -1810,6 +1865,39 @@ class LongRun:
         self._say(f"× 被模态挡住，停下等人：{reason}")
         return obs, True
 
+    def _event_blocked(self, obs: dict[str, Any], rep: DayReport) -> tuple[dict[str, Any], bool]:
+        """游戏事件挂住（`ui.eventUp=true`）：**绝不代游戏做决定** ⇒ 当天停下等人（task-41）。
+
+        为什么连“关一下框”都不许（真机，2026-10-13 19:19，run4 起跑前）：
+          * 事件的第一句被 `closeDialogue()` 关掉后，游戏把它算作“这句说完了”而**推进**剧情
+            （`"Hello Jay!"` → 流浪宠物台词）—— 关框＝替游戏做决定，且不可逆；
+          * 事件里出现 `Yes/No` 时，`ModalDismiss` 的选否口径会替玩家**默认选“否”**（事件分支被悄悄改掉）；
+          * 账本对此一无所知 ⇒ 无人值守的验收可能悄悄改存档剧情状态。
+
+        所以这里的收尾与“职业选择”同款：`ended_by="blocked_event"` ⇒ `checks.no_blocking_modal=False`
+        ⇒ 当天 `verified=False`，并由 `run()` 早退等人处理。**不 dismiss / 不 sleep / 不 load_save。**
+        """
+        ui = obs.get("ui") or {}
+        menu = str(ui.get("activeMenu") or "")
+        text = str(ui.get("activeMenuText") or "")
+        tile = FarmWorker.player_tile(obs)
+        self._journal("event_blocked",
+                      activeMenu=ui.get("activeMenu"), activeMenuText=ui.get("activeMenuText"),
+                      dialogueIsQuestion=ui.get("dialogueIsQuestion"),
+                      dialogueResponses=list(ui.get("dialogueResponses") or []),
+                      tile=list(tile) if tile else None,
+                      timeOfDay=FarmWorker.time_of_day(obs),
+                      worldSeq=obs.get("worldSeq"),
+                      note="游戏事件挂住（ui.eventUp=true）：关框会替游戏推进剧情/默认选否 ⇒ "
+                           "不 dismiss / 不 sleep / 不 load_save，当天不判 VERIFIED，等人处理")
+        rep.ended_by = ENDED_BY_EVENT
+        rep.ended_reason = (f"游戏事件挂住（eventUp=true）：{menu or '?'}"
+                            + (f"「{text}」" if text else ""))
+        rep.notes.append("游戏事件挂住（eventUp），按政策停下等人：不 dismiss / 不 sleep / 不 load_save")
+        self._say(f"× 游戏事件挂住（eventUp）⇒ 停下等人：{menu or '?'}"
+                  + (f"「{text}」" if text else ""))
+        return obs, True
+
     # ------------------------------------------------------------------ 一天
     def _run_day(self) -> DayReport:
         obs = self._snap()
@@ -1819,6 +1907,7 @@ class LongRun:
         self.zone_name = ""
         self.plots_today = 0
         self.plots_capped_noted = False
+        self.farm_evidence_noted = False
         self.refills_today = 0
         self.idle_rounds = 0
         self.blocked = {}
@@ -2053,7 +2142,7 @@ class LongRun:
             "slept_by_us": rep.ended_by == "sleep",
             # task-11：被不可逆/不敢关的模态挡住（职业选择、存档超时）时，这一天**不算数**。
             # 用户 m03224 拍板了职业路线：宁可停下等人，也不静默丢档。
-            "no_blocking_modal": rep.ended_by != ENDED_BY_MODAL,
+            "no_blocking_modal": rep.ended_by not in BLOCKING_ENDS,
             "no_hard_failures": rep.failed_steps == 0,
             "no_unmet_stages": unmet_leftover == 0,
             "crops_watered": int(rep.final.get("unwatered_crops") or 0) == 0,
@@ -2190,9 +2279,9 @@ class LongRun:
                 break
             prev_key = self._last_day_key
             rep = self._run_day()
-            if rep.ended_by in ("bridge_down", "stop", ENDED_BY_MODAL):
-                # `blocked_modal`（职业选择 / 存档模态超时）要**人来处理**：再跑一遍同一天没有意义，
-                # 只会把同一条 journal 又写一次。
+            if rep.ended_by in ("bridge_down", "stop", *BLOCKING_ENDS):
+                # `blocked_modal`（职业选择 / 存档模态超时）/ `blocked_event`（游戏事件挂住）
+                # 都要**人来处理**：再跑一遍同一天没有意义，只会把同一条 journal 又写一次。
                 self._say(f"× 停下：{rep.ended_by} {rep.ended_reason}")
                 break
             if prev_key is not None and self._last_day_key == prev_key:
