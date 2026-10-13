@@ -34,7 +34,9 @@
 python tools\start-detached-longrun.py --journal logs\longrun-3day-llm-run6.jsonl --expect-version 0.7.25
 ```
 
-- 它做的事：①PID 还活着就拒绝重复起跑（退 3）②`--expect-version` 时先跑 `preflight`，红灯就不起跑（退 4）③起 `tools\run-longrun.py`，stdout/stderr 落 `logs\longrun-3day-llm-run6.console{,.err}.log` ④写 `logs\longrun-3day-llm-run6.pid` 与 `…version.json`（HEAD / 三个被测文件 SHA256+mtime / PID+起跑时刻 / `git status --short`）⑤体检 90 秒后打印 console 尾部与账本行数**然后返回**（进程继续跑）。
+- 它做的事：①PID 还活着就拒绝重复起跑（退 3）②`--expect-version` 时先跑 `preflight`，红灯就不起跑（退 4）③起 `tools\run-longrun.py`，stdout/stderr 落 `logs\longrun-3day-llm-run6.console{,.err}.log` ④写 `logs\longrun-3day-llm-run6.pid` 与 `…version.json`（HEAD / 被测文件 SHA256+mtime = `longrun.py`+`farmwork.py`+`bridge.py`+**Mod dll**+**manifest.json** / PID+起跑时刻 / `git status --short`）⑤体检 90 秒后打印 console 尾部与账本行数**然后返回**（进程继续跑）。
+- 先跑一次 `--dry-run` 看四要素（不起进程），再真起跑；冒烟实测（`4aa2369` 后）：`--dry-run` 打出 HEAD `727a767…` + 五个文件 SHA256/mtime + `工作树干净 = False（11 项未提交）`；真起跑冒烟曾以独立进程 PID 26956 + sidecar + console 尾部 `[bridge_file_missing]` 快速失败验证链路。
+- 子进程环境由起跑器写死 `PYTHONUTF8=1` / `PYTHONIOENCODING=utf-8` / `PYTHONPATH=<repo>\brain` ⇒ 在哪个 shell 调用都不影响长跑的 import 与中文编码；起跑器自身也把 stdout/stderr 重配成 UTF-8（cp1252 的 Python 会 `UnicodeEncodeError`）。
 - 它**不**判达标、不关框、不替游戏做选择、不杀进程；跑完仍在跑时**先别退游戏**（Lead 要 live observe 对账）。
 - 需要手工起时（备用）：
 
