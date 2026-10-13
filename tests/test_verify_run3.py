@@ -191,5 +191,47 @@ class TestVerifyRun3(unittest.TestCase):
         self.assertEqual(s["verified_streak_tail"], 1)
 
 
+    # ------------------------------------------------------------ LLM 覆盖口径（Lead 2026-10-14 裁定）
+    def test_llm_fallback_is_not_counted_as_model_output(self):
+        """run2 L17 分歧：`llm=true` + `source=deterministic_fallback` 只算"发起过调用"。
+
+        两个数都要有：`decisions_llm`（调用）与 `decisions_llm_used`（模型结果真被采纳），
+        否则 run6 的"LLM 覆盖"会把截断后的兜底也算成模型产出。
+        """
+        rows = green_rows()
+        rows.insert(1, {"event": "decision", "llm": True, "source": "llm", "boundary": "new_day",
+                        "t": 5.0, "_lineno": 2})
+        rows.insert(2, {"event": "decision", "llm": True, "source": "deterministic_fallback",
+                        "boundary": "new_day", "fallback": "llm_error:truncated", "t": 6.0,
+                        "_lineno": 3})
+        rows.insert(3, {"event": "decision", "llm": False, "source": "deterministic",
+                        "t": 7.0, "_lineno": 4})
+        ok, s = self.check(rows)
+        self.assertTrue(ok, f"决策计数不该影响结论：{s.get('problems')}")
+        self.assertEqual(s["decisions"], 3)
+        self.assertEqual(s["decisions_llm"], 2)          # 发起过调用
+        self.assertEqual(s["decisions_llm_used"], 1)     # 真采用模型结果
+        self.assertEqual(s["decisions_llm_fallback"], 1)
+        self.assertTrue(any("兜底" in i for i in s["infos"]), s["infos"])
+
+    def test_no_fallback_means_no_extra_info(self):
+        rows = green_rows()
+        rows.insert(1, {"event": "decision", "llm": True, "source": "llm", "t": 5.0, "_lineno": 2})
+        ok, s = self.check(rows)
+        self.assertTrue(ok)
+        self.assertEqual((s["decisions_llm"], s["decisions_llm_used"], s["decisions_llm_fallback"]),
+                         (1, 1, 0))
+        self.assertFalse(any("兜底" in i for i in s["infos"]), s["infos"])
+
+    def test_llm_error_without_flag_is_still_counted_as_called_only(self):
+        """即使 `llm` 字段缺失/为假，只要 `source==llm` 也不该被算成"没调用" —— 口径各算各的。"""
+        rows = green_rows()
+        rows.insert(1, {"event": "decision", "source": "llm", "t": 5.0, "_lineno": 2})
+        ok, s = self.check(rows)
+        self.assertTrue(ok)
+        self.assertEqual(s["decisions_llm"], 0)
+        self.assertEqual(s["decisions_llm_used"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

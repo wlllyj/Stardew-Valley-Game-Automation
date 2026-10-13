@@ -21,7 +21,7 @@
 3. `python tools\_bump-mod-version.py 0.7.25 --note-file tools\_note-0725.txt`
 4. 改 `brain\agentfarm\bridge.py` 的 `MOD_VERSION_EXPECTED = "0.7.25"`（注释列本版内容）。
 5. `dotnet build .\mod\AgentFarm.Bridge\AgentFarm.Bridge.csproj -c Release --nologo --no-incremental` ⇒ **0 警 0 错**。
-6. 提交（manifest + bridge.py + 装机前所有在制文件）。
+6. 提交（manifest + bridge.py + 装机前所有在制文件）。⚠️ **必须 `git add -A`**：`scratch/*.py` 被 `.gitignore` 特别保留（`!scratch/*.py`），新写的探针脚本算"未跟踪 ⇒ 工作树脏"，会让 STEP 7 判红（本轮实测：`check-release.py --expect 9.9.9` 同时报出版本不符与 7 项未提交，两条红线都真的会响）。
 7. `python tools\check-release.py --expect 0.7.25` ⇒ **全绿**（manifest==brain、dll 不比源码旧、py_compile、全量单测、树干净）。
 8. `python tools\deploy-mod.py --no-quit` ⇒ 记录 dll/manifest 字节数与桥 `modVersion=0.7.25`。
 9. `python tools\preflight.py --expect 0.7.25 --save-baseline logs\run6-baseline.json` ⇒ 四项全绿（版本/已读档/户外农场/无模态）。

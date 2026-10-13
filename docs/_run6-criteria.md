@@ -56,6 +56,20 @@
 3. deputy-lead 三源对账器 `scratch/_t45_three_source.py`（账本 / 存档 XML / SMAPI 三源）。
 4. Lead 外部快照（`scratch/_run4_snapshot.py --tag start|end`：存档 size+mtime、SMAPI `NewDay`/`SaveGame` 累计、账本行数与 `finish`、PID 存活）。
 
+### 3.1 「LLM 覆盖」口径（Lead 2026-10-14 裁定，源自 log-analyst 在 run2 L17 发现的分歧）
+
+`decision` 行有两个**不同**的计数，四个工具都必须按同一口径报，不许混用：
+
+| 口径 | 判据 | 含义 | run2 实测 | run5 实测 |
+| --- | --- | --- | --- | --- |
+| `decisions_llm` | `llm == true` | **发起过**模型调用（含被拒/截断） | 7 | 33 |
+| `decisions_llm_used` | `llm == true and source == "llm"` | 模型结果**真被采纳** | 6 | 33 |
+| 二者之差 | `deterministic_fallback` | 模型答了但没用（截断/拒收后兜底） | 1（L17） | 0 |
+
+- 判据里说"LLM 覆盖"一律指 **`decisions_llm_used`**；`decisions_llm` 只作旁证。
+- run2 L17 = `llm=true` + `source=deterministic_fallback` + `fallback=llm_error:truncated` ⇒ **不算模型产出**。
+- 两数不等的账本，`tools/verify-run3.py` 会把差额记成 info（不改结论），`tools/analyze-longrun.py` 必须在头部点名该行号。
+
 ## 4. run6 起跑与收口纪律
 
 - 起跑前：`tools/preflight.py --expect 0.7.25 --save-baseline logs/run6-baseline.json` 四项全绿；记「版本四要素」（HEAD / 被测文件 SHA256+mtime / PID+StartTime / 工作树干净）。

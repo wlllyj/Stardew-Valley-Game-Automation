@@ -20,7 +20,9 @@
     按 `day_end.stages[].leftover` 自己算 —— 只认「做过且做完」，`blocked`/封格不得洗白成功。
 3c. **过程里没有异常事件**：`bridge_down` / `watchdog_stop` / `modal_timeout` / `no_day_progress`
     出现任意一条即判未达标（这些是"人不在场也出过事"的证据）。
-4. **LLM 覆盖**：`decision` 条数与其中 `llm==true` 的条数（长跑默认开 LLM）。
+4. **LLM 覆盖**：`decision` 条数、其中 `llm==true`（发起过模型调用）与 `source=="llm"`（模型结果真被采纳）
+   两档口径 —— 二者之差是 `deterministic_fallback`（模型答了但被拒/截断后兜底），**不算模型产出**
+   （Lead 2026-10-14 裁定，回答 log-analyst 在 run2 L17 上发现的口径分歧）。
 5. **尾部连续 VERIFIED 天数** >= `--days`；存在 `finish` 事件时**核对自述**：`code` 必须与
    本工具结论同向（自称达标而判未达标、或反之，都算账本自相矛盾）、`verified_streak` 不同则记信息项。
 6. **账本内部自洽**（deputy-lead `docs/_verify-run3-limits.md` §6 加固项）：
@@ -610,6 +612,17 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
     finish = next((r for r in reversed(rows) if r.get("event") == "finish"), None)
     decisions = [r for r in rows if r.get("event") == "decision"]
     llm_true = sum(1 for r in decisions if r.get("llm"))
+    # `llm=true` 只说明"发起过模型调用"：其中可能有 `source=deterministic_fallback`（模型答了但被拒/截断，
+    # 最终决策并非模型产出，run2 L17 就是这种）。真正"模型产出"= `source=="llm"`。两个数都报，
+    # 避免 run6 的"LLM 覆盖"虚高（Lead 2026-10-14 裁定）。
+    llm_used = sum(1 for r in decisions
+                   if r.get("llm") and str(r.get("source") or "") == "llm")
+    llm_fallback = llm_true - llm_used
+    if llm_fallback:
+        infos.append(
+            f"LLM 兜底 {llm_fallback} 条：发起过模型调用但最终没用模型结果"
+            f"（`source != llm`，多为截断/拒收后的 deterministic_fallback）"
+        )
 
     # finish 自述必须与本工具的结论同向（盲区 B1：K3 账本自称 code=1/streak=0 却全绿）
     def _ok_now() -> bool:
@@ -686,6 +699,8 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         "target_days": target_days,
         "decisions": len(decisions),
         "decisions_llm": llm_true,
+        "decisions_llm_used": llm_used,
+        "decisions_llm_fallback": llm_fallback,
         "finish": {k: v for k, v in (finish or {}).items() if k != "_lineno"},
         "problems": problems,
         "infos": infos,
@@ -728,7 +743,8 @@ def main(argv: list[str] | None = None) -> int:
             f"{d['stages']:<5}{d['ok_steps']:<5}{d['skipped']:<6}{d['failed']:<6}{d['verified']}"
         )
     print("")
-    print(f"decision {summary['decisions']} 条（其中 LLM {summary['decisions_llm']} 条）")
+    print(f"decision {summary['decisions']} 条（LLM 调用 {summary['decisions_llm']} 条 / "
+          f"其中模型产出 {summary.get('decisions_llm_used', summary['decisions_llm'])} 条）")
     if summary["finish"]:
         print(f"finish: {summary['finish']}")
     print(f"尾部连续 VERIFIED 天数 {summary['verified_streak_tail']} / 要求 {summary['target_days']}")
