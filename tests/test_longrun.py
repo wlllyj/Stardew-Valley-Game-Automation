@@ -2634,6 +2634,143 @@ class TestTask42Ship(unittest.TestCase):
         self.assertTrue(any("没能出货" in n or "失败" in n for n in rep.notes), rep.notes)
 
 
+class TestTask49CrossPlotNoWork(unittest.TestCase):
+    """task-49：run5 第 1 天「还有能做的活，却在中途判 `no_work` 去睡觉」（脑侧）。
+
+    真机证据（Lead 逐行读 `logs\\longrun-3day-llm-run5.jsonl`，spring 26 第 1 天）：
+    `t=205.46 till_area field_nw` 还剩 13 格（其中 4 格 `tool_ineffective` 已封）；`t=265.56
+    plots_capped 10/10 zone=field_se`；之后人在 field_se、玩家窗口里看不见 field_nw 的格子 ⇒
+    `t=304.78 sleep ok`、`ended_reason=no_work:…`（体力还剩 62.3）⇒ `day_end.verified=false`，
+    且 `final_water.dry=1` 这条"还有一格没浇"也一起被丢掉。第 2 天同型。
+
+    变异自检（**实测**，脚本 `%TEMP%\t49_mutate.py`，跑完即弃；基线 4/4 绿）：
+    * `m49a`：把 `LongRun._pending_work` 换成恒返回 `[]`（等于关掉跨片地记账）⇒
+      `test_unfinished_tile_elsewhere_blocks_no_work` **红**（`assertTrue(any("没做完"…))` 失败
+      ⇒ 守卫放行了 `no_work`）。
+    * `m49b`：把 `LongRun._farm_totals` 换成恒返回 `None`（等于去掉 `sleep_guard` 的 on-farm
+      `farm.dryCrops` 分支）⇒ `test_dry_crops_on_farm_without_water_are_not_plain_no_work`
+      **红**（`False is not true`：壶空但能补水时也放行睡觉了）。
+    """
+
+    @staticmethod
+    def _plot_nw() -> dict:
+        """"今天开过、还剩格子没做完"的那片地（field_nw）。"""
+        return {"zone": "field_nw", "label": "", "anchor": [60, 10],
+                "tiles": [(60, 10), (60, 11)], "note": ""}
+
+    def _run_for(self, w: FakeWorld, *, target_days: int = 1, max_days: int = 1):
+        """真 `FarmWorker` + 数数假桥；同时挂到 factories（`run()` 会用工厂重建，task-28 踩过）。"""
+        client = _CountingClient(w)
+        worker = FarmWorker(client, log=lambda *_: None)
+        run = make_run(w, target_days=target_days, max_days=max_days,
+                       client_factory=lambda: client, worker_factory=lambda c: worker)
+        run.worker = worker
+        run.client = client
+        return run, worker, client
+
+    def test_unfinished_tile_elsewhere_blocks_no_work(self):
+        """跨片地：field_nw 还有一格没做完，人站在别处 ⇒ 守卫**不许**放行睡觉。"""
+        w = MyopicWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        w.blockers[(60, 11)] = "weed"
+        w.fail_status[(60, 11)] = ["timeout"] * 8      # 拿不到结论 ⇒ 不封格，但占本日配额
+        run, _worker, _client = self._run_for(w)
+        w.player_tile = [60, 12]                       # 先站在那片地旁边（看得见）
+        rep = DayReport(day_key=("spring", 6, 1), started_at=0.0)
+
+        run._step_stage("clear_area", w.obs(), self._plot_nw(), rep)
+
+        self.assertEqual(run.blocked, {}, "timeout 是「没拿到结论」，绝不许封格")
+        self.assertEqual(run.leftover_targets, {(60, 11)}, "没做成的格子必须进跨片地记账")
+
+        w.player_tile = [70, 20]                       # 换到另一片地：窗口里看不见它了
+        w.revealed = False
+        obs = w.obs()
+        seen = {(int(t["tile"][0]), int(t["tile"][1])) for t in obs["location"]["tiles"]}
+        self.assertNotIn((60, 11), seen, "前提：换片地之后玩家窗口看不见留下的格子")
+
+        reasons = run.work_reasons(obs)
+        self.assertTrue(any("没做完" in r for r in reasons), reasons)
+        allow, code, text = run.sleep_guard(obs)
+        self.assertFalse(allow, f"还有没做完的格子却放行睡觉：{code} {text}")
+        resume = run._resume_plot(obs)
+        self.assertIsNotNone(resume, "有遗留就应给得出「回去接着做」的作业区")
+        self.assertEqual(resume["tiles"][0], (60, 11))
+
+    def test_all_leftovers_sealed_still_allows_no_work(self):
+        """反向：片里目标**全部**被证明干不动（封格）⇒ 才允许 `no_work` 收工（不许过度乐观）。"""
+        w = MyopicWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        w.blockers[(60, 11)] = "weed"
+        w.fail_status[(60, 11)] = "tool_ineffective"   # Mod 回「工具全无效」⇒ 判据成立
+        run, _worker, _client = self._run_for(w)
+        w.player_tile = [60, 12]
+        rep = DayReport(day_key=("spring", 6, 1), started_at=0.0)
+
+        run._step_stage("clear_area", w.obs(), self._plot_nw(), rep)
+
+        self.assertIn((60, 11), run.blocked, "「工具全无效」是这一格的结论，必须封到当天结束")
+        self.assertEqual(run.leftover_targets, set(), "封掉的格子不算「今天还有活」")
+
+        w.player_tile = [70, 20]
+        w.revealed = False
+        obs = w.obs()
+        self.assertEqual(run._pending_work(), [])
+        allow, code, _text = run.sleep_guard(obs)
+        self.assertTrue(allow, "片里目标全封了却仍不放行睡觉")
+        self.assertEqual(code, "no_work")
+
+    def test_dry_crops_on_farm_without_water_are_not_plain_no_work(self):
+        """农场口径还有干作物：能补水就继续干；**确实没水**才允许睡，且必须写成 `no_water`。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.farm = {"loaded": True, "complete": True, "crops": 37, "dryCrops": 1,
+                  "ripeCrops": 0, "unwateredCrops": 0, "hoeDirt": 30}
+        w.water_left = 0                                # 壶空，但观测里有补水点
+        run, _worker, _client = self._run_for(w)
+
+        allow, code, text = run.sleep_guard(w.obs())
+        self.assertFalse(allow, "壶空但能去补水 ⇒ 必须先补水再浇")
+        self.assertEqual(code, "keep_working")
+        self.assertIn("干作物", text)
+
+        class _NoRefill(FakeWorld):
+            def obs(self):
+                o = super().obs()
+                o["location"]["refillTiles"] = []
+                return o
+
+        w2 = _NoRefill(weeds=0, seeds=0, money=0)
+        w2.farm = dict(w.farm)
+        w2.water_left = 0
+        run2, _w2, _c2 = self._run_for(w2)
+
+        allow2, code2, text2 = run2.sleep_guard(w2.obs())
+        self.assertTrue(allow2, "打不到水 ⇒ 允许睡（但必须如实记账）")
+        self.assertEqual(code2, "no_water")
+        self.assertIn("想浇但无水", text2)
+        self.assertNotIn(code2, JUSTIFIED_END_REASONS,
+                         "「想浇但无水」不是「没活可做」，不许洗成 day_justified")
+
+    def test_persistent_unfinishable_work_is_bounded_and_never_no_work(self):
+        """有界性：永远做不成的活 ⇒ 当天可以收尾，但**不许**以 `no_work` 洗白，且动作数有上界。"""
+        w = MyopicWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        w.fail_status[(60, 10)] = "timeout"             # 每轮都拿不到结论
+        w.player_tile = [60, 12]                        # 站在这片地旁边：观测看得见它（真机口径）
+        w.farm = {"loaded": True, "complete": True, "crops": 0, "dryCrops": 0,
+                  "ripeCrops": 0, "unwateredCrops": 0, "hoeDirt": 0}
+        run, _worker, _client = self._run_for(w)
+
+        code = run.run()
+
+        rep = run.days[-1]
+        self.assertNotEqual(code, 0, "没做成任何事 ⇒ 不许报达标")
+        self.assertFalse(str(rep.ended_reason).startswith("no_work"),
+                         f"守卫一直说还有活 ⇒ 不许洗成 no_work：{rep.ended_reason}")
+        self.assertLessEqual(run._actions, 40, f"动作数必须收敛：{run._actions}")
+        self.assertLessEqual(run.resume_walks, run.max_plots_per_day)
+
+
 if __name__ == "__main__":
     unittest.main()
 

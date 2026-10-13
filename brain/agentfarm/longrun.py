@@ -482,6 +482,15 @@ class LongRun:
         # **全场级**：`water_area`/`harvest` 看的是整个农场（一天要把所有作物伺候完），
         # 它们没目标就是真没目标 —— 换片地也不该再问。
         self.no_target_global: set[str] = set()
+        # 【task-49】今天**已经见过、但还没做完**的格子（`_step_stage` 每轮的 `leftover`，排除已封格）。
+        # 为什么必须记：观测是**以玩家为中心**的窗口（真机 `tiles[]` 上限 400、近处优先），
+        # 人一换到别的片地，原来那片地的格子就"看不见"了 ⇒ `work_reasons`/`_plot_candidates`
+        # 全判没活。run5 第 1 天就是这么在中途以 `no_work` 去睡的（field_nw 还有 9 格未开垦，
+        # 而人已经在 field_se，体力还剩 62.3）。这份记账让守卫知道"别处还有没做完的"，
+        # 并让 `_resume_plot` 把人带回去再看一次（`resume_walks` 有上界，见 `_run_day`）。
+        self.leftover_targets: set[tuple[int, int]] = set()
+        # 本日"为了看没做完的格子而往回走"的次数上限（防"来回跑"把一天走光）。
+        self.resume_walks = 0
 
     # ------------------------------------------------------------------ 小工具
     def _mark_no_target(self, task: str) -> None:
@@ -569,6 +578,28 @@ class LongRun:
             rep.notes.append(f"回到 {self.farm} 之后观测失败：{exc}")
             return obs
 
+    def _farm_totals(self, obs: dict[str, Any]) -> tuple[int, int] | None:
+        """`farm` 块的全农场读数 `(dryCrops, ripeCrops)`；`None` = 证据不可用。
+
+        【task-49】与 `_farm_scope_work` 的区别只有一条：**人在农场里也算证据**。
+        run5 第 1 天的真实病灶之一就是这里：人站在 field_se（`isOutdoorFarm=true`），
+        `_farm_scope_work` 直接返回 `None` ⇒ `farm.dryCrops=1`（全农场还有 1 格干作物）
+        被丢掉；而玩家窗口（半径 ~14）没盖到那一格 ⇒ `work_reasons` 空 ⇒ 守卫放行
+        `no_work` 去睡觉（体力还剩 62.3）。农场级读数与窗口读数是**互补**的：
+        窗口管"眼前这片的细节"，farm 块管"全农场还有没有没伺候完的作物"。
+
+        字段口径（`mod\\AgentFarm.Bridge\\Contracts.cs` 的 `FarmView`）：`dryCrops` 才是干格数；
+        `unwateredCrops` 数的是 `NeedsWatering`（run3 里整天 32→32）⇒ 不能当判据。
+        """
+        farm = obs.get("farm") or {}
+        if farm.get("complete") is not True or farm.get("loaded") is False:
+            return None                     # 旧 Mod / 未加载（全 0）⇒ 不算证据
+        dry = farm.get("dryCrops")
+        ripe = farm.get("ripeCrops")
+        if dry is None and ripe is None:
+            return None
+        return (int(dry or 0), int(ripe or 0))
+
     def _farm_scope_work(self, obs: dict[str, Any]) -> tuple[int, int] | None:
         """`farm` 块的"还有活"读数 `(dry, ripe)`；`None` = 此刻不是可用证据。
 
@@ -576,13 +607,12 @@ class LongRun:
         "有没有活"必然误判。字段口径按 `mod\\AgentFarm.Bridge\\Contracts.cs` 的 `FarmView`：
         **`dryCrops` 才是"干着的作物格数"**，`unwateredCrops` 数的是 `NeedsWatering` 的作物
         （run3 里它整天 32→32，不能拿来判"今天浇完没有"）。
+
+        【task-49】人在农场里时用 `_farm_totals`（同一个 farm 块，只是不因位置而丢弃）。
         """
         if self._is_farm(obs):
             return None
-        farm = obs.get("farm") or {}
-        if farm.get("complete") is not True or farm.get("loaded") is False:
-            return None                     # 旧 Mod / 未加载（全 0）⇒ 不算证据
-        return (int(farm.get("dryCrops") or 0), int(farm.get("ripeCrops") or 0))
+        return self._farm_totals(obs)
 
     @staticmethod
     def _essence(obs: dict[str, Any]) -> dict[str, Any]:
@@ -876,6 +906,31 @@ class LongRun:
             "note": f"没有作业区但有 {len(tiles)} 格作物待浇/待收（收尾活，不计入换区配额）",
         }
 
+    def _resume_plot(self, obs: dict[str, Any]) -> dict[str, Any] | None:
+        """【task-49】把今天**已经见过、还没做完**的格子当作业区，回去把它做完。
+
+        为什么需要它：观测是**以玩家为中心**的窗口，人一换片地，原来那片地的格子就不在
+        `tiles[]`/`tillable[]` 里了 ⇒ `_plot_candidates`/`_plot_has_work` 都看不见它们。
+        run5 第 1 天：field_nw 还剩 9 格未开垦，人在 field_se ⇒ 没有任何候选区拿得出目标 ⇒
+        `no_work` 去睡（体力还剩 62.3）。
+
+        容器里的格子全部来自 `self.leftover_targets`（`_step_stage` 每轮如实记下的 `leftover`，
+        排除已封格），**不计入 `plots_today`**；调用方拿它去 `_walk_into_plot` 把人带回那片地，
+        让人自己的传感器重新看见那些格子。上界由 `_run_day` 的 `self.resume_walks` 把关。
+        """
+        pending = self._pending_work()
+        if not pending:
+            return None
+        pt = FarmWorker.player_tile(obs)
+        tiles = sorted(pending, key=lambda t: (_dist(t, pt), t[1], t[0]))[:25]
+        return {
+            "zone": "",
+            "label": "",
+            "anchor": [tiles[0][0], tiles[0][1]],
+            "tiles": tiles,
+            "note": f"今天还有 {len(tiles)} 格没做完（跨片地，玩家窗口看不见）：回去接着做",
+        }
+
     # ------------------------------------------------------------------ 简报
     def _plot_brief(self, obs: dict[str, Any], plot: dict[str, Any]) -> Brief:
         """当天作业区的局部简报：清障/开垦/播种按**区**计数，浇水/收获按**全场**计数。
@@ -1072,11 +1127,38 @@ class LongRun:
             # `_run_day` 里 `why = ("no_work" if not reasons else "stuck:守卫说还有活（…）")`
             # ⇒ 理由缺失就会落回 `no_work`，run3 连睡 4 天的路径原地复活。
             reasons.append(self._farm_evidence_reason(obs))
+        # 【task-49】人在农场里时也要看全农场读数：窗口只有半径 ~14，农场另一头的干作物
+        # 在窗口里根本不存在。run5 第 1 天 `farm.dryCrops=1` 就是这么被丢掉的。
+        totals = self._farm_totals(obs)
+        if self._is_farm(obs) and totals is not None:
+            dry_f, ripe_f = totals
+            if dry_f > len(unwatered):
+                reasons.append(f"农场口径还有 {dry_f} 格干作物（当前窗口只看到 {len(unwatered)} 格）")
+            if ripe_f > len(ripe):
+                reasons.append(f"农场口径还有 {ripe_f} 格熟作物（当前窗口只看到 {len(ripe)} 格）")
+        # 【task-49】今天**已经见过、但还没做完**的格子（`_step_stage` 的 `leftover`）。
+        # 换到别的片地之后，那些格子不在玩家窗口里 ⇒ 必须靠这份记账才知道"还有活"，
+        # 否则就是 run5 的 `no_work` 早睡。已封格（`tool_ineffective` 一类）**不算** ——
+        # 那正是"这一格今天真干不动"的结论（反向用例：全部 leftover 都封了 ⇒ 允许 `no_work`）。
+        pending = self._pending_work()
+        if pending:
+            reasons.append(f"今天早些时候还有 {len(pending)} 格没做完（跨片地，最近的是 "
+                           f"{list(min(pending, key=lambda t: _dist(t, FarmWorker.player_tile(obs))))}）")
         for cand in self._plot_candidates(obs):
             if self._plot_has_work(obs, cand["tiles"]):
                 reasons.append(f"{cand.get('zone') or '附近'}还有地要清/开/种")
                 break
         return reasons
+
+    def _pending_work(self) -> list[tuple[int, int]]:
+        """今天"见过但还没做完、且今天没被证明干不动"的格子（task-49）。
+
+        判据与 `_stage_tiles` 的排除项一致：**已封格不算**（`self.blocked` 是
+        "判据证明这一格今天干不动"）。`tile_attempts` 到顶的格子仍然算 —— 它们是
+        "今天试过但没做成"的真目标，允许守卫因此不判 `no_work`（当天会如实 `stuck`/
+        needs_review，而不是洗成"没活"）。
+        """
+        return sorted(t for t in self.leftover_targets if t not in self.blocked)
 
     def _farm_evidence_reason(self, obs: dict[str, Any]) -> str:
         """室内 + `farm` 证据不可用时的"还有活"理由（task-41 NIT-2，fail-closed）。
@@ -1151,6 +1233,25 @@ class LongRun:
             # 【task-41 NIT-2】证据不可用 ⇒ fail-closed：**绝不**退回窗口口径放行 `no_work`
             # （run3 那 4 天连睡就是这么来的）。理由与 `work_reasons` 共用一份实现，避免口径漂移。
             return False, "keep_working", self._farm_evidence_reason(obs)
+        # 【task-49】人在农场里、全农场读数说还有干/熟作物，而玩家窗口没盖到 ⇒ 必须继续干；
+        # 有水（壶里 / 能走到补水点 / 无尽壶）就去浇；**确实打不到水**才允许睡，而且这里
+        # 绝不能返回 `no_work`（"想浇但无水"和"没活可做"是两件事；run5 第 1 天 `dry=1` 却
+        # 以 `no_work` 收场、还白拿一个 `day_justified=true`，就是这条缺失造成的）。
+        totals = self._farm_totals(obs)
+        if self._is_farm(obs) and totals is not None:
+            dry_f, ripe_f = totals
+            if ripe_f > 0:
+                return False, "keep_working", (
+                    f"农场口径还有 {ripe_f} 格熟作物（当前窗口没盖到，别处还有活），先去收")
+            if dry_f > 0:
+                can, why = self._can_water(obs)
+                if can and tod < 2500 and stam >= self.water_min_stamina:
+                    return False, "keep_working", (
+                        f"农场口径还有 {dry_f} 格干作物（{why}），先把水浇完再谈收工")
+                if not can:
+                    return True, "no_water", (
+                        f"农场口径还有 {dry_f} 格干作物，但{why}（想浇但无水；"
+                        "这不是「没活可做」，当天按 needs_review 如实收尾）")
         reasons = self.work_reasons(obs)
         if not reasons:
             return True, "no_work", "确实找不到可做的活（地里的活干完了、也没法/没必要买种子）"
@@ -1458,6 +1559,17 @@ class LongRun:
         # （阶段级失败、没有具体格子）照旧算失败。
         left_set = {tuple(t) for t in leftover}
         failed = [s for s in failed_any if s.tile is None or tuple(s.tile) in left_set]
+        # 【task-49】把"今天见过、还没做完"的格子记进 `leftover_targets`（排除已封格）：
+        # 换到别的片地之后玩家窗口看不见它们，守卫与 `_resume_plot` 只能靠这份记账。
+        # 同一步里做成的格子要**划掉**（否则"做完的格子"会一直把我们往回拽）。
+        for s in all_steps:
+            if s.ok and s.tile:
+                self.leftover_targets.discard(tuple(s.tile))
+        for t in leftover:
+            tt = tuple(t)
+            if tt in self.blocked:
+                continue                    # 判据证明这一格今天干不动 ⇒ 不算"还有活"
+            self.leftover_targets.add(tt)
         skipped = [s for s in all_steps if s.skipped]
         oks = [s for s in all_steps if s.ok]
         inert = [s for s in all_steps if s.proven_inert]
@@ -1969,6 +2081,9 @@ class LongRun:
         self.seed_gate_noted = set()
         self.no_target = set()
         self.no_target_global = set()
+        # 【task-49】跨片地的"今天还没做完"记账 + 回头看的次数上限，每天清零。
+        self.leftover_targets = set()
+        self.resume_walks = 0
         # 【task-42】新的一天 ⇒ 清空出货白名单：昨天收获的东西昨天该出就出了，
         # 今天再拿白名单去卖会变成"卖一件不存在的东西"（`sellable_slots` 找不到就不动，但语义要干净）。
         if self.worker is not None:
@@ -2045,7 +2160,11 @@ class LongRun:
                 # `day_justified` 白名单里）。把"活所在的格子"（待浇/待收的作物）当收尾
                 # 作业区，让策略/执行层把当天该干的干完；真一格都拿不出来时按 `stuck`
                 # 如实收尾（**不洗成** `no_work`），且这条路径只有一次、不空转。
-                spot = self._work_spot_plot(obs) or self._near_player_plot(obs)
+                # 【task-49】再补一道 `_resume_plot`：今天早些时候见过、还没做完的格子
+                # （可能整片都在玩家窗口之外，例如 run5 的 field_nw）。
+                work_spot = self._work_spot_plot(obs)
+                picked = work_spot if work_spot is not None else self._resume_plot(obs)
+                spot = picked or self._near_player_plot(obs)
                 if spot is None:
                     reasons = self.work_reasons(obs)
                     rep.notes.append("找不到有活的作业区："
@@ -2058,6 +2177,21 @@ class LongRun:
                 plot = spot
                 self._journal("work_spot", zone=self.zone_name, tiles=len(plot["tiles"]),
                               note=plot.get("note"))
+                # 【task-49】`_resume_plot` 给的是**别处**的格子（玩家窗口看不到）⇒ 先走回去，
+                # 让传感器重新看见它们再谈策略。上界 `resume_walks < max_plots_per_day`
+                # （与"换片地"同一个量级）；走不动就落回正常判定，不空转。
+                if work_spot is None and picked is plot and self.resume_walks < self.max_plots_per_day:
+                    self.resume_walks += 1
+                    walked = self._walk_into_plot(obs, plot)
+                    self._journal("resume_walk", zone=self.zone_name, tiles=len(plot["tiles"]),
+                                  walked=bool(walked), attempt=self.resume_walks,
+                                  note="回到今天还没做完的格子旁边（玩家窗口看不见它们）")
+                    if walked:
+                        self._actions += 1
+                        rep.notes.append(
+                            f"回到没做完的 {len(plot['tiles'])} 格旁边再看一次"
+                            f"（resume_walk {self.resume_walks}/{self.max_plots_per_day}）")
+                        continue
 
             brief = self._plot_brief(obs, plot)
             decision = self.planner.decide(self.state, brief)
@@ -2097,13 +2231,37 @@ class LongRun:
                 #   说了算：守卫不放行就说明别处还有活 ⇒ 忘掉本片的记账、换一片地接着干。
                 allow, code, text = self.sleep_guard(obs)
                 if not allow:
+                    # 【task-49 主修】守卫说还有活，而**本片**拿不出意图 ⇒ 先用"今天还没做完的
+                    #   格子"（可能整片都在玩家窗口之外）回头看一眼，而不是直接换片地/攒 recovered。
+                    #   run5 第 1 天：field_nw 还剩 9 格未开垦，人站在 field_se 就以为"没活"。
+                    if self._pending_work() and self.resume_walks < self.max_plots_per_day:
+                        resume = self._resume_plot(obs)
+                        if resume is not None:
+                            self.resume_walks += 1
+                            walked = self._walk_into_plot(obs, resume)
+                            self._journal("resume_walk", zone=self.zone_name,
+                                          tiles=len(resume["tiles"]), walked=bool(walked),
+                                          attempt=self.resume_walks,
+                                          note="守卫说还有活但本片没意图 ⇒ 回去看今天没做完的格子")
+                            if walked:
+                                self._actions += 1
+                                rep.notes.append(
+                                    f"守卫说还有活（{text}）⇒ 回到没做完的 "
+                                    f"{len(resume['tiles'])} 格旁边再看一次"
+                                    f"（resume_walk {self.resume_walks}/{self.max_plots_per_day}）")
+                                self.plot = resume
+                                self.zone_name = ""
+                                self.idle_rounds = 0
+                                continue
                     recovered += 1
                     self._journal("plot_exhausted", recovered=recovered, zone=self.zone_name,
                                   note=f"这一片没目标了，但守卫仍要求干活（{text}）⇒ 换一片地")
                     if recovered > self.max_plots_per_day:
                         rep.notes.append(f"换过 {recovered} 片地都拿不出目标")
+                        # ⚠️ 守卫**说还有活**却找不到任何目标 ⇒ 这是 `stuck`，不是"今天没活"：
+                        #    写成 `no_work` 会白拿 `day_justified=true` 并把病灶洗白（task-49）。
                         rep.ended_by, rep.ended_reason = self._do_sleep(
-                            obs, rep, f"no_work:换过 {recovered} 片地都没有目标")
+                            obs, rep, f"stuck:换过 {recovered} 片地都没有目标（守卫仍说还有活：{text}）")
                         break
                     rep.notes.append(f"「{self.zone_name or '当前作业区'}」没目标了，但{text} ⇒ 换一片地继续")
                     self.no_target.clear()     # "本片没目标"是**片区级**记账，换片就得清
