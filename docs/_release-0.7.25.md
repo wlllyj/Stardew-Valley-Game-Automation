@@ -28,14 +28,23 @@
 
 ## 3 run6 起跑（machine-runner，task-57）
 
+**首选：用 Lead 的脱离式起跑器**（把"版本四要素 + 独立进程 + PID 文件 + 90 秒体检"一次做完；`DETACHED_PROCESS` 起，父进程/agent 回合结束不会连带收掉它）：
+
+```powershell
+python tools\start-detached-longrun.py --journal logs\longrun-3day-llm-run6.jsonl --expect-version 0.7.25
+```
+
+- 它做的事：①PID 还活着就拒绝重复起跑（退 3）②`--expect-version` 时先跑 `preflight`，红灯就不起跑（退 4）③起 `tools\run-longrun.py`，stdout/stderr 落 `logs\longrun-3day-llm-run6.console{,.err}.log` ④写 `logs\longrun-3day-llm-run6.pid` 与 `…version.json`（HEAD / 三个被测文件 SHA256+mtime / PID+起跑时刻 / `git status --short`）⑤体检 90 秒后打印 console 尾部与账本行数**然后返回**（进程继续跑）。
+- 它**不**判达标、不关框、不替游戏做选择、不杀进程；跑完仍在跑时**先别退游戏**（Lead 要 live observe 对账）。
+- 需要手工起时（备用）：
+
 ```powershell
 Start-Process -FilePath <python.exe> -ArgumentList '-u','tools\run-longrun.py','--days','3','--size','5','--max-minutes','150','--max-days','9','--journal','logs\longrun-3day-llm-run6.jsonl' `
   -PassThru -WindowStyle Hidden -RedirectStandardOutput 'logs\run6-console.log' -RedirectStandardError 'logs\run6-console.err.log'
 ```
 
-- PID 落 `logs\run6.pid`；**不许**用托管后台作业（run4 曾在回合边界被连根收掉，只跑 13 秒，见条目 040）。
-- 起跑前记"版本四要素"（HEAD / 被测文件 SHA256+mtime / PID+StartTime 必须晚于 mtime / `git status --short` 无被测源码 ` M`）。
-- 只按 **PID 存活 + console 尾部 + 账本行数** 只读轮询；出现 `finish` 或 PID 消失立刻报 Lead；**跑完先别退游戏**（Lead 要 live observe 对账）。
+- **不许**用托管后台作业（`run_in_background`）：run4 曾在回合边界被连根收掉，只跑 13 秒（条目 040）。
+- 只按 **PID 存活 + console 尾部 + 账本行数** 只读轮询；出现 `finish` 或 PID 消失立刻报 Lead。
 - 交付 `docs\_run6-evidence.md`（machine-runner 独占）：逐日表 + 外部证据 + 判据对照 + 与 run5 的对比段。
 
 ## 4 判据（以 `docs\_run6-criteria.md` 为准）
