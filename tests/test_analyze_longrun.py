@@ -589,5 +589,90 @@ class TestDecisionSourceAccounting(unittest.TestCase):
         self.assertNotIn("max_tokens", " ".join(a["text"] for a in rep["advice"]))
 
 
+class TestWaterEvidenceGates(unittest.TestCase):
+    """task-36：浇水证据的两个新字段（`checks.watered_outdoor` + `day_end.final_water`）必须与
+    `tools\\verify-run3.py` 的四个闸门同向：缺失 = 红（缺失 ≠ 通过）、false = 红、
+    true + scope=window + tiles=0 = 红、true + dry>0 = 红；true 但没写 final_water 只记信息项。"""
+
+    OK_CHECKS = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                 "no_unmet_stages": True, "crops_watered": True, "day_justified": True,
+                 "watered_outdoor": True}
+    FARM_OK = {"t": 590.0, "location": "Farm", "tiles": 84, "crops": 31, "dry": 0, "scope": "farm"}
+
+    def _report(self, name, *, checks=None, final_water="absent", **overrides):
+        end = {"checks": self.OK_CHECKS if checks is None else checks}
+        if final_water != "absent":
+            end["final_water"] = final_water
+        end.update(overrides)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, integrity_ledger(day_end_overrides=end)), days=1)
+
+    def test_farm_scope_with_crops_and_no_dry_is_clean(self):
+        rep = self._report("water_farm_ok.jsonl", final_water=self.FARM_OK)
+        self.assertNotIn("missed:check:watered_outdoor", subjects(rep["categories"]["missed"]))
+        self.assertEqual(
+            [s for s in subjects(rep["categories"]["wasted"]) if s.startswith("wasted:water_")], []
+        )
+        self.assertIn("浇水证据=farm/Farm dry=0/31 tiles=84", mod.render_text(rep, 20))
+
+    def test_window_scope_with_zero_tiles_is_flagged(self):
+        rep = self._report(
+            "water_window_empty.jsonl",
+            final_water={"t": 590.0, "location": "", "tiles": 0, "crops": 0, "dry": None, "scope": "window"},
+        )
+        self.assertIn("wasted:water_scope_empty", subjects(rep["categories"]["wasted"]))
+        self.assertEqual(rep["categories_total"]["wasted"], 1)
+
+    def test_dry_greater_than_zero_contradicts_checks(self):
+        rep = self._report(
+            "water_dry.jsonl",
+            final_water={"t": 590.0, "location": "Farm", "tiles": 84, "crops": 31, "dry": 5, "scope": "farm"},
+        )
+        self.assertIn("wasted:water_contradiction", subjects(rep["categories"]["wasted"]))
+        bad = [f for f in rep["categories"]["wasted"] if f["subject"] == "wasted:water_contradiction"]
+        self.assertIn("final_water.dry=5", bad[0]["summary"])
+
+    def test_missing_check_is_red_and_undecidable_never_a_pass(self):
+        checks = {k: v for k, v in self.OK_CHECKS.items() if k != "watered_outdoor"}
+        rep = self._report("water_missing.jsonl", checks=checks, final_water=self.FARM_OK)
+        self.assertIn("missed:check:watered_outdoor", subjects(rep["categories"]["missed"]))
+        self.assertTrue(
+            any("watered_outdoor" in u for u in rep["undecidable"]),
+            "缺失必须同时进【无法判定】：" + "; ".join(rep["undecidable"]),
+        )
+        # 账本自己写 verified=true，但本工具必须点明"该天不判通过"
+        self.assertTrue(rep["days"][0]["verified"])
+        self.assertIn("不判该天通过", mod.render_text(rep, 20))
+
+    def test_false_is_flagged_as_problem(self):
+        checks = dict(self.OK_CHECKS, watered_outdoor=False)
+        rep = self._report("water_false.jsonl", checks=checks, final_water=self.FARM_OK)
+        self.assertIn("missed:check:watered_outdoor", subjects(rep["categories"]["missed"]))
+        self.assertIn("浇水证据=false", mod.render_text(rep, 20))
+
+    def test_whole_field_absent_is_listed_as_undecidable(self):
+        rep = self._report("water_no_field.jsonl")  # final_water 整条不写
+        self.assertTrue(
+            any("本账本没有 day_end.final_water" in u for u in rep["undecidable"]),
+            "; ".join(rep["undecidable"]),
+        )
+        self.assertTrue(
+            any("但没写 final_water" in u for u in rep["undecidable"]),
+            "true 却没有 final_water 可核对的天数要单列：" + "; ".join(rep["undecidable"]),
+        )
+        self.assertIn("浇水证据=true 但无 final_water 可核对", mod.render_text(rep, 20))
+        # 缺证据 ≠ 通过，但也不额外判红（与 verify-run3.py:414-418 同向）
+        self.assertNotIn("wasted:water_contradiction", subjects(rep["categories"]["wasted"]))
+        self.assertNotIn("missed:check:watered_outdoor", subjects(rep["categories"]["missed"]))
+
+    def test_water_advice_names_the_lines(self):
+        rep = self._report("water_advice.jsonl", final_water=self.FARM_OK, checks=dict(
+            self.OK_CHECKS, watered_outdoor=False))
+        water_advice = [a for a in rep["advice"] if "浇水证据有问题" in a["text"]]
+        self.assertTrue(water_advice, "浇水问题必须进建议清单")
+        self.assertTrue(water_advice[0]["lines"], "建议必须带证据行号")
+
+
 if __name__ == "__main__":
     unittest.main()

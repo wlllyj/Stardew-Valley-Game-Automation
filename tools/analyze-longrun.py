@@ -20,7 +20,10 @@
     `policy_fallback` 事件，或 sleep/ended_reason 以 `no_work`/`night`/`stamina` 开头）；
   * `failed_steps` 与 `sum(stages[].failed)` 的差额必须被 `env_block(+count)` + `inconclusive(+count)`
     完全解释（否则"账目不可信"）；
-  * `checks.watered_outdoor=true` 与 `final_water.dry>0` 互斥；跨日必须恰好 +1 天；
+  * 浇水证据（task-19/task-36，与 `tools\verify-run3.py` 四个闸门同向）：`checks.watered_outdoor`
+    **缺失 = 红（缺失 ≠ 通过）**、`false` = 红、`true` + `final_water.scope=="window"` + `tiles==0` = 红
+    （当天没有户外快照 ⇒ 这个 true 没有证据来源）、`true` + `final_water.dry>0` = 红（自相矛盾）；
+    而 `true` 但整条没写 `final_water` 只在【无法判定】里点名（verify-run3.py 记信息项）。跨日必须恰好 +1 天；
   * `t` 回退只记信息项；环境挡路**不算硬失败**。
 
 只读、纯标准库。退出码：0 = 成功产出报告（**不表示"跑得好"**）；2 = 账本不可读/没有可解析事件。
@@ -69,8 +72,9 @@ CHECK_MEANING = {
     "no_hard_failures": "这一天存在硬失败",
     "crops_watered": "收工时仍有作物没浇水",
     "day_justified": "收工理由不在允许集（night/stamina/no_work/no_plot）",
-    # task-19：窗口口径在室内恒 0，不能当浇水证据 ⇒ 必须由 farm 级字段作证（缺失 ≠ 通过）
-    "watered_outdoor": "缺 farm 级/户外浇水证据（窗口 unwatered_crops 在室内恒 0，不作证据）",
+    # task-19/task-36：窗口口径在室内恒 0，不能当浇水证据 ⇒ 必须由 farm 级字段作证（缺失 ≠ 通过）
+    "watered_outdoor": "缺 farm 级/户外浇水证据、或自述还有没浇的作物（缺失 ≠ 通过；"
+                       "窗口 unwatered_crops 在室内恒 0，不作证据）",
     # task-15：阶段后置条件未成立的显式汇总（缺失时本工具按 day_end.stages 自算兜底）
     "no_unmet_stages": "有目标阶段留下了没做完的格子（leftover>0）",
 }
@@ -408,6 +412,23 @@ def cat_missed(sessions, top):
                             subject=f"missed:check:{name}",
                         )
                     )
+        # 1c-2: task-36 —— `checks.watered_outdoor` **缺失 ≠ 通过**（与 tools\verify-run3.py:311-316 同向：
+        #       它把"缺字段"直接记 problem）。缺失同时会进【无法判定】；这里负责点名到具体 day_end 行。
+        #       旧账本（task-19 之前）会整片命中，这是如实读数，不是误报。
+        for lineno, ev in sess["day_ends"]:
+            checks = as_dict(ev.get("checks"))
+            if "watered_outdoor" in checks:
+                continue
+            out.append(
+                finding(
+                    lineno, "day_end",
+                    f"checks.watered_outdoor 未写（缺失 ≠ 通过）：窗口口径的 unwatered_crops/crops_watered "
+                    f"在室内恒 0，不能替它作证（ended_by={ev.get('ended_by')}）；该天不得判通过",
+                    hint="task-19 之后应由 longrun._water_evidence 写 farm 级 bool（farm.dryCrops）；"
+                         "verify-run3.py:311-316 把缺失直接判问题 —— 两边同向",
+                    subject="missed:check:watered_outdoor",
+                )
+            )
         # 1d: 环境挡路（env_fail）后该阶段最终没做成 ⇒ 活没干成，且不是"格子干不动"（task-30）
         idx = _stage_outcome_index(sess)
         for lineno, ev in sess["env_fails"]:
@@ -605,6 +626,27 @@ def cat_wasted(sessions, top):
                         f"账本自相矛盾：checks.watered_outdoor=true 但 final_water.dry={dry}",
                         hint="两份自述不许自相矛盾（verify-run3.py 同口径）；dry>0 = 还有没浇的，别信 checks",
                         subject="wasted:water_contradiction",
+                    )
+                )
+        # 2f: task-36 —— `checks.watered_outdoor=true` 但证据来源是"窗口 0 格"（当天根本没有户外快照）
+        #     ⇒ 这个 true 不可采信（tools\verify-run3.py:404-413 同向；task-19 卡面 5④ 规定此时必须如实
+        #     False/缺省，禁止默认 true）。
+        for lineno, ev in sess["day_ends"]:
+            checks = as_dict(ev.get("checks"))
+            fw = as_dict(ev.get("final_water"))
+            if (
+                checks.get("watered_outdoor") is True
+                and fw.get("scope") == "window"
+                and as_int(fw.get("tiles")) == 0
+            ):
+                out.append(
+                    finding(
+                        lineno, "day_end",
+                        "账本不可信：checks.watered_outdoor=true 但 final_water.scope=window 且覆盖 0 格"
+                        "（当天没有任何户外快照）⇒ 这个 true 没有证据来源",
+                        hint="task-19 卡面 5④：没有户外快照时必须如实 False/缺省，禁止默认 true"
+                             "（verify-run3.py:404-413 同口径）",
+                        subject="wasted:water_scope_empty",
                     )
                 )
     return out[:top] if top else out
@@ -1002,6 +1044,16 @@ def build_advice(report, top=8):
                     "天数不同向 ⇒ 先别信自述字段，以正文为准（与 verify-run3.py 独立交叉核对，冲突就停下来对账）",
             "lines": [f["line"] for f in integrity if f["line"] is not None],
         })
+    # 3c) task-36：浇水证据缺失/自相矛盾（与 tools\verify-run3.py 四个闸门同向）
+    water_bad = [f for f in report["categories"]["missed"] if f["subject"] == "missed:check:watered_outdoor"]
+    water_bad += [f for f in report["categories"]["wasted"] if f["subject"].startswith("wasted:water_")]
+    if water_bad:
+        advice.append({
+            "text": f"浇水证据有问题 ×{len(water_bad)}：缺 watered_outdoor（缺失 ≠ 通过）或自述 true 与 "
+                    "final_water 打架 ⇒ 别信窗口口径，按 farm.dryCrops（task-19）复核"
+                    "（verify-run3.py 同向；run3 前必须把这条清零）",
+            "lines": [f["line"] for f in water_bad if f["line"] is not None],
+        })
     # 4) 白做（有做成但没解决）
     leftover = [f for f in report["categories"]["wasted"] if f["subject"].startswith("wasted:leftover")]
     if leftover:
@@ -1070,7 +1122,9 @@ def build_undecidable(rows, sessions, prelude, report):
         if probe.startswith("event:"):
             absent = probe.split(":", 1)[1] not in names
         elif probe == "final_water":
-            absent = "\"final_water\"" not in blob
+            # task-36：以 day_end 的键为准（整本都没有 ⇒ 单列"本账本没有该字段"）
+            ends = [ev for _, ev in rows if ev.get("event") == "day_end"]
+            absent = (not any("final_water" in ev for ev in ends)) if ends else ("\"final_water\"" not in blob)
         else:
             absent = probe not in blob
         if absent:
@@ -1099,6 +1153,17 @@ def build_undecidable(rows, sessions, prelude, report):
     if not has_modal_event and not has_modal_check:
         out.append("本账本没有任何模态事件（modal_*/levelup_*）、也没有 checks.no_blocking_modal："
                    "无法判定当天是否被模态打断过（task-11 之前的账本）—— **缺失不等于没被挡过**")
+    # task-36：自称浇过、却没有 final_water 可核对的那些天（verify-run3.py:414-418 同口径：只记信息项）
+    no_fw = [
+        lineno for lineno, ev in rows
+        if ev.get("event") == "day_end"
+        and as_dict(ev.get("checks")).get("watered_outdoor") is True
+        and not isinstance(ev.get("final_water"), dict)
+    ]
+    if no_fw:
+        out.append(f"有 {len(no_fw)} 天 checks.watered_outdoor=true 但没写 final_water（行 {no_fw[:8]}）："
+                   "无法核对浇水证据来自哪张快照（缺证据 ≠ 通过；verify-run3.py:414-418 同口径只记信息项、"
+                   "不额外判问题）")
     return out
 
 
@@ -1135,6 +1200,8 @@ def build_report(rows, path, args, bad_lines):
             "failed_steps": end.get("failed_steps"),
             "checks": as_dict(end.get("checks")),
             "final": as_dict(end.get("final")),
+            # task-36：浇水证据（scope/tiles/crops/dry）随天带出来，供"每天一行"与测试核对
+            "final_water": as_dict(end.get("final_water")),
             "outcomes": len(sess["outcomes"]),
             "blocked": len(sess["blocked"]),
         })
@@ -1340,8 +1407,13 @@ MAPPING_TEXT = [
      "5 环境挡路自旋到上限（信息项，但计入当天被环境挡住的总次数；能一眼看出哪几格在反复被挡）"),
     ("inconclusive_fail / day_end.stages[].inconclusive",
      "5 没拿到结论（信息项 + 配额被吃掉 N 格 ⇒ 可能 capped/needs_review）"),
-    ("day_end.checks.watered_outdoor / final_water.dry",
-     "5 浇水口径：watered_outdoor 缺失=没有 farm 级证据；dry>0 与 watered_outdoor=true 互斥（自相矛盾）"),
+    ("day_end.checks.watered_outdoor",
+     "1 该做没做（红）：**缺失 = 没有 farm 级证据（≠ 通过）**、false = 睡前还有没浇的"
+     "（verify-run3.py:311-318 同向）"),
+    ("day_end.checks.watered_outdoor / day_end.final_water",
+     "2 白做：true 与 final_water.dry>0 互斥（自相矛盾）；true 且 scope=window/tiles=0 不可采信"
+     "（当天没有户外快照）；true 但整条没写 final_water ⇒ 只进【无法判定】"
+     "（verify-run3.py:393-418 同向）"),
     ("day_end.checks.no_unmet_stages",
      "1 该做没做（false = 有阶段没达成；不与自算一致时以自算为准）"),
     ("finish",
@@ -1422,9 +1494,20 @@ def render_text(report, top):
                 f"outcome {day['outcomes']} 次、blocked {day['blocked']} 次）⇒ 无法判定")
         else:
             checks = ",".join(f"{k}={v}" for k, v in day["checks"].items()) or "-"
+            # task-36：浇水证据单独摆出来（缺失/自相矛盾不许被 verified=true 掩盖）
+            fw = day.get("final_water") if isinstance(day.get("final_water"), dict) else {}
+            if "watered_outdoor" not in day["checks"]:
+                water_text = " | 浇水证据=缺（缺失 ≠ 通过，本工具不判该天通过）"
+            elif day["checks"].get("watered_outdoor") is False:
+                water_text = " | 浇水证据=false（睡前还有没浇的作物）"
+            elif fw:
+                water_text = (f" | 浇水证据={fw.get('scope')}/{fw.get('location')} dry={fw.get('dry')}"
+                              f"/{fw.get('crops')} tiles={fw.get('tiles')}")
+            else:
+                water_text = " | 浇水证据=true 但无 final_water 可核对"
             add(f"  - {day['label']}: ended_by={day['ended_by']} verified={day['verified']} "
                 f"ok/skip/fail={day['ok_steps']}/{day['skipped_steps']}/{day['failed_steps']} "
-                f"checks[{checks}] 模态打断={day.get('modal_interrupts', 0)} "
+                f"checks[{checks}] 模态打断={day.get('modal_interrupts', 0)}{water_text} "
                 f"L{day['day_end_lines']}{final_text}")
     add("")
     sections = [
