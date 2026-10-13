@@ -460,6 +460,39 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
                     "（0 步不能自证做过事）"
                 )
 
+        # 真空日/弱日（Lead 2026-10-13，run6 判据 `docs/_run6-criteria.md` §1）：
+        # `verified=true` 的一天至少要真的做成过事 —— 有阶段记录但成功动作全 0 ⇒ 判红
+        # （完全没有任何阶段记录的情形已由上面那条覆盖）。
+        # 成功动作很少或只涉及一个阶段 ⇒ 不判红，只出 info（合法但偏弱的一天，供复核时人读）。
+        _ok_self = 0
+        if stage_recs:
+            for _s in stage_recs:
+                try:
+                    _ok_self += int(_s.get("ok") or 0)
+                except (TypeError, ValueError):
+                    pass
+        else:
+            _end_ok = (d.get("end") or {}).get("ok_steps")
+            if isinstance(_end_ok, int):
+                _ok_self = _end_ok
+        if d["verified"] is True and stage_recs and _ok_self <= 0:
+            problems.append(
+                f"[{name}] 自称 VERIFIED 但当天成功动作 0 步（有阶段记录、ok 全 0）"
+                "（0 步不能自证做过事；查 stage_no_target / `no_work` 分支）"
+            )
+        elif d["verified"] is True and 0 < _ok_self < 5:
+            infos.append(f"[{name}] 弱日：VERIFIED 但成功动作只有 {_ok_self} 步（供复核）")
+        if d["verified"] is True and stage_recs and _ok_self >= 5:
+            _kinds = {
+                str(_s.get("stage") or "")
+                for _s in stage_recs
+                if int(_s.get("ok") or 0) > 0
+            }
+            if len(_kinds) < 2:
+                infos.append(
+                    f"[{name}] VERIFIED 但只涉及一个阶段（{sorted(_kinds)}）⇒ 供复核"
+                )
+
         # 3b. 阶段后置条件：无论 checks.no_unmet_stages 在不在，都按 day_end.stages 自算并比对
         unmet = checks.get("no_unmet_stages")
         if unmet is not None and bool(unmet) != (leftover_targeted == 0):

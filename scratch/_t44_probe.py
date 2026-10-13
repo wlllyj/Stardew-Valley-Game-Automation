@@ -7,7 +7,7 @@
   C. `harvest()` 只摘下来而背包没多        ⇒ 不进白名单（不许凭空生成可卖物）
   D. task-43 两段式：超时回执 ⇒ 先接近再只重试一次；两次都失败 ⇒ 有界停手
 
-跑法：`$env:PYTHONUTF8="1"; & $py scratch\_t44_probe.py`
+跑法：`$env:PYTHONUTF8="1"; & $py scratch/_t44_probe.py`
 """
 from __future__ import annotations
 

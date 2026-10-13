@@ -55,6 +55,22 @@ MUTATIONS: dict[str, tuple[str, list[tuple[str, str, str]], list[str]]] = {
              "                        timeout_ms: int = 60000) -> StepResult:",
              "                        timeout_ms: int = 30000) -> StepResult:  # MUT m4")],
            ["tests.test_farmwork.TestTask43LongPathRecovery"]),
+    "m5": ("白名单形同虚设：sellable_slots 不再按白名单过滤（工具也敢卖）",
+           [("farmwork.py",
+             "            if qid not in qids:\n                continue",
+             "            if False:  # MUT m5\n                continue")],
+           ["tests.test_farmwork.TestTask42Sell", "tests.test_planner",
+            "tests.test_longrun.TestTask42Ship"]),
+    "m6": ("出货失败当成功：longrun._ship_loot 恒 return True",
+           [("longrun.py",
+             "        return bool(good)",
+             "        return True  # MUT m6")],
+           ["tests.test_longrun.TestTask42Ship"]),
+    "m7": ("丢掉 sell_failed 记账（失败不落账）",
+           [("longrun.py",
+             '            self._journal("sell_failed", reason=bad[0].reason, code=bad[0].code)',
+             '            pass  # MUT m7')],
+           ["tests.test_longrun.TestTask42Ship"]),
 }
 
 

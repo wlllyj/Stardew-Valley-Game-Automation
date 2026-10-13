@@ -23,11 +23,20 @@
 | `watered_outdoor` | farm 口径 `dryCrops == 0`（或当天最后一个户外窗口逐格全湿） | **唯一浇水证据**（task-19）；字段缺失即问题 |
 | `day_justified` | `is_justified_end(ended_by, ended_reason)`；白名单 `night/stamina/no_work` | **不含** `no_plot`（task-32） |
 
+**真空日闸门（`tools/verify-run3.py` 已实现，2026-10-13 Lead 补）**：`verified == true` 的一天必须**真的做成过事**。
+
+- 有阶段记录但 `Σ stage.ok == 0` ⇒ **判红**（0 步不能自证做过事）。
+- 完全没有任何阶段记录 ⇒ 必须有 `no_work` / `night` / `stamina` 收尾理由或 `excuse` 事件，否则**判红**。
+- 成功动作 `< 5` 步、或只涉及一个阶段 ⇒ **只出 info**（合法但偏弱的一天，供复核时人读）。
+
 ## 2. 连续性与外部证据
 
 - **尾部连续 3 天**：`verified == true` 且 `ended_by == "sleep"` 且 `day_after` 比 `day_key` **恰好 +1 天**。
-- 存档 `Wahaha_450799035` 的 **size 与 mtime 必须前进**（SMAPI `SaveGame.Save() called/completed` 对应）。
-  注意：游戏自身的 `ShippingMenu` 路径会**跳过**当日存档（`docs/_il-newday-save.md`，task-47）——**跳过 ≠ sleep 失败**，以「跨日 +1 + 账本一致」为主，存档不前进取 info（连续 ≥2 天才算问题，见 `docs/_review-run5.md` 的 P3/P4 口径）。
+- 存档 `Wahaha_450799035` 的 **size 与 mtime 应前进**（对应 SMAPI `SaveGame.Save() called/completed`）。
+  **口径按 task-47 定案（`docs/_il-newday-save.md`）更正**：落盘唯一通道是 `SaveGameMenu.update` 的 master 分支；`SaveGameMenu` 只在
+  `Game1.showEndOfNightStuff()` 且 **`endOfNightMenus.Count == 0`** 时被创建 ⇒ **当天早晨有日终菜单（`ShippingMenu`＝有货要结算 / `LevelUpMenu` / `Billboard`）时，存档是被设计延后的**。
+  因此：**跨日 ≠ 落盘**；有日终菜单而"存档未动"**既不能判失败、也不能判通过**（记账本与存档一致 + 三源对账器的 P3c 容差）；**没有任何日终菜单却缺 `SaveGame.Save() called.` 且存档未动 = 异常**。
+  以「跨日 +1 + 账本一致」为主判据（P3a 每次跨日必有 `Synchronizing 'NewDay' task`；P3b 有 Save 必有 NewDay；P3c NewDay 无 Save 记 info，连续 ≥2 天才升 problem）。
 - SMAPI `Synchronizing 'NewDay'` 计数与账本跨日次数**同向**。
 - `finish.code == 0`、`verified_streak >= 3`、0 次 `bridge_down` / `watchdog_stop` / `modal_timeout` / `no_day_progress`。
 
