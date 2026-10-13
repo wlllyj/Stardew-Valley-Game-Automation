@@ -498,6 +498,15 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
                     "（户外还有干作物却判\"今天没活\" ⇒ run3 连睡病复发；"
                     "查 `_farm_scope_work`/`work_reasons` 的 fail-closed 路径，见 task-41 第 10 条）"
                 )
+        # `no_water`（task-49 的诚实收尾：想浇但确实打不到水）**不**判失败，但要看得见 ——
+        # 它是"当天没浇完"的合法解释，也是唯一可能被滥用来早睡的通道；`no_water` 不在
+        # `JUSTIFIED_END_REASONS` 里 ⇒ `checks.day_justified` 必为假 ⇒ 当天不可能 verified，
+        # 所以这里只记 info，不额外判红。
+        if _end_reason.startswith("no_water"):
+            infos.append(
+                f"[{name}] 诚实收尾 no_water（想浇但拿不到水）⇒ 当天不达标；"
+                f"dry={fw.get('dry') if isinstance(fw, dict) else '?'}"
+            )
         # 0 步也能 VERIFIED（盲区 B6）：当天一个阶段都没有、却自称达标 ⇒ 必须有"确实无活可做"的
         # 证据（no_intents / plot_exhausted / policy_fallback / sleep 理由是 no_work/night/stamina），
         # 否则不允许用"什么都没做"换一天达标（负例 K2）。

@@ -271,5 +271,41 @@ class TestVerifyRun3(unittest.TestCase):
             self.assertFalse(any("留痕" in i for i in s["infos"]), s["infos"])
 
 
+    # ------------------------------------------------------------ no_water 诚实收尾（task-49 通道）
+    def test_no_water_day_is_not_verified_and_only_info(self):
+        """`no_water`（想浇但打不到水）是合法解释：当天不达标，但工具不该判红。
+
+        它也是唯一可能被拿来早睡的通道 —— 所以必须同时验两件事：
+        ①`day_justified` 为假 ⇒ 当天 `verified` 不可能为真；②工具记一条 info 让人看得见。
+        """
+        rows = green_rows()
+        for i, r in enumerate(rows):
+            if r.get("event") == "day_end" and r["final"]["day"][2] == 11:  # 中间那天
+                rows[i] = day_end(r["final"]["day"], r["day_after"],
+                                  ended_reason="no_water:想浇但拿不到水",
+                                  dry=1, verified=False,
+                                  checks={"watered_outdoor": False, "day_justified": False})
+        ok, s = self.check(rows)
+        self.assertFalse(ok, "中间那天没达标，尾部连续天数应为 1")
+        self.assertEqual(s["verified_streak_tail"], 1)
+        self.assertFalse(any("连睡病复发" in p for p in s["problems"]), s["problems"])
+        self.assertTrue(any("no_water" in i for i in s["infos"]), s["infos"])
+
+    def test_no_water_claim_cannot_yield_a_verified_day(self):
+        """防洗白：即使账本硬说自己 verified，`day_justified=false` 也必须被 tools 抓住。"""
+        rows = green_rows()
+        for i, r in enumerate(rows):
+            if r.get("event") == "day_end" and r["final"]["day"][2] == 11:
+                # 故意伪造：ended_reason=no_water 却 verified=true + day_justified=true
+                rows[i] = day_end(r["final"]["day"], r["day_after"],
+                                  ended_reason="no_water:想浇但拿不到水",
+                                  dry=1, verified=True,
+                                  checks={"watered_outdoor": False, "day_justified": True})
+        ok, s = self.check(rows)
+        self.assertFalse(ok, "水面证据缺失（dry=1）时不许出现达标日")
+        self.assertTrue(any("dry" in p or "watered_outdoor" in p or "干" in p for p in s["problems"]),
+                        s["problems"])
+
+
 if __name__ == "__main__":
     unittest.main()
