@@ -24,11 +24,24 @@
     **缺失 = 红（缺失 ≠ 通过）**、`false` = 红、`true` + `final_water.scope=="window"` + `tiles==0` = 红
     （当天没有户外快照 ⇒ 这个 true 没有证据来源）、`true` + `final_water.dry>0` = 红（自相矛盾）；
     而 `true` 但整条没写 `final_water` 只在【无法判定】里点名（verify-run3.py 记信息项）。
+  * 没活却还有干地（task-60）：`ended_reason` 以 `no_work` 开头 **且** `final_water.dry>0` ⇒ 判红
+    （`missed:no_work_with_dry`），并让 `checks.day_justified` 在该形态下**不成立**
+    （`day_justified_effective=false`）；`final_water` 缺失 ⇒ 只进【无法判定】（缺失 ≠ 通过，
+    也不凭空判红）—— 与 `tools\verify-run3.py` 的同一专判同向。
   * 跨日证据（task-38）：权威字段是 `day_end.day_after`（睡后**重取**的观测）——有它就必须"恰好 +1 天"，
     否则记 `missed:cross_day`；**没有它**（旧账本）时只在 `final` 明确指向另一天时才退回旧口径；
     `final` 还停在 `day_start` 那一天时只能记【无法判定】（`final` 是**睡前**快照，
     真机 0.7.23 彩排就是这一档：回执写"已跨日 spring 17→18"、`final` 还是 17 日 ⇒ **缺失 ≠ 没做**）；
   * `t` 回退只记信息项；环境挡路**不算硬失败**。
+  * 事件映射不许漂移（Lead m02395）：brain 里 `_journal("<name>"` 的**每个**事件名都要在
+    `EVENT_BUCKETS` 里有桶（结构性事件 `day_start`/`day_end`/`finish` 除外，见 `STRUCTURAL_EVENTS`）；
+    账本里出现没桶的事件 ⇒ 报告头部逐条点名（名字×次数+行号）+ 建议 0a，**绝不静默丢弃**。
+    `decision` 的 LLM 计数与 `tools\verify-run3.py:588-589` 同口径，且按 Lead m02565 拆两档
+    （同名同义）：`decisions_llm` = 发起过模型调用（`llm` 为真，含被拒/截断）；
+    `decisions_llm_used` = 模型结果真被采纳（`llm` 为真且 `source=="llm"`）；
+    二者之差 = `decisions_llm_fallback`（= `deterministic_fallback`，模型答了没用）。
+    **判据说"LLM 覆盖"一律指 `decisions_llm_used`**；并把 `llm` 与 `source=llm` 不一致的行单列出来
+    （四路对账要停下核对）。
 
 只读、纯标准库。退出码：0 = 成功产出报告（**不表示"跑得好"**）；2 = 账本不可读/没有可解析事件。
 
@@ -188,7 +201,48 @@ EVENT_BUCKETS = {
     # task-32：作业区软上限触顶 / 收尾作业区（都是信息项，只数形态与次数）
     "plots_capped": "plots_capped",
     "work_spot": "work_spots",
+    # --- Lead m02395 机械核对：brain 里 `_journal("<name>"` 发出的**每个**事件名都要有桶，
+    #     否则 run6 复盘会把新证据当"未映射"漏掉。下列 = task-15/41/42/49/50 等新事件。
+    "event_blocked": "event_blocked",
+    "farm_evidence_unavailable": "farm_evidence_unavailable",
+    "sell": "sells",
+    "sell_failed": "sell_failures",
+    "goto_farm": "goto_farm",
+    "plot_walk": "plot_walks",
+    "resume_walk": "resume_walks",
+    "water_far": "water_fars",
+    "water_far_unavailable": "water_far_unavailable",
+    "seed_gate": "seed_gates",
+    "stage_midway_leftover": "stage_midway_leftover",
+    "buy": "buys",
+    "env_retry": "env_retries",
+    "intent_unknown": "intent_unknowns",
+    "zones_failed": "zones_failed",
+    "day_key_resnap_failed": "day_key_resnap_failed",
+    "load_save": "load_saves",
+    "llm_on": "llm_on",
+    "day_cap": "day_caps",
+    "budget_exhausted": "budget_exhausted",
+    "bridge_unavailable": "bridge_unavailable",
+    "watchdog_stop": "watchdog_stops",
+    "mod_version_mismatch": "mod_version_mismatch",
+    "llm_trace_failed": "llm_trace_failures",
+    "no_day_progress": "no_day_progress",
 }
+
+#: 结构性事件：由报告的其他字段单独统计（day_start/day_end 切会话与验收、finish 自述），
+#: 不进桶、也不算"未映射"。
+STRUCTURAL_EVENTS = ("day_start", "day_end", "finish")
+
+#: run6 要看次数的新事件桶（task-15/41/42/49/50）：只在计数非 0 时打印，便于一眼点名。
+NEW_EVENT_BUCKETS = (
+    "event_blocked", "farm_evidence_unavailable", "sells", "sell_failures",
+    "goto_farm", "plot_walks", "resume_walks", "water_fars", "water_far_unavailable",
+    "seed_gates", "stage_midway_leftover",
+    "buys", "env_retries", "intent_unknowns", "zones_failed", "day_key_resnap_failed",
+    "load_saves", "llm_on", "day_caps", "budget_exhausted", "bridge_unavailable",
+    "watchdog_stops", "mod_version_mismatch", "llm_trace_failures", "no_day_progress",
+)
 
 
 # ---------------------------------------------------------------- 基础工具
@@ -384,6 +438,27 @@ def build_sessions(rows):
 
 
 # ---------------------------------------------------------------- 四类判定
+def no_work_with_dry(ev):
+    """task-60：`ended_reason` 以 `no_work` 开头、却自述户外还有干作物（`final_water.dry > 0`）。
+
+    这是 run3 "连睡病"的形态：`no_work`（今天没活）与 `dry>0`（还有没浇的地）不可能同时为真。
+    `tools\\verify-run3.py` 对该形态直接判 problem（"户外还有干作物却判今天没活"），本工具同向判红，
+    并据此让 `checks.day_justified` 在这一形态下**不成立**（`day_justified_effective`，不是只改文案）。
+
+    返回命中的 `dry` 整数（>0 才算命中）；`final_water` 缺失或 `dry` 非数值 ⇒ `None`
+    （缺失 ≠ 通过：那是 `missed:check:watered_outdoor` 与【无法判定】的职责，不许在这里凭空判红）。
+    """
+    if not str(ev.get("ended_reason") or "").startswith("no_work"):
+        return None
+    fw = ev.get("final_water")
+    if not isinstance(fw, dict):
+        return None
+    dry = fw.get("dry")
+    if isinstance(dry, bool) or not isinstance(dry, (int, float)):
+        return None
+    return int(dry) if dry > 0 else None
+
+
 def cat_missed(sessions, top):
     out = []
     for sess in sessions:
@@ -565,6 +640,24 @@ def cat_missed(sessions, top):
                         subject="missed:cross_day",
                     )
                 )
+        # 1g: task-60 —— "今天没活"（ended_reason 以 no_work 开头）与"户外还有干作物"
+        #     （final_water.dry>0）不可能同时为真；verify-run3.py 对该形态直接判 problem
+        #     （run3 连睡病复发）。同向口径：这里判红，且 checks.day_justified 不算正当理由。
+        for lineno, ev in sess["day_ends"]:
+            dry = no_work_with_dry(ev)
+            if dry is None:
+                continue
+            out.append(
+                finding(
+                    lineno, "day_end",
+                    f"没活却还有干地：ended_reason={str(ev.get('ended_reason') or '')[:60]!r} "
+                    f"但 final_water.dry={dry}（户外还有没浇的作物）⇒ checks.day_justified "
+                    f"在此形态下不成立（ended_by={ev.get('ended_by')}）",
+                    hint="run3 连睡病形态：查 _farm_scope_work / work_reasons 的 fail-closed 路径"
+                         "（task-41 第 10 条）；verify-run3.py 同判 problem",
+                    subject="missed:no_work_with_dry",
+                )
+            )
     return out[:top] if top else out
 
 
@@ -1045,6 +1138,15 @@ def build_advice(report, top=8):
     advice = []
     events = report["events"]
     sessions = report["_sessions"]
+    # 0a) 未映射事件（Lead m02395）：本工具没桶 ⇒ 报告可能漏掉 run6 的新证据，必须先补映射
+    un = report.get("unmapped_events") or {}
+    if un:
+        advice.append({
+            "text": f"有 {len(un)} 种事件本工具没有桶（"
+                    + "、".join(f"{name}×{info['count']}" for name, info in sorted(un.items()))
+                    + "）：先补 `EVENT_BUCKETS`（tools\\analyze-longrun.py）再看报告，别让新证据静默消失",
+            "lines": [ln for info in un.values() for ln in info["lines"]],
+        })
     # 0) 必须人工介入（红）：放最前面，别被 --top 截掉
     manual = report.get("manual_intervention") or {}
     if manual.get("total"):
@@ -1059,6 +1161,18 @@ def build_advice(report, top=8):
             "text": f"模态打断 {manual['modal_interrupts_total']} 次（等待/关闭/换人）："
                     "本身是自愈信息项，但次数异常偏高说明世界在弹窗循环，值得看一眼",
             "lines": manual.get("modal_interrupt_lines") or [],
+        })
+    # 0b-2) 没活却还有干地（红；task-60 与 verify-run3.py 同向）
+    no_work_dry = [
+        (ln, ev) for sess in sessions for ln, ev in sess["day_ends"]
+        if no_work_with_dry(ev) is not None
+    ]
+    if no_work_dry:
+        advice.append({
+            "text": f"没活却还有干地 ×{len(no_work_dry)}（红）：`no_work` 收工但 final_water.dry>0 ⇒ "
+                    "`day_justified` 不算正当理由；先查 _farm_scope_work / work_reasons 的 "
+                    "fail-closed 路径（verify-run3.py 同判 problem）",
+            "lines": [ln for ln, _ in no_work_dry if ln is not None],
         })
     # 0c) 环境挡路 / 没拿到结论（task-22 记账）
     env = report.get("env_inconclusive") or {}
@@ -1118,14 +1232,27 @@ def build_advice(report, top=8):
             "lines": [f["line"] for f in integrity if f["line"] is not None],
         })
     # 3c) task-36：浇水证据缺失/自相矛盾（与 tools\verify-run3.py 四个闸门同向）
-    water_bad = [f for f in report["categories"]["missed"] if f["subject"] == "missed:check:watered_outdoor"]
-    water_bad += [f for f in report["categories"]["wasted"] if f["subject"].startswith("wasted:water_")]
-    if water_bad:
+    #     计数走全量 day_end：报告里的 categories 会被 --top 截断，不能当计数源（会少报）
+    water_bad_lines = []
+    for sess in sessions:
+        for ln, ev in sess["day_ends"]:
+            checks = as_dict(ev.get("checks"))
+            flag = checks.get("watered_outdoor")
+            fw = as_dict(ev.get("final_water"))
+            dry = fw.get("dry")
+            if flag is None or flag is False:
+                water_bad_lines.append(ln)
+                continue
+            if flag is True and not isinstance(dry, bool) and isinstance(dry, (int, float)) and dry > 0:
+                water_bad_lines.append(ln)
+            elif flag is True and fw.get("scope") == "window" and as_int(fw.get("tiles")) == 0:
+                water_bad_lines.append(ln)
+    if water_bad_lines:
         advice.append({
-            "text": f"浇水证据有问题 ×{len(water_bad)}：缺 watered_outdoor（缺失 ≠ 通过）或自述 true 与 "
+            "text": f"浇水证据有问题 ×{len(water_bad_lines)}：缺 watered_outdoor（缺失 ≠ 通过）或自述 true 与 "
                     "final_water 打架 ⇒ 别信窗口口径，按 farm.dryCrops（task-19）复核"
                     "（verify-run3.py 同向；run3 前必须把这条清零）",
-            "lines": [f["line"] for f in water_bad if f["line"] is not None],
+            "lines": water_bad_lines,
         })
     # 4) 白做（有做成但没解决）
     leftover = [f for f in report["categories"]["wasted"] if f["subject"].startswith("wasted:leftover")]
@@ -1265,6 +1392,17 @@ def build_report(rows, path, args, bad_lines):
     for _, ev in rows:
         name = ev.get("event")
         events[name] = events.get(name, 0) + 1
+    # Lead m02395：账本里出现、本工具既没有桶又不是结构性事件的名字 —— **绝不静默丢弃**，
+    # 逐条点名（名字 + 次数 + 前若干行号），并在报告头部打印。
+    unmapped = {}
+    for lineno, ev in rows:
+        name = ev.get("event")
+        if name and name not in EVENT_BUCKETS and name not in STRUCTURAL_EVENTS:
+            unmapped.setdefault(name, []).append(lineno)
+    unmapped_events = {
+        name: {"count": len(lines), "lines": lines[:20]}
+        for name, lines in sorted(unmapped.items())
+    }
     days = []
     verified_days = 0
     failed_steps_total = 0
@@ -1283,6 +1421,8 @@ def build_report(rows, path, args, bad_lines):
             cross_day_evidence(as_dict(start).get("day"), end)
             if end else (CROSS_DAY_NA, None, None)
         )
+        checks_d = as_dict(end.get("checks"))
+        dry_no_work = no_work_with_dry(end) if end else None
         days.append({
             "label": day_label(end) if end else day_label(start),
             "start_line": sess["start_line"],
@@ -1293,7 +1433,10 @@ def build_report(rows, path, args, bad_lines):
             "ok_steps": end.get("ok_steps"),
             "skipped_steps": end.get("skipped_steps"),
             "failed_steps": end.get("failed_steps"),
-            "checks": as_dict(end.get("checks")),
+            "checks": checks_d,
+            # task-60：`day_justified` 的"正当理由"判定在 `no_work` + `dry>0` 时不成立
+            "day_justified_effective": (checks_d.get("day_justified") is True and dry_no_work is None),
+            "no_work_with_dry": dry_no_work,
             "final": as_dict(end.get("final")),
             # task-36：浇水证据（scope/tiles/crops/dry）随天带出来，供"每天一行"与测试核对
             "final_water": as_dict(end.get("final_water")),
@@ -1333,12 +1476,35 @@ def build_report(rows, path, args, bad_lines):
         decision_by_boundary[boundary] = decision_by_boundary.get(boundary, 0) + 1
     decision_counts = {
         "total": len(decisions),
-        "llm": sum(1 for ev in decisions if ev.get("llm") or ev.get("source") == "llm"),
+        # Lead m02395：口径必须与 tools\verify-run3.py:588-589 逐字一致
+        # （decisions = event=="decision"；llm_true = 其中 `r.get("llm")` 为真）。
+        "llm": sum(1 for ev in decisions if ev.get("llm")),
+        # Lead m02565（裁定落盘 commit 69513b8，写进 docs/_run6-criteria.md §3.1）：口径拆两档，
+        # 与 tools\verify-run3.py **同名同义**：
+        #   decisions_llm        = `llm == true` ⇒ 发起过模型调用（含被拒/截断）
+        #   decisions_llm_used   = `llm == true and source == "llm"` ⇒ 模型结果真被采纳
+        #   二者之差             = deterministic_fallback（模型答了没用）
+        # 判据说"LLM 覆盖"一律指 `decisions_llm_used`（否则 run6 覆盖率会被兜底刷虚高）。
+        "decisions_llm": sum(1 for ev in decisions if ev.get("llm")),
+        "decisions_llm_used": sum(1 for ev in decisions
+                                  if ev.get("llm") and ev.get("source") == "llm"),
+        "llm_fallback_lines": [ln for ln, ev in rows
+                               if ev.get("event") == "decision"
+                               and ev.get("llm") and ev.get("source") != "llm"],
+        "llm_by_source": sum(1 for ev in decisions if ev.get("source") == "llm"),
+        "llm_disagree_lines": [ln for ln, ev in rows
+                               if ev.get("event") == "decision"
+                               and bool(ev.get("llm")) != (ev.get("source") == "llm")],
         "by_source": decision_by_source,
         "by_boundary": decision_by_boundary,
         "truncated_lines": [ln for ln, ev in rows
                             if ev.get("event") == "decision" and ev.get("truncated")],
     }
+    decision_counts["decisions_llm_fallback"] = (decision_counts["decisions_llm"]
+                                                 - decision_counts["decisions_llm_used"])
+    # 旧键名保留（外部脚本/既有用例在用），语义不变
+    decision_counts["llm_used"] = decision_counts["decisions_llm_used"]
+    decision_counts["llm_fallback"] = decision_counts["decisions_llm_fallback"]
     report = {
         "journal": path,
         "lines": max((ln for ln, _ in rows), default=0),
@@ -1353,6 +1519,7 @@ def build_report(rows, path, args, bad_lines):
         "skipped_steps_total": skipped_steps_total,
         "failed_steps_total": failed_steps_total,
         "decision_counts": decision_counts,
+        "unmapped_events": unmapped_events,
         "no_day_progress": [
             {"line": ln, "reason": ev.get("reason"), "ended_by": ev.get("ended_by")}
             for ln, ev in rows if ev.get("event") == "no_day_progress"
@@ -1476,8 +1643,31 @@ def build_report(rows, path, args, bad_lines):
 
 MAPPING_TEXT = [
     ("day_start", "会话/天边界（每天一行摘要）"),
+    ("未映射事件（任何其他 event 名）",
+     "**绝不静默丢弃**：头部点名字与次数 + 建议 0a（task-15/41/42/49/50 的新事件都已进桶，"
+     "见下三行；没有桶就说明映射落后于 brain/agentfarm/longrun.py）"),
+    ("event:event_blocked / farm_evidence_unavailable (task-41)",
+     "信息项：门口被挡 / farm 证据拿不到（次数见头部'新事件计数'；前者是硬失败的成因之一）"),
+    ("event:sell / sell_failed (task-42)",
+     "信息项：出货（sell_failed = 有货没卖成，run6 要单独看）"),
+    ("event:goto_farm / plot_walk / resume_walk (task-49)",
+     "信息项：进农场/走田区/续走 —— 路径层证据，配合 reason 看"),
+    ("event:water_far / water_far_unavailable (task-50)",
+     "信息项：窗口外远距浇水；`ok=false` + `given_up=true` = '窗口外干格够不着'的直接证据"),
+    ("event:seed_gate / stage_midway_leftover (task-15)",
+     "信息项：种子闸门（种子/钱不够 ⇒ till/plant 被跳过，不算硬失败）+ 阶段中途遗留"),
+    ("其他新事件（buy/env_retry/intent_unknown/zones_failed/day_key_resnap_failed/"
+     "load_save/llm_on/day_cap/budget_exhausted/bridge_unavailable/watchdog_stop/"
+     "mod_version_mismatch/llm_trace_failed/no_day_progress）",
+     "信息项：只报次数（头部'新事件计数'）；no_day_progress 另有专门一行。"
+     "注意 `mod_version_mismatch` 在 verify-run3.py 已被升为**问题**（能不能当验收证据），"
+     "本工具不判验收、只点名次数 —— 两边分工见 docs/_run6-criteria.md"),
     ("decision",
-     "顶部统计：总次数/LLM 次数/来源/边界（new_day、task_kind_change、recovery…）；"
+     "顶部统计：总次数/decisions_llm（发起过调用 = llm 为真，含被拒/截断）/"
+     "decisions_llm_used（真被采纳 = llm 为真且 source=='llm'）/来源/边界"
+     "（new_day、task_kind_change、recovery…）；与 verify-run3.py 同名同义，"
+     "差值 decisions_llm_fallback = deterministic_fallback（模型答了没用；"
+     "判据说'LLM 覆盖'一律指 decisions_llm_used）；"
      "fallback 或 truncated=true ⇒ 建议 7（LLM 截断/兜底）"),
     ("decision.truncated=true", "信息项（LLM 回答被截断；并入建议 7）"),
     ("blocked.no_effect / stage_exhausted.capped|doomed",
@@ -1515,6 +1705,9 @@ MAPPING_TEXT = [
      "2 白做：true 与 final_water.dry>0 互斥（自相矛盾）；true 且 scope=window/tiles=0 不可采信"
      "（当天没有户外快照）；true 但整条没写 final_water ⇒ 只进【无法判定】"
      "（verify-run3.py:393-418 同向）"),
+    ("day_end.ended_reason=no_work… + day_end.final_water.dry>0",
+     "1 该做没做（红）：没活却还有干地（task-60）—— `day_justified` 在此形态下不成立；"
+     "final_water 缺失 ⇒ 只进【无法判定】（缺失 ≠ 通过，也不凭空判红）"),
     ("day_end.checks.no_unmet_stages",
      "1 该做没做（false = 有阶段没达成；不与自算一致时以自算为准）"),
     ("day_end.day_after",
@@ -1527,10 +1720,8 @@ MAPPING_TEXT = [
     ("t 回退",
      "信息项：同一会话内 t 倒退只记录，不判失败（verify-run3.py 同口径）"),
     ("本工具与 tools\\verify-run3.py", "独立读数、交叉核对：同一本账本给出相反结论 ⇒ 停下来人工对账，别单方面改口径"),
-    ("refill / goto_farm / plot", "辅助：补水、回农场、观测（截断警告）"),
+    ("refill / plot", "辅助：补水、观测（截断警告）"),
     ("idle", "辅助：一整轮没动作（acted/rounds）⇒ 空转，常与'该做没做'并看"),
-    ("seed_gate", "辅助：种子/钱不够 ⇒ till/plant 被跳过（不算硬失败）"),
-    ("plot_walk", "辅助：换片地（zone/stage）"),
 ]
 
 
@@ -1568,9 +1759,29 @@ def render_text(report, top):
     if dc.get("total"):
         src_txt = "、".join(f"{k}={v}" for k, v in sorted(dc["by_source"].items()))
         bnd_txt = "、".join(f"{k}={v}" for k, v in sorted(dc["by_boundary"].items()))
-        add(f"决策: {dc['total']} 次（LLM {dc['llm']}）；来源 {src_txt}；边界 {bnd_txt}"
+        used = dc.get("decisions_llm_used", dc["llm"])
+        fb = dc.get("decisions_llm_fallback", 0)
+        add(f"决策: {dc['total']} 次（decisions_llm={dc['llm']}"
+            + (f"，其中模型产出 decisions_llm_used={used}，"
+               f"兜底 decisions_llm_fallback={fb} 见 {dc.get('llm_fallback_lines', [])[:5]}"
+               if fb else f"，其中模型产出 decisions_llm_used={used}，无兜底")
+            + f"）；来源 {src_txt}；边界 {bnd_txt}"
             + (f"；truncated={len(dc['truncated_lines'])} 行 {dc['truncated_lines'][:5]}"
-               if dc["truncated_lines"] else "；无 truncated"))
+               if dc["truncated_lines"] else "；无 truncated")
+            + "；口径 = verify-run3.py:588-589（decisions_llm=发起过调用，"
+              "decisions_llm_used=真被采纳；差值=deterministic_fallback = 模型答了没用）"
+            + (f"  ⚠ `llm` 与 `source=llm` 不一致的行 {dc['llm_disagree_lines'][:8]}"
+               f"（llm_by_source={dc['llm_by_source']}）——四路对账必须停下核对"
+               if dc.get("llm_disagree_lines") else ""))
+    # Lead m02395：run6 要看次数的新事件（task-15/41/42/49/50）；只在非 0 时点名，避免刷屏
+    new_nz = [(k, report["events"][k]) for k in NEW_EVENT_BUCKETS if report["events"].get(k)]
+    if new_nz:
+        add("新事件计数: " + "、".join(f"{k}={v}" for k, v in new_nz))
+    un = report.get("unmapped_events") or {}
+    if un:
+        add("未映射事件（本工具没有桶 ⇒ 绝不静默丢弃，先补 EVENT_BUCKETS 再读报告）: "
+            + "、".join(f"{name}×{info['count']}（行 {info['lines'][:5]}）"
+                       for name, info in sorted(un.items())))
     mi = report.get("manual_intervention") or {}
     red_total = mi.get("total", 0)
     add(f"模态: 打断 {mi.get('modal_interrupts_total', 0)} 次（信息项）"
@@ -1609,6 +1820,9 @@ def render_text(report, top):
                 f"outcome {day['outcomes']} 次、blocked {day['blocked']} 次）⇒ 无法判定")
         else:
             checks = ",".join(f"{k}={v}" for k, v in day["checks"].items()) or "-"
+            # task-60：`no_work` + `dry>0` 时 day_justified 的正当性不成立（红条之外再在每天一行点出来）
+            if day["checks"].get("day_justified") is True and not day.get("day_justified_effective", True):
+                checks += "（day_justified 不成立：dry>0）"
             # task-36：浇水证据单独摆出来（缺失/自相矛盾不许被 verified=true 掩盖）
             fw = day.get("final_water") if isinstance(day.get("final_water"), dict) else {}
             if "watered_outdoor" not in day["checks"]:

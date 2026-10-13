@@ -16,11 +16,13 @@ import importlib.util
 import io
 import json
 import os
+import re
 import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "analyze-longrun.py")
+BRAIN_LONG_RUN = os.path.join(ROOT, "brain", "agentfarm", "longrun.py")
 
 _spec = importlib.util.spec_from_file_location("analyze_longrun", TOOL)
 mod = importlib.util.module_from_spec(_spec)
@@ -28,6 +30,7 @@ _spec.loader.exec_module(mod)
 
 RUN1 = os.path.join(ROOT, "logs", "longrun-3day-llm-run1.jsonl")
 RUN2 = os.path.join(ROOT, "logs", "longrun-3day-llm-run2.jsonl")
+RUN5 = os.path.join(ROOT, "logs", "longrun-3day-llm-run5.jsonl")
 GREEN = os.path.join(ROOT, "scratch", "_ledger_green.jsonl")
 FALLBACK = os.path.join(ROOT, "scratch", "_ledger_fallback.jsonl")
 WASH = os.path.join(ROOT, "scratch", "_ledger_leftover_verified.jsonl")
@@ -570,13 +573,39 @@ class TestDecisionSourceAccounting(unittest.TestCase):
         self.assertEqual(dc["by_source"], {"llm": 2, "deterministic": 1})
         self.assertEqual(dc["by_boundary"], {"new_day": 1, "task_kind_change": 1, "(none)": 1})
         self.assertEqual(len(dc["truncated_lines"]), 1)
+        # Lead m02565：两档口径与 tools\verify-run3.py 同名同义
+        self.assertEqual(dc["decisions_llm"], 2)
+        self.assertEqual(dc["decisions_llm_used"], 2)
+        self.assertEqual(dc["decisions_llm_fallback"], 0)
+        self.assertEqual(dc["llm_used"], dc["decisions_llm_used"])
+        self.assertEqual(dc["llm_fallback_lines"], [])
 
     def test_render_and_advice_expose_llm_boundary(self):
         rep = self._report(integrity_ledger(extra_events=self._decisions()), "decision.jsonl")
         text = mod.render_text(rep, 50)
-        self.assertIn("决策: 3 次（LLM 2）", text)
+        self.assertIn("决策: 3 次（decisions_llm=2，其中模型产出 decisions_llm_used=2，无兜底）", text)
         self.assertIn("truncated=1 行", text)
         self.assertIn("LLM 回答被 max_tokens 截断", " ".join(a["text"] for a in rep["advice"]))
+
+    def test_fallback_is_named_but_not_counted_as_used(self):
+        """run2 L17 的形态（Lead m02565）：`llm=true` + `source=deterministic_fallback`
+        ⇒ 发起过调用算 1（`decisions_llm`），但**模型产出算 0**（`decisions_llm_used`），
+        兜底 1 行必须点名（判据说"LLM 覆盖"只能取 `decisions_llm_used`）。"""
+        events = integrity_ledger(extra_events=[
+            {"event": "decision", "t": 1.0, "day": MODAL_DAY, "boundary": "new_day",
+             "source": "deterministic_fallback", "llm": True, "intents": [], "problems": [],
+             "fallback": "llm_error:truncated: 空回答", "truncated": False},
+        ])
+        rep = self._report(events, "fallback.jsonl")
+        dc = rep["decision_counts"]
+        self.assertEqual(dc["decisions_llm"], 1)
+        self.assertEqual(dc["decisions_llm_used"], 0)
+        self.assertEqual(dc["decisions_llm_fallback"], 1)
+        self.assertEqual(len(dc["llm_fallback_lines"]), 1)
+        text = mod.render_text(rep, 50)
+        self.assertIn("decisions_llm=1", text)
+        self.assertIn("decisions_llm_used=0", text)
+        self.assertIn("兜底 decisions_llm_fallback=1 见", text)
 
     def test_clean_ledger_has_no_truncation_advice(self):
         rep = self._report(integrity_ledger(), "decision_clean.jsonl")
@@ -754,6 +783,171 @@ class TestCrossDayDayAfterAndTask32(unittest.TestCase):
             self.assertIn(kw, meaning)
         self.assertIn("no_plot", meaning)
         self.assertIn("不是正当理由", meaning)
+
+
+class TestNoWorkWithDry(unittest.TestCase):
+    """task-60：`ended_reason` 以 `no_work` 开头 **且** `final_water.dry>0` = "没活却还有干地"
+    （run3 连睡病形态）⇒ 必须判红，且 `checks.day_justified` 在该形态下不成立；
+    与 `tools\\verify-run3.py` 的同一专判同向；`final_water` 缺失 ⇒ 只记【无法判定】（缺失 ≠ 通过）。"""
+
+    DRY = {"t": 590.0, "location": "Farm", "tiles": 84, "crops": 31, "dry": 1, "scope": "farm"}
+    CHECKS = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+              "crops_watered": True, "day_justified": True, "watered_outdoor": False}
+
+    def _report(self, events, name):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=1, top=50)
+
+    def test_no_work_with_dry_is_red(self):
+        rep = self._report(integrity_ledger(day_end_overrides={
+            "ended_reason": "no_work:确实找不到可做的活（地里的活干完了）",
+            "final_water": dict(self.DRY),
+            "checks": dict(self.CHECKS),
+        }), "no_work_dry.jsonl")
+        self.assertIn("missed:no_work_with_dry", subjects(rep["categories"]["missed"]))
+        self.assertFalse(rep["days"][0]["day_justified_effective"], "dry>0 时 day_justified 不成立")
+        self.assertEqual(rep["days"][0]["no_work_with_dry"], 1)
+        text = mod.render_text(rep, 20)
+        self.assertIn("day_justified 不成立：dry>0", text)
+        self.assertTrue(any("没活却还有干地" in a["text"] for a in rep["advice"]),
+                        "必须进建议清单：" + "; ".join(a["text"] for a in rep["advice"]))
+        red = [a for a in rep["advice"] if "没活却还有干地" in a["text"]]
+        self.assertTrue(red[0]["lines"], "建议必须带证据行号")
+
+    def test_no_work_with_dry_zero_is_not_red(self):
+        rep = self._report(integrity_ledger(day_end_overrides={
+            "ended_reason": "no_work:确实找不到可做的活",
+            "final_water": dict(self.DRY, dry=0),
+            "checks": dict(self.CHECKS, watered_outdoor=True),
+        }), "no_work_ok.jsonl")
+        self.assertNotIn("missed:no_work_with_dry", subjects(rep["categories"]["missed"]))
+        self.assertTrue(rep["days"][0]["day_justified_effective"], "dry==0 时白名单照常生效")
+        self.assertIsNone(rep["days"][0]["no_work_with_dry"])
+        self.assertNotIn("不成立：dry>0", mod.render_text(rep, 20))
+
+    def test_missing_final_water_is_undecidable_not_pass(self):
+        checks = {k: v for k, v in self.CHECKS.items() if k != "watered_outdoor"}  # 也没有 final_water
+        rep = self._report(integrity_ledger(day_end_overrides={
+            "ended_reason": "no_work:今天没活",
+            "checks": checks,
+        }), "no_work_missing_fw.jsonl")
+        subs = subjects(rep["categories"]["missed"])
+        self.assertNotIn("missed:no_work_with_dry", subs, "缺失 ≠ 判红（也不许当通过）")
+        self.assertIn("missed:check:watered_outdoor", subs, "缺失 ≠ 通过：照 CHECK_MEANING 口径判红")
+        self.assertTrue(any(("watered_outdoor" in u) or ("final_water" in u) for u in rep["undecidable"]),
+                        "缺失必须同时进【无法判定】：" + "; ".join(rep["undecidable"]))
+        self.assertIsNone(rep["days"][0]["no_work_with_dry"])
+
+    def test_run5_three_hits_regression(self):
+        if not os.path.isfile(RUN5):
+            self.skipTest(f"缺少账本 {RUN5}")
+        rep = report_for(RUN5, days=3, top=500)
+        hits = [f for f in rep["categories"]["missed"] if f["subject"] == "missed:no_work_with_dry"]
+        detail = [(f["line"], f["summary"][:60]) for f in hits]
+        self.assertEqual(len(hits), 3, f"run5 应恰有 3 天命中（spring 26/27/28），实际 {detail}")
+        by_line = {d["day_end_lines"][-1]: d["label"] for d in rep["days"] if d["day_end_lines"]}
+        labels = [by_line.get(f["line"]) for f in hits]
+        self.assertTrue(all(lbl and "summer" not in lbl for lbl in labels),
+                        f"命中的必须是 spring 26/27/28，不能含 summer：{labels}")
+        self.assertEqual(rep["verified_days"], 0, "run5 仍是 0/3")
+
+
+class TestEventMappingDrift(unittest.TestCase):
+    """Lead m02395 机械核对：`EVENT_BUCKETS` 不许落后于 brain 里 `_journal("<name>"` 发出的事件名。
+
+    run6 复盘靠桶计数，漏映射 = 新证据静默消失，所以既做"brain × 桶"的漂移测试，
+    也验证"账本里出现没桶的事件 ⇒ 报告点名 + 建议"，还要把 decision 计数钉死在
+    `tools/verify-run3.py` 的口径上（四路对账不许两边数字不同源）。
+    """
+
+    RUN6_NEW_EVENTS = ("event_blocked", "farm_evidence_unavailable", "sell", "sell_failed",
+                       "goto_farm", "plot_walk", "resume_walk", "water_far",
+                       "water_far_unavailable", "seed_gate", "stage_midway_leftover")
+
+    def _report(self, events, name, days=1):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=days)
+
+    def test_event_buckets_cover_every_brain_journal_name(self):
+        if not os.path.isfile(BRAIN_LONG_RUN):
+            self.skipTest(f"缺少 {BRAIN_LONG_RUN}")
+        with open(BRAIN_LONG_RUN, encoding="utf-8") as fh:
+            src = fh.read()
+        names = sorted(set(re.findall(r'_journal\(\s*"([a-z0-9_]+)"', src)))
+        self.assertTrue(names, "没扫到任何 _journal 事件名（正则或文件结构变了？）")
+        missing = [n for n in names if n not in mod.EVENT_BUCKETS]
+        self.assertEqual(missing, sorted(mod.STRUCTURAL_EVENTS),
+                         f"EVENT_BUCKETS 落后于 {BRAIN_LONG_RUN}：{missing}")
+
+    def test_run6_events_are_mapped(self):
+        for name in self.RUN6_NEW_EVENTS:
+            self.assertIn(name, mod.EVENT_BUCKETS, f"run6 要看的事件 {name} 没有桶 ⇒ 计数会漏")
+
+    def test_unknown_event_is_listed_and_advised(self):
+        events = integrity_ledger(extra_events=[
+            {"event": "mystery_event", "t": 3.0, "day": MODAL_DAY, "note": "账本里有、工具没桶"},
+        ])
+        rep = self._report(events, "unknown_event.jsonl")
+        info = rep["unmapped_events"].get("mystery_event")
+        self.assertIsNotNone(info, f"未映射事件必须点名，不许静默丢弃：{rep['unmapped_events']}")
+        self.assertEqual(info["count"], 1)
+        self.assertTrue(info["lines"], "要点名行号")
+        text = mod.render_text(rep, 50)
+        self.assertIn("未映射事件", text)
+        self.assertIn("mystery_event×1", text)
+        self.assertIn("mystery_event×1", " ".join(a["text"] for a in rep["advice"]))
+        self.assertEqual(mod.build_advice(rep)[0]["lines"], info["lines"], "未映射事件要排在最前面")
+
+    def test_real_ledgers_have_no_unmapped_events(self):
+        for path in (RUN2, RUN5):
+            if not os.path.isfile(path):
+                self.skipTest(f"缺少账本 {path}")
+            rep = report_for(path, days=3, top=50)
+            self.assertEqual(rep["unmapped_events"], {},
+                             f"{os.path.basename(path)} 出现未映射事件：{rep['unmapped_events']}")
+
+    def test_decision_counts_match_verify_run3_rule(self):
+        """verify-run3.py:588-589 口径：decisions = event=="decision"；llm = 其中 r.get("llm") 为真。
+
+        `llm` 键与 `source=="llm"` 在真账本上**可能不一致**（run2 L17 = `llm=true` +
+        `source=deterministic_fallback` + `fallback=llm_error:truncated`）——这正是四路对账要看见的东西：
+        计数按 verify-run3 口径，同时把不一致的行单列出来（本工具不替它改口径）。
+        """
+        for path in (RUN2, RUN5):
+            if not os.path.isfile(path):
+                self.skipTest(f"缺少账本 {path}")
+            rows, _ = mod.load_journal(path)
+            decisions = [(ln, ev) for ln, ev in rows if ev.get("event") == "decision"]
+            want_total = len(decisions)
+            want_llm = sum(1 for _, ev in decisions if ev.get("llm"))
+            want_by_source = sum(1 for _, ev in decisions if ev.get("source") == "llm")
+            want_dis = [ln for ln, ev in decisions
+                        if bool(ev.get("llm")) != (ev.get("source") == "llm")]
+            dc = report_for(path, days=3, top=50)["decision_counts"]
+            want_used = sum(1 for _, ev in decisions
+                            if ev.get("llm") and ev.get("source") == "llm")
+            want_fb_lines = [ln for ln, ev in decisions
+                             if ev.get("llm") and ev.get("source") != "llm"]
+            self.assertEqual(dc["total"], want_total, f"{path}: decision 条数口径不一致")
+            self.assertEqual(dc["llm"], want_llm, f"{path}: LLM 条数口径不一致（verify-run3 只看 llm 键）")
+            # Lead m02565：decisions_llm（发起过调用）/ decisions_llm_used（真被采纳）/ 差值=兜底
+            self.assertEqual(dc["decisions_llm"], want_llm, f"{path}: decisions_llm 口径不一致")
+            self.assertEqual(dc["decisions_llm_used"], want_used, f"{path}: decisions_llm_used 口径不一致")
+            self.assertEqual(dc["decisions_llm_fallback"], want_llm - want_used,
+                             f"{path}: 兜底差值口径不一致")
+            self.assertEqual(dc["llm_fallback_lines"], want_fb_lines,
+                             f"{path}: 兜底必须逐行点名")
+            self.assertEqual(dc["llm_by_source"], want_by_source, f"{path}: source=llm 计数不一致")
+            self.assertEqual(dc["llm_disagree_lines"], want_dis,
+                             f"{path}: llm 与 source=llm 不一致的行必须逐行点名")
+            text = mod.render_text(report_for(path, days=3, top=50), 50)
+            if want_dis:
+                self.assertIn("不一致的行", text, f"{path}: 不一致必须在报告里可见")
+            if want_fb_lines:
+                self.assertIn(f"decisions_llm_fallback={len(want_fb_lines)}", text,
+                              f"{path}: 兜底数必须出现在头部（LLM 覆盖率不能虚高）")
 
 
 if __name__ == "__main__":
