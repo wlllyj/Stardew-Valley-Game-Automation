@@ -34,8 +34,8 @@ from agentfarm.farmwork import (  # noqa: E402
     MAX_CLEAR_SWINGS, FarmWorker, STAGE_ACTION, StepResult, StageResult, seed_items,
 )
 from agentfarm.longrun import (  # noqa: E402
-    DEFAULT_LLM_MAX_TOKENS, ENDED_BY_MODAL, MAX_ENV_ATTEMPTS, MAX_TILE_ATTEMPTS, DayReport,
-    LongRun, _till_blocked_by, plot_observe,
+    DEFAULT_LLM_MAX_TOKENS, ENDED_BY_MODAL, JUSTIFIED_END_REASONS, MAX_ENV_ATTEMPTS,
+    MAX_TILE_ATTEMPTS, DayReport, LongRun, _till_blocked_by, is_justified_end, plot_observe,
 )
 from agentfarm.planner import BoundaryPlanner, TaskIntent, deterministic_plan  # noqa: E402
 
@@ -2025,6 +2025,103 @@ class TestTask19WaterEvidence(unittest.TestCase):
         end = self._events(run, "day_end")[-1]
         self.assertEqual(end["final_water"], fw)
         self.assertIs(end["checks"]["watered_outdoor"], True, end["checks"])
+
+
+class TestTask32PlotsCap(unittest.TestCase):
+    """task-32：作业区配额触顶**不许当收工理由**（真机彩排 09:40、体力 144.7/270 就回家睡）。
+
+    真机形态：`plots_today >= max_plots_per_day` ⇒ 旧的 `_ensure_plot` 直接 return None ⇒
+    `_do_sleep("no_plot")`，而同一时刻 `work_reasons` 还在说"还有地要清/开/种"。
+    新语义：配额只限制"换到**新的**作业区"，不限制"当天继续干活"。
+    """
+
+    @staticmethod
+    def _events(run, event):
+        return [e for e in run.entries if e["event"] == event]
+
+    def test_capped_with_work_in_zone_keeps_the_day_going(self):
+        """触顶（`max_plots_per_day=0` 等价于"一片新地都不许开"）但区内还有活 ⇒ 当天照常做完。"""
+        w = FakeWorld(weeds=4, seeds=10, money=500)
+        run = make_run(w, target_days=1, max_plots_per_day=0)
+        code = run.run()
+        rep = run.days[0]
+
+        self.assertEqual(code, 0, run.logs)
+        # 活是真干完的（不是"睡过去"）：草清掉、25 格全种下
+        self.assertEqual(w.blockers, {}, run.logs)
+        self.assertEqual(len(w.crops), 25, run.logs)
+        # 触顶留痕：每天最多一条，且**不计入换区配额**
+        capped = self._events(run, "plots_capped")
+        self.assertEqual(len(capped), 1, [e for e in run.entries if e["event"].startswith("plot")])
+        self.assertEqual(capped[0]["plots_today"], 0, capped[0])
+        self.assertEqual(capped[0]["limit"], 0, capped[0])
+        self.assertEqual(rep.plots, [], "触顶后不该再有新作业区")
+        self.assertTrue(any("已开满" in str(n) for n in rep.notes), rep.notes)
+        # 收工理由必须是正当三种之一 —— 而 `no_plot` 已经不在白名单里
+        self.assertEqual(rep.ended_by, "sleep")
+        self.assertIn(rep.ended_reason.split(":", 1)[0], ("night", "stamina", "no_work"),
+                      rep.ended_reason)
+        self.assertTrue(rep.checks["day_justified"], rep.checks)
+        self.assertTrue(rep.verified, f"{rep.checks}｜{rep.notes}")
+        self.assertEqual(set(rep.stages_seen), {"clear_area", "till_area", "plant_area"})
+
+    def test_capped_and_no_work_anywhere_still_sleeps_no_work(self):
+        """触顶 + 真的没活 + 守卫放行 ⇒ 仍要能收工，且理由是 `no_work`（不是 `no_plot`）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        # 真机 `FarmScan` 每次扫描都发 `farm`（0 作物 ⇒ `dryCrops=0` ⇒ 浇水证据成立）；
+        # 不放这块的话本用例会因为"缺 farm 级浇水证据"被 task-19 的闸门判 needs_review，
+        # 而这里要钉的是"触顶 + 没活 ⇒ 仍然正当收工"，与浇水无关。
+        w.farm = {"loaded": True, "complete": True, "crops": 0, "dryCrops": 0,
+                  "unwateredCrops": 0, "hoeDirt": 0}
+        run = make_run(w, target_days=1, max_plots_per_day=0)
+        obs = w.obs()
+        rep0 = DayReport(day_key=("spring", 1, 6), started_at=0.0)
+        self.assertIsNone(run._ensure_plot(obs, rep0), "没有有活的候选区 ⇒ 必须返回 None 而不是硬撑")
+
+        self.assertEqual(run.run(), 0, run.logs)
+        rep = run.days[0]
+        self.assertEqual(rep.ended_by, "sleep")
+        self.assertTrue(rep.ended_reason.startswith("no_work"), rep.ended_reason)
+        self.assertTrue(rep.checks["day_justified"], rep.checks)
+        self.assertTrue(rep.verified, f"{rep.checks}｜{rep.notes}")
+
+    def test_work_outside_any_zone_is_done_instead_of_sleeping_no_plot(self):
+        """区里一格目标都拿不到 + 守卫说"有作物没浇水" ⇒ **不许 `no_plot` 收工**：拿"活所在的
+        格子"当收尾作业区把水浇掉（journal `work_spot`，不计入换区配额）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        t = (70, 20)
+        w.dirt.add(t)                     # ⚠ 必须同时进 dirt，否则这一格不进观测
+        w.crops[t] = {"watered": False, "ripe": False}
+        run = make_run(w, target_days=1, max_plots_per_day=0)
+        # 钉住前提："候选作业区一个都拿不出活"（真机形态是活落在 `fields` 切不出来的角落）
+        run._plot_candidates = lambda obs: []
+        self.assertIsNone(run._ensure_plot(w.obs(), DayReport(day_key=("spring", 1, 6), started_at=0.0)))
+        self.assertIsNotNone(run._work_spot_plot(w.obs()))
+
+        self.assertEqual(run.run(), 0, run.logs)
+        rep = run.days[0]
+        # ⚠ `w.sleep()` 会把 `watered` 清零，所以不能直接看 `w.crops[t]["watered"]`；
+        # 看"睡前那一刻"的记录（既有 `unwatered_at_sleep` 口径）与当天的浇水证据。
+        self.assertEqual(w.unwatered_at_sleep, [0], "睡前那一刻这 1 格作物已经浇过了")
+        self.assertIs(rep.checks["watered_outdoor"], True, rep.checks)
+        self.assertNotIn("no_plot", rep.ended_reason)
+        self.assertEqual(rep.ended_by, "sleep")
+        self.assertTrue(rep.checks["day_justified"], rep.checks)
+        spots = self._events(run, "work_spot")
+        self.assertTrue(spots, [e["event"] for e in run.entries])
+        # `work_spot` 记的是这一片收尾活里有几格（= 那 1 格作物），且**不计入换区配额**
+        self.assertEqual(spots[0]["tiles"], 1, spots[0])
+        self.assertEqual(rep.plots, [], "收尾活不是新作业区")
+
+    def test_no_plot_is_not_a_justified_reason(self):
+        """白名单钉死：`no_plot` 永远不是正当收工理由（真机彩排就是被它洗白的）。"""
+        self.assertNotIn("no_plot", JUSTIFIED_END_REASONS)
+        self.assertEqual(set(JUSTIFIED_END_REASONS), {"night", "stamina", "no_work"})
+        self.assertFalse(is_justified_end("sleep", "no_plot:找不到有活的作业区"))
+        self.assertTrue(is_justified_end("sleep", "no_work:确实找不到可做的活"))
+        self.assertTrue(is_justified_end("sleep", "night:已经到点了"))
+        self.assertFalse(is_justified_end("sleep_failed", "no_work:…"))
+        self.assertFalse(is_justified_end("stuck", "no_work:…"))
 
 
 if __name__ == "__main__":

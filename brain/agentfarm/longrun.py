@@ -165,6 +165,26 @@ def is_env_blocked(step: StepResult) -> bool:
     return bool(codes) and all(c in ENV_BLOCK_STATUSES for c in codes)
 
 
+#: 【task-32】"这一天可以收工"的**正当理由**（`ended_reason` 冒号前的前缀）。
+#: 只有三种：夜里到点 / 体力见底 / 确实没活。**`no_plot` 不在里面**：作业区配额到顶是
+#: 我们自己给自己设的软上限，被它憋停不等于"没活可做"（0.7.22 真机彩排：第 1 天 09:40、
+#: 体力 144.7/270 就 `no_plot` 回家睡，`work_reasons` 还在喊"还有地要清/开/种"）。
+#: `no_plot` 只允许作为"没睡成的说明"，不许据此判 `verified`（用户 m02532/m00707）。
+JUSTIFIED_END_REASONS = ("night", "stamina", "no_work")
+
+
+def is_justified_end(ended_by: str, ended_reason: str) -> bool:
+    """这一天是不是以**正当理由**收工（`day_justified` 的判据，task-32）。
+
+    口径与旧实现逐字一致（`ended_reason.split(":", 1)[0] in 白名单`），只是把白名单提成
+    模块常量 `JUSTIFIED_END_REASONS` 并抽成函数：一是单测可以直接钉死"`no_plot` 不在里面"，
+    二是别处（`_finish`/日报/工具）不会各抄一份前缀表。
+    """
+    if ended_by != "sleep":
+        return False
+    return str(ended_reason or "").split(":", 1)[0] in JUSTIFIED_END_REASONS
+
+
 #: "上一天未知"的哨兵日键：用来把**一天的第一次决策**顶到 `new_day` 边界上
 #: （`detect_boundary` 只在两边都非空且不相等时才判跨日，所以放 None 是没用的）。
 _DAY_START_SENTINEL: tuple[int, str, int] = (-1, "longrun-day-start", -1)
@@ -404,6 +424,8 @@ class LongRun:
         self.plot: dict[str, Any] | None = None
         self.zone_name = ""
         self.plots_today = 0
+        # 【task-32】当天是否已经播报过 `plots_capped`（作业区软上限触顶）。一天只记一次。
+        self.plots_capped_noted = False
         self.refills_today = 0
         self.idle_rounds = 0
         self.fail_streak = 0
@@ -720,15 +742,34 @@ class LongRun:
         return False
 
     def _ensure_plot(self, obs: dict[str, Any], rep: DayReport) -> dict[str, Any] | None:
-        """挑（或保持）当天的作业区；找不到有活的区就返回 None。"""
+        """挑（或保持）当天的作业区；找不到有活的区就返回 None。
+
+        【task-32 软上限】`max_plots_per_day` 到顶后**只限制"换到新的作业区"这件事被计入
+        `plots_today` / `rep.plots`**，绝不因此结束一天：只要还有区拿得出目标（`_plot_has_work`），
+        就把那个区当作当前作业区接着干，并当天记一次 `plots_capped`（纯信息项，不改 VERIFIED）。
+
+        理由（0.7.22 真机彩排 `logs\\longrun-rehearsal-0.7.22.jsonl`）：第 1 天 09:40、体力 144.7/270
+        在 `plots_today >= 10` 时这里返回 None ⇒ 调用方 `_do_sleep(..., "no_plot")` ⇒ 被自己的
+        配额憋停，而 `day_justified` 还接受 `no_plot` ⇒ 洗成 VERIFIED。用户 m02532/m00707
+        抱怨的"还有体力、时间还早就准备睡觉"就是这一形态。
+        """
         if self.plot is not None and self._plot_has_work(obs, self.plot["tiles"]):
             return self.plot
         for cand in self._plot_candidates(obs):
             if not self._plot_has_work(obs, cand["tiles"]):
                 continue
             if self.plots_today >= self.max_plots_per_day:
-                rep.notes.append(f"今天已经开了 {self.plots_today} 片地，不再换区")
-                return self.plot if (self.plot and self._plot_has_work(obs, self.plot["tiles"])) else None
+                self.plot = cand
+                self.zone_name = str(cand.get("zone") or "")
+                if not self.plots_capped_noted:
+                    note = (f"已开满 {self.plots_today} 片地（上限 {self.max_plots_per_day}），"
+                            f"不再累计新作业区：直接在有活的「{self.zone_name or '窗口'}」继续做")
+                    self.plots_capped_noted = True
+                    rep.notes.append(note)
+                    self._journal("plots_capped", plots_today=self.plots_today,
+                                  limit=self.max_plots_per_day, zone=self.zone_name,
+                                  tiles=len(cand["tiles"]), note=note)
+                return self.plot
             self.plot = cand
             self.zone_name = str(cand.get("zone") or "")
             self.plots_today += 1
@@ -743,6 +784,31 @@ class LongRun:
         self.plot = None
         self.zone_name = ""
         return None
+
+    def _work_spot_plot(self, obs: dict[str, Any]) -> dict[str, Any] | None:
+        """【task-32 兜底】没有任何田区拿得出目标，但守卫说"还有活"时的**收尾作业区**。
+
+        活 = 没浇水的 / 熟了的作物。这些格子可能落在 `fields` 切不出来的区里（或区全被判成
+        "没活"），但守卫（`work_reasons`）已经把它们算成必须干完的活 —— 那就直接把**活所在的
+        格子**当作业区交给策略/执行层（浇水/收获本来就是 `WIDE_TASKS`，按全场取目标），
+        而不是用 `no_plot` 收工。这个容器**不计入** `plots_today`：它不是"新开一片地"。
+
+        没有任何这样的格子 ⇒ 返回 None，调用方按"真没活"处理（守卫此刻不可能同时说要干活，
+        真出现这种自相矛盾时按 `stuck` 如实收尾，不洗成 `no_work`）。
+        """
+        tmap = FarmWorker.tiles_of(obs)
+        tiles = [t for t, v in tmap.items()
+                 if v.get("crop") and (not v.get("watered") or v.get("ripe"))]
+        if not tiles:
+            return None
+        pt = FarmWorker.player_tile(obs)
+        return {
+            "zone": "",
+            "label": "",
+            "anchor": [pt[0], pt[1]] if pt else list(tiles[0]),
+            "tiles": tiles,
+            "note": f"没有作业区但有 {len(tiles)} 格作物待浇/待收（收尾活，不计入换区配额）",
+        }
 
     # ------------------------------------------------------------------ 简报
     def _plot_brief(self, obs: dict[str, Any], plot: dict[str, Any]) -> Brief:
@@ -1685,6 +1751,7 @@ class LongRun:
         self.plot = None
         self.zone_name = ""
         self.plots_today = 0
+        self.plots_capped_noted = False
         self.refills_today = 0
         self.idle_rounds = 0
         self.blocked = {}
@@ -1751,10 +1818,24 @@ class LongRun:
             self._preconditions(obs, rep)
             plot = self._ensure_plot(obs, rep)
             if plot is None:
-                # 没有作业区（区里没活），但守卫说还有活 —— 把话说清楚再睡，别假装干完了
-                rep.notes.append("找不到有活的作业区：" + "；".join(self.work_reasons(obs)))
-                rep.ended_by, rep.ended_reason = self._do_sleep(obs, rep, "no_plot")
-                break
+                # 【task-32】没有田区拿得出目标，但**守卫刚刚说还有活**（否则 line 上方的
+                # `sleep_guard` 早就放行了）⇒ 不许用 `no_plot` 收工（它已不在
+                # `day_justified` 白名单里）。把"活所在的格子"（待浇/待收的作物）当收尾
+                # 作业区，让策略/执行层把当天该干的干完；真一格都拿不出来时按 `stuck`
+                # 如实收尾（**不洗成** `no_work`），且这条路径只有一次、不空转。
+                spot = self._work_spot_plot(obs) or self._near_player_plot(obs)
+                if spot is None:
+                    reasons = self.work_reasons(obs)
+                    rep.notes.append("找不到有活的作业区："
+                                     + ("；".join(reasons) or "（守卫也说没活）"))
+                    why = ("no_work" if not reasons else
+                           "stuck:守卫说还有活（" + "；".join(reasons)
+                           + "）但没有任何作业区拿得出目标")
+                    rep.ended_by, rep.ended_reason = self._do_sleep(obs, rep, why)
+                    break
+                plot = spot
+                self._journal("work_spot", zone=self.zone_name, tiles=len(plot["tiles"]),
+                              note=plot.get("note"))
 
             brief = self._plot_brief(obs, plot)
             decision = self.planner.decide(self.state, brief)
@@ -1905,8 +1986,9 @@ class LongRun:
             # task-19：**唯一**浇水证据（卡面 §1；`tools\verify-run3.py` 缺这条即问题）。
             # 窗口口径的 `crops_watered` 只作旁证：它读的是 `_essence` 的窗口计数，在室内恒 0。
             "watered_outdoor": bool(watered_outdoor),
-            "day_justified": (rep.ended_reason.split(":", 1)[0] in ("night", "stamina", "no_work", "no_plot")
-                              if rep.ended_by == "sleep" else False),
+            # 【task-32】白名单里**没有** `no_plot`：作业区配额到顶是我们自己设的软上限，
+            # 被它憋停不等于"没活可做"，不许据此判 VERIFIED（判据见 `is_justified_end`）。
+            "day_justified": is_justified_end(rep.ended_by, rep.ended_reason),
         }
         rep.verified = all(rep.checks.values())
         self._say(
