@@ -7,6 +7,9 @@
 退出码：0=预算用尽仍在跑；10=账本出现 finish；11=PID 消失；12=找不到 PID 文件（还没起跑/已被清理）。
 只读：进程存活 / 账本行数与末事件 / console 行数与尾行 / err 字节数 / 存档 size+mtime / 桥 modVersion。
 
+复用（run7 等）：传 `--journal logs\\longrun-3day-llm-run7.jsonl` 即自动把 console / err / PID 候选
+（`<journal>.pid` → `logs\\run7.pid`）都按它推导；`--pid-file` 仍可显式覆盖。
+
 路径按 `tools\\start-detached-longrun.py` 的真实落盘规则：
     PID     logs\\longrun-3day-llm-run6.pid（回退 logs\\run6.pid）
     console logs\\longrun-3day-llm-run6.console.log / …console.err.log
@@ -28,6 +31,7 @@ PID_CANDIDATES = (REPO / "logs" / "longrun-3day-llm-run6.pid", REPO / "logs" / "
 JOURNAL = REPO / "logs" / "longrun-3day-llm-run6.jsonl"
 CONSOLE = REPO / "logs" / "longrun-3day-llm-run6.console.log"
 ERR = REPO / "logs" / "longrun-3day-llm-run6.console.err.log"
+RUN6_JOURNAL = JOURNAL  # argparse 默认值用（避免在 global 声明之前引用 JOURNAL）
 SAVE_DIR = Path(os.environ["APPDATA"]) / "StardewValley" / "Saves" / "Wahaha_450799035"
 SAVE = SAVE_DIR / "Wahaha_450799035"
 BRIDGE = Path(os.environ["APPDATA"]) / "StardewValley" / "AgentFarm" / "bridge.json"
@@ -85,12 +89,22 @@ def sample(t0: float) -> tuple[bool, int, str | None, dict | None, str]:
 
 
 def main() -> int:
+    global JOURNAL, CONSOLE, ERR, PID_CANDIDATES
     ap = argparse.ArgumentParser()
     ap.add_argument("--minutes", type=float, default=4.0)
     ap.add_argument("--interval", type=float, default=15.0)
     ap.add_argument("--once", action="store_true", help="只采样一次（起跑后 90 秒汇报用）")
-    ap.add_argument("--pid-file", default="", help="留空则自动认 logs\\longrun-3day-llm-run6.pid → logs\\run6.pid")
+    ap.add_argument("--journal", default=str(RUN6_JOURNAL),
+                    help="长跑账本路径；console/err/PID 候选都按它推导（默认 run6 的账本）")
+    ap.add_argument("--pid-file", default="", help="留空则自动认 <journal>.pid → logs\\run6.pid")
     args = ap.parse_args()
+
+    # 允许重复用于其它 run：按 --journal 重算 console / err / PID 候选
+    JOURNAL = Path(args.journal)
+    CONSOLE = JOURNAL.with_suffix(".console.log")
+    ERR = JOURNAL.with_suffix(".console.err.log")
+    short = JOURNAL.stem.replace("longrun-3day-llm-", "")
+    PID_CANDIDATES = (JOURNAL.with_suffix(".pid"), REPO / "logs" / f"{short}.pid")
 
     pid_file = Path(args.pid_file) if args.pid_file else next((p for p in PID_CANDIDATES if p.exists()), None)
     if pid_file is None or not pid_file.exists():
