@@ -54,7 +54,8 @@ def main() -> int:
     ap.add_argument("--max-minutes", type=float, default=60.0, dest="max_minutes",
                     help="整个长跑的真实时间预算（默认 60 分钟）")
     ap.add_argument("--max-plots", type=int, default=10, dest="max_plots",
-                    help="一天最多开几片地（默认 10）")
+                    help="一天最多**新开**几片地（task-32 起是软配额：配额到顶但区内还有活时会继续干，"
+                         "只是不再换新片；默认 10）")
     ap.add_argument("--min-stamina", type=float, default=12.0, dest="min_stamina",
                     help="体力低于这个值就收工睡觉（默认 12）")
     ap.add_argument("--sleep-at", type=int, default=2200, dest="sleep_at",
