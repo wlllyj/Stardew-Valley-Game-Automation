@@ -11,12 +11,13 @@
 | task-51 | Mod 暴露 `farm.deadCrops` + 脑侧清死苗（`use_tool` 镰刀，判据=该格 crop 消失且 kind 仍 dirt；**活苗绝不碰**） | Mod + brain |
 | task-52 | "四邻都站不过去/A* 无路" ⇒ 新分类 `unreachable`：不算 `failed_steps`、不算 `no_unmet_stages`（同 `max(5, floor(0.2×attempted))` 有界），但必须逐格进 journal；超界或 0 成功仍不 `verified` | brain |
 | task-56 | 每次**真实** LLM 调用落一行 trace（`<journal>-llm.jsonl`：prompt/raw/usage/finish_reason/duration_ms/accepted/rejected），journal `decision` 行只新增 `llm_trace`/`llm_trace_hash`；写盘失败不影响决策 | brain |
+| task-63 | `till` 的 `tool_ineffective`（游戏拒绝该工具动这格）**不再算硬失败** ⇒ `skipped`+`proven_inert`（逐格 journal `tool_refused`）；**Mod 回执 `ok` 但格子没变仍记 `failed`**；日级有界豁免 `refused_bound = max(5, floor(0.2×attempted))`，超界照实 `no_hard_failures=false` | brain |
 
-不进本版：task-14（逐帧 warp 活锁）、task-17（world_stuck 自愈）、task-18（职业自动选）、task-20（工具等级）、task-53（农场级待清障/待开垦格数）、task-55（卖余料换种子钱）、task-58/59（B/C 件：把上次决策喂回模型 / 收工复盘）。
+不进本版：task-14（逐帧 warp 活锁）、task-17（world_stuck 自愈）、task-18（职业自动选）、task-20（工具等级主动探测）、task-53（农场级待清障/待开垦格数）、task-55（卖余料换种子钱）、task-58/59（B/C 件：把上次决策喂回模型 / 收工复盘）。
 
 ## 2 冻结与装机（Lead 独占，链条冻结后一次做完）
 
-1. 确认 `task-50/51/52/56` 全部 completed、工作树干净、`git log -1` 记录 HEAD。
+1. 确认 `task-50/51/52/56/63` 全部 completed、工作树干净、`git log -1` 记录 HEAD。
 2. `tools\_note-0725.txt` **已预写**（四张卡一句话）；冻结前对照最终交付复核一遍，哪张卡没进本版就改这一句。⚠️ **文件必须以 `v0.7.25` 开头** —— 否则 `_bump-mod-version.py` 只打印一行"说明文件应以 v0.7.25 开头"的告警并**原样保留旧 Version**（本轮已在临时副本上实测，见 STEP 3 的预演）。
 3. `python tools\_bump-mod-version.py 0.7.25 --note-file tools\_note-0725.txt`
 4. 改 `brain\agentfarm\bridge.py` 的 `MOD_VERSION_EXPECTED = "0.7.25"`（注释列本版内容）。
