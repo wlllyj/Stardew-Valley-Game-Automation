@@ -273,6 +273,13 @@ namespace AgentFarm.Bridge
                 else
                 {
                     _acc.Crops++;
+                    // task-51：枯死作物单独计数（与 crops/ripeCrops 同一次全农场扫描）。判据与
+                    // WorldSnapshot.ReadTile 的 tiles[].dead 同源（Crop.dead 是 NetBool，可空）。
+                    try
+                    {
+                        if (crop.dead != null && crop.dead.Value) _acc.DeadCrops++;
+                    }
+                    catch { }
                     try
                     {
                         if (crop.fullyGrown.Value) _acc.RipeCrops++;

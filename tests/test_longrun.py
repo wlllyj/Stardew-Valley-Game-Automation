@@ -41,7 +41,7 @@ from agentfarm.longrun import (  # noqa: E402
     MAX_ENV_ATTEMPTS, MAX_TILE_ATTEMPTS, DayReport, LongRun, _till_blocked_by, is_justified_end,
     plot_observe,
 )
-from agentfarm.planner import BoundaryPlanner, TaskIntent, deterministic_plan  # noqa: E402
+from agentfarm.planner import BoundaryPlanner, Brief, TaskIntent, deterministic_plan  # noqa: E402
 
 SEED_ID = "472"
 SEED_NAME = "Parsnip Seeds"
@@ -118,7 +118,7 @@ class FakeWorld:
             c = self.crops.get(t)
             if c:
                 tv.update({"crop": "24", "ripe": bool(c["ripe"]), "watered": bool(c["watered"]),
-                           "plantable": False})
+                           "dead": bool(c.get("dead")), "plantable": False})
             else:
                 tv.update({"plantable": True, "watered": False})
             tiles.append(tv)
@@ -205,6 +205,18 @@ class FakeWorld:
         self.spend("clear")
         return StepResult("clear", tile, ok=True, reason=f"清掉 {kind}")
 
+    def clear_dead(self, tile):
+        """【task-51】清枯死作物：只删 `dead=true` 的 crop；**活苗绝不动**。"""
+        c = self.crops.get(tile)
+        if c is None:
+            return StepResult("clear_dead", tile, code="already", reason="这格没有作物")
+        if not c.get("dead"):
+            return StepResult("clear_dead", tile, code="skipped",
+                              reason="这一格是活苗 —— 清死苗动作绝不碰它")
+        del self.crops[tile]
+        self.spend("clear")
+        return StepResult("clear_dead", tile, ok=True, reason="清掉这一格的枯死作物")
+
     def use_tool(self, tile, tool=None):
         """`use_tool` 的假世界版（与 Mod 同口径：**成功=这一格真的变了**，回执不算数）。
 
@@ -219,6 +231,13 @@ class FakeWorld:
         self.swings[t] = self.swings.get(t, 0) + 1
         if t in self.stuck:
             return {"ok": True, "status": "tool_ineffective", "reason": f"工具对 {t} 无效"}
+        _c = self.crops.get(t)
+        if _c is not None and _c.get("dead") and tool in (None, "scythe", "hoe"):
+            # 【task-51】枯死作物：真机 `destroyCrop(true)`（镰刀/锄头，IL 见
+            # `scratch\il-dead-hoedirt.txt`）⇒ **crop 消失、耕地留下**（`dirt` 不动）。
+            del self.crops[t]
+            self.spend("clear")
+            return {"ok": True, "status": "ok", "reason": "清掉这一格的枯死作物"}
         if tool == "hoe":                                  # 镜像 `till()`
             if t in self.dirt:
                 return {"ok": True, "status": "ok", "reason": "已经是耕地"}
@@ -435,7 +454,7 @@ class FakeWorker:
             if i >= max_steps:
                 res.stopped, res.stopped_reason = "budget", f"达到格数上限 {max_steps}"
                 break
-            if action in ("clear", "till", "water", "harvest", "sow") and self.w.stamina < min_stamina:
+            if action in ("clear", "clear_dead", "till", "water", "harvest", "sow") and self.w.stamina < min_stamina:
                 res.stopped, res.stopped_reason = "stamina", f"体力 {self.w.stamina:g} < {min_stamina:g}"
                 break
             st = getattr(self.w, action)(tile)
@@ -3227,6 +3246,84 @@ class TestTask52Unreachable(unittest.TestCase):
         self.assertEqual(ev[0]["tiles"], 2)
         self.assertEqual(ev[0]["in_leftover"], 2)
         self.assertEqual({tuple(t) for t in ev[0]["coords"]}, set(two))
+
+
+class TestTask51ClearDead(unittest.TestCase):
+    """task-51：枯死作物 —— Mod 报 `farm.deadCrops`，脑侧新增 `clear_dead`（镰刀）。**活苗绝不碰**。
+
+    真机依据（`scratch/_lead_crop_audit.py`，summer 2）：窗口 400 格里 24 个作物有 23 个
+    `dead=True`（唯一活苗 `[73,37]`），而 `till_blocked_by` 见 crop 就回「有作物」⇒ 不清死苗就
+    永远种不上（`till` 也永远被拒）。窗口外的死苗**没有坐标**（Mod 只给计数），只留痕不假装清完。
+    """
+
+    def _plot(self, w, run):
+        cands = run._plot_candidates(w.obs())
+        self.assertTrue(cands, "假农场应该切得出田区")
+        return cands[0]
+
+    @staticmethod
+    def _events(run: LongRun, event: str) -> list:
+        return [e for e in run.entries if e.get("event") == event]
+
+    def test_stage_tiles_leftover_and_plot_work_see_dead_crops_only(self):
+        """死苗进目标池；活苗不进；窗口里有死苗 ⇒ 这片地算"有活"（否则一整天零动作）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        dead, live = (60, 10), (62, 12)
+        w.dirt |= {dead, live}
+        w.crops[dead] = {"watered": True, "ripe": False, "dead": True}
+        w.crops[live] = {"watered": True, "ripe": False, "dead": False}
+        run = make_run(w)
+        run.worker = FakeWorker(w)
+        # 死苗所在的田区（`_plot_candidates` 会切出 4 片；守卫只对"这一片"回答）
+        plots = run._plot_candidates(w.obs())
+        plot = next(p for p in plots if tuple(dead) in {tuple(t) for t in p["tiles"]})
+        obs = w.obs()
+        self.assertEqual(run._stage_tiles("clear_dead", obs, plot), [dead])
+        self.assertEqual(run._leftover("clear_dead", obs, plot), [dead])
+        self.assertTrue(run._plot_has_work(obs, plot["tiles"]))
+
+    def test_day_clears_dead_crops_and_never_touches_the_live_seedling(self):
+        """跑一天：死苗被清掉、活苗原样在、`clear_dead_scope` 留痕、当天照常 VERIFIED。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        dead = [(60, 10), (62, 12)]
+        live = (64, 14)
+        for t in dead + [live]:
+            w.dirt.add(t)
+            w.crops[t] = {"watered": True, "ripe": False, "dead": t in dead}
+        run = make_run(w, target_days=1, max_days=1)
+        self.assertEqual(run.run(), 0, run.days)
+        for t in dead:
+            self.assertNotIn(t, w.crops, "死苗必须被清掉")
+        self.assertIn(live, w.crops, "活苗绝不许被碰")
+        scopes = self._events(run, "clear_dead_scope")
+        self.assertEqual(len(scopes), 1, run.entries)
+        self.assertEqual(scopes[0]["in_view"], 2)
+        self.assertEqual(scopes[0]["farm_status"], "unavailable", "假世界没有 farm 块 ⇒ 不许当 0")
+        rep = run.days[0]
+        self.assertEqual(rep.failed_steps, 0, rep.stages)
+        self.assertTrue(rep.checks["no_unmet_stages"], rep.checks)
+        self.assertTrue(rep.verified, f"{rep.checks} / {rep.stages}")
+
+    def test_planner_puts_clear_dead_between_harvest_and_ship(self):
+        """策略顺序：浇水 → 收获 → **清死苗** → 出货 → 清障 → 开垦 → 播种。
+
+        `deterministic_plan` 每次只回**最高优先级**那一条，所以顺序用"同时有几件事时先挑谁"来验。
+        """
+
+        def top(*, sellable: int = 0, **counts) -> str:
+            base = {"dead": 0, "ripe": 0, "unwatered_crops": 0,
+                    "blockers": 0, "dirt": 0, "plantable": 0}
+            base.update(counts)
+            return deterministic_plan(
+                Brief(day_key=(1, "spring", 6), has_save=True, counts=base,
+                      sellable=sellable))[0].task
+
+        self.assertEqual(top(dead=3), "clear_dead")
+        self.assertEqual(top(dead=3, ripe=2), "harvest", "收获压过清死苗")
+        self.assertEqual(top(dead=3, unwatered_crops=1), "water_area", "浇水压过清死苗")
+        self.assertEqual(top(dead=3, sellable=5), "clear_dead", "清死苗压过出货")
+        self.assertEqual(top(sellable=5), "ship", "没有死苗时才轮到出货")
+        self.assertEqual(top(dead=3, sellable=5, blockers=2), "clear_dead", "清障排在最后")
 
 
 if __name__ == "__main__":

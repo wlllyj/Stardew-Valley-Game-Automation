@@ -85,6 +85,7 @@ TASK_KINDS: tuple[str, ...] = (
     "plant_area",       # 播种
     "water_area",       # 浇水
     "harvest",          # 收获成熟作物
+    "clear_dead",       # 清掉枯死作物（只清 crop.dead，活苗绝不碰；task-51）
     "ship",             # 出货（把今天亲手收获的东西放进农场出货箱，task-42）
     "recover_stamina",  # 体力恢复（进食/睡觉）
     "sleep",            # 收工过夜（跨日）
@@ -782,7 +783,7 @@ class TaskOutcome:
 def deterministic_plan(brief: Brief) -> tuple[TaskIntent, ...]:
     """纯代码策略：**永远给出可执行的下一步**，不依赖任何网络。
 
-    顺序按"当天不做就永久亏"排：读档 → 体力 → **浇水 → 收获** → 清障 → 开垦 → 播种 → 复盘。
+    顺序按"当天不做就永久亏"排：读档 → 体力 → **浇水 → 收获 → 清死苗 → 出货** → 清障 → 开垦 → 播种 → 复盘。
     浇水排在清障/开垦前面是用户 m01770/m01774 的实证要求：作物当天不浇就不长，而清障/开垦
     任何一天都能做；先前把清障/开垦排在前面，真机跑出"体力耗在开垦上、作物没浇完就睡了"。
     每条的 `area_hint` 都是已观测真值的引用（`near:player` / `tillable[0:9]` / `tiles.plantable`），
@@ -814,6 +815,19 @@ def deterministic_plan(brief: Brief) -> tuple[TaskIntent, ...]:
             "harvest", "tiles.ripe",
             f"有 {brief.counts.get('ripe', 0)} 格作物成熟了，先收掉腾地",
             "location.tiles[].ripe 的格子数量下降",
+        ),)
+
+    # 【task-51】收掉成熟作物之后、出货之前：清掉**枯死**作物。
+    # 位置理由与 harvest 同源——死苗占着耕地、挡着 till（`till_blocked_by` 见 crop 就拒），
+    # 不清掉这一季就再也种不上；而清死苗是**一次性**动作（清完当季不会再有），
+    # 所以排在"每天不做就永久亏"的浇/收/卖之后、"任何一天都能做"的清障/开垦之前。
+    # 计数只认观测窗口里 `dead=true` 的格子（Mod 的 farm 级 `deadCrops` 是**农场全量**、
+    # 没有坐标 ⇒ 不能拿它当目标；窗口外的死苗由 `clear_dead_scope` journal 留痕）。
+    if int(brief.counts.get("dead", 0)) > 0:
+        return (TaskIntent(
+            "clear_dead", "tiles.dead",
+            f"有 {brief.counts.get('dead', 0)} 格枯死作物占着耕地，先清掉才能重种",
+            "location.tiles[] 里 dead=true 的作物格数量下降",
         ),)
 
     # 【task-42】收获之后立刻出货（用户 m08335："怎么到现在一分钱也没挣到呀"）。

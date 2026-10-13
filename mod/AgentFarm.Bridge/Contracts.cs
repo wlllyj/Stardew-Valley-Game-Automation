@@ -503,6 +503,21 @@ namespace AgentFarm.Bridge
         [JsonPropertyName("emptyDirt")] public int EmptyDirt { get; set; }
         [JsonPropertyName("crops")] public int Crops { get; set; }
         [JsonPropertyName("ripeCrops")] public int RipeCrops { get; set; }
+
+        /// <summary>
+        /// **枯死作物格数**（farm-wide 真值，与 <see cref="Crops"/>/<see cref="RipeCrops"/> **同一次扫描口径**：
+        /// `HoeDirt.crop != null &amp;&amp; Crop.dead.Value`）。枯死苗占着耕地、挡着 `till`（脑侧
+        /// `till_blocked_by` 见到 crop 就拒），必须先清掉才能重种（task-51）。
+        ///
+        /// 【为什么是计数而不是坐标】与 <see cref="DryCrops"/>/<see cref="DryTiles"/> 不同：清死苗是
+        /// **一次性**动作，脑侧先用计数决定"今天要不要开 `clear_dead` 阶段"，逐格坐标仍走
+        /// 玩家窗口 `location.tiles[].dead`（Mod 侧 `ReadTile` 早就在给）。若将来出现"窗口外还有死苗"
+        /// 导致清不完，再按 task-50 的 dryTiles 模式补坐标（本卡不做）。
+        ///
+        /// ⚠️ 旧 Mod 无此字段 ⇒ JSON 里为 null：脑侧**不许把"没这个字段"当成 0**（那是"不知道"）。
+        /// 只在 <see cref="Complete"/> == true（整场 Farm 分帧扫描跑完）时可信。
+        /// </summary>
+        [JsonPropertyName("deadCrops")] public int DeadCrops { get; set; }
         /// <summary>
         /// ⚠️ **这不是"今天还没浇水的作物格数"**：它数的是 `HoeDirt.needsWatering()`
         /// （只读 `CropData.NeedsWatering`、**完全不看是否已经浇过水**，IL 定案见 `docs\_analyze-farmcounts.md`），

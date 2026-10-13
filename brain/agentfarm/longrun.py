@@ -43,7 +43,7 @@ from typing import Any, Callable, Iterable
 
 from .bridge import MOD_VERSION_EXPECTED, BridgeClient, BridgeError
 from .farmwork import (ENV_BLOCK_STATUSES, STAGE_ACTION, FarmWorker, StageResult, StepResult,
-                       farm_dry_tiles, seed_items, till_blocked_by)
+                       farm_dead_crops, farm_dry_tiles, seed_items, till_blocked_by)
 from .planner import (BoundaryPlanner, Brief, PlannerState, TaskIntent, TaskOutcome,
                       deterministic_plan)
 
@@ -504,6 +504,8 @@ class LongRun:
         # 本日已经播报过"没种子也没钱 ⇒ 不再开垦"的任务（`till_area`/`plant_area`）。
         # 只在第一次撞到时说一句，别每轮刷屏（task-9：run2 白锄 60 格、体力 270→74）。
         self.seed_gate_noted: set[str] = set()
+        # 【task-51】本日是否已经播报过 `clear_dead` 的"看得见多少 / 农场口径还剩多少"。
+        self.dead_scope_noted: set[str] = set()
         # 本日"策略要了但一格目标都拿不出来"的任务。策略与执行层一旦不同口径，
         # 每轮空转一次、攒够 3 轮就判 stuck 报废整天；记下来当天不再要它。
         # **片区级**：`clear_area`/`till_area`/`plant_area` 只在作业区内看目标，换一片地就得忘掉。
@@ -1027,6 +1029,11 @@ class LongRun:
             if tv.get("crop"):
                 if not tv.get("watered") or tv.get("ripe"):
                     return True
+                # 【task-51】枯死作物**也是活**：它占着耕地、挡着 `till`（`till_blocked_by` 见 crop 就拒），
+                # 不清掉就永远开不了这一格。run5 真机夏季 2 日：窗口 24 个作物里 23 个 `dead=True`
+                # ⇒ 这一趟一直返回 False ⇒ 作业区被判"没活"⇒ 一整天零动作。
+                if tv.get("dead"):
+                    return True
                 continue
             kind = str(tv.get("kind") or "")
             if kind in ACTIONABLE_KINDS:
@@ -1183,6 +1190,9 @@ class LongRun:
         counts["dirt"] = max(0, int(counts.get("dirt", 0)) - int(local.counts.get("crops", 0)))
         counts["unwatered_crops"] = int(full.counts.get("unwatered_crops", 0))
         counts["ripe"] = int(full.counts.get("ripe", 0))
+        # 【task-51】枯死作物也按**全场（窗口）**计数：按区计数会让"这一片没死苗"压住
+        # 策略，而隔壁片地正躺着 20 格枯死苗。`planner.deterministic_plan` 据此插 `clear_dead`。
+        counts["dead"] = int(full.counts.get("dead", 0))
         if broken:
             counts["plantable"] = 0
         # 具名田区进简报：模型可以拿它当 `area_hint` 说"今天去哪片地"（方向由模型给、坐标由代码落）。
@@ -1229,6 +1239,13 @@ class LongRun:
             limit = self.water_stage_tiles
         elif task == "harvest":
             pool = [t for t, v in tmap.items() if v.get("crop") and v.get("ripe")]
+        elif task == "clear_dead":
+            # 【task-51】枯死作物**按窗口取**（与 harvest 同口径）：死苗是农场卫生问题，
+            # 一个作业区里往往散着十几格（真机窗口 23 格），按区取会把它们拖到明天。
+            # 只认观测里 `dead` 为真的格子 ⇒ 活苗永远进不了这个池子。
+            # 局限（如实记录）：窗口（`OBSERVE_REACH` 半径）外的死苗**没有坐标**，
+            # Mod 只给计数（`farm.deadCrops`）⇒ 本卡清不到，由 `clear_dead_scope` journal 留痕。
+            pool = [t for t, v in tmap.items() if v.get("crop") and v.get("dead")]
         elif task == "clear_area":
             pool = [t for t in local if str((tmap.get(t) or {}).get("kind") or "") in ACTIONABLE_KINDS]
         elif task == "till_area":
@@ -1250,7 +1267,7 @@ class LongRun:
             _seeds, _money, can_plant = self._seed_outlook(obs)
             if not can_plant:
                 pool = []
-        if task in ("clear_area", "till_area", "plant_area"):
+        if task in ("clear_area", "clear_dead", "till_area", "plant_area"):
             # 今天已经证明"动了没用"的格子不再碰（一格最多白试一次）；
             # 再叠一道"同一格一天最多发起 MAX_TILE_ATTEMPTS 次"的兜底不变量。
             pool = [t for t in pool
@@ -1275,6 +1292,10 @@ class LongRun:
             return [t for t, v in tmap.items() if v.get("crop") and not v.get("watered")]
         if task == "harvest":
             return [t for t, v in tmap.items() if v.get("crop") and v.get("ripe")]
+        if task == "clear_dead":
+            # 【task-51】与 `_stage_tiles` 同口径、**刻意不排除 `self.blocked`**（task-9 铁律）：
+            # 窗口里还有枯死作物 ⇒ 这一阶段就没做完（清不掉的那些由 `_step_stage` 单独报数）。
+            return [t for t, v in tmap.items() if v.get("crop") and v.get("dead")]
         if task == "clear_area":
             return [t for t in local
                     if str((tmap.get(t) or {}).get("kind") or "") in ACTIONABLE_KINDS]
@@ -1688,6 +1709,19 @@ class LongRun:
                 in_plot = pt is not None and tuple(pt) in {tuple(t) for t in plot["tiles"]}
                 self._journal("seed_gate", stage=task, seeds=seeds, money=money,
                               seed_price=self.seed_price, zone=self.zone_name, in_plot=in_plot)
+        # 【task-51】清死苗阶段：把"窗口里看得见几格"与"农场口径总共还剩几格"一起记下来。
+        # 为什么必须有：窗口（`OBSERVE_REACH` 半径）外的死苗**没有坐标**（Mod 只给
+        # `farm.deadCrops` 计数）⇒ 本卡清不到；但绝不许把"看不见"说成"没有了"。
+        # `farm_status="unavailable"` = 旧 Mod 没这个字段/farm 证据不可信（计数不可当 0）。
+        if task == "clear_dead" and task not in self.dead_scope_noted:
+            self.dead_scope_noted.add(task)
+            in_view = sum(1 for _tv in FarmWorker.tiles_of(obs).values()
+                          if _tv.get("crop") and _tv.get("dead"))
+            farm_dead, farm_status = farm_dead_crops(obs)
+            self._journal("clear_dead_scope", in_view=in_view, farm=farm_dead,
+                          farm_status=farm_status,
+                          note=("窗口内可见的枯死作物格数 vs Mod 农场口径（farm.deadCrops）："
+                                "窗口外的死苗没有坐标，本卡清不到，只做留痕"))
         wmin = self.water_min_stamina if task == "water_area" else self.min_stamina
         # task-15 §④：环境挡路（渐黑/模态/没存档/Mod 忙）**不是"这活没干成"**。遇到时先把
         # 挡路的模态收掉（`_clear_modals`），再**重跑同一批格子**（`forced`），最多
@@ -2336,6 +2370,7 @@ class LongRun:
         self.env_streak = {}
         self.env_spin_noted = set()
         self.seed_gate_noted = set()
+        self.dead_scope_noted = set()
         self.no_target = set()
         self.no_target_global = set()
         # 【task-49】跨片地的"今天还没做完"记账 + 回头看的次数上限，每天清零。

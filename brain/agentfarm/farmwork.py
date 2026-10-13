@@ -34,11 +34,13 @@ from typing import Any, Callable
 from .bridge import BridgeClient, BridgeError
 
 __all__ = [
+    "DEAD_TOOL_CANDIDATES",
     "DEBRIS_KINDS",
     "ENV_BLOCK_STATUSES",
     "INCONCLUSIVE_STATUSES",
     "KIND_TOOL",
     "MAX_CLEAR_SWINGS",
+    "MAX_DEAD_SWINGS",
     "SKIP_KINDS",
     "STAGE_ACTION",
     "TILE_INERT_STATUSES",
@@ -49,6 +51,7 @@ __all__ = [
     "StageResult",
     "StepResult",
     "farm_dry_tiles",
+    "farm_dead_crops",
     "is_unreachable",
     "seed_items",
     "till_blocked_by",
@@ -159,13 +162,24 @@ BED_CELL_FALLBACK = ((0, 1), (1, 1))
 
 #: 规划层的任务类型 → 执行层的动作。
 #: `plant_area` 走 `sow`（播种 + 立刻浇这一格），理由见 `FarmWorker.sow` 的 docstring。
+#: `clear_dead` 走 `clear_dead`（只清**枯死**作物，活苗不碰；task-51）。
 STAGE_ACTION = {
     "clear_area": "clear",
     "till_area": "till",
     "plant_area": "sow",
     "water_area": "water",
     "harvest": "harvest",
+    "clear_dead": "clear_dead",
 }
+
+#: 【task-51】清枯死作物最多连发几次请求。`destroyCrop(true)` 在**第一次命中**就发生
+#: （IL 见 `clear_dead` 的 docstring），第 2 次只用来兜"第一次没拿到结论"（超时/环境抖动）。
+MAX_DEAD_SWINGS = 2
+
+#: 【task-51】清枯死作物的工具候选顺序（IL 定案：镰刀与锄头都能 `destroyCrop`）。
+#: 首选镰刀：与割草同路、不会把耕地锄掉；背包里只有锄头时退锄头。
+#: `tool_missing_reason` 判不准（观测里没有工具/背包信息）时返回空串 ⇒ 放行，宁可多挥一次。
+DEAD_TOOL_CANDIDATES = ("scythe", "hoe")
 
 #: 邻格顺序（上/下/右/左）：站到目标格四邻之一再动手。
 NEIGHBORS = ((0, -1), (0, 1), (1, 0), (-1, 0))
@@ -592,6 +606,32 @@ def farm_dry_tiles(obs: dict[str, Any]) -> tuple[list[tuple[int, int]], str]:
             seen.add(t)
             out.append(t)
     return out, ("truncated" if farm.get("dryTilesTruncated") else "ok")
+
+
+def farm_dead_crops(obs: dict[str, Any]) -> tuple[int, str]:
+    """Mod 报的"枯死作物格数"（`farm.deadCrops`，task-51）。
+
+    返回 `(格数, 状态)`：
+
+    * `"ok"` —— `farm.deadCrops` 可信（`complete == true` 且 `loaded != false`）；
+    * `"unavailable"` —— 旧 Mod 没有这个字段，或 `farm` 证据不可信 ⇒ 格数回 **0**，
+      但调用方**绝不**能把 0 当成"农场里没有枯死作物"（那只是"不知道"）。
+
+    为什么是计数而不是坐标：清死苗是一次性动作，逐格坐标走玩家窗口 `tiles[].dead`
+    （`longrun._stage_tiles("clear_dead")` 就用它）。这个 farm 级计数用来**如实记录**
+    "窗口清完了、农场里还剩多少"（journal `clear_dead_scope`）—— 免得把"看不见"说成"没有了"
+    （与 task-50 的 `dryTiles` 同一条纪律，只是死苗暂时没给坐标）。
+    """
+    farm = obs.get("farm") or {}
+    if farm.get("loaded") is False or farm.get("complete") is not True:
+        return 0, "unavailable"
+    raw = farm.get("deadCrops")
+    if raw is None:
+        return 0, "unavailable"
+    try:
+        return max(0, int(raw)), "ok"
+    except (TypeError, ValueError):
+        return 0, "unavailable"
 
 
 class FarmWorker:
@@ -1100,6 +1140,139 @@ class FarmWorker:
         r.reason = (f"{why}（{tool}）这格还是 {kind_now or '未知'}"
                     f"⇒ 判据「kind 离开 {kind or '未知'}」未满足"
                     f"（{'、'.join(traces)}；回执 {r.receipt or '无'}）；{_work_context(obs)}")
+        return r
+
+    # ------------------------------------------------------------- 单格：清枯死作物
+    def clear_dead(self, tile: tuple[int, int]) -> StepResult:
+        """清掉一格**枯死**作物（task-51）。**活苗绝不碰**。
+
+        判据：动手前 = 该格 `crop` 存在且 `dead` 为真；动手后 = 该格 `crop` 消失。
+
+        真机依据（`scratch\\_lead_crop_audit.py`，summer 2）：窗口 400 格里 24 个作物有 23 个
+        `dead=True`（例 `[72,26] crop=24 dead=True watered=True kind=dirt`），唯一活苗 `[73,37]`。
+        死苗占着耕地 ⇒ `till_blocked_by` 见到 crop 就拒（"有作物"）⇒ 不清就永远种不上。
+
+        工具（IL 定案，`scratch\\il-dead-hoedirt.txt`）：`HoeDirt.performToolAction` 里
+        `isinst Hoe` 走 `hitWithHoe → destroyCrop(true)`；镰刀路末尾 `IL_021D-023E`
+        `if (crop != null && crop.dead.Value) destroyCrop(true)` ⇒ 普通镰刀(66)与锄头都能清。
+        所以按 `DEAD_TOOL_CANDIDATES` 先镰刀后锄头；两者都判"没有"⇒ 一次都不挥（`skipped`+封格）。
+
+        收尾口径与 `clear()` 一致：Mod 说"挥不动"/挥满上限 ⇒ `skipped` + `proven_inert`
+        （当天封这一格、次日重试）；走不到 ⇒ task-52 的 `unreachable`；环境挡路 / 没结论
+        ⇒ `failed` + `env_block`/`inconclusive`（**不封格**，下轮再试）。
+        """
+        r = StepResult(action="clear_dead", tile=tile)
+        obs = self.snap()
+        tv = self.tile_view(obs, tile)
+        r.before = self.tile_essence(tv)
+        kind = str((tv or {}).get("kind") or "")
+
+        if not (tv or {}).get("crop"):
+            r.ok, r.code = True, "already"
+            r.reason = f"这一格没有作物（kind={kind or '未知'}），不用清"
+            return r
+        if not (tv or {}).get("dead"):
+            r.code = "skipped"
+            r.reason = "这一格是活苗 —— 清死苗动作绝不碰它"
+            return r
+
+        # ---- 先判后动：工具不在身上就别挥（`clear()` 同款判据）----
+        tool, miss = "", ""
+        for want in DEAD_TOOL_CANDIDATES:
+            why = tool_missing_reason(self.player_of(obs), want)
+            if not why:
+                tool = want
+                break
+            miss = miss or why
+        if not tool:
+            r.code = "skipped"
+            r.proven_inert = True
+            r.reason = f"判据说这格现在清不掉 ⇒ 不动手：{miss}；{_work_context(obs)}"
+            return r
+        if not self.stand_next_to(tile):
+            r.code, r.reason = UNREACHABLE_CODE, "四邻都站不过去（没有落脚点）"
+            return r
+
+        traces: list[str] = []
+        statuses: list[str] = []
+        conclusive = False
+        env_block = ""
+        unreach = ""
+        swung = False
+        for i in range(1, MAX_DEAD_SWINGS + 1):
+            status = ""
+            try:
+                res = self.c.use_tool(tile, tool=tool, timeout_ms=15000)
+                r.receipt = _receipt_of(res)
+                if isinstance(res, dict):
+                    status = str(res.get("status") or ("" if res.get("ok", True) else "error"))
+            except BridgeError as exc:
+                status = str(getattr(exc, "status", "") or "")
+                r.receipt = _receipt(exc)
+            if status:
+                statuses.append(status)
+            obs = self.snap()
+            tv = self.tile_view(obs, tile)
+            r.after = self.tile_essence(tv)
+            kind_now = str((tv or {}).get("kind") or "")
+            has_crop = bool((tv or {}).get("crop"))
+            state = "无作物" if not has_crop else ("枯死" if (tv or {}).get("dead") else "活苗")
+            traces.append(f"第{i}次请求→{state}")
+            if not has_crop:
+                r.ok = True
+                r.code = ""
+                if isinstance(r.after, dict):
+                    r.after = {**r.after, "requests": i, "statuses": list(statuses)}
+                r.reason = (f"已清掉枯死作物（kind {kind or '未知'} → {kind_now or '未知'}；"
+                            f"{'、'.join(traces)}）")
+                return r
+            if status in TILE_INERT_STATUSES:
+                conclusive = True
+                break
+            if is_unreachable(status, r.receipt):
+                unreach = status
+                break
+            env, inconclusive = _classify_status(status)
+            if env:
+                env_block = status
+                break
+            if inconclusive:
+                continue
+            swung = True
+
+        if unreach:
+            r.code = UNREACHABLE_CODE
+            if isinstance(r.after, dict):
+                r.after = {**r.after, "requests": i, "statuses": list(statuses)}
+            r.reason = (f"第 {i} 次请求回「走不到」（{unreach}）：Mod 没找到落脚点/没算出路径 ⇒ "
+                        f"不算清死苗失败，也不算这一格干不动；{r.receipt}")
+            return r
+
+        if env_block:
+            r.code = "failed"
+            r.env_block = True
+            if isinstance(r.after, dict):
+                r.after = {**r.after, "requests": i, "statuses": list(statuses)}
+            r.reason = (f"第 {i} 次清死苗被环境挡住（{env_block}）⇒ 这一格不算被证明干不动；{r.receipt}")
+            return r
+
+        if statuses and not swung and not conclusive:
+            r.code = "failed"
+            r.inconclusive = True
+            if isinstance(r.after, dict):
+                r.after = {**r.after, "requests": i, "statuses": list(statuses)}
+            r.reason = (f"连续 {len(statuses)} 次请求没有拿到结论（statuses={'、'.join(statuses)}）"
+                        f"⇒ 这一格不算被证明干不动（枯死作物仍在）；{r.receipt}")
+            return r
+
+        r.code = "skipped"
+        r.proven_inert = True
+        if isinstance(r.after, dict):
+            r.after = {**r.after, "requests": i, "statuses": list(statuses)}
+        why = "Mod 回「工具全无效」" if conclusive else f"连挥 {MAX_DEAD_SWINGS} 次"
+        r.reason = (f"{why}（{tool}）这格枯死作物还在"
+                    f"⇒ 判据「crop 消失」未满足（{'、'.join(traces)}；回执 {r.receipt or '无'}）；"
+                    f"{_work_context(obs)}")
         return r
 
     # ------------------------------------------------------------- 单格：锄地
@@ -1990,12 +2163,14 @@ class FarmWorker:
                 break
             obs = self.snap()
             stam = self.stamina(obs)
-            if action in ("clear", "till", "water", "harvest", "sow") and stam < min_stamina:
+            if action in ("clear", "clear_dead", "till", "water", "harvest", "sow") and stam < min_stamina:
                 res.stopped, res.stopped_reason = "stamina", f"体力 {stam:g} < {min_stamina:g}"
                 break
 
             if action == "clear":
                 st = self.clear(tile)
+            elif action == "clear_dead":
+                st = self.clear_dead(tile)
             elif action == "till":
                 st = self.till(tile)
             elif action == "plant":

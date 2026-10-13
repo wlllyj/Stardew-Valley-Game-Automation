@@ -24,7 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "brain"))
 from agentfarm.bridge import BridgeError  # noqa: E402
 from agentfarm.farmwork import (  # noqa: E402
     NEIGHBORS, FarmWorker, KIND_TOOL, MAX_CLEAR_SWINGS, StepResult as SR, StageResult,
-    farm_dry_tiles, is_unreachable, till_blocked_by, tool_missing_reason, tool_presence,
+    farm_dead_crops, farm_dry_tiles, is_unreachable, till_blocked_by, tool_missing_reason,
+    tool_presence,
 )
 
 DROP = object()          # "这一格的障碍没了"（观测里那条记录消失）
@@ -47,6 +48,10 @@ class MiniWorld:
         self.result: dict[tuple[int, int], object] = {}             # 动作后这一格变成什么（默认：记录消失）
         #: 这一格要**第几刀**才变（默认 1）—— 草是多刀特征：普通镰刀一刀只把 numberOfWeeds 减 1。
         self.swings_needed: dict[tuple[int, int], int] = {}
+        # ---- task-51：枯死作物（`crop` 在、`dead=true`）----
+        #: 这些格**是枯死作物**：`use_tool` 命中后把 `crop`/`dead`/`ripe` 摘掉、`kind` 留 `dirt`
+        #: （真机 `destroyCrop(true)`）。活苗绝不进这个集合 ⇒ 用来证明"清死苗动作不碰活苗"。
+        self.dead_crops: set[tuple[int, int]] = set()
         #: 回执说"成了"但世界一动不动（真机 run1 镰刀假 ok 的复现）。
         self.lie: set[tuple[int, int]] = set()
         #: 这一格固定回哪个失败状态码（`tool_ineffective` / `no_save` / …）；给 list 则按顺序发。
@@ -244,6 +249,18 @@ class MiniWorld:
         if want:
             return {"ok": False, "status": want,
                     "reason": f"use_tool 试过的工具都无效：目标格 {t} 上仍有东西（起手=否）"}
+        if t in self.dead_crops:
+            # 【task-51】枯死作物：真机是 `destroyCrop(true)`（镰刀或锄头，IL 见
+            # `scratch\il-dead-hoedirt.txt`）⇒ 这一格的 **crop 消失、耕地留下**。
+            self.dead_crops.discard(t)
+            for r in self.records:
+                if tuple(r["tile"]) == t:
+                    r.pop("crop", None)
+                    r.pop("dead", None)
+                    r.pop("ripe", None)
+                    r["kind"] = "dirt"
+            return {"ok": True, "status": "ok",
+                    "reason": f"已用「{tool}」清掉这一格的枯死作物"}
         if t in self.lie:
             return {"ok": True, "status": "ok",
                     "reason": f"已用「{tool}」对 {t} 动手 1 次，现在**已经空了**（假回执）"}
@@ -392,6 +409,18 @@ def grass_rec(tile=(60, 10)) -> dict:
 
 def weed_rec(tile=(60, 10)) -> dict:
     return {"tile": list(tile), "kind": "weed", "standable": True, "actionable": True}
+
+
+def dead_crop_rec(tile=(60, 10)) -> dict:
+    """枯死作物格（task-51）：耕地 + `crop` 存在 + `dead=true`（真机审计的形态）。"""
+    return {"tile": list(tile), "kind": "dirt", "feature": "HoeDirt", "crop": "24",
+            "dead": True, "ripe": False, "watered": True, "standable": False}
+
+
+def live_crop_rec(tile=(60, 10)) -> dict:
+    """活苗格（task-51 的负例）：`crop` 存在但 `dead=false` ⇒ 清死苗动作**绝不许碰**。"""
+    return {"tile": list(tile), "kind": "dirt", "feature": "HoeDirt", "crop": "264",
+            "dead": False, "ripe": False, "watered": True, "standable": False}
 
 
 class TestToolPresence(unittest.TestCase):
@@ -1319,6 +1348,123 @@ class TestTask52Unreachable(unittest.TestCase):
         self.assertEqual(stage.as_dict()["unreachable"], 1)
         self.assertIs(r.as_dict().get("unreachable"), True)
         self.assertNotIn("proven_inert", r.as_dict(), "走不到不许被当成「证明干不动」")
+
+
+class TestFarmDeadCrops(unittest.TestCase):
+    """task-51：`farm_dead_crops` 三态 —— 旧 Mod 缺字段**绝不许**当 0。"""
+
+    def test_reads_count_only_when_complete(self):
+        self.assertEqual(farm_dead_crops({"farm": {"loaded": True, "complete": True,
+                                                  "deadCrops": 23}}), (23, "ok"))
+        self.assertEqual(farm_dead_crops({"farm": {"loaded": True, "complete": True,
+                                                   "deadCrops": 0}}), (0, "ok"))
+        self.assertEqual(farm_dead_crops({"farm": {"loaded": True, "complete": True,
+                                                   "deadCrops": -4}}), (0, "ok"))
+
+    def test_missing_field_is_unavailable_not_zero(self):
+        """旧 Mod 没有 `deadCrops` ⇒ `unavailable`（不是"没有死苗"）。"""
+        self.assertEqual(farm_dead_crops({"farm": {"loaded": True, "complete": True}}),
+                         (0, "unavailable"))
+        self.assertEqual(farm_dead_crops({"farm": {"filled": True, "complete": False,
+                                                   "deadCrops": 9}}), (0, "unavailable"))
+        self.assertEqual(farm_dead_crops({"farm": {"loaded": False, "complete": True,
+                                                   "deadCrops": 9}}), (0, "unavailable"))
+        self.assertEqual(farm_dead_crops({}), (0, "unavailable"))
+
+
+class TestTask51ClearDead(unittest.TestCase):
+    """task-51：清枯死作物。**活苗绝不碰**；判据只看观测差分（`crop` 消失）。
+
+    真机依据：summer 2 的窗口 400 格里 24 个作物有 23 个 `dead=True`，而 `till_blocked_by`
+    见到 crop 就回「有作物」⇒ 不清死苗就永远种不上（`till` 也永远被拒）。
+    """
+
+    def _worker(self, rec, *, inventory=None, tools=None, dead=True, **kw):
+        tile = tuple(rec["tile"])
+        w = MiniWorld(records=[dict(rec)],
+                      inventory=INV_WITH_SCYTHE if inventory is None else inventory,
+                      tools=TOOLS_WITH_SCYTHE if tools is None else tools, **kw)
+        if dead:
+            w.dead_crops.add(tile)
+        return w, make_worker(w)
+
+    def test_dead_crop_is_cleared_and_diff_proves_it(self):
+        """死苗 ⇒ `ok`，**判据是 crop 从观测里消失**（回执只是声明）。"""
+        tile = (60, 10)
+        w, worker = self._worker(dead_crop_rec(tile))
+        r = worker.clear_dead(tile)
+        self.assertTrue(r.ok, r.reason)
+        self.assertEqual(r.code, "")
+        self.assertIs(r.failed, False)
+        self.assertIs(r.proven_inert, False)
+        self.assertIn("已清掉枯死作物", r.reason)
+        self.assertIn("第1次请求→无作物", r.reason)
+        self.assertEqual(w.calls, [(tile, "scythe")], "先镰刀（不毁耕地），一次就够")
+        self.assertNotIn("crop", FarmWorker.tiles_of(w.obs())[tile])
+        self.assertEqual(r.after.get("requests"), 1)
+        self.assertEqual(r.after.get("statuses"), ["ok"])
+
+    def test_live_seedling_is_never_touched(self):
+        """活苗 ⇒ `skipped` 且**一次都不挥**（本卡的红线）。"""
+        tile = (60, 10)
+        w, worker = self._worker(live_crop_rec(tile), dead=False)
+        r = worker.clear_dead(tile)
+        self.assertIs(r.ok, False)
+        self.assertEqual(r.code, "skipped")
+        self.assertIs(r.proven_inert, False, "活苗不是「证明干不动」，是「不该动」")
+        self.assertIn("活苗", r.reason)
+        self.assertEqual(w.calls, [])
+        self.assertIn("crop", FarmWorker.tiles_of(w.obs())[tile], "活苗必须原样在")
+
+    def test_missing_tools_means_no_swing_and_the_tile_is_sealed(self):
+        """镰刀与锄头**都明确不在**（`tools` 位也是 false）⇒ 先判后动：一次不挥，封格。
+
+        注意：观测里**读不到**工具信息是「判不准 ⇒ 放行」，只有 Mod 明确说 false 才拦
+        （`tool_missing_reason` 的口径，用户 m01758/m01804 要的正是这条）。
+        """
+        tile = (60, 10)
+        none_tools = {k: False for k in ("axe", "pickaxe", "hoe", "wateringCan", "weapon")}
+        w, worker = self._worker(dead_crop_rec(tile), inventory=[], tools=none_tools)
+        r = worker.clear_dead(tile)
+        self.assertEqual(r.code, "skipped")
+        self.assertIs(r.proven_inert, True)
+        self.assertIs(r.failed, False)
+        self.assertIn("清不掉", r.reason)
+        self.assertIn("scythe", r.reason)
+        self.assertEqual(w.calls, [])
+
+    def test_mod_tool_ineffective_is_sealed_not_failed(self):
+        """Mod 说「工具全无效」（世界给的前置事实）⇒ `skipped`+封格，**不是**硬失败。"""
+        tile = (60, 10)
+        w, worker = self._worker(dead_crop_rec(tile))
+        w.fail_status[tile] = "tool_ineffective"
+        r = worker.clear_dead(tile)
+        self.assertEqual(r.code, "skipped")
+        self.assertIs(r.proven_inert, True)
+        self.assertIs(r.failed, False, "run5 就是被这类「拒绝」烧成 no_hard_failures=false")
+        self.assertIn("工具全无效", r.reason)
+        self.assertEqual(len(w.calls), 1, "回「无效」是结论性的：不必挥满上限")
+
+    def test_unreachable_is_its_own_class(self):
+        """四邻都站不过去 ⇒ task-52 的 `unreachable`（不是清死苗失败，也不封格）。"""
+        tile = (60, 10)
+        w, worker = self._worker(dead_crop_rec(tile))
+        w.unwalkable = {(tile[0] + dx, tile[1] + dy) for dx, dy in NEIGHBORS}
+        r = worker.clear_dead(tile)
+        self.assertEqual(r.code, "unreachable")
+        self.assertIs(r.unreachable, True)
+        self.assertIs(r.failed, False)
+        self.assertEqual(w.calls, [])
+
+    def test_no_crop_at_all_is_already_done(self):
+        """格子上没作物（别人已经清过）⇒ `ok/already`，不挥。"""
+        tile = (60, 10)
+        rec = {"tile": list(tile), "kind": "dirt", "feature": "HoeDirt", "standable": False}
+        w, worker = self._worker(rec, dead=False)
+        r = worker.clear_dead(tile)
+        self.assertTrue(r.ok)
+        self.assertEqual(r.code, "already")
+        self.assertEqual(w.calls, [])
 
 
 if __name__ == "__main__":  # pragma: no cover
