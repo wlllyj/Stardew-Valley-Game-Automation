@@ -476,15 +476,20 @@ class TestIntegrityAndSpinAccounting(unittest.TestCase):
                          "差额 5-3=2 被 env_block=2 解释完 ⇒ 不算账目不可信")
 
     def test_cross_day_must_be_exactly_one_day(self):
-        same = self._report(integrity_ledger(day_end_overrides={"final": final(MODAL_DAY)}),
-                            "cross_same.jsonl")
-        self.assertIn("missed:cross_day", subjects(same["categories"]["missed"]))
+        # task-38：`final` 是**睡前**快照 ⇒ 它停在当天**不能**证明"没跨日"（旧口径就是这么假报警的）
+        stale = self._report(integrity_ledger(day_end_overrides={"final": final(MODAL_DAY)}),
+                             "cross_stale_final.jsonl")
+        self.assertNotIn("missed:cross_day", subjects(stale["categories"]["missed"]),
+                         "没有 day_after 且 final 停在当天 ⇒ 只能【无法判定】，不算'该做没做'")
+        # `final` 明确指向另一天（旧账本兜底）但不是 +1 天 ⇒ 仍然报红
         twice = self._report(integrity_ledger(
             day_end_overrides={"final": final([MODAL_DAY[0], MODAL_DAY[1], MODAL_DAY[2] + 2])}),
             "cross_twice.jsonl")
         self.assertIn("missed:cross_day", subjects(twice["categories"]["missed"]))
         good = self._report(integrity_ledger(), "cross_ok.jsonl")
         self.assertNotIn("missed:cross_day", subjects(good["categories"]["missed"]))
+        self.assertEqual(good["days"][0]["cross_day_verdict"], "crossed")
+        self.assertEqual(good["days"][0]["cross_day_source"], "final")
 
     def test_zero_step_verified_needs_no_work_excuse(self):
         ok = self._report(integrity_ledger(), "zero_ok.jsonl")
@@ -672,6 +677,83 @@ class TestWaterEvidenceGates(unittest.TestCase):
         water_advice = [a for a in rep["advice"] if "浇水证据有问题" in a["text"]]
         self.assertTrue(water_advice, "浇水问题必须进建议清单")
         self.assertTrue(water_advice[0]["lines"], "建议必须带证据行号")
+
+
+class TestCrossDayDayAfterAndTask32(unittest.TestCase):
+    """task-38：跨日以 `day_end.day_after`（睡后重取的观测）为权威证据；`plots_capped`/`work_spot`
+    入桶且只算信息项；`no_plot` 不再是正当收工理由。"""
+
+    def _report(self, events, name):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=1)
+
+    def test_day_after_plus_one_is_the_authority(self):
+        rep = self._report(integrity_ledger(day_end_overrides={
+            "day_after": [1, "spring", 13],
+            # final 故意留在当天（睡前快照）：有 day_after 时不许拿 final 判"没跨日"
+            "final": final(MODAL_DAY),
+        }), "day_after_ok.jsonl")
+        self.assertNotIn("missed:cross_day", subjects(rep["categories"]["missed"]))
+        day = rep["days"][0]
+        self.assertEqual(day["cross_day_verdict"], "crossed")
+        self.assertEqual(day["cross_day_source"], "day_after")
+        self.assertEqual(day["day_after"], [1, "spring", 13])
+        text = mod.render_text(rep, 20)
+        self.assertIn("跨日=day_after 1/spring/13", text)
+        self.assertIn("跨日证据 day_after: 1/1 天", text)
+        self.assertNotIn("跨日=无法判定", text)
+
+    def test_day_after_plus_two_is_red_and_unparsable_is_undecidable(self):
+        twice = self._report(integrity_ledger(day_end_overrides={"day_after": [1, "spring", 14]}),
+                             "day_after_twice.jsonl")
+        self.assertIn("missed:cross_day", subjects(twice["categories"]["missed"]))
+        self.assertEqual(twice["days"][0]["cross_day_source"], "day_after")
+        weird = self._report(integrity_ledger(day_end_overrides={"day_after": ["?", "spring", 13]}),
+                             "day_after_weird.jsonl")
+        self.assertNotIn("missed:cross_day", subjects(weird["categories"]["missed"]),
+                         "认不出的 day_after ⇒ 【无法判定】，绝不当'没跨日'")
+        self.assertEqual(weird["days"][0]["cross_day_verdict"], "undecidable")
+        self.assertTrue(any("无法判定是否跨日" in u for u in weird["undecidable"]))
+
+    def test_missing_day_after_is_undecidable_in_report_and_render(self):
+        rep = self._report(integrity_ledger(day_end_overrides={"final": final(MODAL_DAY)}),
+                           "cross_no_after.jsonl")
+        day = rep["days"][0]
+        self.assertEqual(day["cross_day_verdict"], "undecidable")
+        self.assertEqual(day["cross_day_source"], "final")
+        self.assertEqual(day["day_after"], [])
+        self.assertNotIn("missed:cross_day", subjects(rep["categories"]["missed"]))
+        text = mod.render_text(rep, 20)
+        self.assertIn("跨日=无法判定（缺 day_after，final 是睡前快照；缺失 ≠ 没做）", text)
+        self.assertIn("跨日证据 day_after: 0/1 天", text)
+        self.assertIn("⚠", text, "跨日证据不齐必须在 header 里显式标注")
+        self.assertTrue(any("无法判定是否跨日（缺失 ≠ 没做）×1 天" in u and "L2" in u
+                            for u in rep["undecidable"]),
+                        "缺失必须进【无法判定】并带行号：" + "; ".join(rep["undecidable"]))
+
+    def test_plots_capped_and_work_spot_are_info_counts(self):
+        rep = self._report(integrity_ledger(extra_events=[
+            {"event": "plots_capped", "t": 3.0, "plots_today": 10, "limit": 10, "zone": "field_ne",
+             "tiles": 25, "note": "一天 10 片到顶"},
+            {"event": "work_spot", "t": 4.0, "zone": "field_se", "tiles": 4, "note": "收尾作业区"},
+        ]), "task32_events.jsonl")
+        self.assertEqual(rep["events"]["plots_capped"], 1)
+        self.assertEqual(rep["events"]["work_spot"], 1)
+        text = mod.render_text(rep, 20)
+        self.assertIn("plots_capped 1 次", text)
+        self.assertIn("work_spot 1 次", text)
+        missed = subjects(rep["categories"]["missed"])
+        self.assertNotIn("missed:plots_capped", missed)
+        self.assertNotIn("missed:work_spot", missed)
+        self.assertTrue(any(name == "plots_capped / work_spot" for name, _ in mod.MAPPING_TEXT))
+
+    def test_no_plot_is_not_a_justified_reason(self):
+        meaning = mod.CHECK_MEANING["day_justified"]
+        for kw in ("night", "stamina", "no_work"):
+            self.assertIn(kw, meaning)
+        self.assertIn("no_plot", meaning)
+        self.assertIn("不是正当理由", meaning)
 
 
 if __name__ == "__main__":

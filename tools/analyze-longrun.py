@@ -23,7 +23,11 @@
   * 浇水证据（task-19/task-36，与 `tools\verify-run3.py` 四个闸门同向）：`checks.watered_outdoor`
     **缺失 = 红（缺失 ≠ 通过）**、`false` = 红、`true` + `final_water.scope=="window"` + `tiles==0` = 红
     （当天没有户外快照 ⇒ 这个 true 没有证据来源）、`true` + `final_water.dry>0` = 红（自相矛盾）；
-    而 `true` 但整条没写 `final_water` 只在【无法判定】里点名（verify-run3.py 记信息项）。跨日必须恰好 +1 天；
+    而 `true` 但整条没写 `final_water` 只在【无法判定】里点名（verify-run3.py 记信息项）。
+  * 跨日证据（task-38）：权威字段是 `day_end.day_after`（睡后**重取**的观测）——有它就必须"恰好 +1 天"，
+    否则记 `missed:cross_day`；**没有它**（旧账本）时只在 `final` 明确指向另一天时才退回旧口径；
+    `final` 还停在 `day_start` 那一天时只能记【无法判定】（`final` 是**睡前**快照，
+    真机 0.7.23 彩排就是这一档：回执写"已跨日 spring 17→18"、`final` 还是 17 日 ⇒ **缺失 ≠ 没做**）；
   * `t` 回退只记信息项；环境挡路**不算硬失败**。
 
 只读、纯标准库。退出码：0 = 成功产出报告（**不表示"跑得好"**）；2 = 账本不可读/没有可解析事件。
@@ -71,7 +75,9 @@ CHECK_MEANING = {
                          "—— 不是代码能自愈的那种，必须人工介入",
     "no_hard_failures": "这一天存在硬失败",
     "crops_watered": "收工时仍有作物没浇水",
-    "day_justified": "收工理由不在允许集（night/stamina/no_work/no_plot）",
+    # task-32/task-38：白名单只有 night/stamina/no_work（longrun.JUSTIFIED_END_REASONS）；
+    # `no_plot`（作业区配额到顶）是**我们自己设的软上限**，不许当"正当收工理由"。
+    "day_justified": "收工理由不在允许集（night/stamina/no_work；no_plot 不是正当理由）",
     # task-19/task-36：窗口口径在室内恒 0，不能当浇水证据 ⇒ 必须由 farm 级字段作证（缺失 ≠ 通过）
     "watered_outdoor": "缺 farm 级/户外浇水证据、或自述还有没浇的作物（缺失 ≠ 通过；"
                        "窗口 unwatered_crops 在室内恒 0，不作证据）",
@@ -95,6 +101,14 @@ FIELD_PROBES = [
      "户外浇水证据（task-19；缺失 ≠ 通过）"),
     ("day_end.checks.no_unmet_stages", "no_unmet_stages",
      "阶段后置条件是否全部成立（task-15；缺失时按 stages 自算）"),
+    # task-38：睡后重取的观测才是跨日权威证据（`final` 是**睡前**快照）
+    ("day_end.day_after", "day_after",
+     "睡后重取的观测 [年,季,日]（task-38：权威跨日证据；缺失 ⇒ 只能记【无法判定】，不能当'没跨日'）"),
+    # task-32：两种新事件的可见性（deputy `docs\_review-task32.md` NIT-②）
+    ("event:plots_capped", "plots_capped",
+     "作业区软上限触顶的留痕（task-32：plots_today/limit/zone/tiles；纯信息项，不改 VERIFIED）"),
+    ("event:work_spot", "work_spot",
+     "收尾作业区（task-32：拿不出田区、守卫却说还有活时用的容器；zone/tiles；不如 no_plot 收工）"),
     ("event:stage_exhausted", "stage_exhausted", "阶段级'没有目标'的显式记录"),
     ("event:stage_no_target", "stage_no_target", "阶段级'没有目标'的旧记录"),
     ("event:plot_exhausted", "plot_exhausted", "片区级'没有目标'的换片记录"),
@@ -171,6 +185,9 @@ EVENT_BUCKETS = {
     "modal_wait_error": "modal_errors",
     "levelup_profession_pending": "levelup_pending",
     "levelup_profession_unknown": "levelup_unknown",
+    # task-32：作业区软上限触顶 / 收尾作业区（都是信息项，只数形态与次数）
+    "plots_capped": "plots_capped",
+    "work_spot": "work_spots",
 }
 
 
@@ -231,22 +248,73 @@ def day_label(ev):
 
 #: 季节顺序（跨日校验用：每季固定 28 天）
 SEASON_ORDER = ("spring", "summer", "fall", "winter")
+#: 季节别名（与 `tools\verify-run3.py` 的 `_SEASON_INDEX` 逐字同口径：认英文与中文）
+SEASON_ALIASES = {"spring": 0, "summer": 1, "fall": 2, "winter": 3,
+                  "春": 0, "夏": 1, "秋": 2, "冬": 3}
 
 
 def day_index(day):
-    """把 `[year, season, day]` 折成可比较的序号（每季 28 天）；解析不了返回 None。
+    """把 `[year, season, day]` 折成绝对日序（每季 28 天）；认不出返回 None。
 
-    只用来做"跨日必须恰好 +1 天"这条校验（与 `tools\\verify-run3.py` 同口径）。
+    只用来做"跨日必须恰好 +1 天"这条校验。task-38：口径逐字对齐
+    `tools\\verify-run3.py:_day_ordinal` —— 季节认 spring/summer/fall/winter 与春秋夏冬
+    （大小写/空白不敏感，也接受 0-3 的整数），日必须是 1..28。
+    认不出返回 None ⇒ 调用方只能记【无法判定】，**绝不许**把"认不出"当成"没跨日"。
     """
     seq = as_list(day)
     if len(seq) != 3:
         return None
-    year = as_int(seq[0], -1)
-    season = str(seq[1] or "")
-    dom = as_int(seq[2], -1)
-    if year < 0 or dom <= 0 or season not in SEASON_ORDER:
+    season = seq[1]
+    if isinstance(season, str):
+        idx = SEASON_ALIASES.get(season.strip().lower())
+    elif isinstance(season, int) and not isinstance(season, bool):
+        idx = season
+    else:
+        idx = None
+    try:
+        year = int(seq[0])
+        dom = int(seq[2])
+    except (TypeError, ValueError):
         return None
-    return year * 112 + SEASON_ORDER.index(season) * 28 + (dom - 1)
+    if idx is None or not (0 <= idx <= 3) or not (1 <= dom <= 28):
+        return None
+    return ((year - 1) * 4 + idx) * 28 + (dom - 1)
+
+
+#: 跨日判定的三种结论 + "不适用"（只看我们主动睡过去的日子）
+CROSS_DAY_CROSSED = "crossed"
+CROSS_DAY_WRONG = "wrong"
+CROSS_DAY_UNDECIDABLE = "undecidable"
+CROSS_DAY_NA = "n/a"
+
+
+def cross_day_evidence(start_day, end):
+    """task-38：判断这一天有没有"跨日恰好 +1 天"的证据。
+
+    返回 `(verdict, source, end_day)`；`verdict ∈ {crossed, wrong, undecidable, n/a}`。
+
+    口径（与 `tools\\verify-run3.py:216-227`/`:391-404` 对齐 + 一条按 Lead m01723 的裁定）：
+      * `day_end.ended_by != "sleep"` ⇒ `n/a`（这条校验只管我们主动睡过去的日子）；
+      * 有 `day_after`（睡后**重取**的观测）⇒ 它就是权威证据：正好 +1 天 = `crossed`，
+        否则 = `wrong`；认不出 `[年,季,日]` = `undecidable`；
+      * 没有 `day_after`（task-38 之前的旧账本）⇒ **只在 `final` 明确指向另一天时**才退回旧口径
+        （+1 = `crossed`，否则 `wrong`）；`final` 还停在 `day_start` 那一天、或缺失 ⇒ `undecidable`。
+        理由：`final` 是**睡前**快照，拿它判"没跨日"就是 task-38 要修的那个假报警
+        （真机 0.7.23 彩排：回执写"已跨日 spring 17→18"、`final` 还是 17 日）⇒ **缺失 ≠ 没做**。
+    """
+    if not isinstance(end, dict) or end.get("ended_by") != "sleep":
+        return CROSS_DAY_NA, None, None
+    after = as_list(end.get("day_after"))
+    if after:
+        i0, i1 = day_index(start_day), day_index(after)
+        if i0 is None or i1 is None:
+            return CROSS_DAY_UNDECIDABLE, "day_after", after
+        return (CROSS_DAY_CROSSED if i1 == i0 + 1 else CROSS_DAY_WRONG), "day_after", after
+    fin_day = as_dict(end.get("final")).get("day")
+    i0, i1 = day_index(start_day), day_index(fin_day)
+    if i0 is None or i1 is None or i1 == i0:
+        return CROSS_DAY_UNDECIDABLE, "final", fin_day
+    return (CROSS_DAY_CROSSED if i1 == i0 + 1 else CROSS_DAY_WRONG), "final", fin_day
 
 
 def find_default_journal():
@@ -478,18 +546,18 @@ def cat_missed(sessions, top):
                     )
                 )
         # 1f: 主动睡过去了却没跨到"次日"（verify-run3.py：ended_by=sleep 必须有跨日证据）
-        if end and end.get("ended_by") == "sleep":
-            start = as_dict(sess["start"])
-            fin = as_dict(end.get("final"))
-            i0 = day_index(start.get("day"))
-            i1 = day_index(fin.get("day"))
-            if i0 is not None and i1 is not None and i1 != i0 + 1:
+        #     task-38：判据统一交给 `cross_day_evidence()` —— 优先 `day_after`（睡后重取的观测），
+        #     只有 `final` 明确指向另一天时才退回旧口径；`final` 还停在当天 ⇒ 【无法判定】，不报红。
+        if end:
+            verdict, src, end_day = cross_day_evidence(as_dict(sess["start"]).get("day"), end)
+            if verdict == CROSS_DAY_WRONG:
                 out.append(
                     finding(
                         end_line, "day_end",
-                        f"缺跨日证据：ended_by=sleep，但 final 日期 {fin.get('day')!r} 不是 "
-                        f"day_start {start.get('day')!r} 的次日",
-                        hint="跨日必须恰好 +1 天（verify-run3.py 同口径）；+2 天或倒退都说明账本/世界不对",
+                        f"缺跨日证据：ended_by=sleep，但 {src} 日期 {end_day!r} 不是 "
+                        f"day_start {as_dict(sess['start']).get('day')!r} 的次日",
+                        hint="跨日必须恰好 +1 天（verify-run3.py:391-404 同口径）；+2 天或倒退都说明"
+                             "账本/世界不对。task-38 之后的日子以 `day_after` 为权威证据",
                         subject="missed:cross_day",
                     )
                 )
@@ -747,7 +815,8 @@ def cat_sleep(sessions, top, stamina_full, sleep_pct):
                     finding(
                         sleep_line, "sleep",
                         f"睡前 timeOfDay={tod} < 2200，天还早",
-                        hint="sleep_at 默认 2200；若提前收工要给出理由（no_work/no_plot/stamina）",
+                        hint="sleep_at 默认 2200；若提前收工要给出理由（night/stamina/no_work）——"
+                             "`no_plot`（作业区配额到顶）**不算**正当理由（task-32）",
                         subject="sleep:early",
                     )
                 )
@@ -1164,6 +1233,24 @@ def build_undecidable(rows, sessions, prelude, report):
         out.append(f"有 {len(no_fw)} 天 checks.watered_outdoor=true 但没写 final_water（行 {no_fw[:8]}）："
                    "无法核对浇水证据来自哪张快照（缺证据 ≠ 通过；verify-run3.py:414-418 同口径只记信息项、"
                    "不额外判问题）")
+    # task-38：跨日证据"无法判定"的那些天 —— 只能说无法判定，**不许**把"没写成"当"没做"
+    # （真机 0.7.23 彩排：回执写"已跨日 spring 17→18"，但 day_end 没写 day_after、final 还是 17 日）
+    undec_cross = []
+    for sess in sessions:
+        if not sess["day_ends"]:
+            continue
+        lineno, end = sess["day_ends"][-1]
+        verdict, src, end_day = cross_day_evidence(as_dict(sess["start"]).get("day"), end)
+        if verdict != CROSS_DAY_UNDECIDABLE:
+            continue
+        if src == "day_after":
+            undec_cross.append(f"L{lineno}（day_after={end_day!r} 认不出 [年,季,日]）")
+        else:
+            undec_cross.append(f"L{lineno}（没有 day_after，final 是睡前快照 day={end_day!r}）")
+    if undec_cross:
+        out.append(f"无法判定是否跨日（缺失 ≠ 没做）×{len(undec_cross)} 天：{'、'.join(undec_cross[:8])}"
+                   " —— `final` 是**睡前**快照，task-38 之后应由 `day_end.day_after`（睡后重取的观测）作证；"
+                   "这段证据缺失时本工具**不判** `missed:cross_day`，只在此处如实记录")
     return out
 
 
@@ -1188,6 +1275,10 @@ def build_report(rows, path, args, bad_lines):
             failed_steps_total += as_int(end.get("failed_steps"))
             ok_steps_total += as_int(end.get("ok_steps"))
             skipped_steps_total += as_int(end.get("skipped_steps"))
+        cross_verdict, cross_src, cross_day = (
+            cross_day_evidence(as_dict(start).get("day"), end)
+            if end else (CROSS_DAY_NA, None, None)
+        )
         days.append({
             "label": day_label(end) if end else day_label(start),
             "start_line": sess["start_line"],
@@ -1202,6 +1293,12 @@ def build_report(rows, path, args, bad_lines):
             "final": as_dict(end.get("final")),
             # task-36：浇水证据（scope/tiles/crops/dry）随天带出来，供"每天一行"与测试核对
             "final_water": as_dict(end.get("final_water")),
+            # task-38：跨日证据（优先 day_after；final 只是旧账本兜底，且它本身是睡前快照）
+            "start_day": as_dict(start).get("day"),
+            "day_after": as_list(end.get("day_after")),
+            "cross_day_verdict": cross_verdict,
+            "cross_day_source": cross_src,
+            "cross_day_day": cross_day,
             "outcomes": len(sess["outcomes"]),
             "blocked": len(sess["blocked"]),
         })
@@ -1416,6 +1513,11 @@ MAPPING_TEXT = [
      "（verify-run3.py:393-418 同向）"),
     ("day_end.checks.no_unmet_stages",
      "1 该做没做（false = 有阶段没达成；不与自算一致时以自算为准）"),
+    ("day_end.day_after",
+     "1 该做没做（红）：跨日证据 —— 有它就必须恰好 +1 天（+2/倒退都算）；**缺失或认不出 ⇒ 只进"
+     "【无法判定】**，不许把'没写成'当'没做'（final 是睡前快照）"),
+    ("plots_capped / work_spot",
+     "顶部统计：作业区软上限触顶 / 收尾作业区（信息项，不改 VERIFIED；task-32）"),
     ("finish",
      "收尾自述：code/verified_streak 必须自身自洽、并与正文 verified 天数同向（不同向 ⇒ 自述在洗账）"),
     ("t 回退",
@@ -1449,6 +1551,15 @@ def render_text(report, top):
     add(f"blocked: {blocked} 条（{blocked_detail}）；其中理由含 grass 的 {report['blocked_grass']} 条"
         + ("（草格无效挥动）" if report["blocked_grass"] else ""))
     add(f"sleep: {report['events'].get('sleep', 0)} 次（ok {report['sleep_ok']} / failed {report['sleep_failed']}）")
+    # task-32：两种新事件形态的计数（信息项）；task-38：跨日证据覆盖度
+    pc, ws = report["events"].get("plots_capped", 0), report["events"].get("work_spot", 0)
+    add(f"软上限/收尾: plots_capped {pc} 次（作业区配额到顶，信息项）；work_spot {ws} 次（收尾作业区）")
+    sleep_days = [d for d in report["days"] if d.get("ended_by") == "sleep"]
+    if sleep_days:
+        after_days = sum(1 for d in sleep_days if d.get("day_after"))
+        add(f"跨日证据 day_after: {after_days}/{len(sleep_days)} 天（ended_by=sleep）"
+            + ("" if after_days == len(sleep_days) else
+               "  ⚠ 其余天没有该字段 ⇒ 跨日只能记【无法判定】（缺失 ≠ 没做；final 是睡前快照）"))
     dc = report.get("decision_counts") or {}
     if dc.get("total"):
         src_txt = "、".join(f"{k}={v}" for k, v in sorted(dc["by_source"].items()))
@@ -1505,9 +1616,20 @@ def render_text(report, top):
                               f"/{fw.get('crops')} tiles={fw.get('tiles')}")
             else:
                 water_text = " | 浇水证据=true 但无 final_water 可核对"
+            # task-38：跨日证据单独摆出来（有 day_after 以它为准；没有就说"无法判定"，不说"没跨日"）
+            if day.get("cross_day_verdict") == CROSS_DAY_CROSSED:
+                cross_text = (f" | 跨日={day.get('cross_day_source')} "
+                              + "/".join(str(x) for x in as_list(day.get("cross_day_day"))))
+            elif day.get("cross_day_verdict") == CROSS_DAY_WRONG:
+                cross_text = (f" | 跨日=不是+1 天（{day.get('cross_day_source')} "
+                              f"{day.get('cross_day_day')!r}）")
+            elif day.get("cross_day_verdict") == CROSS_DAY_UNDECIDABLE:
+                cross_text = " | 跨日=无法判定（缺 day_after，final 是睡前快照；缺失 ≠ 没做）"
+            else:
+                cross_text = ""
             add(f"  - {day['label']}: ended_by={day['ended_by']} verified={day['verified']} "
                 f"ok/skip/fail={day['ok_steps']}/{day['skipped_steps']}/{day['failed_steps']} "
-                f"checks[{checks}] 模态打断={day.get('modal_interrupts', 0)}{water_text} "
+                f"checks[{checks}] 模态打断={day.get('modal_interrupts', 0)}{water_text}{cross_text} "
                 f"L{day['day_end_lines']}{final_text}")
     add("")
     sections = [
