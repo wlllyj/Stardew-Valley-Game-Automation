@@ -307,5 +307,32 @@ class TestVerifyRun3(unittest.TestCase):
                         s["problems"])
 
 
+    # ------------------------------------------------------------ 三腿覆盖（P3 ⑥ 的四步里哪几步真跑过）
+    def test_missing_legs_are_listed_as_info(self):
+        """绿账本只跑浇水腿 ⇒ 必须点出"清障/开垦"与"播种"全程 0 步（否则"三层过=四层过"）。"""
+        ok, s = self.check(green_rows())
+        self.assertTrue(ok, s.get("problems"))
+        self.assertEqual(s["leg_ok"]["浇水"], 30)      # 3 天 × 10 步
+        self.assertEqual(s["leg_ok"]["播种"], 0)
+        self.assertTrue(any("三腿覆盖" in i and "播种" in i for i in s["infos"]), s["infos"])
+        self.assertTrue(any("三腿覆盖" in i and "清障" in i for i in s["infos"]), s["infos"])
+
+    def test_all_three_legs_covered_silently(self):
+        """四类阶段都真做过 ⇒ 三腿覆盖不再刷 info，且计数逐腿可查。"""
+        rows: list[dict] = []
+        for i in range(3):
+            d = [1, "spring", 10 + i]
+            nd = [1, "spring", 11 + i]
+            stages = [stage("clear_area", tiles=2, ok=2), stage("till_area", tiles=2, ok=2),
+                      stage("plant_area", tiles=2, ok=2), stage("water_area", tiles=2, ok=2)]
+            rows += [day_start(d, t=i * 300.0), sleep_ok(t=i * 300.0 + 100),
+                     day_end(d, nd, t=i * 300.0 + 200, ok_steps=8, stages=stages)]
+        rows.append(finish())
+        ok, s = self.check(rows)
+        self.assertTrue(ok, s.get("problems"))
+        self.assertEqual(s["leg_ok"], {"清障/开垦": 12, "播种": 6, "浇水": 6})
+        self.assertFalse(any("三腿覆盖" in i for i in s["infos"]), s["infos"])
+
+
 if __name__ == "__main__":
     unittest.main()

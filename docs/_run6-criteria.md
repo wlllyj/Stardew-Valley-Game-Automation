@@ -71,6 +71,15 @@
 - 两数不等的账本，`tools/verify-run3.py` 会把差额记成 info（不改结论），`tools/analyze-longrun.py` 必须在头部点名该行号。
 - **留痕完整性**（task-56）：账本 `decision[].llm_trace` 引用的 `<journal>-llm.jsonl` 必须**真的在盘上**，且文件行数与引用条数一一对应；缺失/行数不符都记 info（复盘材料不全，不影响当天是否达标），`llm_trace_failed` 事件也列进风险信息项。
 
+### 3.2 「三腿覆盖」（P3 ⑥ 的四步里，哪几步在 run6 里真跑过）
+
+`tools/verify-run3.py` 汇总 `leg_ok`（按阶段名归并：**清障/开垦** = `clear_area` + `till_area`、**播种** = `plant_area` + `sow`、**浇水** = `water_area`），某腿全程 0 步成功时记 info。
+
+- **达标日不强制包含播种腿** —— 种子/钱不足时它会合法缺席（钱 14g、种子 20g/包），但 **P3 ⑥ 的整体结必须能指出播种腿的真机证据**，不许"三层过了就说四层过"：
+  1. 首选 run6 内出现 `plant_area`/`sow` 的 `ok > 0` 阶段；
+  2. 若 run6 全程无种子，则引用既有真机证据（run5 `播种 ok=7`、run2 `播种 ok=1`）+ **一次装机后的单独播种探针**，并在开发日志里写明"run6 只覆盖三腿"。
+- 参照数字：run5 = 清障/开垦 **284** / 播种 **7** / 浇水 **172**；run2 = **66 / 1 / 31**。
+
 ## 4. run6 起跑与收口纪律
 
 - 起跑前：`tools/preflight.py --expect 0.7.25 --save-baseline logs/run6-baseline.json` 四项全绿；记「版本四要素」（HEAD / 被测文件 SHA256+mtime / PID+StartTime / 工作树干净）。

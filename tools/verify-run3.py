@@ -634,6 +634,38 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
             f"（`source != llm`，多为截断/拒收后的 deterministic_fallback）"
         )
 
+    # 三腿覆盖（Lead 2026-10-14 补）：P3 ⑥ 的目标是"清理障碍 → 开垦 → 播种 → 浇水"，但每日 checks
+    # 只盯浇水与硬失败 —— **播种腿有没有真跑过**必须单独看得见，否则"三层过了"会被当成"四层过了"。
+    # 只记 info：种子/钱不足时播种腿会合法缺席（task-55 卖余料换种子钱之前就是这样）。
+    _LEGS: dict[str, tuple[str, ...]] = {
+        "清障/开垦": ("clear_area", "till_area"),
+        "播种": ("plant_area", "sow"),
+        "浇水": ("water_area",),
+    }
+    leg_ok: dict[str, int] = {leg: 0 for leg in _LEGS}
+    for r in rows:
+        if r.get("event") != "day_end":
+            continue
+        for s in (r.get("stages") or []):
+            if not isinstance(s, dict):
+                continue
+            try:
+                ok_n = int(s.get("ok") or 0)
+            except (TypeError, ValueError):
+                ok_n = 0
+            if ok_n <= 0:
+                continue
+            name = str(s.get("stage") or "")
+            for leg, names in _LEGS.items():
+                if name in names:
+                    leg_ok[leg] += ok_n
+    for leg in _LEGS:
+        if leg_ok[leg] == 0:
+            infos.append(
+                f"三腿覆盖：{leg} 全程 0 步成功"
+                f"（种子/钱不足时合法，但目标 P3 ⑥ 要求这一腿有真机证据）"
+            )
+
     # 留痕完整性（task-56）：账本声称的 `llm_trace` 必须真的落在盘上，且行数与引用数一一对应。
     # 只记 info：留痕是**复盘材料**，缺了不影响当天是否达标，但 run6 复盘必须有它。
     decision_traces = [r for r in decisions if str(r.get("llm_trace") or "")]
@@ -735,6 +767,7 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         "decisions_llm": llm_true,
         "decisions_llm_used": llm_used,
         "decisions_llm_fallback": llm_fallback,
+        "leg_ok": leg_ok,
         "finish": {k: v for k, v in (finish or {}).items() if k != "_lineno"},
         "problems": problems,
         "infos": infos,
