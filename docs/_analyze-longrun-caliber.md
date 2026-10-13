@@ -70,10 +70,28 @@ run2 的 `decisions_llm=7` 里有 1 条是兜底：`logs\longrun-3day-llm-run2.j
 - 单测：`tests\test_analyze_longrun.py::TestUnreachableAccounting`（5 条：桶/上界内信息项+解释差额/
   越界红/无计数解释仍红/缺字段不误报）。
 
+## 3.6 真空日闸门（task-64，Lead m02981 / m03030）—— 与 `verify-run3.py:604-625` 同口径、不许更宽
+
+- 规则（**两边同向**）：`day_end.verified is True` 且**当天有阶段记录**且 `Σ stage.ok == 0` ⇒
+  本工具 `wasted:verified_zero_steps`（文案含"自称 VERIFIED 但当天成功动作 0 步"），
+  它在同一形态下判 problem「自称 VERIFIED 但当天成功动作 0 步（有阶段记录、ok 全 0）」。
+- **有阶段记录时不吃豁免**：`no_intents` / `plot_exhausted` / `policy_fallback` 只豁免
+  `wasted:verified_without_work`（当天 0 阶段 + 没有"无活可做"证据）那条；两条并存、
+  `verified_without_work` **不放宽**，新条**不更宽也不更窄**。
+- 阶段记录两种形态都收：`day_end.stages[]`（brain 现在的写法）与**独立 `stage` 事件**
+  （对照夹具 `scratch\_t5x_vacuum.jsonl` 的写法）⇒ 已给 `stage` 单独开桶 `stage_events`，
+  并进【无法判定】清单的反面（不落 `unmapped_events`）。
+- `0 < Σ stage.ok < 5` ⇒ 只记**弱日**信息项（头部「弱日: N 天（…）」），不判红（与它同）。
+- `stages` 与 `ok_steps` **都缺** ⇒ 只进【无法判定】（"既没有 stages 也没有 ok_steps …
+  缺失 ≠ 通过"）：既不判通过、也不当 0 步判红。
+- 单测：`tests\test_analyze_longrun.py::TestVacuumDayGate`（4 条：真空日判红 / 独立 `stage`
+  事件同样计数且不落未映射 / 弱日只记信息项 + `ok>=5` 干净 / 缺字段只进无法判定）。
+- 顺带：`EVENT_BUCKETS` 同步收了 dev task-63 的 `clear_dead_scope`（只计数，等 run6 形态再定分类）。
+
 ## 4. 复核命令
 
 ```
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run5.jsonl
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run5.jsonl
-python -m unittest discover -s tests        # 当前 413 OK
+python -m unittest discover -s tests        # 当前 428 OK
 ```

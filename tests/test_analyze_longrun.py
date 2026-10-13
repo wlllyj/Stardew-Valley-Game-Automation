@@ -1060,5 +1060,75 @@ class TestUnreachableAccounting(unittest.TestCase):
         self.assertFalse(any("不可达（四邻" in a["text"] for a in rep["advice"]))
 
 
+class TestVacuumDayGate(unittest.TestCase):
+    """task-64（Lead m02981）：真空日闸门与 `tools/verify-run3.py:604-625` 同口径、不许更宽。
+
+    口径：
+      * ``day_end.verified is True`` + **有阶段记录** + ``Σ stage.ok == 0`` ⇒ 红
+        ``wasted:verified_zero_steps``（文案含"自称 VERIFIED 但当天成功动作 0 步"）；
+      * ``0 < Σ ok < 5`` ⇒ 顶部"弱日"信息项（不判红）；
+      * 阶段记录可来自 ``day_end.stages[]`` 或**独立** ``stage`` 事件（对照夹具的形态）；
+      * ``stages`` 与 ``ok_steps`` 都缺 ⇒ 只进【无法判定】，既不判通过也不误判红；
+      * 既有的 ``wasted:verified_without_work``（当天 0 阶段 + 无"无活可做"证据）**不许放宽**。
+    """
+
+    OK_CHECKS = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                 "crops_watered": True, "day_justified": True, "no_unmet_stages": True}
+
+    def _report(self, events, name):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=1)
+
+    @staticmethod
+    def _stage(ok, stage="till_area", failed=0):
+        return {"stage": stage, "tiles": max(ok, failed), "ok": ok, "skipped": 0, "failed": failed,
+                "proven_inert": 0, "env_block": 0, "inconclusive": 0, "stopped": "", "leftover": 0}
+
+    def _events_with_stages(self, ok):
+        return integrity_ledger(day_end_overrides={
+            "verified": True, "ended_reason": "night", "checks": dict(self.OK_CHECKS),
+            "stages": [self._stage(ok)], "ok_steps": ok,
+        })
+
+    def test_zero_ok_with_stage_records_is_red(self):
+        rep = self._report(self._events_with_stages(0), "vacuum_zero.jsonl")
+        subs = subjects(rep["categories"]["wasted"])
+        self.assertIn("wasted:verified_zero_steps", subs)
+        text = mod.render_text(rep, 50)
+        self.assertIn("自称 VERIFIED 但当天成功动作 0 步", text)
+        self.assertTrue(any("0 步（有阶段记录" in a["text"] for a in rep["advice"]))
+
+    def test_standalone_stage_events_are_counted_too(self):
+        # Lead 的 vacuum 夹具形态：阶段记录是独立 `stage` 事件、`day_end.stages` 为空。
+        rep = self._report(
+            integrity_ledger(extra_events=[{"event": "stage", "t": 5.0, "stage": "water_area",
+                                            "tiles": 3, "ok": 0, "skipped": 0, "failed": 0,
+                                            "leftover": 0}],
+                             day_end_overrides={"verified": True, "stages": [], "checks": dict(self.OK_CHECKS)}),
+            "vacuum_standalone.jsonl",
+        )
+        self.assertIn("wasted:verified_zero_steps", subjects(rep["categories"]["wasted"]))
+        self.assertNotIn("stage", rep["unmapped_events"], "独立 stage 事件必须有桶、不许落进未映射清单")
+
+    def test_weak_day_is_info_and_enough_steps_is_clean(self):
+        clean = self._report(self._events_with_stages(5), "vacuum_ok5.jsonl")
+        self.assertNotIn("wasted:verified_zero_steps", subjects(clean["categories"]["wasted"]))
+        self.assertEqual(clean["weak_days"], [])
+        weak = self._report(self._events_with_stages(2), "vacuum_weak.jsonl")
+        self.assertNotIn("wasted:verified_zero_steps", subjects(weak["categories"]["wasted"]))
+        self.assertEqual(len(weak["weak_days"]), 1)
+        self.assertIn("弱日: 1 天", mod.render_text(weak, 50))
+
+    def test_missing_stage_fields_is_undecidable_not_red(self):
+        end = {"event": "day_end", "t": 9.0, "day": MODAL_DAY, "day_text": "1年 spring 12日",
+               "ended_by": "sleep", "ended_reason": "night", "verified": True,
+               "checks": dict(self.OK_CHECKS), "final": final([MODAL_DAY[0], MODAL_DAY[1], MODAL_DAY[2] + 1])}
+        rep = self._report([day_start(MODAL_DAY), end], "vacuum_missing.jsonl")
+        self.assertNotIn("wasted:verified_zero_steps", subjects(rep["categories"]["wasted"]))
+        undec = " ".join(rep["undecidable"])
+        self.assertIn("既没有 stages 也没有 ok_steps", undec)
+
+
 if __name__ == "__main__":
     unittest.main()

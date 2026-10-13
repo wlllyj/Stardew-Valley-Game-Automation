@@ -49,6 +49,11 @@
     二者之差 = `decisions_llm_fallback`（= `deterministic_fallback`，模型答了没用）。
     **判据说"LLM 覆盖"一律指 `decisions_llm_used`**；并把 `llm` 与 `source=llm` 不一致的行单列出来
     （四路对账要停下核对）。
+  * 真空日/弱日（task-64，Lead m02981）：`day_end.verified=true` 且**当天有阶段记录**且
+    `Σ stage.ok == 0` ⇒ 红 `wasted:verified_zero_steps`（文案含"自称 VERIFIED 但当天成功动作 0 步"，
+    与 `tools\verify-run3.py:604-625` 的 problem 逐字对账）；`0 < Σ ok < 5` ⇒ 顶部"弱日"信息项；
+    `stages` 与 `ok_steps` 都缺 ⇒ 只进【无法判定】（缺失 ≠ 通过，也不当 0 步判红）。
+    **不许放宽**既有的 `wasted:verified_without_work`（它只管"当天 0 阶段 + 无'无活可做'证据"），两条并存。
 
 只读、纯标准库。退出码：0 = 成功产出报告（**不表示"跑得好"**）；2 = 账本不可读/没有可解析事件。
 
@@ -257,6 +262,11 @@ EVENT_BUCKETS = {
     "unreachable": "unreachable",
     "unreachable_stage": "unreachable_stages",
     "unreachable_summary": "unreachable_summaries",
+    # --- task-64：`stage` 是**独立事件**形态的阶段记录（brain 现在把阶段写进 `day_end.stages`；
+    #     但对照夹具/旧账本可能用独立事件）⇒ 收进桶，供真空日闸门统计 Σ stage.ok。
+    "stage": "stage_events",
+    # --- task-63（dev 在制）：枯死作物清理范围 + 农场级 deadCrops 证据；只计数，等 run6 形态再定分类
+    "clear_dead_scope": "clear_dead_scopes",
 }
 
 #: 结构性事件：由报告的其他字段单独统计（day_start/day_end 切会话与验收、finish 自述），
@@ -848,6 +858,30 @@ def cat_wasted(sessions, top):
                         subject="wasted:water_scope_empty",
                     )
                 )
+        # 2g: 真空日闸门（Lead m02981 裁定；与 verify-run3.py:604-625 逐字同口径，不许更宽）——
+        #     `verified=true` 且有阶段记录但 Σ stage.ok == 0 ⇒ 判红（0 步不能自证做过事）；
+        #     `0 < Σ ok < 5` ⇒ 只记"弱日"信息项（合法但偏弱的一天，供复核时人读）；
+        #     完全没有阶段记录的情形由上面 2d 覆盖；字段缺失由 build_undecidable 记【无法判定】。
+        for lineno, ev in sess["day_ends"]:
+            if not ev.get("verified"):
+                continue
+            stage_recs = as_list(ev.get("stages")) or [e2 for _, e2 in sess.get("stage_events") or []]
+            if not stage_recs:
+                continue
+            ok_sum = 0
+            for st in stage_recs:
+                ok_sum += as_int(st.get("ok"))
+            if ok_sum <= 0:
+                out.append(
+                    finding(
+                        lineno, "day_end",
+                        f"自称 VERIFIED 但当天成功动作 0 步（有阶段记录 {len(stage_recs)} 个、Σ stage.ok=0）"
+                        "（0 步不能自证做过事；查 stage_no_target / `no_work` 分支）",
+                        hint="真空日闸门：与 verify-run3.py:604-625 同口径；有阶段记录时不吃"
+                             "no_intents/no_work 之类的豁免（豁免只覆盖'当天 0 阶段'那条）",
+                        subject="wasted:verified_zero_steps",
+                    )
+                )
     return out[:top] if top else out
 
 
@@ -1317,6 +1351,24 @@ def build_advice(report, top=8):
             "text": "grass 格 0 成功、非 grass 全成功：修镰刀入口（Mod 真挥）或把 grass 从 ACTIONABLE_KINDS 摘掉并显式记为'今天不做'",
             "lines": [grass[0]["line"]],
         })
+    # 2g-advice) 真空日（task-64）：0 步却自称 VERIFIED —— 计数走全量 day_end（同 3c 的理由）
+    zero_step_lines = []
+    for sess in sessions:
+        for ln, ev in sess["day_ends"]:
+            if not ev.get("verified"):
+                continue
+            recs = as_list(ev.get("stages")) or [e2 for _, e2 in sess.get("stage_events") or []]
+            if not recs:
+                continue
+            if sum(as_int(st.get("ok")) for st in recs) <= 0:
+                zero_step_lines.append(ln)
+    if zero_step_lines:
+        advice.append({
+            "text": f"自称 VERIFIED 但当天成功动作 0 步（有阶段记录）×{len(zero_step_lines)}（红）："
+                    "0 步不能自证做过事 ⇒ 与 verify-run3.py:604-625 的真空日闸门同判 problem；"
+                    "先查 stage_no_target / no_work 分支（有阶段记录时不吃'无活可做'豁免）",
+            "lines": zero_step_lines,
+        })
     # 3) 被洗白
     white = [f for f in report["categories"]["wasted"] if f["subject"].startswith("wasted:whitewash")]
     if white:
@@ -1486,6 +1538,23 @@ def build_undecidable(rows, sessions, prelude, report):
         out.append(f"无法判定是否跨日（缺失 ≠ 没做）×{len(undec_cross)} 天：{'、'.join(undec_cross[:8])}"
                    " —— `final` 是**睡前**快照，task-38 之后应由 `day_end.day_after`（睡后重取的观测）作证；"
                    "这段证据缺失时本工具**不判** `missed:cross_day`，只在此处如实记录")
+    # task-64（Lead m02981/m03030）：真空日闸门要算"当天自我成功步数"，需要 stages 或 ok_steps；
+    # 两者都缺时**无法判定**（缺失 ≠ 通过；也不许当 0 步直接判红）。
+    no_step_fields = []
+    for sess in sessions:
+        if not sess["day_ends"]:
+            continue
+        lineno, ev = sess["day_ends"][-1]
+        if ev.get("verified") is not True:
+            continue
+        if as_list(ev.get("stages")) or (sess.get("stage_events") or []):
+            continue
+        if "ok_steps" in ev:
+            continue
+        no_step_fields.append(lineno)
+    if no_step_fields:
+        out.append(f"有 {len(no_step_fields)} 天自称 VERIFIED，但既没有 stages 也没有 ok_steps"
+                   f"（行 {no_step_fields[:8]}）：无法判定当天是否'0 步 VERIFIED'（缺失 ≠ 通过）")
     return out
 
 
@@ -1508,6 +1577,7 @@ def build_report(rows, path, args, bad_lines):
         for name, lines in sorted(unmapped.items())
     }
     days = []
+    weak_days = []
     verified_days = 0
     failed_steps_total = 0
     ok_steps_total = 0
@@ -1527,6 +1597,26 @@ def build_report(rows, path, args, bad_lines):
         )
         checks_d = as_dict(end.get("checks"))
         dry_no_work = no_work_with_dry(end) if end else None
+        # 真空日/弱日（Lead m02981）：当天的自我成功步数（有阶段记录时按 Σ stage.ok，否则退回 ok_steps）
+        stage_recs_d = as_list(end.get("stages")) or [e2 for _, e2 in sess.get("stage_events") or []]
+        if stage_recs_d:
+            ok_self_d = 0
+            for st_d in stage_recs_d:
+                ok_self_d += as_int(st_d.get("ok"))
+            ok_self_src = "stages"
+        elif "ok_steps" in end:
+            ok_self_d = as_int(end.get("ok_steps"))
+            ok_self_src = "ok_steps"
+        else:
+            ok_self_d = None
+            ok_self_src = None
+        if end.get("verified") is True and ok_self_d is not None and 0 < ok_self_d < 5:
+            weak_days.append({
+                "line": sess["day_ends"][-1][0],
+                "label": day_label(end),
+                "ok": ok_self_d,
+                "source": ok_self_src,
+            })
         days.append({
             "label": day_label(end) if end else day_label(start),
             "start_line": sess["start_line"],
@@ -1623,6 +1713,7 @@ def build_report(rows, path, args, bad_lines):
         "skipped_steps_total": skipped_steps_total,
         "failed_steps_total": failed_steps_total,
         "decision_counts": decision_counts,
+        "weak_days": weak_days,
         "unmapped_events": unmapped_events,
         "no_day_progress": [
             {"line": ln, "reason": ev.get("reason"), "ended_by": ev.get("ended_by")}
@@ -1872,6 +1963,11 @@ MAPPING_TEXT = [
      "5 环境挡路（信息项：**不计当天硬失败**、当天记 blocked、**次日重试**；日级豁免有上界 "
      "max(5, 20%×attempted)，`checks.unreachable_within_bound=false` ⇒ 0 必须人工介入"
      "（豁免越界＝可能把真失败当不可达洗白，verify-run3.py:415-448 判 problem ⇒ 两边同向））"),
+    ("day_end.verified=True + 有阶段记录 + Σ stage.ok==0（task-64）",
+     "2 白做（红）：自称 VERIFIED 但当天成功动作 0 步（0 步不能自证做过事）。与 "
+     "verify-run3.py:604-625 的真空日闸门同口径、**不许更宽**：有阶段记录时不吃 no_intents/"
+     "no_work 类豁免（那只覆盖'当天 0 阶段'的 `wasted:verified_without_work` 那条）；"
+     "`0 < Σ ok < 5` ⇒ 顶部'弱日'信息项；stages 与 ok_steps 都缺 ⇒ 只进【无法判定】"),
     ("finish",
      "收尾自述：code/verified_streak 必须自身自洽、并与正文 verified 天数同向（不同向 ⇒ 自述在洗账）"),
     ("t 回退",
@@ -1912,6 +2008,10 @@ def render_text(report, top):
         add(f"跨日证据 day_after: {after_days}/{len(sleep_days)} 天（ended_by=sleep）"
             + ("" if after_days == len(sleep_days) else
                "  ⚠ 其余天没有该字段 ⇒ 跨日只能记【无法判定】（缺失 ≠ 没做；final 是睡前快照）"))
+    weak = report.get("weak_days") or []
+    if weak:
+        add(f"弱日: {len(weak)} 天（VERIFIED 但成功动作只有 0<ok<5 步，信息项供复核）"
+            f"（行 {[w['line'] for w in weak][:10]}）")
     dc = report.get("decision_counts") or {}
     if dc.get("total"):
         src_txt = "、".join(f"{k}={v}" for k, v in sorted(dc["by_source"].items()))
