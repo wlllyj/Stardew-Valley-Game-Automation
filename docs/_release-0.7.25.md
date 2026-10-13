@@ -57,3 +57,4 @@ Start-Process -FilePath <python.exe> -ArgumentList '-u','tools\run-longrun.py','
 - task-53（农场级待清障/待开垦格数）未做 ⇒ 观测窗口外仍有"看不见的活"（但不会再被写成 `no_work`）。
 - task-14 逐帧 warp 活锁未修 ⇒ 每次 `goto Farm` 仍会刷 `Warping to Farm`，并可能勾出剧情事件（task-41 会硬停等人）。
 - Mod 无 C# 测试工程 ⇒ Mod 侧新逻辑靠 build + 真机验收。
+- LLM 留痕 `<journal>-llm.jsonl` **只追加、不轮转/不封顶**（task-56，Lead 2026-10-14 裁定）：run6 三天量级可接受，长跑（>10 天）再谈上限；`raw` 原样记录不截断（受 `max_tokens=16384` 天然约束）；`t` 是墙钟 unix 秒，**跨文件关联一律以 `llm_trace_hash` 为键**。
