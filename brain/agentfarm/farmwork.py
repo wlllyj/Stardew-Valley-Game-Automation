@@ -41,6 +41,8 @@ __all__ = [
     "KIND_TOOL",
     "MAX_CLEAR_SWINGS",
     "MAX_DEAD_SWINGS",
+    "SEED_KEEP_FACTOR",
+    "SEED_NAME_HINTS",
     "SKIP_KINDS",
     "STAGE_ACTION",
     "TILE_INERT_STATUSES",
@@ -52,8 +54,11 @@ __all__ = [
     "StepResult",
     "farm_dry_tiles",
     "farm_dead_crops",
+    "is_seed_offer",
     "is_unreachable",
+    "pick_seed_offer",
     "seed_items",
+    "seed_offers_from",
     "till_blocked_by",
     "tool_missing_reason",
     "tool_presence",
@@ -370,6 +375,10 @@ class StepResult:
     #: 次日重试），**不算硬失败**；但日级另有**有界**豁免（`refused_bound`），防"游戏全拒绝"
     #: 换一个 verified。与 task-52 的 `unreachable` 是**两套独立计数**、互不覆盖。
     refused: bool = False
+    #: 【task-67】`buy` 回执带回来的**结构化货架清单**（`availableItems`，成功与失败都有）：
+    #: 脑据此挑"当季、买得起"的种子，不再硬编码物品 id（run6：夏季硬买春季 `472` ⇒ 每天白试 6 次）。
+    #: 只落盘成纯数据（`[{"id","name","price"}, …]`），解析容错在 `seed_offers_from()`。
+    available: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def skipped(self) -> bool:
@@ -418,6 +427,8 @@ class StepResult:
             d["unreachable"] = True
         if self.refused:
             d["refused"] = True
+        if self.available:
+            d["available"] = self.available
         return d
 
 
@@ -654,6 +665,83 @@ def farm_dead_crops(obs: dict[str, Any]) -> tuple[int, str]:
         return max(0, int(raw)), "ok"
     except (TypeError, ValueError):
         return 0, "unavailable"
+
+
+# ======================================================================
+#  买种子的选品（task-67）
+# ======================================================================
+
+#: 名字里带这些子串的货架条目算"种子"（Mod 的 `DisplayName` 是英文 `… Seeds`，
+#: 中文环境是「…种子」）。**只看游戏自己报的名字**，不猜 `Data/Crops`（脑看不到）。
+SEED_NAME_HINTS = ("seed", "seeds", "种子")
+
+#: 「留够 K 包的钱」：单价 ≤ 钱 / K 才算买得起（K=10）。这样买完种子还剩钱买别的/应急。
+SEED_KEEP_FACTOR = 10
+
+
+def seed_offers_from(res: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """从 `buy` 回执里取出**结构化货架清单**（`availableItems`，task-67）。
+
+    容错：旧键 `available` 也认；脏条目（缺 id / 价格不是整数）跳过；价格缺省按 0。
+    返回 `[{"id": "(O)472", "name": "Parsnip Seeds", "price": 20}, …]`（顺序照回执）。
+    """
+    if not isinstance(res, dict):
+        return []
+    rows = res.get("availableItems")
+    if rows is None:
+        rows = res.get("available")
+    out: list[dict[str, Any]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        iid = str(row.get("id") or "").strip()
+        if not iid:
+            continue
+        try:
+            price = int(row.get("price") or 0)
+        except (TypeError, ValueError):
+            price = 0
+        out.append({"id": iid, "name": str(row.get("name") or ""), "price": price})
+    return out
+
+
+def is_seed_offer(offer: dict[str, Any] | None) -> bool:
+    """货架条目是不是"种子"（按名字；大小写不敏感，中英都认）。"""
+    if not isinstance(offer, dict):
+        return False
+    name = str(offer.get("name") or "")
+    low = name.lower()
+    return any(hint in low for hint in SEED_NAME_HINTS)
+
+
+def pick_seed_offer(
+    offers: list[dict[str, Any]],
+    money: int,
+    *,
+    keep_factor: int = SEED_KEEP_FACTOR,
+) -> tuple[dict[str, Any] | None, str]:
+    """在货架清单里挑"最便宜、且买得起"的种子。返回 `(选中项, 代码)`。
+
+    代码三种（与 `longrun` 的 journal 同名）：
+
+    * `"ok"` —— 选中了，`pick["id"]` 就是要下单的 `QualifiedItemId`；
+    * `"no_seed_for_sale"` —— 货架上**一条种子都没有**（run6 的夏季：只有当季种子，
+      而脑硬编码的春季 `472` 不在架上）；
+    * `"cannot_afford"` —— 有种子，但按"留够 `keep_factor` 包"的口径**买不起**
+      （`price > money / keep_factor`），或有种子的价格不可用（≤0）。
+
+    为什么要"留够 K 包"而不是"买得起一个就买"：run6 那 956g 全砸进种子，
+    之后连应急的余地都没有；而锄地/浇水每格都要体力与时间，钱是唯一的缓冲。
+    """
+    seeds = [o for o in (offers or []) if is_seed_offer(o)]
+    if not seeds:
+        return None, "no_seed_for_sale"
+    budget = int(money // int(keep_factor)) if int(keep_factor) > 0 else int(money)
+    afford = [o for o in seeds if 0 < int(o.get("price") or 0) <= budget]
+    if not afford:
+        return None, "cannot_afford"
+    pick = min(afford, key=lambda o: (int(o.get("price") or 0), str(o.get("id") or "")))
+    return pick, "ok"
 
 
 class FarmWorker:
@@ -2141,28 +2229,41 @@ class FarmWorker:
     # ------------------------------------------------------------- 买种子
     def buy(self, item: str, count: int = 10, *, shop: str = "SeedShop",
             timeout_ms: int = 25000) -> StepResult:
-        """买种子。判据 = 钱减少 **且** 背包里该物品变多（回执里游戏返回值不是成败，见开发日志 023）。"""
+        """买种子。判据 = 钱减少 **且** 背包里该物品变多（回执里游戏返回值不是成败，见开发日志 023）。
+
+        【task-67】无论成败，回执里的**货架清单**都要带回来（`r.available`）：
+        `item_not_sold` 时它是脑唯一能"改买当季种子"的信息（run6 每天靠字符串猜货架、白试 6 次）。
+        """
         r = StepResult(action="buy")
         obs = self.snap()
         money_before = self.money(obs)
         have_before = _count_item(self.player_of(obs), item)
         r.before = {"money": money_before, "item": have_before}
         try:
-            self.c.buy(item, count, shop=shop, timeout_ms=timeout_ms)
+            res = self.c.buy(item, count, shop=shop, timeout_ms=timeout_ms)
         except BridgeError as exc:
             r.receipt = _receipt(exc)
+            # 失败回执原文在 `exc.payload`（`bridge.py::_request`）⇒ 一样能读货架。
+            r.available = seed_offers_from(getattr(exc, "payload", None))
+        else:
+            # 旧桥（0.7.24 及之前）返回 None ⇒ `seed_offers_from` 给空表，语义 = "没有清单"。
+            r.available = seed_offers_from(res if isinstance(res, dict) else None)
         obs = self.snap()
         money_after = self.money(obs)
         have_after = _count_item(self.player_of(obs), item)
         r.after = {"money": money_after, "item": have_after}
+        if r.available:
+            r.after["available"] = len(r.available)
         if have_after > have_before and money_after < money_before:
             r.ok = True
-            r.reason = (f"买到 {have_after - have_before} 个 {item}（钱 {money_before}→{money_after}）")
+            r.reason = (f"买到 {have_after - have_before} 个 {item}（钱 {money_before}→{money_after}"
+                        f"；货架 {len(r.available)} 条）")
             return r
         r.code = "failed"
         r.reason = (f"没成交：物品 {have_before}→{have_after}，钱 {money_before}→{money_after}"
                     + (f"；回执={r.receipt}" if r.receipt else ""))
         return r
+
 
     def load_save(self, save: str | None = None) -> StepResult:
         r = StepResult(action="load_save")

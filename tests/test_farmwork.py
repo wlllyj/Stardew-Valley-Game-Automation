@@ -24,8 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "brain"))
 from agentfarm.bridge import BridgeError  # noqa: E402
 from agentfarm.farmwork import (  # noqa: E402
     NEIGHBORS, FarmWorker, KIND_TOOL, MAX_CLEAR_SWINGS, StepResult as SR, StageResult,
-    farm_dead_crops, farm_dry_tiles, is_unreachable, till_blocked_by, tool_missing_reason,
-    tool_presence,
+    farm_dead_crops, farm_dry_tiles, is_seed_offer, is_unreachable, pick_seed_offer,
+    seed_offers_from, till_blocked_by, tool_missing_reason, tool_presence,
 )
 
 DROP = object()          # "这一格的障碍没了"（观测里那条记录消失）
@@ -35,13 +35,14 @@ class MiniWorld:
     """只有一格或几格的假世界：`use_tool` 真的改它、`obs()` 真的反映它。"""
 
     def __init__(self, *, records=None, tillable=(), inventory=None, tools=None,
-                 farming_level: int = 0, stamina: float = 270.0) -> None:
+                 farming_level: int = 0, stamina: float = 270.0, money: int = 500) -> None:
         self.records = [dict(r) for r in (records or [])]
         self.tillable = {tuple(t) for t in tillable}
         self.inventory = [dict(i) for i in (inventory or [])]
         self.tools = tools
         self.farming_level = farming_level
         self.stamina = stamina
+        self.money = int(money)
         self.player_tile = [62, 14]
         self.calls: list[tuple[tuple[int, int], str | None]] = []   # 每一次 use_tool 都被记下
         self.stuck: set[tuple[int, int]] = set()                    # 挥了也白挥的格子（真机 run1 的草）
@@ -110,11 +111,27 @@ class MiniWorld:
         self.harvest_item: dict | None = {"slot": 5, "id": "24", "qualifiedId": "(O)24",
                                           "name": "Parsnip", "stack": 1, "isTool": False}
         self.harvests: list[tuple[int, int]] = []
+        # ---- task-67：买种子（`buy`）----
+        #: 回执里带的货架清单（`availableItems`）。默认照 run6 的夏季真机货架（只有当季种子，
+        #: **没有**春季的防风草 `472`）—— 这正是"硬编码 472 必失败"的现场。
+        self.buy_offers: list[dict] | None = [
+            {"id": "(O)254", "name": "Melon Seeds", "price": 80},
+            {"id": "(O)479", "name": "Tomato Seeds", "price": 50},
+            {"id": "(O)481", "name": "Blueberry Seeds", "price": 80},
+            {"id": "(O)482", "name": "Pepper Seeds", "price": 40},
+            {"id": "(O)483", "name": "Wheat Seeds", "price": 10},
+        ]
+        self.buy_calls: list[dict] = []
+        #: 非空 ⇒ `buy` 抛 `BridgeError(status=…)`（回执里**照样**带 `availableItems`）。
+        self.buy_fail_status = ""
+        #: 非空 ⇒ 该品类买不到（缺省 `item_not_sold`），用来演 run6 的"硬编码 472"。
+        self.buy_missing_item = ""
+        self.buy_price = 20            # 配置项（默认 472）的单价：按它扣钱、加背包
 
     # ---- 观测 ----
     def obs(self) -> dict:
         player: dict = {"name": "测试员", "tile": list(self.player_tile),
-                        "stamina": self.stamina, "money": 500,
+                        "stamina": self.stamina, "money": self.money,
                         "farmingLevel": self.farming_level,
                         "inventory": [dict(i) if isinstance(i, dict) else None
                                       for i in self.inventory]}
@@ -184,6 +201,52 @@ class MiniWorld:
         self.inventory[int(slot)] = None
         self.shipping_bin.append(dict(item))
         return {"ok": True, "status": "ok", "reason": "已放进出货箱（钱等 NewDay）"}
+
+    def do_buy(self, item, count) -> dict:
+        """Mod `BuySkill` 的离线替身（task-67）。
+
+        行为照真机：`availableItems` **成功与失败都带**；要买的品类不在货架上 ⇒ 抛
+        `item_not_sold`（回执里照样带清单 —— run6 就是靠这一条才知道夏季货架上有什么）。
+        """
+        self.buy_calls.append({"item": str(item), "count": int(count)})
+        # `None` = 旧桥（0.7.24 及之前）：没有 `availableItems` 字段，买得成也没清单可带。
+        offers = None if self.buy_offers is None else [dict(o) for o in self.buy_offers]
+
+        def _digits(v) -> str:
+            s = "".join(ch for ch in str(v or "") if ch.isdigit())
+            return s or str(v or "")
+
+        # 货架上有没有这一件（按 id 数字比：`(O)483` 与 `483` 是同一件）。
+        on_shelf = bool(offers is not None and any(
+            _digits(o.get("id")) == _digits(item) for o in offers))
+        missing = str(self.buy_missing_item or ("" if on_shelf or offers is None else str(item)))
+        if self.buy_fail_status or missing:
+            status = str(self.buy_fail_status or "item_not_sold")
+            raise BridgeError(f"{status}：商店里没有「{item}」", status=status,
+                              payload=({"availableItems": offers} if offers is not None else {}))
+        price = int(self.buy_price)
+        can = min(int(count), self.money // price) if price > 0 else int(count)
+        if can < 1:
+            raise BridgeError(f"钱不够（{self.money}g < {price}g）", status="purchase_no_effect",
+                              payload=({"availableItems": offers} if offers is not None else {}))
+        self.money -= price * can
+        slot = None
+        for it in self.inventory:
+            if it and "Seed" in str(it.get("name") or ""):
+                slot = it
+                break
+        if slot is None:
+            self.inventory.append({"slot": 5, "id": str(item).replace("(O)", ""),
+                                   "qualifiedId": str(item) if str(item).startswith("(")
+                                   else f"(O){item}",
+                                   "name": "Parsnip Seeds", "stack": can, "isTool": False})
+        else:
+            slot["stack"] = int(slot.get("stack") or 0) + can
+        reply = {"ok": True, "status": "ok",
+                 "reason": f"买到了 {can} 个「{item}」，共花 {price * can}g"}
+        if offers is not None:
+            reply["availableItems"] = offers          # 旧桥没有这个字段
+        return reply
 
     def do_sleep(self) -> None:
         """Mod `SleepSkill` 的离线替身：**只有"人已在床上 / 提问已弹出"才可能跨日**。
@@ -378,6 +441,10 @@ class MiniBridge:
     def sell(self, slot, *, whitelist=None, timeout_ms=None):
         """`sell`（task-42）：真桥对拒绝/失败是**抛** `BridgeError`（带 `status`），这里照做。"""
         return self.w.ship(int(slot), whitelist)
+
+    def buy(self, item, count=1, *, shop="SeedShop", timeout_ms=None):
+        """`buy`（task-67）：真桥失败时抛 `BridgeError`，**回执原文（含货架清单）在 `payload`**。"""
+        return self.w.do_buy(item, count)
 
 
 TOOLS_WITH_SCYTHE = {"axe": True, "pickaxe": True, "hoe": True, "wateringCan": True,
@@ -1528,6 +1595,82 @@ class TestTask51ClearDead(unittest.TestCase):
         self.assertTrue(r.ok)
         self.assertEqual(r.code, "already")
         self.assertEqual(w.calls, [])
+
+
+class TestSeedOffers(unittest.TestCase):
+    """task-67 选品三件套：解析回执 → 认种子 → 挑"最便宜且买得起"的。"""
+
+    def test_parses_available_items_and_tolerates_junk(self):
+        rows = [{"id": "(O)483", "name": "Wheat Seeds", "price": 10},
+                {"id": "", "name": "坏条目（没有 id）", "price": 5},
+                {"id": "(O)24", "name": "Parsnip", "price": "20"},
+                "不是字典",
+                {"id": "(O)400", "name": "没价"}]          # 缺 price ⇒ 按 0
+        offers = seed_offers_from({"availableItems": rows})
+        self.assertEqual([o["id"] for o in offers], ["(O)483", "(O)24", "(O)400"])
+        self.assertEqual(offers[1]["price"], 20)
+        self.assertEqual(offers[2]["price"], 0)
+        # 旧键 `available` 也认（桥面刚加字段时的兼容）
+        self.assertEqual(seed_offers_from({"available": rows[:1]})[0]["id"], "(O)483")
+        self.assertEqual(seed_offers_from(None), [])
+
+    def test_is_seed_offer_matches_english_and_chinese(self):
+        self.assertTrue(is_seed_offer({"name": "Melon Seeds"}))
+        self.assertTrue(is_seed_offer({"name": "小麦种子"}))
+        self.assertFalse(is_seed_offer({"name": "Parsnip"}))
+        self.assertFalse(is_seed_offer(None))
+
+    def test_pick_three_codes(self):
+        """夏季货架（run6 现场）：认得出种子、挑最便宜的、春季硬编码那条路不再是唯一出路。"""
+        summer = [{"id": "(O)254", "name": "Melon Seeds", "price": 80},
+                  {"id": "(O)483", "name": "Wheat Seeds", "price": 10},
+                  {"id": "(O)24", "name": "Parsnip", "price": 20}]
+        pick, code = pick_seed_offer(summer, 500)
+        self.assertEqual(code, "ok")
+        self.assertEqual(pick["id"], "(O)483", "要挑最便宜的可买种子")
+        # 一条种子都没有（货架只有作物/矿物）⇒ no_seed_for_sale，绝不下单
+        pick, code = pick_seed_offer([{"id": "(O)24", "name": "Parsnip", "price": 20}], 500)
+        self.assertIsNone(pick)
+        self.assertEqual(code, "no_seed_for_sale")
+        # 有种子但按"留够 10 包"的口径买不起 ⇒ cannot_afford（钱 100 ⇒ 预算 10 < 40）
+        pick, code = pick_seed_offer([{"id": "(O)482", "name": "Pepper Seeds", "price": 40}], 100)
+        self.assertIsNone(pick)
+        self.assertEqual(code, "cannot_afford")
+
+
+class TestTask67BuyAvailable(unittest.TestCase):
+    """`FarmWorker.buy` 必须把回执里的货架清单带回来 —— **成功与失败两条路都要**。"""
+
+    def test_success_receipt_carries_the_shelf(self):
+        w = MiniWorld(tools={"hoe": True}, inventory=[])
+        worker = make_worker(w)
+        r = worker.buy("(O)483", 10)
+        self.assertTrue(r.ok, r.reason)
+        self.assertEqual(len(r.available), 5)
+        self.assertEqual(r.available[4]["name"], "Wheat Seeds")
+        self.assertEqual(r.as_dict()["available"], r.available)
+        self.assertEqual(r.after.get("available"), 5)
+
+    def test_item_not_sold_still_carries_the_shelf(self):
+        """run6 的死锁解药：买不到时，回执（`BridgeError.payload`）里必须有货架，脑才能改买。"""
+        w = MiniWorld(tools={"hoe": True}, inventory=[])
+        worker = make_worker(w)
+        r = worker.buy("472", 10)                      # 夏季货架上没有 472（春季种子）
+        self.assertFalse(r.ok)
+        self.assertEqual(r.code, "failed")
+        self.assertEqual([o["id"] for o in r.available], ["(O)254", "(O)479", "(O)481",
+                                                          "(O)482", "(O)483"])
+        self.assertEqual(seed_offers_from({"availableItems": r.available})[0]["id"], "(O)254")
+
+    def test_old_bridge_without_the_field_gives_empty_shelf(self):
+        """旧桥（0.7.24 及之前）没有这个字段 ⇒ 空表（"没有清单"），绝不能伪造货架。"""
+        w = MiniWorld(tools={"hoe": True}, inventory=[])
+        w.buy_offers = None                            # 旧桥：没有 availableItems 字段
+        worker = make_worker(w)
+        r = worker.buy("472", 10)
+        self.assertTrue(r.ok, r.reason)
+        self.assertEqual(r.available, [])
+        self.assertNotIn("available", r.as_dict())
 
 
 if __name__ == "__main__":  # pragma: no cover

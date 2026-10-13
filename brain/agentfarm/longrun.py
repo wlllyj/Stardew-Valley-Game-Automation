@@ -42,8 +42,9 @@ from types import SimpleNamespace
 from typing import Any, Callable, Iterable
 
 from .bridge import MOD_VERSION_EXPECTED, BridgeClient, BridgeError
-from .farmwork import (ENV_BLOCK_STATUSES, STAGE_ACTION, FarmWorker, StageResult, StepResult,
-                       farm_dead_crops, farm_dry_tiles, seed_items, till_blocked_by)
+from .farmwork import (ENV_BLOCK_STATUSES, SEED_KEEP_FACTOR, STAGE_ACTION, FarmWorker,
+                       StageResult, StepResult, farm_dead_crops, farm_dry_tiles,
+                       pick_seed_offer, seed_items, till_blocked_by)
 from .planner import (BoundaryPlanner, Brief, PlannerState, TaskIntent, TaskOutcome,
                       deterministic_plan)
 
@@ -555,6 +556,20 @@ class LongRun:
         self.far_dry_given_up: set[tuple[int, int]] = set()
         # 本日是否已经播报过"旧 Mod 没给 dryTiles 坐标"（一天只提醒一次，不刷屏）。
         self.far_dry_unavailable_noted = False
+        # 【task-67】今天"买不到合适种子"的结论（"" = 还没确认；否则是 `no_seed_for_sale` 或
+        # `cannot_afford`）。run6 死锁：夏季买不到硬编码的春季 `472`，而 `work_reasons` 里
+        # "没种子但钱够 ⇒ 该去买"这条**永不可满足**的理由把守卫钉死，3 轮零变化 ⇒ 天天 `stuck`。
+        # 今天确认买不到 ⇒ 这条理由当天失效（改记 `seed_unavailable_today`），诚实收工。
+        # **不跨日**：`_run_day` 每天清空（明天可能上架新种子 / 钱变多）。
+        self.seed_dead_today: str = ""
+        # 本条 journal 当天只写一次（`work_reasons` 每轮都会被调用）。
+        # 注意与 `seed_dead_noted`（`_preconditions` 自己那句 notes 的"已说"标志）分开：
+        # `_seed_dead` 会置 `seed_dead_noted`，若共用同一个标志，`work_reasons` 永远没机会留痕。
+        self.seed_unavail_noted = False
+        self.seed_dead_noted = False
+        # 【task-67】最近一次 `buy` 回执带回来的货架清单（`availableItems`）。**跨天保留**：
+        # 货架是稳定事实，留着就能直接挑 id 下单，少发注定失败的那一次请求。
+        self.shop_offers: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------ 小工具
     def _mark_no_target(self, task: str) -> None:
@@ -1024,11 +1039,16 @@ class LongRun:
         }
 
     def _seed_outlook(self, obs: dict[str, Any]) -> tuple[int, int, bool]:
-        """(种子总数, 钱, 还能不能搞到种子)。"""
+        """(种子总数, 钱, 还能不能搞到种子)。
+
+        【task-67】"能不能搞到"必须把**今天已经确认买不到**算进去（`self.seed_dead_today`）：
+        否则 run6 的死锁原样复现 —— 守卫每轮都看到"钱够 ⇒ 该去买"，而商店根本没有当季种子。
+        """
         player = FarmWorker.player_of(obs)
         seeds = sum(n for _i, _nm, n in seed_items(player))
         money = FarmWorker.money(obs)
-        can = seeds > 0 or (self.allow_buy and money >= self.seed_price)
+        can = seeds > 0 or (self.allow_buy and money >= self.seed_price
+                            and not self.seed_dead_today)
         return seeds, money, can
 
     def _plot_has_work(self, obs: dict[str, Any], tiles: Iterable[tuple[int, int]]) -> bool:
@@ -1352,6 +1372,15 @@ class LongRun:
         seeds, money, can_plant = self._seed_outlook(obs)
         if seeds <= 0 and can_plant:
             reasons.append(f"没种子但钱够（{money}g ≥ {self.seed_price}g），该去买")
+        elif seeds <= 0 and self.seed_dead_today and not self.seed_unavail_noted:
+            # 【task-67 ③b，run6 死锁的解药】今天已经确认"买不到合适种子" ⇒ "该去买"这条理由
+            # **当天失效**：不然它会一直拒绝收工（`sleep_guard` 拿 `work_reasons` 判 `no_work`），
+            # 而商店根本没有当季种子 ⇒ 永远满足不了 ⇒ 3 轮零变化 ⇒ `stuck` 报废整天。
+            # 只留痕一次，不刷屏；明天 `_run_day` 重置后可以重试。
+            self.seed_unavail_noted = True
+            self._journal("seed_unavailable_today", code=self.seed_dead_today, money=money,
+                          seed_price=self.seed_price, note="今天已确认买不到合适种子 ⇒ "
+                          "不再把「该去买种子」当活；收工理由按真实情况写（no_work / stuck:）")
         # 【run3 真 bug B】人不在农场时，窗口观测只覆盖室内 ⇒ 上面两条必然为空。
         # 真值在 `farm` 块（`complete=true` 时 `dryCrops`/`ripeCrops` 是全农场口径）：
         # 有干作物/熟作物就是"还有活"，而且第一件事是**先回农场**（见 `_ensure_on_farm`）。
@@ -1505,7 +1534,16 @@ class LongRun:
 
     # ------------------------------------------------------------------ 前置条件
     def _preconditions(self, obs: dict[str, Any], rep: DayReport) -> None:
-        """种子没了就买。买不成**如实记账**，不让后面每一格去撞同一堵墙。"""
+        """种子没了就买**当季能买到的**种子。买不成如实记账，不让后面每一格去撞同一堵墙。
+
+        【task-67】选品顺序（每一层都比上一层信息新）：
+
+        1. **今天已确认买不到**（`self.seed_dead_today`）⇒ 直接返回，不再发请求
+           （run6 一天白发 6 次 `item_not_sold`，每次都白烧一次过场与时间）；
+        2. 手上有货架清单（`self.shop_offers`，来自最近一次回执，**跨天保留**）⇒ 直接挑；
+        3. 没有清单 ⇒ 用配置的 `buy_item` **探一次**（旧 Mod 没有清单字段时的唯一办法）；
+        4. 探测带回清单 ⇒ 按清单**重挑一次**（换一个 id）；仍不成 ⇒ 置 `seed_dead_today`。
+        """
         player = FarmWorker.player_of(obs)
         seeds_total = sum(n for _i, _nm, n in seed_items(player))
         if seeds_total > 0:
@@ -1515,15 +1553,73 @@ class LongRun:
         if not self.allow_buy:
             rep.notes.append("没种子（本轮禁止买种子）")
             return
+        if self.seed_dead_today:
+            if not self.seed_dead_noted:
+                self.seed_dead_noted = True
+                rep.notes.append(f"今天已确认买不到合适种子（{self.seed_dead_today}），不再试")
+            return
+        if self.shop_offers:
+            # 有清单：直接挑，**不发注定失败的请求**（清单跨天保留）。
+            pick, code = pick_seed_offer(self.shop_offers, money)
+            if pick is None:
+                self._seed_dead(code, rep, money=money, offers=self.shop_offers)
+                return
+            self._buy_seed(str(pick.get("id") or ""), money, "shelf", rep,
+                           price=int(pick.get("price") or 0))
+            return
+        # 没有清单（旧 Mod / 首次）：拿配置项探**一次**。
+        # ⚠️ 探测**成功**时绝不能下"买不到"的结论 —— 上面那次 `no_seed_for_sale` 的误判
+        # （探到了种子还说商店没有）会把 `seed_dead_today` 置上，当天后半程直接瘫掉。
         if money < self.seed_price:
             rep.notes.append(f"没种子且钱不够（{money}g < {self.seed_price}g），只能干等/清障开垦")
             return
-        st = self.worker.buy(self.buy_item, self.buy_count, shop=self.shop)
+        st = self._buy_seed(self.buy_item, money, "probe", rep)
+        if st is not None and st.ok:
+            return
+        # 探测失败：若回执带了货架清单，就照它重挑一次（换 id）；仍不成才下结论。
+        pick, code = pick_seed_offer(self.shop_offers, money)
+        if pick is not None:
+            self._buy_seed(str(pick.get("id") or ""), money, "shelf", rep,
+                           price=int(pick.get("price") or 0))
+            return
+        self._seed_dead(code, rep, money=money, offers=self.shop_offers)
+
+    def _buy_seed(self, item: str, money: int, source: str, rep: DayReport,
+                  *, price: int = 0) -> StepResult | None:
+        """发一次 `buy`；把回执里的货架清单收进 `self.shop_offers`，并如实记 `buy` journal。"""
+        assert self.worker is not None
+        if not item:
+            return None
+        st = self.worker.buy(item, self.buy_count, shop=self.shop)
         self._actions += 1
-        rep.notes.append(f"补种子：{st.reason}")
+        if st.available:
+            self.shop_offers = list(st.available)   # 跨天保留：下次直接挑，不发注定失败的请求
+        rep.notes.append(f"补种子（{source}{f' {price}g' if price else ''}）：{st.reason}")
         self._say(f"  · 补种子：{st.reason}")
-        self._journal("buy", ok=st.ok, code=st.code, reason=st.reason,
-                      before=st.before, after=st.after, receipt=st.receipt)
+        self._journal("buy", ok=st.ok, code=st.code, reason=st.reason, item=item,
+                      count=self.buy_count, price=price, source=source,
+                      before=st.before, after=st.after, receipt=st.receipt,
+                      available=len(st.available))
+        return st
+
+    def _seed_dead(self, code: str, rep: DayReport, *, money: int,
+                   offers: list[dict[str, Any]]) -> None:
+        """记下"今天买不到合适种子"（`no_seed_for_sale` / `cannot_afford`）。
+
+        为什么必须记：`work_reasons` 里"没种子但钱够 ⇒ 该去买"这条**当天必须失效**，
+        否则守卫永远拒绝收工，而商店根本没有当季种子（run6 的死锁）。
+        """
+        self.seed_dead_today = code or "no_seed_for_sale"
+        self.seed_dead_noted = True
+        top = "、".join(f"{o.get('name')}({o.get('price')}g)" for o in (offers or [])[:12])
+        self._journal("no_seed_for_sale" if self.seed_dead_today == "no_seed_for_sale"
+                      else "cannot_afford",
+                      code=self.seed_dead_today, money=money, seed_price=self.seed_price,
+                      keep_factor=SEED_KEEP_FACTOR, offers=top or "(没有货架清单)",
+                      note="今天不再发起 buy（次日重试一次）")
+        rep.notes.append(f"买不到合适种子（{self.seed_dead_today}）：{top or '没有货架清单'}"
+                         "；今天不再试（明天再看）")
+        self._say(f"  · 买不到合适种子（{self.seed_dead_today}），今天不再试")
 
     # ------------------------------------------------------------------ 睡觉
     def _do_sleep(self, obs: dict[str, Any], rep: DayReport, why: str) -> tuple[str, str]:
@@ -2425,6 +2521,11 @@ class LongRun:
         self.env_streak = {}
         self.env_spin_noted = set()
         self.seed_gate_noted = set()
+        # 【task-67】"今天买不到合适种子"的结论与它的播报位：每天清零（明天可能上架 / 钱变多）。
+        # `shop_offers`（货架清单）**不清**：它是稳定事实，留着省一次注定失败的请求。
+        self.seed_dead_today = ""
+        self.seed_unavail_noted = False
+        self.seed_dead_noted = False
         self.dead_scope_noted = set()
         self.no_target = set()
         self.no_target_global = set()

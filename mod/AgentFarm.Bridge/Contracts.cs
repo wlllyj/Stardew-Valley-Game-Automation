@@ -798,6 +798,38 @@ namespace AgentFarm.Bridge
         /// 【可选字段】null 时序列化省略。
         /// </summary>
         [JsonPropertyName("tile")] public int[] Tile { get; set; }
+
+        // ------------------------------------------------------------------
+        //  0.7.26（task-67）新增：`buy` 的"可审计货架"
+        //
+        //  run6 真机事故：脑把种子品种硬编码成 `472`（防风草种子，**春季**作物），
+        //  夏季商店不卖 ⇒ 每天白试 6 次、`item_not_sold`，播种腿永远走不通。
+        //  脑看不到 `Data/Crops`，唯一的事实来源就是**开店那一刻的货架**——
+        //  所以回执必须把它结构化地带回来（成功与失败都带）。
+        // ------------------------------------------------------------------
+
+        /// <summary>
+        /// <c>buy</c> 专用：开店那一刻货架上的在售清单（**按价格升序，最多 30 条**）。
+        /// 成功与失败都带；`id` 是 <c>QualifiedItemId</c>（如 <c>(O)472</c>），脑直接拿它下单。
+        /// 【可选字段】null 时序列化省略 ⇒ 其它技能回执形状不变。
+        /// </summary>
+        [JsonPropertyName("availableItems")] public ShopItemView[] AvailableItems { get; set; }
+    }
+
+    /// <summary>
+    /// <c>buy</c> 回执里的一条货架条目（协议 0.7.26 / task-67）。
+    /// 只报观测到的事实：游戏自己的 <c>ShopMenu.itemPriceAndStock</c>。
+    /// </summary>
+    internal sealed class ShopItemView
+    {
+        /// <summary><c>QualifiedItemId</c>（如 <c>(O)472</c>）；买的时候用它，比名字稳。</summary>
+        [JsonPropertyName("id")] public string Id { get; set; }
+
+        /// <summary>展示名（`Seeds` / 本地化名），脑据此筛"这是不是种子"。</summary>
+        [JsonPropertyName("name")] public string Name { get; set; }
+
+        /// <summary>单价（游戏货架价）。</summary>
+        [JsonPropertyName("price")] public int Price { get; set; }
     }
 
     /// <summary>

@@ -68,6 +68,13 @@ namespace AgentFarm.Bridge
         private long _seqBefore;
         private int _openTries;
 
+        /// <summary>
+        /// 【0.7.26 / task-67】菜单挂上那一刻的货架清单（`itemPriceAndStock`），成功与失败回执都带。
+        /// run6 真机事故：脑硬编码 `472`（**春季**防风草种子）⇒ 夏季每天白试 6 次 `item_not_sold`。
+        /// 脑看不到 `Data/Crops`，只能靠这份清单自己挑当季能买的种子。
+        /// </summary>
+        private ShopItemView[] _available;
+
         public BuySkill(ExecRequest req, WorldObserver world, IMonitor monitor)
         {
             this._req = req;
@@ -95,6 +102,8 @@ namespace AgentFarm.Bridge
                 Schema = Skills.ExecSchema, ElapsedMs = elapsedMs,
                 WorldSeqBefore = this._seqBefore, WorldSeqAfter = this._world?.WorldSeq,
                 ReachedLocation = StepMover.CurrentLocationName(),
+                // 【task-67】失败也必须带货架清单：`item_not_sold` 正是脑唯一能"改买当季种子"的时机。
+                AvailableItems = this._available,
             };
 
         /// <summary>主线程调用：返回非 null = 终态；返回 null = 还在等商店菜单挂上。</summary>
@@ -160,6 +169,8 @@ namespace AgentFarm.Bridge
         private ExecResponse DoPurchase(ShopMenu menu)
         {
             long elapsed = this.Elapsed();
+            // 【task-67】先抓一份货架真值：成功、失败（`item_not_sold` 尤其重要）都要带回去。
+            this._available = Shelf(menu);
             string want = this._req?.Args?.Item;
             if (string.IsNullOrWhiteSpace(want))
                 return this.Fail("bad_args", "buy 需要 args.item（ItemId / QualifiedItemId / 名字）", elapsed);
@@ -269,6 +280,7 @@ namespace AgentFarm.Bridge
                 ElapsedMs = this.Elapsed(),
                 WorldSeqBefore = this._seqBefore, WorldSeqAfter = this._world?.WorldSeq,
                 ReachedLocation = StepMover.CurrentLocationName(),
+                AvailableItems = this._available,   // 【task-67】货架真值：脑据此挑品种
             };
         }
 
@@ -398,6 +410,47 @@ namespace AgentFarm.Bridge
 
         private static string StockText(int stock)
             => stock == int.MaxValue ? "无限" : (stock < 0 ? "?" : stock.ToString());
+
+        /// <summary>
+        /// 【task-67】货架的**结构化**清单：按价格升序、最多 30 条。
+        ///
+        /// 为什么按价格升序再截断：脑要的是"我买得起的最便宜当季种子"，贵的排后面被截掉正合适。
+        /// 读不出来就返回 null（字段被省略 ⇒ 脑按"没有清单"处理）——**绝不伪造**货架。
+        /// </summary>
+        private static ShopItemView[] Shelf(ShopMenu menu)
+        {
+            try
+            {
+                List<ShopItemView> rows = new List<ShopItemView>();
+                foreach (KeyValuePair<ISalable, ItemStockInformation> kv in menu.itemPriceAndStock)
+                    rows.Add(new ShopItemView
+                    {
+                        Id = SafeId(kv.Key),
+                        Name = SafeName(kv.Key),
+                        Price = kv.Value?.Price ?? -1,
+                    });
+                rows.Sort((a, b) => a.Price.CompareTo(b.Price));
+                if (rows.Count > 30) rows = rows.GetRange(0, 30);
+                return rows.ToArray();
+            }
+            catch { return null; }
+        }
+
+        /// <summary>下单用的 id：优先 `QualifiedItemId`（`(O)472`），退 `ItemId`，再退名字。</summary>
+        private static string SafeId(ISalable s)
+        {
+            if (s == null) return null;
+            try
+            {
+                if (s is Item it)
+                {
+                    if (!string.IsNullOrEmpty(it.QualifiedItemId)) return it.QualifiedItemId;
+                    if (!string.IsNullOrEmpty(it.ItemId)) return it.ItemId;
+                }
+                return s.Name;
+            }
+            catch { return null; }
+        }
 
         /// <summary>货架清单（截断），用于"没有这件商品"时让脑自己看清有什么。</summary>
         private static string Listing(ShopMenu menu)

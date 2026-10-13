@@ -78,6 +78,11 @@ class FakeWorld:
         self.sleeps = 0
         self.refills = 0
         self.buys: list[int] = []
+        # ---- task-67：买种子的货架（`availableItems`）----
+        #: 空 = 旧桥（脑走"拿配置项探一次"的老路，与改动前行为一致）；非空 = 回执带货架清单。
+        self.buy_offers: list[dict] = []
+        self.buy_calls: list[dict] = []      # 每一次 `buy` 请求的 item/count（证明不再硬编码 472）
+        self.buy_price = 20                  # 配置项（默认 472）的单价
         # 睡前那一刻"还有几格没浇" —— 跨日会把 watered 全部清零（世界语义），
         # 所以"这天有没有浇完"只能在睡前问，事后问必然为假。
         self.unwatered_at_sleep: list[int] = []
@@ -333,10 +338,24 @@ class FakeWorld:
         return StepResult("sleep", ok=True, reason=f"跨到第 {self.day} 天")
 
     def buy(self, item, count, shop):
-        price = 20
+        # 【task-67】回执带回来的货架清单（空 = 旧桥/探路模式，行为与改动前完全一致）。
+        # 记下**每一次请求的 item**：`TestTask67SeedChoice` 就是靠它证明"不再硬编码 472"。
+        self.buy_calls.append({"item": str(item), "count": int(count)})
+        price = self.buy_price
+        offers = [dict(o) for o in self.buy_offers]
+        if offers:
+            want = "".join(ch for ch in str(item) if ch.isdigit())
+            on_shelf = any(want and want == "".join(ch for ch in str(o.get("id") or "") if ch.isdigit())
+                           for o in offers)
+            if not on_shelf:
+                # 真机在这里回 `item_not_sold` + 在售清单（脑必须照清单换一个 id 重挑）
+                return StepResult("buy", code="failed", status="item_not_sold",
+                                  reason=f"商店「{shop}」里没有「{item}」",
+                                  available=offers)
         can = min(int(count), self.money // price)
         if can < 1:
-            return StepResult("buy", code="failed", reason=f"钱不够（{self.money}g < {price}g）")
+            return StepResult("buy", code="failed", reason=f"钱不够（{self.money}g < {price}g）",
+                              available=offers)
         self.money -= price * can
         slot = self._seed_slot()
         if slot is None:
@@ -345,7 +364,8 @@ class FakeWorld:
         else:
             slot["stack"] += can
         self.buys.append(can)
-        return StepResult("buy", ok=True, reason=f"买到 {can} 个，钱 {self.money}g")
+        return StepResult("buy", ok=True, reason=f"买到 {can} 个，钱 {self.money}g",
+                          available=offers)
 
     def _seed_slot(self):
         for it in self.inventory:
@@ -3478,6 +3498,116 @@ class TestTask63Refused(unittest.TestCase):
                             "两套豁免各扣各的：refused_summary 只报 refused 的实扣")
 
 
-if __name__ == "__main__":
+class TestTask67SeedChoice(unittest.TestCase):
+    """task-67：脑自己挑"当季、买得起"的种子（run6 死锁：夏季硬买春季 `472`，每天白试 6 次）。
+
+    变异自检（脚本 `scratch/_t67_mutate.py`，跑完即弃）：
+
+    * **m67a**（`is_seed_offer` 恒 True：不按名字筛）⇒ `test_shelf_without_seeds_is_not_bought` 红；
+    * **m67b**（`_seed_outlook` 去掉 `not self.seed_dead_today` 的门）⇒
+      `test_seed_dead_today_disarms_the_reason` 红（守卫又被"该去买"钉死）。
+    """
+
+    SUMMER = [{"id": "(O)254", "name": "Melon Seeds", "price": 80},
+              {"id": "(O)483", "name": "Wheat Seeds", "price": 10}]
+    TOOL_OFFERS = [{"id": "(O)24", "name": "Parsnip", "price": 20},
+                   {"id": "(O)60", "name": "Emerald", "price": 250}]
+
+    @staticmethod
+    def _run(w: FakeWorld) -> LongRun:
+        run = make_run(w, target_days=1)
+        run.worker = FakeWorker(w)
+        return run
+
+    @staticmethod
+    def _events(run: LongRun, event: str) -> list[dict]:
+        return [e for e in run.entries if e.get("event") == event]
+
+    def test_picks_a_shelf_item_instead_of_hardcoded_472(self):
+        """夏季货架 ⇒ 买货架上最便宜的那件（`(O)483`），**不是**配置里的 472。"""
+        w = FakeWorld(weeds=0, seeds=0, money=500)
+        w.buy_offers = list(self.SUMMER)
+        run = self._run(w)
+        run._preconditions(w.obs(), DayReport(day_key=("spring", 1, 5), started_at=0.0))
+        self.assertEqual([c["item"] for c in w.buy_calls], ["472", "(O)483"],
+                         "先探一次配置项（被商店拒绝），再照货架换一个 id")
+        self.assertEqual(run.shop_offers, self.SUMMER, "回执里的货架要留下（跨天保留）")
+        buy = self._events(run, "buy")
+        self.assertEqual(len(buy), 2, "被拒那次 + 真买到那次都留痕")
+        self.assertEqual(buy[-1]["item"], "(O)483")
+        self.assertEqual(buy[-1]["price"], 10)
+        self.assertEqual(buy[-1]["source"], "shelf")
+        self.assertFalse(buy[0]["ok"], "探测失败要如实记")
+        self.assertTrue(w.buys, "真买到了")
+
+    def test_cached_shelf_is_used_without_probing(self):
+        """手上有货架清单 ⇒ 直接挑，连"探一次"都不用（旧桥的探路请求是纯浪费）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=500)
+        run = self._run(w)
+        run.shop_offers = list(self.SUMMER)
+        run._preconditions(w.obs(), DayReport(day_key=("spring", 1, 5), started_at=0.0))
+        self.assertEqual([c["item"] for c in w.buy_calls], ["(O)483"])
+
+    def test_shelf_without_seeds_is_not_bought(self):
+        """货架只有作物/矿物 ⇒ `no_seed_for_sale` + **一次买都不发**（run6 一天 6 次就这么浪费的）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=500)
+        w.buy_offers = list(self.TOOL_OFFERS)
+        run = self._run(w)
+        run._preconditions(w.obs(), DayReport(day_key=("spring", 1, 5), started_at=0.0))
+        self.assertEqual([c["item"] for c in w.buy_calls], ["472"],
+                         "只探一次（探完就知道货架没种子），不再重复发请求")
+        self.assertEqual(run.seed_dead_today, "no_seed_for_sale")
+        self.assertEqual(len(self._events(run, "no_seed_for_sale")), 1)
+
+    def test_cannot_afford_does_not_buy(self):
+        """有种子但攒不够 10 包的钱 ⇒ `cannot_afford`，不买。"""
+        w = FakeWorld(weeds=0, seeds=0, money=100)     # 预算 10 < 最便宜的 40
+        w.buy_offers = [{"id": "(O)482", "name": "Pepper Seeds", "price": 40}]
+        run = self._run(w)
+        run._preconditions(w.obs(), DayReport(day_key=("spring", 1, 5), started_at=0.0))
+        self.assertEqual([c["item"] for c in w.buy_calls], ["472"], "探了一次就够")
+        self.assertEqual(run.seed_dead_today, "cannot_afford")
+        self.assertEqual(len(self._events(run, "cannot_afford")), 1)
+
+    def test_seed_dead_today_disarms_the_reason(self):
+        """run6 死锁的解药：确认买不到之后，"该去买种子"这条理由**当天失效**。"""
+        w = FakeWorld(weeds=0, seeds=0, money=500)
+        w.buy_offers = list(self.TOOL_OFFERS)
+        run = self._run(w)
+        run._preconditions(w.obs(), DayReport(day_key=("spring", 1, 5), started_at=0.0))
+        reasons = run.work_reasons(w.obs())
+        self.assertNotIn("该去买", "；".join(reasons), f"买不到就不该再要求去买：{reasons}")
+        # 只留痕一次（`work_reasons` 每轮都被调用，不刷屏）
+        run.work_reasons(w.obs())
+        self.assertEqual(len(self._events(run, "seed_unavailable_today")), 1)
+        # 守卫不再被这条不可满足的理由钉死
+        _can, _code, why = run.sleep_guard(w.obs())
+        self.assertNotIn("该去买", why)
+        # 当天也不再发 buy（`_preconditions` 直接返回；只剩最开始那一次探测）
+        run._preconditions(w.obs(), DayReport(day_key=("spring", 1, 5), started_at=0.0))
+        self.assertEqual([c["item"] for c in w.buy_calls], ["472"], "当天不再发起 buy")
+
+    def test_next_day_retries_once(self):
+        """次日重试一次：`_run_day` 每天清空 `seed_dead_today`（明天可能上架新种子）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=500)
+        w.buy_offers = list(self.SUMMER)
+        run = self._run(w)
+        rep = DayReport(day_key=("spring", 1, 5), started_at=0.0)
+        run._preconditions(w.obs(), rep)
+        first = len(w.buy_calls)
+        self.assertEqual(first, 2, "探测被拒一次 + 照货架买到一次")
+        run._preconditions(w.obs(), rep)               # 同一天再问：已有种子 ⇒ 不动
+        self.assertEqual(len(w.buy_calls), first)
+        # 模拟跨日重置（`_run_day` 每天做的事）
+        run.seed_dead_today = ""
+        run.seed_dead_noted = False
+        w.money = 500
+        w.inventory = [i for i in w.inventory
+                       if not i or "Seed" not in str(i.get("name") or "")]
+        run._preconditions(w.obs(), rep)
+        self.assertEqual(len(w.buy_calls), first + 1, "次日应该再试一次")
+
+
+if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 
