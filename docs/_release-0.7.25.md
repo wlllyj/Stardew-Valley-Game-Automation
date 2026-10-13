@@ -98,3 +98,11 @@ Start-Process -FilePath <python.exe> -ArgumentList '-u','tools\run-longrun.py','
 - ⚠️ **缺口（比 §7 原计划更严）**：Mod `ShipSkill` 出货的是 `Items[slot]` **整叠**，没有"只卖超额部分"的能力 ⇒ **"每 id 保留 K=10"在操作员层也做不到**（这次是整叠卖掉）。这正是 task-55 要在脑侧解决的形态（要么先分叠、要么按 id 记账免得把家底卖空）。
 - ⚠️ **task-47 U2 数据点**：本次 summer 3→4 的日终保存**即使关掉 `ShippingMenu` 也没落盘**（存档仍 `3696701 B / 2026-10-13T20:37:37.898`；关框后 `worldAdvancing=true` 但无 `SaveGame.Save()` 行）⇒ 起点存档 mtime 是旧的；按 `docs\_run6-criteria.md` §2 口径（有日终菜单时"存档未动"不判失败也不判通过）处理，但 evidence 里要如实点名。
 - 起跑前状态即 §2.1 STEP 9 的基线：`money 956` / `seeds []` ⇒ 起跑后**脑自己**会 `buy` 种子（该路径 run5 实测过：`114→14` 买 5 包 `472`）。
+
+### 7.2 run6 结果（2026-10-14，Lead + machine-runner 取证）——**FAIL（0/3）**
+
+- `finish {"code":1,"verified_streak":0,"target_days":3,"actions":95,"minutes":0.62,"stages_seen":["clear_dead","till_area"],"unmet_days":["1年 summer 4日","1年 summer 4日"]}`；两次日报告同为 `summer 4`（t 18.47 / 37.20），`ended_by=stuck`、`day_after=null`，**0 跨日**；存档 `3696701 B / 20:37:37.898` 未动；SMAPI 起跑后 672 行里 NewDay 0 / `SaveGame.Save()` 0 / ERROR 0；`console.err` 0 B ⇒ **干净快速失败**（不是崩溃/掉线/模态）。
+- 死因两条（详见 [docs/_run6-evidence.md](docs/_run6-evidence.md)、条目 047）：
+  1. `buy` 品种硬编码 **472（防风草＝春季作物）**，夏季 SeedShop 不卖 ⇒ 一天 6 次 `item_not_sold`；`sleep_guard` 的「没种子但钱够(956g)⇒该去买」使该条件**永不可满足**；
+  2. 唯一实体活（清 `field_ne` 枯死作物）**42 格全部「四邻都站不过去」**⇒ `unreachable 42 > bound 8` ⇒ `checks.unreachable_within_bound=false`（新闸门首次真机报警）。
+- 去向：**task-67**（按在售清单买当季种子 + `no_seed_for_sale` 当天封 + 守卫理由当天失效）、**task-68**（先清邻格开路 + `unreachable_bound` 口径修正）⇒ 冻结 **0.7.26** 后跑 **run7**（见 [docs/_release-0.7.26.md](docs/_release-0.7.26.md)）。
