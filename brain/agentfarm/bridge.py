@@ -36,9 +36,8 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.25"   # v0.7.25：窗口外干作物（Mod `farm.dryTiles` + 脑侧走过去浇）
-                                 # + 枯死作物（`farm.deadCrops` + 脑侧清死苗）+ 「不可达」不算硬失败
-                                 # + 锄不动（tool_ineffective）不算硬失败 + LLM 边界决策留痕
+MOD_VERSION_EXPECTED = "0.7.26"   # v0.7.26：当季种子（BuySkill 在售清单 + 脑按货架挑） + 枯死作物开路
+                                 # + stuck 日有界翻篇 + 豁免上界基数 bound_basis（剔除 encircled）
                                  # （`<journal>-llm.jsonl` + decision 行 llm_trace/llm_trace_hash）。
                                  # v0.7.23：睡觉跨日打通 —— SleepSkill 应答后**同一 tick 关框**
                                  # （原先只 answerDialogue 跑回调、DialogueBox 不收 ⇒ Game1.newDay
