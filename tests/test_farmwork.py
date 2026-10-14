@@ -333,10 +333,13 @@ class MiniWorld:
         new = self.result.get(t, DROP)
         if new is DROP:
             self.records = [r for r in self.records if tuple(r["tile"]) != t]
+            # 【task-68】清掉挡路物以后这一格就**能站了**（真机是障碍消失 ⇒ A* 有路）。
+            self.unwalkable.discard(t)
         else:
             for r in self.records:
                 if tuple(r["tile"]) == t:
                     r["kind"] = new
+            self.unwalkable.discard(t)
         return {"ok": True, "status": "ok",
                 "reason": f"已用「{tool}」对 {t} 动手 {n} 次"}
 
@@ -1671,6 +1674,88 @@ class TestTask67BuyAvailable(unittest.TestCase):
         self.assertTrue(r.ok, r.reason)
         self.assertEqual(r.available, [])
         self.assertNotIn("available", r.as_dict())
+
+
+class TestTask68OpenWay(unittest.TestCase):
+    """task-68（Lead m06336）：判"走不到"之前**先开路** —— 清掉四邻里"可清 + 自己够得着"的邻格。
+
+    真机依据（run6）：`field_ne` 被草 432/石 169/枝 92/树 356 堵住 ⇒ `clear_dead` 一次 ok 都没有、
+    `unreachable 42 / bound 8`，最后 19 秒就 `stuck` 收工。修法分三态：
+    `ok`（清邻格后站到了）/ `encircled`（四邻**连落脚点都没有**：树/桩/大石一类 ⇒ 不封格、
+    不进不可达豁免）/ `exhausted`（有可清的、清了上限还不通 ⇒ 仍按 `unreachable`，有界）。
+    变异自检（**实测**，脚本 `scratch\\_t68_mutate.py`：复制 brain+tests 到临时目录做文本替换；
+    基线 11/11 绿 —— 本类 4 条 + `test_longrun.TestTask68*` 7 条）：
+    * `m68a`：`_ensure_reachable` 里的 `open_way` 短路成 `"exhausted"` ⇒ **5 条红**
+      （本类两条 + `test_surrounded_by_unclearable_is_encircled`，以及 longrun 的 encircled 两条）。
+    * `m68b`：`open_way` 的 `encircled` 分支并进 `exhausted` ⇒ **3 条红**（encircled 被当成走不到）。
+    * `m68c`：`longrun._mark_blocked` 不认 `s.encircled` ⇒ **1 条红**
+      （`test_encircled_never_enters_blocked`：被围住就封格了）。
+    """
+
+    TARGET = (62, 10)
+
+    def _world(self, records, *, unwalkable=(), player=(60, 10)):
+        w = MiniWorld(records=records, inventory=INV_WITH_SCYTHE, tools=TOOLS_WITH_SCYTHE)
+        w.player_tile = list(player)
+        w.unwalkable = {tuple(t) for t in unwalkable}
+        return w
+
+    def test_clearing_a_neighbour_opens_the_way(self):
+        """唯一落脚点是丛杂草、而且走不过去 ⇒ 先清掉它，再站过去把目标清了。"""
+        nb = [(self.TARGET[0] + dx, self.TARGET[1] + dy) for dx, dy in NEIGHBORS]
+        w = self._world([weed_rec(self.TARGET), weed_rec(nb[0])], unwalkable=nb)
+        worker = make_worker(w)
+        r = worker.clear(self.TARGET)
+        self.assertTrue(r.ok, r.reason)
+        self.assertIs(r.stood, True, "开路成功后必须真的站到了目标格旁边")
+        opened = r.opened
+        self.assertTrue(opened, r.as_dict())
+        self.assertEqual(opened[0]["neighbour"], [nb[0][0], nb[0][1]])
+        self.assertEqual(opened[0]["kind"], "weed")
+        self.assertEqual(opened[0]["result"], "ok")
+        self.assertEqual(r.as_dict().get("clear_neighbor"), opened)
+        # 目标格自己也被清掉了（先清邻格，再清目标）
+        self.assertNotIn(self.TARGET, {tuple(x["tile"]) for x in w.records})
+
+    def test_surrounded_by_unclearable_is_encircled(self):
+        """四邻全是树/桩一类（`FRONTIER_KINDS` 之外、且没有落脚点）⇒ `encircled`，不是走不到。"""
+        nb = [(self.TARGET[0] + dx, self.TARGET[1] + dy) for dx, dy in NEIGHBORS]
+        recs = [weed_rec(self.TARGET)]
+        recs += [{"tile": list(t), "kind": "tree" if i % 2 else "clump",
+                  "standable": False, "actionable": False} for i, t in enumerate(nb)]
+        w = self._world(recs, unwalkable=nb)
+        r = make_worker(w).clear(self.TARGET)
+        self.assertEqual(r.code, "encircled")
+        self.assertIs(r.encircled, True)
+        self.assertIs(r.failed, False, "被围住不是硬失败，也不是「走不到」")
+        self.assertIs(r.unreachable, False)
+        self.assertIs(r.stood, False)
+        self.assertEqual(w.calls, [], "邻格都清不了 ⇒ 一次工具都不许挥")
+        self.assertIn("树/桩/大石", r.reason)
+
+    def test_open_way_is_bounded_then_still_unreachable(self):
+        """有可清的邻格、但清掉也没用（邻格自己被拒）⇒ 有界地退回 `unreachable`。"""
+        nb = [(self.TARGET[0] + dx, self.TARGET[1] + dy) for dx, dy in NEIGHBORS]
+        w = self._world([weed_rec(self.TARGET), weed_rec(nb[0])], unwalkable=nb)
+        w.fail_status[nb[0]] = "tool_ineffective"       # 邻格自己清不动 ⇒ 换不了突破口
+        r = make_worker(w).clear(self.TARGET)
+        self.assertEqual(r.code, "unreachable")
+        self.assertIs(r.failed, False)
+        self.assertEqual(len(w.calls), 1, "只试一次就停（有界），不许在同一格死磕")
+        self.assertIn("上限 4 次", r.reason)
+
+    def test_stood_is_true_only_when_really_beside_target(self):
+        """`stood` 的口径：真的站到目标格旁边才 True（日级不可达上界的分母靠它）。"""
+        w = self._world([weed_rec(self.TARGET)], player=self.TARGET)
+        r = make_worker(w).clear(self.TARGET)
+        self.assertTrue(r.ok)
+        self.assertIs(r.stood, True)
+        # 走不到时不许把它算成"站过"
+        nb = [(self.TARGET[0] + dx, self.TARGET[1] + dy) for dx, dy in NEIGHBORS]
+        w2 = self._world([weed_rec(self.TARGET)], unwalkable=nb)
+        r2 = make_worker(w2).clear(self.TARGET)
+        self.assertEqual(r2.code, "unreachable")
+        self.assertIs(r2.stood, False)
 
 
 if __name__ == "__main__":  # pragma: no cover

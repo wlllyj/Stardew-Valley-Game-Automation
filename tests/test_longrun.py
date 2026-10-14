@@ -37,9 +37,9 @@ from agentfarm.farmwork import (  # noqa: E402
     MAX_CLEAR_SWINGS, FarmWorker, STAGE_ACTION, StepResult, StageResult, seed_items,
 )
 from agentfarm.longrun import (  # noqa: E402
-    DEFAULT_LLM_MAX_TOKENS, ENDED_BY_EVENT, ENDED_BY_MODAL, JUSTIFIED_END_REASONS,
-    MAX_ENV_ATTEMPTS, MAX_TILE_ATTEMPTS, DayReport, LongRun, _till_blocked_by, is_justified_end,
-    plot_observe,
+    DEFAULT_LLM_MAX_TOKENS, ENDED_BY_EVENT, ENDED_BY_MODAL, FRONTIER_CLEAR_MAX,
+    JUSTIFIED_END_REASONS, MAX_ENV_ATTEMPTS, MAX_TILE_ATTEMPTS, DayReport, LongRun,
+    _till_blocked_by, is_justified_end, plot_observe,
 )
 from agentfarm.planner import BoundaryPlanner, Brief, TaskIntent, deterministic_plan  # noqa: E402
 
@@ -3606,6 +3606,215 @@ class TestTask67SeedChoice(unittest.TestCase):
                        if not i or "Seed" not in str(i.get("name") or "")]
         run._preconditions(w.obs(), rep)
         self.assertEqual(len(w.buy_calls), first + 1, "次日应该再试一次")
+
+
+class EncircledWorld(FakeWorld):
+    """run6 的「被围住」：目标格（枯死作物）四邻是树/桩一类 —— 不在 `FRONTIER_KINDS`、也没落脚点。
+
+    真机依据（`logs\\longrun-3day-llm-run6.jsonl`）：`field_ne` 的 42 格枯死作物全部"走不到"，
+    农场被草 432/石 169/枝 92/树 356 堵住 ⇒ `clear_dead` 一次 ok 都没有。其中"四邻是树、连落脚
+    点都没有"的那些**不是**不可达（明天/开路后就可能变）：归 `encircled` 单独计数、不封格、
+    也不许进 `unreachable_exempt` 分子。
+    """
+
+    def __init__(self, *, enclosed=(), ring="tree", **kw) -> None:
+        kw.setdefault("weeds", 0)
+        super().__init__(**kw)
+        self.enclosed = {tuple(t) for t in enclosed}
+        self.ring_kind = ring
+        for t in sorted(self.enclosed):
+            self.dirt.add(t)
+            self.crops[t] = {"ripe": False, "watered": True, "dead": True}
+            for dx, dy in _NB4:
+                self.blockers[(t[0] + dx, t[1] + dy)] = ring
+
+    def obs(self) -> dict:
+        o = super().obs()
+        for tv in o["location"]["tiles"]:
+            if tv.get("kind") in ("tree", "clump"):
+                tv["standable"] = False          # 树/桩上站不住（`_standable_near` 的判据）
+        return o
+
+
+class TestTask68Encircled(unittest.TestCase):
+    """task-68（Lead m06336）：`encircled` 是与 `unreachable` **并列的新类**，口径必须分得清。
+
+    * `encircled`：四邻**连落脚点都没有**（树/桩/大石）⇒ 不封格、不进 `blocked`、
+      不进 `unreachable_exempt` 分子（否则"被围住"会吃掉不可达的豁免额度，把真·不可达洗白）。
+    * `exhausted`：有落脚点、但开路到上限仍不通 ⇒ 仍按 task-52 的 `unreachable`（**有界**）。
+
+    变异自检（**实测**，脚本 `scratch\\_t68_mutate.py`，基线 11/11 绿）：
+    `m68a`（短路 `open_way`）**5 条红**；`m68b`（`encircled` 并进 `exhausted`）**3 条红**；
+    `m68c`（`_mark_blocked` 不认 `s.encircled`）**1 条红** = `test_encircled_never_enters_blocked`。
+    """
+
+    ENCLOSED = (62, 12)
+
+    def _world(self) -> EncircledWorld:
+        return EncircledWorld(enclosed=[self.ENCLOSED], seeds=0, money=0)
+
+    def _run(self, w: FakeWorld):
+        client = _UnreachableClient(w, unreachable=getattr(w, "enclosed", ()))
+        worker = FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+        run = make_run(w, client_factory=lambda: client, worker_factory=lambda c: worker,
+                       target_days=1, max_days=1)
+        run.worker = worker
+        run.client = client
+        return run
+
+    @staticmethod
+    def _events(run: LongRun, event: str) -> list:
+        return [e for e in run.entries if e.get("event") == event]
+
+    def _plot(self) -> dict:
+        return {"zone": "", "label": "", "anchor": list(self.ENCLOSED),
+                "tiles": [tuple(self.ENCLOSED)], "note": ""}
+
+    def test_encircled_never_enters_blocked(self):
+        """四邻全树 ⇒ `code=encircled`、逐格 journal `encircled`、**不写 `blocked`**、不算失败。"""
+        w = self._world()
+        run = self._run(w)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        out = run._step_stage("clear_dead", w.obs(), self._plot(), rep)
+        tile = tuple(self.ENCLOSED)
+        self.assertNotIn(tile, run.blocked, "encircled 不许封格（明天/开路后可能变可达）")
+        st = rep.stages[-1]
+        self.assertEqual(st["encircled"], 1, st)
+        self.assertEqual({tuple(t) for t in st["encircled_tiles"]}, {tile})
+        self.assertEqual(st["failed"], 0, "被围住不是硬失败")
+        self.assertEqual(st["unreachable"], 0, "encircled 与 unreachable 是两套独立计数")
+        self.assertFalse(out.postcondition_met)
+        per = self._events(run, "encircled")
+        self.assertEqual([tuple(e["tile"]) for e in per], [tile], per)
+        self.assertNotIn("unreachable", [e.get("event") for e in run.entries], run.entries[-3:])
+
+    def test_encircled_is_reported_but_does_not_exempt_unreachable(self):
+        """跑完一天：`day_end` 有 `encircled` 两键、有 `encircled_summary`，且不进不可达豁免。"""
+        w = self._world()
+        run = self._run(w)
+        run.run()
+        rep = run.days[0]
+        self.assertEqual(rep.encircled, 1, rep.stages)
+        self.assertEqual({tuple(t) for t in rep.encircled_tiles}, {tuple(self.ENCLOSED)})
+        self.assertEqual(rep.unreachable, 0, "围住 ≠ 走不到：不许混进 unreachable 账本")
+        self.assertEqual(rep.unreachable_exempt, 0, "encircled 不许占不可达豁免额度")
+        self.assertEqual(rep.failed_steps, 0)
+        day_end = self._events(run, "day_end")[-1]
+        for key in ("encircled", "encircled_tiles"):
+            self.assertIn(key, day_end, f"day_end 缺 {key}")
+        self.assertEqual(day_end["encircled"], 1)
+        summary = self._events(run, "encircled_summary")
+        self.assertEqual(len(summary), 1, summary)
+        self.assertEqual(summary[0]["count"], 1)
+        for key in ("attempted", "engaged"):
+            self.assertIn(key, summary[0], "分母与「站过」的证据都要留痕（口径可复核）")
+
+
+class TestTask68FrontierClear(unittest.TestCase):
+    """task-68「一轮不许零动作」：目标全够不着时，先清一格**可达的**可清障格（有界 ≤20/天）。
+
+    三个层次都测：`_frontier_clear` 真清一格 / 到日上限就停 / 没有可达候选时**不硬造动作**；
+    再加一条 day 级：作业区里的目标恒被 `ui_modal` 挡住（不封格、不占配额、世界不变）⇒ 走到
+    `idle_rounds>=3` 那一支时必须转去 `frontier_clear`，而不是像 run6 那样 19 秒收工。
+    """
+
+    def _run(self, w: FakeWorld):
+        client = FakeClient(w)
+        worker = FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+        run = make_run(w, client_factory=lambda: client, worker_factory=lambda c: worker)
+        run.worker = worker
+        run.client = client
+        return run
+
+    @staticmethod
+    def _events(run: LongRun, event: str) -> list:
+        return [e for e in run.entries if e.get("event") == event]
+
+    def test_clears_one_reachable_blocker(self):
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(61, 10)] = "weed"
+        w.player_tile = [62, 12]
+        run = self._run(w)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        self.assertTrue(run._frontier_clear(w.obs(), rep))
+        self.assertEqual(run.frontier_clears, 1)
+        self.assertNotIn((61, 10), w.blockers, "frontier_clear 必须真的清掉一格")
+        ev = self._events(run, "frontier_clear")
+        self.assertEqual(len(ev), 1, ev)
+        self.assertEqual(ev[0]["tile"], [61, 10])
+        self.assertIs(ev[0]["acted"], True)
+        self.assertEqual(ev[0]["limit"], FRONTIER_CLEAR_MAX)
+
+    def test_bounded_by_daily_cap(self):
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(61, 10)] = "weed"
+        w.player_tile = [62, 12]
+        run = self._run(w)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        run.frontier_clears = FRONTIER_CLEAR_MAX
+        self.assertFalse(run._frontier_clear(w.obs(), rep))
+        self.assertIn((61, 10), w.blockers, "到上限就该停手，不许无限清障")
+        self.assertEqual(self._events(run, "frontier_clear"), [])
+
+    def test_no_reachable_frontier_means_no_action(self):
+        """没有任何可达的可清障格 ⇒ 不许硬造动作（那天该按诚实理由收尾）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = self._run(w)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        self.assertFalse(run._frontier_clear(w.obs(), rep))
+        self.assertEqual(run.frontier_clears, 0)
+
+    def test_all_targets_unreachable_still_clears_a_reachable_one(self):
+        """Lead m06336③「一轮不许零动作」：守卫说有活、却拿不出作业区目标 ⇒ 必须去清一格可达的。
+
+        复现 run6 的形态：`field_ne` 的目标全够不着（`unreachable`），而农场里还有可达的杂草。
+        为了确定性地打中那条接线（而不是让 `_ensure_plot` 换片地把它当阶段目标），这里把
+        `_ensure_plot` 钉成 `None`、`work_reasons` 钉成"还有活" —— 正是 run6 那两句旁白。
+        """
+        w = UnreachableWorld(unreachable=[(60, 10)], seeds=0, money=0)
+        w.blockers[(70, 10)] = "weed"
+        # 作业区那一格"环境挡路"（`ui_modal`）：它**不封格、不占配额**（task-22 口径）⇒ 每轮都被
+        # 重新选中、世界却一点都不变 ⇒ 正是"指定目标够不着 + 有可达的可清障格"的僵局。
+        w.fail_status[(60, 10)] = "ui_modal"
+        client = _UnreachableClient(w, unreachable=w.unreachable)
+        worker = FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+        run = make_run(w, client_factory=lambda: client, worker_factory=lambda c: worker,
+                       target_days=1, max_days=1)
+        run.worker = worker
+        run.client = client
+        # 把作业区钉在这一格上：否则 `_ensure_plot` 会换片地，走的是另一条"换 11 片地"的守卫。
+        run._ensure_plot = lambda obs, rep: {"zone": "", "label": "", "anchor": [62, 12],
+                                             "tiles": [(60, 10)], "note": ""}
+        run.run()
+        ev = self._events(run, "frontier_clear")
+        self.assertTrue(ev, f"目标够不着 + 有可达的可清障格却零动作：{run.days[0].ended_reason}")
+        self.assertEqual(ev[0]["tile"], [70, 10])
+        self.assertIs(ev[0]["acted"], True)
+        self.assertNotIn((70, 10), w.blockers, "frontier_clear 必须真的清掉那一格")
+        self.assertGreaterEqual(run.frontier_clears, 1)
+        self.assertNotEqual(run.days[0].ended_by, "no_work", "有可达的活就不许按「没活」收工")
+
+    def test_engaged_is_evidence_not_the_bound_denominator(self):
+        """`engaged`（真站到过目标旁边）只作证据：`unreachable_summary` 同时带 `attempted` 与 `engaged`。"""
+        w = UnreachableWorld(unreachable=[(60, 10), (61, 10)], seeds=0, money=0)
+        client = _UnreachableClient(w, unreachable=w.unreachable)
+        worker = FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+        run = make_run(w, client_factory=lambda: client, worker_factory=lambda c: worker,
+                       target_days=1, max_days=1)
+        run.worker = worker
+        run.client = client
+        run.run()
+        summary = self._events(run, "unreachable_summary")
+        self.assertEqual(len(summary), 1, summary)
+        self.assertEqual(summary[0]["attempted"], 2)
+        self.assertEqual(summary[0]["engaged"], 0, "压根没走到跟前 ⇒ engaged 必须为 0")
+        rep = run.days[0]
+        self.assertEqual(rep.unreachable, 2)
+        # 分母仍是既有口径 `attempted`（工具/分析器按它对账），没有换成 engaged
+        self.assertGreaterEqual(rep.unreachable_bound, max(5, int(0.2 * 2)))
+        st = [s for s in rep.stages if s.get("attempted")][0]
+        self.assertIn("engaged", st)
+        self.assertLessEqual(st["engaged"], st["attempted"])
 
 
 if __name__ == "__main__":  # pragma: no cover

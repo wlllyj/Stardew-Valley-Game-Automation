@@ -189,6 +189,20 @@ DEAD_TOOL_CANDIDATES = ("scythe", "hoe")
 #: 邻格顺序（上/下/右/左）：站到目标格四邻之一再动手。
 NEIGHBORS = ((0, -1), (0, 1), (1, 0), (-1, 0))
 
+#: 【task-68】能靠"开路"对付的邻格类（清得掉的障碍）。树/树桩/大石/灌木/放置物**不碰**：
+#: 砍树砸石要斧镐等级、还可能连带伤到别的层 ⇒ 它们堵住的格归 `encircled` 单独一类。
+FRONTIER_KINDS = ("weed", "twig", "stone", GRASS_KIND)
+
+#: 【task-68】为某一格"开路"最多花几次动作（清邻格）。到上限还没通 ⇒ 承认"开了也不通"（有界）。
+MAX_OPEN_ACTIONS = 4
+
+#: 【task-68】目标格**被不可清障物围住**（2 层内找不到"可站 + 可清"的突破口）：
+#: 既不是"走不到"（那是地形/寻路问题），也不是"干不动"（那是世界拒绝）。
+#: 它**不进** `unreachable` 计数与豁免分子、当天**不封格**（次日/开路后可能变可达），
+#: 只单独计数 + 逐格 `encircled` journal —— 这样"整片被围住"不会把合法豁免顶出上界
+#: （run6：42 格里多数是这种，却被记成 `走不到` ⇒ `unreachable_within_bound=false` 假红）。
+ENCIRCLED_CODE = "encircled"
+
 #: 【task-43】从 `move_to_location` 的失败回执里取"warp 源格 (x,y)"与"剩余 N 步"。
 #: 真机原文（run4，`docs/_run4-evidence.md` §153）：
 #: `第 1 跳失败（timeout）：走向 Farm → FarmHouse 的 warp 源格 (64,14) 超时（单跳预算 8000ms 或整体剩余时间用尽）`
@@ -379,6 +393,14 @@ class StepResult:
     #: 脑据此挑"当季、买得起"的种子，不再硬编码物品 id（run6：夏季硬买春季 `472` ⇒ 每天白试 6 次）。
     #: 只落盘成纯数据（`[{"id","name","price"}, …]`），解析容错在 `seed_offers_from()`。
     available: list[dict[str, Any]] = field(default_factory=list)
+    #: 【task-68】**真的站到了目标格旁边**（站位成功）才为真。日级 `unreachable_bound` 的分母
+    #: 用它而不是"发起过动作的格"：压根没走到跟前的格子（run6 那 42 格）不该抬高豁免上界，
+    #: 否则"整片被围住"时合法豁免反而被自己的分母顶出去（`unreachable_within_bound` 假红）。
+    stood: bool = False
+    #: 【task-68】为够到 `tile` 而**先清掉的邻格**（`[{"neighbour":[x,y],"kind":…,"result":…}]`）。
+    #: 单独一个字段（不塞 `after`）：`after` 是逐格观测要点、会在动作循环里被覆盖，
+    #: 开路证据必须留到最后 ⇒ `as_dict()` 里叫 `clear_neighbor`，`longrun` 汇总成 journal。
+    opened: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def skipped(self) -> bool:
@@ -388,8 +410,8 @@ class StepResult:
     def failed(self) -> bool:
         """**真失败**：动作发了、世界没按后置条件变。
 
-        ⚠️ `unreachable`（task-52：四邻都站不过去 / 寻路到不了）**不是** `failed` —— 见
-        `UNREACHABLE_CODE` 的注释：那是客观世界约束，日级豁免另有上界与逐格留痕。
+        ⚠️ `unreachable`（task-52：四邻都站不过去 / 寻路到不了）与 `encircled`（task-68：
+        被不可清障物围住）**都不是** `failed` —— 那是客观世界约束，日级另有有界豁免与逐格留痕。
         """
         return self.code == "failed"
 
@@ -397,6 +419,11 @@ class StepResult:
     def unreachable(self) -> bool:
         """【task-52】没有落脚点 / 寻路到不了 ⇒ 当天不再白试、次日重试、单独计数（不算硬失败）。"""
         return self.code == UNREACHABLE_CODE
+
+    @property
+    def encircled(self) -> bool:
+        """【task-68】被不可清障物围住（2 层内无"可站+可清"突破口）⇒ 不算硬失败、不封格。"""
+        return self.code == ENCIRCLED_CODE
 
     @property
     def attempted(self) -> bool:
@@ -425,6 +452,12 @@ class StepResult:
             d["inconclusive"] = True
         if self.unreachable:
             d["unreachable"] = True
+        if self.encircled:
+            d["encircled"] = True
+        if self.stood:
+            d["stood"] = True
+        if self.opened:
+            d["clear_neighbor"] = self.opened
         if self.refused:
             d["refused"] = True
         if self.available:
@@ -766,6 +799,10 @@ class FarmWorker:
         # 绝不做'除工具以外都能卖'的黑名单"——黑名单一旦上游有 bug，种子/工具/任务物品都会被卖掉。
         # `reset_harvested()` 由长跑控制器在每天开始时调用。
         self.harvested: dict[str, int] = {}
+        # 【task-68】正在"为某一格开路"（清它的邻格）时为真：**只允许一层开路** ——
+        # 清邻格时若那个邻格自己也站不到，就直接判 `unreachable`，不再为它继续开路的开路
+        # （否则"清障→站不到→再清障"会指数级展开，跟有界性要求冲突）。
+        self._opening = False
 
     # ------------------------------------------------------------------ 观测
     def snap(self) -> dict[str, Any]:
@@ -920,6 +957,116 @@ class FarmWorker:
         return self.tiles_of(obs).get(tile)
 
     # ------------------------------------------------------------------ 走位
+    # ------------------------------------- 【task-68】先开路，再判"走不到"
+    @staticmethod
+    def _standable_near(obs: dict[str, Any], tile: tuple[int, int]) -> bool:
+        """这一格的四邻里有没有落脚点（观测说能站；**没观测到也算**——交给 Mod 去试）。"""
+        tiles = FarmWorker.tiles_of(obs)
+        for dx, dy in NEIGHBORS:
+            tv = tiles.get((tile[0] + dx, tile[1] + dy))
+            if tv is None or tv.get("standable"):
+                return True
+        return False
+
+    def _openable_neighbours(self, obs: dict[str, Any], tile: tuple[int, int],
+                             *, skip: set[tuple[int, int]] | None = None
+                             ) -> list[tuple[tuple[int, int], str]]:
+        """能当"开路"对象的邻格：**可清障类** + 它自己有落脚点（允许递归 1 层）。
+
+        树/树桩/大石一类（`FRONTIER_KINDS` 之外）不碰：砍树砸石要斧镐等级、还可能连带伤到别的层。
+        """
+        skip = skip or set()
+        tiles = FarmWorker.tiles_of(obs)
+        pt = self.player_tile(obs) or (0, 0)
+        out: list[tuple[tuple[int, int], str]] = []
+        for dx, dy in NEIGHBORS:
+            n = (tile[0] + dx, tile[1] + dy)
+            if n in skip:
+                continue
+            tv = tiles.get(n) or {}
+            kind = str(tv.get("kind") or "")
+            if kind not in FRONTIER_KINDS:
+                continue
+            if tv.get("crop"):
+                continue          # 邻格上有作物 ⇒ 清障会伤到它（`clear()` 也会拒）
+            if not self._standable_near(obs, n):
+                continue          # 邻格自己也够不着 ⇒ 清了也白清
+            out.append((n, kind))
+        out.sort(key=lambda it: (abs(it[0][0] - pt[0]) + abs(it[0][1] - pt[1]), it[0][1], it[0][0]))
+        return out
+
+    def open_way(self, tile: tuple[int, int]) -> tuple[str, list[dict[str, Any]], list[str]]:
+        """【task-68】判"走不到"之前**先开路**：清掉挡住 `tile` 落脚点的邻格，再重试站过去。
+
+        返回 `(code, cleared, notes)`：
+
+        * `"ok"` —— 现在站得到 `tile` 旁边了（清掉了邻格，或本来就站得到）；
+        * `"encircled"` —— 四邻里没有"可清 + 自己够得着"的突破口 ⇒ 归 `encircled`；
+        * `"exhausted"` —— 有可清的，清了 `MAX_OPEN_ACTIONS` 次还不通 ⇒ 归 `unreachable`（**有界**）。
+
+        `cleared` 是可落盘的逐条证据（`[{"neighbour":[x,y],"kind":…,"result":…}]`），进
+        `StepResult.after["clear_neighbor"]` ⇒ longrun 记 `clear_neighbor` journal。
+        开路动作本身也走 `clear()`（同一套先判后动/工具体检/回执口径），不做第二套。
+        """
+        cleared: list[dict[str, Any]] = []
+        notes: list[str] = []
+        skip: set[tuple[int, int]] = set()
+        for _i in range(MAX_OPEN_ACTIONS):
+            obs = self.snap()
+            if self.stand_next_to(tile):
+                return "ok", cleared, notes
+            cands = self._openable_neighbours(obs, tile, skip=skip)
+            if not cands:
+                # 没有"可清 + 够得着"的邻格：还要分两种 ——
+                #   * 四邻**连落脚点都没有**（树/桩/大石一类）⇒ `encircled`（被围住，不封格、不计不可达）；
+                #   * 四邻**有落脚点**（只是寻路/站位失败）⇒ `exhausted` ⇒ 按 `unreachable` 处理
+                #     （task-52 口径不变：这是"走不到"，不是"被围住"）。
+                if not self._standable_near(obs, tile):
+                    return "encircled", cleared, notes
+                return "exhausted", cleared, notes
+            n, kind = cands[0]
+            st = self.clear(n)
+            result = st.code or ("ok" if st.ok else "failed")
+            cleared.append({"neighbour": [int(n[0]), int(n[1])], "kind": kind, "result": result})
+            notes.append(f"为 {list(tile)} 开路：清邻格 {list(n)}（{kind}）⇒ {result}")
+            if not st.ok:
+                skip.add(n)       # 这一格自己也清不了 ⇒ 换一个，别在同一格死磕
+        if self.stand_next_to(tile):
+            return "ok", cleared, notes
+        return "exhausted", cleared, notes
+
+    def _ensure_reachable(self, tile: tuple[int, int], r: StepResult) -> bool:
+        """站到 `tile` 旁；站不到就**先开路**（task-68）。成功置 `r.stood=True` 并返回 True；
+        失败时把 `r` 写成 `unreachable`/`encircled` 并返回 False（调用方直接 `return r`）。
+        """
+        if self.stand_next_to(tile):
+            r.stood = True
+            return True
+        if self._opening:
+            # 只允许一层：正在为别人开路时，这一格站不到就直接算走不到（防递归爆炸）。
+            r.code, r.reason = UNREACHABLE_CODE, "四邻都站不过去（开路只做一层：这一格是开路的邻格）"
+            return False
+        self._opening = True
+        try:
+            code, cleared, notes = self.open_way(tile)
+        finally:
+            self._opening = False
+        if cleared:
+            # 单独存字段（不塞 `after`）：`after` 在动作循环里会被逐格观测覆盖，开路证据要留住。
+            r.opened = list(cleared)
+        if code == "ok":
+            r.stood = True
+            return True
+        if code == "encircled":
+            r.code = ENCIRCLED_CODE
+            r.reason = ("四邻被不可清障物占住（树/桩/大石一类；2 层内没有「可站+可清」的突破口）"
+                        "⇒ 归 encircled：不算「走不到」、不封格，次日/开路后可能变可达")
+            return False
+        r.code = UNREACHABLE_CODE
+        r.reason = (f"四邻都站不过去（已为开路清 {len(cleared)} 格邻格仍不通，"
+                    f"上限 {MAX_OPEN_ACTIONS} 次）")
+        return False
+
     def stand_next_to(self, tile: tuple[int, int], *, timeout_ms: int = 15000) -> bool:
         """站到目标格的四邻之一（先挑"观测说能站"的、再挑近的），返回是否到位。"""
         obs = self.snap()
@@ -1152,10 +1299,10 @@ class FarmWorker:
             r.proven_inert = True
             r.reason = f"判据说这格现在清不掉 ⇒ 不动手：{miss}；{_work_context(obs)}"
             return r
-        if not self.stand_next_to(tile):
-            # 【task-52】四邻都站不过去 ⇒ 专属 `unreachable`（**不是** `failed`）：
-            # 当天 `longrun` 会记进 `blocked` 不再白试、次日自动重试，日级另有有界豁免。
-            r.code, r.reason = UNREACHABLE_CODE, "四邻都站不过去（没有落脚点）"
+        # 【task-68】站不到旁边 ⇒ **先看四邻能不能开路**（清掉 weeds/stone/twig/grass 再重试）；
+        # 开路后仍站不到 ⇒ 被不可清障物围住记 `encircled`、清了上限还不通记 `unreachable`
+        # （task-52：不是 `failed`，当天不白试、次日重试，日级各有有界豁免）。
+        if not self._ensure_reachable(tile, r):
             return r
 
         tool = "scythe" if want_grass else "auto"
@@ -1299,8 +1446,7 @@ class FarmWorker:
             r.proven_inert = True
             r.reason = f"判据说这格现在清不掉 ⇒ 不动手：{miss}；{_work_context(obs)}"
             return r
-        if not self.stand_next_to(tile):
-            r.code, r.reason = UNREACHABLE_CODE, "四邻都站不过去（没有落脚点）"
+        if not self._ensure_reachable(tile, r):
             return r
 
         traces: list[str] = []
@@ -1423,10 +1569,10 @@ class FarmWorker:
             r.proven_inert = True
             r.reason = f"判据说这格现在锄不了 ⇒ 不动手：{why}"
             return r
-        if not self.stand_next_to(tile):
-            # 【task-52】四邻都站不过去 ⇒ 专属 `unreachable`（**不是** `failed`）：
-            # 当天 `longrun` 会记进 `blocked` 不再白试、次日自动重试，日级另有有界豁免。
-            r.code, r.reason = UNREACHABLE_CODE, "四邻都站不过去（没有落脚点）"
+        # 【task-68】站不到旁边 ⇒ **先看四邻能不能开路**（清掉 weeds/stone/twig/grass 再重试）；
+        # 开路后仍站不到 ⇒ 被不可清障物围住记 `encircled`、清了上限还不通记 `unreachable`
+        # （task-52：不是 `failed`，当天不白试、次日重试，日级各有有界豁免）。
+        if not self._ensure_reachable(tile, r):
             return r
 
         status = ""
@@ -1499,10 +1645,10 @@ class FarmWorker:
             r.code, r.reason = "no_seed", f"背包里没有种子 {sid}（现有：{items}）"
             return r
 
-        if not self.stand_next_to(tile):
-            # 【task-52】四邻都站不过去 ⇒ 专属 `unreachable`（**不是** `failed`）：
-            # 当天 `longrun` 会记进 `blocked` 不再白试、次日自动重试，日级另有有界豁免。
-            r.code, r.reason = UNREACHABLE_CODE, "四邻都站不过去（没有落脚点）"
+        # 【task-68】站不到旁边 ⇒ **先看四邻能不能开路**（清掉 weeds/stone/twig/grass 再重试）；
+        # 开路后仍站不到 ⇒ 被不可清障物围住记 `encircled`、清了上限还不通记 `unreachable`
+        # （task-52：不是 `failed`，当天不白试、次日重试，日级各有有界豁免）。
+        if not self._ensure_reachable(tile, r):
             return r
         status = ""
         try:
@@ -1587,10 +1733,10 @@ class FarmWorker:
             r.code, r.reason = "need_refill", "壶里没水了（先补水）"
             return r
 
-        if not self.stand_next_to(tile):
-            # 【task-52】四邻都站不过去 ⇒ 专属 `unreachable`（**不是** `failed`）：
-            # 当天 `longrun` 会记进 `blocked` 不再白试、次日自动重试，日级另有有界豁免。
-            r.code, r.reason = UNREACHABLE_CODE, "四邻都站不过去（没有落脚点）"
+        # 【task-68】站不到旁边 ⇒ **先看四邻能不能开路**（清掉 weeds/stone/twig/grass 再重试）；
+        # 开路后仍站不到 ⇒ 被不可清障物围住记 `encircled`、清了上限还不通记 `unreachable`
+        # （task-52：不是 `failed`，当天不白试、次日重试，日级各有有界豁免）。
+        if not self._ensure_reachable(tile, r):
             return r
         status = ""
         try:
@@ -1643,10 +1789,10 @@ class FarmWorker:
         if not (tv or {}).get("ripe"):
             r.code, r.reason = "skipped", "还没成熟"
             return r
-        if not self.stand_next_to(tile):
-            # 【task-52】四邻都站不过去 ⇒ 专属 `unreachable`（**不是** `failed`）：
-            # 当天 `longrun` 会记进 `blocked` 不再白试、次日自动重试，日级另有有界豁免。
-            r.code, r.reason = UNREACHABLE_CODE, "四邻都站不过去（没有落脚点）"
+        # 【task-68】站不到旁边 ⇒ **先看四邻能不能开路**（清掉 weeds/stone/twig/grass 再重试）；
+        # 开路后仍站不到 ⇒ 被不可清障物围住记 `encircled`、清了上限还不通记 `unreachable`
+        # （task-52：不是 `failed`，当天不白试、次日重试，日级各有有界豁免）。
+        if not self._ensure_reachable(tile, r):
             return r
         status = ""
         try:
