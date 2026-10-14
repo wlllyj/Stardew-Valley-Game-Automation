@@ -587,6 +587,55 @@ class TestVerifyRun3(unittest.TestCase):
         self.assertFalse(any("没写任何坐标" in p for p in s["problems"]), s["problems"])
         self.assertTrue(ok, s.get("problems"))
 
+    # —— task-68（encircled / frontier_clear / clear_neighbor）：只做自算 + info，不许误判成 problem。
+    def test_encircled_is_info_only_and_mismatch_is_info(self):
+        """被围住（encircled）单独成类：账本与 journal 对不上只记 info，绝不升 problem。"""
+        rows = green_rows()
+        rows.insert(2, {"event": "encircled", "t": 40.0, "_lineno": 80, "tile": [50, 20],
+                        "action": "clear_dead", "stage": "clear_dead"})
+        for i, r in enumerate(rows):
+            if r.get("event") == "day_end" and r["final"]["day"][2] == 10:
+                rows[i] = day_end(r["final"]["day"], r["day_after"], encircled=1,
+                                  encircled_tiles=[[50, 20], [51, 20]])
+        ok, s = self.check(rows)
+        self.assertTrue(
+            any("被围住（encircled" in i for i in s["infos"]), s["infos"]
+        )
+        self.assertFalse(
+            any("encircled" in p for p in s["problems"]), s["problems"]
+        )
+        self.assertFalse(
+            any("坐标对不上" in p for p in s["problems"]), s["problems"]
+        )
+
+    def test_frontier_clear_and_clear_neighbor_are_reported(self):
+        """run6 的"零动作收工"要让下一次一眼看得见：frontier_clear 尝试/成功数 + 开路格数。"""
+        rows = green_rows()
+        rows.insert(2, {"event": "frontier_clear", "t": 40.0, "_lineno": 80, "tile": [60, 20],
+                        "acted": False, "attempt": 1, "limit": 20})
+        rows.insert(3, {"event": "frontier_clear", "t": 41.0, "_lineno": 81, "tile": [61, 20],
+                        "acted": True, "attempt": 2, "limit": 20})
+        rows.insert(4, {"event": "clear_neighbor", "t": 42.0, "_lineno": 82, "stage": "clear_dead"})
+        ok, s = self.check(rows)
+        blob = " | ".join(s["infos"])
+        self.assertIn("frontier_clear 尝试 2 次", blob)
+        self.assertIn("真清掉 1 次", blob)
+        self.assertIn("为开路清掉邻格 1 次", blob)
+
+    def test_stuck_day_with_zero_actions_is_flagged_as_info(self):
+        """stuck + 当天 ok_steps=0（run6 形态）⇒ info 点名，且不因此改判（verified 由 day_end 决定）。"""
+        rows = green_rows()
+        for i, r in enumerate(rows):
+            if r.get("event") == "day_end" and r["final"]["day"][2] == 10:
+                rows[i] = day_end(r["final"]["day"], None, ok_steps=0, ended_by="stuck",
+                                  ended_reason="stuck:连续 3 轮世界没有任何变化",
+                                  verified=False, stages=[stage(ok=0, leftover=3)])
+        ok, s = self.check(rows)
+        self.assertTrue(
+            any("零动作收工" in i for i in s["infos"]), s["infos"]
+        )
+        self.assertFalse(ok)
+
 
 if __name__ == "__main__":
     unittest.main()

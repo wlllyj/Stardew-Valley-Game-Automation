@@ -224,6 +224,10 @@ def build_days(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "refused_bound",
                     "refused_exempt",
                     "attempted",
+                    # task-68：`encircled`（四邻连落脚点都没有 = 被树/桩/大石围住）**单独成类**，
+                    # 不进 `unreachable_exempt` 分子；`frontier_clear`/`clear_neighbor` 只走 journal。
+                    "encircled",
+                    "encircled_tiles",
                 )
             }
             fin_key = day_key({"final": cur["final"]}) if cur["final"] else "?"
@@ -299,6 +303,33 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         tile = r.get("tile")
         if isinstance(tile, (list, tuple)) and len(tile) >= 2:
             refused_tiles_by_day.setdefault(_cur_key2, set()).add((tile[0], tile[1]))
+
+    # task-68（Lead 2026-10-14）：dev-coder 把「被围住」从 run6 的 42 格里分出来，单独成类
+    # `encircled`（四邻连落脚点都没有 ⇒ 不封格、不计入 unreachable、不进任何豁免分子），
+    # 并新增 `frontier_clear`（所有指定目标都不可达时，至少清一格自己够得着的可清障格）
+    # 与 `clear_neighbor`（为开路清掉的邻格）。本工具只**自算 + 报信息项**：
+    #   ①账本 `day_end.encircled` vs journal 逐格自算（缺失 ≠ 通过）；
+    #   ②`frontier_clear` 的 acted 计数（run6 就是"19 秒零动作收工"，这一项让下次一眼看见）；
+    #   ③`clear_neighbor` 次数（开路证据）。
+    enc_by_day: dict[tuple[str, Any], set[tuple[Any, Any]]] = {}
+    frontier_by_day: dict[tuple[str, Any], list[bool]] = {}
+    neighbor_by_day: dict[tuple[str, Any], int] = {}
+    _cur_key3: tuple[str, Any] | None = None
+    for r in rows:
+        ev = r.get("event")
+        if ev == "day_start":
+            _cur_key3 = (day_key(r), r.get("_lineno"))
+            continue
+        if _cur_key3 is None or ev not in ("encircled", "frontier_clear", "clear_neighbor"):
+            continue
+        if ev == "encircled":
+            tile = r.get("tile")
+            if isinstance(tile, (list, tuple)) and len(tile) >= 2:
+                enc_by_day.setdefault(_cur_key3, set()).add((tile[0], tile[1]))
+        elif ev == "frontier_clear":
+            frontier_by_day.setdefault(_cur_key3, []).append(bool(r.get("acted")))
+        else:
+            neighbor_by_day[_cur_key3] = neighbor_by_day.get(_cur_key3, 0) + 1
 
     # 0. 时间轴自洽（deputy-lead `docs/_verify-run3-limits.md` 盲区 B2）：t 回退只记信息项。
     #    理由：t 是 longrun 自己的 time.time() 读数，系统时钟回拨（NTP）会让真长跑也"回退"，
@@ -578,6 +609,38 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
             )
         if d["verified"] is False:
             problems.append(f"[{name}] day_end verified=false")
+
+        # task-68 信息项（不改结论）：被围住 vs 真不可达要分得开；开路证据与"零动作收工"要看得见。
+        self_enc = enc_by_day.get(sess) or set()
+        field_enc = end_stats.get("encircled")
+        field_enc_tiles = {
+            tuple(t) for t in (end_stats.get("encircled_tiles") or [])
+            if isinstance(t, (list, tuple)) and len(t) >= 2
+        }
+        if isinstance(field_enc, (int, float)) or self_enc:
+            infos.append(
+                f"[{name}] 被围住（encircled，四邻无落脚点）账本="
+                f"{int(field_enc) if isinstance(field_enc, (int, float)) else '未写'}"
+                f"、journal 自算={len(self_enc)} 格"
+                f"（不进不可达豁免；单独留痕，供 task-68 口径复核）"
+            )
+        if len(self_enc) and field_enc_tiles and self_enc != field_enc_tiles:
+            infos.append(
+                f"[{name}] encircled 坐标对不上：账本 {len(field_enc_tiles)} 格 vs journal {len(self_enc)} 格"
+            )
+        fz = frontier_by_day.get(sess) or []
+        if fz:
+            infos.append(
+                f"[{name}] frontier_clear 尝试 {len(fz)} 次（真清掉 {sum(1 for x in fz if x)} 次）"
+            )
+        nb = neighbor_by_day.get(sess) or 0
+        if nb:
+            infos.append(f"[{name}] 为开路清掉邻格 {nb} 次（clear_neighbor）")
+        if d["ended_by"] == "stuck" and not int(end_stats.get("ok_steps") or 0):
+            infos.append(
+                f"[{name}] stuck 收尾且当天成功动作 0 步（run6 那种零动作收工的形态；"
+                "task-68 的 frontier_clear 应让下一次至少真的清掉一格）"
+            )
         if d["sleep_fail"]:
             problems.append(f"[{name}] 当天有 {d['sleep_fail']} 次 sleep 失败（回执 ok=false）")
 
