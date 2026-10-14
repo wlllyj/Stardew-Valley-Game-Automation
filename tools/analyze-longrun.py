@@ -11,7 +11,7 @@
   5. 环境挡路（env_fail，statuses=busy/渐黑/模态/没存档）、**自旋到上限**（env_spin_capped：
      同一格被挡住超过 MAX_ENV_ATTEMPTS=2 后改按"没结论"占配额）、**不可达**（unreachable /
      unreachable_stage / unreachable_summary，task-52：四邻都站不过去 / A* 算不出路；政策是
-     **不计当天硬失败**、当天记 blocked、**次日重试**，日级豁免有上界 max(5, 20%×attempted)）、
+     **不计当天硬失败**、当天记 blocked、**次日重试**，日级豁免有上界 max(5, 20%×bound_basis（= attempted − encircled；被围住的格不参与起界，task-78）)）、
      **被游戏拒绝**（tool_refused / refused_stage / refused_summary，task-63/task-66：
      till 的 tool_ineffective/precondition_failed；政策同上但**独立起界**，两套豁免不许互相掩护）
      与没拿到结论（inconclusive_fail，占配额 ⇒ "配额被吃掉 N 格"）
@@ -39,11 +39,11 @@
     真机 0.7.23 彩排就是这一档：回执写"已跨日 spring 17→18"、`final` 还是 17 日 ⇒ **缺失 ≠ 没做**）；
   * `t` 回退只记信息项；环境挡路**不算硬失败**。
   * 不可达豁免（task-52）：`checks.unreachable_within_bound=false`（当天不可达格数超过
-    max(5, 20%×attempted)）⇒ 0 类红（豁免越界＝可能把真失败当"走不到"洗白）；
+    max(5, 20%×bound_basis（= attempted − encircled；被围住的格不参与起界，task-78）)）⇒ 0 类红（豁免越界＝可能把真失败当"走不到"洗白）；
     `unreachable`/`unreachable_stage`/`unreachable_summary` 本身只作信息项、**不并进"该做没做"**
     （tools\verify-run3.py:415-448 同向：上界内是 info、越界才是 problem）。
   * 被游戏拒绝（task-63/task-66）：`checks.refused_within_bound=false`（当天被拒绝格数超过
-    max(5, 20%×attempted)）⇒ 0 类红 `manual:check:refused_within_bound`（可能把真失败混进
+    max(5, 20%×bound_basis（= attempted − encircled；被围住的格不参与起界，task-78）)）⇒ 0 类红 `manual:check:refused_within_bound`（可能把真失败混进
     "游戏拒绝"洗白）；`tool_refused`/`refused_stage`/`refused_summary` 本身只作信息项（5 环境挡路）、
     **不并进"该做没做"**，日级看 `refused_bound`/`refused_exempt`（与 `unreachable`
     **独立起界、各自扣减、不许互相掩护**）；`day_end.refused*` / `checks.refused_within_bound`
@@ -125,10 +125,10 @@ CHECK_MEANING = {
     # task-15：阶段后置条件未成立的显式汇总（缺失时本工具按 day_end.stages 自算兜底）
     "no_unmet_stages": "有目标阶段留下了没做完的格子（leftover>0）",
     # task-52：不可达豁免的**硬上界**（与 tools\verify-run3.py:445-448 同向：越界直接判 problem）
-    "unreachable_within_bound": "当天'unreachable'格数超过上界 max(5, 20%×attempted)"
+    "unreachable_within_bound": "当天'unreachable'格数超过上界 max(5, 20%×bound_basis（= attempted − encircled；被围住的格不参与起界，task-78）)"
                                 "—— 可能把真失败/不可动格混进不可达来洗白，必须人工核对 unreachable_tiles",
     # task-63/task-66：被**游戏拒绝**（till 的 tool_ineffective / precondition_failed）的硬上界
-    "refused_within_bound": "当天'被游戏拒绝'的格数超过上界 max(5, 20%×attempted)"
+    "refused_within_bound": "当天'被游戏拒绝'的格数超过上界 max(5, 20%×bound_basis（= attempted − encircled；被围住的格不参与起界，task-78）)"
                             "—— 可能把真失败混进'游戏拒绝'来洗白，必须人工核对 refused_tiles"
                             "（与 unreachable 是两套独立豁免，互不掩护）",
 }
@@ -172,7 +172,12 @@ FIELD_PROBES = [
     ("day_end.unreachable_tiles", "unreachable_tiles",
      "当天不可达格坐标 [[x,y],…]（task-52；越界时人工核对用）"),
     ("day_end.unreachable_bound", "unreachable_bound",
-     "不可达豁免上界 max(5, 20%×attempted)（task-52）"),
+     "不可达豁免上界 max(5, 20%×bound_basis（= attempted − encircled；被围住的格不参与起界，task-78）)（task-52）"),
+    # task-78 / task-80：上界**基数**（= 发起过动作且不是 encircled 的步数）。deputy 的伪造账本 V5
+    # 曾用 `encircled` 把旧分母 `attempted` 抬到 800 ⇒ 20% 上界 200 ⇒ 200 格真不可达被豁免、exit 0。
+    ("day_end.bound_basis", "bound_basis",
+     "豁免上界基数 = attempted − encircled（task-78；**被围住的格不参与起界**）；本工具按它自算上界，"
+     "绝不采信比自算更大的账本上界"),
     ("day_end.unreachable_exempt", "unreachable_exempt",
      "真正从 no_unmet_stages 里扣掉的不可达格数（task-52：先扣它再比 checks.no_unmet_stages）"),
     ("day_end.checks.unreachable_within_bound", "unreachable_within_bound",
@@ -185,7 +190,7 @@ FIELD_PROBES = [
     ("day_end.refused_tiles", "refused_tiles",
      "当天被拒绝的格坐标 [[x,y],…]（task-63；越界时人工核对用）"),
     ("day_end.refused_bound", "refused_bound",
-     "拒绝豁免上界 max(5, 20%×attempted)（task-63）"),
+     "拒绝豁免上界 max(5, 20%×bound_basis（= attempted − encircled；被围住的格不参与起界，task-78）)（task-63）"),
     ("day_end.refused_exempt", "refused_exempt",
      "真正从 no_unmet_stages 里扣掉的拒绝格数（task-63；与 unreachable_exempt 各自扣减）"),
     ("day_end.checks.refused_within_bound", "refused_within_bound",
@@ -318,13 +323,13 @@ EVENT_BUCKETS = {
     "llm_trace_failed": "llm_trace_failures",
     "no_day_progress": "no_day_progress",
     # --- task-52：不可达（四邻都站不过去 / A* 算不出路）三级留痕。政策：**不计当天硬失败**、
-    #     当天记 blocked、**次日重试**，日级豁免有上界 max(5, 20%×attempted)
+    #     当天记 blocked、**次日重试**，日级豁免有上界 max(5, 20%×bound_basis（= attempted − encircled；被围住的格不参与起界，task-78）)
     #     （tools\verify-run3.py:254-258/415-448 同口径：越界才是 problem）。
     "unreachable": "unreachable",
     "unreachable_stage": "unreachable_stages",
     "unreachable_summary": "unreachable_summaries",
     # --- task-63/task-66：`till` 被**游戏拒绝**（tool_ineffective/precondition_failed）的三级留痕。
-    #     政策：不算当天硬失败、当天封格、**次日重试**；日级豁免有上界 max(5, 20%×attempted)；
+    #     政策：不算当天硬失败、当天封格、**次日重试**；日级豁免有上界 max(5, 20%×bound_basis（= attempted − encircled；被围住的格不参与起界，task-78）)；
     #     与 task-52 的 unreachable 是**两套集合、两套界**，各自扣减、互不掩护
     #     （tools\verify-run3.py:518-521 同向：越界才是 problem）。
     "tool_refused": "tool_refused",
@@ -633,6 +638,64 @@ def no_work_with_dry(ev):
     return int(dry) if dry > 0 else None
 
 
+def bound_self_check(*, basis_field, attempted, encircled, ledger_bound):
+    """task-78 / task-80：上界基数自算 + "**绝不采信比自算更大的账本上界**"。
+
+    公式与 brain（`longrun.py:3082`）和 `tools\\verify-run3.py`（`2ce830b`）**同式**：
+    `bound = max(5, floor(0.2 × (attempted − encircled)))` —— 被围住的格既不是"走不到"也不是
+    "干了没成"，不该为豁免额度做贡献；deputy 的伪造账本 V5 正是拿 `encircled` 把旧分母 `attempted`
+    抬到 800 ⇒ 20% 上界 200 ⇒ 200 格真不可达被豁免、当天 exit 0。
+
+    返回 `(status, basis_self, bound_self, note)`：
+      `"ok"`（账本不更大）；`"inflated"`（账本基数或上界比自算大 ⇒ **判红**）；
+      `"no_bound"`（账本没写上界 ⇒ 只报自算，不判红也不当通过）；
+      `"undecidable"`（账本没写 `attempted` ⇒ 无法自算；缺失 ≠ 通过）。
+    """
+    if isinstance(attempted, bool) or not isinstance(attempted, (int, float)):
+        return "undecidable", None, None, "账本没写 attempted ⇒ 无法自算上界基数"
+    enc = encircled if (isinstance(encircled, (int, float))
+                        and not isinstance(encircled, bool)) else 0
+    basis_self = max(0, int(attempted) - int(enc))
+    bound_self = max(5, int(0.2 * basis_self))
+    if isinstance(basis_field, (int, float)) and not isinstance(basis_field, bool):
+        if int(basis_field) > int(attempted):
+            return ("inflated", basis_self, bound_self,
+                    f"账本 bound_basis={int(basis_field)} > attempted={int(attempted)}"
+                    "（抬高基数就能放宽 20% 上界 ⇒ 账目不可信）")
+        if int(basis_field) > basis_self:
+            return ("inflated", basis_self, bound_self,
+                    f"账本 bound_basis={int(basis_field)} > 自算={basis_self}"
+                    f"（attempted={int(attempted)} − encircled={int(enc)}）⇒ 基数被放宽")
+    if isinstance(ledger_bound, bool) or not isinstance(ledger_bound, (int, float)):
+        return "no_bound", basis_self, bound_self, "账本没写上界 ⇒ 只报自算"
+    if int(ledger_bound) > bound_self:
+        return ("inflated", basis_self, bound_self,
+                f"账本上界 {int(ledger_bound)} > 自算上界 {bound_self}"
+                f"（bound_basis 自算={basis_self} = attempted {int(attempted)} − encircled {int(enc)}）")
+    return "ok", basis_self, bound_self, ""
+
+
+def _bound_basis_text(env, side):
+    """task-80：把上界**基数**口径写进头部；run6 等旧账本没有 `bound_basis` ⇒ 只报缺失。
+
+    缺失**不许当 0、不许当通过**：`attempted` 也缺 ⇒ 【无法判定】；账本数比自算大 ⇒ 标红口径。
+    """
+    led = env.get("bound_basis_ledger")
+    status = env.get(f"{side}_bound_status")
+    basis_self = env.get(f"{side}_basis_self")
+    bound_self = env.get(f"{side}_bound_self")
+    if led is None:
+        if status == "undecidable":
+            return ("；bound_basis=<缺失>（无法自算：账本没写 attempted/bound_basis"
+                    " ⇒ 【无法判定】，缺失 ≠ 通过）")
+        return (f"；bound_basis=<缺失>（自算基数 {basis_self}、上界 {bound_self}，缺失 ≠ 通过）")
+    txt = f"；bound_basis={led}（自算基数 {basis_self}、上界 {bound_self}）"
+    if status == "inflated":
+        txt += (f"  ⚠ {env.get(f'{side}_bound_note') or '账本上界比自算大'}"
+                " ⇒ 0 类红（missed:bound_inflated）")
+    return txt
+
+
 def cat_missed(sessions, top):
     out = []
     for sess in sessions:
@@ -835,6 +898,32 @@ def cat_missed(sessions, top):
                     subject="missed:no_work_with_dry",
                 )
             )
+        # 1h: task-78/task-80 —— 上界自检：**绝不采信比自算更大的账本上界**（deputy 的伪造账本 V5
+        #     用 `encircled` 把旧分母 `attempted` 抬到 800 ⇒ 20% 上界 200 ⇒ 200 格真不可达被豁免、
+        #     exit 0）。verify-run3.py 同判 problem（`2ce830b`）；这里判红并点名两侧数字。
+        for lineno, ev in sess["day_ends"]:
+            _ev = as_dict(ev)
+            for _side, _cnt_key, _bound_key in (("不可达", "unreachable", "unreachable_bound"),
+                                                ("被拒绝", "refused", "refused_bound")):
+                status, bself, bound_self, note = bound_self_check(
+                    basis_field=_ev.get("bound_basis"),
+                    attempted=_ev.get("attempted"),
+                    encircled=_ev.get("encircled"),
+                    ledger_bound=_ev.get(_bound_key),
+                )
+                if status != "inflated":
+                    continue
+                out.append(
+                    finding(
+                        lineno, "day_end",
+                        f"上界自检（{_side}）账目不可信：{note} ⇒ 绝不采信账本上界，"
+                        f"以自算 bound_basis={bself}、上界={bound_self} 为准",
+                        hint="task-78：上界基数 = attempted − encircled（**被围住的格不参与起界**）；"
+                             "基数/上界比自算大 ⇒ 可能把真失败洗成豁免（deputy V5 打法）；"
+                             "verify-run3.py 同判 problem",
+                        subject="missed:bound_inflated",
+                    )
+                )
     return out[:top] if top else out
 
 
@@ -1320,7 +1409,7 @@ def cat_environment(sessions, top):
                 )
             )
         # task-52：不可达（四邻都站不过去 / A* 算不出路）＝ 环境挡路的第三种形态。
-        # 政策：**不计当天硬失败**、当天记 blocked、**次日重试**；日级豁免有上界 max(5, 20%×attempted)。
+        # 政策：**不计当天硬失败**、当天记 blocked、**次日重试**；日级豁免有上界 max(5, 20%×bound_basis（= attempted − encircled；被围住的格不参与起界，task-78）)。
         # 本工具只把它数成信息项（不并进"该做没做"）：是否真做成由 checks.no_unmet_stages
         # **先扣 unreachable_exempt** 后说话（tools\verify-run3.py:254-258/415-448 同口径；越界才是 problem）。
         unreach_events = sess["unreachable"]
@@ -1343,7 +1432,7 @@ def cat_environment(sessions, top):
                     f"bound={summary.get('bound')}、attempted={summary.get('attempted')}、"
                     f"raw_unmet={summary.get('raw_unmet')}、exempted={summary.get('exempted')}、"
                     f"unmet={summary.get('unmet')}",
-                    hint="task-52：当天记 blocked、次日重试；豁免上界 max(5, 20%×attempted)，"
+                    hint="task-52：当天记 blocked、次日重试；豁免上界 max(5, 20%×bound_basis（= attempted − encircled；被围住的格不参与起界，task-78）)，"
                          "越界由 checks.unreachable_within_bound=false 判红（本工具 0 类）",
                     subject="environment:unreachable",
                 )
@@ -1362,7 +1451,7 @@ def cat_environment(sessions, top):
             )
         # task-63/task-66：被**游戏拒绝**（till 的 tool_ineffective / precondition_failed）＝ 环境挡路的
         # 第四种形态：不是"格子走不到"（不可达），而是世界的前置事实（不可锄的地 / 工具等级不够）拒绝执行。
-        # 政策与 task-52 同形但**独立起界**（refused_bound = max(5, 20%×attempted)）：两套豁免各自扣减、
+        # 政策与 task-52 同形但**独立起界**（refused_bound = max(5, 20%×bound_basis（= attempted − encircled；被围住的格不参与起界，task-78）)）：两套豁免各自扣减、
         # 互不掩护；本工具只作信息项（不并进"该做没做"），是否真做成由 checks.no_unmet_stages
         # **先扣 refused_exempt** 后说话（tools\verify-run3.py:518-521：越界才是 problem）。
         refused_events = sess["tool_refused"]
@@ -2226,7 +2315,7 @@ def build_report(rows, path, args, bad_lines):
     env_spin_lines = []
     env_spin_tiles = set()
     # task-52：不可达（四邻都站不过去 / A* 算不出路）——不计当天硬失败、当天记 blocked、次日重试；
-    # 日级豁免有上界 max(5, 20%×attempted)，越界由 checks.unreachable_within_bound 说话。
+    # 日级豁免有上界 max(5, 20%×bound_basis（= attempted − encircled；被围住的格不参与起界，task-78）)，越界由 checks.unreachable_within_bound 说话。
     unreach_lines = []
     unreach_tiles = set()
     unreach_stage_lines = []
@@ -2358,6 +2447,19 @@ def build_report(rows, path, args, bad_lines):
             "exempted": _last_day_end.get("unreachable_exempt"),
         }
     _u_checks = as_dict(_last_day_end.get("checks"))
+    # task-78/task-80：上界自检（账本 bound_basis / 上界 vs 自算 attempted − encircled）。
+    # day_end 没写 attempted/bound 时退回同一天的 summary 事件（run6 就是 day_end 缺 attempted、
+    # summary 里有 attempted=42 的形状）；两边都没有才算【无法判定】。
+    _att = _last_day_end.get("attempted")
+    if _att is None:
+        _att = _u_sum.get("attempted")
+    _enc = _last_day_end.get("encircled")
+    if _enc is None:
+        _enc = _u_sum.get("encircled")
+    _bounds = {
+        "u": _last_day_end.get("unreachable_bound")
+        if _last_day_end.get("unreachable_bound") is not None else _u_sum.get("bound"),
+    }
     # task-63/task-66：被"游戏拒绝"的日级豁免汇总（优先 `refused_summary` 事件，缺失时退回最后一天
     # day_end 的字段）——与 unreachable 各算各的，两套豁免不互相掩护。
     refused_summaries = [ev for s in all_sessions for _, ev in s["refused_summaries"]]
@@ -2369,6 +2471,14 @@ def build_report(rows, path, args, bad_lines):
             "bound": _last_day_end.get("refused_bound"),
             "exempted": _last_day_end.get("refused_exempt"),
         }
+    _bounds["r"] = (_last_day_end.get("refused_bound")
+                    if _last_day_end.get("refused_bound") is not None else _r_sum.get("bound"))
+    _b_chk_u = bound_self_check(basis_field=_last_day_end.get("bound_basis"),
+                                attempted=_att, encircled=_enc,
+                                ledger_bound=_bounds["u"])
+    _b_chk_r = bound_self_check(basis_field=_last_day_end.get("bound_basis"),
+                                attempted=_att, encircled=_enc,
+                                ledger_bound=_bounds["r"])
     # task-68/task-76：可达性/开路的日级汇总（优先 `encircled_summary`，缺失退回最后一天 day_end）
     enc_summaries = [ev for s in all_sessions for _, ev in s["encircled_summaries"]]
     if enc_summaries:
@@ -2402,7 +2512,7 @@ def build_report(rows, path, args, bad_lines):
         "env_spin_tiles": sorted([list(t) for t in env_spin_tiles]),
         "env_blocked_total": env_blocked_total,
         # task-52：不可达（四邻都站不过去 / A* 算不出路）＝ 环境挡路的第三种形态。
-        # 政策：**不计当天硬失败**、当天记 blocked、**次日重试**；日级豁免上界 max(5, 20%×attempted)。
+        # 政策：**不计当天硬失败**、当天记 blocked、**次日重试**；日级豁免上界 max(5, 20%×bound_basis（= attempted − encircled；被围住的格不参与起界，task-78）)。
         # 本工具只作信息项；越界由 checks.unreachable_within_bound=false 进 0 类红
         # （tools\verify-run3.py:415-448 把它判 problem ⇒ 两边同向）。
         "unreachable_events": sum(len(s["unreachable"]) for s in all_sessions),
@@ -2421,8 +2531,16 @@ def build_report(rows, path, args, bad_lines):
         "unreachable_raw_unmet": _u_sum.get("raw_unmet"),
         "unreachable_unmet": _u_sum.get("unmet"),
         "unreachable_within_bound": _u_checks.get("unreachable_within_bound"),
+        # task-78/task-80：上界**基数**（attempted − encircled）与自算上界；账本更大 ⇒ status=inflated
+        "bound_basis": (_u_sum.get("bound_basis") if _u_sum.get("bound_basis") is not None
+                        else _last_day_end.get("bound_basis")),
+        "bound_basis_ledger": _last_day_end.get("bound_basis"),
+        "unreachable_basis_self": _b_chk_u[1],
+        "unreachable_bound_self": _b_chk_u[2],
+        "unreachable_bound_status": _b_chk_u[0],
+        "unreachable_bound_note": _b_chk_u[3],
         # task-63/task-66：被游戏拒绝（till 的 tool_ineffective/precondition_failed）＝ 环境挡路第四形态。
-        # 政策：不计当天硬失败、当天封格、次日重试；日级豁免上界 max(5, 20%×attempted)，
+        # 政策：不计当天硬失败、当天封格、次日重试；日级豁免上界 max(5, 20%×bound_basis（= attempted − encircled；被围住的格不参与起界，task-78）)，
         # 与 unreachable **独立起界**（各自的 bound/exempt）；越界由 checks.refused_within_bound=false
         # 进 0 类红（tools\verify-run3.py:518-521 把它判 problem ⇒ 两边同向）。
         "refused_events": sum(len(s["tool_refused"]) for s in all_sessions),
@@ -2440,6 +2558,10 @@ def build_report(rows, path, args, bad_lines):
         "refused_raw_unmet": _r_sum.get("raw_unmet"),
         "refused_unmet": _r_sum.get("unmet"),
         "refused_within_bound": _u_checks.get("refused_within_bound"),
+        "refused_basis_self": _b_chk_r[1],
+        "refused_bound_self": _b_chk_r[2],
+        "refused_bound_status": _b_chk_r[0],
+        "refused_bound_note": _b_chk_r[3],
         "statuses": sorted(statuses),
     }
     # task-68/task-76：可达性/开路（**无硬闸门** ⇒ 不判红；与 unreachable 分开计数）
@@ -2606,7 +2728,7 @@ MAPPING_TEXT = [
      "顶部统计：作业区软上限触顶 / 收尾作业区（信息项，不改 VERIFIED；task-32）"),
     ("unreachable / unreachable_stage / unreachable_summary（task-52）",
      "5 环境挡路（信息项：**不计当天硬失败**、当天记 blocked、**次日重试**；日级豁免有上界 "
-     "max(5, 20%×attempted)，`checks.unreachable_within_bound=false` ⇒ 0 必须人工介入"
+     "max(5, 20%×bound_basis（= attempted − encircled；被围住的格不参与起界，task-78）)，`checks.unreachable_within_bound=false` ⇒ 0 必须人工介入"
      "（豁免越界＝可能把真失败当不可达洗白，verify-run3.py:415-448 判 problem ⇒ 两边同向））"),
     ("tool_refused / refused_stage / refused_summary（task-63/task-66）",
      "5 环境挡路（信息项：**不计当天硬失败**、当天封格、**次日重试**；与 unreachable 是两套独立豁免"
@@ -2742,6 +2864,7 @@ def render_text(report, top):
             + (f"（tiles={env.get('unreachable_tiles')[:8]}）" if env.get("unreachable_tiles") else "")
             + f"；日级 count={env.get('unreachable_count')}、bound={env.get('unreachable_bound')}、"
               f"attempted={env.get('unreachable_attempted')}、exempt={env.get('unreachable_exempt')}"
+            + (_bound_basis_text(env, "unreachable"))
             + ("  ⚠ checks.unreachable_within_bound=false ⇒ 0 类红"
                if env.get("unreachable_within_bound") is False else ""))
     # task-63/task-66：被游戏拒绝（不计当天硬失败、当天封格、次日重试；日级豁免有上界，越界进 0 类红）
@@ -2750,6 +2873,7 @@ def render_text(report, top):
             + (f"（tiles={env.get('refused_tiles')[:8]}）" if env.get("refused_tiles") else "")
             + f"；日级 count={env.get('refused_count')}、bound={env.get('refused_bound')}、"
               f"attempted={env.get('refused_attempted')}、exempt={env.get('refused_exempt')}"
+            + _bound_basis_text(env, "refused")
             + ("  ⚠ checks.refused_within_bound=false ⇒ 0 类红"
                if env.get("refused_within_bound") is False else ""))
     # task-68/task-76：可达性/开路（**无硬闸门 ⇒ 不判红**；与不可达分开计数）

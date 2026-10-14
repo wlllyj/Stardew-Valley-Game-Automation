@@ -1723,5 +1723,75 @@ class TestReachabilityAndOpenPath(unittest.TestCase):
         self.assertNotIn("stuck_flush", rep["red"]["subjects"])
 
 
+class TestBoundBasisAccounting(unittest.TestCase):
+    """task-80：上界基数 = `bound_basis = attempted − encircled`，**绝不采信比自算更大的账本上界**。
+
+    背景：deputy 的伪造账本 V5 把 `encircled` 步计进 `attempted` ⇒ 20% 上界被抬到 200
+    ⇒ 200 格真不可达被豁免、exit 0。与 `tools/verify-run3.py`（`2ce830b`）同向。
+    """
+
+    def _report(self, name, **kw):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, integrity_ledger(**kw)), days=1)
+
+    def test_deputy_v5_inflated_basis_is_red(self):
+        """V5 打法：encircled 撑大 attempted，账本 bound_basis 比自算大 ⇒ 判红、绝不采信。"""
+        rep = self._report("v5.jsonl", day_end_overrides={
+            "attempted": 1000, "encircled": 800, "bound_basis": 800, "unreachable_bound": 160,
+            "unreachable": 160, "unreachable_exempt": 160, "unreachable_tiles": [[1, 1]],
+        })
+        self.assertIn("missed:bound_inflated", subjects(rep["categories"]["missed"]))
+        env = rep["env_inconclusive"]
+        self.assertEqual(env["unreachable_bound_status"], "inflated")
+        self.assertEqual(env["bound_basis_ledger"], 800)
+        self.assertEqual(env["unreachable_basis_self"], 200)  # 1000 − 800
+        self.assertEqual(env["unreachable_bound_self"], 40)   # max(5, 20%×200)
+        text = mod.render_text(rep, 50)
+        self.assertIn("missed:bound_inflated", text)
+
+    def test_ledger_bound_bigger_than_self_bound_is_red(self):
+        """账本没写 bound_basis，但上界比自算大 ⇒ 同样判红。"""
+        rep = self._report("big-bound.jsonl", day_end_overrides={
+            "attempted": 42, "encircled": 2, "unreachable_bound": 20,
+            "unreachable": 20, "unreachable_exempt": 8, "unreachable_tiles": [[1, 1]],
+        })
+        self.assertIn("missed:bound_inflated", subjects(rep["categories"]["missed"]))
+        self.assertEqual(rep["env_inconclusive"]["unreachable_bound_self"], 8)
+
+    def test_same_basis_is_clean_and_rendered(self):
+        rep = self._report("ok.jsonl",
+                           extra_events=[{"event": "unreachable", "t": 5.0, "tile": [1, 1],
+                                          "action": "clear", "stage": "clear_area",
+                                          "zone": "field_ne", "reason": "四邻都站不过去"}],
+                           day_end_overrides={
+            "attempted": 42, "encircled": 2, "bound_basis": 40, "unreachable_bound": 8,
+            "unreachable": 3, "unreachable_exempt": 3, "unreachable_tiles": [[1, 1]],
+            "checks": {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                       "crops_watered": True, "day_justified": True,
+                       "unreachable_within_bound": True, "no_unmet_stages": True},
+        })
+        self.assertNotIn("missed:bound_inflated", subjects(rep["categories"]["missed"]))
+        self.assertEqual(rep["env_inconclusive"]["unreachable_bound_status"], "ok")
+        self.assertIn("bound_basis=40（自算基数 40、上界 8）", mod.render_text(rep, 50))
+
+    def test_old_ledger_without_basis_is_undecidable_not_red(self):
+        """run6 等旧账本没有 bound_basis ⇒ 只记【无法判定】，不许当 0、不许当通过。"""
+        rep = self._report("old.jsonl")
+        self.assertNotIn("missed:bound_inflated", subjects(rep["categories"]["missed"]))
+        self.assertIsNone(rep["env_inconclusive"]["bound_basis_ledger"])
+        undec = " ".join(str(u) for u in rep["undecidable"])
+        self.assertIn("day_end.bound_basis", undec)
+
+    def test_refused_side_uses_the_same_basis(self):
+        """refused 与 unreachable 共用同一基数；账本 refused_bound 比自算大 ⇒ 也判红。"""
+        rep = self._report("refused.jsonl", day_end_overrides={
+            "attempted": 42, "encircled": 0, "refused_bound": 30,
+            "refused": 30, "refused_exempt": 8, "refused_tiles": [[2, 2]],
+        })
+        self.assertIn("missed:bound_inflated", subjects(rep["categories"]["missed"]))
+        self.assertEqual(rep["env_inconclusive"]["refused_bound_status"], "inflated")
+
+
 if __name__ == "__main__":
     unittest.main()

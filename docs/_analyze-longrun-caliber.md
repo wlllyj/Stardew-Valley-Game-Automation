@@ -288,6 +288,46 @@ rg -n '"stuck_flush"' logs\longrun-*.jsonl
 rg -n '"stuck_flush_skipped"' logs\longrun-*.jsonl   # reason=eventUp / activeMenu=存档类 / 次数达 limit
 ```
 
+## 3.11 上界基数 `bound_basis`（task-78 / task-80，dev 在制 + Lead `2ce830b`）
+
+### 为什么改
+旧口径把日级豁免上界写成 `max(5, 20% × attempted)`，而 `attempted` **含被围住的格**。
+deputy 的伪造账本 **V5** 就是这么打穿的：把 `encircled` 步计进 `attempted` ⇒ 分母被抬到 1000
+⇒ 20% 上界 = 200 ⇒ **200 格真不可达被"豁免"、当天 exit 0**（`docs/_verify-run3-limits.md` v5）。
+
+**Lead 裁定**：上界基数 = `bound_basis = attempted − encircled`（被围住的格既不是"走不到"也不是
+"干了没成"，不该为豁免额度做贡献）。脑侧 dev-coder 在 **task-78** 落地该字段（`brain/agentfarm/longrun.py`：
+stage 级 `bound_basis` = `attempted and not encircled` 的步数求和，日级 `rep.bound_basis`；
+`unreachable_bound`/`refused_bound` 都改用它），工具侧 Lead 镜像提交 **`2ce830b`**（`tools/verify-run3.py`）。
+
+### 本工具口径（与 `verify-run3.py` 同式）
+- `FIELD_PROBES` 收 `day_end.bound_basis`；报告/文档里所有"上界 = 20% × attempted"字样改为
+  **`20% × bound_basis`**（含本文件与 `MAPPING_TEXT`）。
+- **自算 + 绝不采信更大的账本上界**：`bound_self_check()` 用
+  `basis_self = max(0, attempted − encircled)`、`bound_self = max(5, floor(0.2 × basis_self))`；
+  - 账本 `bound_basis > attempted` 或 `> basis_self` ⇒ **判红** `missed:bound_inflated`；
+  - 账本 `unreachable_bound`/`refused_bound > bound_self` ⇒ 同样判红；
+  - 账本没写上界 ⇒ 只报自算（不判红、不当通过）；连 `attempted` 都没有 ⇒ status=`undecidable`。
+- `day_end` 缺 `attempted`/上界时退回同一天的 `unreachable_summary`/`refused_summary` 事件
+  （run6 就是 `day_end` 缺 `attempted`、summary 里 `attempted=42` 的形状），两边都没有才算【无法判定】。
+- 头部两行（`不可达:` / `游戏拒绝:`）追加 `；bound_basis=<ledger>（自算基数 a、上界 b）`；
+  旧账本没有该字段时写 `bound_basis=<缺失>（自算基数 …，缺失 ≠ 通过）`，**不许当 0、不许当通过**。
+- 两套豁免（unreachable / refused）**共用同一基数**，但各自的上界与 exempt 独立，不许互相掩护。
+
+### 单测与回归
+`tests/test_analyze_longrun.py::TestBoundBasisAccounting` 5 条：V5 抬高基数 ⇒ 红（自算基数 200、
+上界 40 出现在报告里）/ 账本上界更大 ⇒ 红 / 同基数 ⇒ 干净且头部可读 / 旧账本缺字段 ⇒ 只进【无法判定】
+不判红 / refused 侧同一基数。
+6 本既有账本 rc 与判决**不变**：green 0(red=0)、run2 1(19)、run3 1(17)、run5 1(62)、run6 1(14)、
+vacuum 1(3)（run6 ⇒ `bound_basis=<缺失>（自算基数 42、上界 8，缺失 ≠ 通过）`）。
+
+### grep 配方
+```
+rg -n '"bound_basis"' logs\longrun-*.jsonl
+rg -n 'bound_basis' docs\_verify-run3-limits.md
+python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run6.jsonl | rg 'bound_basis|上界自检'
+```
+
 ## 4. 复核命令
 
 ```
@@ -295,5 +335,6 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run5.jsonl   # �
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run6.jsonl   # run6：守卫死锁 + 同日重试
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run6.jsonl   # 判决权威（rc=1 needs_review）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
-python -m unittest discover -s tests        # 当前 507 OK（task-76：含 task-68 可达性/开路 + task-73 stuck_flush 在制）
+python -m unittest tests.test_analyze_longrun  # 当前 95 OK（task-80）
+python -m unittest discover -s tests           # 当前 522，其中 2 条红属 dev 在制（tests/test_longrun.py::TestTask78HonestEncircledWording）
 ```
