@@ -1792,6 +1792,17 @@ class TestBoundBasisAccounting(unittest.TestCase):
         self.assertIn("missed:bound_inflated", subjects(rep["categories"]["missed"]))
         self.assertEqual(rep["env_inconclusive"]["refused_bound_status"], "inflated")
 
+    def test_caliber_text_never_says_20pct_attempted(self):
+        """口径文字必须改成 bound_basis：报告里不许再出现"20% × attempted"。”"""
+        rep = self._report("text.jsonl", day_end_overrides={
+            "attempted": 42, "encircled": 2, "bound_basis": 40, "unreachable_bound": 8,
+        })
+        text = mod.render_text(rep, 50)
+        self.assertNotIn("20%×attempted", text)
+        self.assertNotIn("20% × attempted", text)
+        self.assertIn("20%×bound_basis", text)
+        self.assertIn("被围住的格不参与起界", text)
+
 
 if __name__ == "__main__":
     unittest.main()
