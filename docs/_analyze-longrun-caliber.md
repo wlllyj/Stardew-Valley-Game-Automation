@@ -131,7 +131,7 @@ run2 的 `decisions_llm=7` 里有 1 条是兜底：`logs\longrun-3day-llm-run2.j
   （`environment:refused` 逐日聚合 + `environment:refused_stage` 逐阶段），**不计当天硬失败、
   不并进"该做没做"**；政策是当天封格、**次日重试**。
 - **两套豁免互不掩护**：`unreachable`（task-52）与 `refused`（task-63）各有自己的
-  `bound = max(5, 20%×attempted)` 与 `exempt`，各自从 `no_unmet_stages` 里扣减；
+  `bound = max(5, 20%×bound_basis（= attempted − encircled；见 §3.11）)` 与 `exempt`，各自从 `no_unmet_stages` 里扣减；
   本工具的账目差额口径仍与 `tools\verify-run3.py:388-404` 逐字一致（**只认
   `env_block`+`inconclusive`**）⇒ 拿 `refused` 去把 `stages[].failed` 差额洗平会被判
   `missed:stage_account`（有单测证伪）。
