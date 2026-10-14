@@ -48,6 +48,14 @@
     **不并进"该做没做"**，日级看 `refused_bound`/`refused_exempt`（与 `unreachable`
     **独立起界、各自扣减、不许互相掩护**）；`day_end.refused*` / `checks.refused_within_bound`
     **缺失 ⇒ 只进【无法判定】**（缺失 ≠ 通过；tools\verify-run3.py:518-521 同向）。
+  * 可达性/开路（task-68/task-76，verify-run3.py:307-332/613-643 同向）：`encircled` /
+    `encircled_stage` / `encircled_summary`（被树/桩/大石围住 ⇒ 四邻没有「可站+可清」的突破口）
+    与 `frontier_clear`（目标都够不着时至少清一格可达的可清障格；**`acted=false` = 想清没清掉**）、
+    `clear_neighbor`（开路清掉的邻格）**没有硬闸门**（不存在 `encircled_within_bound`）⇒ 一律
+    **只作 5 环境挡路·可达性/开路信息项、不判红、不并进"该做没做"**；与 `unreachable`（物理走不到）
+    **分开计数**、不进任何豁免分子、不封格；`day_end.encircled*` **缺失 ⇒ 只进【无法判定】**。
+    额外把 `stuck` + `Σ stage.ok == 0` 的"零动作收工"单列（头部 ⚠ + 建议 0j），让 run6 那种
+    "19 秒零动作收工"下次一眼可见。
   * 事件映射不许漂移（Lead m02395）：brain 里 `_journal("<name>"` 的**每个**事件名都要在
     `EVENT_BUCKETS` 里有桶（结构性事件 `day_start`/`day_end`/`finish` 除外，见 `STRUCTURAL_EVENTS`）；
     账本里出现没桶的事件 ⇒ 报告头部逐条点名（名字×次数+行号）+ 建议 0a，**绝不静默丢弃**。
@@ -190,6 +198,26 @@ FIELD_PROBES = [
      "有种子但按 keep_factor 买不起（task-67；看 money/seed_price/offers）"),
     ("event:seed_unavailable_today", "seed_unavailable_today",
      "今天已确认买不到 ⇒ 不再把「该去买种子」当活（task-67；防 run6 那种 stuck 死锁的解药留痕）"),
+    # task-68/task-76：可达性/开路（无硬闸门 ⇒ 缺失只记【无法判定】、绝不判红也不当通过）
+    ("event:encircled_summary", "encircled_summary",
+     "日级'被围住'汇总（task-68：count/attempted/engaged；不进不可达豁免、不封格）"),
+    ("day_end.encircled", "encircled",
+     "当天被不可清障物围住的格数（task-68；与 unreachable 分开计数）"),
+    ("day_end.encircled_tiles", "encircled_tiles",
+     "当天被围住的格坐标 [[x,y],…]（task-68；开路/次日重试用）"),
+    ("event:frontier_clear", "frontier_clear",
+     "开路尝试（task-68：tile/acted/attempt/limit/why；**acted=false = 想清但没清掉**）"),
+    ("event:clear_neighbor", "clear_neighbor",
+     "为开路清掉的邻格汇总（task-68：opens/targets；逐格在 StepResult.after）"),
+    # task-73（dev 在制 working tree）：stuck 日**有界翻篇**——绕过 sleep_guard 睡过去让整轮继续，
+    # 而不是 19 秒终止。**绝不放宽验收**（本日仍 ended_by=stuck / day_justified=False / 不 VERIFIED）
+    # ⇒ 只作信息项：翻篇成功、被跳过（eventUp/存档模态/次数上限）、翻篇后重观测失败。
+    ("event:stuck_flush", "stuck_flush",
+     "stuck 日有界翻篇（task-73：ok/count/limit/day_after/detail；不判红、不洗白 stuck）"),
+    ("event:stuck_flush_skipped", "stuck_flush_skipped",
+     "翻篇被跳过（task-73：reason=eventUp / 存档类模态 / 次数达 limit）"),
+    ("event:stuck_flush_resnap_failed", "stuck_flush_resnap_failed",
+     "翻篇后重观测失败（task-73：error；只作诊断）"),
 ]
 OUTCOME_RE = re.compile(
     r"目标\s*(\d+)\s*步：做成\s*(\d+)、跳过\s*(\d+)、失败\s*(\d+)"
@@ -317,6 +345,23 @@ EVENT_BUCKETS = {
     "no_seed_for_sale": "no_seed_for_sales",
     "cannot_afford": "cannot_affords",
     "seed_unavailable_today": "seed_unavailable_today",
+    # --- task-68/task-76：**可达性/开路**新类（与 task-52 的 `unreachable` **分开计数**：
+    #     不可达 = 物理上走不到；被围住 = 现在开不了路（四邻没有"可站+可清"的突破口）。
+    #     这一整类**没有硬闸门**（不存在 `encircled_within_bound`）⇒ 一律不判红、不进任何豁免分子，
+    #     只作信息项 + 让 run6 那种"19 秒零动作收工"下次一眼可见：
+    #     `encircled`/`encircled_stage`/`encircled_summary` = 三级留痕（逐格/阶段/日级）；
+    #     `frontier_clear` = "目标都够不着时至少清一格可达的可清障格"的尝试，`acted=false` = 想清没清掉；
+    #     `clear_neighbor` = 为开路清掉的邻格（阶段级，逐格在 `StepResult.after["clear_neighbor"]`）。
+    "encircled": "encircled",
+    "encircled_stage": "encircled_stages",
+    "encircled_summary": "encircled_summaries",
+    "frontier_clear": "frontier_clears",
+    "clear_neighbor": "clear_neighbors",
+    # task-73（dev 在制 working tree）：stuck 日**有界翻篇** —— 本日仍如实 stuck / 不 VERIFIED，
+    #     只是"睡过去让整轮继续"，所以本工具只作信息项（成功/跳过/重观测失败），一律不判红。
+    "stuck_flush": "stuck_flushes",
+    "stuck_flush_skipped": "stuck_flush_skips",
+    "stuck_flush_resnap_failed": "stuck_flush_resnap_failures",
 }
 
 #: 结构性事件：由报告的其他字段单独统计（day_start/day_end 切会话与验收、finish 自述），
@@ -344,6 +389,11 @@ NEW_EVENT_BUCKETS = (
     "tool_refused", "refused_stages", "refused_summaries",
     # task-70：种子经济（买不到 / 买不起 / 当天失效留痕）
     "no_seed_for_sales", "cannot_affords", "seed_unavailable_today",
+    # task-76：可达性/开路（被围住三级留痕 + 开路尝试/结果 + 清邻格；无硬闸门、不判红）
+    "encircled", "encircled_stages", "encircled_summaries",
+    "frontier_clears", "clear_neighbors",
+    # task-73（dev 在制）：stuck 日有界翻篇（不经 sleep_guard，但绝不放宽验收、不判红）
+    "stuck_flushes", "stuck_flush_skips", "stuck_flush_resnap_failures",
 )
 
 
@@ -1354,6 +1404,97 @@ def cat_environment(sessions, top):
                     subject="environment:refused_stage",
                 )
             )
+        # task-68/task-76：**可达性/开路** ＝ 环境挡路的第五种形态，与 task-52 的 `unreachable` **分开**：
+        # 不可达 = 物理上走不到（A* 算不出路 / 没有落脚点）；被围住 = 四邻没有"可站+可清"的突破口
+        # （树/桩/大石）。这一整类**没有硬闸门**（不存在 `encircled_within_bound`）⇒ 只作信息项、
+        # 不判红、不进任何豁免分子；三条价值：①谁被围住（三级留痕）②`frontier_clear` 的 acted 计数
+        # （run6 那种"19 秒零动作收工"下次一眼可见）③`clear_neighbor` 开路证据。
+        enc_events = sess["encircled"]
+        if enc_events or sess["encircled_stages"] or sess["encircled_summaries"]:
+            e_tile_set = set()
+            for _, ev in enc_events:
+                tile = as_list(ev.get("tile"))
+                if len(tile) == 2:
+                    e_tile_set.add((as_int(tile[0]), as_int(tile[1])))
+            etiles = sorted(e_tile_set)
+            estages = sorted({str(ev.get("stage") or "?") for _, ev in enc_events})
+            esummary = sess["encircled_summaries"][-1][1] if sess["encircled_summaries"] else {}
+            efirst = (enc_events or sess["encircled_stages"] or sess["encircled_summaries"])[0][0]
+            out.append(
+                finding(
+                    efirst, "encircled",
+                    f"被围住（可达性/开路；不计硬失败、不封格、不进不可达豁免）：{len(enc_events)} 次 / "
+                    f"{len(etiles)} 格（阶段 {estages or '-'}；坐标 {[list(t) for t in etiles[:6]]}"
+                    f"{'…' if len(etiles) > 6 else ''}）；日级 count={esummary.get('count')}、"
+                    f"attempted={esummary.get('attempted')}、engaged={esummary.get('engaged')}",
+                    hint="task-68：四邻没有「可站+可清」的突破口（树/桩/大石一类）⇒ 与 unreachable "
+                         "分开计数；开路后/次日地形变了就可能可达（本类无硬闸门、不判红）",
+                    subject="environment:encircled",
+                )
+            )
+        for lineno, ev in sess["encircled_stages"]:
+            out.append(
+                finding(
+                    lineno, "encircled_stage",
+                    f"阶段级被围住：{ev.get('stage')} @ zone={ev.get('zone')} 有 "
+                    f"{as_int(ev.get('tiles'))} 格（其中还留在 leftover 的 "
+                    f"{as_int(ev.get('in_leftover'))} 格；坐标 {as_list(ev.get('coords'))[:6]}）",
+                    hint="encircled_leftover 不参与任何豁免扣减（不进 unreachable_exempt 分子）",
+                    subject="environment:encircled_stage",
+                )
+            )
+        fz = sess["frontier_clears"]
+        if fz:
+            acted = [ln for ln, ev in fz if bool(ev.get("acted"))]
+            failed = [ln for ln, ev in fz if not bool(ev.get("acted"))]
+            flines = sorted({ln for ln, _ in fz})
+            out.append(
+                finding(
+                    flines[0], "frontier_clear",
+                    f"开路尝试 {len(fz)} 次（真清掉 {len(acted)} 次、没清掉 {len(failed)} 次；行 {flines}）"
+                    + ("  ⚠ 全部 acted=false ⇒ 想清但没清掉（run6 那种零动作收工的形态）"
+                       if failed and not acted else ""),
+                    hint="task-68：所有指定目标都够不着时，至少要真清掉一格自己够得着的可清障格；"
+                         "acted=false 的次数就是「这一轮没动作」的证据（本类不判红）",
+                    subject="environment:frontier_clear",
+                )
+            )
+        nb = sess["clear_neighbors"]
+        if nb:
+            opens = sum(as_int(ev.get("opens")) for _, ev in nb)
+            nstages = sorted({str(ev.get("stage") or "?") for _, ev in nb})
+            out.append(
+                finding(
+                    nb[0][0], "clear_neighbor",
+                    f"为开路清掉邻格：{len(nb)} 个阶段共 opens={opens}（阶段 {nstages}）",
+                    hint="task-68：开路成功证据；逐格在 StepResult.after['clear_neighbor']",
+                    subject="environment:clear_neighbor",
+                )
+            )
+        # task-73：stuck 日**有界翻篇**（绕过 sleep_guard 睡过去让整轮继续）。本日仍如实
+        # `ended_by=stuck`、`day_justified=False`、不 VERIFIED ⇒ 只作信息项，绝不判红；
+        # 价值：run6 那种"19 秒零动作终止"现在能一眼看到"翻篇成功 / 为什么跳过".
+        sf = sess["stuck_flushes"]
+        sfs = sess["stuck_flush_skips"]
+        sfr = sess["stuck_flush_resnap_failures"]
+        if sf or sfs or sfr:
+            sf_ok = [ln for ln, ev in sf if ev.get("ok") is True]
+            sf_no = [ln for ln, ev in sf if ev.get("ok") is not True]
+            skip_reasons = sorted({str(ev.get("reason") or "?") for _, ev in sfs})
+            sflines = sorted({ln for ln, _ in sf} | {ln for ln, _ in sfs})
+            out.append(
+                finding(
+                    (sflines or [None])[0], "stuck_flush",
+                    f"stuck 日有界翻篇：{len(sf)} 次（睡成功 {len(sf_ok)} / 没成功 {len(sf_no)}）"
+                    f"；被跳过 {len(sfs)} 次"
+                    + (f"（原因 {'、'.join(skip_reasons[:3])}）" if skip_reasons else "")
+                    + (f"；翻篇后重观测失败 {len(sfr)} 次（L{sfr[0][0]}）" if sfr else "")
+                    + ("  ⚠ 有跳过 ⇒ 那天没能睡过去（外层照旧 no_day_progress 终止）" if sfs else ""),
+                    hint="task-73：绕过 sleep_guard 的有界翻篇；本日仍如实 stuck、DayReport 不 "
+                         "VERIFIED ⇒ 不判红（验收口径看 ended_by/checks，不看翻篇）",
+                    subject="environment:stuck_flush",
+                )
+            )
     return out[:top] if top else out
 
 
@@ -1475,6 +1616,50 @@ def build_advice(report, top=8):
             "lines": (se["lines"].get("no_seed_for_sale", [])
                       + se["lines"].get("cannot_afford", [])
                       + se["lines"].get("seed_unavailable_today", [])),
+        })
+    # 0j) 可达性/开路（task-76：task-68 的被围住 + frontier_clear + clear_neighbor；**不判红**）
+    rc = report.get("reachability") or {}
+    if (rc.get("encircled_events") or rc.get("frontier_clear_attempts")
+            or rc.get("clear_neighbor_events") or rc.get("zero_action_days")):
+        parts = []
+        if rc.get("encircled_events"):
+            parts.append(f"被围住 {rc['encircled_events']} 次 / {rc.get('encircled_tile_count', 0)} 格"
+                         f"（不进不可达豁免；开路后/次日可能可达）")
+        if rc.get("frontier_clear_attempts"):
+            parts.append(f"开路尝试 {rc['frontier_clear_attempts']} 次（真清掉 "
+                         f"{rc.get('frontier_clear_acted', 0)}、没清掉 {rc.get('frontier_clear_failed', 0)}）")
+        if rc.get("clear_neighbor_events"):
+            parts.append(f"为开路清掉邻格 opens={rc.get('clear_neighbor_opens', 0)}"
+                         f"（{rc['clear_neighbor_events']} 个阶段）")
+        if rc.get("zero_action_days"):
+            parts.append("零动作收工 " + "、".join(
+                f"{z.get('day')}(L{z.get('line')})" for z in rc["zero_action_days"]))
+        advice.append({
+            "text": "可达性/开路（信息项，**不判红**）：" + "；".join(parts)
+                    + ("。⚠ 开路全部 acted=false（想清但没清掉）⇒ 至少有一轮零动作，"
+                       "run6 那种「19 秒零动作收工」会在这里现形"
+                       if rc.get("frontier_clear_failed") and not rc.get("frontier_clear_acted") else ""),
+            "lines": sorted(set((rc.get("encircled_lines") or []) + (rc.get("frontier_clear_lines") or [])
+                                + (rc.get("clear_neighbor_lines") or [])
+                                + [z.get("line") for z in (rc.get("zero_action_days") or [])
+                                   if z.get("line") is not None])),
+        })
+    # 0k) stuck 日有界翻篇（task-73；信息项，本日仍如实 stuck / 不 VERIFIED ⇒ 不判红）
+    sf = report.get("stuck_flush") or {}
+    if sf.get("events") or sf.get("skipped") or sf.get("resnap_failed"):
+        advice.append({
+            "text": f"stuck 日有界翻篇（信息项，**不判红**）：{sf.get('events', 0)} 次"
+                    f"（睡成功 {sf.get('ok', 0)} / 没成功 {sf.get('not_ok', 0)}）"
+                    f"；被跳过 {sf.get('skipped', 0)} 次"
+                    + (f"（原因 {'、'.join((sf.get('skip_reasons') or [])[:3])}）"
+                       if sf.get("skip_reasons") else "")
+                    + (f"；翻篇后重观测失败 {sf.get('resnap_failed', 0)} 次"
+                       if sf.get("resnap_failed") else "")
+                    + "。task-73 刻意绕过 sleep_guard 让整轮继续跑下一天，但**绝不放宽验收**："
+                      "那天依然如实记 stuck、day_justified=False、不 VERIFIED（验收看 ended_by/checks）"
+                    + ("；⚠ 有跳过 ⇒ 那天没能睡过去，外层照旧 no_day_progress 终止"
+                       if sf.get("skipped") else ""),
+            "lines": sf.get("lines") or [],
         })
     # 0c) 环境挡路 / 没拿到结论（task-22 记账）
     env = report.get("env_inconclusive") or {}
@@ -2052,6 +2237,24 @@ def build_report(rows, path, args, bad_lines):
     refused_tiles = set()
     refused_stage_lines = []
     refused_summary_lines = []
+    # task-68/task-76：可达性/开路（被围住 + 开路尝试 + 清邻格）——无硬闸门、不判红，只作信息项。
+    enc_lines = []
+    enc_tiles = set()
+    enc_stage_lines = []
+    enc_summary_lines = []
+    frontier_lines = []
+    frontier_acted = 0
+    frontier_failed = 0
+    neighbor_events = 0
+    neighbor_opens = 0
+    neighbor_lines = []
+    # task-73：stuck 日有界翻篇（信息项：本日仍如实 stuck、day_justified=False、不 VERIFIED）
+    stuck_flush_lines = []
+    stuck_flush_ok = 0
+    stuck_flush_skipped = 0
+    stuck_flush_skip_reasons = set()
+    stuck_flush_resnap_failed = 0
+    zero_action_days = []
     t_regressions = []
     for sess in all_sessions:
         idx = _stage_outcome_index(sess)
@@ -2087,6 +2290,44 @@ def build_report(rows, path, args, bad_lines):
                 refused_tiles.add((as_int(tile[0]), as_int(tile[1])))
         refused_stage_lines.extend(ln for ln, _ in sess["refused_stages"])
         refused_summary_lines.extend(ln for ln, _ in sess["refused_summaries"])
+        # task-68/task-76：可达性/开路（被围住三级留痕 / 开路尝试 acted 计数 / 清邻格）
+        for ln, ev in sess["encircled"]:
+            enc_lines.append(ln)
+            tile = ev.get("tile")
+            if isinstance(tile, (list, tuple)) and len(tile) == 2:
+                enc_tiles.add((as_int(tile[0]), as_int(tile[1])))
+        enc_stage_lines.extend(ln for ln, _ in sess["encircled_stages"])
+        enc_summary_lines.extend(ln for ln, _ in sess["encircled_summaries"])
+        for ln, ev in sess["frontier_clears"]:
+            frontier_lines.append(ln)
+            if bool(ev.get("acted")):
+                frontier_acted += 1
+            else:
+                frontier_failed += 1
+        for ln, ev in sess["clear_neighbors"]:
+            neighbor_events += 1
+            neighbor_lines.append(ln)
+            neighbor_opens += as_int(ev.get("opens"))
+        # task-73：stuck 日有界翻篇（只有 `stuck_flush` 的 ok=true 才算"睡过去成功"）
+        for ln, ev in sess["stuck_flushes"]:
+            stuck_flush_lines.append(ln)
+            if ev.get("ok") is True:
+                stuck_flush_ok += 1
+        for _ln, ev in sess["stuck_flush_skips"]:
+            stuck_flush_skipped += 1
+            stuck_flush_skip_reasons.add(str(ev.get("reason") or "?"))
+        stuck_flush_resnap_failed += len(sess["stuck_flush_resnap_failures"])
+        # task-68：`stuck` 收尾且当天有阶段记录但成功动作 0 步 ⇒ "零动作收工"（run6 的形态；
+        # verify-run3.py:639-643 同口径，只报信息项、不判红）。
+        for _ln_end, _end_ev in sess["day_ends"]:
+            _d_end = as_dict(_end_ev)
+            if str(_d_end.get("ended_by") or "") != "stuck":
+                continue
+            _stages_d = as_list(_d_end.get("stages"))
+            _ok_self = sum(as_int(as_dict(_st).get("ok")) for _st in _stages_d
+                           if isinstance(_st, dict))
+            if _stages_d and _ok_self == 0:
+                zero_action_days.append({"line": _ln_end, "day": day_label(_d_end)})
         # `t` 只该单调不减；回退只记信息项（verify-run3.py 同口径，不当失败）
         prev_t = None
         for ln, ev in sess["events"]:
@@ -2128,6 +2369,12 @@ def build_report(rows, path, args, bad_lines):
             "bound": _last_day_end.get("refused_bound"),
             "exempted": _last_day_end.get("refused_exempt"),
         }
+    # task-68/task-76：可达性/开路的日级汇总（优先 `encircled_summary`，缺失退回最后一天 day_end）
+    enc_summaries = [ev for s in all_sessions for _, ev in s["encircled_summaries"]]
+    if enc_summaries:
+        _e_sum = as_dict(enc_summaries[-1])
+    else:
+        _e_sum = {"count": _last_day_end.get("encircled"), "engaged": None}
     report["manual_intervention"] = {
         "total": len(manual_all),
         "red_lines": sorted({f["line"] for f in manual_all if f["line"] is not None}),
@@ -2169,6 +2416,7 @@ def build_report(rows, path, args, bad_lines):
         "unreachable_count": _u_sum.get("count"),
         "unreachable_bound": _u_sum.get("bound"),
         "unreachable_attempted": _u_sum.get("attempted"),
+        "unreachable_engaged": _u_sum.get("engaged"),
         "unreachable_exempt": _u_sum.get("exempted"),
         "unreachable_raw_unmet": _u_sum.get("raw_unmet"),
         "unreachable_unmet": _u_sum.get("unmet"),
@@ -2193,6 +2441,37 @@ def build_report(rows, path, args, bad_lines):
         "refused_unmet": _r_sum.get("unmet"),
         "refused_within_bound": _u_checks.get("refused_within_bound"),
         "statuses": sorted(statuses),
+    }
+    # task-68/task-76：可达性/开路（**无硬闸门** ⇒ 不判红；与 unreachable 分开计数）
+    report["reachability"] = {
+        "encircled_events": sum(len(s["encircled"]) for s in all_sessions),
+        "encircled_tiles": sorted([list(t) for t in enc_tiles]),
+        "encircled_tile_count": len(enc_tiles),
+        "encircled_lines": sorted(set(enc_lines)),
+        "encircled_stage_events": sum(len(s["encircled_stages"]) for s in all_sessions),
+        "encircled_stage_lines": sorted(set(enc_stage_lines)),
+        "encircled_summary_events": sum(len(s["encircled_summaries"]) for s in all_sessions),
+        "encircled_summary_lines": sorted(set(enc_summary_lines)),
+        "encircled_count": _e_sum.get("count"),
+        "encircled_engaged": _e_sum.get("engaged"),
+        "frontier_clear_attempts": len(frontier_lines),
+        "frontier_clear_acted": frontier_acted,
+        "frontier_clear_failed": frontier_failed,
+        "frontier_clear_lines": sorted(set(frontier_lines)),
+        "clear_neighbor_events": neighbor_events,
+        "clear_neighbor_opens": neighbor_opens,
+        "clear_neighbor_lines": sorted(set(neighbor_lines)),
+        "zero_action_days": zero_action_days,
+    }
+    # task-73：stuck 日**有界翻篇**（信息项；本日仍如实 stuck、day_justified=False、不 VERIFIED）
+    report["stuck_flush"] = {
+        "events": len(stuck_flush_lines),
+        "ok": stuck_flush_ok,
+        "not_ok": len(stuck_flush_lines) - stuck_flush_ok,
+        "skipped": stuck_flush_skipped,
+        "skip_reasons": sorted(stuck_flush_skip_reasons),
+        "resnap_failed": stuck_flush_resnap_failed,
+        "lines": sorted(set(stuck_flush_lines)),
     }
     # `t` 回退（只记信息项）
     report["t_regressions"] = t_regressions
@@ -2250,6 +2529,22 @@ MAPPING_TEXT = [
     ("event:no_seed_for_sale / cannot_afford / seed_unavailable_today (task-67)",
      "种子经济（信息项，**不是硬失败**）：货架没种子 / 留够 K 包买不起 / 买不到结论**当天失效**留痕；"
      "与头部 `购买:` 计数一起看 —— 买不到却没有失效留痕 = run6 那种守卫死锁（建议 0i）"),
+    ("encircled / encircled_stage / encircled_summary（task-68、task-76）",
+     "5 环境挡路·可达性/开路（信息项，**无硬闸门 ⇒ 一律不判红**）：被不可清障物围住（四邻没有"
+     "「可站+可清」的突破口）＝与 `unreachable`（物理走不到）**分开计数**、不封格、不进任何豁免分子；"
+     "三级留痕：逐格/阶段(encircled_leftover)/日级(count/attempted/engaged)；"
+     "`day_end.encircled`/`encircled_tiles` 与它互检（缺失 ⇒ 只记【无法判定】，不当通过）"),
+    ("frontier_clear / clear_neighbor（task-68、task-76）",
+     "5 环境挡路·开路（信息项）：`frontier_clear` 是「所有目标都够不着时至少清一格可达的可清障格」"
+     "的尝试（tile/acted/attempt/limit/why；**acted=false = 想清没清掉**）；"
+     "`clear_neighbor` 是开路清掉的邻格（阶段级 opens/targets，逐格在 StepResult.after）——"
+     "两者让 run6 那种「stuck + ok_steps=0 + 零动作收工」在头部与建议 0j 一眼可见"),
+    ("stuck_flush / stuck_flush_skipped / stuck_flush_resnap_failed（task-73、dev 在制）",
+     "5 环境挡路·解卡（信息项，**不判红**）：`stuck_flush` = stuck 日**有界翻篇**"
+     "（绕过 sleep_guard 睡过去让整轮继续跑下一天；ok/count/limit/day_after/detail）；"
+     "`stuck_flush_skipped` = 翻篇被跳过（reason=`eventUp`/存档类模态/次数达 limit）；"
+     "`stuck_flush_resnap_failed` = 翻篇后重观测失败（只作诊断）。**绝不放宽验收**："
+     "那天仍如实 ended_by=stuck、day_justified=False、不 VERIFIED ⇒ 头部'stuck 翻篇'行 + 建议 0k"),
     ("其他新事件（buy/env_retry/intent_unknown/zones_failed/day_key_resnap_failed/"
      "load_save/llm_on/day_cap/budget_exhausted/bridge_unavailable/watchdog_stop/"
      "mod_version_mismatch/llm_trace_failed/no_day_progress）",
@@ -2457,6 +2752,38 @@ def render_text(report, top):
               f"attempted={env.get('refused_attempted')}、exempt={env.get('refused_exempt')}"
             + ("  ⚠ checks.refused_within_bound=false ⇒ 0 类红"
                if env.get("refused_within_bound") is False else ""))
+    # task-68/task-76：可达性/开路（**无硬闸门 ⇒ 不判红**；与不可达分开计数）
+    reach = report.get("reachability") or {}
+    if (reach.get("encircled_events") or reach.get("frontier_clear_attempts")
+            or reach.get("clear_neighbor_events") or reach.get("zero_action_days")):
+        reach_line = (f"可达性/开路: 被围住 {reach.get('encircled_events', 0)} 次 / "
+                      f"{reach.get('encircled_tile_count', 0)} 格"
+                      + (f"（tiles={reach.get('encircled_tiles')[:8]}）" if reach.get("encircled_tiles") else "")
+                      + f"；日级 count={reach.get('encircled_count')}、engaged={reach.get('encircled_engaged')}"
+                      + f"；开路尝试 {reach.get('frontier_clear_attempts', 0)} 次（真清掉 "
+                        f"{reach.get('frontier_clear_acted', 0)} / 没清掉 {reach.get('frontier_clear_failed', 0)}）"
+                      + (f"；为开路清邻格 opens={reach.get('clear_neighbor_opens', 0)}"
+                         f"（{reach.get('clear_neighbor_events', 0)} 个阶段）"
+                         if reach.get("clear_neighbor_events") else ""))
+        if reach.get("frontier_clear_failed") and not reach.get("frontier_clear_acted"):
+            reach_line += "  ⚠ 开路全部 acted=false（想清但没清掉 ⇒ 至少一轮零动作）"
+        if reach.get("zero_action_days"):
+            reach_line += ("  ⚠ 零动作收工: " + "、".join(
+                f"{z.get('day')}(L{z.get('line')})" for z in reach["zero_action_days"]))
+        add(reach_line)
+    # task-73：stuck 日有界翻篇（信息项；本日仍如实 stuck / day_justified=False / 不 VERIFIED ⇒ 不判红）
+    sf = report.get("stuck_flush") or {}
+    if sf.get("events") or sf.get("skipped") or sf.get("resnap_failed"):
+        sf_tail = ("  ⚠ 有跳过 ⇒ 那天没能睡过去（外层照旧 no_day_progress 终止）"
+                   if sf.get("skipped")
+                   else "（有界翻篇：让整轮继续跑下一天；本日仍如实 stuck、不 VERIFIED）")
+        add(f"stuck 翻篇: {sf.get('events', 0)} 次（睡成功 {sf.get('ok', 0)} / 没成功 "
+            f"{sf.get('not_ok', 0)}）；被跳过 {sf.get('skipped', 0)} 次"
+            + (f"（原因 {'、'.join((sf.get('skip_reasons') or [])[:3])}）"
+               if sf.get("skip_reasons") else "")
+            + (f"；翻篇后重观测失败 {sf.get('resnap_failed', 0)} 次" if sf.get("resnap_failed") else "")
+            + (f"（行 {sf.get('lines')[:6]}）" if sf.get("lines") else "")
+            + sf_tail)
     t_reg = report.get("t_regressions") or []
     if t_reg:
         add(f"t 回退: {len(t_reg)} 次（信息项，行 {[r['line'] for r in t_reg][:8]}"

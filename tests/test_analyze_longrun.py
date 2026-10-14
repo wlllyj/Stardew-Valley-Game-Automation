@@ -1563,5 +1563,165 @@ class TestSeedEconomy(unittest.TestCase):
         self.assertEqual(rep["red"]["total"], 0, "干净账本不该因为缺种子事件而变红")
 
 
+class TestReachabilityAndOpenPath(unittest.TestCase):
+    """task-76 / task-68：可达性/开路五事件（encircled 三级留痕 + frontier_clear + clear_neighbor）。
+
+    政策：与 `unreachable`（物理走不到）**分开计数**；整类**没有硬闸门**（不存在
+    `encircled_within_bound`）⇒ 一律不判红、不并进"该做没做"；价值是让 run6 那种
+    「`stuck` + 成功动作 0 步 + 开路 `acted=false`」的**零动作收工**一眼可见。
+    """
+
+    ENC1 = {"event": "encircled", "t": 1.0, "tile": [61, 20], "action": "clear",
+            "stage": "clear_area", "zone": "field_se", "reason": "四邻没有可站+可清的突破口"}
+    ENC2 = {"event": "encircled", "t": 2.0, "tile": [62, 20], "action": "clear",
+            "stage": "clear_area", "zone": "field_se", "reason": "同上"}
+    ENC_STAGE = {"event": "encircled_stage", "t": 3.0, "stage": "clear_area", "zone": "field_se",
+                 "tiles": 2, "in_leftover": 2, "coords": [[61, 20], [62, 20]], "note": "被围住"}
+    ENC_SUM = {"event": "encircled_summary", "t": 8.0, "count": 2, "attempted": 42, "engaged": 7,
+               "tiles": [[61, 20], [62, 20]], "note": "只记证据"}
+    FRONTIER_FAIL = {"event": "frontier_clear", "t": 4.0, "tile": [70, 20], "acted": False,
+                     "attempt": 1, "limit": 20, "why": "目标都够不着", "note": ""}
+    FRONTIER_FAIL2 = dict(FRONTIER_FAIL, t=4.5, tile=[71, 20], attempt=2)
+    FRONTIER_OK = {"event": "frontier_clear", "t": 5.0, "tile": [72, 20], "acted": True,
+                   "attempt": 3, "limit": 20, "why": "开路", "note": ""}
+    NEIGHBOR = {"event": "clear_neighbor", "t": 6.0, "stage": "clear_area", "zone": "field_se",
+                "opens": 1, "targets": [{"target": [61, 20]}], "note": "为开路清邻格"}
+
+    def _report(self, events, name, overrides=None, days=1):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        body = integrity_ledger(extra_events=list(events),
+                                day_end_overrides=dict(overrides or {}))
+        return report_for(write_ledger(tmp.name, name, body), days=days)
+
+    def test_five_events_have_buckets_and_are_not_unmapped(self):
+        for n in ("encircled", "encircled_stage", "encircled_summary",
+                  "frontier_clear", "clear_neighbor"):
+            self.assertIn(n, mod.EVENT_BUCKETS, f"brain 会发 {n}，没有桶就会静默消失")
+        rep = self._report([self.ENC1, self.ENC2, self.ENC_STAGE, self.ENC_SUM,
+                            self.FRONTIER_FAIL, self.FRONTIER_FAIL2, self.NEIGHBOR],
+                           "reach_buckets.jsonl",
+                           overrides={"encircled": 2, "encircled_tiles": [[61, 20], [62, 20]]})
+        self.assertEqual(rep["unmapped_events"], {}, "五个事件都必须有桶")
+        ev = rep["events"]
+        self.assertEqual(ev["encircled"], 2)
+        self.assertEqual(ev["encircled_stage"], 1)
+        self.assertEqual(ev["encircled_summary"], 1)
+        self.assertEqual(ev["frontier_clear"], 2)
+        self.assertEqual(ev["clear_neighbor"], 1)
+        text = mod.render_text(rep, 50)
+        for key in ("encircled=2", "encircled_stages=1", "encircled_summaries=1",
+                    "frontier_clears=2", "clear_neighbors=1"):
+            self.assertIn(key, text, "新事件计数必须点名（不许静默）")
+
+    def test_encircled_is_info_only_and_separate_from_unreachable(self):
+        rep = self._report([self.ENC1, self.ENC2, self.ENC_STAGE, self.ENC_SUM],
+                           "reach_info.jsonl",
+                           overrides={"encircled": 2, "encircled_tiles": [[61, 20], [62, 20]],
+                                      "unreachable": 42, "unreachable_bound": 8,
+                                      "unreachable_exempt": 8})
+        reach = rep["reachability"]
+        self.assertEqual(reach["encircled_events"], 2)
+        self.assertEqual(reach["encircled_tile_count"], 2)
+        self.assertEqual(reach["encircled_count"], 2)
+        self.assertEqual(reach["encircled_engaged"], 7)
+        env = rep["env_inconclusive"]
+        self.assertIn("unreachable_engaged", env, "task-68 的 engaged 只作证据，也要可见")
+        self.assertEqual(env["unreachable_count"], 42, "被围住不许并进不可达计数")
+        self.assertFalse([s for s in rep["red"]["subjects"] if "encircled" in s],
+                         "可达性/开路没有硬闸门 ⇒ 一律不判红")
+        text = mod.render_text(rep, 50)
+        self.assertIn("可达性/开路:", text)
+        self.assertIn("被围住 2 次 / 2 格", text)
+        advice = " ".join(a["text"] for a in rep["advice"])
+        self.assertIn("不进不可达豁免", advice)
+
+    def test_frontier_clear_all_failed_is_visible(self):
+        rep = self._report([self.ENC1, self.FRONTIER_FAIL, self.FRONTIER_FAIL2],
+                           "reach_frontier_fail.jsonl",
+                           overrides={"encircled": 1, "encircled_tiles": [[61, 20]]})
+        reach = rep["reachability"]
+        self.assertEqual((reach["frontier_clear_attempts"], reach["frontier_clear_acted"],
+                          reach["frontier_clear_failed"]), (2, 0, 2))
+        text = mod.render_text(rep, 50)
+        self.assertIn("开路全部 acted=false", text)
+        self.assertIn("至少一轮零动作", text)
+        advice = " ".join(a["text"] for a in rep["advice"])
+        self.assertIn("想清但没清掉", advice)
+        self.assertFalse([s for s in rep["red"]["subjects"] if "frontier" in s],
+                         "开路失败是信息项，不是红")
+
+    def test_frontier_clear_success_and_clear_neighbor_opens(self):
+        rep = self._report([self.ENC1, self.FRONTIER_OK, self.NEIGHBOR],
+                           "reach_frontier_ok.jsonl")
+        reach = rep["reachability"]
+        self.assertEqual((reach["frontier_clear_attempts"], reach["frontier_clear_acted"],
+                          reach["frontier_clear_failed"]), (1, 1, 0))
+        self.assertEqual(reach["clear_neighbor_events"], 1)
+        self.assertEqual(reach["clear_neighbor_opens"], 1)
+        text = mod.render_text(rep, 50)
+        self.assertIn("真清掉 1 / 没清掉 0", text)
+        self.assertIn("为开路清邻格 opens=1", text)
+        self.assertNotIn("开路全部 acted=false", text)
+
+    def test_zero_action_stuck_day_is_named(self):
+        stages = [{"stage": "clear_dead", "tiles": 30, "ok": 0, "skipped": 0, "failed": 0,
+                   "proven_inert": 0, "env_block": 0, "inconclusive": 0, "stopped": False,
+                   "leftover": 30}]
+        rep = self._report([self.ENC1, self.ENC2, self.FRONTIER_FAIL],
+                           "reach_zero_action.jsonl",
+                           overrides={"ended_by": "stuck", "ended_reason": "stuck",
+                                      "verified": False, "stages": stages, "ok_steps": 0,
+                                      "encircled": 2,
+                                      "encircled_tiles": [[61, 20], [62, 20]]})
+        reach = rep["reachability"]
+        self.assertEqual(len(reach["zero_action_days"]), 1, "stuck + 成功动作 0 步要点名")
+        text = mod.render_text(rep, 50)
+        self.assertIn("零动作收工", text)
+        advice = " ".join(a["text"] for a in rep["advice"])
+        self.assertIn("零动作收工", advice)
+        self.assertFalse([s for s in rep["red"]["subjects"] if "encircled" in s or "frontier" in s],
+                         "零动作收工是信息项（改由 verify-run3 的 problem 口径判验收）")
+
+    SF_OK = {"event": "stuck_flush", "t": 9.0, "ok": True, "count": 1, "limit": 3,
+             "day_after": [1, "summer", 5], "detail": "sleep",
+             "note": "绕 sleep_guard 有界翻篇，让整轮继续跑下一天"}
+    SF_SKIP = {"event": "stuck_flush_skipped", "t": 9.5, "reason": "eventUp=true",
+               "note": "task-41：游戏事件挂住必须人来处理"}
+    SF_SKIP_MENU = {"event": "stuck_flush_skipped", "t": 9.6, "reason": "activeMenu=SaveGameMenu",
+                    "note": "task-11：存档类模态只等不关"}
+    SF_RESNAP = {"event": "stuck_flush_resnap_failed", "t": 9.7, "error": "bridge timeout"}
+
+    def test_stuck_flush_events_are_mapped_and_visible(self):
+        for n in ("stuck_flush", "stuck_flush_skipped", "stuck_flush_resnap_failed"):
+            self.assertIn(n, mod.EVENT_BUCKETS, f"brain 会发 {n}（task-73），没有桶就会静默消失")
+        rep = self._report([self.SF_OK, self.SF_SKIP], "stuck_flush.jsonl",
+                           overrides={"ended_by": "stuck", "ended_reason": "stuck",
+                                      "verified": False})
+        self.assertEqual(rep["unmapped_events"], {}, "task-73 三个事件都必须有桶")
+        sf = rep["stuck_flush"]
+        self.assertEqual((sf["events"], sf["ok"], sf["not_ok"], sf["skipped"]), (1, 1, 0, 1))
+        self.assertEqual(sf["skip_reasons"], ["eventUp=true"])
+        text = mod.render_text(rep, 50)
+        self.assertIn("stuck 翻篇: 1 次（睡成功 1 / 没成功 0）；被跳过 1 次（原因 eventUp=true）", text)
+        self.assertIn("有跳过 ⇒ 那天没能睡过去", text)
+        self.assertFalse([s for s in rep["red"]["subjects"] if "stuck_flush" in s],
+                         "有界翻篇是信息项：本日仍如实 stuck ⇒ 绝不判红")
+
+    def test_stuck_flush_resnap_failure_and_skip_reasons_are_named(self):
+        rep = self._report([self.SF_OK, self.SF_SKIP_MENU, self.SF_RESNAP],
+                           "stuck_flush_resnap.jsonl",
+                           overrides={"ended_by": "stuck", "ended_reason": "stuck",
+                                      "verified": False})
+        sf = rep["stuck_flush"]
+        self.assertEqual(sf["skip_reasons"], ["activeMenu=SaveGameMenu"])
+        self.assertEqual(sf["resnap_failed"], 1)
+        text = mod.render_text(rep, 50)
+        self.assertIn("翻篇后重观测失败 1 次", text)
+        advice = " ".join(a["text"] for a in rep["advice"])
+        self.assertIn("绝不放宽验收", advice, "翻篇不许被读成'放行了'")
+        self.assertNotIn("stuck_flush", rep["red"]["subjects"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -243,6 +243,51 @@ rg -n '"offers"' logs\longrun-*.jsonl                 # 架上到底有什么（
 现在加了 `BUCKET_TO_EVENT` 反查：run3/run5/run6 头部立刻能看见
 `plot_walks=…`、`seed_gates=…`、`buys=6`、`unreachable_stages=8`、`unreachable_summaries=2`（**纯呈现，rc 不变**）。
 
+## 3.10 可达性/开路（task-76 / task-68）与 stuck 日有界翻篇（task-73，dev 在制）
+
+**一句话**：`encircled`（被树/桩/大石围住 = 四邻没有「可站+可清」的突破口）、`frontier_clear`
+（目标都够不着时至少清一格可达的可清障格；**`acted=false` = 想清没清掉**）、`clear_neighbor`
+（开路清掉的邻格）与 `stuck_flush*`（stuck 日有界翻篇）**一律不判红**，只作信息项；
+与 `unreachable`（物理走不到）**分开计数**、不封格、不进任何豁免分子。
+
+| 事件 | 桶 | 归因 | 判红？ |
+|---|---|---|---|
+| `encircled` | `encircled` | 逐格被不可清障物围住（task-68 单独成类） | 否 |
+| `encircled_stage` | `encircled_stages` | 阶段级 tiles/in_leftover/coords（**不进 `unreachable_exempt` 分子**） | 否 |
+| `encircled_summary` | `encircled_summaries` | 日级 count/attempted/**engaged**（engaged 仅证据） | 否 |
+| `frontier_clear` | `frontier_clears` | 开路尝试 tile/acted/attempt/limit/why | 否 |
+| `clear_neighbor` | `clear_neighbors` | 为开路清掉的邻格（阶段级 opens/targets） | 否 |
+| `stuck_flush` | `stuck_flushes` | task-73：绕过 `sleep_guard` 睡过去让整轮继续（ok/count/limit/day_after） | 否 |
+| `stuck_flush_skipped` | `stuck_flush_skips` | 翻篇被跳过：`reason` = `eventUp=true` / `activeMenu=<存档类>` / 次数达 limit | 否 |
+| `stuck_flush_resnap_failed` | `stuck_flush_resnap_failures` | 翻篇后重观测失败（只作诊断） | 否 |
+
+- **没有硬闸门**：task-68 不存在 `encircled_within_bound`（不像 `unreachable_within_bound` /
+  `refused_within_bound`）⇒ 本类**不产 0 类红**，`report["red"]` 里不会出现 `manual:check:encircled*`。
+- **缺失行为**：`day_end.encircled*` / `encircled_summary` 缺失 ⇒ 逐条进【无法判定】（缺失 ≠ 通过），
+  且**绝不静默丢弃**（`unmapped_events` 必须为空）；`stuck_flush*` 缺失就是 0 次、不打行、不出建议。
+- **呈现**：头部两行 —— `可达性/开路: 被围住 N 次 / M 格；日级 count=…、engaged=…；开路尝试 N 次
+  （真清掉 a / 没清掉 b）；为开路清邻格 opens=…`（开路全 `acted=false` ⇒ `⚠ 开路全部 acted=false`；
+  `stuck` 且当天有阶段记录但成功动作 0 步 ⇒ `⚠ 零动作收工: <日>(L行)`）与 `stuck 翻篇: N 次
+  （睡成功 a / 没成功 b）；被跳过 s 次（原因 …）；翻篇后重观测失败 c 次`；建议 **0j**（可达性/开路）
+  与 **0k**（有界翻篇，含"绝不放宽验收"一句）。
+- **与 `tools\verify-run3.py` 对齐（task-75，`8ceea87`）**：它侧白名单含 `encircled`/`encircled_tiles`，
+  会话级自算 + info（`verify-run3.py:307-332` / `613-643`，含 `stuck` 且 `ok_steps==0` 的"零动作收工"）
+  —— **两侧都只作信息项、都不判红**，口径同向、不必逐字相同。`stuck_flush*` 那边**尚未接**
+  （task-73 的在制工作），本工具先收，避免漂移测试红。
+- **判据**：被围住/开路失败/翻篇**都不能当通过**——尤其 `stuck_flush` 成功后当天仍是 `ended_by=stuck`、
+  `day_justified=False`、**不 VERIFIED**（task-73 刻意绕过 `sleep_guard`，但没放宽验收）。
+- **单测**：`tests/test_analyze_longrun.py::TestReachabilityAndOpenPath`（7 条：五事件有桶不落未映射 /
+  被围住只 info 且与不可达分开 / 开路全失败可见 / 开路成功 + 邻格 opens / 零动作 stuck 日点名 /
+  `stuck_flush` 有桶且可见 / 跳过原因与重观测失败点名且不判红）。
+
+```
+# run6 那种「19 秒零动作收工」下次一眼可见
+rg -n '"frontier_clear"' logs\longrun-*.jsonl
+rg -n '"encircled_summary"|"encircled_stage"' logs\longrun-*.jsonl
+rg -n '"stuck_flush"' logs\longrun-*.jsonl
+rg -n '"stuck_flush_skipped"' logs\longrun-*.jsonl   # reason=eventUp / activeMenu=存档类 / 次数达 limit
+```
+
 ## 4. 复核命令
 
 ```
@@ -250,5 +295,5 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run5.jsonl   # �
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run6.jsonl   # run6：守卫死锁 + 同日重试
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run6.jsonl   # 判决权威（rc=1 needs_review）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
-python -m unittest discover -s tests        # 当前 482 OK
+python -m unittest discover -s tests        # 当前 507 OK（task-76：含 task-68 可达性/开路 + task-73 stuck_flush 在制）
 ```
