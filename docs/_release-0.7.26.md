@@ -9,8 +9,12 @@
 | 卡 | 内容 | 侧 |
 |---|---|---|
 | **task-67** | `BuySkill` 回执带**结构化在售清单** `available:[{id,name,price}]`（≤30 条，成功/失败都带）；脑侧按「name 含 Seeds/种子 且 price ≤ money/K(K=10) 的最便宜者」下单，不再硬编码 `472`；买不到 ⇒ journal `no_seed_for_sale` + **当天不再发起 buy**；**守卫里「没种子但钱够 ⇒ 该去买」当天失效**（改记 `seed_unavailable_today`），收工理由诚实（`no_work`/`stuck:`） | Mod + brain |
-| **task-68** | 判"走不到"之前先看 4 邻，邻格是可清障类（weed/stone/twig/grass）就先清它、清完重试目标格（每格 ≤4 次开路动作）；`unreachable_bound` 口径修正（分母只算"有过站位尝试"的格 / 追加与已封格数挂钩的绝对项 / 单列 `encircled`），**不放宽** `checks.unreachable_within_bound` 的存在性与 `no_unmet_stages` 的防空洞条 | brain |
+| **task-68** | 判"走不到"之前先看 4 邻，邻格是可清障类（weed/stone/twig/grass）就先清它、清完重试目标格（每格 ≤4 次开路动作，`open_way`/`_ensure_reachable`）；口径取**单选题③**：`encircled`（四邻连落脚点都没有）**单独成类** —— 不封格、**不进 `unreachable_exempt` 分子**、只单独留痕；`attempted` 分母**不动**（与工具侧对账口径一致）；新增 `frontier_clear`（所有指定目标都不可达时，至少真清一格可达的可清障格，≤20/天，杜绝 run6 那种"19 秒零动作收工"）；**不放宽** `checks.unreachable_within_bound` 的存在性与 `no_unmet_stages` 的防空洞条 | brain |
 | **task-73** | **stuck 日有界翻篇**：idle 守卫判 stuck 后不立刻让外层 `no_day_progress` 终止整轮，而是先 `_do_sleep(..., "stuck_flush:…")` 翻到下一天（`MAX_STUCK_FLUSH=2`，刻意绕过 `sleep_guard` 并在 journal 写明理由）；睡不成才照旧终止。**该日 `verified` 仍为 False**（`ended_by=stuck`、`day_justified=False`），绝不许洗成 `no_work`/`night`/`stamina`；`eventUp`/`blocked_modal` 一律不 flush | brain |
+| **task-70** | `analyze-longrun` 种子经济三事件（`no_seed_for_sale`/`seed_unavailable_today`/`seed_gate` 同类分开计数）+ `NEW_EVENT_BUCKETS` 桶名→事件名反查修复（此前会**静默丢事件**）+ 口径卡 §3.9 | 工具 |
+| **task-71** | `verify-run3` 对抗加固：两套豁免的 `bound` 一律**自算**（账本写 `9999` 不再被采信）、豁免>0 而无坐标 ⇒ problem、同一格同时进两套豁免 ⇒ problem、`attempted` 被抬高 ⇒ 可疑 | 工具 |
+| **task-75** | `verify-run3` 接住 task-68 的五个新名字（`encircled`/`encircled_stage`/`encircled_summary`/`frontier_clear`/`clear_neighbor`）：白名单补 `day_end.encircled*`、会话级自算、info 里点名"`stuck` 且 `ok_steps==0` ⇒ 零动作收工" | 工具 |
+| **task-76** | `analyze-longrun` 收同样五个新事件（可达性/开路新类，与 `environment:unreachable` 分开计数）+ 漂移测试全绿 | 工具 |
 
 **不在本版**：task-53（农场级待清障/待开垦计数）、task-55（卖余料换种子钱，脑侧自己出货 + 分叠/记账）、task-58/59（LLM 带决策史 / 收工复盘）⇒ 排 0.7.27。
 
@@ -54,6 +58,9 @@
 2. `no_seed_for_sale` 每天最多 1 次，且**不再**导致 `stuck`（守卫理由当天失效生效）。
 3. `clear_dead` 至少有一天 `ok > 0`，`farm.deadCrops` 下降。
 4. `unreachable_within_bound` 不再假红；若仍超界，账本必须给出 `encircled`/坐标证据证明是真超界。
+5. **零动作收工不再出现**：`stuck` 日的 `frontier_clear` 至少要真清掉一格（`frontier_clear{acted:true}` 或 stage `ok>0`）；工具侧会点名 `stuck` + `ok_steps==0`。
+6. **stuck 日翻篇**：出现 `stuck_flush` 时看它是否真的把 `day_after` 推进 +1，且当天 `verified=false`、`day_justified=false`（不许洗白）。
+7. 工具侧新闸门必须**不误杀**：`verify-run3` 对 run2/run3/run5/run6 旧账本的判决与 task-71/75 之前**逐字相同**；`analyze-longrun` 六本账本 rc 不变。
 
 ---
 
