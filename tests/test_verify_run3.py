@@ -676,6 +676,29 @@ class TestVerifyRun3(unittest.TestCase):
         ok, s = self.check(rows)
         self.assertFalse(any("上界" in p for p in s["problems"]), s["problems"])
 
+    def test_lying_bound_basis_is_reported_even_though_it_gets_clamped(self):
+        """task-81 NIT-1：账本谎报 `bound_basis` 必须**留痕**（先比较、再钳）。
+
+        旧写法 `basis = min(_basis, basis_self)` 之后才判 `basis != basis_self`，只要自算 > 0
+        就被钳平 ⇒ 这条 problem 永不触发（deputy 的 ADV-4 实测点名 0 行）。这里 stage 自算
+        `bound_basis = 50 − 45 = 5`，账本谎报 50 ⇒ 必须报 problem（并仍按自算 5 算上界）。
+        """
+        rows = green_rows()
+        for i, r in enumerate(rows):
+            if r.get("event") == "day_end" and r["final"]["day"][2] == 10:
+                rows[i] = day_end(
+                    r["final"]["day"], r["day_after"],
+                    stages=[stage("clear_dead", tiles=50, ok=10, attempted=50,
+                                  encircled=45, unreachable=0, leftover=0)],
+                    attempted=50, encircled=45, unreachable=0, bound_basis=50,
+                    unreachable_bound=10,
+                )
+        ok, s = self.check(rows)
+        blob = " | ".join(s["problems"])
+        self.assertIn("上界基数账本", blob)
+        self.assertIn("> 自算=5", blob)
+        self.assertFalse(ok)
+
     def test_stuck_flushed_day_must_not_be_verified(self):
         """task-73：卡死翻篇只许翻页，不许洗白 —— `stuck_flushed=true` 的日子记 verified ⇒ problem。"""
         rows = green_rows()

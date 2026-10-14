@@ -511,20 +511,20 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         basis_self = max(0, attempted_total - encircled_total)
         _basis = end_stats.get("bound_basis")
         if isinstance(_basis, (int, float)):
-            if int(_basis) > attempted_total:
+            _basis_i = int(_basis)
+            # task-81 NIT-1（deputy 对抗验收 ADV-4 实测）：旧写法**先钳后比** ——
+            # `basis = min(_basis, basis_self)` 之后再判 `basis != basis_self`，只要自算 > 0
+            # 就被 `min()` 钳平 ⇒「账本谎报 bound_basis」这条 problem 永不触发（说谎不留痕）。
+            # 正确姿势：**先比较原始账本值，再钳**（方向仍然是 fail-closed，不构成洗白通道）。
+            if _basis_i > basis_self:
                 problems.append(
-                    f"[{name}] 上界基数账本 bound_basis={int(_basis)} > attempted={attempted_total}"
-                    "（抬高基数就能放宽 20% 上界 ⇒ 账目不可信）"
+                    f"[{name}] 上界基数账本 bound_basis={_basis_i} > 自算={basis_self}"
+                    f"（attempted={attempted_total} − encircled={encircled_total}）"
+                    "⇒ 基数被放宽，可能把真失败洗成不可达"
                 )
-                basis = attempted_total
+                basis = basis_self
             else:
-                basis = min(int(_basis), basis_self) if basis_self else int(_basis)
-                if basis != basis_self and int(_basis) > basis_self:
-                    problems.append(
-                        f"[{name}] 上界基数账本 bound_basis={int(_basis)} > 自算={basis_self}"
-                        f"（attempted={attempted_total} − encircled={encircled_total}）"
-                        "⇒ 基数被放宽，可能把真失败洗成不可达"
-                    )
+                basis = _basis_i
         else:
             basis = basis_self
         bound_self = max(5, int(0.2 * basis)) if basis else 5
