@@ -3,7 +3,24 @@
 > 本文是**收工快照**，只写"明天开工要用的东西"。`docs\_resume-prompt.md` 是 P2 时代的三步恢复法（仍然有效：单测 → `deploy-mod.py` → `run-plot.py`），但它的状态表已过期，以本文为准。
 > 目标不变：**P3 ⑥ —— 端到端自主完成「清障 → 开垦 → 播种 → 浇水」，连续 3 个游戏日无人工介入**（判据一律用 `observe?detail=full` 的 `tiles[]`/`inventory[]`/`money` 差分，回执不算证据）。
 
-## 0e. 2026-10-14 深夜收尾（**最新，与下文冲突以本节为准**）
+## 0f. 2026-10-14 深夜二段收尾（**最新，与下文冲突以本节为准**）
+
+用户节奏：`User said (m11056)`：「找合适的时机可以先停了，明天再继续」；同夜还有 `User said (m11003)`（三条问题）与 `User said (m11005)`（「记录下来，安排后续修复」）。
+
+- **run7 仍在跑（脱离式，与 DSH 无关，重启 DSH 不会中断）**：`logs/longrun-3day-llm-run7.jsonl`，PID **27308**（存活），游戏 `StardewModdingAPI` PID **19500** 存活、`bridge.json` 在。收尾时已出现 **两个 `day_end`**：
+  - `[1,summer,3]` → `ended_by=sleep`、`verified=false`、reason `stuck:换过 11 片地都没有目标（守卫仍说还有活：农场口径还有 1 格干作物，其中 1 格在玩家窗口之外…）` —— **task-73 的"stuck 日翻篇"真机首次生效**（run6 是 19 秒当场收工）。
+  - `[1,summer,4]` → `ended_by=sleep`、**`verified=true`**、reason `no_work:确实找不到可做的活（地里的活干完了、也没法/没必要买种子）` —— **P3 ⑥ 的"单个游戏日达标"首次成立**（还差"连续 3 天"，run7 最长 9 天，可能今晚自己跑完）。
+- **明天第一件事**：看 run7 是否已 `finish`（`logs/longrun-3day-llm-run7.jsonl` 尾行 + `logs/longrun-3day-llm-run7.pid` 是否还活）⇒ 已结束就 `python tools/stop-game.py` 收掉游戏、`scratch\run6-snapshot.py --tag end` 取外部证据、跑三路复核（`tools/verify-run3.py` / `tools/analyze-longrun.py` / deputy 三源对账器）并写 `docs/_run7-evidence.md`（machine-runner）。
+- **用户三条新反馈已立卡（本夜完成）**：`docs/_user-feedback-2026-10-14.md` + 开发日志**条目 049**（提交 `e8f5bde`）：
+  - **task-82**：LLM 反馈闭环（决策→结果 join + `<journal>-lessons.json` 跨日教训库 + 次日注入；承接 task-58/59）。诚实边界：是"会话内记忆 + 提示词反馈"，**不是**改权重。
+  - **task-83**：固定当家田块 + `next_plant_tiles()` 行优先连续填空 + 同日不跨 zone（治"东一个西一个"）。
+  - **task-84**：死苗不再浇水（Mod 拆"活苗 dry/死苗" + `water()` 排除死苗 + `clear_dead` 提到 water 之前）。
+  - ⚠ 三张卡都要动 `brain/agentfarm/longrun.py`（83/84 还要 `farmwork.py`）⇒ **必须 Lead 逐张串行放行**，收进 **0.7.27**。
+- **Lead 工具侧本夜最后一笔（已提交 `1b801c1`）**：task-81 的 NIT-1 —— `tools/verify-run3.py` 上界基数改为**先比较再钳**（旧写法 `min()` 先钳住，"账本谎报 `bound_basis`"永不触发、说谎不留痕）；新增回归用例 ⇒ `tests.test_verify_run3` **42 OK**、全量 OK。
+- **task-81（deputy-lead）= PASS-WITH-NITS**（`docs/_review-task78.md`，提交 `f2b4cdd`）：task-78 四文件哈希/范围/回归/对抗全过，B 段实测 `attempted=564, encircled=539, bound_basis=25 ⇒ bound=5`（旧口径会是 112）⇒ 被围住的格不再抬上界。
+- goal `goal-1ee4cda9-fdd4-4ba0-80cb-0c06902157eb` 仍 **paused/disarmed** ⇒ 明天在界面 resume 或对我说「继续」。
+
+## 0e. 2026-10-14 深夜收尾（**与下文冲突以本节为准**）
 
 用户节奏：`User said (m10939)`：「准备收尾我需要重启dsh」⇒ 本回合只做"把状态收干净 + 让真实运行自己跑完"。
 
