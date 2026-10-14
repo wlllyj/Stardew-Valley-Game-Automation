@@ -534,7 +534,8 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
             if bound > bound_self:
                 problems.append(
                     f"[{name}] 不可达豁免上界账本={bound} > 自算={bound_self}"
-                    f"（attempted={attempted_total}）⇒ 上界被放宽，可能把真失败洗成不可达"
+                    f"（bound_basis={basis} = attempted {attempted_total} − encircled {encircled_total}）"
+                    "⇒ 上界被放宽，可能把真失败洗成不可达"
                 )
             else:
                 infos.append(
