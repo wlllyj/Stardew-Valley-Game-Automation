@@ -1,6 +1,6 @@
 # 0.7.26 发布计划（run7 前置）
 
-> 上一版 0.7.25 的 run6 = **干净快速失败（0/3、0 跨日、37.2s）**，死因两条：夏季买不到硬编码的 `472`（且守卫死咬"该去买"）、枯死作物 42 格全被围住不可达。本版只修这两条，然后发 run7。
+> 上一版 0.7.25 的 run6 = **干净快速失败（0/3、0 跨日、37.2s，首个日报告 t=18.5s）**，死因三条：夏季买不到硬编码的 `472`（且守卫死咬"该去买"）、枯死作物 42 格全被围住不可达、**stuck 日不能翻篇**（`no_day_progress` 直接终止整轮）。本版修这三条，然后发 run7。
 
 ---
 
@@ -10,6 +10,7 @@
 |---|---|---|
 | **task-67** | `BuySkill` 回执带**结构化在售清单** `available:[{id,name,price}]`（≤30 条，成功/失败都带）；脑侧按「name 含 Seeds/种子 且 price ≤ money/K(K=10) 的最便宜者」下单，不再硬编码 `472`；买不到 ⇒ journal `no_seed_for_sale` + **当天不再发起 buy**；**守卫里「没种子但钱够 ⇒ 该去买」当天失效**（改记 `seed_unavailable_today`），收工理由诚实（`no_work`/`stuck:`） | Mod + brain |
 | **task-68** | 判"走不到"之前先看 4 邻，邻格是可清障类（weed/stone/twig/grass）就先清它、清完重试目标格（每格 ≤4 次开路动作）；`unreachable_bound` 口径修正（分母只算"有过站位尝试"的格 / 追加与已封格数挂钩的绝对项 / 单列 `encircled`），**不放宽** `checks.unreachable_within_bound` 的存在性与 `no_unmet_stages` 的防空洞条 | brain |
+| **task-73** | **stuck 日有界翻篇**：idle 守卫判 stuck 后不立刻让外层 `no_day_progress` 终止整轮，而是先 `_do_sleep(..., "stuck_flush:…")` 翻到下一天（`MAX_STUCK_FLUSH=2`，刻意绕过 `sleep_guard` 并在 journal 写明理由）；睡不成才照旧终止。**该日 `verified` 仍为 False**（`ended_by=stuck`、`day_justified=False`），绝不许洗成 `no_work`/`night`/`stamina`；`eventUp`/`blocked_modal` 一律不 flush | brain |
 
 **不在本版**：task-53（农场级待清障/待开垦计数）、task-55（卖余料换种子钱，脑侧自己出货 + 分叠/记账）、task-58/59（LLM 带决策史 / 收工复盘）⇒ 排 0.7.27。
 
@@ -31,7 +32,7 @@
 
 ---
 
-## 3 run7 起跑（machine-runner：task-57）
+## 3 run7 起跑（machine-runner：task-74）
 
 - 先用起跑器，**不要**用托管后台作业（DSH 会在 agent 回合边界把作业连根收掉 ⇒ run4 13 秒猝死，见条目 040/041）：
   ```
