@@ -3,6 +3,17 @@
 > 本文是**收工快照**，只写"明天开工要用的东西"。`docs\_resume-prompt.md` 是 P2 时代的三步恢复法（仍然有效：单测 → `deploy-mod.py` → `run-plot.py`），但它的状态表已过期，以本文为准。
 > 目标不变：**P3 ⑥ —— 端到端自主完成「清障 → 开垦 → 播种 → 浇水」，连续 3 个游戏日无人工介入**（判据一律用 `observe?detail=full` 的 `tiles[]`/`inventory[]`/`money` 差分，回执不算证据）。
 
+## 0e. 2026-10-14 深夜收尾（**最新，与下文冲突以本节为准**）
+
+用户节奏：`User said (m10939)`：「准备收尾我需要重启dsh」⇒ 本回合只做"把状态收干净 + 让真实运行自己跑完"。
+
+- **0.7.26 已冻结并装机**：提交 **`6718429`**（`mod/AgentFarm.Bridge/manifest.json` 0.7.25→**0.7.26** + `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED="0.7.26"`）；`dotnet build -c Release --no-incremental` **0 警 0 错**（dll **172032 B** @22:51、manifest **19887 B**）；`tools/deploy-mod.py --no-quit` ⇒ 0.7.26 装机 + 自动读档 `Wahaha_450799035`（FarmHouse (9,9)）。
+- **run7 已脱离式起跑（与 DSH 无关，重启 DSH 不会中断它）**：`python tools/start-detached-longrun.py --journal logs\longrun-3day-llm-run7.jsonl --expect-version 0.7.26` ⇒ 体检通过（存活 True / 账本 12 行 / stderr 0 B）。产物：`logs/longrun-3day-llm-run7.jsonl`（+ `-llm.jsonl` 决策留痕）+ `logs/longrun-3day-llm-run7.{pid,console.log,console.err.log,version.json}`。console 首批已见 `[day] 1年 summer 3日 开始：Farm 体力 270 钱 14g 作物 31（未浇 31）` 与一串 `· 浇窗口外干作物 [x,y]：ok`（**task-50 的 Mod `farm.dryTiles` + 脑侧走过去浇在真机首次生效**）。
+- 起跑基线：`tools\preflight.py --expect 0.7.26 --save-baseline logs\run7-baseline.json` ⇒ **✅ 可以起跑**（`day [1,summer,3] 06:20`、`Farm (64,15)`、体力 270、**钱 14g**、`seeds []`、`crops 31`、`tillableCount 147`、无模态、`worldAdvancing true`）。
+- ⚠ **run7 是无种起跑（预期）**：昨晚预置的 956g 没能落盘（`ShippingMenu` 日终菜单把保存推迟、重开游戏回到钱 14g）⇒ 播种腿今晚大概率仍空转，`buy` 会走 task-67 的新路径（货架清单 → 挑当季种子 → 14g 买不起则记 `cannot_afford`，且**当天不再重试、不再判 stuck**）。这本身是 run7 要验的诚实性。
+- **收尾时未做（明天补）**：`tools/check-release.py --expect 0.7.26` 没跑（冻结时工作树还有 deputy 的未跟踪 `scratch/_t72_tool_fix.py`/`_t81_probe.py`）⇒ 明天先 `git add -A` + `check-release --expect 0.7.26`。
+- **明天开工顺序**：①读 `docs/_review-task78.md`（task-81，deputy-lead 在本回合收尾时仍在跑，完成与否看板面）；②`tools/verify-run3.py --journal logs\longrun-3day-llm-run7.jsonl` + `tools/analyze-longrun.py` + deputy 三源对账器三路复核 run7，并用 `scratch\run6-snapshot.py` 取外部证据；③按 run7 结果立卡（预期仍是"播种腿/经济闭环"与"窗口盲区"家族）；④goal 是 **paused/disarmed**，要在界面里 resume 才能自动续跑。
+
 ## 0d. 2026-10-14 收工（**最新，与下文冲突以本节为准**）
 
 用户节奏：`User said (m10163)`：「完成现有的任务后，跑一次真实的游戏运行，然后结束今天的事情，总结整理今天的进展，明天再继续」⇒ **今天到此为止，明天继续**。
