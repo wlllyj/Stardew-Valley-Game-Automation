@@ -451,18 +451,43 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
             field_unreach = int(day_unreach)
         elif sum_unreach:
             field_unreach = sum_unreach
-        # task-52 的豁免上界/实扣（账本优先，缺失时按 max(5, 20%×attempted) 自算）
-        attempted_total = int(end_stats.get("attempted") or 0)
+        # task-52 的豁免上界/实扣。**上界必须自算**（task-71：deputy 的 task-54 实测账本写
+        # `unreachable_bound=9999` 会被无条件采信 ⇒ 伪造账本 exit 0）。自算公式与 longrun 一致：
+        # `max(5, floor(0.2×attempted))`；账本值比自算值大 ⇒ problem（放宽豁免=洗白）。
+        attempted_day = end_stats.get("attempted")
+        attempted_self = sum(int(s.get("attempted") or 0) for s in stage_recs)
+        attempted_total = int(attempted_day) if isinstance(attempted_day, (int, float)) else 0
         if not attempted_total:
-            attempted_total = sum(int(s.get("attempted") or 0) for s in stage_recs)
+            attempted_total = attempted_self
+        if isinstance(attempted_day, (int, float)) and attempted_self and int(attempted_day) > attempted_self:
+            problems.append(
+                f"[{name}] day_end.attempted={int(attempted_day)} > stages 求和 {attempted_self}"
+                "（抬高分母就能放宽 20% 上界 ⇒ 账目不可信）"
+            )
+        bound_self = max(5, int(0.2 * attempted_total)) if attempted_total else 5
         _bound = end_stats.get("unreachable_bound")
-        if not isinstance(_bound, (int, float)):
-            _bound = max(5, int(0.2 * attempted_total)) if attempted_total else 5
-        bound = int(_bound)
+        bound = int(_bound) if isinstance(_bound, (int, float)) else bound_self
+        if isinstance(_bound, (int, float)) and bound != bound_self:
+            if bound > bound_self:
+                problems.append(
+                    f"[{name}] 不可达豁免上界账本={bound} > 自算={bound_self}"
+                    f"（attempted={attempted_total}）⇒ 上界被放宽，可能把真失败洗成不可达"
+                )
+            else:
+                infos.append(
+                    f"[{name}] 不可达豁免上界账本={bound} < 自算={bound_self}（更严，信息项）"
+                )
         _exempt = end_stats.get("unreachable_exempt")
         if not isinstance(_exempt, (int, float)):
             _exempt = min(bound, self_unreach) if (self_unreach or field_unreach) else 0
         unreach_exempt = max(0, int(_exempt))
+        field_tiles_raw = end_stats.get("unreachable_tiles")
+        field_tiles = {tuple(t) for t in field_tiles_raw or [] if isinstance(t, (list, tuple)) and len(t) >= 2}
+        if unreach_exempt > 0 and self_tiles == 0 and not field_tiles:
+            problems.append(
+                f"[{name}] 不可达豁免扣了 {unreach_exempt} 格却没写任何坐标"
+                "（journal 无 unreachable 逐格事件、day_end.unreachable_tiles 也空 ⇒ 缺失≠通过）"
+            )
         if field_unreach is not None or self_unreach:
             src = f"{field_unreach}" if field_unreach is not None else "未写"
             infos.append(
@@ -495,14 +520,40 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
             sum_refused or None
         )
         _rbound = end_stats.get("refused_bound")
-        if not isinstance(_rbound, (int, float)):
-            _rbound = max(5, int(0.2 * attempted_total)) if attempted_total else 5
-        rbound = int(_rbound)
+        rbound_self = max(5, int(0.2 * attempted_total)) if attempted_total else 5
+        rbound = int(_rbound) if isinstance(_rbound, (int, float)) else rbound_self
+        if isinstance(_rbound, (int, float)) and rbound != rbound_self:
+            if rbound > rbound_self:
+                problems.append(
+                    f"[{name}] 被拒豁免上界账本={rbound} > 自算={rbound_self}"
+                    f"（attempted={attempted_total}）⇒ 上界被放宽，可能把真失败洗成「游戏拒绝」"
+                )
+            else:
+                infos.append(f"[{name}] 被拒豁免上界账本={rbound} < 自算={rbound_self}（更严，信息项）")
         # task-63 的实扣（账本优先；缺失时按 min(bound, 被拒格数) 自算，与 longrun 同口径）
         _rexempt = end_stats.get("refused_exempt")
         if not isinstance(_rexempt, (int, float)):
             _rexempt = min(rbound, self_refused) if (self_refused or field_refused) else 0
         refused_exempt = max(0, int(_rexempt))
+        refused_tiles_raw = end_stats.get("refused_tiles")
+        refused_tiles_field = {
+            tuple(t) for t in refused_tiles_raw or [] if isinstance(t, (list, tuple)) and len(t) >= 2
+        }
+        if refused_exempt > 0 and self_refused_tiles == 0 and not refused_tiles_field:
+            problems.append(
+                f"[{name}] 被拒豁免扣了 {refused_exempt} 格却没写任何坐标"
+                "（journal 无 tool_refused 逐格事件、day_end.refused_tiles 也空 ⇒ 缺失≠通过）"
+            )
+        # task-71：两套豁免不得互相掩护 —— 同一格同时进 unreachable 与 refused 会重复扣减。
+        self_unreach_tiles = unreach_tiles_by_day.get(sess) or set()
+        self_refused_tile_set = refused_tiles_by_day.get(sess) or set()
+        overlap = (set(self_unreach_tiles) | field_tiles) & (set(self_refused_tile_set) | refused_tiles_field)
+        if overlap:
+            sample = "、".join(f"({int(t[0])},{int(t[1])})" for t in sorted(overlap)[:6])
+            problems.append(
+                f"[{name}] 同一格同时进两套豁免：{len(overlap)} 格（例 {sample}）"
+                "⇒ 可被重复扣减（unreachable + refused），必须人工核对坐标来源"
+            )
         if field_refused is not None or self_refused:
             src_r = f"{field_refused}" if field_refused is not None else "未写"
             infos.append(

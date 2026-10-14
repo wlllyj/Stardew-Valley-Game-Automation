@@ -196,6 +196,7 @@ class TestVerifyRun3(unittest.TestCase):
             unreachable=2,
             unreachable_bound=5,
             unreachable_exempt=2,
+            unreachable_tiles=[[71, 34], [74, 34]],
             attempted=10,
         )
         ok, s = self.check(rows)
@@ -429,7 +430,9 @@ class TestVerifyRun3(unittest.TestCase):
                 day_end(d, nd, t=i * 300.0 + 200, ok_steps=1, stages=stages,
                         checks={"unreachable_within_bound": True, "refused_within_bound": True},
                         unreachable=1, unreachable_bound=5, unreachable_exempt=1,
-                        refused=1, refused_bound=5, refused_exempt=1),
+                        unreachable_tiles=[[38, 20]],
+                        refused=1, refused_bound=5, refused_exempt=1,
+                        refused_tiles=[[39, 20]]),
             ]
         rows.append(finish())
         ok, s = self.check(rows)
@@ -450,6 +453,7 @@ class TestVerifyRun3(unittest.TestCase):
                         checks={"no_unmet_stages": False, "no_hard_failures": False,
                                 "unreachable_within_bound": True, "refused_within_bound": True},
                         unreachable=3, unreachable_bound=5, unreachable_exempt=3,
+                        unreachable_tiles=[[60, 20], [61, 20], [62, 20]],
                         refused=0, refused_bound=5, refused_exempt=0),
             ]
         rows.append(finish(code=1, streak=0))
@@ -509,6 +513,79 @@ class TestVerifyRun3(unittest.TestCase):
         self.assertTrue(
             any("不可达计数账本" in i and "不一致" in i for i in s["infos"]), s["infos"]
         )
+
+    # ---------------------------------------------- task-71：对抗加固（deputy task-54 实测打穿的三条通道）
+    def test_forged_large_unreachable_bound_is_problem(self):
+        """账本把豁免上界写成 9999（attempted=10 ⇒ 自算应为 5）⇒ 必须判红，不许无条件采信账本。"""
+        rows = tweak(green_rows(), "day_end", attempted=10, unreachable=0,
+                     unreachable_bound=9999, unreachable_exempt=0,
+                     checks={"unreachable_within_bound": True})
+        ok, s = self.check(rows)
+        self.assertFalse(ok)
+        self.assertTrue(
+            any("上界" in p and "自算" in p for p in s["problems"]), s["problems"]
+        )
+
+    def test_forged_large_refused_bound_is_problem(self):
+        """同一通道的被拒侧：`refused_bound` 也不许被账本放宽。"""
+        rows = tweak(green_rows(), "day_end", attempted=10, refused=0,
+                     refused_bound=9999, refused_exempt=0,
+                     checks={"refused_within_bound": True})
+        ok, s = self.check(rows)
+        self.assertFalse(ok)
+        self.assertTrue(
+            any("被拒豁免上界" in p and "自算" in p for p in s["problems"]), s["problems"]
+        )
+
+    def test_exemption_without_coordinates_is_problem(self):
+        """扣了豁免却没有任何坐标（journal 无逐格事件、账本 tiles 也空）⇒ 判红（缺失≠通过）。"""
+        rows = tweak(green_rows(), "day_end", attempted=10, unreachable=2,
+                     unreachable_bound=5, unreachable_exempt=2,
+                     checks={"unreachable_within_bound": True})
+        ok, s = self.check(rows)
+        self.assertFalse(ok)
+        self.assertTrue(
+            any("没写任何坐标" in p for p in s["problems"]), s["problems"]
+        )
+
+    def test_overlapping_exemption_tiles_is_problem(self):
+        """同一格同时进 unreachable 与 refused（可重复扣减）⇒ 判红。"""
+        rows = green_rows()
+        rows.insert(2, {"event": "unreachable", "t": 40.0, "_lineno": 80, "tile": [40, 20],
+                        "reason": "四邻都站不过去（没有落脚点）"})
+        rows.insert(3, {"event": "tool_refused", "t": 41.0, "_lineno": 81, "tile": [40, 20],
+                        "status": "tool_ineffective"})
+        for i, r in enumerate(rows):
+            if r.get("event") == "day_end" and r["final"]["day"][2] == 10:
+                rows[i] = day_end(r["final"]["day"], r["day_after"], attempted=10,
+                                  unreachable=1, unreachable_bound=5, unreachable_exempt=1,
+                                  refused=1, refused_bound=5, refused_exempt=1,
+                                  checks={"unreachable_within_bound": True,
+                                          "refused_within_bound": True})
+        ok, s = self.check(rows)
+        self.assertFalse(ok)
+        self.assertTrue(
+            any("同一格同时进两套豁免" in p for p in s["problems"]), s["problems"]
+        )
+
+    def test_disjoint_exemptions_with_coordinates_stay_green(self):
+        """反向：两套豁免坐标不相交、各带上界内实扣 ⇒ 只记 info，不误报。"""
+        rows = green_rows()
+        rows.insert(2, {"event": "unreachable", "t": 40.0, "_lineno": 80, "tile": [40, 20],
+                        "reason": "四邻都站不过去（没有落脚点）"})
+        rows.insert(3, {"event": "tool_refused", "t": 41.0, "_lineno": 81, "tile": [41, 20],
+                        "status": "tool_ineffective"})
+        for i, r in enumerate(rows):
+            if r.get("event") == "day_end" and r["final"]["day"][2] == 10:
+                rows[i] = day_end(r["final"]["day"], r["day_after"], attempted=10,
+                                  unreachable=1, unreachable_bound=5, unreachable_exempt=1,
+                                  refused=1, refused_bound=5, refused_exempt=1,
+                                  checks={"unreachable_within_bound": True,
+                                          "refused_within_bound": True})
+        ok, s = self.check(rows)
+        self.assertFalse(any("同时进两套豁免" in p for p in s["problems"]), s["problems"])
+        self.assertFalse(any("没写任何坐标" in p for p in s["problems"]), s["problems"])
+        self.assertTrue(ok, s.get("problems"))
 
 
 if __name__ == "__main__":
