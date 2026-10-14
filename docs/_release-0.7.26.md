@@ -15,8 +15,9 @@
 | **task-71** | `verify-run3` 对抗加固：两套豁免的 `bound` 一律**自算**（账本写 `9999` 不再被采信）、豁免>0 而无坐标 ⇒ problem、同一格同时进两套豁免 ⇒ problem、`attempted` 被抬高 ⇒ 可疑 | 工具 |
 | **task-75** | `verify-run3` 接住 task-68 的五个新名字（`encircled`/`encircled_stage`/`encircled_summary`/`frontier_clear`/`clear_neighbor`）：白名单补 `day_end.encircled*`、会话级自算、info 里点名"`stuck` 且 `ok_steps==0` ⇒ 零动作收工" | 工具 |
 | **task-76** | `analyze-longrun` 收同样五个新事件（可达性/开路新类，与 `environment:unreachable` 分开计数）+ 漂移测试全绿 | 工具 |
+| **task-78** | **封闭 encircled 洗白通道**（deputy 的 task-77 对抗验收打穿 V5：`encircled` 步计进 `attempted` ⇒ `max(5, 20%×attempted)` 被抬到 200 ⇒ 200 格真不可达被豁免、exit 0）：新增上界基数 `bound_basis = attempted − encircled`，两套豁免上界改用它起界（`attempted` 语义不变，仍是原始证据计数）；`day_end`/两套 summary 新增 `bound_basis` 字段；`encircled` 判据文案与 journal 照实写（四邻**真实 kind** + 开路尝试次数 `tried_open`），不再断言"树/桩/大石"。工具侧由 Lead 镜像（`2ce830b`：自算同式、账本基数/上界大于自算 ⇒ problem、`stuck_flushed=true` 却 verified ⇒ problem） | brain + 工具 |
 
-**不在本版**：task-53（农场级待清障/待开垦计数）、task-55（卖余料换种子钱，脑侧自己出货 + 分叠/记账）、task-58/59（LLM 带决策史 / 收工复盘）⇒ 排 0.7.27。
+**不在本版**：task-53（农场级待清障/待开垦计数）、task-55（卖余料换种子钱，脑侧自己出货 + 分叠/记账）、task-58/59（LLM 带决策史 / 收工复盘）⇒ 排 0.7.27；task-79/80（验收工具 v5 文档、analyze-longrun 口径同步）**只改文档/呈现**、不阻塞本版。
 
 ---
 
