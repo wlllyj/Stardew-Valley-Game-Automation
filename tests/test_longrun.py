@@ -38,8 +38,8 @@ from agentfarm.farmwork import (  # noqa: E402
 )
 from agentfarm.longrun import (  # noqa: E402
     DEFAULT_LLM_MAX_TOKENS, ENDED_BY_EVENT, ENDED_BY_MODAL, FRONTIER_CLEAR_MAX,
-    JUSTIFIED_END_REASONS, MAX_ENV_ATTEMPTS, MAX_TILE_ATTEMPTS, DayReport, LongRun,
-    _till_blocked_by, is_justified_end, plot_observe,
+    JUSTIFIED_END_REASONS, MAX_ENV_ATTEMPTS, MAX_STUCK_FLUSH, MAX_TILE_ATTEMPTS, DayReport,
+    LongRun, _till_blocked_by, is_justified_end, plot_observe,
 )
 from agentfarm.planner import BoundaryPlanner, Brief, TaskIntent, deterministic_plan  # noqa: E402
 
@@ -967,7 +967,12 @@ class TestDiscipline(unittest.TestCase):
         rep = run.days[0]
         self.assertNotEqual(rep.ended_by, "sleep")
         self.assertTrue(any(e["event"] == "intent_vetoed" for e in run.entries))
-        self.assertEqual(w.sleeps, 0)
+        # task-73 之后：判 `stuck` 的日子会走**有界翻篇**（`_stuck_flush`，整轮 ≤ MAX_STUCK_FLUSH 次），
+        # 所以这里允许出现 sleep —— 但必须**全部来自翻篇**，绝不许来自那个被否决的睡眠意图。
+        flushes = [e for e in run.entries if e["event"] == "stuck_flush"]
+        self.assertEqual(w.sleeps, len(flushes),
+                         "睡觉只能来自 stuck 翻篇；被否决的睡眠意图一次都不许落地")
+        self.assertLessEqual(len(flushes), MAX_STUCK_FLUSH)
         # 不是假装干完了：如实报 stuck
         self.assertEqual(rep.ended_by, "stuck")
 
@@ -3815,6 +3820,147 @@ class TestTask68FrontierClear(unittest.TestCase):
         st = [s for s in rep.stages if s.get("attempted")][0]
         self.assertIn("engaged", st)
         self.assertLessEqual(st["engaged"], st["attempted"])
+
+
+class TestTask73StuckFlush(unittest.TestCase):
+    """task-73：stuck 日**有界翻篇** —— 睡过去让整轮继续，而不是 run6 那样 19 秒终止。
+
+    背景（run6 真机 `logs/longrun-3day-llm-run6.jsonl`）：两个 `day_end` 都是 `ended_by=stuck`
+    （42 格够不着、`clear_dead` 一格 ok 都没有），随后外层 `run()` 命中
+    `prev_key == self._last_day_key` ⇒ 写 `no_day_progress` 并 **break 整轮**：游戏日根本没往前
+    走（没睡），一次「撞上一片走不到的簇」就让无人值守在 19 秒内结束，连"明天再试"的机会都没有。
+
+    这里补的正是"翻篇"：`_stuck_flush` 刻意**绕过 `sleep_guard`**（守卫此刻仍会说有活）睡一觉、
+    把游戏日推一格，让外层继续；但**验收一个字不放宽** —— 这一天 `ended_by` 仍是 `stuck`、
+    `checks["day_justified"] is False`、`verified is False`，绝不许洗成 `no_work`/`night`/`stamina`。
+
+    变异自检（`%TEMP%\t73_mutate.py`，复制 brain+tests 到临时目录做文本替换，跑完即删；实测
+    2026-10-14）：
+
+    * `m73a`：把 `if self.stuck_flushes >= MAX_STUCK_FLUSH:` 改成 `if False:`（去掉整轮上界）
+      ⇒ **红 2**（`test_flush_is_bounded_by_max_stuck_flush` + `test_flushed_day_is_still_stuck_and_never_verified`）。
+    * `m73b`：翻篇成功后把 `rep.ended_by` 改写成 `"sleep"`（把"睡过去"洗成正常收工）
+      ⇒ **红 1**（`test_flushed_day_is_still_stuck_and_never_verified`）。
+    * 基线：本类 4 条全绿。
+    """
+
+    @staticmethod
+    def _events(run: LongRun, event: str) -> list[dict]:
+        return [e for e in run.entries if e.get("event") == event]
+
+    @staticmethod
+    def _day_key_of(world: FakeWorld) -> list:
+        return [int(v) if str(v).isdigit() else str(v) for v in FarmWorker.day_key(world.obs())]
+
+    def _run_for(self, w: FakeWorld):
+        client = FakeClient(w)
+        worker = FakeWorker(w)
+        run = make_run(w, client_factory=lambda: client, worker_factory=lambda c: worker,
+                       target_days=1, max_days=1)
+        run.worker = worker
+        run.client = client
+        return run
+
+    def test_flush_sleeps_and_advances_the_game_day(self):
+        """翻篇 = 真的睡了一觉、游戏日 +1，且账本（`stuck_flushes`/`day_after`）落下来。"""
+        w = FakeWorld()
+        run = self._run_for(w)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        self.assertTrue(run._stuck_flush(w.obs(), rep, "stuck:测试"))
+        self.assertEqual(run.stuck_flushes, 1)
+        self.assertEqual(w.day, 7, "翻篇必须真的把游戏日推一格（默认 spring 6）")
+        self.assertIs(rep.stuck_flushed, True)
+        self.assertEqual(rep.day_after, self._day_key_of(w))
+        ev = self._events(run, "stuck_flush")
+        self.assertEqual(len(ev), 1, ev)
+        self.assertIs(ev[0]["ok"], True)
+        self.assertEqual(ev[0]["count"], 1)
+        self.assertEqual(ev[0]["limit"], MAX_STUCK_FLUSH)
+        self.assertEqual(ev[0]["day_after"], self._day_key_of(w))
+        self.assertIn("sleep_guard", ev[0]["note"], "绕过 sleep_guard 的理由必须写进 journal")
+
+    def test_flush_is_bounded_by_max_stuck_flush(self):
+        """整轮最多 `MAX_STUCK_FLUSH` 次：到顶后不再睡，如实维持现状（外层照旧终止）。"""
+        w = FakeWorld()
+        run = self._run_for(w)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        run.stuck_flushes = MAX_STUCK_FLUSH
+        self.assertFalse(run._stuck_flush(w.obs(), rep, "stuck:到顶"))
+        self.assertEqual(w.day, 6, "到顶后绝不许再睡一天")
+        self.assertIs(rep.stuck_flushed, False)
+        self.assertEqual(self._events(run, "stuck_flush"), [])
+        skipped = self._events(run, "stuck_flush_skipped")
+        self.assertEqual(len(skipped), 1, skipped)
+        self.assertEqual(skipped[0]["count"], MAX_STUCK_FLUSH)
+        self.assertEqual(skipped[0]["limit"], MAX_STUCK_FLUSH)
+
+    def test_never_flushes_during_a_game_event_or_a_save_modal(self):
+        """task-41/task-11 不回归：`eventUp=true` 与只等不关的存档模态期间**绝不**翻篇。"""
+        w = FakeWorld()
+        run = self._run_for(w)
+        base = w.obs()
+        event_obs = {**base, "ui": {**base.get("ui", {}), "eventUp": True}}
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        self.assertFalse(run._stuck_flush(event_obs, rep, "stuck:事件"))
+        self.assertEqual(w.day, 6)
+        self.assertEqual(run.stuck_flushes, 0)
+        self.assertEqual(self._events(run, "stuck_flush_skipped")[0]["reason"], "eventUp=true")
+        # 存档类模态（只等不关）：同样一次都不许睡
+        run2 = self._run_for(FakeWorld())
+        save_obs = {**base, "ui": {**base.get("ui", {}), "activeMenu": "SaveGameMenu"}}
+        rep2 = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        self.assertFalse(run2._stuck_flush(save_obs, rep2, "stuck:存档"))
+        self.assertEqual(run2.stuck_flushes, 0)
+        self.assertIn("SaveGameMenu", self._events(run2, "stuck_flush_skipped")[0]["reason"])
+
+    def test_flushed_day_is_still_stuck_and_never_verified(self):
+        """day 级：stuck 日翻篇后整轮**继续**（不再 19 秒 `no_day_progress` 终止）。
+
+        复现 run6 的形态：作业区目标恒被 `ui_modal` 挡住（env 挡路 ⇒ 不封格、不占配额、世界
+        永不变），而且**没有**任何可达的可清障格 ⇒ `_frontier_clear` 也拿不出动作 ⇒ 走到
+        `idle_rounds>=3` 那一支。翻篇把游戏日推了一格（第 6 天 → 第 7 天），所以总控**不该**
+        在第 1 天就写 `no_day_progress`；但这一天仍如实算 `stuck`：`day_justified is False`、
+        `verified is False`。到了整轮上限（`MAX_STUCK_FLUSH`）之后才允许终止。
+        """
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        # 作业区那一格"环境挡路"（`ui_modal`）：**不封格、不占配额**（task-22 口径）⇒ 每轮都被
+        # 重新选中、世界却一点都不变 ⇒ 累计 `idle_rounds`，正是 run6 的僵局形态。而且这里**没有**
+        # 任何可达的可清障格 ⇒ `_frontier_clear` 也拿不出动作，只能靠 task-73 的"翻篇"。
+        w.blockers[(60, 10)] = "weed"
+        w.fail_status[(60, 10)] = "ui_modal"
+        client = FakeClient(w)
+        worker = FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+        run = make_run(w, client_factory=lambda: client, worker_factory=lambda c: worker,
+                       target_days=1, max_days=4)
+        run.worker = worker
+        run.client = client
+        # 三个 seam，把"三轮下来世界一点没变"这件事**确定化**（`idle_rounds` 量的正是它）：
+        #   ① 作业区钉在那一格（否则 `_ensure_plot` 会换片地，走的是 task-49 那条"换 11 片地"出口）；
+        #   ② `_execute` 不落地任何动作（真机里对应"目标恒被环境挡住 ⇒ 每次都没改变世界"）；
+        #   ③ 世界指纹冻结（`changed` 恒假 ⇒ 连续 3 轮后进 idle 分支）。
+        # 被 seam 掉的只有"执行/指纹"这两件事，"判 stuck 之后干什么"完全走生产代码。
+        run._ensure_plot = lambda obs, rep: {"zone": "", "label": "", "anchor": [62, 12],
+                                             "tiles": [(60, 10)], "note": ""}
+        run._execute = lambda decision, obs, plot, rep: True
+        run._fingerprint = lambda obs: "frozen"
+        run.run()
+        first = run.days[0]
+        self.assertEqual(first.ended_by, "stuck", "翻篇不许把这一天洗成别的结局")
+        self.assertIs(first.checks["day_justified"], False, "翻篇不是「收工有正当理由」")
+        self.assertIs(first.verified, False)
+        self.assertIs(first.stuck_flushed, True)
+        flushes = self._events(run, "stuck_flush")
+        self.assertEqual(len(flushes), MAX_STUCK_FLUSH, flushes)
+        self.assertIs(flushes[0]["ok"], True)
+        self.assertEqual(flushes[0]["day_after"], [1, "spring", 7])
+        self.assertEqual(flushes[1]["day_after"], [1, "spring", 8])
+        # 翻篇把游戏日一天一天推着走 ⇒ 整轮**没有**在第 1 天就 19 秒终止（run6 的病灶）
+        self.assertGreaterEqual(len(run.days), 3, "翻篇后必须继续跑下一天，而不是当场终止")
+        self.assertEqual(w.day, 6 + MAX_STUCK_FLUSH, "每个翻篇日推一格游戏日")
+        # 有界：到整轮上限后如实维持现状终止（不是无限睡），并且 `no_day_progress` 只出现在最后
+        self.assertEqual(run.stuck_flushes, MAX_STUCK_FLUSH)
+        self.assertEqual(len(self._events(run, "no_day_progress")), 1)
+        self.assertEqual(run.summary["stuck_flushes"], run.stuck_flushes)
 
 
 if __name__ == "__main__":  # pragma: no cover

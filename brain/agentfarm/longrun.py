@@ -89,6 +89,16 @@ MAX_ENV_ATTEMPTS = 2
 #: 上界 20/天：不封顶的话"目标全够不着"的日子会把整天耗在**无目的**的清障上。
 FRONTIER_CLEAR_MAX = 20
 
+#: 【task-73】stuck 日"有界翻篇"的整轮上限（Lead m06814）。
+#:
+#: 为什么要翻篇：run6（0.7.25）两个 `day_end` 都是 `ended_by=stuck`，随后 `run()` 命中
+#: `prev_key == self._last_day_key` ⇒ 写 `no_day_progress` 并 **break 整轮** —— 游戏日根本
+#: 没往前走（没睡），一次"撞上一片走不到的簇"就让无人值守在 **19 秒**内终止，连"明天再试"
+#: 的机会都没有。所以 idle 守卫判 stuck 后不再直接停：走一条**刻意绕过 `sleep_guard`** 的
+#: 收尾睡觉路径（守卫此刻仍会说"有活"，但本日已用有界尝试证明动不了）。
+#: 取 2：一次算偶发（世界刚好卡了一片），两次以上就该让人来看，而不是无限"睡过去再撞一次"。
+MAX_STUCK_FLUSH = 2
+
 #: 【task-50】同一格"窗口外干作物"一天最多试几次（一次 = 走过去 + 浇一下）。
 #:
 #: 为什么要这个上限：`farm.dryTiles` 里的格子可能**根本走不到**（农场另一头、
@@ -319,6 +329,11 @@ class DayReport:
     #: 它们的用途是给出**证据**（run6 的 42 格"走不到"里有多少其实是"开不了路"）与下一步归因。
     encircled: int = 0
     encircled_tiles: list[Any] = field(default_factory=list)
+    #: 【task-73】这一天是 `stuck`、但**已经睡过去翻篇**了（有界 `MAX_STUCK_FLUSH`/整轮）。
+    #: 注意语义：`ended_by` 仍然是 `stuck`、`checks.day_justified=False`、`verified=False`
+    #: —— 这一天**如实算失败**，只是"游戏日往前走了一格"，让整轮能继续跑下一天，
+    #: 而不是像 run6 那样 19 秒 `no_day_progress` 终止。
+    stuck_flushed: bool = False
 
     @property
     def failed_steps(self) -> int:
@@ -376,6 +391,8 @@ class DayReport:
             # 【task-68】被围住：只报证据（计数 + 坐标），不进任何豁免分子
             "encircled": self.encircled,
             "encircled_tiles": [list(t) for t in self.encircled_tiles],
+            # 【task-73】stuck 日是否已翻篇（睡过去了）—— 只作证据；验收口径不变
+            "stuck_flushed": self.stuck_flushed,
         }
 
 
@@ -571,6 +588,9 @@ class LongRun:
         # 【task-68】本日 `frontier_clear`（"所有指定目标都不可达时，也要至少清掉一格可达的可清障格"）
         # 已经用掉的次数。上界 20：不封顶的话，"目标全不可达"的日子会把整天耗在无目的的清障上。
         self.frontier_clears = 0
+        # 【task-73】**整轮**（不是每天）已经用掉的"stuck 日翻篇"次数（上界 `MAX_STUCK_FLUSH`）。
+        # 刻意不复位：一次卡死睡过去还能算偶发，两次以上就该让人来看，而不是无限"睡过去再撞一次"。
+        self.stuck_flushes = 0
         # 本日"为了看没做完的格子而往回走"的次数上限（防"来回跑"把一天走光）。
         self.resume_walks = 0
         # 【task-50】窗口外干作物（Mod 的 `farm.dryTiles`）：每格试了几次、哪些已经认输。
@@ -1717,6 +1737,65 @@ class LongRun:
             return "sleep", why
         rep.notes.append(f"睡觉失败：{st.reason}（{why}）")
         return "sleep_failed", st.reason
+
+    def _stuck_flush(self, obs: dict[str, Any], rep: DayReport, why: str) -> bool:
+        """【task-73】stuck 日**有界翻篇**：睡过去一天，让整轮继续，而不是 19 秒终止。
+
+        run6（0.7.25）两个 `day_end` 都是 `ended_by=stuck`，随后 `run()` 命中
+        `prev_key == self._last_day_key` ⇒ 写 `no_day_progress` 并 **break 整轮**：游戏日根本
+        没往前走（没睡），一次"撞上一片走不到的簇"就让无人值守在 **19 秒**内结束，连"明天再试"
+        的机会都没有（run6 verdict 里的「跨日没有推进 ×1」）。
+
+        这里**刻意绕过 `sleep_guard`**：守卫此刻仍会说"有活"（`farm.dryCrops`、跨片地遗留…），
+        但我们刚刚已经用**有界**的尝试（阶段重试 / 开路 / `frontier_clear` / 每格配额）证明今天
+        动不了 —— 原地再试只会重复写同一条 journal。绕过的理由写进 journal `stuck_flush.note`。
+
+        **绝不放宽验收**：本日 `ended_by` 保持 `stuck`、`checks.day_justified=False`、
+        `verified=False`；绝不许把 `stuck` 洗成 `no_work`/`night`/`stamina`。
+
+        返回 True = 睡成了（游戏日已前进，外层循环继续跑下一天）；False = 维持现状（外层照旧
+        `no_day_progress` 终止）。`eventUp` / 存档类模态期间**绝不**翻篇（task-41 / task-11 不回归）。
+        """
+        ui = obs.get("ui") or {}
+        if ui.get("eventUp"):
+            self._journal("stuck_flush_skipped", reason="eventUp=true",
+                          note="task-41：游戏事件挂住必须人来处理，绝不用睡觉把它糊过去")
+            return False
+        menu = str(ui.get("activeMenu") or "")
+        if menu in MODAL_WAIT_ONLY:
+            self._journal("stuck_flush_skipped", reason=f"activeMenu={menu}",
+                          note="task-11：存档类模态只等不关，翻篇会打断存档")
+            return False
+        if self.stuck_flushes >= MAX_STUCK_FLUSH:
+            self._journal("stuck_flush_skipped", count=self.stuck_flushes, limit=MAX_STUCK_FLUSH,
+                          note="翻篇次数已达整轮上限，维持现状（本日如实算 stuck，运行终止）")
+            return False
+        self.stuck_flushes += 1
+        why_txt = why or "守卫没有再给理由"
+        by, detail = self._do_sleep(obs, rep, f"stuck_flush:{why_txt}")
+        ok = by == "sleep"
+        if ok:
+            # 睡成功后重新观测一次（`rep.final` 是**睡前**证据，跨日必须靠观测）：
+            # 顺手把 `day_after` 落进账本，`stuck_flush` 的 journal 才能带上目标字段。
+            rep.stuck_flushed = True
+            try:
+                fresh = self._snap()
+                rep.day_after = [int(v) if str(v).isdigit() else str(v)
+                                 for v in FarmWorker.day_key(fresh)]
+            except BridgeError as exc:  # pragma: no cover - 仅诊断
+                self._journal("stuck_flush_resnap_failed", error=str(exc))
+            rep.notes.append(
+                f"stuck 日翻篇：已睡过这一天（第 {self.stuck_flushes}/{MAX_STUCK_FLUSH} 次），"
+                "下一轮继续跑新的一天；本日仍如实记 stuck、day_justified=False、不 VERIFIED")
+        else:
+            rep.notes.append("stuck 日翻篇失败（睡不过去）⇒ 维持现状终止")
+        self._journal("stuck_flush", ok=ok, count=self.stuck_flushes, limit=MAX_STUCK_FLUSH,
+                      day_after=list(rep.day_after) if rep.day_after else None,
+                      detail=str(detail)[:200],
+                      note=("守卫仍说「有活」，但本日已用有界尝试（阶段重试/开路/frontier_clear/每格"
+                            "配额）证明动不了 ⇒ 刻意绕过 sleep_guard 睡过去，让整轮继续跑下一天；"
+                            "本日仍如实计 stuck、day_justified=False、绝不 VERIFIED。"))
+        return ok
 
     # ------------------------------------------------------------------ 执行
     def _run_stage_intent(self, intent: TaskIntent, obs: dict[str, Any], plot: dict[str, Any],
@@ -2916,6 +2995,10 @@ class LongRun:
                     rep.ended_by, rep.ended_reason = "stuck", (
                         f"stuck:连续 {self.idle_rounds} 轮世界没有任何变化（最后意图："
                         f"{[i.task for i in decision.intents]}；策略说有进展：{acted}）{why}")
+                    # 【task-73】不再直接让外层 break：先试一晚**有界翻篇**（睡过去、让整轮继续
+                    # 跑下一天 —— run6 就是在这里 19 秒 `no_day_progress` 终止的）。`ended_by`
+                    # 保持 `stuck`：这一天仍如实算失败，只是游戏日往前走了一格。
+                    self._stuck_flush(obs, rep, rep.ended_reason)
                     break
                 self.sleep_fn(0.5)
             if self.supervise_every and self._actions and self._actions % self.supervise_every == 0:
@@ -3124,7 +3207,10 @@ class LongRun:
         # （之前只被"睡觉失败的日子整段跳过浇水检查"这层遮住没暴露）。这是**观测**不是回执。
         try:
             key_obs = last_obs
-            if rep.ended_by == "sleep":
+            # 【task-73】stuck 日翻篇也睡过了一天 ⇒ 同样必须重新取观测，否则 `_last_day_key`
+            # 还停在旧的一天，总控会误判"游戏日没有前进"当场停（那样翻篇就白做了）。
+            # `_stuck_flush` 已经取过一张的话（`day_after` 非空）就不重复发请求。
+            if rep.ended_by == "sleep" or (rep.stuck_flushed and not rep.day_after):
                 try:
                     fresh = self._snap()
                 except BridgeError as exc:  # pragma: no cover - 仅诊断
@@ -3134,7 +3220,14 @@ class LongRun:
                     key_obs = fresh
                     rep.day_after = [int(v) if str(v).isdigit() else str(v)
                                      for v in FarmWorker.day_key(fresh)]
-            self._last_day_key = tuple(FarmWorker.day_key(key_obs))
+            # 【task-73】翻篇那天 `_stuck_flush` 已经把"睡后那一天"取进 `rep.day_after`（而
+            # `key_obs` 还是睡前观测）⇒ 优先用 `day_after`，否则总控会把翻篇误判成
+            # "游戏日没有前进"当场 break（翻篇白做）。`rep.day_after` 的归一化形式与
+            # `FarmWorker.day_key()` 一致，可直接成 tuple。
+            if rep.day_after:
+                self._last_day_key = tuple(rep.day_after)
+            else:
+                self._last_day_key = tuple(FarmWorker.day_key(key_obs))
         except Exception:  # pragma: no cover
             self._last_day_key = None
         self._journal("day_end", **rep.as_dict())
@@ -3260,12 +3353,16 @@ class LongRun:
             "stages_seen": sorted({s for d in self.days for s in d.stages_seen}),
             "no_unmet_stages": not unmet_days,
             "unmet_days": unmet_days,
+            # 【task-73】整轮用掉几次"stuck 日翻篇"（上界 `MAX_STUCK_FLUSH`）：>0 说明有日子是
+            # 靠睡过去才让运行继续的 —— 那些日子本身仍如实算 `stuck`/不 VERIFIED，这里只是账。
+            "stuck_flushes": self.stuck_flushes,
             "journal": str(self.journal_path) if self.journal_path else "",
             **({"prepare_error": self.summary["prepare_error"]} if self.summary.get("prepare_error") else {}),
         }
         self._journal("finish", code=code, verified_streak=streak, actions=self._actions,
                       minutes=round(self._elapsed_minutes(), 2), stages_seen=self.summary["stages_seen"],
-                      no_unmet_stages=not unmet_days, unmet_days=unmet_days)
+                      no_unmet_stages=not unmet_days, unmet_days=unmet_days,
+                      stuck_flushes=self.stuck_flushes)
         if self._jf is not None:
             try:
                 self._jf.close()
@@ -3277,5 +3374,6 @@ class LongRun:
                   f"（共 {len(self.days)} 天，{self._actions} 个动作，{self.summary['minutes']} 分钟）"
                   + f"；no_unmet_stages={not unmet_days}"
                   + (f"（有未完成阶段的天：{'、'.join(unmet_days)}）" if unmet_days else "")
+                  + (f"；stuck 日翻篇 {self.stuck_flushes} 次" if self.stuck_flushes else "")
                   + (f"；准备失败：{self.summary['prepare_error']}" if self.summary.get("prepare_error") else ""))
         return code
