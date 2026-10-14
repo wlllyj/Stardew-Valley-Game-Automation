@@ -3,7 +3,8 @@
 - 作者：deputy-lead（应 Lead m00877④）
 - v1 2026-10-13 01:0x，工具 `tools\verify-run3.py` @ `bfb8649`（367 行）
 - **v2 2026-10-13 01:1x 复测重写**：Lead 已按本文 §6 加固工具（536 行），口径/行号/期望表按加固后版本重写；复跑证据见 §8。
-- **v3 2026-10-13 01:2x（本文档当前版本）**：deputy-lead 按 **task-19 要求 5④**（"没有任何户外快照 ⇒ 如实 False/缺省，禁止默认 true"）新增 **B4b**（`:394-401`）与"没写 `final_water` ⇒ 信息项"（`:403-407`）；新增负例 **R**（window 口径覆盖 0 格却自称 `watered_outdoor=true`）与正对照 **S**（farm 口径覆盖 32 格 ⇒ 仍 exit 0）。**行号均按 603 行版**。后果：**K2 从 exit 0 翻成 exit 1**（它的 `final_water` 正是 window/0 格），矩阵 29 本 ⇒ exit 0 = 6 本 / exit 1 = 23 本（其余读数逐本不变，见 §2/§8）。
+- **v3 2026-10-13 01:2x**：deputy-lead 按 **task-19 要求 5④**（"没有任何户外快照 ⇒ 如实 False/缺省，禁止默认 true"）新增 **B4b**（`:394-401`）与"没写 `final_water` ⇒ 信息项"（`:403-407`）；新增负例 **R**（window 口径覆盖 0 格却自称 `watered_outdoor=true`）与正对照 **S**（farm 口径覆盖 32 格 ⇒ 仍 exit 0）。**行号均按 603 行版**。后果：**K2 从 exit 0 翻成 exit 1**（它的 `final_water` 正是 window/0 格），矩阵 29 本 ⇒ exit 0 = 6 本 / exit 1 = 23 本（其余读数逐本不变，见 §2/§8）。
+- **v4 2026-10-14 21:5x（本文档当前版本，task-72）**：新增 **§9**（task-52/task-63 豁免记账的**三条洗白通道**：修复前 exit 0 / 修复后 exit 1 的双侧实测）与 **§10**（run6 归因更正：`unreachable_within_bound=false` 与上界无关）；§4 盲区清单加 **B11–B14**；§5 加"**实测有效**的防线"。三条通道已由 **`9f554d7`（task-71）**修复并用负例锁死（`tests/test_verify_run3.py:518-578`）；**仍开放的是 B11**（真失败改写成 `unreachable`/`tool_refused`，账本层不可判）。
 - **一句话结论（v3）**：K3（`finish` 自述反向）、K4（浇水两处自述矛盾）、**K2（window 口径 0 覆盖却自称浇过户外水）**已被抓（exit 1）；**完全自洽的伪造账本 `review-neg-K` 仍然 exit 0** —— `verify-run3.py` 验的是**这一本账本自己是否自洽**，**不是世界真的推进过 3 天**。防伪造仍必须靠**账本之外的证据**（§5）。
 
 ## §0 修订记录（初版 → v2 加固 → v3）
@@ -30,8 +31,15 @@
 | `review-neg-R-t19-window-no-outdoor.jsonl` | 全绿日 + `watered_outdoor=true` + `final_water={location:"FarmHouse", tiles:0, crops:0, dry:0, scope:"window"}` | **task-19 上线前探针**：证据来源为空（当天无任何户外快照）时，"true"能不能白过 |
 | `review-neg-S-t19-farm-scope-ok.jsonl` | 全绿日 + `watered_outdoor=true` + `final_water={scope:"farm", tiles:32, crops:32, dry:0}` | 正对照：加固不得误杀合法的一天 |
 | `review-task11-modal-day.jsonl` | 绿账本末日改 `blocked_modal` + `no_blocking_modal=false` | 反向对照：**真问题**必须被抓（它被抓了） |
+| `review-t72-bound-inflate.jsonl` | 42 格不可达 + 账本 `unreachable_bound=9999`（自算 10），其余自洽 | 通道 (c)：抬上界/抬分母（`9f554d7` **前** exit 0） |
+| `review-t72-exempt-no-coords.jsonl` | 扣 3 格不可达豁免、`unreachable_tiles=[]`、无逐格 journal；上界取自算值 6 | 通道 (e)：扣豁免不写坐标（修复前 exit 0） |
+| `review-t72-overlap-two-sets.jsonl` | 同一批 2 格 (50,14)/(51,14) 同时进 `unreachable_tiles` 与 `refused_tiles`；上界自洽 | 通道 (f)：两套豁免重复扣减（修复前 exit 0） |
+| `review-t72-relabel-clean.jsonl` | 4 条真失败（`blocked`，reason「锄完不是 dirt」）改写成 `unreachable`，**账目字段全自洽**（bound=5、坐标齐、计数齐） | **B11 盲区**：账本层不可判（修复前后**都 exit 0**） |
+| `review-t72-vacuum-clean.jsonl` | 8 格全不可达 + 0 成功动作 + 自称 VERIFIED，bound 自洽（=5） | 反空洞防线（修复前后**都 exit 1**） |
 
 生成器：`scratch\_review_neg_gen.py`（mode `forged_consistent`/`forged_empty`/`env_info_item`/`env_info_cannot_mask`/`t19_window_no_outdoor`/`t19_farm_scope_ok`/`t15_last_round_done`/`t15_earlier_done_last_leftover`）、`scratch\_mk_k3_k4.py`、`scratch\_mk_task11_modal_day.py`、矩阵跑器 `scratch\_review_matrix.py`（`EXPECT0` = 期望 exit 0 集合）。pwsh 下必须 `$env:PYTHONUTF8="1"`。
+
+**task-72 追加（豁免类账本）**：`scratch\_t72_forge.py`（复用 `scratch\_t54_forge.py` 的基座构造，但把 `unreachable_bound`/`refused_bound` 设成**工具自算值** `max(5, floor(0.2×attempted))` —— 即"攻击者把账本做到完全自洽"，从而把三条通道**各自隔离**，见 §9）；工具两侧冻结：`scratch\_t72_freeze_tool.py`（已提交 HEAD 版 → `_t72_tool_head.py`，Lead 在制版 → `_t72_tool_wip.py`）、`scratch\_t72_freeze2.py`（`9f554d7` 版 → `_t72_tool_fix.py` + 该提交的 `tests/test_verify_run3.py`）；闸门引入历史：`scratch\_t72_when.py`。
 
 **v2 踩到的坑（留档）**：加固后我第一次跑矩阵，**除 green 外全部 exit 1** —— 不是工具误报，是**我的假账本自己 `t` 不单调**（`env_fail`/`finish` 的 `t` 小于前面事件）。已修。**真机 run2 账本零回退报告** ⇒ 该检查对真实数据不是误报（且现已是信息项）。
 
@@ -54,6 +62,24 @@
 - **exit 1（23 本）**：`review-neg-A/B/C/D/E/F/H/J/K2/K3/K4/Q/R`、`scratch\review-task11-modal-day.jsonl`、真机 `logs\longrun-3day-llm-run2.jsonl`、`logs\longrun-3day-llm-run1.jsonl`、`logs\longrun-3day-run1.jsonl`、`logs\longrun-rehearsal-0.7.22.jsonl`，以及只有 1 天的 `scratch\_ledger_green.jsonl`/`_ledger_fallback.jsonl`/`_ledger_leftover_verified.jsonl` 与旧探针 `scratch\journal-green-bad.jsonl`、`scratch\journal-nochecks.jsonl`（后 7 本属预期）。
 - **v3 相对 v2 的变化只有两处**：①`K2` exit 0 → exit 1（B4b）；②`R` 从不存在 → exit 1。**其余 27 本 problems/exit 逐本不变**（部分账本 `infos` +1/天，来自"`watered_outdoor=true` 但账本没写 `final_water`"的信息项 `:403-407`，不影响结论）。改前/改后逐行对照留档：`scratch\_matrix_before_t19gate.txt`、`scratch\_matrix_after_t19gate.txt`。
 
+### §2.1 task-72：豁免三通道的双侧读数（修复前 vs 修复后）
+
+两侧工具都按**冻结副本**跑（同一份字节 ⇒ 可复现）：
+- 修复前 = 已提交 HEAD（`3c02940` 的 `tools/verify-run3.py`，937 行，sha256 `6c0ac399…`）→ `scratch\_t72_tool_head.py`
+- 修复后 = `9f554d7`（task-71，988 行，sha256 `a62a6e94…`）→ `scratch\_t72_tool_fix.py`
+
+| 账本 | 修复前 | 修复后 | 说明 |
+| --- | --- | --- | --- |
+| `review-t72-bound-inflate` | **exit 0 / VERIFIED** | **exit 1 / needs_review** | 修复后的 problem：「不可达豁免上界账本=9999 > 自算=10（attempted=50）⇒ 上界被放宽」+ refused 侧同款 |
+| `review-t72-exempt-no-coords` | **exit 0 / VERIFIED** | **exit 1 / needs_review** | 「不可达豁免扣了 3 格却没写任何坐标（journal 无 unreachable 逐格事件、`day_end.unreachable_tiles` 也空 ⇒ 缺失≠通过）」 |
+| `review-t72-overlap-two-sets` | **exit 0 / VERIFIED** | **exit 1 / needs_review** | 「同一格同时进两套豁免：2 格（例 (50,14)、(51,14)）⇒ 可被重复扣减」 |
+| `review-t72-relabel-clean` | exit 0 / VERIFIED | **exit 0 / VERIFIED** | **B11 仍开放**：真失败改写成 `unreachable`，账目自洽 ⇒ 两侧都看不出 |
+| `review-t72-vacuum-clean` | exit 1 / needs_review | exit 1 / needs_review | 反空洞防线，两侧一致有效 |
+| 对照 `scratch/journal-green.jsonl` | exit 0 | exit 0 | 修复**没有**引入假红 |
+| 真机 run2/run3/run5/run6 | exit 1 ×4 | exit 1 ×4 | 判决逐本未变 |
+
+⇒ 一句话：**task-71 把三条"账本层可判"的通道都堵上了，且不误杀绿账本；唯一仍然过不去的是 B11（分类造假），它不是判据能解决的，见 §5-D/§10。**
+
 ## §3 工具**确实**查了的东西（v3 行号 = 603 行版，全部仍是"账本内部一致性"）
 
 1. `ended_by != "sleep"` 即问题（`:301-302`）；`ended_by=="sleep"` 必须有 `event=sleep, ok=true` 证据（`:304-305`）—— **回执不算证据，要求观测里的日期变了**。
@@ -68,12 +94,13 @@
 9. 异常事件 `bridge_down`/`watchdog_stop`/`modal_timeout`/`no_day_progress` 出现即问题（`:427-434` 起的异常事件段）。
 10. 尾部连续 VERIFIED 天数 ≥ `--days`（`:451-456`），`ok = streak >= target_days and not problems`（`:467-470`）。
 11. `finish` 自洽 + 与本工具结论同向（`:478-500`；两侧 `days` 不可比时降为信息项；`verified_streak` 不同只记信息项；没有 `finish` 也记信息项）。
+12. **（v4，行号按 `9f554d7` 的 988 行版）豁免记账**（task-52 不可达 / task-63 锄不动被拒）：自算分母 `day_end.attempted` > `Σ stages[].attempted` ⇒ problem「抬高分母就能放宽 20% 上界」（`:462-466`）；`bound_self = max(5, floor(0.2×attempted))`，账本 `unreachable_bound` > 自算 ⇒ problem（`:468-475`）、< 自算 ⇒ **info**「更严」（`:476-479`），refused 侧镜像（`:522-532`）；`*_exempt > 0` 而逐格坐标（journal 事件 + `day_end.*_tiles`）皆空 ⇒ problem「缺失≠通过」（`:486-490` / `:542-546`）；两套坐标**交集非空** ⇒ problem「同一格同时进两套豁免」（`:547-556`）；`checks.unreachable_within_bound is False` ⇒ problem（`:499-503`，refused 侧 `:518-522` 为 v3 既有）。⚠️ 这些**仍是"账本内部一致性"**：抓的是"账目互相打架"，不抓"分类本身是不是真的"（见 B11/§9）。
 
 ⇒ 这些**全是读账本自述**：`verified`/`checks`/`stages`/`failed_steps` 都是 longrun **自己写的**，账本自洽就无从分辨；加固只是把"自己跟自己打架"的花样抓得更全（B4b 也属这一类：它抓的是"自称浇过水，却同时写着证据来自 0 格的窗口"）。
 
-## §4 盲区清单（v3 状态）
+## §4 盲区清单（v4 状态；B1–B10 逐条沿用 v3 结论）
 
-| # | 盲区 | v3 状态 |
+| # | 盲区 | v4 状态 |
 | --- | --- | --- |
 | B1 | `finish` 不参与判定 | **已关闭**（K3 exit 1） |
 | B2 | `t` 从不检查 | **有意降级为信息项**：判成问题会误杀真机 |
@@ -86,6 +113,10 @@
 | B8 | `analyze-longrun.py` 同源同盲 | **开放**（§2 实测 0 条） |
 | B9 | B6 的"无活可做"证据也是**自述** | **开放，但已不能单独骗过**：K2 现在必须先解决 B4b（伪造者把 `scope` 改成 `farm`+覆盖格数即可再骗过 ⇒ 本质仍开放） |
 | B10 | （v3 新增）`watered_outdoor` 的**真值来源**本身不可验：`scope="farm"` + `tiles=32` + `dry=0` 也全是自述 | **开放**（B3 的实例；只有 task-19 的单测 + 真机外部证据能兜） |
+| B11 | **（v4）真失败改分类**：格子没变/回执 ok 但世界没变，却被写成 `unreachable`（或 `tool_refused`） | **开放（本质不可判）**：把账目做自洽后两侧工具都 exit 0（`review-t72-relabel-clean`）。复核只能盯这几个位置：`day_end.stages[].unreachable`/`unreachable_tiles`；`blocked` 事件的 `reason`（真失败文案如「锄完不是 dirt」）；`brain/agentfarm/farmwork.py:554-568 is_unreachable()`（**自由文本**命中 `UNREACHABLE_HINTS` 也算不可达 ⇒ 回执文案可触发）；`farmwork.py:379-399` 的 `StepResult.failed/unreachable` 两属性；`longrun.py:2712` 的上界公式与 `:2751` 的 `unmet_leftover` 扣减。**真防线是 §5-A 的外部证据 + 分类代码本身可复核**，不是账本判据 |
+| B12 | （v4，**已关闭** `9f554d7`）账本自抬 `*_bound` / 抬高 `attempted` 分母 | **已关闭**：自算 `max(5, floor(0.2×attempted))` + 分母与 `Σ stages.attempted` 交叉核对 ⇒ problem；负例 `tests/test_verify_run3.py:518-539` |
+| B13 | （v4，**已关闭** `9f554d7`）扣了豁免却不写逐格坐标 | **已关闭**：`*_exempt > 0` 且 journal/账本坐标皆空 ⇒ problem「缺失≠通过」；负例 `tests/test_verify_run3.py:540-550` |
+| B14 | （v4，**已关闭** `9f554d7`）两套豁免坐标重叠（重复扣减） | **已关闭**：坐标交集非空 ⇒ problem；负例 `tests/test_verify_run3.py:551-570`，且"不相交 + 带坐标仍绿"有正对照 `:571-578` |
 
 ## §5 那靠什么防（逐条标可执行性）
 
@@ -104,7 +135,12 @@
 
 6. journal 的 `day_start`/`day_end` 里记录 `liveness.worldSeq`（桥观测的单调世界序号）+ 要求跨日时显著前进。⚠️ 需改 brain + 口径；是"提高伪造成本"，不是"不可能伪造"。
 
-## §6 对 `verify-run3.py` 的低成本加固建议（只报不改）—— v3 状态
+**D. 实测有效的防线（v4，不是建议）**
+
+7. **反空洞**（task-52 ⑥）：一天全是豁免格 + 0 步成功 + 自称 VERIFIED ⇒ 判红（`review-t72-vacuum-clean` 修复前后**都 exit 1**；problem 文案「自称 VERIFIED 但当天成功动作 0 步」＋「`checks.no_unmet_stages` 与自算不一致」）。⇒ 伪造者不能靠"把 0 成功的一天写成全豁免"过关。
+8. **B11 的复核动作（账本层不可判，但必须留痕可查）**：拿 `day_end.stages[].unreachable_tiles` + `unreachable` journal 事件逐格对照 ——(a) 该格四邻在观测窗口里是否真的都不可站；(b) 同一天同阶段有没有 `blocked` 事件（"真失败被改写"的痕迹）；(c) `stage.attempted` 与 `ok/skipped/failed` 是否自洽。⚠️ (b) 只能抓"改了一半"的账本，**全删干净就查不出来** ⇒ 最终仍靠 §5-A 的三条外部证据。
+
+## §6 对 `verify-run3.py` 的低成本加固建议 —— v4 状态（9/10/11 已由 Lead 在 `9f554d7` 落地）
 
 1. ~~`finish` 一致（挡 K3）~~ → **已加固**。
 2. ~~浇水互检（挡 K4）~~ → **已加固**。
@@ -114,6 +150,10 @@
 6. `worldSeq` 采样 → **未做**（Lead 有意；见 §5-C）。
 7. ~~措辞 nit（一因两报）~~ → **已修**（`d43e75e`）。
 8. **（v3）window 口径 0 覆盖不许 `watered_outdoor=true`** → **已加**（`:394-401`）。**待 Lead 拍板**的一点：这会改 `review-neg-K2` 的基线读数（exit 0 → exit 1）；若要把 K2 保留为"完全过关的伪造样本"，可用 `review-neg-K`（farm 口径）替代它的角色 —— 但我建议**保留这次加固**，因为 K2 原来的过关依赖的正是 task-19 明令禁止的字段组合。
+9. **（v4）账本大幅放宽 `unreachable_bound`/`refused_bound`、或抬高 `attempted` 分母** → **已加固（`9f554d7`，task-71）**：工具自算 `attempted`（`day_end.attempted > Σ stages.attempted` ⇒ problem `:462-466`）与自算上界 `max(5, floor(0.2×attempted))`（账本 **大于** 自算 ⇒ problem `:468-475`/`:522-532`；**小于** 自算只记 info「更严」`→ 不误杀保守账本`）；负例 `tests/test_verify_run3.py:518-539`。
+10. **（v4）扣了豁免却不写逐格坐标** → **已加固（`9f554d7`）**：`*_exempt > 0` 且 journal 逐格事件与 `day_end.*_tiles` 皆空 ⇒ problem「缺失≠通过」（`:486-490`/`:542-546`）；负例 `tests/test_verify_run3.py:540-550`。
+11. **（v4）两套豁免互相掩护** → **已加固（`9f554d7`）**：解析两套逐格坐标取交集，非空 ⇒ problem（`:547-556`）；负例 `:551-570` + 正对照"不相交且带坐标仍绿"`:571-578`。
+12. **（v4，判据关不掉）B11 分类造假**：建议最多做**启发式 info**（同阶段存在 `blocked` 事件而 `failed_steps==0` ⇒ info 提示人工核对），并把"本质不可判"写进 §5-D（已写）。**不要**把启发式升成 problem —— 会误杀"不可达格与真失败格恰好同阶段"的合法日。
 
 ## §7 建议写进 task-12 / 发布清单的验收单（外部证据）
 
@@ -122,6 +162,7 @@
 3. run3 结束、quit 前做一次 **live `/observe` 对账**：`day_key/money/crops/stamina/location` 与最后一条 `day_end.final` 相符。
 4. 这三条之外，`verify-run3.py` 的 exit 0 只是"账本自洽"的**必要条件**，不是"跑通了"的充分条件。
 5. **（v3）** task-19 落地后，除 `checks.watered_outdoor` 外**必须同时看 `final_water.scope`**：`scope="window"` 且覆盖 0 格时该字段不得为 `true`（工具已按此抓，见 B4b）。
+6. **（v4）豁免日的附加核对**：某天出现 `day_end.unreachable`/`refused` > 0 时，验收人要额外核三件事（`9f554d7` 起工具会自动判红，但验收单上要写明口径）：①`unreachable_bound`/`refused_bound` 必须等于 `max(5, floor(0.2×attempted))`；②被豁免的**每一格**都能在 journal 里找到逐格坐标；③不可达与被拒两套坐标**交集为空**。任一条不满足 ⇒ 该天不算"合法豁免"，**不得**据此把 `no_unmet_stages` 当通过。
 
 ## §8 怎么复跑（v3 证据）
 
@@ -135,3 +176,69 @@ $py="C:\Users\admin\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\py
 ```
 
 期望（v3）：**exit 0 = 6 本**（green / G / I / K / P / S），**exit 1 = 23 本**（A/B/C/D/E/F/H/J/K2/K3/K4/Q/R + modal-day + 真机 run2/run1 + 彩排 + 7 本旧料/单日料），逐本与 §2 一致；`scratch\_review_matrix.py` 的 `EXPECT0` 集合需随之更新为上面 6 本（`K2` 移出）。
+
+### §8.1 task-72 复跑（豁免三通道，双侧冻结副本）
+
+```powershell
+$env:PYTHONUTF8="1"
+$py="C:\Users\admin\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
+& $py scratch\_t72_freeze_tool.py   # 冻结：已提交 HEAD 版 → _t72_tool_head.py；Lead 在制/修复版 → _t72_tool_wip.py（打印两侧 sha256）
+& $py scratch\_t72_freeze2.py      # 冻结：9f554d7 版 → _t72_tool_fix.py（+ 该提交的 tests/test_verify_run3.py，592 行）
+& $py scratch\_t72_when.py         # 闸门引入历史（哪些提交开始带这些判据）
+& $py scratch\_t72_forge.py        # 生成 5 本"上界自洽"的隔离账本 review-t72-*.jsonl
+# 逐本跑两侧冻结副本（原文输出留档 scratch\_t72b_{head,fix}_*.txt）
+foreach ($t in @("head","fix")) { foreach ($f in @("bound-inflate","exempt-no-coords","overlap-two-sets","relabel-clean","vacuum-clean")) {
+  & $py "scratch\_t72_tool_$t.py" --journal "scratch\review-t72-$f.jsonl" --days 1
+  Write-Output "$t/$f exit=$LASTEXITCODE"
+} }
+& $py -m unittest tests.test_verify_run3   # task-71 的负例所在：Ran 34 / OK
+```
+
+期望（v4，读数见 §2.1）：`head`（修复前）= `bound-inflate`/`exempt-no-coords`/`overlap-two-sets`/`relabel-clean` **exit 0**、`vacuum-clean` exit 1；`fix`（`9f554d7`）= 前三本 **exit 1**、`relabel-clean` 仍 **exit 0**（B11 盲区）、`vacuum-clean` exit 1。冻结副本单个 ≈52 KB，**不入库**；账本（`*.jsonl`）与文本输出也被 `.gitignore` 的 `scratch/*`（例外 `!scratch/*.py`）排除 ⇒ **入库的只有这 4 个脚本**（`_t72_forge.py`/`_t72_freeze_tool.py`/`_t72_freeze2.py`/`_t72_when.py`），账本与 `scratch\_t72b_*.txt` 随时可用脚本重生成。
+
+## §9 task-72 实测：豁免记账的三条洗白通道（已由 `9f554d7` 关闭）+ 一条开放盲区
+
+**背景**：task-52（不可达豁免）与 task-63（游戏拒绝豁免）让"环境挡路"不再计入当天硬失败，代价是**多了一条洗白通道** —— 把失败写成"豁免"，`no_hard_failures`/`no_unmet_stages` 就都变成账本自述。task-54 时我用 6 本伪造账本打穿其中**三条账本层可判**的通道；Lead 的 **task-71（提交 `9f554d7`，只改 `tools/verify-run3.py` + `tests/test_verify_run3.py`）**把这三条堵上并用负例锁死。
+
+### §9.1 双侧矩阵（复现命令见 §8.1；原文输出 `scratch\_t72b_{head,fix}_*.txt`）
+
+| 通道 | 账本（`scratch/`） | 关键构造 | 修复前 HEAD（937 行 `6c0ac399…`） | 修复后 `9f554d7`（988 行 `a62a6e94…`） |
+| --- | --- | --- | --- | --- |
+| (c) 抬上界/抬分母 | `review-t72-bound-inflate.jsonl` | 42 格不可达、账本 `unreachable_bound=9999`（自算 10） | **exit 0 / VERIFIED** | **exit 1 / needs_review** |
+| (e) 扣豁免不写坐标 | `review-t72-exempt-no-coords.jsonl` | `unreachable_exempt=3`、`unreachable_tiles=[]`、无逐格 journal | **exit 0 / VERIFIED** | **exit 1 / needs_review** |
+| (f) 两套豁免重叠 | `review-t72-overlap-two-sets.jsonl` | 同 2 格同时进 `unreachable_tiles` 与 `refused_tiles` | **exit 0 / VERIFIED** | **exit 1 / needs_review** |
+| (b) 分类造假 | `review-t72-relabel-clean.jsonl` | 4 条真失败（「锄完不是 dirt」）写成不可达、**账目全自洽** | exit 0 / VERIFIED | **exit 0 / VERIFIED（仍开放 = B11）** |
+| 反空洞（防线） | `review-t72-vacuum-clean.jsonl` | 8 格全不可达 + 0 成功动作 + 自称 VERIFIED | exit 1 | exit 1 |
+| 对照 | `scratch/journal-green.jsonl` | 正常绿账本 | exit 0 | exit 0 |
+
+真机 `logs\longrun-3day-llm-run{2,3,5,6}.jsonl` 修复前后**都是 exit 1**（判决未变，输出 `scratch\_t72c_*.txt`）⇒ 这次加固不引入新假红。用 `_t54_forge.py` 那 6 本（上界写成 8、与自算不符）复跑同样得到"修复前 4 本 exit 0 / 修复后全 exit 1"，见 `scratch\_t72_head_review-t54-*.txt` 与 `scratch\_t72_wip_review-t54-*.txt`。
+
+### §9.2 修复后的判红原文（逐字抄自工具输出）
+
+- **(c)** 两套上界各报一条：
+  - `[spring 10] 不可达豁免上界账本=9999 > 自算=10（attempted=50）⇒ 上界被放宽，可能把真失败洗成不可达`
+  - `[spring 10] 被拒豁免上界账本=9999 > 自算=10（attempted=50）⇒ 上界被放宽，可能把真失败洗成「游戏拒绝」`
+- **(e)** `[spring 10] 不可达豁免扣了 3 格却没写任何坐标（journal 无 unreachable 逐格事件、day_end.unreachable_tiles 也空 ⇒ 缺失≠通过）`
+- **(f)** `[spring 10] 同一格同时进两套豁免：2 格（例 (50,14)、(51,14)）⇒ 可被重复扣减（unreachable + refused），必须人工核对坐标来源`
+- **修复前**这三本都只有"信息项"、`结论：VERIFIED`，例：`[spring 10] 不可达（四邻都站不过去/A* 算不出路）账本=42、journal 自算=42 次/42 格、豁免上界 bound=9999（attempted=50）、实际扣除 exempt=42（task-52 政策：不计当天硬失败；本行只供复核）` ⇒ 说明工具当时**只是"展示"豁免，没有核对**。
+- **反空洞防线**（修复前后都判红）：`[spring 10] 自称 VERIFIED 但当天成功动作 0 步（有阶段记录、ok 全 0）（0 步不能自证做过事；查 stage_no_target / no_work 分支）` + `[spring 10] checks.no_unmet_stages=True 与自算不一致（有目标阶段遗留 leftover=0 格，扣掉不可达豁免 8 + 锄不动豁免 0 后剩 0 格、当天成功动作 0；期望 False）`。
+
+### §9.3 修补位置（`9f554d7`，行号按 988 行版；只动工具与工具单测两个文件）
+
+1. **自算分母 + 自算上界**：`day_end.attempted` 与 `Σ stages[].attempted` 交叉核对（账本更大 ⇒ problem「抬高分母就能放宽 20% 上界 ⇒ 账目不可信」`:462-466`）；`bound_self = max(5, floor(0.2×attempted))`，账本 `unreachable_bound` **大于** 自算 ⇒ problem（`:468-475`）、**小于** ⇒ 只记 info「更严」（`:476-479`）；refused 侧镜像（`:522-532`）。⇒ 通道 (c) 关闭。
+2. **豁免必须有逐格坐标**：`unreachable_exempt > 0` 且 journal 逐格事件 `self_tiles == 0` 且 `day_end.unreachable_tiles` 为空 ⇒ problem（`:486-490`）；refused 侧 `:542-546`。⇒ 通道 (e) 关闭。
+3. **两套豁免不得互相掩护**：`overlap = (journal 坐标 ∪ 账本坐标)_unreachable ∩ (…)_refused`，非空 ⇒ problem 并打印样例坐标（`:547-556`）。⇒ 通道 (f) 关闭。
+4. **负例锁死**（`tests/test_verify_run3.py`，592 行，sha256 `eb11c9b8…`）：`test_forged_large_unreachable_bound_is_problem` `:518`、`test_forged_large_refused_bound_is_problem` `:529`、`test_exemption_without_coordinates_is_problem` `:540`、`test_overlapping_exemption_tiles_is_problem` `:551`、正对照 `test_disjoint_exemptions_with_coordinates_stay_green` `:571`（不相交 + 带坐标仍绿）。**我亲跑** `python -m unittest tests.test_verify_run3` ⇒ **Ran 34 tests / OK**。
+
+### §9.4 为什么 (b) 关不掉（= B11）
+
+分类造假发生在**写入阶段**：`farmwork.is_unreachable()`（`brain/agentfarm/farmwork.py:554-568`）判定"不可达"的依据之一是**自由文本**命中 `UNREACHABLE_HINTS`（"四邻都站不过去"/"寻路无法到达"/"无法到达"/"A* 未算出路径"/"unreachable"），而 `StepResult.unreachable`（`:388-390`）与 `failed`（`:379`）是同一份 `code` 的两个投影。**只要伪造者把 `code` 写成 `unreachable`、坐标写齐、上界取自算值、不留下 `blocked` 事件**，账本里就没有任何自相矛盾之处 ⇒ 工具两侧都只能给 `VERIFIED`（`review-t72-relabel-clean` 实证）。这不是工具的缺陷，而是**判据的信息论上限**：判据只能读账本，无法读世界。复核动作见 §5-D；最终仍靠 §5-A 的三条外部证据 + 直接读分类代码。
+
+## §10 run6 归因更正：`unreachable_within_bound=false` 不是"上界卡住合法豁免"
+
+Lead 原倾向是"密农场下上界公式偏小 + 42 格确实无落脚点"。逐字段核对后**只有后半句成立**：
+
+- run6 账本（`logs\longrun-3day-llm-run6.jsonl`，143 行）：`unreachable` 84 条、`unreachable_stage` 8 条、`unreachable_summary` 2 条；`day_start/day_end` 各 2（summer 4 跑了两轮），`finish={code:1, verified_streak:0, actions:95, minutes:0.62, stages_seen:["clear_dead","till_area"], no_unmet_stages:false, unmet_days:["1年 summer 4日","1年 summer 4日"]}`。
+- 工具 info 行口径（两轮相同）：`账本=42、journal 自算=42 次/42 格、豁免上界 bound=8（attempted=42）、实际扣除 exempt=8` ⇒ **42 格全被判"四邻都站不过去"（`field_ne`）**，而 `max(5, floor(0.2×42)) = 8` ⇒ 42 ≫ 8（超界 5.25 倍）。**就算把上界公式放大到 42 也仍然要问"这 42 格为什么都没有落脚点"** ⇒ 失败与上界无关。
+- 每类阶段最后一条 leftover 合计 **54 格**，`checks.no_unmet_stages=false`、`ended_by=stuck`、`verified=false`、37.2 s 就退出 ⇒ **工具如实判红，不是误判**；`finish` 自述 `code=1/verified_streak=0` 与之一致。
+- 根因链（写给 run7 复盘）：作业区选择把一整天花在"无落脚点簇"上（task-67 已修采种死锁、task-68 在修可达性与上界口径）。⇒ 验收单上写"**run6 失败 = 不可达格数远超上界 + 作业区选择**"，**不要**写"上界公式偏小导致合法豁免被卡住"。
