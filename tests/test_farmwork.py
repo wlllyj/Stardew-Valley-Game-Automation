@@ -1731,7 +1731,37 @@ class TestTask68OpenWay(unittest.TestCase):
         self.assertIs(r.unreachable, False)
         self.assertIs(r.stood, False)
         self.assertEqual(w.calls, [], "邻格都清不了 ⇒ 一次工具都不许挥")
-        self.assertIn("树/桩/大石", r.reason)
+        # 【task-78 NIT-2】reason 照实写四邻**真实 kind**，不许再断言"是树/桩/大石"。
+        self.assertIn("tree", r.reason)
+        self.assertIn("clump", r.reason)
+        self.assertNotIn("树/桩/大石", r.reason)
+        self.assertIn("试开路 0 次", r.reason)
+        self.assertEqual(r.tried_open, 0)
+        self.assertEqual(r.encircled_kinds,
+                         ["tree" if i % 2 else "clump" for i in range(len(NEIGHBORS))])
+
+    def test_weed_neighbour_that_cannot_be_stood_on_is_told_truthfully(self):
+        """【task-78 NIT-2 实证场景】四邻是 `weed`、但 `standable=false` ⇒ 0 次挥动却曾写成
+        "树/桩/大石"（与事实不符）。现在 reason 必须照实写 `weed`，且不得出现"树/桩/大石"。"""
+        nb = [(self.TARGET[0] + dx, self.TARGET[1] + dy) for dx, dy in NEIGHBORS]
+        # deputy 实证的形态：目标格（枯死作物，`standable=False`）四邻是 `weed`，但那些邻格
+        # **自己也没法站上去**（半径 3 内都观测成 `standable=False`）⇒ 没有"可清障 + 够得着"的
+        # 突破口 ⇒ `encircled`，且一次都不挥（而不是像以前那样写成"树/桩/大石"）。
+        ring = [(self.TARGET[0] + dx, self.TARGET[1] + dy)
+                for dx in (-3, -2, -1, 0, 1, 2, 3) for dy in (-3, -2, -1, 0, 1, 2, 3)
+                if (dx, dy) != (0, 0)]
+        recs = [dead_crop_rec(self.TARGET)]
+        recs += [{"tile": list(t), "kind": "weed", "actionable": True,
+                  "standable": False} for t in ring]
+        w = self._world(recs, unwalkable=ring)
+        r = make_worker(w).clear_dead(self.TARGET)
+        self.assertEqual(r.code, "encircled")
+        self.assertEqual(w.calls, [], "四邻够不着 ⇒ 一次都不许挥")
+        self.assertIn("weed", r.reason)
+        self.assertNotIn("树/桩/大石", r.reason)
+        self.assertIn("没有「可清障 + 自己够得着」的突破口", r.reason)
+        self.assertEqual(r.encircled_kinds, ["weed"] * len(NEIGHBORS))
+        self.assertEqual(r.tried_open, 0)
 
     def test_open_way_is_bounded_then_still_unreachable(self):
         """有可清的邻格、但清掉也没用（邻格自己被拒）⇒ 有界地退回 `unreachable`。"""

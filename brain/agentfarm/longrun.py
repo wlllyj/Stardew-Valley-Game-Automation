@@ -307,15 +307,16 @@ class DayReport:
     #: 【task-52】当天判为"走不到"（四邻都站不过去 / 寻路到不了）的**格数**与**逐格坐标**。
     #: 字段名与 `tools\verify-run3.py` 的交叉核对口径逐字对齐（Lead m04925）：
     #: `day_end.unreachable`（int）+ `day_end.unreachable_tiles`（`[[x,y],…]`）。
-    #: `unreachable_bound` = `max(5, floor(0.2 × attempted))`，`unreachable_exempt` = 真正从
+    #: `unreachable_bound` = `max(5, floor(0.2 × bound_basis))`，`unreachable_exempt` = 真正从
     #: `no_unmet_stages` 里扣掉的格数（≤ bound，且只扣还留在 leftover 里的不可达格）。
+    #: 【task-78 NIT-1】上界基数改用它自己的字段 `bound_basis`，`attempted` 仍是原始证据计数。
     unreachable: int = 0
     unreachable_tiles: list[Any] = field(default_factory=list)
     unreachable_bound: int = 0
     unreachable_exempt: int = 0
     #: 【task-63】当天被**游戏拒绝**（`tool_ineffective`/`precondition_failed`）的**格数**与
     #: **逐格坐标**：这些格记 `skipped`+`proven_inert`（不算硬失败、当天封格、次日重试），
-    #: 但豁免**有界** —— `refused_bound = max(5, floor(0.2 × attempted))`，超界当天照实
+    #: 但豁免**有界** —— `refused_bound = max(5, floor(0.2 × bound_basis))`，超界当天照实
     #: `no_hard_failures=false`（防"游戏全拒绝"换个 verified）。
     #: `refused_exempt` = 真正从 `no_unmet_stages` 里扣掉的格数（≤ bound，只扣仍在 leftover 的）。
     #: 与 task-52 的 `unreachable*` 是**两套独立计数**、互不覆盖（各自有界、各自逐格留痕）。
@@ -323,8 +324,18 @@ class DayReport:
     refused_tiles: list[Any] = field(default_factory=list)
     refused_bound: int = 0
     refused_exempt: int = 0
-    #: 【task-68】当天被**围住**（四邻没有"可清 + 自己够得着"的突破口：树/桩/大石一类）的格数
-    #: 与逐格坐标。**与 `unreachable*` / `refused*` 都不同**：这些格既不封格、也不进任何豁免分子 ——
+    #: 【task-78 NIT-1】两套豁免上界的**共同基数** = 当天"发起过动作且**不是** `encircled`"的步数
+    #: （`sum(1 for s in all_steps if s.attempted and not s.encircled)`）。
+    #: 语义：`attempted` = 发起过的步数（证据）；`bound_basis` = 其中**可能真做成**的步数 ——
+    #: 被围住的格既不是"走不到"也不是"干了没成"，不能拿它抬高豁免上界。
+    #: 背景（deputy 伪造账本 V5）：800 次 `encircled` 曾把上界抬到 200，让 200 格真不可达被豁免、
+    #: 当天 VERIFIED ⇒ 洗白通道。现在从**分母**剔掉（fail-closed：只让豁免更难）。
+    bound_basis: int = 0
+    #: 【task-68】当天被**围住**（四邻没有"可清 + 自己够得着"的突破口）的格数与逐格坐标。
+    #: 【task-78 NIT-2】判据只讲"四邻没有突破口"，**不再断言**是树/桩/大石（四邻可能是 `weed`
+    #: 只是站不上去）；逐格证据看 journal `encircled` 的 `kinds`/`tried_open` 与
+    #: `encircled_summary.tried_open_steps`。
+    #: **与 `unreachable*` / `refused*` 都不同**：这些格既不封格、也不进任何豁免分子 ——
     #: `checks.unreachable_within_bound` 仍然只数"真·不可达"，所以"一圈树围住"不会污染上界；
     #: 它们的用途是给出**证据**（run6 的 42 格"走不到"里有多少其实是"开不了路"）与下一步归因。
     encircled: int = 0
@@ -388,6 +399,8 @@ class DayReport:
             "refused_tiles": [list(t) for t in self.refused_tiles],
             "refused_bound": self.refused_bound,
             "refused_exempt": self.refused_exempt,
+            # 【task-78 NIT-1】两套豁免上界的共同基数（`attempted` 语义不变，仍是原始证据计数）
+            "bound_basis": self.bound_basis,
             # 【task-68】被围住：只报证据（计数 + 坐标），不进任何豁免分子
             "encircled": self.encircled,
             "encircled_tiles": [list(t) for t in self.encircled_tiles],
@@ -579,7 +592,9 @@ class LongRun:
         # "今天到底有多少格被游戏拒绝" —— 日级豁免按 `refused_bound` 有界，超界照实 `needs_review`。
         # **不跨日**：`_run_day` 每天清空 ⇒ 次日自动重试（例：工具等级够了就能锄了）。
         self.refused_day: set[tuple[int, int]] = set()
-        # 【task-68】当天被**围住**的格子（四邻没有"可清 + 自己够得着"的突破口：树/桩/大石一类）。
+        # 【task-68】当天被**围住**的格子（四邻没有"可清 + 自己够得着"的突破口）。
+        # 【task-78 NIT-2】不再预设"是树/桩/大石"——四邻可能是 `weed` 只是自己站不上去；
+        # 真实 kind 与开路次数逐格记在 journal `encircled`（`kinds`/`tried_open`）。
         # 与 `unreachable_day` 的区别是**口径**：这些格不是"走不到"，而是"现在还开不了路" ——
         # 所以：**不进 `unreachable_exempt` 分子**（`checks.unreachable_within_bound` 仍只数真不可达）、
         # **不写 `self.blocked`**（不封格：开路后/次日可能就可达了），只单独计数 + 逐格 journal。
@@ -1895,7 +1910,9 @@ class LongRun:
                               reason=s.reason[:200])
                 continue
             if s.encircled:
-                # 【task-68】被围住（四邻没有"可清 + 自己够得着"的突破口：树/桩/大石一类）。
+                # 【task-68】被围住（四邻没有"可清 + 自己够得着"的突破口）。
+                # 【task-78 NIT-2】逐格 journal 照实带 `kinds`（四邻真实 kind，从 reason 里读不到就
+                # 写 `None` —— 不许替观测断言"树/桩/大石"）与 `tried_open`（真试了几次开路）。
                 # 与"走不到"**分开**：这些格不是物理上不可达，而是"现在还开不了路" ——
                 # ① **不写 `self.blocked`**（不封格：今天开路/明天地形变了就可能可达）；
                 # ② **不进 `unreachable_day`**（`checks.unreachable_within_bound` 只数真不可达，
@@ -1905,8 +1922,11 @@ class LongRun:
                 encircled_marked += 1
                 self._journal("encircled", tile=list(key), action=s.action, stage=stage,
                               zone=self.zone_name, reason=s.reason[:200],
-                              note="被不可清障物围住（树/桩/大石一类）⇒ 不算「走不到」、不封格；"
-                                   "进 encircled 单独计数，不进 unreachable 豁免")
+                              kinds=list(getattr(s, "encircled_kinds", []) or []),
+                              tried_open=int(getattr(s, "tried_open", 0) or 0),
+                              note="四邻没有「可清障 + 自己够得着」的突破口 ⇒ 不算「走不到」、"
+                                   "不封格；进 encircled 单独计数，不进 unreachable 豁免"
+                                   "（真实四邻 kind 与开路尝试次数见本事件 kinds/tried_open）")
                 continue
             if before.get(key) != after.get(key):
                 continue
@@ -2163,7 +2183,7 @@ class LongRun:
         refused_tiles = sorted({tuple(s.tile) for s in refused_steps if s.tile})
         refused_in_left = min(len(leftover),
                               len([t for t in self.refused_day if t in left_set]))
-        # 【task-68】"被围住"（四邻没有"可清 + 自己够得着"的突破口：树/桩/大石一类）：与
+        # 【task-68】"被围住"（四邻没有"可清 + 自己够得着"的突破口）：与
         # `unreachable`/`refused` **都独立** —— 不写 `self.blocked`（不封格）、不进任何豁免分子，
         # 只单独计数 + 逐格留痕（run6 的 42 格"走不到"里就有这种成分，混着会污染不可达上界）。
         encircled_steps = [s for s in all_steps if s.encircled]
@@ -2198,8 +2218,14 @@ class LongRun:
             "encircled_tiles": [list(t) for t in encircled_tiles],
             "encircled_leftover": encircled_in_left,
             "attempted": attempted_steps,
+            # 【task-78 NIT-1】上界基数：发起过动作、且**不是** `encircled` 的步数。
+            # `attempted` 一字不动（原始证据计数），豁免上界改用它做分母（fail-closed）。
+            "bound_basis": sum(1 for s in all_steps if s.attempted and not s.encircled),
+            # 【task-78 NIT-2】判 `encircled` 时**实际试了几次开路**（逐格证据，不参与判定）。
+            "encircled_tried": sum(int(getattr(s, "tried_open", 0) or 0) for s in encircled_steps),
             # 【task-68】`engaged` = 其中**真的站到过目标格旁边**的步数（`stood`）——
-            # 日级 `unreachable_bound` 的分母用它（run6 口径修正，见日终注释）。
+            # 只作证据（`unreachable_summary.engaged`），**不参与**任何上界计算（task-78 后分母
+            # 是 `bound_basis`）。
             "engaged": sum(1 for s in all_steps if s.attempted and s.stood),
             "stopped": stopped, "leftover": len(leftover),
         })
@@ -2218,9 +2244,13 @@ class LongRun:
         if encircled_steps:
             self._journal("encircled_stage", stage=task, zone=self.zone_name,
                           tiles=len(encircled_tiles), in_leftover=encircled_in_left,
+                          tried_open=sum(int(getattr(s, "tried_open", 0) or 0)
+                                         for s in encircled_steps),
                           coords=[list(t) for t in encircled_tiles[:12]],
-                          note="被不可清障物围住（树/桩/大石一类；2 层内没有「可站+可清」的突破口）⇒ "
-                               "不算「走不到」、不封格、不进 unreachable 豁免；逐格见 encircled 事件")
+                          note="四邻没有「可清障 + 自己够得着」的突破口"
+                               "（【task-78】照实写，不再断言是树/桩/大石）⇒ "
+                               "不算「走不到」、不封格、不进 unreachable 豁免；"
+                               "逐格真实 kind 与开路次数见 encircled 事件")
         if opens:
             self._journal("clear_neighbor", stage=task, zone=self.zone_name,
                           opens=len(opens), targets=[o for o in opens[:12] if o.get("target")],
@@ -3030,7 +3060,7 @@ class LongRun:
         for s in rep.stages:
             last_by_stage[str(s.get("stage") or "")] = s
         # 【task-52】不可达豁免（Lead m04621/m04925 钉死口径）：
-        #   * 上界 = `max(5, floor(0.2 × 当天 attempted 步数))`；`unreachable` 计数在这个界内
+        #   * 上界 = `max(5, floor(0.2 × bound_basis))`；`unreachable` 计数在这个界内
         #     才不影响 `verified`，超了照实 needs_review（`unreachable_within_bound` 判据）；
         #   * **同一豁免也要作用到 `no_unmet_stages`**：把已判"走不到"、且还留在 leftover 里的
         #     格子从日级剩余里扣掉（否则 run5 那种"最后一个阶段轮次刚好以不可达格子收尾"会把
@@ -3038,18 +3068,24 @@ class LongRun:
         #     （`_mark_blocked`）+ 阶段级 `unreachable_stage`/账本 `unreachable_tiles`。
         #   * 防洗白：**全部目标不可达且当天 0 成功动作** ⇒ `no_unmet_stages` 仍为 False
         #     （下面的 `made_any_progress` 合取项），不许靠豁免把真空日洗成达标。
-        # 【task-68】上界**分母保持 `attempted`**（口径一字不动），但把"被围住"从**分子**里剔出去 ——
-        # 这才是本次选的修正方向（卡面三个方向里的 ③"单列 `encircled`"）：
+        # 【task-68】把"被围住"从**分子**里剔出去（卡面三方向里的 ③"单列 `encircled`"）：
         #   * run6 的 42 格里，真"寻路到不了"与"被树/石围着开不了路"混在一起；现在后者归 `encircled`
-        #     （不封格、不计入 `unreachable`、不进豁免分子，只单独留痕 + 日级 `encircled_summary`）；
-        #   * 分母为什么不动：`attempted` 是 `tools/verify-run3.py` 与 `tools/analyze-longrun.py`
-        #     对账用的既有口径（Lead m04925 钉死），换成 `engaged` 会让两侧算出的界不一致；
-        #     而且它会让界**变小**（run6 的 engaged≈0）⇒ 属"悄悄收紧"，同样不是修法。
-        #   * `engaged`（真的站到过目标格旁边的步数）仍然逐阶段入账 + 进 `unreachable_summary`，
-        #     作为"这 42 格里有多少压根没走到跟前"的**证据**，供 run7 复核，不参与判定。
+        #     （不封格、不计入 `unreachable`、不进豁免分子，只单独留痕 + 日级 `encircled_summary`）。
+        #   * `engaged`（真的站到过目标格旁边的步数）逐阶段入账 + 进 `unreachable_summary`，
+        #     作为"这 42 格里有多少压根没走到跟前"的**证据**，不参与判定。
+        # 【task-78 NIT-1】上界**分母**从 `attempted` 换成 `bound_basis`
+        # （= `sum(1 for s in all_steps if s.attempted and not s.encircled)`）：
+        #   * 洗白通道（deputy 伪造账本 V5）：800 次 `encircled` 曾把 `attempted` 抬到 4000 ⇒
+        #     上界 800 ⇒ 200 格真不可达被豁免、当天 VERIFIED、exit 0。`encircled` 既不是"走不到"
+        #     也不是"干了没成"，没有资格抬高豁免上界。
+        #   * 选"从分母剔除"而不是"新硬闸门"：方向 fail-closed（只让豁免更难），不引入新失败模式。
+        #   * `attempted` **语义一字不动**（仍是发起过的步数 = 原始证据），只是不再当分母；
+        #     `day_end`/`unreachable_summary`/`refused_summary` 都新增 `bound_basis` 字段。
         attempted_steps = sum(int(s.get("attempted") or 0) for s in rep.stages)
+        bound_basis_steps = sum(int(s.get("bound_basis") or 0) for s in rep.stages)
         engaged_steps = sum(int(s.get("engaged") or 0) for s in rep.stages)
-        unreachable_bound = max(5, int(0.2 * attempted_steps))
+        rep.bound_basis = bound_basis_steps
+        unreachable_bound = max(5, int(0.2 * bound_basis_steps))
         unreach_day: set[tuple[int, int]] = set(self.unreachable_day)
         for s in rep.stages:
             for t in (s.get("unreachable_tiles") or []):
@@ -3067,13 +3103,13 @@ class LongRun:
         unreachable_exempt = min(unreachable_bound, unreach_in_last)
         rep.unreachable_exempt = unreachable_exempt
         # 【task-63】被**游戏拒绝**（`tool_ineffective`/`precondition_failed`）：与"走不到"同形态
-        # 但**独立起界**（`refused_bound = max(5, floor(0.2 × attempted))`）：
+        # 但**独立起界**（`refused_bound = max(5, floor(0.2 × bound_basis))`，与不可达侧同一基数）：
         #   * 界内 ⇒ 从 `no_unmet_stages` 里扣掉"仍留在 leftover 的拒绝格"（否则 run5 那种
         #     "目标池落进几格不可锄的地"会把做了 100+ 步的一天判死）；
         #   * 超界 ⇒ 照实 `no_hard_failures=false`（`refused_within_bound` 判据）—— 不许靠
         #     "游戏全拒绝"换来一个 verified；
         #   * 两套豁免**各自扣减、互不覆盖**（拒绝格与不可达格是两批坐标、两套集合）。
-        refused_bound = max(5, int(0.2 * attempted_steps))
+        refused_bound = max(5, int(0.2 * bound_basis_steps))
         refused_day: set[tuple[int, int]] = set(self.refused_day)
         for s in rep.stages:
             for t in (s.get("refused_tiles") or []):
@@ -3092,21 +3128,23 @@ class LongRun:
         made_any_progress = rep.ok_steps > 0
         if refused_day:
             self._journal("refused_summary", count=len(refused_day), bound=refused_bound,
-                          attempted=attempted_steps, exempted=refused_exempt,
+                          attempted=attempted_steps, bound_basis=bound_basis_steps,
+                          exempted=refused_exempt,
                           raw_unmet=raw_unmet, unmet=unmet_leftover,
                           tiles=[list(t) for t in sorted(refused_day)[:12]],
                           note="游戏拒绝的格：当天封格、次日重试；界内不影响 verified，"
                                "超界照实 needs_review（与 unreachable 两套独立计数）")
         if unreach_day:
             self._journal("unreachable_summary", count=len(unreach_day), bound=unreachable_bound,
-                          attempted=attempted_steps, engaged=engaged_steps,
+                          attempted=attempted_steps, bound_basis=bound_basis_steps,
+                          engaged=engaged_steps,
                           exempted=unreachable_exempt,
                           raw_unmet=raw_unmet, unmet=unmet_leftover,
                           tiles=[list(t) for t in sorted(unreach_day)[:12]],
                           note="不可达豁免：界内不影响 verified；扣掉的格子在 leftover 里逐格可见"
-                               "（【task-68】`attempted` 仍是界的分母、与对账工具一致；"
-                               "`engaged` = 真的站到过目标格旁边的步数，只作证据 —— run6 的 42 格"
-                               "里有多少压根没走到跟前，看它）")
+                               "（【task-78】上界分母 = `bound_basis`（发起过动作且**不是** encircled "
+                               "的步数）；`attempted` 仍是原始证据计数、`engaged` = 真的站到过目标格"
+                               "旁边的步数，两者都只作证据）")
         # 【task-68】"被围住"的日级账本：**只报证据**，既不影响任何豁免，也不封格。
         enc_day: set[tuple[int, int]] = set(self.encircled_day)
         for s in rep.stages:
@@ -3117,15 +3155,19 @@ class LongRun:
                     continue
         rep.encircled = len(enc_day)
         rep.encircled_tiles = [list(t) for t in sorted(enc_day)]
+        tried_open_steps = sum(int(s.get("encircled_tried") or 0) for s in rep.stages)
         if enc_day:
             self._journal("encircled_summary", count=len(enc_day),
-                          attempted=attempted_steps, engaged=engaged_steps,
+                          attempted=attempted_steps, bound_basis=bound_basis_steps,
+                          engaged=engaged_steps, tried_open_steps=tried_open_steps,
                           tiles=[list(t) for t in sorted(enc_day)[:12]],
-                          note="被不可清障物围住（树/桩/大石一类）：不算「走不到」、不封格、"
-                               "不进 unreachable 豁免；开路后/次日可能变可达")
+                          note="四邻没有「可清障 + 自己够得着」的突破口 ⇒ 不算「走不到」、不封格、"
+                               "不进 unreachable 豁免；开路后/次日可能变可达"
+                               "（真实四邻 kind 与逐格开路次数见 encircled 事件的 kinds/tried_open；"
+                               "本键 `tried_open_steps` 是当天合计）")
             rep.notes.append(
-                f"有 {len(enc_day)} 格被不可清障物围住（树/桩/大石一类）⇒ 不算「走不到」、"
-                f"不进不可达豁免，只记 encircled 证据")
+                f"有 {len(enc_day)} 格四邻没有「可清障 + 自己够得着」的突破口 ⇒ 不算「走不到」、"
+                f"不进不可达豁免，只记 encircled 证据（为这些格试过开路 {tried_open_steps} 次）")
         # 遮蔽可见性（Lead m02561 裁定 1）：同一阶段种类当天**更早**记录 leftover>0、**最后一条**
         # leftover==0 ⇒ "前一片地没做完、后一片地干净"的遮蔽发生了。**纯信息项**：不改 VERIFIED、
         # 不改退出码，只发 journal + 进 notes，让 run3 事后能人工复核。
@@ -3162,8 +3204,9 @@ class LongRun:
             # 用户 m03224 拍板了职业路线：宁可停下等人，也不静默丢档。
             "no_blocking_modal": rep.ended_by not in BLOCKING_ENDS,
             "no_hard_failures": rep.failed_steps == 0 and rep.refused <= refused_bound,
-            # 【task-52】"走不到"本身不算硬失败，但**有上界**：超过 `max(5, 20%×attempted)`
+            # 【task-52】"走不到"本身不算硬失败，但**有上界**：超过 `max(5, 20%×bound_basis)`
             # 就不是"个别格子客观走不到"，而是"今天大片目标够不着" ⇒ 照实 needs_review。
+            # （【task-78 NIT-1】基数 `bound_basis` 剔掉了 `encircled` 步 —— 见日终注释。）
             "unreachable_within_bound": rep.unreachable <= unreachable_bound,
             # 【task-63】游戏拒绝同样**有上界**（防"游戏全拒绝"换个 verified）。该键**总是**写、
             # 总是 bool（`tools\verify-run3.py` 按 `is False` 判 problem）。

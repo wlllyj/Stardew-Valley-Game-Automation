@@ -393,14 +393,21 @@ class StepResult:
     #: 脑据此挑"当季、买得起"的种子，不再硬编码物品 id（run6：夏季硬买春季 `472` ⇒ 每天白试 6 次）。
     #: 只落盘成纯数据（`[{"id","name","price"}, …]`），解析容错在 `seed_offers_from()`。
     available: list[dict[str, Any]] = field(default_factory=list)
-    #: 【task-68】**真的站到了目标格旁边**（站位成功）才为真。日级 `unreachable_bound` 的分母
-    #: 用它而不是"发起过动作的格"：压根没走到跟前的格子（run6 那 42 格）不该抬高豁免上界，
-    #: 否则"整片被围住"时合法豁免反而被自己的分母顶出去（`unreachable_within_bound` 假红）。
+    #: 【task-68】**真的站到了目标格旁边**（站位成功）才为真。
+    #: 【task-78】它只作**证据**（`unreachable_summary.engaged`）：日级不可达上界的分母是
+    #: `bound_basis`（发起过动作且**不是** `encircled` 的步数），不是 `stood` 也不是原始 `attempted`。
     stood: bool = False
     #: 【task-68】为够到 `tile` 而**先清掉的邻格**（`[{"neighbour":[x,y],"kind":…,"result":…}]`）。
     #: 单独一个字段（不塞 `after`）：`after` 是逐格观测要点、会在动作循环里被覆盖，
     #: 开路证据必须留到最后 ⇒ `as_dict()` 里叫 `clear_neighbor`，`longrun` 汇总成 journal。
     opened: list[dict[str, Any]] = field(default_factory=list)
+    #: 【task-78】这一格**试了几次开路**（真的对邻格发起 `clear()` 的次数；被围住的格多半是 0）。
+    #: 纯证据：进逐格 journal `encircled` 与日级 `encircled_summary.tried_open_steps`，
+    #: 让"判 `encircled` 时到底试过没有"可复核；**不参与任何上界 / 豁免计算**。
+    tried_open: int = 0
+    #: 【task-78 NIT-2】判 `encircled` 时四邻的**真实 kind**（`["weed","未知","空地",…]`）。
+    #: 进逐格 journal `encircled.kinds` —— 观测拿不到就写"未知"，**不许**替观测断言"树/桩/大石"。
+    encircled_kinds: list[str] = field(default_factory=list)
 
     @property
     def skipped(self) -> bool:
@@ -458,6 +465,8 @@ class StepResult:
             d["stood"] = True
         if self.opened:
             d["clear_neighbor"] = self.opened
+        if self.tried_open:
+            d["tried_open"] = self.tried_open
         if self.refused:
             d["refused"] = True
         if self.available:
@@ -968,6 +977,23 @@ class FarmWorker:
                 return True
         return False
 
+    @staticmethod
+    def _neighbour_kinds(obs: dict[str, Any], tile: tuple[int, int]) -> list[str]:
+        """【task-78】四邻的**真实 kind**（照实写进走不到/被围住的 reason，不许替观测下结论）。
+
+        观测里没有这一格 ⇒ `"未知"`；有观测但 kind 为空/`none` ⇒ `"空地"`（能站、没有可清障物）。
+        """
+        tiles = FarmWorker.tiles_of(obs)
+        out: list[str] = []
+        for dx, dy in NEIGHBORS:
+            tv = tiles.get((tile[0] + dx, tile[1] + dy))
+            if tv is None:
+                out.append("未知")
+                continue
+            kind = str(tv.get("kind") or "")
+            out.append(kind if kind and kind != "none" else "空地")
+        return out
+
     def _openable_neighbours(self, obs: dict[str, Any], tile: tuple[int, int],
                              *, skip: set[tuple[int, int]] | None = None
                              ) -> list[tuple[tuple[int, int], str]]:
@@ -1018,7 +1044,9 @@ class FarmWorker:
             cands = self._openable_neighbours(obs, tile, skip=skip)
             if not cands:
                 # 没有"可清 + 够得着"的邻格：还要分两种 ——
-                #   * 四邻**连落脚点都没有**（树/桩/大石一类）⇒ `encircled`（被围住，不封格、不计不可达）；
+                #   * 四邻**连落脚点都没有** ⇒ `encircled`（被围住，不封格、不计不可达）；
+                #     具体被什么占着**照观测写**（`_ensure_reachable` 里用 `_neighbour_kinds`），
+                #     不许在这里替观测断言"是树/桩/大石"。
                 #   * 四邻**有落脚点**（只是寻路/站位失败）⇒ `exhausted` ⇒ 按 `unreachable` 处理
                 #     （task-52 口径不变：这是"走不到"，不是"被围住"）。
                 if not self._standable_near(obs, tile):
@@ -1058,9 +1086,21 @@ class FarmWorker:
             r.stood = True
             return True
         if code == "encircled":
+            # 【task-78 NIT-2】reason 只写**看得见的事实**：试了几次开路 + 四邻真实 kind。
+            # 不许再断言"是树/桩/大石"—— 四邻完全可能是 `weed` 只是自己站不上去（deputy 实证：
+            # `weed` + `standable=false` ⇒ 0 次挥动却写成树/桩/大石，与事实不符）。
+            facts = self.snap()
+            try:
+                kinds = self._neighbour_kinds(facts, tile)
+            except Exception:                      # 观测拿不到就照实写"未知"，不许编
+                kinds = ["未知"] * len(NEIGHBORS)
             r.code = ENCIRCLED_CODE
-            r.reason = ("四邻被不可清障物占住（树/桩/大石一类；2 层内没有「可站+可清」的突破口）"
-                        "⇒ 归 encircled：不算「走不到」、不封格，次日/开路后可能变可达")
+            r.tried_open = len(cleared)
+            r.encircled_kinds = list(kinds)
+            r.reason = (f"四邻没有「可清障 + 自己够得着」的突破口（判据：四邻既没有落脚点，"
+                        f"也没有可清障类邻格）⇒ 归 encircled：不算「走不到」、不封格，"
+                        f"次日/开路后可能变可达；四邻实际 kind={kinds}；"
+                        f"已试开路 {len(cleared)} 次（上限 {MAX_OPEN_ACTIONS}）")
             return False
         r.code = UNREACHABLE_CODE
         r.reason = (f"四邻都站不过去（已为开路清 {len(cleared)} 格邻格仍不通，"

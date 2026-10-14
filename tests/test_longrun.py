@@ -3963,6 +3963,197 @@ class TestTask73StuckFlush(unittest.TestCase):
         self.assertEqual(run.summary["stuck_flushes"], run.stuck_flushes)
 
 
+class TestTask78BoundBasis(unittest.TestCase):
+    """task-78 NIT-1（deputy 的伪造账本 V5）：豁免上界的**分母**必须是 `bound_basis`。
+
+    病灶：两套 bound 原来都用 `max(5, floor(0.2×attempted))`，而 `attempted` 把 `encircled`
+    步也算进去 ⇒ 800 次 `encircled` 能把上界抬到 200，200 格真不可达被豁免、当天 VERIFIED。
+    修法：`bound_basis = Σ(阶段里 attempted 且**不是** encircled 的步数)`，两套 bound 改用它；
+    `attempted` 的语义一字不动（它仍是"发起过的步数"的**证据**）。
+
+    本用例把两个数**都造出来**：20 格被围住（`encircled`，会被重试 ⇒ 实际几十次）+ 2 格真
+    不可达 ⇒ 按 `bound_basis`（=2）算界是 `max(5, 0) = 5`，按旧的 `attempted` 算界会到 8+。
+    """
+
+    def _world(self):
+        enclosed = [(60 + 3 * i, 30) for i in range(20)]
+        w = EncircledWorld(enclosed=enclosed, seeds=0, money=0)
+        # 2 格真不可达：目标格周围**没有观测**（`_standable_near` 为真 ⇒ 不是 encircled），
+        # 但四邻都在 `_UnreachableClient` 的"移动必被拒"名单里 ⇒ 开路也没得清 ⇒ `exhausted`
+        # ⇒ 归 task-52 的 `unreachable`（有界、当日封格、次日重试）。
+        far = [(66, 40), (70, 40)]
+        for t in far:
+            w.dirt.add(t)
+            w.crops[t] = {"ripe": False, "watered": True, "dead": True}
+        blocked_moves = set(far)
+        for t in far:
+            for dx, dy in _NB4:
+                blocked_moves.add((t[0] + dx, t[1] + dy))
+        return w, set(far), blocked_moves
+
+    def _run(self, w, blocked_moves):
+        # `_UnreachableClient` 会把名单里每一格的**四邻**也拉黑 ⇒ 把被围住的也算进去，
+        # 它们才走得进"站不过去 ⇒ 先开路 ⇒ 没突破口 ⇒ encircled"这条路。
+        client = _UnreachableClient(w, unreachable=blocked_moves | set(w.enclosed))
+        worker = FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+        run = make_run(w, client_factory=lambda: client, worker_factory=lambda c: worker,
+                       target_days=1, max_days=1, per_stage_tiles=200, max_stage_rounds=2)
+        run.worker = worker
+        run.client = client
+        return run
+
+    @staticmethod
+    def _events(run, event: str) -> list:
+        return [e for e in run.entries if e.get("event") == event]
+
+    def test_encircled_never_inflates_the_exemption_bound(self):
+        """20 格 encircled + 2 格真 unreachable ⇒ 界仍按 5 算，那 2 格才被豁免。"""
+        w, far, blocked = self._world()
+        run = self._run(w, blocked)
+        targets = sorted(w.enclosed | far)
+        run._ensure_plot = lambda obs, rep: {"zone": "", "label": "",
+                                             "anchor": list(targets[0]),
+                                             "tiles": targets, "note": ""}
+        run.run()
+        rep = run.days[0]
+        attempted = sum(int(st.get("attempted") or 0) for st in rep.stages)
+        encircled = sum(int(st.get("encircled") or 0) for st in rep.stages)
+        self.assertGreaterEqual(encircled, 20, f"被围住的格子必须真的被记成 encircled：{rep.stages}")
+        self.assertEqual(rep.unreachable, 2, "只有那 2 格是真·走不到")
+        self.assertEqual(rep.bound_basis, attempted - encircled, "bound_basis = attempted − encircled")
+        self.assertEqual(rep.unreachable_bound, 5, "界按 bound_basis 算（2 ⇒ 下限 5）")
+        self.assertLess(rep.unreachable_bound, max(5, int(0.2 * attempted)),
+                        "旧口径（attempted 当分母）会把界抬高 ⇒ 这条断言就是 NIT-1 的证伪点")
+        self.assertEqual(rep.unreachable_exempt, 2, "那 2 格才该被豁免")
+        self.assertEqual({tuple(t) for t in rep.unreachable_tiles}, far)
+
+    def test_bound_basis_is_written_to_the_ledger(self):
+        """`day_end` 与三个 summary 都要带 `bound_basis`（工具侧照它复核）。"""
+        w, far, blocked = self._world()
+        run = self._run(w, blocked)
+        targets = sorted(w.enclosed | far)
+        run._ensure_plot = lambda obs, rep: {"zone": "", "label": "",
+                                             "anchor": list(targets[0]),
+                                             "tiles": targets, "note": ""}
+        run.run()
+        rep = run.days[0]
+        day_end = self._events(run, "day_end")[-1]
+        self.assertEqual(day_end["bound_basis"], rep.bound_basis)
+        for name in ("unreachable_summary", "encircled_summary"):
+            got = self._events(run, name)
+            self.assertEqual(len(got), 1, (name, got))
+            self.assertEqual(got[0]["bound_basis"], rep.bound_basis, name)
+        # 记账口径可复核：阶段账本里也留着 `bound_basis`
+        for st in rep.stages:
+            self.assertIn("bound_basis", st, st)
+        # 既有闸门的方向与存在性一个字没改（task-52/task-63 的断言口径）
+        self.assertIn("unreachable_within_bound", rep.checks)
+        self.assertIsInstance(rep.checks["unreachable_within_bound"], bool)
+
+    def test_bound_formula_matches_the_ledger(self):
+        """两套界都必须**逐字**从 `bound_basis` 推出来（不是从 `attempted`）。
+
+        `attempted` 的语义一字没动（它仍是"发起过多少步"的证据，`unreachable_summary` 里
+        与 `engaged` 并列）；这里把公式钉死，防止哪天被人改回 `attempted` 当分母。
+        """
+        w, far, blocked = self._world()
+        run = self._run(w, blocked)
+        targets = sorted(w.enclosed | far)
+        run._ensure_plot = lambda obs, rep: {"zone": "", "label": "",
+                                             "anchor": list(targets[0]),
+                                             "tiles": targets, "note": ""}
+        run.run()
+        rep = run.days[0]
+        attempted = sum(int(st.get("attempted") or 0) for st in rep.stages)
+        self.assertLessEqual(rep.bound_basis, attempted)
+        self.assertEqual(rep.unreachable_bound, max(5, int(0.2 * rep.bound_basis)))
+        self.assertEqual(rep.refused_bound, max(5, int(0.2 * rep.bound_basis)))
+        self.assertNotEqual(rep.unreachable_bound, max(5, int(0.2 * attempted)),
+                            "这条差值就是 NIT-1 的证伪点：分母不能是 attempted")
+
+
+class WeedRingWorld(FakeWorld):
+    """task-78 NIT-2 的 deputy 实证形态：目标格是枯死作物，四邻是 `weed`，**但那些邻格自己也站不上去**。
+
+    与 `EncircledWorld`（四邻是树/桩）的区别就在这里：被围住的原因**不是**树/桩/大石，
+    而是"可清障类邻格 + 没有落脚点" ⇒ 一次都没挥过。所以 reason/journal 不许再断言
+    "树/桩/大石一类"，要照观测写真实 kind（这里四邻都是 `weed`）。
+    """
+
+    def __init__(self, *, tile) -> None:
+        super().__init__(weeds=0, seeds=0, money=0)
+        self.target = (int(tile[0]), int(tile[1]))
+        self.dirt.add(self.target)
+        self.crops[self.target] = {"ripe": False, "watered": True, "dead": True}
+        # 半径 3 内的每一格都观测成"站不住"（目标格自己也是 —— 枯死作物格上站不上去），
+        # 这样四邻既清不了（没有落脚点去站它旁边）也当不了"可站"的参照。
+        self.cold = {(self.target[0] + dx, self.target[1] + dy)
+                     for dx in range(-3, 4) for dy in range(-3, 4)}
+        self.ring = [(self.target[0] + dx, self.target[1] + dy) for dx, dy in _NB4]
+        for t in self.ring:
+            self.blockers[t] = "weed"
+        # 半径 3 内**除目标格与那 4 个 `weed` 之外**的每一格都用 `tree` 占上（`tree` **不在**
+        # `FRONTIER_KINDS` ⇒ 不会变成开路候选），只为让观测**覆盖**它们：否则"窗口里没有这一格"
+        # 会被 `_standable_near` 当成"也许能站"，四邻就又变回"可清障 + 够得着"了。
+        for t in sorted(self.cold):
+            if t != self.target and t not in self.ring:
+                self.blockers[t] = "tree"
+
+    def obs(self) -> dict:
+        o = super().obs()
+        for tv in o["location"]["tiles"]:
+            if tuple(tv["tile"]) in self.cold:
+                tv["standable"] = False
+        return o
+
+
+class TestTask78HonestEncircledWording(unittest.TestCase):
+    """task-78 NIT-2：判 `encircled` 时要说**实话** —— 真实四邻 kind + 试过开路几次。
+
+    病灶：四邻是 `weed` 但站不上去 ⇒ 0 次挥动也判 `encircled`，reason 却断言"树/桩/大石一类"。
+    """
+
+    TILE = (62, 12)
+
+    def _run(self, w):
+        client = _UnreachableClient(w, unreachable=[self.TILE])
+        worker = FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+        run = make_run(w, client_factory=lambda: client, worker_factory=lambda c: worker,
+                       target_days=1, max_days=1)
+        run.worker = worker
+        run.client = client
+        return run
+
+    @staticmethod
+    def _events(run, event: str) -> list:
+        return [e for e in run.entries if e.get("event") == event]
+
+    def test_reason_names_the_real_neighbour_kinds(self):
+        w = WeedRingWorld(tile=self.TILE)
+        run = self._run(w)
+        run.run()
+        per = self._events(run, "encircled")
+        # 被围住的格子**不封格**（次日/开路后可能变可达）⇒ 同一天会被重试若干轮，事件会多条。
+        self.assertGreaterEqual(len(per), 1, per)
+        self.assertEqual({tuple(e["tile"]) for e in per}, {self.TILE})
+        for e in per:
+            self.assertEqual(e["kinds"], ["weed"] * len(_NB4), "逐格 journal 要写四邻真实 kind")
+            self.assertEqual(e["tried_open"], 0, "一次都没挥过就照实写 0")
+            self.assertIn("weed", e["reason"])
+            self.assertNotIn("树/桩/大石", e["reason"], "没证据就不许暗示是树/桩/大石")
+            self.assertIn("突破口", e["reason"])
+
+    def test_summary_reports_tried_open_steps(self):
+        w = WeedRingWorld(tile=self.TILE)
+        run = self._run(w)
+        run.run()
+        summary = self._events(run, "encircled_summary")
+        self.assertEqual(len(summary), 1, summary)
+        self.assertEqual(summary[0]["tried_open_steps"], 0, "开路尝试次数要能被复核")
+        self.assertIn("bound_basis", summary[0])
+        self.assertNotIn("树/桩/大石", str(summary[0].get("note") or ""))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 
