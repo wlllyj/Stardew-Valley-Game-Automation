@@ -228,6 +228,11 @@ def build_days(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     # 不进 `unreachable_exempt` 分子；`frontier_clear`/`clear_neighbor` 只走 journal。
                     "encircled",
                     "encircled_tiles",
+                    # task-78：上界基数（= 发起过动作且**不是** encircled 的步数）。账号本缺失时
+                    # 工具按 `attempted − encircled` 自算，绝不采信"账本更大的上界"。
+                    "bound_basis",
+                    # task-73：这一天是 stuck 但已经睡过去翻篇（有界 MAX_STUCK_FLUSH）。
+                    "stuck_flushed",
                 )
             }
             fin_key = day_key({"final": cur["final"]}) if cur["final"] else "?"
@@ -484,7 +489,10 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
             field_unreach = sum_unreach
         # task-52 的豁免上界/实扣。**上界必须自算**（task-71：deputy 的 task-54 实测账本写
         # `unreachable_bound=9999` 会被无条件采信 ⇒ 伪造账本 exit 0）。自算公式与 longrun 一致：
-        # `max(5, floor(0.2×attempted))`；账本值比自算值大 ⇒ problem（放宽豁免=洗白）。
+        # `max(5, floor(0.2×bound_basis))`；账本值比自算值大 ⇒ problem（放宽豁免=洗白）。
+        # task-78：分母从 `attempted` 换成 `bound_basis = attempted − encircled` —— deputy 的对抗
+        # 验收用伪造账本 V5 打穿过旧口径（800 次 `encircled` 把上界抬到 200 ⇒ 200 格真不可达被
+        # 豁免、exit 0）。被围住的格既不是"走不到"也不是"干了没成"，不该为豁免额度做贡献。
         attempted_day = end_stats.get("attempted")
         attempted_self = sum(int(s.get("attempted") or 0) for s in stage_recs)
         attempted_total = int(attempted_day) if isinstance(attempted_day, (int, float)) else 0
@@ -495,7 +503,31 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
                 f"[{name}] day_end.attempted={int(attempted_day)} > stages 求和 {attempted_self}"
                 "（抬高分母就能放宽 20% 上界 ⇒ 账目不可信）"
             )
-        bound_self = max(5, int(0.2 * attempted_total)) if attempted_total else 5
+        encircled_day = end_stats.get("encircled")
+        encircled_self = sum(int(s.get("encircled") or 0) for s in stage_recs)
+        encircled_total = int(encircled_day) if isinstance(encircled_day, (int, float)) else 0
+        if not encircled_total:
+            encircled_total = encircled_self
+        basis_self = max(0, attempted_total - encircled_total)
+        _basis = end_stats.get("bound_basis")
+        if isinstance(_basis, (int, float)):
+            if int(_basis) > attempted_total:
+                problems.append(
+                    f"[{name}] 上界基数账本 bound_basis={int(_basis)} > attempted={attempted_total}"
+                    "（抬高基数就能放宽 20% 上界 ⇒ 账目不可信）"
+                )
+                basis = attempted_total
+            else:
+                basis = min(int(_basis), basis_self) if basis_self else int(_basis)
+                if basis != basis_self and int(_basis) > basis_self:
+                    problems.append(
+                        f"[{name}] 上界基数账本 bound_basis={int(_basis)} > 自算={basis_self}"
+                        f"（attempted={attempted_total} − encircled={encircled_total}）"
+                        "⇒ 基数被放宽，可能把真失败洗成不可达"
+                    )
+        else:
+            basis = basis_self
+        bound_self = max(5, int(0.2 * basis)) if basis else 5
         _bound = end_stats.get("unreachable_bound")
         bound = int(_bound) if isinstance(_bound, (int, float)) else bound_self
         if isinstance(_bound, (int, float)) and bound != bound_self:
@@ -523,7 +555,7 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
             src = f"{field_unreach}" if field_unreach is not None else "未写"
             infos.append(
                 f"[{name}] 不可达（四邻都站不过去/A* 算不出路）账本={src}、journal 自算={self_unreach} 次"
-                f"/{self_tiles} 格、豁免上界 bound={bound}（attempted={attempted_total}）、实际扣除 exempt={unreach_exempt}"
+                f"/{self_tiles} 格、豁免上界 bound={bound}（bound_basis={basis} = attempted {attempted_total} − encircled {encircled_total}）、实际扣除 exempt={unreach_exempt}"
                 "（task-52 政策：不计当天硬失败；本行只供复核）"
             )
         # 硬闸门：豁免越界＝洗白风险（把"真失败"混进不可达或抬高 attempted 分母）
@@ -551,13 +583,13 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
             sum_refused or None
         )
         _rbound = end_stats.get("refused_bound")
-        rbound_self = max(5, int(0.2 * attempted_total)) if attempted_total else 5
+        rbound_self = max(5, int(0.2 * basis)) if basis else 5
         rbound = int(_rbound) if isinstance(_rbound, (int, float)) else rbound_self
         if isinstance(_rbound, (int, float)) and rbound != rbound_self:
             if rbound > rbound_self:
                 problems.append(
                     f"[{name}] 被拒豁免上界账本={rbound} > 自算={rbound_self}"
-                    f"（attempted={attempted_total}）⇒ 上界被放宽，可能把真失败洗成「游戏拒绝」"
+                    f"（bound_basis={basis}）⇒ 上界被放宽，可能把真失败洗成「游戏拒绝」"
                 )
             else:
                 infos.append(f"[{name}] 被拒豁免上界账本={rbound} < 自算={rbound_self}（更严，信息项）")
@@ -828,6 +860,31 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         n = events.get(code, 0)
         if n:
             infos.append(f"风险事件：{label} ×{n}（信息项，不改结论）")
+
+    # 3e. task-73（stuck 日有界翻篇）：`MAX_STUCK_FLUSH` 允许"卡死的日子"睡过去翻到第二天
+    #     —— 翻篇那天本身 `ended_by=stuck`、`verified=false`（不许洗白），但**翻篇过的日子
+    #     绝不允许被记成 verified**（那是"用睡觉绕过没做完的活"）。同时把次数呈现出来，
+    #     这样"尾部连续 3 天"的达成分得清"真干活"和"靠翻篇凑天数"。
+    flushed_days = [d for d in days if (d.get("end") or {}).get("stuck_flushed") is True]
+    for d in flushed_days:
+        if d.get("verified") is True:
+            problems.append(
+                f"[{d['key']}] 该日是 stuck 翻篇（`day_end.stuck_flushed=true`）却记成 verified"
+                "（task-73 的翻篇只许翻页、不许洗白；查 _stuck_flush 的 ended_by/verified 写法）"
+            )
+    n_flush = events.get("stuck_flush", 0)
+    n_flush_skip = events.get("stuck_flush_skipped", 0)
+    if flushed_days or n_flush:
+        infos.append(
+            f"stuck 日翻篇：{len(flushed_days)} 天 / journal `stuck_flush` ×{n_flush}"
+            f"、`stuck_flush_skipped` ×{n_flush_skip}"
+            "（task-73 有界 MAX_STUCK_FLUSH=2；翻篇日必须 verified=false，尾部连续天数必须靠真干活的日子）"
+        )
+    if events.get("stuck_flush_resnap_failed", 0):
+        infos.append(
+            f"风险事件：stuck 翻篇后重新观测失败 ×{events['stuck_flush_resnap_failed']}"
+            "（跨日证据可能缺）"
+        )
 
     streak = 0
     for d in reversed(days):

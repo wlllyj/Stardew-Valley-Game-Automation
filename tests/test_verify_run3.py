@@ -637,5 +637,73 @@ class TestVerifyRun3(unittest.TestCase):
         self.assertFalse(ok)
 
 
+    def test_encircled_steps_do_not_inflate_the_exemption_bound(self):
+        """task-78：上界分母是 `bound_basis = attempted − encircled`。
+
+        deputy-lead 的对抗验收用伪造账本 V5 打穿过旧口径：800 次 `encircled` 把
+        `max(5, floor(0.2 × attempted))` 抬到 200 ⇒ 200 格真不可达被豁免、exit 0。
+        现在被围住的格不给豁免额度：账本若仍按 `attempted` 写一个更大的 bound ⇒ problem。
+        """
+        rows = green_rows()
+        for i, r in enumerate(rows):
+            if r.get("event") == "day_end" and r["final"]["day"][2] == 10:
+                rows[i] = day_end(
+                    r["final"]["day"], r["day_after"],
+                    stages=[stage("clear_dead", tiles=100, ok=0, skipped=0,
+                                  attempted=100, encircled=90, unreachable=5,
+                                  leftover=95)],
+                    attempted=100, encircled=90, unreachable=5,
+                    unreachable_bound=20, unreachable_exempt=5,
+                    unreachable_tiles=[[50, 20]] * 5,
+                )
+        ok, s = self.check(rows)
+        blob = " | ".join(s["problems"])
+        self.assertIn("上界被放宽", blob)
+        self.assertFalse(ok)
+
+    def test_bound_basis_field_is_honoured_when_consistent(self):
+        """账本写对 `bound_basis`（= attempted − encircled）时不许误报，且上界按它算。"""
+        rows = green_rows()
+        for i, r in enumerate(rows):
+            if r.get("event") == "day_end" and r["final"]["day"][2] == 10:
+                rows[i] = day_end(
+                    r["final"]["day"], r["day_after"],
+                    stages=[stage("clear_dead", tiles=50, ok=10, attempted=50,
+                                  encircled=45, unreachable=0, leftover=0)],
+                    attempted=50, encircled=45, unreachable=0, bound_basis=5,
+                    unreachable_bound=5,
+                )
+        ok, s = self.check(rows)
+        self.assertFalse(any("上界" in p for p in s["problems"]), s["problems"])
+
+    def test_stuck_flushed_day_must_not_be_verified(self):
+        """task-73：卡死翻篇只许翻页，不许洗白 —— `stuck_flushed=true` 的日子记 verified ⇒ problem。"""
+        rows = green_rows()
+        for i, r in enumerate(rows):
+            if r.get("event") == "day_end" and r["final"]["day"][2] == 11:
+                rows[i] = day_end(r["final"]["day"], r["day_after"], stuck_flushed=True)
+        ok, s = self.check(rows)
+        self.assertTrue(
+            any("stuck 翻篇" in p and "verified" in p for p in s["problems"]), s["problems"]
+        )
+        self.assertFalse(ok)
+
+    def test_stuck_flush_day_is_reported_as_info(self):
+        """翻篇日如实 rejected（verified=false）⇒ 只记 info，并报次数供"连续 3 天"复核。"""
+        rows = green_rows()
+        rows.insert(2, {"event": "stuck_flush", "t": 41.0, "_lineno": 80,
+                        "ok": True, "count": 1, "limit": 2})
+        for i, r in enumerate(rows):
+            if r.get("event") == "day_end" and r["final"]["day"][2] == 11:
+                rows[i] = day_end(r["final"]["day"], None, ok_steps=0, ended_by="stuck",
+                                  ended_reason="stuck:连续 3 轮世界没有任何变化",
+                                  verified=False, stages=[stage(ok=0, leftover=2)],
+                                  stuck_flushed=True)
+        ok, s = self.check(rows)
+        blob = " | ".join(s["infos"])
+        self.assertIn("stuck 日翻篇", blob)
+        self.assertFalse(any("stuck 翻篇" in p for p in s["problems"]), s["problems"])
+
+
 if __name__ == "__main__":
     unittest.main()
