@@ -183,6 +183,13 @@ FIELD_PROBES = [
     ("day_end.checks.refused_within_bound", "refused_within_bound",
      "拒绝计数是否在上界内（task-63；false ⇒ 可能把真失败当'游戏拒绝'洗白，verify-run3 判 problem；"
      "缺失 ≠ 通过）"),
+    # task-67/task-70：种子经济（run6 死锁链的第一环）；行内含 code/money/seed_price/keep_factor/offers
+    ("event:no_seed_for_sale", "no_seed_for_sale",
+     "今天货架上一条种子都没有（task-67；看 code/money/seed_price/offers —— run6 就是这一环）"),
+    ("event:cannot_afford", "cannot_afford",
+     "有种子但按 keep_factor 买不起（task-67；看 money/seed_price/offers）"),
+    ("event:seed_unavailable_today", "seed_unavailable_today",
+     "今天已确认买不到 ⇒ 不再把「该去买种子」当活（task-67；防 run6 那种 stuck 死锁的解药留痕）"),
 ]
 OUTCOME_RE = re.compile(
     r"目标\s*(\d+)\s*步：做成\s*(\d+)、跳过\s*(\d+)、失败\s*(\d+)"
@@ -300,11 +307,28 @@ EVENT_BUCKETS = {
     "stage": "stage_events",
     # --- task-63（dev 在制）：枯死作物清理范围 + 农场级 deadCrops 证据；只计数，等 run6 形态再定分类
     "clear_dead_scope": "clear_dead_scopes",
+    # --- task-67/task-70：**种子经济**三事件（run6 死锁链的第一环）。归同一类（种子/经济）但
+    #     **分开计数**（不许互相掩护）：
+    #     `no_seed_for_sale` = 货架一条种子都没有（run6 夏季只有当季种子、硬编码 472 不在架）；
+    #     `cannot_afford` = 有种子但按 keep_factor（留够 K 包）买不起；
+    #     `seed_unavailable_today` = "今天买不到"的**当天失效**留痕（sleep_guard 不再把「该去买」当活）
+    #     ⇒ 它是 run6 死锁的**解药证据**：出现它却仍 stuck，就得去查别的守卫条件，别再怪种子。
+    #     三者都**不是硬失败**（买不到是环境事实）；判据要看它和 buy/stuck 的组合。
+    "no_seed_for_sale": "no_seed_for_sales",
+    "cannot_afford": "cannot_affords",
+    "seed_unavailable_today": "seed_unavailable_today",
 }
 
 #: 结构性事件：由报告的其他字段单独统计（day_start/day_end 切会话与验收、finish 自述），
 #: 不进桶、也不算"未映射"。
 STRUCTURAL_EVENTS = ("day_start", "day_end", "finish")
+
+#: 桶名 → 事件名 的反查表。`report["events"]` 数的是**事件名**，而 `NEW_EVENT_BUCKETS` 里写的是
+#: **桶名**；对 `buy→buys`/`sell→sells`/`unreachable_stage→unreachable_stages` 这类非同名映射，
+#: 直接拿桶名去查会恒为 0 ⇒ 新事件在头部"隐形"（run6 的 6 次 `buy` 就是这么消失的，task-70 修）。
+BUCKET_TO_EVENT = {}
+for _ev_name, _bucket_name in EVENT_BUCKETS.items():
+    BUCKET_TO_EVENT.setdefault(_bucket_name, _ev_name)
 
 #: run6 要看次数的新事件桶（task-15/41/42/49/50）：只在计数非 0 时打印，便于一眼点名。
 NEW_EVENT_BUCKETS = (
@@ -318,6 +342,8 @@ NEW_EVENT_BUCKETS = (
     "unreachable", "unreachable_stages", "unreachable_summaries",
     # task-66：被游戏拒绝（till 的 tool_ineffective）三级留痕
     "tool_refused", "refused_stages", "refused_summaries",
+    # task-70：种子经济（买不到 / 买不起 / 当天失效留痕）
+    "no_seed_for_sales", "cannot_affords", "seed_unavailable_today",
 )
 
 
@@ -1432,6 +1458,24 @@ def build_advice(report, top=8):
                     "先看上一轮为什么卡住（stuck / 守卫死锁）",
             "lines": sdr.get("retry_lines") or [],
         })
+    # 0i) 种子经济（task-70：task-67 的种子三事件；run6 死锁链的第一环）
+    se = report.get("seed_economy") or {}
+    if se.get("total"):
+        advice.append({
+            "text": f"种子经济 ×{se['total']}（没货 {se['no_seed_for_sale']} / "
+                    f"买不起 {se['cannot_afford']} / 当天失效留痕 {se['seed_unavailable_today']}）"
+                    + (f"；货架：{str(se.get('offers') or '')[:160]}" if se.get("offers") else "")
+                    + ("：买不到是**当天确认的环境事实**（不是硬失败），但必须有 "
+                       "`seed_unavailable_today` 让「该去买种子」这条守卫理由当天失效，"
+                       "否则守卫永远拒绝收工 ⇒ 3 轮零变化 ⇒ stuck（run6 的形态）；"
+                       "留痕为 0 就先查 `_seed_dead` / `seed_unavail_noted` 的退路"
+                       if se.get("deadlock_risk") else
+                       "：种子经济已按当天失效处理（防死锁路径走到了），"
+                       "此时再 stuck 就要查别的守卫条件（别继续怪种子）"),
+            "lines": (se["lines"].get("no_seed_for_sale", [])
+                      + se["lines"].get("cannot_afford", [])
+                      + se["lines"].get("seed_unavailable_today", [])),
+        })
     # 0c) 环境挡路 / 没拿到结论（task-22 记账）
     env = report.get("env_inconclusive") or {}
     if env.get("env_fail_events"):
@@ -1854,6 +1898,40 @@ def build_report(rows, path, args, bad_lines):
         if ev.get("event") == "finish":
             finish = dict(ev)
             finish["line"] = lineno
+    # task-70：种子经济（task-67）—— `no_seed_for_sale` / `cannot_afford` / `seed_unavailable_today`
+    # 归**同一类**（种子/经济）但**分开计数**（不许互相掩护）。三者都不是硬失败；真正的指纹是
+    # 「守卫还要求去买（buy 没成交 / ended_by=stuck）却拿不出种子」⇒ 与 buy 计数一起看。
+    seed_counts = {"no_seed_for_sale": 0, "cannot_afford": 0, "seed_unavailable_today": 0}
+    seed_lines = {k: [] for k in seed_counts}
+    seed_offers = ""
+    seed_money = None
+    seed_price = None
+    for ln, ev in rows:
+        seed_name = str(ev.get("event") or "")
+        if seed_name not in seed_counts:
+            continue
+        seed_counts[seed_name] += 1
+        seed_lines[seed_name].append(ln)
+        if seed_name in ("no_seed_for_sale", "cannot_afford"):
+            if not seed_offers:
+                seed_offers = str(ev.get("offers") or "")
+            if seed_money is None:
+                seed_money = ev.get("money")
+            if seed_price is None:
+                seed_price = ev.get("seed_price")
+    seed_economy = {
+        "total": sum(seed_counts.values()),
+        "no_seed_for_sale": seed_counts["no_seed_for_sale"],
+        "cannot_afford": seed_counts["cannot_afford"],
+        "seed_unavailable_today": seed_counts["seed_unavailable_today"],
+        "lines": seed_lines,
+        "offers": seed_offers,
+        "money": seed_money,
+        "seed_price": seed_price,
+        # run6 死锁指纹：确认买不到、却**没有**当天失效留痕 ⇒ 守卫很可能还在要"去买"
+        "deadlock_risk": (seed_counts["no_seed_for_sale"] + seed_counts["cannot_afford"]) > 0
+                         and seed_counts["seed_unavailable_today"] == 0,
+    }
     sleep_ok = sum(1 for _, ev in rows if ev.get("event") == "sleep" and ev.get("ok"))
     sleep_failed = sum(1 for _, ev in rows if ev.get("event") == "sleep" and not ev.get("ok"))
     blocked_by_action = {}
@@ -1923,6 +2001,8 @@ def build_report(rows, path, args, bad_lines):
         # task-69：同日重试的呈现 + buy 事件的成/败计数（跑 run6 复核用）
         "same_day_retries": same_day_retries,
         "buy": buy_counts,
+        # task-70：种子经济（task-67 的种子三事件；与 buy 一起才是守卫死锁的完整指纹）
+        "seed_economy": seed_economy,
         "unmapped_events": unmapped_events,
         "no_day_progress": [
             {"line": ln, "reason": ev.get("reason"), "ended_by": ev.get("ended_by")}
@@ -2167,6 +2247,9 @@ MAPPING_TEXT = [
      "信息项：窗口外远距浇水；`ok=false` + `given_up=true` = '窗口外干格够不着'的直接证据"),
     ("event:seed_gate / stage_midway_leftover (task-15)",
      "信息项：种子闸门（种子/钱不够 ⇒ till/plant 被跳过，不算硬失败）+ 阶段中途遗留"),
+    ("event:no_seed_for_sale / cannot_afford / seed_unavailable_today (task-67)",
+     "种子经济（信息项，**不是硬失败**）：货架没种子 / 留够 K 包买不起 / 买不到结论**当天失效**留痕；"
+     "与头部 `购买:` 计数一起看 —— 买不到却没有失效留痕 = run6 那种守卫死锁（建议 0i）"),
     ("其他新事件（buy/env_retry/intent_unknown/zones_failed/day_key_resnap_failed/"
      "load_save/llm_on/day_cap/budget_exhausted/bridge_unavailable/watchdog_stop/"
      "mod_version_mismatch/llm_trace_failed/no_day_progress）",
@@ -2285,6 +2368,17 @@ def render_text(report, top):
                if buy.get("codes") else "")
             + (f"  ⚠ 同一回执连续失败 ⇒ 守卫死锁嫌疑（行 {buy.get('failed_lines', [])[:6]}）"
                if buy.get("same_receipt") else ""))
+    # task-70：种子经济（task-67）—— 买不到/买不起/当天失效留痕；与上一行的购买计数一起看
+    se = report.get("seed_economy") or {}
+    if se.get("total"):
+        add(f"种子经济: 买不到 {se['no_seed_for_sale'] + se['cannot_afford']} 次"
+            f"（没货 {se['no_seed_for_sale']} / 买不起 {se['cannot_afford']}）"
+            f"；当天失效留痕 seed_unavailable_today {se['seed_unavailable_today']} 次"
+            + (f"（money={se.get('money')}、seed_price={se.get('seed_price')}、"
+               f"货架：{str(se.get('offers') or '')[:120]}）"
+               if se.get("offers") else "")
+            + ("  ⚠ 有买不到结论但没有当天失效留痕 ⇒ 守卫可能还在要「去买」（run6 死锁形态）"
+               if se.get("deadlock_risk") else ""))
     # task-32：两种新事件形态的计数（信息项）；task-38：跨日证据覆盖度
     pc, ws = report["events"].get("plots_capped", 0), report["events"].get("work_spot", 0)
     add(f"软上限/收尾: plots_capped {pc} 次（作业区配额到顶，信息项）；work_spot {ws} 次（收尾作业区）")
@@ -2317,7 +2411,8 @@ def render_text(report, top):
                f"（llm_by_source={dc['llm_by_source']}）——四路对账必须停下核对"
                if dc.get("llm_disagree_lines") else ""))
     # Lead m02395：run6 要看次数的新事件（task-15/41/42/49/50）；只在非 0 时点名，避免刷屏
-    new_nz = [(k, report["events"][k]) for k in NEW_EVENT_BUCKETS if report["events"].get(k)]
+    new_nz = [(k, report["events"].get(BUCKET_TO_EVENT.get(k, k), 0)) for k in NEW_EVENT_BUCKETS
+              if report["events"].get(BUCKET_TO_EVENT.get(k, k), 0)]
     if new_nz:
         add("新事件计数: " + "、".join(f"{k}={v}" for k, v in new_nz))
     un = report.get("unmapped_events") or {}

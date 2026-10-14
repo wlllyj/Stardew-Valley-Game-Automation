@@ -203,6 +203,46 @@ rg -n '"unreachable_within_bound": ?false' logs\longrun-*.jsonl
 **没有任何成交类动作**（`buy`/`sell` 全失败或 0 次），且唯一实体阶段的 `ok` 全 0
 ⇒ 判"守卫死锁"：不判通过、重跑无效、必须改守卫条件或数据（种子 id / 在售清单 / 可达性）。
 
+## 3.9 种子经济（task-70 / task-67，dev `2f4d03f`）—— 守卫死锁链的第一环
+
+**三个事件（brain 只在"今天确认买不到"时发一次）**
+
+| 事件 | 出处 | 含义 | 字段 |
+|---|---|---|---|
+| `no_seed_for_sale` | `brain/agentfarm/longrun.py:1605-1622` `_seed_dead`（名字按 `seed_dead_today` 选） | 货架上**一条种子都没有**（run6 夏季只有当季种子、硬编码 `472` 不在架） | `code`/`money`/`seed_price`/`keep_factor`/`offers`/`note` |
+| `cannot_afford` | 同上（`pick_seed_offer` 返回 `cannot_afford`，`farmwork.py:717-744`） | 有种子，但按"留够 `keep_factor` 包"的口径**买不起** | 同上 |
+| `seed_unavailable_today` | `brain/agentfarm/longrun.py:1381-1383` | "今天买不到"的**当天失效**留痕：`sleep_guard` 不再把「该去买种子」当活（否则永不可满足 ⇒ 3 轮零变化 ⇒ `stuck`） | `code`/`money`/`seed_price`/`note` |
+
+**归类（Lead m03600 建议采纳）**：三个都算**同一类"种子/经济"**（环境事实，**不是硬失败、不判红**），
+但**分开计数、不许互相掩护**：`EVENT_BUCKETS` → `no_seed_for_sales` / `cannot_affords` /
+`seed_unavailable_today`（三个都在 `NEW_EVENT_BUCKETS` 里点名；`FIELD_PROBES` 也各有探针）。
+漂移测试 `TestEventMappingDrift` 已覆盖（含独立事件形态）。
+
+**本工具怎么报**
+- 头部（有事件才打）：`种子经济: 买不到 N 次（没货 a / 买不起 b）；当天失效留痕 seed_unavailable_today M 次（money=…、seed_price=…、货架：…）`，
+  当**有买不到结论却 M=0** 时追加 `⚠ 有买不到结论但没有当天失效留痕 ⇒ 守卫可能还在要「去买」（run6 死锁形态）`。
+- 建议 **0i**「种子经济 ×N」：M=0 ⇒ 去查 `_seed_dead` / `seed_unavail_noted` 的退路；M>0 ⇒
+  "防死锁路径走到了，此时再 `stuck` 就得查别的守卫条件（别继续怪种子）"。
+- **缺失行为**：账本里没有这三个事件 ⇒ `report["seed_economy"]["total"] == 0`、**不打头部行、不出建议**
+  （不编造、不当通过）；旧账本（run6 及之前）就是这一形态。
+- 判据（与 §3.8 合看）：`no_seed_for_sale`/`cannot_afford` > 0 **且** `buy` 没成交 **且** `ended_by=stuck`
+  ⇒ 守卫死锁；若同时有 `seed_unavailable_today`，死锁原因**不再是种子**，去查其它守卫条件。
+
+**grep 配方（run7 快速定位）**
+
+```
+rg -n '"event": ?"(no_seed_for_sale|cannot_afford|seed_unavailable_today)"' logs\longrun-*.jsonl
+rg -n '"event": ?"buy"' logs\longrun-*.jsonl          # 与上一条合看：买不到 + 买不成 = 死锁
+rg -n '"ended_by": ?"stuck"' logs\longrun-*.jsonl
+rg -n '"offers"' logs\longrun-*.jsonl                 # 架上到底有什么（run6 是 Melon/Tomato Seeds）
+```
+
+**顺带修的一个真 bug（task-70 发现）**：头部"新事件计数"以前拿**桶名**去查按**事件名**计数的
+`report["events"]` ⇒ `buy→buys`、`sell→sells`、`plot_walk→plot_walks`、`unreachable_stage→unreachable_stages`
+这类非同名映射**恒为 0**（run6 的 6 次 `buy` 就是这样在头部隐形的，靠 task-69 的专行才补回来）。
+现在加了 `BUCKET_TO_EVENT` 反查：run3/run5/run6 头部立刻能看见
+`plot_walks=…`、`seed_gates=…`、`buys=6`、`unreachable_stages=8`、`unreachable_summaries=2`（**纯呈现，rc 不变**）。
+
 ## 4. 复核命令
 
 ```
@@ -210,5 +250,5 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run5.jsonl   # �
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run6.jsonl   # run6：守卫死锁 + 同日重试
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run6.jsonl   # 判决权威（rc=1 needs_review）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
-python -m unittest discover -s tests        # 当前 459 OK
+python -m unittest discover -s tests        # 当前 482 OK
 ```

@@ -1476,5 +1476,92 @@ class TestSameDayRetryAndBuyAccounting(unittest.TestCase):
         self.assertIn("守卫死锁嫌疑", text)
 
 
+class TestSeedEconomy(unittest.TestCase):
+    """task-70 / task-67：种子经济三事件（没货 / 买不起 / 买不到结论当天失效留痕）。
+
+    政策：归**同一类**（种子/经济）但分开计数；三者都**不是硬失败**；真正的指纹是
+    「买不到却没有失效留痕 ⇒ 守卫还在要『去买』」= run6 那种 stuck 死锁。
+    """
+
+    NO_SEED = {"event": "no_seed_for_sale", "t": 1.0, "code": "no_seed_for_sale",
+               "money": 956, "seed_price": 20, "keep_factor": 3,
+               "offers": "Melon Seeds(80g)、Tomato Seeds(50g)", "note": "今天不再发起 buy"}
+    CANNOT = {"event": "cannot_afford", "t": 2.0, "code": "cannot_afford",
+              "money": 10, "seed_price": 80, "keep_factor": 3,
+              "offers": "Melon Seeds(80g)", "note": "今天不再发起 buy"}
+    UNAVAIL = {"event": "seed_unavailable_today", "t": 3.0, "code": "no_seed_for_sale",
+               "money": 956, "seed_price": 20, "note": "不再把「该去买种子」当活"}
+
+    def _report(self, events, name, days=1):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=days)
+
+    def test_seed_events_have_buckets_and_are_not_unmapped(self):
+        for n in ("no_seed_for_sale", "cannot_afford", "seed_unavailable_today"):
+            self.assertIn(n, mod.EVENT_BUCKETS, f"brain 会发 {n}，没有桶就会静默消失")
+        rep = self._report(integrity_ledger(extra_events=[
+            dict(self.NO_SEED), dict(self.CANNOT), dict(self.UNAVAIL),
+        ]), "seed_buckets.jsonl")
+        self.assertEqual(rep["unmapped_events"], {}, "三个种子事件都必须有桶")
+        ev = rep["events"]
+        self.assertEqual(ev["no_seed_for_sale"], 1)
+        self.assertEqual(ev["cannot_afford"], 1)
+        self.assertEqual(ev["seed_unavailable_today"], 1)
+        text = mod.render_text(rep, 50)
+        for key in ("no_seed_for_sales=1", "cannot_affords=1", "seed_unavailable_today=1"):
+            self.assertIn(key, text, "新事件计数要点名（不许静默）")
+
+    def test_seed_economy_grouped_but_counted_separately(self):
+        rep = self._report(integrity_ledger(extra_events=[
+            dict(self.NO_SEED), dict(self.CANNOT), dict(self.CANNOT, t=2.5), dict(self.UNAVAIL),
+        ]), "seed_grouped.jsonl")
+        se = rep["seed_economy"]
+        self.assertEqual(se["total"], 4)
+        self.assertEqual((se["no_seed_for_sale"], se["cannot_afford"],
+                          se["seed_unavailable_today"]), (1, 2, 1),
+                         "同属种子经济但三个计数必须分开（不许互相掩护）")
+        self.assertEqual(se["money"], 956)
+        self.assertEqual(se["seed_price"], 20)
+        self.assertIn("Melon Seeds(80g)", se["offers"])
+        self.assertFalse(se["deadlock_risk"], "有当天失效留痕 ⇒ 不是死锁形态")
+        text = mod.render_text(rep, 50)
+        self.assertIn("种子经济: 买不到 3 次（没货 1 / 买不起 2）", text)
+        self.assertIn("seed_unavailable_today 1 次", text)
+        self.assertNotIn("守卫可能还在要", text)
+        self.assertIn("种子经济 ×4", " ".join(a["text"] for a in rep["advice"]))
+
+    def test_missing_seed_unavailable_is_deadlock_risk(self):
+        rep = self._report(integrity_ledger(extra_events=[
+            dict(self.NO_SEED), dict(self.NO_SEED, t=1.5),
+        ]), "seed_deadlock.jsonl")
+        se = rep["seed_economy"]
+        self.assertEqual((se["no_seed_for_sale"], se["seed_unavailable_today"]), (2, 0))
+        self.assertTrue(se["deadlock_risk"], "买不到却没有失效留痕 ⇒ run6 死锁形态")
+        text = mod.render_text(rep, 50)
+        self.assertIn("守卫可能还在要「去买」", text)
+        advice = " ".join(a["text"] for a in rep["advice"])
+        self.assertIn("让「该去买种子」这条守卫理由当天失效", advice)
+        self.assertFalse([s for s in rep["red"]["subjects"] if "seed" in s],
+                         "种子事件本身不是红（买不到是环境事实）")
+
+    def test_no_seed_events_means_no_line_and_no_advice(self):
+        rep = self._report(integrity_ledger(day_end_overrides={
+            "verified": True, "ended_reason": "night",
+            "checks": {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                       "crops_watered": True, "day_justified": True, "watered_outdoor": True,
+                       "no_unmet_stages": True},
+            "final_water": {"t": 9.0, "location": "Farm", "tiles": 84, "crops": 31, "dry": 0,
+                            "scope": "farm"},
+        }), "seed_absent.jsonl")
+        se = rep["seed_economy"]
+        self.assertEqual(se["total"], 0)
+        self.assertFalse(se["deadlock_risk"])
+        text = mod.render_text(rep, 50)
+        self.assertNotIn("种子经济:", text, "没有事件就不许编造这一行")
+        self.assertNotIn("种子经济", " ".join(a["text"] for a in rep["advice"]))
+        self.assertEqual(rep["red"]["total"], 0, "干净账本不该因为缺种子事件而变红")
+
+
 if __name__ == "__main__":
     unittest.main()
