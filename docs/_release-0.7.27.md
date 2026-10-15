@@ -110,7 +110,8 @@ python tools\start-detached-longrun.py --journal logs\longrun-3day-llm-run8.json
 2. `python tools/deploy-mod.py --no-quit`（0.7.26 → 0.7.27；记录 dll/manifest 字节数与 `modVersion`）。
 3. `python -m agentfarm goto Farm --no-focus`（需 `PYTHONPATH=<repo>\brain`）⇒ 户外农场，否则 `preflight` 的户外判据红。
 4. `python tools/preflight.py --expect 0.7.27 --save-baseline logs/run8-baseline.json` ⇒ 四项全绿才算"可以起跑"。
-5. **预置（若 `seeds_total==0` 且 `money < seed_price`）**：`scratch/run6-preseed.py` 出货（**每 id 保留 K=10 做不到：Mod `ShipSkill` 只能整叠出货**，见 §7.1 备注）→ `scratch/verify-sleep-brain.py --from-farm` 睡一夜收款 → 复核 `money ≥ 20g`；红线：只走 `sell`/`sleep`/`buy` 三条已验收路径，**绝不 `Money +=`、绝不手改存档**；同夜「有 `ShippingMenu` 时保存被设计推迟」属正常（`docs/_il-newday-save.md`）。
+5. **预置：run8 刻意不做操作员预置**（Lead 2026-10-15 夜定）—— run7 已证明"清障战利品堆在背包里、`money=14g`、`seeds=0`"，而本版 task-55 的卖盈余（`surplus_sell_plan`：三闸门 `seeds_total==0` 且 `money < 5×seed_price` 且 `emptyDirt>0`）就是要让**脑自己**走通 `sell →（次日 NewDay 到账）→ buy 当季种子 → plant`。若由操作员先卖一遍，这条链就永远测不到。⇒ **只观测、不动手**；`scratch/run6-preseed.py` 保留为紧急手段（真要预置才用：整叠出货 → `scratch/verify-sleep-brain.py --from-farm` 睡一夜收款 → 复核 `money ≥ 20g`；红线：只走 `sell`/`sleep`/`buy` 三条已验收路径，**绝不 `Money +=`、绝不手改存档**；同夜「有 `ShippingMenu` 时保存被设计推迟」属正常，见 `docs/_il-newday-save.md`）。
+   - run8 新增关注项（写进 `docs/_run8-evidence.md`）：①`surplus_sell`/`sell` 事件出现且**当天 `money` 不变**（钱次日到账）；②跨日后 `money` 增量 == 卖出叠的 `sellToStorePrice` 合计（游戏自己结算）；③随后 `buy` 成功且买到**当季**种子（task-67）⇒ `seed_gate` 不再空转；④`plant_area`/`sow` 有 ok>0。
 6. 起跑（**脱离式**，见 `docs/00-开发日志.md` 条目 040：DSH 托管后台作业会在回合边界被连根收掉）：`python tools/start-detached-longrun.py --journal logs/longrun-3day-llm-run8.jsonl --expect-version 0.7.27`（先 `--dry-run` 看四要素）；交付 `docs/_run8-evidence.md`（5 节）。
 7. 证据纪律：跑完**先别退游戏**；`docs/_runN-evidence.md` §4 必须并列 `tools/verify-run3.py` 的 `verdict` 与 `strict_verdict` 两行（严格口径只呈现、不改 rc），并逐条抄出 `history_problems`。
 
