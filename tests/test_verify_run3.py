@@ -148,6 +148,38 @@ class TestVerifyRun3(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(any("账目不可信" in p for p in s["problems"]), s["problems"])
 
+    # --------------------------------------------------- task-84（死苗不浇水）口径
+    def test_no_work_with_uncleared_dead_crops_is_problem(self):
+        """死苗不许当"今天没活"的借口：`no_work` 收尾 + `dry_dead>0` ⇒ 判红。"""
+        rows = tweak(green_rows(), "day_end",
+                     ended_reason="no_work:确实找不到可做的活", dry=0, dry_dead=2,
+                     checks={"watered_outdoor": True})
+        ok, s = self.check(rows)
+        self.assertFalse(ok)
+        self.assertTrue(any("dry_dead=2" in p for p in s["problems"]), s["problems"])
+
+    def test_gave_up_dry_is_honest_info_not_problem(self):
+        """`gave_up_dry` 是如实收尾（当天不达标），工具不许把它当异常。"""
+        rows = green_rows()
+        for i, r in enumerate(rows):
+            if r.get("event") == "day_end":
+                rows[i] = day_end(r["final"]["day"], r["day_after"],
+                                  ended_reason="gave_up_dry:窗外干格全部认输",
+                                  verified=False, dry=1, dry_dead=0,
+                                  checks={"watered_outdoor": False, "day_justified": False},
+                                  gave_up_tiles=[[12, 30]])
+                break
+        ok, s = self.check(rows)          # 尾部 streak 归零 ⇒ 整体不达标，但问题应来自跨界/未达标而非"异常"
+        self.assertFalse(ok)
+        self.assertTrue(any("gave_up_dry" in i for i in s["infos"]), s["infos"])
+        self.assertFalse(any("dry_dead" in p for p in s["problems"]), s["problems"])
+
+    def test_missing_dry_dead_is_info_not_pass(self):
+        """旧账本缺 `dry_dead` ⇒ 只记 info（不算通过、也不算失败）。"""
+        ok, s = self.check(green_rows())
+        self.assertTrue(ok, s.get("problems"))
+        self.assertTrue(any("dry_dead" in i for i in s["infos"]), s["infos"])
+
     def test_missing_verified_field_is_problem(self):
         """字段整体缺失（不是 null）也必须判红：缺失 ≠ 通过。"""
         rows = green_rows()

@@ -268,6 +268,13 @@ def build_days(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "bound_basis",
                     # task-73：这一天是 stuck 但已经睡过去翻篇（有界 MAX_STUCK_FLUSH）。
                     "stuck_flushed",
+                    # task-84（死苗不浇水）：`dryCrops`/`dryTiles` 自 0.7.27 起**只算活苗**，
+                    # 死苗单独计数；`gave_up_tiles` = 当天已认输的窗口外干格坐标（不再当"有活"）。
+                    "dead_crops",
+                    "dead_crops_status",
+                    "dry_dead",
+                    "dry_dead_status",
+                    "gave_up_tiles",
                 )
             }
             fin_key = day_key({"final": cur["final"]}) if cur["final"] else "?"
@@ -778,6 +785,37 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
             infos.append(
                 f"[{name}] 诚实收尾 no_water（想浇但拿不到水）⇒ 当天不达标；"
                 f"dry={fw.get('dry') if isinstance(fw, dict) else '?'}"
+            )
+        # task-84（死苗不浇水）对齐：`no_work` 的一天**不许还有没清的死苗**。死苗的正确归宿是
+        # `clear_dead`（策略序 harvest → clear_dead → water_area → …）或如实 `stuck`/`gave_up_dry`
+        # 收尾；拿"死苗没浇"当"今天没活"的理由，正是用户 m11003 第 3 条抱怨的形态（run7 追着一株
+        # 够不着的死苗烧掉两个整天）。字段缺失（task-84 之前的旧账本）⇒ 只记 info：不算通过也不算失败。
+        _dry_dead = end_stats.get("dry_dead")
+        if _dry_dead is None:
+            infos.append(f"[{name}] 账本没写 `dry_dead`（task-84 之前的旧账本）⇒ 死苗口径无法判定")
+        else:
+            try:
+                _dd = int(_dry_dead)
+            except (TypeError, ValueError):
+                _dd = None
+            if _dd is None:
+                problems.append(f"[{name}] day_end.dry_dead 不是整数（{_dry_dead!r}）⇒ 账目不可信")
+            elif _dd > 0 and _end_reason.startswith("no_work"):
+                problems.append(
+                    f"[{name}] ended_reason 以 no_work 开头，但 day_end.dry_dead={_dd}"
+                    "（还有枯死作物没清却判\"今天没活\" ⇒ 死苗被当成没活的借口；"
+                    "应走 `clear_dead`，够不着应如实 `stuck`/`gave_up_dry`，见 task-84）"
+                )
+        _gave_up = end_stats.get("gave_up_tiles")
+        if _end_reason.startswith("gave_up_dry"):
+            infos.append(
+                f"[{name}] 诚实收尾 gave_up_dry（当天窗口外干格已全部认输）⇒ 当天不达标；"
+                f"gave_up_tiles={len(_gave_up or [])}"
+            )
+        elif _gave_up:
+            # 认输格不再当"有活"，但当天仍可能靠别的活达标 ⇒ 只记 info（task-84 的口径是"诚实"而非"失败"）。
+            infos.append(
+                f"[{name}] 当天有 {len(_gave_up)} 格干作物认输（不再当\"有活\"）"
             )
         # 0 步也能 VERIFIED（盲区 B6）：当天一个阶段都没有、却自称达标 ⇒ 必须有"确实无活可做"的
         # 证据（no_intents / plot_exhausted / policy_fallback / sleep 理由是 no_work/night/stamina），
