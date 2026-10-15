@@ -66,6 +66,16 @@
      时判红就是假红）。`day_end.dead_crops`/`dead_crops_status`/
      `dry_dead`/`dry_dead_status`/`gave_up_tiles`（以及 `dead_crops_summary` 事件）**缺失 ⇒ 只进
      【无法判定】，既不算通过也不算失败**（缺失 ≠ 0）。
+  * 背包空格死锁（task-102 `9b09735` / task-104，run8 day 2/12/13 形态）：**买不到不是失败** ——
+    `buy_no_space`（回执 `no_space`/`no_inventory_space` ⇒ 当天不再重试 buy）、`slept_without_work`
+    （当天 **0 农场动作**又有活 ⇒ 拒绝睡觉、当天不推进；是**守卫生效**的证据，不是"睡眠失败"）、
+    `modal_dismiss_failed`（关模态时桥报错 ⇒ **只点名次数**，`tools\verify-run3.py` 不判它，
+    判红会两边反向）、`water_far_skipped`（task-104：人不在户外农场 ⇒ 不扣额度、不认输）
+    **一律不判红**，只作信息项：头部「种子经济/背包」一行 + 建议 0n。
+    `free_slots` 取自 `sell`/`surplus_sell`/`surplus_sell_skip` 的 `trigger.freeSlots`，
+    **缺失 ⇒ 写 `<缺失>` + 进【无法判定】（缺失 ≠ 0）**；旧账本没有 `buy_no_space` 事件时
+    从 `buy.receipt` 的 `no_inventory_space` 回执码补认（run8 就是这样被看见的）。
+    `sell`/`surplus_sell` 成交**当天 `money` 不变是设计**（钱等下一次 `NewDay` 结算）⇒ 绝不判红。
   * 事件映射不许漂移（Lead m02395）：brain 里 `_journal("<name>"` 的**每个**事件名都要在
     `EVENT_BUCKETS` 里有桶（结构性事件 `day_start`/`day_end`/`finish` 除外，见 `STRUCTURAL_EVENTS`）；
     账本里出现没桶的事件 ⇒ 报告头部逐条点名（名字×次数+行号）+ 建议 0a，**绝不静默丢弃**。
@@ -262,6 +272,27 @@ FIELD_PROBES = [
     ("event:dead_crops_summary", "dead_crops_summary",
      "日级死苗汇总（task-84：dead_crops/dry_dead/dry_dead_status/gave_up/tiles；只在 dead_crops>0 "
      "且状态 ok 时写）"),
+    # task-102（背包空格死锁）：三个新事件都**不是失败**，缺失 ⇒【无法判定】（缺失 ≠ 0 / ≠ "没发生"）。
+    ("event:buy_no_space", "buy_no_space",
+     "回执 `no_space`（`no_inventory_space`，task-102：item/price/attempt/free_slots_status/reason）"
+     "⇒ 当天不再重试 buy；**买不到不是失败**（钱不够、没货架、没空格一律不判红）"),
+    ("event:slept_without_work", "slept_without_work",
+     "当天 0 农场动作又有活 ⇒ **拒绝睡觉、当天不推进**（task-102：why/farm_actions/reasons/note）；"
+     "这是守卫生效的证据，**不是睡眠失败**，那天会以 needs_review / no_day_progress 如实停住"),
+    ("event:modal_dismiss_failed", "modal_dismiss_failed",
+     "关模态时桥报错（task-102：menu/reason）；`tools\\verify-run3.py` 不判它 ⇒ 本工具只点名次数、"
+     "**不判红**（免得两边反向——Lead m05068 的『两边判决一致』要求）"),
+    ("event:water_far_skipped", "water_far_skipped",
+     "窗口外有干作物、但**人不在户外农场**（task-104：reason=not_on_farm/tiles/count/where/note）"
+     "⇒ 不扣该格当日额度、不进 `given_up`，**不是失败**；先回农场再说（run8 day 12 形态）"),
+    ("event:goto_farm.where", "goto_farm_where",
+     "进农场/走位的原因（task-49/task-102：`day_start` = 日初入场；`day_start_retry` = 早晨被模态挡下"
+     "后的重试入场 —— run8 day 12 的 goto_farm 就是被晨间 ShippingMenu 挡成 ui_modal）"),
+    ("event:surplus_sell.trigger.freeSlots", "free_slots",
+     "背包空格数（`surplus_sell` / `surplus_sell_skip` / `sell` 的 `trigger.freeSlots` + "
+     "`trigger.freeSlotsStatus`；task-102 腾格路径的门闸就是这个数；缺失 ⇒ 写 `<缺失>`、不当 0）"),
+    ("event:surplus_sell.why", "sell_why",
+     "卖出触发路径（task-102：`need_money`=钱不够 / `need_slot`=钱够但背包没空格 ⇒ 卖一叠腾格）"),
 ]
 OUTCOME_RE = re.compile(
     r"目标\s*(\d+)\s*步：做成\s*(\d+)、跳过\s*(\d+)、失败\s*(\d+)"
@@ -415,6 +446,18 @@ EVENT_BUCKETS = {
     "surplus_sell_skip": "surplus_sell_skips",
     # task-84：日级死苗汇总（`dead_crops_summary`，只在 `dead_crops>0` 且状态 ok 时写一条）。
     "dead_crops_summary": "dead_crops_summaries",
+    # task-102（`9b09735`）：**背包空格死锁**的三个新事件（run8 day 2/12/13）—— 都不是失败：
+    #     `buy_no_space` = 回执 `no_space`（`no_inventory_space`）⇒ 当天不再重试 buy；
+    #     `slept_without_work` = 当天 0 农场动作又有活 ⇒ **拒绝睡觉、当天不推进**（守卫生效的
+    #     证据，不是"睡眠失败"；那天会以 needs_review/no_day_progress 如实停住）；
+    #     `modal_dismiss_failed` = 关模态时桥报错（`verify-run3` 不判它 ⇒ 本工具只点名次数，
+    #     不判红，免得两边反向）。
+    "buy_no_space": "buy_no_spaces",
+    "slept_without_work": "slept_without_works",
+    "modal_dismiss_failed": "modal_dismiss_failures",
+    # task-104（run8 day 12 的 `water_far` 前置）：窗口外有干作物但**人不在户外农场** ⇒ 不扣该格当日
+    # 额度、不进 `given_up`，只记一条（`reason=not_on_farm`）⇒ **不是失败**。
+    "water_far_skipped": "water_far_skips",
 }
 
 #: 结构性事件：由报告的其他字段单独统计（day_start/day_end 切会话与验收、finish 自述），
@@ -451,6 +494,10 @@ NEW_EVENT_BUCKETS = (
     "surplus_sells", "surplus_sell_skips",
     # task-84：死苗汇总（一眼看出"还有 N 格枯死、其中 M 格没浇、今天认输 K 格"）
     "dead_crops_summaries",
+    # task-102：背包空格死锁（买不到不是失败；0 动作拒绝睡觉是有界停住，不是睡眠失败）
+    "buy_no_spaces", "slept_without_works", "modal_dismiss_failures",
+    # task-104：窗口外浇水被人不在农场挡下（不扣额度、不认输 ⇒ 不是失败）
+    "water_far_skips",
 )
 
 
@@ -1925,6 +1972,45 @@ def build_advice(report, top=8):
             "lines": (dci.get("no_work_uncleared", []) + dci.get("verified_with_gave_up", [])
                       + dci.get("bad_fields", [])),
         })
+    # 0n) task-102（`9b09735`）：背包空格死锁 —— **买不到不是失败**，也不许读成"睡眠失败"
+    bsi = report.get("bag_space") or {}
+    if (bsi.get("buy_no_space") or bsi.get("buy_no_space_receipts") or bsi.get("slept_without_work")
+            or bsi.get("slot_sells") or bsi.get("modal_dismiss_failures")):
+        _bparts = []
+        if bsi.get("buy_no_space"):
+            _bparts.append(
+                f"买种子撞背包没空格 ×{bsi['buy_no_space']}"
+                f"（行 {bsi.get('buy_no_space_lines', [])[:6]}）⇒ 当天不再重试 buy；"
+                "**买不到不是失败**（真问题是格子/钱/货架，不是任务没做成）")
+        elif bsi.get("buy_no_space_receipts"):
+            _bparts.append(
+                f"买种子撞背包没空格 ×{bsi['buy_no_space_receipts']}（旧账本形态："
+                f"没有 buy_no_space 事件，从回执码 no_inventory_space 补认，行 "
+                f"{bsi.get('buy_lines', [])[:6]}）：回执明说「空格 0」⇒ 真卡点是背包格子，"
+                "**买不到不是失败**（task-102 之后 brain 会写 buy_no_space 事件）")
+        if bsi.get("slot_sells"):
+            _bparts.append(
+                f"为腾格卖盈余材料 ×{bsi['slot_sells']}"
+                f"（行 {bsi.get('slot_sell_lines', [])[:6]}；why=need_slot）：钱要等下一次 NewDay "
+                "才由游戏结算 ⇒ **成交当天 money 不变是设计**，别判红")
+        if bsi.get("slept_without_work"):
+            _bparts.append(
+                f"0 农场动作拒绝睡觉 ×{bsi['slept_without_work']}"
+                f"（行 {bsi.get('slept_without_work_lines', [])[:6]}）⇒ 那天**不推进**（守卫生效），"
+                "账本会以 needs_review / `no_day_progress` 如实停住 —— 这是**不是睡眠失败**；"
+                "要查的是「为什么一整天 0 动作」（种子/格子死锁、可达性），不是睡觉协议")
+        if bsi.get("modal_dismiss_failures"):
+            _bparts.append(
+                f"关模态失败 ×{bsi['modal_dismiss_failures']}"
+                f"（行 {bsi.get('modal_dismiss_failed_lines', [])[:6]}）：只点名（verify-run3 未判它，"
+                "本工具**不判红**以免两边反向）；若同日另有 modal_blocked/timeout，按那条算")
+        advice.append({
+            "text": "背包空格/买种子闭环（task-102）：" + "；".join(_bparts),
+            "lines": (bsi.get("buy_no_space_lines", []) + bsi.get("slot_sell_lines", [])
+                      + bsi.get("slept_without_work_lines", [])
+                      + bsi.get("modal_dismiss_failed_lines", [])
+                      + ([] if bsi.get("buy_no_space") else bsi.get("buy_lines", [])[:6])),
+        })
     # 0j) 可达性/开路（task-76：task-68 的被围住 + frontier_clear + clear_neighbor；**不判红**）
     rc = report.get("reachability") or {}
     if (rc.get("encircled_events") or rc.get("frontier_clear_attempts")
@@ -2211,6 +2297,16 @@ def build_undecidable(rows, sessions, prelude, report):
                               for k in ("dead_crops", "dry_dead", "gave_up_tiles") if k not in ev})
         if _dc_missing:
             out.append(f"死苗字段只写了一部分（缺 {_dc_missing}）：无法判定缺的那一列（缺失 ≠ 0）")
+    # task-102：背包空格/买种子闭环的证据是否存在（缺失 ⇒【无法判定】，绝不因此判通过、也不判红）
+    _bag_ev = [ev for _, ev in rows
+               if ev.get("event") in ("sell", "surplus_sell", "surplus_sell_skip", "buy_no_space")]
+    _bag_fs = [ev for ev in _bag_ev
+               if as_dict(ev.get("trigger")).get("freeSlots") is not None
+               or ev.get("free_slots_status")]
+    if (rows and not _bag_ev) or (_bag_ev and not _bag_fs):
+        out.append("本账本没有 free_slots 证据（`surplus_sell`/`surplus_sell_skip`/`sell` 的 "
+                   "`trigger.freeSlots`，或 `buy_no_space.free_slots_status`）：无法判定「背包空格」"
+                   "这条死锁链（缺失 ≠ 空、≠ 没发生；task-102）")
     # task-36：自称浇过、却没有 final_water 可核对的那些天（verify-run3.py:414-418 同口径：只记信息项）
     no_fw = [
         lineno for lineno, ev in rows
@@ -2596,6 +2692,78 @@ def build_report(rows, path, args, bad_lines):
         "money_at_sell": surplus_money,
         "sold_days_with_no_buy_next": sold_no_buy_next,
     }
+    # task-102（`9b09735`）：**背包空格死锁**闭环 —— free_slots / buy 尝试数 / `buy_no_space` /
+    # 腾格卖出（`why=need_slot`）/ 当日钱变化 / `slept_without_work` / `modal_dismiss_failed`。
+    # 口径（Lead m05068）：**买不到不是失败** —— 没空格（`buy_no_space`）、钱不够、没货架一律不判红；
+    # `slept_without_work` 是"0 农场动作又有活 ⇒ 拒绝睡觉、当天不推进"，是守卫生效的证据（那天会以
+    # needs_review / `no_day_progress` 如实停住），**不是"睡眠失败"**；`modal_dismiss_failed` 本工具
+    # 只点名次数（`tools\verify-run3.py` 不判它 ⇒ 判红会造成两边反向）。
+    # 缺字段 ⇒【无法判定】（缺失 ≠ 0、≠ "没发生"），见 build_undecidable。
+    bag = {
+        "buy_attempts": 0, "buy_lines": [],
+        "buy_no_space": 0, "buy_no_space_lines": [],
+        "buy_receipt_codes": {}, "buy_no_space_receipts": 0,
+        "slot_sells": 0, "slot_sell_lines": [],
+        "slept_without_work": 0, "slept_without_work_lines": [],
+        "modal_dismiss_failures": 0, "modal_dismiss_failed_lines": [],
+        "free_slots": None, "free_slots_status": "", "free_slots_lines": [],
+        "why_counts": {},
+    }
+    for ln, ev in rows:
+        name = str(ev.get("event") or "")
+        if name == "buy":
+            bag["buy_attempts"] += 1
+            bag["buy_lines"].append(ln)
+            # 旧账本（task-102 之前）没有 `buy_no_space` 事件，只有回执码 ⇒ 从回执里补认一次
+            _rc = str(ev.get("receipt") or "")
+            _code = (_rc.split(":")[0].strip() if ":" in _rc
+                     else str(ev.get("code") or "").strip())
+            if _code:
+                bag["buy_receipt_codes"][_code] = bag["buy_receipt_codes"].get(_code, 0) + 1
+            if _code in ("no_space", "no_inventory_space"):
+                bag["buy_no_space_receipts"] += 1
+        elif name == "buy_no_space":
+            bag["buy_no_space"] += 1
+            bag["buy_no_space_lines"].append(ln)
+            if not bag["free_slots_status"]:
+                bag["free_slots_status"] = str(ev.get("free_slots_status") or "")
+        elif name == "slept_without_work":
+            bag["slept_without_work"] += 1
+            bag["slept_without_work_lines"].append(ln)
+        elif name == "modal_dismiss_failed":
+            bag["modal_dismiss_failures"] += 1
+            bag["modal_dismiss_failed_lines"].append(ln)
+        if name in ("sell", "surplus_sell", "surplus_sell_skip"):
+            why = str(ev.get("why") or "")
+            if why:
+                bag["why_counts"][why] = bag["why_counts"].get(why, 0) + 1
+            trig = as_dict(ev.get("trigger"))
+            if bag["free_slots"] is None and trig.get("freeSlots") is not None:
+                bag["free_slots"] = as_int(trig.get("freeSlots"))
+                bag["free_slots_status"] = str(trig.get("freeSlotsStatus")
+                                               or bag["free_slots_status"])
+                bag["free_slots_lines"].append(ln)
+            if why == "need_slot":
+                bag["slot_sells"] += 1
+                bag["slot_sell_lines"].append(ln)
+    bag["has_free_slots_evidence"] = bag["free_slots"] is not None
+    bag["slot_gate_tried"] = bag["slot_sells"] > 0
+    # 当日钱变化：最后一个会话的 `day_start.money` → 最后一条 `day_end.final.money`
+    _bag_money_start = None
+    _bag_money_end = None
+    if sessions:
+        _bag_sess = sessions[-1]
+        _bag_sd = as_dict(_bag_sess.get("start"))
+        if "money" in _bag_sd:
+            _bag_money_start = as_int(_bag_sd.get("money"))
+        _bag_des = _bag_sess.get("day_ends") or []
+        if _bag_des:
+            _bag_fd = as_dict(as_dict(_bag_des[-1][1]).get("final"))
+            if "money" in _bag_fd:
+                _bag_money_end = as_int(_bag_fd.get("money"))
+    bag["money_start"] = _bag_money_start
+    bag["money_end"] = _bag_money_end
+    bag_space = bag
     sleep_ok = sum(1 for _, ev in rows if ev.get("event") == "sleep" and ev.get("ok"))
     sleep_failed = sum(1 for _, ev in rows if ev.get("event") == "sleep" and not ev.get("ok"))
     blocked_by_action = {}
@@ -2670,6 +2838,9 @@ def build_report(rows, path, args, bad_lines):
         "seed_economy": seed_economy,
         # task-84：死苗/放弃格（`dead_crops`/`dry_dead`/`gave_up_tiles`；缺失 ⇒【无法判定】）
         "dead_crops": dead_crops,
+        # task-102：背包空格死锁（free_slots / buy_no_space / 腾格卖出 / slept_without_work /
+        # modal_dismiss_failed；买不到不是失败，缺失 ⇒【无法判定】）
+        "bag_space": bag_space,
         "unmapped_events": unmapped_events,
         "no_day_progress": [
             {"line": ln, "reason": ev.get("reason"), "ended_by": ev.get("ended_by")}
@@ -3140,6 +3311,16 @@ MAPPING_TEXT = [
      "（`warn:verified_with_gave_up`，Lead m04997：真洗白通道已被 verify-run3 的 "
      "`watered_outdoor=true` + `final_water.dry>0` 自相矛盾闸门堵住，认输格当天被解决时判红即假红）；"
      "字段缺失（旧账本）⇒ 只进【无法判定】、绝不判红也不当通过；头部'死苗/放弃格'行 + 建议 0m"),
+    ("buy_no_space / slept_without_work / modal_dismiss_failed（task-102、`9b09735`）",
+     "背包空格死锁闭环（**全部不判红**）；头部'种子经济/背包'行 + 建议 0n："
+     "`buy_no_space` = 回执 `no_space`（背包没空格）⇒ 当天不再重试 buy（`item/price/attempt/"
+     "free_slots_status/reason`）—— **买不到不是失败**；"
+     "`slept_without_work` = 0 农场动作又有活 ⇒ **拒绝睡觉、当天不推进**"
+     "（`why/farm_actions/reasons/note`；是守卫生效的证据、**不是睡眠失败**，那天会以 needs_review / "
+     "`no_day_progress` 停住）；`modal_dismiss_failed` = 关模态时桥报错（`menu/reason`）——"
+     "`tools\\verify-run3.py` 不判它 ⇒ 本工具只点名次数（判红会两边反向）；"
+     "`free_slots` 取自 `sell`/`surplus_sell`/`surplus_sell_skip` 的 `trigger.freeSlots`，"
+     "缺失 ⇒ 写 `<缺失>` + 【无法判定】、绝不当 0；`sell` 成交当天 `money` 不变是设计（次日结算）"),
     ("encircled / encircled_stage / encircled_summary（task-68、task-76）",
      "5 环境挡路·可达性/开路（信息项，**无硬闸门 ⇒ 一律不判红**）：被不可清障物围住（四邻没有"
      "「可站+可清」的突破口）＝与 `unreachable`（物理走不到）**分开计数**、不封格、不进任何豁免分子；"
@@ -3306,6 +3487,29 @@ def render_text(report, top):
                f"{[x['line'] for x in sl['sold_days_with_no_buy_next']][:10]}）"
                if sl.get("sold_days_with_no_buy_next") else ""))
     # task-32：两种新事件形态的计数（信息项）；task-38：跨日证据覆盖度
+    # task-102（`9b09735`）：**背包空格闭环**一行 —— free_slots / buy 尝试 / buy_no_space /
+    # 腾格卖出（`why=need_slot`）/ 当日钱变化 / `slept_without_work` / `modal_dismiss_failed`。
+    # 口径：**买不到不是失败**（没空格/钱不够/没货架都不判红；缺字段写【无法判定】）；
+    # `slept_without_work` 是"0 农场动作拒绝睡觉、当天不推进"（守卫生效，不是睡眠失败）。
+    bs = report.get("bag_space") or {}
+    fs_txt = ("<缺失>" if bs.get("free_slots") is None
+              else f"{bs.get('free_slots')}（{bs.get('free_slots_status') or '状态未知'}）")
+    money_txt = ("<缺失>" if bs.get("money_start") is None or bs.get("money_end") is None
+                 else f"{bs.get('money_start')} → {bs.get('money_end')}")
+    add(f"种子经济/背包: free_slots {fs_txt}；buy 尝试 {bs.get('buy_attempts', 0)} 次；"
+        f"buy_no_space {bs.get('buy_no_space', 0)} 次（背包没空格 ⇒ 当天不再重试）；"
+        + (f"回执 no_inventory_space×{bs['buy_no_space_receipts']}（旧账本形态：brain 还没发 "
+           "buy_no_space 事件，从回执码补认）；"
+           if bs.get("buy_no_space_receipts") and not bs.get("buy_no_space") else "")
+        + f"腾格卖出 {bs.get('slot_sells', 0)} 次（why=need_slot"
+        + (f"；why 分布 {bs.get('why_counts')}" if bs.get("why_counts") else "") + "）；"
+        f"当日钱 {money_txt}；slept_without_work {bs.get('slept_without_work', 0)} 次"
+        "（0 农场动作拒绝睡觉 ⇒ 当天不推进，是守卫生效的证据、**不是睡眠失败**）"
+        "；口径：**买不到不是失败**（no_space / 钱不够 / 没货架一律不判红；缺字段写【无法判定】）"
+        + (f"  ⚠ modal_dismiss_failed {bs.get('modal_dismiss_failures')} 次"
+           f"（行 {bs.get('modal_dismiss_failed_lines', [])[:6]}）"
+           "——关模态时桥报错，只点名（verify-run3 未判它，判红会两边反向）"
+           if bs.get("modal_dismiss_failures") else ""))
     pc, ws = report["events"].get("plots_capped", 0), report["events"].get("work_spot", 0)
     add(f"软上限/收尾: plots_capped {pc} 次（作业区配额到顶，信息项）；work_spot {ws} 次（收尾作业区）")
     sleep_days = [d for d in report["days"] if d.get("ended_by") == "sleep"]

@@ -2157,5 +2157,131 @@ class TestDeadCropsAccounting(unittest.TestCase):
         self.assertIn("<缺失>", mod.render_text(rep, 50))
 
 
+class TestBagSpaceDeadlock(unittest.TestCase):
+    """task-102（`9b09735`）+ task-104：背包空格死锁闭环。
+
+    口径（Lead m05068）：**买不到不是失败** —— `buy_no_space`（没空格）、钱不够、没货架一律不判红；
+    `slept_without_work` = 0 农场动作又有活 ⇒ 拒绝睡觉、当天不推进（守卫生效的证据，**不是睡眠失败**）；
+    `modal_dismiss_failed` 只点名次数（`tools\\verify-run3.py` 不判它 ⇒ 判红会两边反向）；
+    `water_far_skipped` = 人不在户外农场（不扣额度、不认输，不是失败）；
+    `free_slots` 缺证据 ⇒ 写 `<缺失>` + 【无法判定】（缺失 ≠ 0）。
+    """
+
+    NO_SPACE = {"event": "buy_no_space", "t": 5.0, "item": "472", "price": 20, "attempt": 1,
+                "free_slots_status": "ok", "reason": "no_space"}
+    SLEPT_NO_WORK = {"event": "slept_without_work", "t": 6.0, "why": "still_work",
+                     "farm_actions": 0, "reasons": ["背包没空格"], "note": "0 农场动作 ⇒ 拒绝睡觉"}
+    DISMISS_FAILED = {"event": "modal_dismiss_failed", "t": 7.0, "menu": "ShippingMenu",
+                      "reason": "bridge error"}
+    WATER_FAR_SKIP = {"event": "water_far_skipped", "t": 7.5, "reason": "not_on_farm",
+                      "tiles": [[12, 30]], "count": 1, "where": "window"}
+    SLOT_SELL = {"event": "surplus_sell", "t": 8.0, "ok": True, "why": "need_slot",
+                 "strategy": "surplus_materials", "keep": 10, "sold": 12, "ok_count": 1,
+                 "fail_count": 0, "below_keep": False,
+                 "trigger": {"money": 188, "freeSlots": 0, "freeSlotsStatus": "ok",
+                             "slotsNeeded": 1, "threshold": 200, "emptyDirt": 30}}
+
+    def _report(self, events, name, *, days=1):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=days, top=50)
+
+    def _day(self, day, *, extra=(), money=None):
+        nxt = [day[0], day[1], day[2] + 1]
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": True,
+                  "watered_outdoor": True}
+        end = {"event": "day_end", "t": 9.0, "day": day, "day_text": "", "ended_by": "sleep",
+               "ended_reason": "night", "verified": True, "checks": checks,
+               "stages": [{"stage": "water_area", "ok": 5, "skipped": 0, "failed": 0,
+                           "env_block": 0, "inconclusive": 0, "stopped": None, "leftover": 0}],
+               "outcomes": [], "ok_steps": 5, "skipped_steps": 0, "failed_steps": 0,
+               "notes": [], "final": final(nxt),
+               "final_water": {"t": 9.0, "location": "Farm", "tiles": 84, "crops": 31,
+                               "dry": 0, "scope": "farm"}}
+        if money is not None:
+            end["final"] = dict(final(nxt), money=money)
+        return [day_start(day), *extra, end]
+
+    def test_mechanical_enumeration_has_no_unmapped_event(self):
+        """机械枚举 brain 两个文件的 `_journal("…")` 字面量 ⇒ 一个都不许漏桶（task-106 ①）。"""
+        src = ""
+        for name in ("longrun.py", "farmwork.py"):
+            with open(os.path.join(ROOT, "brain", "agentfarm", name), encoding="utf-8") as fh:
+                src += fh.read()
+        names = sorted(set(re.findall(r'_journal\(\s*"([a-z0-9_]+)"', src)))
+        self.assertGreater(len(names), 50, "正则失效？brain 的 journal 事件远不止这些")
+        missing = [n for n in names
+                   if n not in mod.EVENT_BUCKETS and n not in mod.STRUCTURAL_EVENTS]
+        self.assertEqual(missing, [], f"brain 写了但本工具没有桶的事件：{missing}（不许静默丢弃）")
+
+    def test_new_events_have_buckets_and_are_not_unmapped(self):
+        for name in ("buy_no_space", "slept_without_work", "modal_dismiss_failed",
+                     "water_far_skipped"):
+            self.assertIn(name, mod.EVENT_BUCKETS, f"{name} 必须有桶，否则 run8 复核数不到")
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.NO_SPACE),
+                                                              dict(self.SLEPT_NO_WORK),
+                                                              dict(self.DISMISS_FAILED),
+                                                              dict(self.WATER_FAR_SKIP)]),
+                           "bag_bucket.jsonl")
+        self.assertEqual(rep["unmapped_events"], {})
+        for name in ("buy_no_space", "slept_without_work", "modal_dismiss_failed",
+                     "water_far_skipped"):
+            self.assertEqual(rep["events"][name], 1, f"{name} 要能被数到")
+
+    def test_buy_no_space_is_not_a_failure_and_is_visible(self):
+        buy_fail = {"event": "buy", "t": 4.0, "ok": False, "code": "failed",
+                    "receipt": "no_inventory_space: [no_inventory_space] (HTTP 200) 背包没空格"}
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(buy_fail), dict(self.NO_SPACE),
+                                                              dict(self.SLOT_SELL)], money=188),
+                           "bag_nospace.jsonl")
+        self.assertEqual(rep["red"]["total"], 0,
+                         "买不到（没空格）不是失败 ⇒ 绝不判红；腾格卖出当天钱不变也是设计")
+        text = mod.render_text(rep, 50)
+        for frag in ("种子经济/背包:", "free_slots 0", "buy_no_space 1 次", "腾格卖出 1 次",
+                     "买不到不是失败", "100 → 188"):
+            self.assertIn(frag, text, f"头部行要能一眼看到 {frag}")
+        advice = " ".join(str(a["text"]) for a in rep["advice"])
+        self.assertIn("买不到不是失败", advice, "建议 0n 要点明它不是失败")
+
+    def test_old_ledger_without_event_is_recognised_from_receipt_code(self):
+        """run8 形态：brain 还没发 `buy_no_space`，只有回执码 `no_inventory_space` ⇒ 也要认出来。"""
+        buy_fail = {"event": "buy", "t": 4.0, "ok": False, "code": "failed",
+                    "receipt": "no_inventory_space: [no_inventory_space] (HTTP 200) 空格 0"}
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(buy_fail)]), "bag_old.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "买不到不是失败 ⇒ 不判红")
+        self.assertEqual(rep["bag_space"]["buy_no_space_receipts"], 1)
+        text = mod.render_text(rep, 50)
+        self.assertIn("回执 no_inventory_space×1", text, "旧账本要从回执码补认，不许看不见")
+        self.assertIn("买不到不是失败", " ".join(str(a["text"]) for a in rep["advice"]))
+
+    def test_slept_without_work_is_visible_and_not_red(self):
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.SLEPT_NO_WORK)]),
+                           "bag_slept.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "0 动作拒绝睡觉是守卫生效 ⇒ 不判红")
+        text = mod.render_text(rep, 50)
+        self.assertIn("slept_without_work 1 次", text)
+        self.assertIn("不是睡眠失败", text)
+        advice = " ".join(str(a["text"]) for a in rep["advice"])
+        self.assertIn("拒绝睡觉", advice)
+        self.assertIn("不是睡眠失败", advice)
+
+    def test_missing_free_slots_is_undecidable_not_pass(self):
+        rep = self._report(self._day([1, "summer", 5]), "bag_missing.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "缺证据既不算通过也不算失败 ⇒ 不许判红")
+        text = mod.render_text(rep, 50)
+        self.assertIn("free_slots <缺失>", text)
+        self.assertIn("free_slots 证据", str(rep["undecidable"]),
+                      "缺 free_slots 证据要进【无法判定】（缺失 ≠ 0）")
+
+    def test_modal_dismiss_failed_is_info_not_red(self):
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.DISMISS_FAILED)]),
+                           "bag_dismiss.jsonl")
+        self.assertEqual(rep["red"]["total"], 0,
+                         "verify-run3 不判 modal_dismiss_failed ⇒ 本工具也不判红（免得两边反向）")
+        self.assertNotIn("modal_dismiss_failed", rep["red"]["subjects"])
+        self.assertIn("modal_dismiss_failed 1 次", mod.render_text(rep, 50))
+
+
 if __name__ == "__main__":
     unittest.main()

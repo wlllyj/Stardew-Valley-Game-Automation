@@ -401,14 +401,54 @@ rg -n 'dead_crops|dry_dead|gave_up_tiles' logs/longrun-*.jsonl
 python tools/analyze-longrun.py --journal <ledger> | rg "死苗/放弃格"
 ```
 
+## 3.15 背包空格死锁（task-102 `9b09735` / task-104）—— 买不到不是失败
+
+**病**：run8 day 2/12/13 的形态 —— 卖盈余材料卖了钱（`money 14 → 188`）、货架上有当季种子（Wheat 10g），
+但**背包空格 0** ⇒ `buy` 一直撞回执 `no_inventory_space`（run8 实测 26 次尝试里 **25 次**是这个回执），
+守卫却还说"还有活" ⇒ 空转到 stuck。task-102 给脑侧加了三条留痕，task-104 又加了"人不在农场就别浇水"。
+
+**四个新事件（全都不判红、绝不静默丢弃）**
+
+| 事件 | 语义 | 本工具 |
+|---|---|---|
+| `buy_no_space` | 回执 `no_space`/`no_inventory_space`（背包放不下）⇒ **当天不再重试 buy**；字段 `item/price/attempt/free_slots_status/reason` | 信息项；头部「种子经济/背包」+ 建议 0n |
+| `slept_without_work` | 当天 **0 农场动作**又有活 ⇒ **拒绝睡觉、当天不推进**（`why/farm_actions/reasons/note`） | 信息项；**不是"睡眠失败"**（那天会以 needs_review / `no_day_progress` 如实停住，`ended_by` 不是 sleep） |
+| `modal_dismiss_failed` | 关模态时桥报错（`menu/reason`） | **只点名次数**：`tools\verify-run3.py` 不判它 ⇒ 判红会两边反向 |
+| `water_far_skipped` | 窗口外有干作物但**人不在户外农场**（task-104，`reason=not_on_farm`）⇒ 不扣额度、不进 `given_up` | 信息项（桶 `water_far_skips`，见头部"新事件计数"）；不是失败 |
+
+**呈现（头部一行 + 建议 0n）**：`种子经济/背包: free_slots …；buy 尝试 N 次；buy_no_space M 次；腾格卖出 K 次（why=need_slot）；当日钱 A → B；slept_without_work S 次`。
+
+- `free_slots` 取自 `sell` / `surplus_sell` / `surplus_sell_skip` 的 `trigger.freeSlots`（task-102 起）
+  —— **缺失 ⇒ 写 `<缺失>` + 进【无法判定】，绝不当 0**（run8 早于 task-102 ⇒ 就是 `<缺失>`）。
+- **旧账本兜底**：run8 没有 `buy_no_space` 事件（当时代码没发），只有回执码 ⇒ 本工具从 `buy.receipt`
+  里补认 `no_inventory_space`/`no_space`，并按**回执码**列出（`回执 no_inventory_space×25`）。
+  没有这层兜底，run8 的头只会写 `buy_no_space 0 次`、把真正的死锁藏掉。
+- 钱：`sell`/`surplus_sell` 成交**当天 `money` 不变是设计**（钱等下一次 `NewDay` 由游戏结算）
+  ⇒ 本工具只呈现 `当日钱 A → B`，绝不判红；`buy` 为 0 条时也不许暗示"购买任务失败"。
+
+**与 `verify-run3.py` 的同向性**：这四个事件它都不判 problem（它只看 `buy`/`sell` 的成/败与
+`no_day_progress`）⇒ 本工具也一律不判红，只点名；`modal_dismiss_failed` 尤其不许判红（否则同一本账本
+会出现"我红它绿"的反向）。缺 `day_end.refused*` 一类的字段照旧【无法判定】。
+
+**读数（task-106，2026-10-15）**：`tests.test_analyze_longrun` **122 OK**；全量 `discover -s tests`
+**618 OK（0 红）**；8 本账本 rc 并排（本工具/`verify-run3.py`）：green 0/0、run2 1/1、run3 1/1、
+run5 1/1、run6 1/1、run7 0/0、vacuum 1/1、**run8 1/1**（两边都 FAIL ⇒ 同向）。
+
+```
+rg -n '"event": ?"(buy_no_space|slept_without_work|modal_dismiss_failed|water_far_skipped)"' logs/longrun-*.jsonl
+rg -n 'no_inventory_space|no_space' logs/longrun-3day-llm-run8.jsonl
+python tools/analyze-longrun.py --journal logs/longrun-3day-llm-run8.jsonl | rg "种子经济/背包|slept_without_work"
+```
+
 ## 4. 复核命令
 
 ```
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run5.jsonl   # 有红 ⇒ rc=1（--advisory 才恒 0）
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run6.jsonl   # run6：守卫死锁 + 同日重试
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run7.jsonl --days 7   # run7：窗口口径 ⇒ rc=0；死苗字段缺失 ⇒ <缺失> + 【无法判定】
+python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run8.jsonl   # run8：背包空格死锁 ⇒ rc=1（回执 no_inventory_space×25）
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
-python -m unittest tests.test_analyze_longrun  # 当前 115 OK（task-95）
-python -m unittest discover -s tests           # 当前 578 OK（0.7.27 装机放行条件）
+python -m unittest tests.test_analyze_longrun  # 当前 122 OK（task-106）
+python -m unittest discover -s tests           # 当前 618 OK（0 红；0.7.28 装机放行条件）
 ```
