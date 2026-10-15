@@ -763,5 +763,60 @@ class TestVerifyRun3(unittest.TestCase):
         self.assertFalse(any("stuck 翻篇" in p for p in s["problems"]), s["problems"])
 
 
+    # ------------------------------------------------------------ 窗口口径健壮性（task-86 FAIL 回归）
+    def test_bracket_in_day_label_cannot_hide_an_in_window_problem(self):
+        """task-86 FAIL 回归：日期标签里塞 `]` 不许把**窗口内**的问题骗成 history。
+
+        对抗验收（deputy-lead，2026-10-15）打穿的形态：尾部 3 天里的一天 `verified=true`、
+        但账目自相矛盾（stage `leftover=2` 而 `checks.no_unmet_stages=true`），同时该日
+        `day[1]` 写成 `spring]x`。旧解析 `p[1:].split("]", 1)[0]` 按**第一个 `]`** 截断 ⇒
+        标签被截成 `spring`、与真实日标签 `spring]x 10` 不匹配 ⇒ 降级进 `history_problems`
+        ⇒ **假 VERIFIED**（该通道在口径变更 `7c4ff68` 之后才出现）。
+
+        现在：标签生成时净化（`_clean_label`）+ 解析时按已知日标签最长前缀匹配
+        （`problem_day`）+ 头部标签不在已知日集合时一律 fatal ⇒ 这条问题必须留在 problems。
+        """
+        rows = tweak(
+            green_rows(),
+            "day_end",
+            stages=[stage(tiles=10, ok=8, leftover=2)],
+            ok_steps=8,
+            unreachable=2,
+            unreachable_bound=5,
+            attempted=10,
+        )
+        out: list[dict] = []
+        for r in rows:
+            nr = dict(r)
+            if nr.get("event") == "day_start" and list(nr.get("day") or [None, None, None])[2] == 10:
+                nr["day"] = [1, "spring]x", 10]
+                nr["final"] = {"day": [1, "spring]x", 10]}
+            if nr.get("event") == "day_end" and nr["final"]["day"][2] == 10:
+                damaged = dict(nr)
+                damaged["final"] = dict(nr["final"], day=[1, "spring]x", 10])
+                damaged["day_after"] = [1, "spring]x", 11]
+                nr = damaged
+            out.append(nr)
+        ok, s = self.check(out)
+        self.assertEqual(s["verified_streak_tail"], 3, "尾部仍应是 3 天（这是攻击成立的前提）")
+        self.assertFalse(ok, "窗口内的问题带 `]` 标签也必须 fatal")
+        self.assertEqual(s["history_problems"], [], s["history_problems"])
+        self.assertTrue(any("no_unmet_stages" in p for p in s["problems"]), s["problems"])
+
+    def test_unknown_problem_day_label_is_never_demoted(self):
+        """头部标签解析不出 / 不在已知日集合 ⇒ 当全局问题（fatal），不许降级。
+
+        `problem_day()` 先按已知标签最长前缀匹配；匹配不到才退回朴素截断，而调用方要求
+        "解析出的标签必须属于某个已知日"才允许降级 —— 伪造一个不存在的日标签不能绕过窗口。
+        """
+        known = {"spring 10", "springx 11"}
+        self.assertEqual(vr.day_key({"day": [1, "spring]x", 11]}), "springx 11")
+        self.assertEqual(vr.problem_day("[spring 10] boom", known), "spring 10")
+        self.assertEqual(vr.problem_day("[springx 11] boom", known), "springx 11")
+        self.assertEqual(vr.problem_day("全局问题不带前缀", known), "")
+        self.assertNotIn(vr.problem_day("[spring] 11] boom", known), known)
+        self.assertNotIn(vr.problem_day("[summer 99] boom", known), known)
+
+
 if __name__ == "__main__":
     unittest.main()

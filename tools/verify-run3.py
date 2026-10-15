@@ -82,18 +82,49 @@ def latest_journal(explicit: str | None) -> str | None:
     return max(cands, key=os.path.getmtime)
 
 
+def _clean_label(label: Any) -> str:
+    """日标签净化：账本里的日期字段是游戏给的文本，可能带 `]`、换行或制表符。
+
+    工具用 `[标签] ` 前缀标注"这条问题属于哪一天"。**前缀解析绝不能靠第一个 `]` 截断** ——
+    对抗验收（deputy-lead task-86，2026-10-15）证明：只要账本日期里塞一个 `]`
+    （例如 `day_start.day[1] = "spring]x"`），窗口内的问题就会被当成"窗口外"
+    降级进 `history_problems` ⇒ 假 VERIFIED。修法两头一起做：标签生成时净化字符（本函数），
+    解析时按**已知标签最长前缀匹配**（`problem_day()`），且头部标签不在已知日集合里时
+    一律当全局问题（fatal），不许降级。
+    """
+    text = "" if label is None else str(label)
+    for bad in ("[", "]", "\n", "\r", "\t"):
+        text = text.replace(bad, "")
+    return text.strip() or "?"
+
+
 def day_key(row: dict[str, Any]) -> str:
     day = row.get("day")
     if isinstance(day, (list, tuple)) and len(day) >= 3:
-        return f"{day[1]} {day[2]}"
+        return f"{_clean_label(day[1])} {_clean_label(day[2])}"
     if day is not None:
-        return str(day)
+        return _clean_label(day)
     for holder in ("final", "before", "after", "decision"):
         sub = row.get(holder)
         if isinstance(sub, dict) and isinstance(sub.get("day"), (list, tuple)):
             d = sub["day"]
-            return f"{d[1]} {d[2]}" if len(d) >= 3 else str(d)
+            return f"{_clean_label(d[1])} {_clean_label(d[2])}" if len(d) >= 3 else _clean_label(d)
     return "?"
+
+
+def problem_day(text: str, known: set[str]) -> str:
+    """从 `[day] ...` 形式的问题条目里取出日标签。
+
+    先按**已知日标签做最长前缀匹配**（这样即使标签里混进 `]` 也不会被截错）；
+    匹配不到再退回朴素截断 —— 调用方必须把"取出的标签不在已知日集合里"的条目
+    当全局问题（不许降级成 history），否则伪造标签即可绕过达标窗口。
+    """
+    if not text.startswith("["):
+        return ""
+    for name in sorted(known, key=len, reverse=True):
+        if name and text.startswith(f"[{name}]"):
+            return name
+    return text[1:].split("]", 1)[0]
 
 
 def _tile_count(stage: dict[str, Any]) -> int:
@@ -909,10 +940,13 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
     history_problems: list[str] = []
     if streak >= target_days:
         tail_names = {d["key"] for d in days[-streak:]}
+        known_names = {d["key"] for d in days}
         kept: list[str] = []
         for p in problems:
-            head = p[1:].split("]", 1)[0] if p.startswith("[") else ""
-            if head and head not in tail_names:
+            head = problem_day(p, known_names)
+            # 只在**能确证**这条问题属于某个"已知的、窗口外的日"时才降级；
+            # 头部标签未知/解析不出（含伪造标签、日期里塞 `]`）一律留作 fatal。
+            if head and head in known_names and head not in tail_names:
                 history_problems.append(p)
             else:
                 kept.append(p)
