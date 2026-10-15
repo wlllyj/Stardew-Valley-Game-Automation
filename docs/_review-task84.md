@@ -21,7 +21,7 @@ task-84 自身的四根支柱（Mod 拆分 / 死苗不浇水 / 政策序 / 三�
 | ②真死苗当活苗 ⇒ 会不会去浇死苗？ | **不会**（post 树：`skipped`、零请求、世界不变、不吃配额）；改动真实生效（pre 树会真浇掉一格水） | C4（`_t92_water.py`） |
 | ③口径一致性（缺失≠0、`gave_up_dry` 不 VERIFIED、`_far_dry_all_given_up` 边界） | **达标** | §3-B4/B5 |
 | ④工具侧对齐（`dry_dead` 缺失⇒info、`dry_dead>0`+`no_work`⇒problem、`gave_up_dry`⇒info） | **达标**（F2 判红、F3 记 info） | F1/F2/F3 |
-| ⑤新洞 | **一条真 fail-open（早于本卡）** + 4 条 NIT | §4 / §5 / §6 |
+| ⑤新洞 | **一条真 fail-open（早于本卡）** + 3 条 NIT（原 NIT-1「C7b」经复核为**夹具工件**，已撤回，见 §8） | §4 / §5 / §6 / §8 |
 
 被判 FAIL 的**不是** task-84 的代码，而是"0.7.27 的浇水证据链在 farm 证据不可用时仍能被判达标"这一状态：
 它正好落在卡面主攻题上（活苗 dry 被排除、`no_work` 不再判红），且是唯一一次真机 run8 会被它白烧/白过的路径。
@@ -95,7 +95,7 @@ task-84 自身的四根支柱（Mod 拆分 / 死苗不浇水 / 政策序 / 三�
 
 ### C 段 —— 对抗（≥4 条，实际 12 条，逐条读数见 §4）
 - C6（活苗说成死苗）**未全拦住** ⇒ 本卡判 FAIL 的直接依据。
-- C7（死苗混进 `no_work`）：活苗都浇好、窗口里还剩**没浇的死苗** ⇒ 工具判红（新闸门），**脑侧仍自认 VERIFIED**（NIT-1 的放宽形态 C7b 连工具也放行）。
+- C7（死苗混进 `no_work`）：活苗都浇好、窗口里还剩**没浇的死苗** ⇒ 工具判红（新闸门），**脑侧仍自认 VERIFIED**（属"脑侧比工具宽"的信息项；放宽形态 C7b 经复核为**夹具工件**，见 §8）。
 - C8（够不着的干活苗）：**未拦住**（C8b/C8c，且无需谎报）。
 - C9（旧 Mod 缺 `dryDeadCrops`）：脑侧如实 `unavailable`、工具记 info（**不判 0**）✅；但同一配置叠加"干作物在窗口外"⇒ C8c 洗白。
 
@@ -112,7 +112,7 @@ task-84 自身的四根支柱（Mod 拆分 / 死苗不浇水 / 政策序 / 三�
 | **C6c** | 活苗谎报 dead；farm `complete=false`（证据不可用） | `no_work`、`watered_outdoor=true`、`verified=true`；`final_water={scope:"window", tiles:1, crops:0, dry:0}` | **`ok=True / VERIFIED`**，problems 空 | **拦不住 ⇒ FAIL 依据** |
 | **C6d** | 同上但**完全没有 farm 块**（旧 Mod 形态） | 同 C6c | **`ok=True / VERIFIED`** | **拦不住** |
 | **C7** | 窗口里一株**没浇的死苗** + 活苗都浇好；farm `dryCrops=0, dryDeadCrops=1` | `no_work`、`verified=true`、`dry_dead=1` | `ok=False / needs_review`（同上 dry_dead 闸门） | 工具拦住、脑侧仍自认达标 |
-| **C7b** | 窗口里一株**浇过水的死苗**（`dry_dead=0`，死苗还杵在地里）+ 活苗都浇好 | `no_work`、`verified=true`、`dead_crops=1` | **`ok=True / VERIFIED`**（连 info 都没有） | NIT-1 |
+| **C7b** | 窗口里一株**浇过水的死苗**（`dry_dead=0`）+ 活苗都浇好；farm 块是**我写死的陈旧快照**（`deadCrops=1`） | `no_work`、`verified=true`、`dead_crops=1`（来自静态场块）；世界层面该死苗**已被 `clear_dead` 清掉**（stage `ok=1`、`crops` 只剩活苗） | **`ok=True / VERIFIED`** | **夹具工件，已撤回**（§8） |
 | **C8 / C8b / C8c** | **不谎报**：真·没浇的活苗在观测窗口之外；窗口只剩 1 格空耕地；farm 证据不可用（`complete=false` / 无 farm 块） | `no_work`、`watered_outdoor=true`、`verified=true` | **`ok=True / VERIFIED`**，info 里只有`当天 0 个阶段且自称 VERIFIED，但有"无活可做"证据 ⇒ 接受` | **拦不住（核心 fail-open）** |
 | **C8（初版）** | 同上但窗口被藏成 0 格 | `watered_outdoor=false`（空窗口守卫） | `needs_review` | 空窗口那条守住了 |
 | **F1** | 账本级：`dry_dead=0` + `dead_crops=1` + `watered_outdoor=true` + `final_water={scope:"window", tiles:30, crops:0, dry:0}` + `no_work` | — | **`ok=True / VERIFIED`** | 账本盲区（工具拿不到"活/死"真值） |
@@ -131,7 +131,7 @@ task-84 自身的四根支柱（Mod 拆分 / 死苗不浇水 / 政策序 / 三�
 
 | # | 现象 | 行号/证据 | 建议 | 阻塞 run8？ |
 |---|---|---|---|---|
-| NIT-1 | 窗口里"浇过水的死苗"（`dry_dead=0`）仍杵在地里，当天却判 `no_work` + VERIFIED；工具也放行 | C7b（§4） | `work_reasons()`/`sleep_guard` 把"窗口里还有 `dead` 格"也算有活（或至少在 `dead_crops>0` 且未清时不许 `no_work`） | 否 |
+| ~~NIT-1~~ | ~~窗口里"浇过水的死苗"（`dry_dead=0`）仍杵在地里，当天却判 `no_work` + VERIFIED~~ **已撤回**：世界层面那株死苗被 `clear_dead` 清掉了（stage `ok=1`，`crops` 只剩活苗），`dead_crops=1` 来自我在夹具里写死的 farm 块 ⇒ 是**陈旧快照工件**，不是脑侧漏看 | `scratch/_t92_c7b_check.py` + §8 | 无需修 | 否 |
 | NIT-2 | 工具只堵 `scope=="window"` 且 `tiles==0`（B4b）；`tiles>0, crops==0` 的 window 证据被当作有效 | F1/C6c/C8b | window 口径加"`crops==0` 且当天 farm 证据不可用 ⇒ 不算浇水证据" | 否（但见 §6） |
 | NIT-3 | C6a 守卫文案写死"旧 Mod / farm 证据不可信"，实际触发是 `farm.dryTiles` 缺失（也可能是瞬时 `complete=false`） | C6a | 文案按实际字段缺失分支 | 否 |
 | NIT-4 | `dead_crops/dry_dead` 只进账本与工具闸门，**不参与**"今天有没有活"的判定（B12） | C7b | 见 NIT-1 | 否 |
@@ -172,3 +172,25 @@ $env:T92_ROOT = (Resolve-Path .\scratch\_t92_pre).Path           # pre（a29b170
 
 （`scratch\_t92_snap` / `scratch\_t92_pre` 由 `git archive e23481e` / `git archive a29b170` 展开；`T92_ROOT` 同时决定
 `brain/`、`tests/`、`tools/verify-run3.py` 取自哪棵树。）
+
+---
+
+## §8 更正记录：撤回 NIT-1（C7b 是夹具工件，不是脑侧漏看）
+
+**发现经过**：Lead 问"C7b 是否需要单独立卡修生产代码"时我复核了自己的夹具，发现 C7b 的 `dead_crops=1` 是**我自己写死的 farm 块**造成的：
+`w.farm` 是静态 dict，`clear_dead` 把世界里的死苗清掉后它仍然写 `deadCrops=1`，于是 `rep.dead_crops=1` 是"陈旧快照"，不是"脑侧没看见还在的死苗"。
+
+**证据**（`scratch/_t92_c7b_check.py`，跑在 `scratch\_t92_snap` 上）：
+```
+ended_reason='no_work:确实找不到可做的活（地里的活干完了、也没法/没必要买种子）'
+stages=[('clear_dead', 1, 0)]          # 脑认为清掉了
+rep.dead_crops=1                        # 来自静态 farm 块
+世界里的死苗还在吗：False  crops=[(61, 10)]   # 世界层面只剩活苗
+地里还有没有 dead=true 的格：[]
+```
+
+**结论**：C7b **撤回**，不作为缺陷、不建议立卡。真正值得在 task-97 里再验的是**清不掉的**死苗形态
+（四邻堵死 / 工具缺失 ⇒ 应走 `encircled` / `unreachable` / `tool_refused` 记账，而不是 `no_work`），
+以及"陈旧 farm 快照"本身是否会让 `dead_crops`/`dry_dead` 与 `checks` 自相矛盾（工具侧已有 `dry_dead>0 + no_work` 硬闸门）。
+本卡其余结论（FAIL + B23 fail-open + NIT-2/3/4/5）不受影响；NIT-2 已由 Lead 在 `23e13c7` 修掉（`scope=window && crops==0` 判红）。
+
