@@ -47,6 +47,13 @@
 
 **风险事件分级（`tools/verify-run3.py` 已实现，2026-10-14 Lead 补）**：`mod_version_mismatch`（版本与脑侧期望不一致）**升格为问题项** —— 版本不符的账本不能当验收证据。其余十类只记 info：`water_far_unavailable`（farm 说还有干作物却拿不到 `dryTiles` 坐标）、`farm_evidence_unavailable`、`sell_failed`、`zones_failed`、`day_key_resnap_failed`、`bridge_unavailable`、`env_spin_capped`、`budget_exhausted`、`day_cap`、`event_blocked`。
 
+**dry 口径与死苗 / 买不起（Lead 2026-10-15 补，run7 实证；task-84/88 修复前适用）**：
+
+- `farm.dryCrops`/`dryTiles` 目前**把枯死作物格也算"干"**（`FarmScan.AccumulateTerrain` 的判据是 `crop != null && !HoeDirt.isWatered()`，**不看 `dead`**）⇒ `checks.watered_outdoor` / `final_water.dry` 在死苗清完之前**不可能为 0**。
+- run7 实证（`logs/longrun-3day-llm-run7.jsonl`）：`clear_dead_scope`(t=143) 记 `farm=33` 株死苗，本跑 `clear_dead` 只做成 **32** 株；剩下那一株（高置信 = `[12,30]`，`water_far` 10 次：8 次 `unreachable`、2 次 `ok=true` 但 `dry 6→6`）导致 **`summer 3`/`summer 5` 各烧掉一个整天**（`dry=1`、`verified=false`、`stuck:`）、**`summer 6` 63 次 `idle` + 20 次 `frontier_clear`（约 4.5 分钟）后靠 `stuck_flush` 翻篇**。
+- 复核口径：`final_water.dry > 0` 且 `farm.deadCrops > 0` ⇒ **必须点名"疑似死苗"**（task-84 落地前工具侧给 info；落地后 `dry` 只算活苗、`dead_crops` 单列，见 task-84 卡面）。
+- **买不起 ≠ 失败**：`seed_gate {seeds:0, money < seed_price}` ⇒ **未发起购买，属设计内**（不是任务失败、不判红、不算 `no_work` 洗白的理由）。run7 的 `buy` 事件 **0 条**正是此形态（`seed_gate` 5 次全是 `{seeds:0, money:14, seed_price:20}`）。brain 侧自 task-55 起补写 `cannot_afford` 事件；工具侧自 task-88 起输出人话行。
+
 ## 2. 连续性与外部证据
 
 - **尾部连续 3 天**：`verified == true` 且 `ended_by == "sleep"` 且 `day_after` 比 `day_key` **恰好 +1 天**。
