@@ -6,6 +6,7 @@
 - **v3 2026-10-13 01:2x**：deputy-lead 按 **task-19 要求 5④**（"没有任何户外快照 ⇒ 如实 False/缺省，禁止默认 true"）新增 **B4b**（`:394-401`）与"没写 `final_water` ⇒ 信息项"（`:403-407`）；新增负例 **R**（window 口径覆盖 0 格却自称 `watered_outdoor=true`）与正对照 **S**（farm 口径覆盖 32 格 ⇒ 仍 exit 0）。**行号均按 603 行版**。后果：**K2 从 exit 0 翻成 exit 1**（它的 `final_water` 正是 window/0 格），矩阵 29 本 ⇒ exit 0 = 6 本 / exit 1 = 23 本（其余读数逐本不变，见 §2/§8）。
 - **v4 2026-10-14 21:5x（task-72）**：新增 **§9**（task-52/task-63 豁免记账的**三条洗白通道**：修复前 exit 0 / 修复后 exit 1 的双侧实测）与 **§10**（run6 归因更正：`unreachable_within_bound=false` 与上界无关）；§4 盲区清单加 **B11–B14**；§5 加"**实测有效**的防线"。三条通道已由 **`9f554d7`（task-71）**修复并用负例锁死（`tests/test_verify_run3.py:518-578`）；**仍开放的是 B11**（真失败改写成 `unreachable`/`tool_refused`，账本层不可判）。
 - **v5 2026-10-14 22:4x（本文档当前版本，task-79）**：记录 task-68 的 `encircled` 带来的**V5 洗白通道已关闭** —— 上界分母从 `attempted` 换成 **`bound_basis = attempted − encircled`**（"被围住的格既不是走不到、也不是干了没成，不该为豁免额度做贡献"）：脑侧 task-78 落地字段、工具侧 Lead 镜像提交 **`2ce830b`**（1051 行，sha256 `FDB4E8D9…`；自算 `max(5, floor(0.2×bound_basis))`，账本 `bound_basis` > 自算 或账本 `*_bound` > 自算 ⇒ problem）。§2.1 补双侧读数、§3 加第 13 条、§4 新增 **B15（已关闭）/ B16（开放）/ B17（开放）**、§9.5 记双侧实测原文。**明确保留开放、不许写成已修**：**V1 = B16**（0 阶段 + `no_work` 理由 + `verified` ⇒ 两侧都 exit 0）、**V2 = B17**（遮蔽，task-15 已知）、**B11**。
+- **v6 2026-10-15 20:4x（task-86）**：Lead 把**验收口径**从"整本账本零问题"改成"**尾部连续 N 天达标 + 窗口内问题为空**"（提交 **`7c4ff68`**：`tools/verify-run3.py` +30 / `tests/test_verify_run3.py` +35 / `docs/_run6-criteria.md` +5 / `scratch/_run7_summary.py` +44；父 `1ffe2ca`）。窗口之外日子的**日级**问题降级为 `--json` 的 **`history_problems`**（人类输出里"历史问题（达标窗口之外…）"段），`streak < --days` **不降级**，不带 `[day]` 前缀的**全局**问题（journal 损坏 / `mod_version_mismatch` / `finish` 自相矛盾）**永不降级**。我独立两侧复跑 78 本账本（`scratch/_t86_side.py`）：**只有 run7 一本改变**（rc 1→0、9 条问题→9 条 history、VERIFIED），其余逐字不变；`--days 5` 零变化。**同时打穿/新增三条盲区 B19–B21**（详见 §11）：B19 = 打穿（窗口内问题可被"含 `]` 的 day 标签"降级）；B20 = 窗口外系统性缺陷被一路放过（设计取舍，需明示）；B21 = `analyze-longrun.py`（整本）与本工具（窗口）结论反向。判定见 `docs\_review-caliber-2026-10-15.md`（**FAIL**）。
 - **一句话结论（v3）**：K3（`finish` 自述反向）、K4（浇水两处自述矛盾）、**K2（window 口径 0 覆盖却自称浇过户外水）**已被抓（exit 1）；**完全自洽的伪造账本 `review-neg-K` 仍然 exit 0** —— `verify-run3.py` 验的是**这一本账本自己是否自洽**，**不是世界真的推进过 3 天**。防伪造仍必须靠**账本之外的证据**（§5）。
 
 ## §0 修订记录（初版 → v2 加固 → v3）
@@ -116,7 +117,7 @@
 
 ⇒ 这些**全是读账本自述**：`verified`/`checks`/`stages`/`failed_steps` 都是 longrun **自己写的**，账本自洽就无从分辨；加固只是把"自己跟自己打架"的花样抓得更全（B4b 也属这一类：它抓的是"自称浇过水，却同时写着证据来自 0 格的窗口"）。
 
-## §4 盲区清单（v5 状态；B1–B10 逐条沿用 v3 结论，B11–B18 见下）
+## §4 盲区清单（v6 状态；B1–B10 逐条沿用 v3 结论，B11–B21 见下）
 
 | # | 盲区 | v4 状态 |
 | --- | --- | --- |
@@ -139,6 +140,10 @@
 | B16 | （v5，**开放**，pre-existing，**与 task-68 无关**）**0 阶段 / 0 动作 + `no_work` 理由 + `verified=true`**：账本写 `encircled` 一大把、`unreachable=0`、`stages=[]`、`ok_steps=0`，靠"无活可做"证据放行（task-77 的 V1 账本，两侧工具都 exit 0） | **开放**：控制组 V1'（完全不写 encircled/无该事件）判决**完全相同** ⇒ 根因是既有 B6/B9 一类盲区（"0 步不能自证做过事"只对**没有**无活可做证据的日子生效），**不是 task-68 引入**。要动它属于"改 `no_work` 放行口径"，与 `encircled` 无关 |
 | B17 | （v5，**开放**，task-15 已知）**遮蔽**：同一阶段种类当天更早一轮 `leftover>0`（被围住的格留在那轮）、最后一轮 `leftover=0` ⇒ 日级按"最后一条"算 ⇒ 当天 `verified=true`（task-77 的 V2 账本，两侧工具都 exit 0） | **开放**：`stage_midway_leftover` 只留痕、不改结论（`9f554d7` 起也只在工具里给 info）。task-68 让命中概率上升（`encircled` 格不入 `blocked`、当天可换片继续），但**判据本身是 task-15 定的**，要收紧需单独裁定 |
 | B18 | （v5，**已关闭** `2ce830b`）**stuck 翻篇洗白**：`day_end.stuck_flushed=true` 的一天却记 `verified=true`（用"睡过去翻篇"凑尾部连续天数） | **已关闭**：`stuck_flushed=true` 且 `verified` ⇒ problem；负例 `tests/test_verify_run3.py` 的 `test_stuck_flushed_day_must_not_be_verified`（`:679`）（`test_stuck_flush_day_is_reported_as_info`（`:691`）守 info 侧） |
+
+| B19 | （v6，**打穿 = 开放**，`7c4ff68` 引入）**窗口内的 fatal 问题可以被"改 key"降级成 `history_problems`**：把该日 `day_start.day[1]`（季节）写成含 `]` 的字符串（例 `spring]x`）⇒ 问题前缀变 `[spring]x 11] …` ⇒ 窗口过滤用 `p[1:].split("]",1)[0]` 解析出 `spring`，与 `tail_names` 不匹配 ⇒ 被判"窗口之外"、`rc` 从 1 变 0、`VERIFIED` | **开放**（旧口径无此通道）。根因：`tools/verify-run3.py:914-916` 靠**文本前缀**归因，而标签由 `day_key()`（`:85-96`）从**账本原文** `f"{day[1]} {day[2]}"` 拼成、未净化；`name = d["key"]`（`:362`）。负例 `scratch/review-t86-a4b-inwindow-contradiction-injected-key.jsonl`（对照 a4a 正常标签 ⇒ exit 1）。修法：建问题时带**结构化 day key**、按值比较（不要再解析文本），并对 `]`/换行做净化+校验 |
+| B20 | （v6，**开放 = 设计取舍，需 Lead 明示**）**窗口之外的系统性缺陷被一路放过**：27 天全程"浇水没做完" + 尾部 3 天全绿 ⇒ 新口径 `VERIFIED`（135 条 `history_problems`），旧口径 `needs_review` | **开放**：`scratch/review-t86-a6-systematic-27-bad-3-clean.jsonl`。要保留该口径，必须在 `docs/_run6-criteria.md` §2 与发布清单写死"验收只覆盖尾部 N 天，更早缺陷靠三源对账/人工"；否则给历史问题加门槛（数量/同因 ⇒ 至少不判 VERIFIED） |
+| B21 | （v6，**开放**）`tools/analyze-longrun.py` **仍按整本账本**判红（run7：`VERIFIED: 4/3 天`、`退出码 1；有红 138 条`），而 `verify-run3.py` 按窗口判 `VERIFIED` ⇒ 两个工具对同一本账本**结论反向** | **开放（口径差异，不是 bug）**：发布物里必须注明口径，或给 `--json` 加 `caliber:"tail_window"`；否则外部读者会以为两者自相矛盾 |
 
 ## §5 那靠什么防（逐条标可执行性）
 
@@ -279,3 +284,49 @@ Lead 原倾向是"密农场下上界公式偏小 + 42 格确实无落脚点"。�
 - 工具 info 行口径（两轮相同）：`账本=42、journal 自算=42 次/42 格、豁免上界 bound=8（attempted=42）、实际扣除 exempt=8` ⇒ **42 格全被判"四邻都站不过去"（`field_ne`）**，而 `max(5, floor(0.2×42)) = 8` ⇒ 42 ≫ 8（超界 5.25 倍）。**就算把上界公式放大到 42 也仍然要问"这 42 格为什么都没有落脚点"** ⇒ 失败与上界无关。
 - 每类阶段最后一条 leftover 合计 **54 格**，`checks.no_unmet_stages=false`、`ended_by=stuck`、`verified=false`、37.2 s 就退出 ⇒ **工具如实判红，不是误判**；`finish` 自述 `code=1/verified_streak=0` 与之一致。
 - 根因链（写给 run7 复盘）：作业区选择把一整天花在"无落脚点簇"上（task-67 已修采种死锁、task-68 在修可达性与上界口径）。⇒ 验收单上写"**run6 失败 = 不可达格数远超上界 + 作业区选择**"，**不要**写"上界公式偏小导致合法豁免被卡住"。
+
+## §11 task-86 实测：尾部达标窗口口径（`7c4ff68`）—— 新旧差别 / 打穿清单 / 剩余盲区
+
+**新口径（`tools/verify-run3.py` @`7c4ff68`，1139 行）**
+
+- `ok = (尾部连续 N 天 verified) and (窗口内问题为空)`；`streak = days[-target_days:]` 若全满足 `ended_by=="sleep" and cross_day and verified is True`（`:894-899`，在降级**之前**算，不受影响）。
+- `if streak >= target_days:` ⇒ `tail_names = {d["key"] for d in days[-streak:]}`（`:911`）；逐条问题 `head = p[1:].split("]",1)[0] if p.startswith("[") else ""`，`head` 命中 `tail_names` ⇒ 保留，否则进 `history_problems`（`:914-916`）；`problems = kept`（`:919`）。`history_problems` 不参与 rc。
+- `streak < target_days` ⇒ **整段跳过**（不降级）。不带 `[day]` 前缀的全局问题（journal 坏行、`mod_version_mismatch`、`finish` 自洽/同向）在降级**之后**追加（`:996-1027`）⇒ 结构上永不被降级。
+- `--json` 新增 `history_problems`（`:1072`）；人类输出多一段"历史问题（达标窗口**之外**的日子，不影响结论，共 N 条）"（`:1123-1127`）。
+
+**两侧并排（78 本既有账本，`scratch/_t86_side.py --days 3`）**
+
+| 类别 | 旧（`7c4ff68^`，1109 行 sha256 `EB186584…`） | 新（`7c4ff68`，1139 行 sha256 `3573A397…`） |
+| --- | --- | --- |
+| `logs/longrun-3day-llm-run7.jsonl` | rc 1 / 9 问题 / needs_review | **rc 0 / 0 问题 / 9 history / streak 3 / VERIFIED** |
+| 其余 77 本（含 green、neg-A..Q、K/K2/K3/K4、t54/t72/t77/t79/t81 全系列） | — | **判决、问题数逐字不变** |
+| `--days 5` | — | **零本改变**（run7 `streak(3) < 5` ⇒ 不降级） |
+
+run7 的 9 条 history 原文（summer 3×2、summer 5×2、summer 6×5）见 `docs\_review-caliber-2026-10-15.md` §2；run7 本体读数：1230 行 / 7 天 / `finish{code:0,streak:3,actions:683,minutes:25.2}`，尾部 summer 7/8/9。
+
+**打穿 / 未打穿（`scratch/_t86_adv.py` → `scratch/review-t86-*.jsonl`）**
+
+| 变体 | 旧 rc | 新 rc | 结论 |
+| --- | --- | --- | --- |
+| A1 尾部 3 绿 + 前 5 坏 | 1 | 0（25 history） | 设计允许；坏日逐条列出 |
+| A6 **27 坏 + 3 绿（同因系统性）** | 1 | **0（135 history）** | **B20：会一路放过**（需 Lead 明示取舍） |
+| A2 窗口内中间日账目自相矛盾 | 1 | 1 | 窗口内问题仍 fatal ✅ |
+| A3 run 停在坏的一天 | 1 | 1（streak 0 / history 0） | 窗口没打满不降级 ✅ |
+| A4a 窗口内矛盾（正常标签，对照） | 1 | 1 | ✅ |
+| A4b 同 A4a，仅 day 标签改 `spring]x` | 1 | **0（该问题进 history）** | **B19：打穿** |
+| A5 全局问题（早期 `bridge_down`）+ 3 绿窗口 | 1 | 1（25 条降级、全局那条保留） | 全局问题永不降级 ✅ |
+
+**三源对账 run7（只读，`scratch/_t45_three_source.py`）**：6 次跨日全部恰好 +1（summer 3→4 / 4→5 / 5→6 / 7→8 / 8→9 / 9→10），其中 5 次与 SMAPI `Synchronizing 'NewDay' task` + `SaveGame.Save() completed` 逐条配对（`23:00:00` / `23:01:11` / `23:06:57` / `23:10:57` / `23:15:42` / `23:17:00`），summer 6 是 `stuck` 翻篇（info）；存档主文件 3648782 B @ `23:33:11.539`（`_old` 3614652 B @ `23:18:27`）⇒ 前进。**唯一 problem**：存档比账本收尾新 1 天（存档 summer 11 / 账本 summer 10）—— 原因是 SMAPI 在 `23:18:27`（L8513/L8521）与 `23:33:11`（L8525/L8532）还各有一次 NewDay+Save，而 journal 在 `23:18:29` 已 `finish` 停写 ⇒ **不是账本造假**，是"跑批窗口 < 游戏会话"；建议收工前退出游戏，或有 `finish` 时把该检查降 info（NIT-5）。SMAPI 源（`SMAPI-latest.txt` 630353 B / 8533 行 / mtime `2026-10-14 23:33:13`）仍是 run7 会话，只读副本 `scratch/_t86_smapi_run7_live.txt` sha256 `0782B2A1…`；**请求冻结为 `logs/run7-smapi-window.txt`**；无 run7 的 start/end 快照 ⇒ 窗口 delta 未判（info）。
+
+**复跑命令**
+
+```powershell
+$py = "C:\Users\admin\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
+$env:PYTHONUTF8="1"
+& $py scratch\_t86_side.py --days 3        # 两侧并排 → scratch\_t86_side_d3.txt
+& $py scratch\_t86_adv.py                 # A1/A2/A3/A4a/A4b/A5/A6 → scratch\_t86_adv_out.txt
+& $py scratch\_t86_tool_old.py --journal scratch\review-t86-a4b-inwindow-contradiction-injected-key.jsonl --days 3   # rc 1
+& $py scratch\_t86_tool_new.py --journal scratch\review-t86-a4b-inwindow-contradiction-injected-key.jsonl --days 3   # rc 0 / VERIFIED
+& $py scratch\_t45_three_source.py --ledger logs\longrun-3day-llm-run7.jsonl --smapi scratch\_t86_smapi_run7_live.txt --date 2026-10-14 --snapshots scratch\_t86_no_such_snapshots.jsonl --baseline logs\run7-baseline.json
+python -m unittest tests.test_verify_run3   # Ran 44 / OK
+```
