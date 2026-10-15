@@ -45,6 +45,7 @@ python tools\start-detached-longrun.py ^
 - **N2 经济闭环四步留痕**：`sell`/`surplus_sell`（卖出）→ 次日 `day_start.money` 增加（到账）→ `buy` 成功（当季种子）→ `sow`/`plant_area` 至少 1 格成功；四步缺一即在该日 evidence 里点名。
 - **N3 无空格死锁**：同一天 `buy` 尝试 ≤3、`no_inventory_space` 后不再重试；若因背包满，必须出现 `surplus_sell{why:"need_slot"}`。
 - **N4 跨日与落盘**：每个 `day_after` 恰 +1；落盘缺口必须能用"日终菜单链（`ShippingMenu`/`SaveGameMenu`）"解释，否则记红。
+- **N5 死苗证据不许"真空通过"**：run8 全程 `farm.deadCrops=0`/`dryDeadCrops=0`/`day_end.dead_crops=0` ⇒ task-84 的死苗路径在真机上**仍是真空未验**（见 `docs/_run8-evidence.md` §4.3 ③）。run9 若同样没有死苗，evidence **必须明写"本轮无死苗 ⇒ 该判据真空，不算通过也不算失败"**；想真正验到它需要跨换季（下一次换季 = 秋1日，距今约 15 游戏日）或另设针对性场景 —— 记为后续 run 的必验项。
 
 ## 5. 与 run8 的对比基线
 
