@@ -104,11 +104,19 @@ python tools\start-detached-longrun.py --journal logs\longrun-3day-llm-run8.json
 - 工具侧对齐提交 **`fdb87d8`**（`tools/verify-run3.py` 收 task-84 的 5 个 `day_end` 字段 + 新闸门 `no_work` + `dry_dead>0` ⇒ problem；`gave_up_dry` 只记 info；缺 `dry_dead` 的旧账本只记 info；`tests/test_verify_run3.py` 50 OK）。
 - **放行条件**：`check-release.py --expect 0.7.27` 必须六项全绿 —— 首次跑时唯一红是 `TestEventMappingDrift`（task-84 的新事件 `dead_crops_summary` 未入 `EVENT_BUCKETS`），作 **task-95** 派 log-analyst；**树不绿不装机**（v0.7.17 教训）。
 
-### §7.2 装机与起跑前预置（待 task-95 交付后执行）
-1. `python tools/check-release.py --expect 0.7.27` ⇒ 六项全绿（含 `Ran N tests / OK`、工作树干净）。
+### §7.2 装机与起跑前预置（**放行链见 §7.3，先过 task-96/97 再执行**）
+0. **前置闸门（2026-10-15 夜新增）**：`task-92` 对抗验收 **FAIL** ⇒ 发现一条**早于 task-84** 的 fail-open 老洞（人 在农场 + `farm` 证据不可用 ⇒ `no_work` + `watered_outdoor=true` + `verified=true`，真·没浇的活苗在 400 格窗外；run7 那颗 `[12,30]` 正是此形态）。修法 = **task-96**（brain-only，dev-coder）+ **task-97**（deputy-lead 对抗验收修法本身）。**task-96 未交付、task-97 未 PASS 之前不许装机、不许起 run8**——否则 run8 可能拿假 VERIFIED 当成绩。
+1. `python tools/check-release.py --expect 0.7.27` ⇒ 六项全绿（含 `Ran N tests / OK`、工作树干净）。此时 HEAD 应含 task-96（brain-only 改动**不需要**重新 bump Mod，四要素里的 HEAD/SHA256 会记它）。
 2. `python tools/deploy-mod.py --no-quit`（0.7.26 → 0.7.27；记录 dll/manifest 字节数与 `modVersion`）。
 3. `python -m agentfarm goto Farm --no-focus`（需 `PYTHONPATH=<repo>\brain`）⇒ 户外农场，否则 `preflight` 的户外判据红。
 4. `python tools/preflight.py --expect 0.7.27 --save-baseline logs/run8-baseline.json` ⇒ 四项全绿才算"可以起跑"。
 5. **预置（若 `seeds_total==0` 且 `money < seed_price`）**：`scratch/run6-preseed.py` 出货（**每 id 保留 K=10 做不到：Mod `ShipSkill` 只能整叠出货**，见 §7.1 备注）→ `scratch/verify-sleep-brain.py --from-farm` 睡一夜收款 → 复核 `money ≥ 20g`；红线：只走 `sell`/`sleep`/`buy` 三条已验收路径，**绝不 `Money +=`、绝不手改存档**；同夜「有 `ShippingMenu` 时保存被设计推迟」属正常（`docs/_il-newday-save.md`）。
 6. 起跑（**脱离式**，见 `docs/00-开发日志.md` 条目 040：DSH 托管后台作业会在回合边界被连根收掉）：`python tools/start-detached-longrun.py --journal logs/longrun-3day-llm-run8.jsonl --expect-version 0.7.27`（先 `--dry-run` 看四要素）；交付 `docs/_run8-evidence.md`（5 节）。
 7. 证据纪律：跑完**先别退游戏**；`docs/_runN-evidence.md` §4 必须并列 `tools/verify-run3.py` 的 `verdict` 与 `strict_verdict` 两行（严格口径只呈现、不改 rc），并逐条抄出 `history_problems`。
+
+### §7.3 放行链修正（2026-10-15 夜，Lead 记录）
+- **task-95 已交付**（`244e456`）后按裁定**降级一处判红**（`3235a75`）：`missed:verified_with_gave_up` 从红改警告（`warn:verified_with_gave_up`）——真洗白通道已被 `watered_outdoor=true` + `final_water.dry>0` 互斥闸门堵住，认输格当天被解决时判红即假红；`Ran 578 / OK`，七账本 rc 一字未变。
+- **工具侧补洞（Lead，`23e13c7`）**：`tools/verify-run3.py` 把 `final_water.scope=window && crops==0` 也判红（原先只堵 `tiles==0`）——"窗口里没看到作物"不等于"浇过了"；+2 用例（含 farm 口径正对照）⇒ `tests.test_verify_run3` 52 OK；七账本判决不变（green 0 / vacuum 3 / run2 11 / run3 17 / run5 21 / run6 9 / run7 0+严格 9）。
+- **task-96**（dev-coder，brain-only）：①`_farm_scope_work` 在"人在农场 + farm 证据可用"时也给值；②证据不可用且人在农场 ⇒ `work_reasons()` 给理由 + `sleep_guard` 不许放行 `no_work`（journal `farm_evidence_unavailable` 每天一次）；③`_water_evidence` 的 window 分支要求 `crops > 0`；④不许把诚实日洗成 `no_work`；⑤单测 ≥6 + 变异 ≥2。
+- **task-97**（deputy-lead，`blocked_by task-96`）：复跑 task-92 的 C6c/C6d/C8b/C8c（必须由 FAIL 转 PASS）+ 朝新修法进攻（部分可用证据 / 真没活的日子不许被关成死循环也不许洗白 / `crops>0` 但全是死苗时 `watered_outdoor` 该是什么 / 窗口与 farm 口径打架谁优先 / 畸形 `complete` 值）。
+- 顺序：**task-96 交付 ⇒ task-97 PASS ⇒ §7.2 第 1 步起跑全链**。
