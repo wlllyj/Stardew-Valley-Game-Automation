@@ -780,17 +780,24 @@ class LongRun:
         return (int(dry or 0), int(ripe or 0))
 
     def _farm_scope_work(self, obs: dict[str, Any]) -> tuple[int, int] | None:
-        """`farm` 块的"还有活"读数 `(dry, ripe)`；`None` = 此刻不是可用证据。
+        """`farm` 块的"还有活"读数 `(dry, ripe)`；`None` = **拿不到可用证据**。
 
-        只有在**人不在户外农场**时才有意义：此刻窗口观测只覆盖室内（`crops=0`），用它判
-        "有没有活"必然误判。字段口径按 `mod\\AgentFarm.Bridge\\Contracts.cs` 的 `FarmView`：
-        **`dryCrops` 才是"干着的作物格数"**，`unwateredCrops` 数的是 `NeedsWatering` 的作物
-        （run3 里它整天 32→32，不能拿来判"今天浇完没有"）。
+        【task-96 ①】**人在户外农场时也给值**（0.7.27 之前这里对 `_is_farm(obs)` 直接返回
+        `None`）。旧写法把两种完全不同的情形混成同一个 `None`：
 
-        【task-49】人在农场里时用 `_farm_totals`（同一个 farm 块，只是不因位置而丢弃）。
+        * 人**不在**农场 ⇒ 窗口只覆盖室内（`crops=0`），必须"先回农场再判"（run3 bug B）；
+        * 人**在**农场但 `farm` 证据不可用（`complete != true` / `dryCrops is None`）⇒
+          必须 **fail-closed**：不许拿窗口的 `crops=0` 当"地里没活"。
+
+        旧代码里 `None` 被消费者当成"没意见" ⇒ 人在农场 + 证据不可用时 `work_reasons()`
+        为空、`sleep_guard` 放行 `no_work`、`_water_evidence` 退回窗口口径（`crops==0` ⇒
+        `dry==0` ⇒ true）⇒ **假 VERIFIED**（deputy-lead task-92 的 C8b/C8c，正是 run7 那颗
+        窗口外没浇的 `[12,30]`）。现在"人不在农场"由调用方用 `self._is_farm(obs)` 自判，
+        `None` 只表示**证据不可用**。
+
+        字段口径按 `mod\\AgentFarm.Bridge\\Contracts.cs` 的 `FarmView`：**`dryCrops` 才是
+        "干着的作物格数"**，`unwateredCrops` 数的是 `NeedsWatering`（run3 里整天 32→32）。
         """
-        if self._is_farm(obs):
-            return None
         return self._farm_totals(obs)
 
     # --------------------------------------------------- task-50：窗口外的干作物
@@ -1063,6 +1070,14 @@ class LongRun:
             # 与上面那句 note 自相矛盾 ⇒ 必须在这里就把结论钉成 False，不许"0 格也自称浇过"。
             info["note"] += ("；本天没有任何户外窗口观测格（覆盖 0 格）⇒ 不能据此自称浇过"
                              "（空窗口下逐格判据恒真，故如实判 False）")
+            return False, info
+        if not crops_t:
+            # 【task-96 ③】窗口里**一格作物都没有**时 `dry == 0` 同样是恒真：这不是"浇完了"，
+            # 而是"没证据"。run7 那颗没浇的活苗 `[12,30]` 就在 400 格窗口之外 —— 旧代码在这里
+            # 返回 True ⇒ `checks.watered_outdoor=true` ⇒ **假 VERIFIED**（deputy-lead task-92 的
+            # C8b/C8c，完全不需要撒谎）。farm 口径不可用时只许"说不清"，绝不许"默认浇过"。
+            info["note"] += ("；窗口里一格作物都没有（crops==0）⇒ 没有逐格浇水证据，如实判 False"
+                             "（`dry==0` 在 crops==0 时恒真，不许据此自称浇过；task-96 ③）")
             return False, info
         return len(dry_t) == 0, info
 
@@ -1509,18 +1524,19 @@ class LongRun:
         # 真值在 `farm` 块（`complete=true` 时 `dryCrops`/`ripeCrops` 是全农场口径）：
         # 有干作物/熟作物就是"还有活"，而且第一件事是**先回农场**（见 `_ensure_on_farm`）。
         farm_work = self._farm_scope_work(obs)
-        if farm_work is not None:
+        if farm_work is None:
+            # 【task-96 ②】证据不可用 ⇒ **人在室内和人在农场都要给理由**（fail-closed）。
+            # 旧代码只在室内给理由 ⇒ 人站在农场、最后一张快照的 `farm` 证据不可用（`complete`
+            # 不为 true / 旧 Mod 没有 `dryCrops`）时这里为空 ⇒ 守卫放行 `no_work`，同时
+            # `_water_evidence` 退回窗口口径（`crops==0` ⇒ `dry==0` ⇒ true）⇒ **假 VERIFIED**。
+            # deputy-lead task-92 的 C8b/C8c 正是这条：真·没浇的活苗在 400 格窗口之外。
+            reasons.append(self._farm_evidence_reason(obs))
+        elif not self._is_farm(obs):
             dry, ripe = farm_work
             if dry > 0:
                 reasons.append(f"人不在农场，但 farm 口径还有 {dry} 格干作物（先回去浇）")
             if ripe > 0:
                 reasons.append(f"人不在农场，但 farm 口径还有 {ripe} 格熟作物（先回去收）")
-        elif not self._is_farm(obs):
-            # 【task-41 NIT-2，Lead rev4 §10 硬要求】人在室内、而 `farm` 证据不可用
-            # （`complete` 不为 true / `loaded` 为 false）⇒ 这条理由**必须出现在这里**：
-            # `_run_day` 里 `why = ("no_work" if not reasons else "stuck:守卫说还有活（…）")`
-            # ⇒ 理由缺失就会落回 `no_work`，run3 连睡 4 天的路径原地复活。
-            reasons.append(self._farm_evidence_reason(obs))
         # 【task-49】人在农场里时也要看全农场读数：窗口只有半径 ~14，农场另一头的干作物
         # 在窗口里根本不存在。run5 第 1 天 `farm.dryCrops=1` 就是这么被丢掉的。
         totals = self._farm_totals(obs)
@@ -1617,24 +1633,31 @@ class LongRun:
         return False
 
     def _farm_evidence_reason(self, obs: dict[str, Any]) -> str:
-        """室内 + `farm` 证据不可用时的"还有活"理由（task-41 NIT-2，fail-closed）。
+        """`farm` 证据不可用时的"还有活"理由（task-41 NIT-2 / task-96 ②，fail-closed）。
 
         为什么这算"还有活"：**不知道**地里干没干 ⇒ 绝不许据此判"没活可做"（run3 连睡 4 天就是这么来的）。
+        【task-96 ②】这条理由对**人在室内和人在农场**一视同仁：0.7.27 之前只有"人在室内"会走到
+        这里，人站在农场 + 证据不可用时 `work_reasons()` 为空 ⇒ `no_work` + 假 `watered_outdoor`
+        ⇒ 假 VERIFIED（deputy-lead task-92 的 C8b/C8c）。
+
         有界性**不靠** `idle_rounds`（它只在走完 `_execute` 且世界指纹没变时才涨）：`_run_day` 的
         `spot = _work_spot_plot(...) or _near_player_plot(...)` 为 `None` 那条**单次分支**会直接
-        `<ended_by>="stuck"` + `break`，一天只走一次、不空转。
+        `<ended_by>="stuck"` + `break`（换片地次数也有上限），一天不空转。
         journal `farm_evidence_unavailable` 每天最多一条（`self.farm_evidence_noted`）。
         """
         farm = obs.get("farm") or {}
         loc = str((obs.get("location") or {}).get("name") or "?")
+        where = "农场里" if self._is_farm(obs) else f"室内（{loc}）"
         if not self.farm_evidence_noted:
             self._journal("farm_evidence_unavailable", complete=farm.get("complete"),
-                          loaded=farm.get("loaded"), location=loc,
-                          note="人在室内但 farm 证据不可用（complete/loaded）⇒ 不许判 no_work；"
-                               "先回农场再判，当天拿不出目标则以 stuck 如实收尾（一天只走一次，不空转）")
+                          loaded=farm.get("loaded"), location=loc, on_farm=bool(self._is_farm(obs)),
+                          note="farm 证据不可用（complete/loaded/dryCrops）⇒ 不许判 no_work；"
+                               "先确保站在户外农场再判，当天拿不出目标则以 stuck 如实收尾"
+                               "（一天只走一次，不空转）")
             self.farm_evidence_noted = True
-        return (f"人在室内（{loc}）且 farm 证据不可用（farm.complete={farm.get('complete')!r}/"
-                f"loaded={farm.get('loaded')!r}）⇒ farm 口径不算证据，先回农场再判有没有活")
+        return (f"人在{where}且 farm 证据不可用（farm.complete={farm.get('complete')!r}/"
+                f"loaded={farm.get('loaded')!r}/dryCrops={farm.get('dryCrops')!r}）⇒ farm 口径不算证据，"
+                "不许据此判『没有活』：窗口的 crops==0 不是证据（run7 那颗没浇的活苗就在窗口外）")
 
     def _can_water(self, obs: dict[str, Any]) -> tuple[bool, str]:
         """还能不能继续浇：有壶，且壶里有水（或能去补水 / 无尽壶）。
@@ -1681,15 +1704,17 @@ class LongRun:
         # （睡醒在 FarmHouse）时窗口 `crops=0`，而 `farm` 口径可能还有一堆干作物 ——
         # 此时一律否决（先回农场），绝不允许把"人没到地里"当成"地里没活"。
         farm_work = self._farm_scope_work(obs)
-        if farm_work is not None and (farm_work[0] > 0 or farm_work[1] > 0):
+        if farm_work is not None and not self._is_farm(obs) and (farm_work[0] > 0 or farm_work[1] > 0):
             loc = str((obs.get("location") or {}).get("name") or "?")
             return False, "keep_working", (
                 f"人在室内（{loc}）、farm 口径还有 {farm_work[0]} 格干作物 / "
                 f"{farm_work[1]} 格熟作物，先回农场再说"
             )
-        if farm_work is None and not self._is_farm(obs):
-            # 【task-41 NIT-2】证据不可用 ⇒ fail-closed：**绝不**退回窗口口径放行 `no_work`
-            # （run3 那 4 天连睡就是这么来的）。理由与 `work_reasons` 共用一份实现，避免口径漂移。
+        if farm_work is None:
+            # 【task-41 NIT-2 + task-96 ②】证据不可用 ⇒ fail-closed，**室内与农场一视同仁**：
+            # 绝不退回窗口口径放行 `no_work`（run3 那 4 天连睡、task-92 的 C8b/C8c 假 VERIFIED
+            # 都是这条缺失造成的）。理由与 `work_reasons` 共用一份实现，避免口径漂移。
+            # 有界：守卫说"还有活"而本片拿不出目标 ⇒ 换片地上限 + `stuck:` 单次收尾，不空转。
             return False, "keep_working", self._farm_evidence_reason(obs)
         # 【task-49】人在农场里、全农场读数说还有干/熟作物，而玩家窗口没盖到 ⇒ 必须继续干；
         # 有水（壶里 / 能走到补水点 / 无尽壶）就去浇；**确实打不到水**才允许睡，而且这里
