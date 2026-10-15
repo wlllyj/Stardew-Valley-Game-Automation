@@ -214,7 +214,7 @@ FIELD_PROBES = [
      "开路尝试（task-68：tile/acted/attempt/limit/why；**acted=false = 想清但没清掉**）"),
     ("event:clear_neighbor", "clear_neighbor",
      "为开路清掉的邻格汇总（task-68：opens/targets；逐格在 StepResult.after）"),
-    # task-73（dev 在制 working tree）：stuck 日**有界翻篇**——绕过 sleep_guard 睡过去让整轮继续，
+    # task-73（dev 在制 working tree）：stuck 日**有界翻篇** —— 本日仍如实 stuck / 不 VERIFIED，
     # 而不是 19 秒终止。**绝不放宽验收**（本日仍 ended_by=stuck / day_justified=False / 不 VERIFIED）
     # ⇒ 只作信息项：翻篇成功、被跳过（eventUp/存档模态/次数上限）、翻篇后重观测失败。
     ("event:stuck_flush", "stuck_flush",
@@ -223,6 +223,16 @@ FIELD_PROBES = [
      "翻篇被跳过（task-73：reason=eventUp / 存档类模态 / 次数达 limit）"),
     ("event:stuck_flush_resnap_failed", "stuck_flush_resnap_failed",
      "翻篇后重观测失败（task-73：error；只作诊断）"),
+    # task-55/task-91：盈余材料换种子钱（钱次日 NewDay 结算；缺字段记【无法判定】、绝不判红）
+    ("event:surplus_sell", "surplus_sell",
+     "本轮卖盈余材料汇总（task-55：sold 件数/ok_count 叠数/below_keep/trigger{money,threshold,emptyDirt}；"
+     "**钱要等下一次 NewDay ⇒ 当天 money 不变是设计**）"),
+    ("event:surplus_sell_skip", "surplus_sell_skip",
+     "想卖盈余材料但没有材料超过保留线（task-55：short=缺口 g、below_keep、trigger、items）⇒ **不是失败**"),
+    ("event:sell.strategy", "sell_strategy",
+     "逐叠出货字段（task-55/task-42：strategy=surplus_materials / keep / below_keep / slot / qid / stack）"),
+    ("event:cannot_afford.money", "cannot_afford_money",
+     "钱不够买当季种子（task-55：money/seed_price/short 缺口；**不是失败**、当天不走 buy）"),
 ]
 OUTCOME_RE = re.compile(
     r"目标\s*(\d+)\s*步：做成\s*(\d+)、跳过\s*(\d+)、失败\s*(\d+)"
@@ -367,6 +377,13 @@ EVENT_BUCKETS = {
     "stuck_flush": "stuck_flushes",
     "stuck_flush_skipped": "stuck_flush_skips",
     "stuck_flush_resnap_failed": "stuck_flush_resnap_failures",
+    # task-55/task-91：**盈余材料换种子钱**（`_sell_surplus_for_seeds`，brain/agentfarm/longrun.py:1680-1740）。
+    #     `sell`/`sell_failed` 逐叠出货（task-42 已在桶里）；`surplus_sell` = 本轮汇总
+    #     （sold 件数 / ok_count 叠数 / below_keep / trigger{money,threshold,emptyDirt}；
+    #      **钱要等下一次 NewDay 才结算 ⇒ 当天 money 不变是设计，绝不判红**）；
+    #     `surplus_sell_skip` = 想卖但没有材料超过保留线（带 short 缺口）⇒ **不是失败**。
+    "surplus_sell": "surplus_sells",
+    "surplus_sell_skip": "surplus_sell_skips",
 }
 
 #: 结构性事件：由报告的其他字段单独统计（day_start/day_end 切会话与验收、finish 自述），
@@ -399,6 +416,8 @@ NEW_EVENT_BUCKETS = (
     "frontier_clears", "clear_neighbors",
     # task-73（dev 在制）：stuck 日有界翻篇（不经 sleep_guard，但绝不放宽验收、不判红）
     "stuck_flushes", "stuck_flush_skips", "stuck_flush_resnap_failures",
+    # task-55/task-91：盈余材料换种子钱（钱次日 NewDay 结算；skips/below_keep 都不是失败）
+    "surplus_sells", "surplus_sell_skips",
 )
 
 
@@ -1765,6 +1784,18 @@ def build_advice(report, top=8):
                     "（建议 3 的 brain 半边已进 task-84）",
             "lines": se.get("afford_blocked_lines", []),
         })
+    # 0i-3) task-91 ③：卖了盈余材料但**次日** buy 仍 0 ⇒ 只列两个候选，**不下结论**
+    sl = report.get("sell") or {}
+    if sl.get("sold_days_with_no_buy_next"):
+        _dn = "、".join(f"{x['day']}(L{x['line']})" for x in sl["sold_days_with_no_buy_next"][:6])
+        advice.append({
+            "text": f"盈余材料卖出后次日仍没买种子（{len(sl['sold_days_with_no_buy_next'])} 天：{_dn}）"
+                    "：候选只有两个 —— ①**钱没到账**（出货的钱要等下一次 `NewDay` 由游戏结算；"
+                    "`surplus_sell.note` 已写明「当天 money 不变是正常的」）；"
+                    "②**货架没有当季种子**（看 `no_seed_for_sale` 的 offers 与 `cannot_afford` 的缺口）。"
+                    "本工具只给这两个候选与证据行，**不下结论**。",
+            "lines": [x["line"] for x in sl["sold_days_with_no_buy_next"] if x.get("line") is not None],
+        })
     # 0j) 可达性/开路（task-76：task-68 的被围住 + frontier_clear + clear_neighbor；**不判红**）
     rc = report.get("reachability") or {}
     if (rc.get("encircled_events") or rc.get("frontier_clear_attempts")
@@ -2290,6 +2321,96 @@ def build_report(rows, path, args, bad_lines):
         "seed_gate_money": seed_gate_money,
         "seed_gate_price": seed_gate_price,
     }
+    # task-91：**盈余材料换种子钱**（task-55）—— 逐叠 `sell` + 汇总 `surplus_sell` + `surplus_sell_skip`。
+    # 口径：`below_keep` / `surplus_sell_skip` / `cannot_afford` **都不是失败**；`sell` 成交当天
+    # `money` 不变是**设计**（钱要等下一次 NewDay 由游戏结算）⇒ 这里只呈现，绝不判红。
+    sell_ok_n = sell_failed_n = sell_below_keep = 0
+    sell_lines: list[int] = []
+    sell_failed_lines: list[int] = []
+    sell_strategies: dict[str, int] = {}
+    surplus_ok = surplus_sold = surplus_below_keep = 0
+    surplus_lines: list[int] = []
+    surplus_money = None
+    skip_lines: list[int] = []
+    skip_short_max = 0
+    skip_below_keep = 0
+    skip_reason = ""
+    for ln, ev in rows:
+        name = str(ev.get("event") or "")
+        if name == "sell":
+            sell_lines.append(ln)
+            strat = str(ev.get("strategy") or "?")
+            sell_strategies[strat] = sell_strategies.get(strat, 0) + 1
+            if ev.get("ok") is True:
+                sell_ok_n += 1
+                if ev.get("below_keep") is True:
+                    sell_below_keep += 1
+            else:
+                sell_failed_n += 1
+                sell_failed_lines.append(ln)
+        elif name == "surplus_sell":
+            surplus_lines.append(ln)
+            if ev.get("ok") is True:
+                surplus_ok += 1
+            surplus_sold += as_int(ev.get("sold"))
+            if ev.get("below_keep") is True:
+                surplus_below_keep += 1
+            if surplus_money is None:
+                surplus_money = as_dict(ev.get("trigger")).get("money")
+        elif name == "surplus_sell_skip":
+            skip_lines.append(ln)
+            short = as_int(ev.get("short"))
+            if short > skip_short_max:
+                skip_short_max = short
+            if ev.get("below_keep") is True:
+                skip_below_keep += 1
+            if not skip_reason and ev.get("reason"):
+                skip_reason = str(ev.get("reason"))[:200]
+    # 「卖了盈余材料、但**次日** buy 仍为 0」的两候选（task-91 ③）：只给证据行，不下结论
+    _bounds = []
+    for _i, _d in enumerate(days):
+        _lo = _d.get("start_line") or 0
+        _hi = (days[_i + 1].get("start_line") or 10 ** 9) if _i + 1 < len(days) else 10 ** 9
+        _bounds.append((_lo, _hi))
+    _day_sell_ok = [0] * len(days)
+    _day_buy = [0] * len(days)
+    for ln, ev in rows:
+        name = str(ev.get("event") or "")
+        if name not in ("sell", "buy"):
+            continue
+        for _i, (_lo, _hi) in enumerate(_bounds):
+            if _lo <= ln < _hi:
+                if name == "sell" and ev.get("ok") is True:
+                    _day_sell_ok[_i] += 1
+                elif name == "buy":
+                    _day_buy[_i] += 1
+                break
+    sold_no_buy_next = [
+        {"day": days[_i].get("label"), "line": days[_i].get("start_line")}
+        for _i in range(len(days) - 1)
+        if _day_sell_ok[_i] > 0 and _day_buy[_i + 1] == 0
+    ]
+    sell = {
+        "total": sell_ok_n + sell_failed_n,
+        "ok": sell_ok_n,
+        "failed": sell_failed_n,
+        "below_keep": sell_below_keep,
+        "lines": sell_lines,
+        "failed_lines": sell_failed_lines,
+        "strategies": sell_strategies,
+        "surplus_events": len(surplus_lines),
+        "surplus_ok": surplus_ok,
+        "surplus_sold": surplus_sold,
+        "surplus_below_keep": surplus_below_keep,
+        "surplus_lines": surplus_lines,
+        "skips": len(skip_lines),
+        "skip_lines": skip_lines,
+        "skip_short_max": skip_short_max,
+        "skip_below_keep": skip_below_keep,
+        "skip_reason": skip_reason,
+        "money_at_sell": surplus_money,
+        "sold_days_with_no_buy_next": sold_no_buy_next,
+    }
     sleep_ok = sum(1 for _, ev in rows if ev.get("event") == "sleep" and ev.get("ok"))
     sleep_failed = sum(1 for _, ev in rows if ev.get("event") == "sleep" and not ev.get("ok"))
     blocked_by_action = {}
@@ -2359,6 +2480,7 @@ def build_report(rows, path, args, bad_lines):
         # task-69：同日重试的呈现 + buy 事件的成/败计数（跑 run6 复核用）
         "same_day_retries": same_day_retries,
         "buy": buy_counts,
+        "sell": sell,
         # task-70：种子经济（task-67 的种子三事件；与 buy 一起才是守卫死锁的完整指纹）
         "seed_economy": seed_economy,
         "unmapped_events": unmapped_events,
@@ -2815,6 +2937,12 @@ MAPPING_TEXT = [
     ("event:no_seed_for_sale / cannot_afford / seed_unavailable_today (task-67)",
      "种子经济（信息项，**不是硬失败**）：货架没种子 / 留够 K 包买不起 / 买不到结论**当天失效**留痕；"
      "与头部 `购买:` 计数一起看 —— 买不到却没有失效留痕 = run6 那种守卫死锁（建议 0i）"),
+    ("surplus_sell / surplus_sell_skip（task-55、task-91）",
+     "种子经济·盈余材料换钱（信息项，**不是失败、绝不判红**）：`surplus_sell` = 本轮卖盈余材料汇总"
+     "（sold 件数 / ok_count 叠数 / below_keep / trigger{money,threshold,emptyDirt}；"
+     "**钱要等下一次 NewDay 才结算 ⇒ 当天 money 不变是设计**）；"
+     "`surplus_sell_skip` = 想卖但没有材料超过保留线（short=缺口 g）⇒ 不是失败；"
+     "逐叠字段见 `sell.strategy/keep/below_keep/slot/qid/stack`"),
     ("encircled / encircled_stage / encircled_summary（task-68、task-76）",
      "5 环境挡路·可达性/开路（信息项，**无硬闸门 ⇒ 一律不判红**）：被不可清障物围住（四邻没有"
      "「可站+可清」的突破口）＝与 `unreachable`（物理走不到）**分开计数**、不封格、不进任何豁免分子；"
@@ -2966,6 +3094,20 @@ def render_text(report, top):
             f"seed_price={se.get('seed_gate_price')}）⇒ 未发起购买，不是任务失败"
             f"（seed_gate {se.get('seed_gate')} 次、其中钱不够/背包 0 种子 "
             f"{se.get('afford_blocked')} 次；行 {se.get('afford_blocked_lines', [])[:10]}）")
+    # task-91 ③：一行看懂"种子经济闭环"（出货 → 结算 → 买种子）
+    sl = report.get("sell") or {}
+    if sl.get("total") or sl.get("surplus_events") or sl.get("skips"):
+        add(f"种子经济/出货: sell {sl.get('total', 0)} 次（成交 {sl.get('ok', 0)} / 失败 "
+            f"{sl.get('failed', 0)}；below_keep {sl.get('below_keep', 0)} 叠）；盈余汇总 "
+            f"surplus_sell {sl.get('surplus_events', 0)} 次（sold {sl.get('surplus_sold', 0)} 件、"
+            f"below_keep {sl.get('surplus_below_keep', 0)} 叠）；想卖但没材料 "
+            f"surplus_sell_skip {sl.get('skips', 0)} 次（short 最大 {sl.get('skip_short_max', 0)}g）；"
+            f"buy {buy.get('total', 0)} 次（成交 {buy.get('ok', 0)} / 未成交 {buy.get('failed', 0)}）；"
+            f"seed_gate {se.get('seed_gate', 0)} 次"
+            + ("  ⚠ 卖了但次日 buy 仍 0 ⇒ 候选只有两个：钱没到账（次日 NewDay 才结算）/ "
+               "货架没有当季种子（别下结论；行 "
+               f"{[x['line'] for x in sl['sold_days_with_no_buy_next']][:10]}）"
+               if sl.get("sold_days_with_no_buy_next") else ""))
     # task-32：两种新事件形态的计数（信息项）；task-38：跨日证据覆盖度
     pc, ws = report["events"].get("plots_capped", 0), report["events"].get("work_spot", 0)
     add(f"软上限/收尾: plots_capped {pc} 次（作业区配额到顶，信息项）；work_spot {ws} 次（收尾作业区）")

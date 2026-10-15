@@ -1953,5 +1953,121 @@ class TestWindowAndSettledClassification(unittest.TestCase):
                            "summer 6 的历史红条不许因为窗口切换而消失")
 
 
+class TestSurplusSellAccounting(unittest.TestCase):
+    """task-91 / task-55：盈余材料换种子钱（`surplus_sell` / `surplus_sell_skip` / `sell` / `cannot_afford`）。
+
+    政策：`cannot_afford` / `surplus_sell_skip` / `below_keep` **都不是失败**；`sell` 成交当天
+    `money` 不变是**设计**（钱等下一次 `NewDay` 结算）⇒ 一律不判红；漂移测试要求有桶（不许静默）。
+    """
+
+    SELL_OK = {"event": "sell", "t": 1.0, "ok": True, "code": "ok", "strategy": "surplus_materials",
+               "slot": 3, "qid": "(O)390", "stack": 12, "keep": 3, "below_keep": False,
+               "trigger": {"money": 14, "threshold": 20, "emptyDirt": 0},
+               "before": {"slot": 3, "qid": "(O)390", "stack": 12, "money": 14},
+               "after": {"slot": 3, "qid": None, "stack": 0, "money": 14},
+               "reason": "已出货", "receipt": "ok"}
+    SURPLUS = {"event": "surplus_sell", "t": 2.0, "ok": True, "strategy": "surplus_materials",
+               "keep": 3, "slots": [3], "whitelist": ["(O)390"], "items": [],
+               "trigger": {"money": 14, "threshold": 20, "emptyDirt": 0},
+               "sold": 12, "ok_count": 1, "fail_count": 0, "below_keep": False,
+               "note": "钱要等下一次 NewDay 才由游戏结算（当天 money 不变是正常的）"}
+    SKIP = {"event": "surplus_sell_skip", "t": 3.0, "short": 6, "below_keep": True,
+            "reason": "唯一一大叠也补不上种子钱（short=6g）",
+            "trigger": {"money": 14, "threshold": 20, "emptyDirt": 0}, "items": []}
+    CANNOT = {"event": "cannot_afford", "t": 4.0, "code": "cannot_afford", "money": 12,
+              "seed_price": 80, "keep_factor": 3, "offers": "Melon Seeds(80g)",
+              "note": "今天不再发起 buy"}
+
+    def _report(self, events, name, *, days=1, window=None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=days, window=window)
+
+    def _day(self, day, *, verified=True, stage_ok=5, extra=(), final_money=14):
+        nxt = [day[0], day[1], day[2] + 1]
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": verified,
+                  "watered_outdoor": True}
+        fin = final(nxt)
+        fin["money"] = final_money
+        end = {"event": "day_end", "t": 9.0, "day": day, "day_text": "", "ended_by": "sleep",
+               "ended_reason": "night", "verified": verified, "checks": checks,
+               "stages": [{"stage": "clear_area", "ok": stage_ok, "skipped": 0, "failed": 0,
+                           "env_block": 0, "inconclusive": 0, "stopped": None, "leftover": 0}],
+               "outcomes": [], "ok_steps": stage_ok, "skipped_steps": 0, "failed_steps": 0,
+               "notes": [], "final": fin,
+               "final_water": {"t": 9.0, "location": "Farm", "tiles": 84, "crops": 31,
+                               "dry": 0, "scope": "farm"}}
+        return [day_start(day), *extra, end]
+
+    def test_surplus_events_have_buckets_and_are_never_red(self):
+        for n in ("surplus_sell", "surplus_sell_skip"):
+            self.assertIn(n, mod.EVENT_BUCKETS, f"brain 会发 {n}，没有桶就会静默消失")
+        events = self._day([1, "summer", 3], extra=[dict(self.SELL_OK), dict(self.SURPLUS),
+                                                    dict(self.SKIP), dict(self.CANNOT)])
+        rep = self._report(events, "surplus_buckets.jsonl")
+        self.assertEqual(rep["unmapped_events"], {}, "盈余卖出事件必须有桶")
+        self.assertEqual(rep["events"]["surplus_sell"], 1)
+        self.assertEqual(rep["events"]["surplus_sell_skip"], 1)
+        self.assertEqual(rep["red"]["total"], 0,
+                         "below_keep / skip / cannot_afford / 当天钱不变都不是失败 ⇒ 不判红")
+        text = mod.render_text(rep, 50)
+        self.assertIn("surplus_sells=1", text)
+        self.assertIn("surplus_sell_skips=1", text)
+
+    def test_sell_money_unchanged_on_same_day_is_by_design(self):
+        ev = dict(self.SELL_OK)
+        ev["after"] = dict(ev["after"], money=14)   # 当天钱一分没变（设计）
+        rep = self._report(self._day([1, "summer", 3], extra=[ev, dict(self.SURPLUS)]),
+                           "surplus_money.jsonl")
+        self.assertEqual(rep["red"]["total"], 0)
+        sl = rep["sell"]
+        self.assertEqual((sl["total"], sl["ok"], sl["failed"]), (1, 1, 0))
+        self.assertEqual(sl["surplus_sold"], 12)
+        self.assertEqual(sl["money_at_sell"], 14)
+        text = mod.render_text(rep, 50)
+        self.assertIn("种子经济/出货: sell 1 次（成交 1 / 失败 0", text)
+        self.assertIn("sold 12 件", text)
+
+    def test_sell_then_next_day_without_buy_lists_two_candidates_only(self):
+        day1 = self._day([1, "summer", 3], extra=[dict(self.SELL_OK), dict(self.SURPLUS)])
+        gate = {"event": "seed_gate", "t": 20.0, "stage": "till_area", "seeds": 0, "money": 14,
+                "seed_price": 20, "zone": "field_ne", "in_plot": False}
+        day2 = self._day([1, "summer", 4], extra=[gate], final_money=14)
+        rep = self._report(day1 + day2, "surplus_nobuy.jsonl", days=2)
+        sl = rep["sell"]
+        self.assertEqual(len(sl["sold_days_with_no_buy_next"]), 1,
+                         "第 1 天卖出、第 2 天 buy 0 ⇒ 命中")
+        self.assertEqual(rep["buy"]["total"], 0)
+        advice = " ".join(str(a["text"]) for a in rep["advice"])
+        self.assertIn("钱没到账", advice)
+        self.assertIn("货架没有当季种子", advice)
+        self.assertIn("不下结论", advice)
+        for bad in ("买入失败",):
+            self.assertNotIn(bad, advice, "只给候选，不许下结论")
+        # "购买任务失败"只允许出现在否定式「不是购买任务失败」里
+        self.assertTrue(all(advice[max(0, m.start() - 2):m.start()] == "不是"
+                            for m in re.finditer("购买任务失败", advice)),
+                        "只给候选，不许把'没买种子'写成购买任务失败")
+        text = mod.render_text(rep, 50)
+        self.assertIn("卖了但次日 buy 仍 0", text)
+
+    def test_seed_line_combines_sell_buy_and_seed_gate(self):
+        day1 = self._day([1, "summer", 3], extra=[dict(self.SELL_OK), dict(self.SURPLUS),
+                                                  dict(self.SKIP), dict(self.CANNOT)])
+        rep = self._report(day1, "surplus_line.jsonl")
+        text = mod.render_text(rep, 50)
+        for frag in ("sell 1 次", "surplus_sell 1 次", "surplus_sell_skip 1 次",
+                     "short 最大 6g", "buy 0 次", "seed_gate"):
+            self.assertIn(frag, text, f"种子经济/出货行要能一眼看到 {frag}")
+
+    @unittest.skipUnless(os.path.isfile(os.path.join(ROOT, "logs", "longrun-3day-llm-run7.jsonl")),
+                         "缺少 run7 账本")
+    def test_run7_has_no_surplus_events_and_is_still_clean(self):
+        rep = report_for(os.path.join(ROOT, "logs", "longrun-3day-llm-run7.jsonl"), days=7, top=0)
+        self.assertEqual(rep["sell"]["total"], 0, "run7 早于 task-55，没有 sell 事件")
+        self.assertEqual(rep["red"]["total"], 0, "没有这些事件不该引入任何红")
+
+
 if __name__ == "__main__":
     unittest.main()

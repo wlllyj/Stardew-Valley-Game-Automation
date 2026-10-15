@@ -356,6 +356,25 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run7.jsonl --day
 rg -n '"seed_gate' logs\longrun-*.jsonl
 ```
 
+## 3.13 盈余材料换种子钱（task-55 / task-91，dev `6948bb4`）—— 种子经济闭环的后半段
+
+| 事件 | 关键字段 | 归因 |
+| --- | --- | --- |
+| `surplus_sell` | `ok` / `sold` / `ok_count` / `fail_count` / `below_keep` / `trigger{money,threshold,emptyDirt}` / `keep` / `slots` / `whitelist` / `items` / `note` | 种子经济（信息项，**绝不判红**）：钱要等下一次 `NewDay` 结算 ⇒ **当天 `money` 不变是设计** |
+| `surplus_sell_skip` | `short`（缺口 g）/ `below_keep` / `trigger` / `items` / `reason` | 想卖但没有材料超过保留线 ⇒ **不是失败** |
+| `sell`（task-42 已有桶） | `strategy=surplus_materials` / `keep` / `below_keep` / `slot` / `qid` / `stack` / `before` / `after` | 逐叠出货；`ok=false` 才失败（另有 `sell_failed`） |
+| `cannot_afford`（task-67） | `money` / `seed_price` / `short` / `offers` | 钱不够 ⇒ 当天不走 `buy`，**不是失败** |
+
+- **呈现**：头部 `种子经济/出货:` 一行 —— `sell` 次数与成交/失败、`below_keep` 叠数、`surplus_sell` 汇总（sold 件数 / below_keep 叠）、`surplus_sell_skip` 次数与最大 `short`、`buy` 成交/未成交、`seed_gate` 次数。
+- **建议 0i-3**：`sell` 有成交而**次日** `buy` 仍 0 ⇒ 只列**两个候选**（①**钱没到账**：出货钱要等下一次 `NewDay` 由游戏结算；②**货架没有当季种子**：看 `no_seed_for_sale.offers` 与 `cannot_afford.short`），**不下结论**。
+- **缺失行为**：这些事件没出现 ⇒ 照既有规则进【无法判定】（`本账本没有 event:…`），不判红、不当通过。
+- **单测**：`tests/test_analyze_longrun.py::TestSurplusSellAccounting`（5 条：有桶不判红 / 当天钱不变是设计 / 次日没买只给两候选 / 种子经济行齐全 / run7 无这些事件且仍干净）。
+
+```
+rg -n '"surplus_sell|"sell"|"cannot_afford' logs/longrun-*.jsonl
+python tools/analyze-longrun.py --journal <ledger> | rg "种子经济/出货"
+```
+
 ## 4. 复核命令
 
 ```
@@ -364,6 +383,6 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run6.jsonl   # r
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run7.jsonl --days 7   # run7：窗口口径 ⇒ rc=0
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
-python -m unittest tests.test_analyze_longrun  # 当前 104 条（其中 1 条漂移红属 task-91 的 surplus_sell 在制）
-python -m unittest discover -s tests
+python -m unittest tests.test_analyze_longrun  # 当前 109 OK（task-91）
+python -m unittest discover -s tests           # 当前 559 OK
 ```
