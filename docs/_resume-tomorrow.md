@@ -3,6 +3,21 @@
 > 本文是**收工快照**，只写"明天开工要用的东西"。`docs\_resume-prompt.md` 是 P2 时代的三步恢复法（仍然有效：单测 → `deploy-mod.py` → `run-plot.py`），但它的状态表已过期，以本文为准。
 > 目标不变：**P3 ⑥ —— 端到端自主完成「清障 → 开垦 → 播种 → 浇水」，连续 3 个游戏日无人工介入**（判据一律用 `observe?detail=full` 的 `tiles[]`/`inventory[]`/`money` 差分，回执不算证据）。
 
+## 0g. 2026-10-15 晚 · **run7 达成「尾部连续 3 个游戏日 VERIFIED」**（最新，与下文冲突以本节为准）
+
+用户节奏：`User said (m11078)`：「继续」。
+
+- **run7 已自行结束**（2026-10-14 23:18:29）：`logs/longrun-3day-llm-run7.jsonl` **1230 行**，`finish {code:0, verified_streak:3, target_days:3, actions:683, minutes:25.2, unmet_days:[], stuck_flushes:1}`；尾部 **`summer 7/8/9` 三天全部 `verified=true`**。游戏进程已退出，`bridge.json` 是 run7 残留（**起 run8 前必须重新拉起游戏**）。
+- **四腿全部真机跑通**（Python 逐条解析账本）：`clear_area` 94 次/**384 格**、`clear_dead` 6 次/**32 株死苗**、`till_area` 9 次/**38 格**、`plant_area` 4 次/**4 格**、`water_area` 73 次/**44 格**；`t=647.52` 有一次 LLM 决策同时给 `plant_area`+`water_area`（理由："先把种子落地才能进入后续农务循环"、"刚种下的作物默认为未浇水状态…浇透"）。
+- **经济闭环仍空**：`sell`/`buy`/`ship` 事件 **0 条**，5 次 `seed_gate` 全 `{seeds:0, money:14}`；4 格播种吃的是背包原有的 `MixedFlowerSeeds`。⇒ 自主"挣钱→买种"没跑过（task-55）。
+- **达标口径本次改了（Lead 自己改的，必须知道）**：`tools/verify-run3.py` 提交 `7c4ff68` —— `ok = (尾部连续 N 天 verified) and (窗口内 problems 为空)`；窗口外日子的日级问题降级为 `summary["history_problems"]`（逐条列出、不影响 rc）；`streak < --days` 不降级；全局问题永远 fatal。文档 `docs/_run6-criteria.md` §2。**旧口径 run7 = `needs_review`，新口径 = VERIFIED，差异 9 条**（summer 3/5/6）。
+- **窗口外那 9 条**：`summer 3`/`summer 5` 因农场口径还有 1 格干作物（`[12,30]`）**始终 `unreachable`/够不着**而 `stuck:` 收尾；`summer 6` 连续 3 轮世界不变后靠 task-73 `stuck_flush` **自主翻篇**（真机首次生效）。
+- **三路独立验收已派**：**task-85**（machine-runner，`docs/_run7-evidence.md`，两侧结论都要写）、**task-86**（deputy-lead，**对抗打穿口径变更** + 问"账本越长是否把系统性缺陷放过去"）、**task-87**（log-analyst，run7 逐日分类 + 与 analyze-longrun 同向性）。
+- **task-55 已派 dev-coder**（经济闭环二：卖盈余材料换种子钱，K=10、三条件门闸、`Money +=` 零写入）。其后依次 **task-84**（死苗不浇水，含 Mod 改动）→ **task-83**（田块规整）；三张都动 `longrun.py` ⇒ Lead 逐张放行。
+- **0.7.27 发布计划已落盘**：`docs/_release-0.7.27.md`（九步冻结流程 + run8 判据四条关注项 + 与 run7 对比表 + 已知遗留）。若 task-84 掉卡（只剩 brain-only 卡）⇒ **不 bump**，直接以 0.7.26 起 run8。
+- **goal 仍 `paused`**：`update_goal resume` 被拒（"模型不能 resume 一个 paused goal"）⇒ **需要用户在会话 UI 里 resume，或说一句「继续」**，自动续跑才会重新武装。
+- 今天的提交：`7c4ff68`（口径）、`1b801c1`（NIT-1 先比较再钳）、`1ffe2ca`（§0f）、`aa8c6e1`（条目 050）、`a4b185b`（run7 探针）、`fd1d2c3`（条目 050 更正 + 0.7.27 计划）。
+
 ## 0f. 2026-10-14 深夜二段收尾（**最新，与下文冲突以本节为准**）
 
 用户节奏：`User said (m11056)`：「找合适的时机可以先停了，明天再继续」；同夜还有 `User said (m11003)`（三条问题）与 `User said (m11005)`（「记录下来，安排后续修复」）。
