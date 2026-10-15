@@ -1,9 +1,11 @@
-# 0.7.28 发布 / 验收计划（run9）
+# 0.7.28 发布 / 验收计划（run9 = run A，run10 = run B）
 
 > 起草：2026-10-15 22:35（Lead）。状态：**未冻结**（等 task-104/task-106 交付 + task-103/task-108 对抗验收 PASS）。
 > 上游：`docs/_release-0.7.27.md`（0.7.27 已装机并跑出 run8，证据见 `docs/_run8-evidence.md`、开发日志条目 053）。
 
 ## 1. 本版内容（卡片即权威）
+
+### 1a. 第一批：run8 两病灶（已交，验收已过）
 
 | 卡 | owner | 内容 | 状态 |
 |---|---|---|---|
@@ -13,10 +15,25 @@
 | **task-108** | deputy-lead | 对 task-104 的独立对抗验收（`not_on_farm` 不扣额度、收尾点名、回不去时的有界性、回农场后仍能浇的正例） | in_progress |
 | **task-106** | log-analyst | **analyze-longrun 收 task-102 新事件/字段**（`slept_without_work`/`buy_no_space`/`surplus_sell.why=need_slot`，另补 `modal_dismiss_failed`/`water_far_skipped`）——`TestEventMappingDrift` 那条红**必须清零** | **已交 `6293696`**（Lead 已核：3 文件 +372/−2、越界零命中、`tests.test_analyze_longrun` 122 OK、全量 618 OK 零红） |
 
+### 1b. 第二批：LLM 决策复盘/演进（**明天做**，brain-only，串行同一 owner）
+
+> 来源：用户 `m12553`：「总之要让模型再玩这个游戏的时候具备决策演进的能力，你自己定吧」⇒ Lead 决定并入 0.7.28。
+
+| 卡 | owner | 内容 | 状态 |
+|---|---|---|---|
+| **task-58** | dev-coder | `Brief.recent_decisions` 骨架（最近 3–5 条边界决策 + 结局摘要喂回提示词，≤300 字符；超限时决策史最先被裁；≥4 单测） | pending（明天第一个开工） |
+| **task-82** | dev-coder | 决策→结果 join（`terminal`/`leftover`/`unreachable`/`refused`/`ended_by`/失败格坐标 ≤3）+ **跨日教训库** `<journal>-lessons.json`（客观事实代码写、一句 `hint` LLM 写；≤~20 条按 `last_seen` 淘汰；次日注入 ≤3 条 ≤200 字符；**只认客观证据**） | pending |
+| **task-59** | dev-coder | night 边界一次独立复盘调用（只写 `review_llm` + 次日 `recent_notes`；**失败无害**；`max_tokens ≤512`；notes 含坐标 ⇒ 拒收） | pending |
+| **task-111** | log-analyst | analyzer 收录本批新事件/字段（防漂移红）+ 八本账本两侧 rc 同向 | pending（`blocked_by 58/59/82`） |
+| **task-112** | deputy-lead | 独立对抗验收：**最高优先级 = 零判定影响**（开/关机制 `verified`/`checks`/`final_water` 逐字相同）+ 只认客观证据 + 失败无害 + 有界性 + ≥4 对抗 | pending（`blocked_by 58/59/82`） |
+
+> **诚实边界**（写进 evidence 与给用户的结论）：这是「会话内记忆 + 提示词反馈」，**不是**权重更新/在线训练。
+> **演进验收**：run9 = run A（积累）→ run10 = run B（注入）。必须有"run A 某意图被 cancel/失败 → run B 的 prompt 里出现对应教训、且同形态不再出现"的对照证据，**否则不许写"自我进化已实现"**。
+
 ## 2. 冻结与装机九步（Lead 独占，链式，不许并行）
 
-1. `team_task_get` 确认 **task-102 / task-104 / task-106 已 completed**；**task-103 / task-108** PASS 或 PASS-WITH-NITS（无必修）。
-2. 确认 `tools/_note-0728.txt` 存在且**首串是 `v0.7.28`**（列本版卡片）。
+1. `team_task_get` 确认 **task-102 / task-104 / task-106 / task-58 / task-59 / task-82 已 completed**，且 **task-103 / task-108 / task-112** PASS 或 PASS-WITH-NITS（无必修）、**task-111** 已交（八本账本两侧 rc 同向、`TestEventMappingDrift` 零红）。
+2. 确认 `tools/_note-0728.txt` 存在且**首串是 `v0.7.28`**（列本版两批卡片：run8 两病灶 + LLM 复盘/教训库；LLM 两条等 task-82/task-59 落地后按实际内容补写）。
 3. `python tools/_bump-mod-version.py 0.7.28 --note-file tools\_note-0728.txt`（⚠️ cp1252 下末句 print 会 `UnicodeEncodeError` 且退出码 1，但**版本已写盘** ⇒ 一律用 `json.load` 核对 `manifest.json` 的 `Version`）。
 4. `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.28"`。
 5. `dotnet build .\mod\AgentFarm.Bridge\AgentFarm.Bridge.csproj -c Release --nologo --no-incremental` ⇒ 0 警告 0 错误；记下 `AgentFarm.Bridge.dll` / `manifest.json` 的 B 与 mtime。

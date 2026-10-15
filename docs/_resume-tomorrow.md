@@ -3,22 +3,26 @@
 > 本文是**收工快照**，只写"明天开工要用的东西"。`docs\_resume-prompt.md` 是 P2 时代的三步恢复法（仍然有效：单测 → `deploy-mod.py` → `run-plot.py`），但它的状态表已过期，以本文为准。
 > 目标不变：**P3 ⑥ —— 端到端自主完成「清障 → 开垦 → 播种 → 浇水」，连续 3 个游戏日无人工介入**（判据一律用 `observe?detail=full` 的 `tiles[]`/`inventory[]`/`money` 差分，回执不算证据）。
 
-## 0h. 2026-10-15 深夜 · **run8 两病灶已修完，0.7.28 冻结只剩 task-108 一道门**（最新，与下文冲突以本节为准）
+## 0h. 2026-10-15 深夜 · **0.7.28 = 「run8 两病灶修复」+「LLM 决策复盘/演进」两批一起冻结**（最新，与下文冲突以本节为准）
 
-用户节奏：`User said (m12478)`：「准备停下来吧，明天再搞」。goal 已由 Lead `pause`。
+用户节奏：`User said (m12478)`：「准备停下来吧，明天再搞」；随后 `User said (m12538)` 问「大模型的决策复盘进化机制有了吗？」、`User said (m12553)`：「总之要让模型再玩这个游戏的时候具备决策演进的能力，你自己定吧」、`User said (m12569)`：「定好之后排上任务，不用开始，明天再做」。⇒ Lead 决定：**把演进机制并入 0.7.28**（run9 当"run A 积累"、run10 当"run B 注入 + 对照验收"）。**今晚不动手**：卡已排好、无 owner、无人在跑。goal 已 `paused`。
 
-- **run8（0.7.27）= 0/3**：summer 11 VERIFIED / summer 12 **0 动作早睡** / summer 13 `sleep_failed`。两病灶：**A 经济闭环空格死锁**（`buy` 26 次 0 成交，其中 25 次回执 `no_inventory_space`；当季筛选本身正确）+ **B 早晨连睡**（上一夜 `ShippingMenu` 把 `goto_farm` 挡成 `ui_modal`，人留 FarmHouse，`_water_far_dry` 仍逐格空转、6 格全进 `given_up` ⇒ 8 秒后 0 农场动作就睡）。证据 `docs/_run8-evidence.md`、开发日志条目 053。
-- **0.7.28 内容已交三张 + 验收过一张**（全部已提交、单测全绿）：
-  - **task-102** `9b09735`：`no_space` 独立结果码 + 当天 ≤3 + 卖一叠腾格（`surplus_sell{why:"need_slot"}`）+ 买前清模态 + 0 动作不许睡觉（`slept_without_work`）。
-  - **task-104** `9b5b592`：`_water_far_dry` 只在人在户外农场时才逐格；场外回不去记 `water_far_skipped{reason:"not_on_farm"}`、**不扣额度、不认输**、收尾点名。
-  - **task-106** `6293696`：analyze-longrun 收 4 个新事件（含 `water_far_skipped`/`modal_dismiss_failed`）⇒ 漂移红清零，全量 **618 OK**。
-  - **task-103**（deputy 对 task-102 的对抗验收）= **PASS-WITH-NITS，无必修**（`7e2ad95`）；NIT-1（卖货计划如实性/最小损失）与 NIT-3（卖后刷新 obs）已立 **task-109**（0.7.29）。
-  - **task-108（deputy 对 task-104 的对抗验收）在制** ⇒ **0.7.28 冻结的最后一道门**；明天先看它的判定。
-- **明天第一件事（Lead，照 `docs/_release-0.7.28.md` §2）**：`tools/_note-0728.txt`（已在库、首串 `v0.7.28`）→ `python tools/_bump-mod-version.py 0.7.28 --note-file tools\_note-0728.txt`（⚠️ cp1252 下末句 print 抛 `UnicodeEncodeError` 且退出码 1，但版本已写盘 ⇒ 用 `json.load` 核对）→ `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED="0.7.28"` → `dotnet build .\mod\AgentFarm.Bridge\AgentFarm.Bridge.csproj -c Release --nologo --no-incremental`（0/0）→ `git add -A` + 提交 → `python tools\check-release.py --expect 0.7.28`（须全绿）→ `python tools\deploy-mod.py --no-quit` → `python -m agentfarm goto Farm` → `python tools\preflight.py --expect 0.7.28 --save-baseline logs\run9-baseline.json`（四绿）→ 交 **task-105** 给 machine-runner 起 **run9**（`tools/start-detached-longrun.py --journal logs\longrun-3day-llm-run9.jsonl --expect-version 0.7.28`，起跑前 `scratch/run8-snapshot.py --tag start --expected-mod-version 0.7.28`）。
-- **run9 现场（存档：夏 13 日 06:00、钱 188g、种子 `[]`、背包满、作物 6 格）**：**不做操作员预置** —— 这正是"卖一叠腾格 → 买当季种子 → 播种"的验收场景（task-105 卡面明写）。判据 = `docs/_run6-criteria.md` §3.4 的 N1–N5（N1 已按 task-103 的口径澄清改成不变量：`day_after` 推进 ∧ `ok_steps==0` ∧ `verified==true` 三者绝不同时）。
-- **观察点（诚实边界）**：run8 那"6 格窗外干作物"在 summer 11 曾被浇成功过（当日 `dry=0`）⇒ 大概率可达，属 task-104 修的场外情形；若 run9 再现"真·够不着的活苗"，当天应如实 `gave_up_dry`/不 VERIFIED，**不许洗白**。
-- **本轮提交**：`9b09735`(task-102)、`9b5b592`(task-104)、`6293696`(task-106)、`7e2ad95`(task-103 报告)、`beb1112`+`f220c3c`(0.7.28 计划/口径)、`2bf0d8f`/`a23427a`(条目 052)。
-- **goal `goal-1ee4cda9-fdd4-4ba0-80cb-0c06902157eb` 已被 Lead pause**（用户要求今天停）⇒ 明天说一句「继续」或在会话 UI 里 resume 即可重新武装自动续跑。
+**明天的开工顺序（Lead 串行放行；一次只让一个 owner 动 `longrun.py`/`planner.py`）**：
+
+1. **task-58**（dev-coder）= `Brief.recent_decisions` 骨架（决策史喂回提示词 ≤300 字符 + 裁切优先级 + ≥4 单测）。
+2. **task-82**（dev-coder 接着做）= 决策→结果 join（`terminal`/`leftover`/`unreachable`/`refused`/`ended_by`/失败格坐标 ≤3）+ **跨日教训库** `<journal>-lessons.json`（客观事实由代码写、一句 `hint` 由 LLM 写；上限 ~20 条按 `last_seen` 淘汰；次日注入 ≤3 条 ≤200 字符；**只认客观证据，回执不算**）。
+3. **task-59**（dev-coder 收尾）= night 边界一次独立复盘调用（只写 `review_llm` + 次日 `recent_notes`；**失败无害**；`max_tokens ≤512`；notes 含坐标 ⇒ 拒收）。
+4. **task-111**（log-analyst，`blocked_by 58/59/82`）= analyzer 收录本批新事件/字段（防漂移红，否则 `check-release` 树不绿）+ 八本账本两侧 rc 同向。
+5. **task-112**（deputy-lead，`blocked_by 58/59/82`）= 独立对抗验收：**最高优先级 = 零判定影响**（开/关机制跑同一假世界，`verified`/`checks`/`final_water` 逐字相同）；只认客观证据；失败无害；有界性；≥4 条对抗。
+6. 全绿后 Lead 走 **0.7.28 冻结九步**（见下）⇒ **run9 = run A**（验收 P3 ⑥ + 开始积累教训）⇒ **run10 = run B**（真机两次 run 对照：run A 被 cancel/失败的意图，在 run B 的 prompt 里以教训出现、且同形态不再出现）。**没有这条对照，不许写"自我进化已实现"。**
+
+**诚实边界（对用户要说清）**：这是「**会话内记忆 + 提示词反馈**」，**不是**模型权重更新/在线训练；同一模型跨 run 变好，全靠这段记忆进 prompt。
+
+- **0.7.28 第一批（run8 两病灶）已交三张 + 验收两张全过**：**task-102** `9b09735`（`no_space` 独立码 + 当天 ≤3 + 卖一叠腾格 + 0 动作不许睡觉 `slept_without_work`）；**task-104** `9b5b592`（`_water_far_dry` 只在户外农场才逐格；场外回不去记 `water_far_skipped{reason:"not_on_farm"}`、不扣额度不认输）；**task-106** `6293696`（analyzer 收 4 个新事件 ⇒ 漂移红清零）；**task-103**（deputy 对 102）= PASS-WITH-NITS `7e2ad95`、**task-108**（deputy 对 104）= PASS-WITH-NITS `9081a44`（8 组对抗无白过）。NIT → **task-109**（卖货计划如实性/最小损失 + 卖后刷新 obs）与 **task-110**（`ensure_location` 无 try/except ⇒ `BridgeError` 穿出 `run()`，**老洞**），都进 0.7.29。
+- 当前读数：全量 **618 OK**；树干净（只剩队友未跟踪的 scratch 探针）；Mod 0.7.27 已装机、**0.7.28 未 bump/未装机**；游戏未运行、桥不在。
+- **明天冻结时 Lead 必做（照 `docs/_release-0.7.28.md` §2）**：`tools/_note-0728.txt`（已在库，需补写 LLM 复盘/教训库两条）→ `python tools/_bump-mod-version.py 0.7.28 --note-file tools\_note-0728.txt`（⚠️ cp1252 下末句 print 抛 `UnicodeEncodeError` 且退出码 1，但版本已写盘 ⇒ 一律用 `json.load` 核对）→ `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED="0.7.28"` → `dotnet build .\mod\AgentFarm.Bridge\AgentFarm.Bridge.csproj -c Release --nologo --no-incremental`（0/0）→ `git add -A` + 提交 → `python tools\check-release.py --expect 0.7.28`（须全绿）→ `python tools\deploy-mod.py --no-quit` → `python -m agentfarm goto Farm` → `python tools\preflight.py --expect 0.7.28 --save-baseline logs\run9-baseline.json`（四绿）→ 交 **task-105** 给 machine-runner 起 **run9**（`tools/start-detached-longrun.py --journal logs\longrun-3day-llm-run9.jsonl --expect-version 0.7.28`；起跑前 `scratch/run8-snapshot.py --tag start --expected-mod-version 0.7.28`）。
+- **run9 现场（存档：夏 13 日 06:00、钱 188g、种子 `[]`、背包满、作物 6 格）**：**不做操作员预置** —— 正是"卖一叠腾格 → 买当季种子 → 播种"的验收场景。判据 = `docs/_run6-criteria.md` §3.4 的 N1–N5（N1 已按 task-103 澄清为不变量：`day_after` 推进 ∧ `ok_steps==0` ∧ `verified==true` 三者绝不同时）。
+- **观察点（诚实边界）**：run8 那"6 格窗外干作物"在 summer 11 曾被浇成功过（当日 `dry=0`）⇒ 大概率可达；若 run9 再现"真·够不着的活苗"，当天应如实 `gave_up_dry`/不 VERIFIED，**不许洗白**。
 
 ## 0g. 2026-10-15 晚 · **run7 达成「尾部连续 3 个游戏日 VERIFIED」**
 
