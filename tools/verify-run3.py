@@ -928,7 +928,7 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
     #     相邻风险面；`sell_failed` 是经济闭环的失败面。
     for code, label in (
         ("water_far_unavailable", "窗口外干作物拿不到坐标（旧 Mod/证据不可信）"),
-        ("farm_evidence_unavailable", "室内且 farm 口径不可用（守卫按有活处理）"),
+        ("farm_evidence_unavailable", "farm 口径不可用（守卫按有活处理；室内或人在农场）"),
         ("sell_failed", "出货（sell）失败"),
         ("zones_failed", "田区划分失败（LLM 田区提示不可用）"),
         ("day_key_resnap_failed", "睡后重新观测失败（跨日证据可能缺）"),
@@ -942,6 +942,19 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         n = events.get(code, 0)
         if n:
             infos.append(f"风险事件：{label} ×{n}（信息项，不改结论）")
+
+    # 3d-2（task-96 配套）：`farm_evidence_unavailable` 现在室内与"人在农场"都会出现。把
+    #     **人在农场**的次数单独报出来 —— 那正是 task-92 打穿的 fail-open 入口（人在农场 + 农场级
+    #     证据不可用 ⇒ 曾经能靠窗口 `crops==0` 判 `watered_outdoor=true` 拿假 VERIFIED）。
+    n_onfarm = sum(
+        1 for r in rows
+        if r.get("event") == "farm_evidence_unavailable" and r.get("on_farm") is True
+    )
+    if n_onfarm:
+        infos.append(
+            f"风险事件：人在农场且 farm 口径不可用 ×{n_onfarm}"
+            "（守卫按有活处理；fail-closed 生效时的可观测面，run8 复盘重点看它有没有伴随假 VERIFIED）"
+        )
 
     # 3e. task-73（stuck 日有界翻篇）：`MAX_STUCK_FLUSH` 允许"卡死的日子"睡过去翻到第二天
     #     —— 翻篇那天本身 `ended_by=stuck`、`verified=false`（不许洗白），但**翻篇过的日子

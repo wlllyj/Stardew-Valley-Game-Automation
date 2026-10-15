@@ -181,6 +181,16 @@ class TestVerifyRun3(unittest.TestCase):
         ok, s = self.check(rows)
         self.assertTrue(ok, s["problems"])
 
+    def test_on_farm_evidence_gap_is_reported_as_info(self):
+        """task-96 配套：发生在**农场里**的 farm 证据缺口必须可见
+        （fail-closed 的可观测面 —— task-92 打穿的 fail-open 入口就在这条上）。"""
+        rows = green_rows()
+        rows.insert(1, {"event": "farm_evidence_unavailable", "t": 1.0, "on_farm": True,
+                        "complete": False})
+        ok, s = self.check(rows)
+        self.assertTrue(ok, s["problems"])
+        self.assertTrue(any("人在农场且 farm 口径不可用" in i for i in s["infos"]), s["infos"])
+
     def test_gave_up_dry_is_honest_info_not_problem(self):
         """`gave_up_dry` 是如实收尾（当天不达标），工具不许把它当异常。"""
         rows = green_rows()
