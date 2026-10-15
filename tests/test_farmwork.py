@@ -24,7 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "brain"))
 from agentfarm.bridge import BridgeError  # noqa: E402
 from agentfarm.farmwork import (  # noqa: E402
     NEIGHBORS, FarmWorker, KIND_TOOL, MAX_CLEAR_SWINGS, StepResult as SR, StageResult,
-    SURPLUS_MATERIAL_IDS, farm_dead_crops, farm_dry_tiles, farm_empty_dirt, is_seed_offer,
+    SURPLUS_MATERIAL_IDS, farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles,
+    farm_empty_dirt, is_seed_offer,
     is_unreachable, pick_seed_offer, seed_offers_from, surplus_sell_plan, till_blocked_by,
     tool_missing_reason, tool_presence,
 )
@@ -1509,6 +1510,84 @@ class TestFarmDeadCrops(unittest.TestCase):
         self.assertEqual(farm_dead_crops({"farm": {"loaded": False, "complete": True,
                                                    "deadCrops": 9}}), (0, "unavailable"))
         self.assertEqual(farm_dead_crops({}), (0, "unavailable"))
+
+
+class _CanWorld(MiniWorld):
+    """`MiniWorld` 的 `obs()` 不带水壶 ⇒ 补一个"有水的壶"（task-84 浇水用例要用）。"""
+
+    def obs(self) -> dict:
+        o = super().obs()
+        o["player"]["wateringCan"] = {"present": True, "bottomless": False, "waterLeft": 40}
+        return o
+
+
+class TestTask84DeadCropsAreNotWatered(unittest.TestCase):
+    """【task-84】枯死作物**不浇水**（用户 m11003）+ `farm.dryDeadCrops` 三态。
+
+    真机依据（run7）：`[12,30]` 那株死苗被 `water_far` 追了 10 次（8 次 `unreachable`、
+    2 次回执 `ok` 但 `dry 6→6`），`given_up=true`；summer 3/5 整天换片地、summer 6
+    63 次 idle + 20 次 `frontier_clear` 空转 4.5 分钟才靠 `stuck_flush` 翻篇。
+    根因：Mod `TileView.Tool` 是 `watered ? "none" : "can"`（不看 `crop.dead`），
+    `farm.dryCrops`/`dryTiles` 也把死苗算"干"。
+
+    0.7.27 起 Mod 侧拆开（`dryCrops`/`dryTiles` 只算活苗 + 新 `dryDeadCrops` +
+    `tool` 对死苗给 `none`）；脑侧这里再兜一道：**`water()` 遇死苗直接 `skipped`，
+    一个请求都不发**（白烧体力与水）。
+
+    变异自检（复制 brain+tests 到临时目录做文本替换、跑完即弃；基线 3/3 绿）：
+    `m84b`（`water()` 里 `if (tv or {}).get("dead"):` 改成 `if False:`）⇒
+    `test_dead_crop_is_skipped_without_any_request` 红。
+    """
+
+    DEAD = {"tile": [60, 10], "kind": "dirt", "feature": "HoeDirt", "crop": "24",
+            "dead": True, "ripe": False, "watered": False, "standable": True}
+    LIVE = {"tile": [60, 10], "kind": "dirt", "feature": "HoeDirt", "crop": "264",
+            "dead": False, "ripe": False, "watered": False, "standable": True}
+
+    def _worker(self, rec):
+        w = _CanWorld(records=[dict(rec)], inventory=INV_WITH_SCYTHE, tools=TOOLS_WITH_SCYTHE)
+        return w, make_worker(w)
+
+    def test_dead_crop_is_skipped_without_any_request(self):
+        tile = (60, 10)
+        w, worker = self._worker(self.DEAD)
+        r = worker.water(tile)
+        self.assertIs(r.ok, False)
+        self.assertEqual(r.code, "skipped")
+        self.assertIs(r.failed, False, "死苗不浇水是「不该动」，不是「浇了没成」")
+        self.assertIs(r.proven_inert, False, "更不是「证明干不动」——它只是不该浇")
+        self.assertIn("枯死", r.reason)
+        self.assertIn("clear_dead", r.reason, "要指出正确去处是清死苗")
+        self.assertEqual(w.calls, [], "一个请求都不许发（真机白烧体力与水）")
+        self.assertIs(r.attempted, False, "不吃当天尝试配额（不是尝试，是拒绝）")
+
+    def test_live_crop_still_waters_normally(self):
+        """红线之外：活苗**照旧真的去浇**（不会误入 task-84 的死苗短路）。
+
+        假世界这一步不模拟"浇完 watered 变 true"，所以这里只验"请求真的发出去了、
+        且不是被死苗分支挡下的"—— `skipped`/`proven_inert` 都不许出现。
+        """
+        tile = (60, 10)
+        w, worker = self._worker(self.LIVE)
+        r = worker.water(tile)
+        self.assertNotEqual(r.code, "skipped", f"活苗不该被跳过：{r.reason}")
+        self.assertNotIn("枯死", r.reason)
+        self.assertEqual(w.calls, [(tile, "can")], "活苗照旧发一次浇水请求")
+
+    def test_farm_dry_dead_crops_three_states(self):
+        """`farm.dryDeadCrops` 与 `farm_dead_crops` 同一条纪律：缺字段 = **不知道**，不是 0。"""
+        self.assertEqual(farm_dry_dead_crops(
+            {"farm": {"loaded": True, "complete": True, "dryDeadCrops": 7}}), (7, "ok"))
+        self.assertEqual(farm_dry_dead_crops(
+            {"farm": {"loaded": True, "complete": True, "dryDeadCrops": -3}}), (0, "ok"),
+            "负数归 0 但状态仍是 ok（字段可信）")
+        for obs in (
+            {"farm": {"loaded": True, "complete": True}},                    # 旧 Mod 没这字段
+            {"farm": {"loaded": True, "complete": False, "dryDeadCrops": 7}},  # 扫描没走完
+            {"farm": {"loaded": False, "complete": True, "dryDeadCrops": 7}},  # farm 不可信
+            {},
+        ):
+            self.assertEqual(farm_dry_dead_crops(obs), (0, "unavailable"), obs)
 
 
 class TestTask51ClearDead(unittest.TestCase):

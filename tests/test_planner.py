@@ -23,6 +23,7 @@ import 本身不发请求。
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import sys
@@ -720,7 +721,7 @@ class PlanCommandCliTests(unittest.TestCase):
         self.assertIsNone(args.boundary)
         self.assertTrue(M.build_parser().parse_args(["plan", "--boundary-llm"]).boundary_llm)
 
-    def _run_plan(self, argv):
+    def _run_plan(self, argv, *, drop_ripe=False):
         import contextlib
         import io
         from unittest import mock
@@ -728,6 +729,10 @@ class PlanCommandCliTests(unittest.TestCase):
         from agentfarm import __main__ as M
 
         snapshot = BriefTests.SNAPSHOT
+        if drop_ripe:
+            snapshot = copy.deepcopy(snapshot)
+            for tile in (snapshot.get("location") or {}).get("tiles") or []:
+                tile["ripe"] = False
 
         class FakeClient:
             def __init__(self, *a, **k):
@@ -755,10 +760,19 @@ class PlanCommandCliTests(unittest.TestCase):
         self.assertEqual(calls, [])                       # 关着开关 ⇒ 默认 seam 一次都不许被调
         self.assertIn(P.SOURCE_DETERMINISTIC_FALLBACK, out)
         self.assertIn("默认关闭", out)
-        # 降级到纯代码策略仍然给出可执行意图；顺序上"浇水优先"（用户 m01770/m01774：
-        # 作物当天不浇就补不回来，而清障/开垦哪天都能做），所以第一条就是 water_area。
+        # 降级到纯代码策略仍然给出可执行意图；顺序上"熟了先收、其次清死苗、再浇水"
+        # （【task-84】用户 m11003：死苗浇水是纯浪费；成熟作物先收掉腾地），
+        # 所以这个"有熟作物"的快照第一条就是 harvest，且 area 只用观测真值引用、绝无格坐标。
+        self.assertIn("harvest", out)
+        self.assertIn("tiles.ripe", out)
+
+    def test_plan_without_switch_puts_watering_first_when_nothing_is_ripe(self):
+        """【task-84】无熟作物、无死苗时，浇水仍是第一优先（当天不浇就补不回来）。"""
+        code, out, calls = self._run_plan(["plan", "--boundary", "new_day"], drop_ripe=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [])
         self.assertIn("water_area", out)
-        self.assertIn("tiles.unwatered_crops", out)       # 且 area 只用观测真值引用，绝无格坐标
+        self.assertIn("tiles.unwatered_crops", out)
 
     def test_plan_with_switch_calls_seam_once(self):
         code, out, calls = self._run_plan(["plan", "--boundary", "new_day", "--boundary-llm"])

@@ -58,6 +58,7 @@ __all__ = [
     "StepResult",
     "farm_dry_tiles",
     "farm_dead_crops",
+    "farm_dry_dead_crops",
     "farm_empty_dirt",
     "is_seed_offer",
     "is_unreachable",
@@ -667,8 +668,12 @@ def farm_dry_tiles(obs: dict[str, Any]) -> tuple[list[tuple[int, int]], str]:
     为什么需要它（run5 三天全挂的形态）：脑侧的观测只有玩家周围最近的 400 格
     （`location.tilesTruncated=true`），农场另一头那 1 格干作物既看不到、也没坐标
     ⇒ `work_reasons()` 拿不出目标 ⇒ `no_work` 收工 ⇒ `day_justified=true`，
-    只有 `watered_outdoor` 把 `verified` 拽下来。Mod 侧与 `dryCrops` 严格同一次扫描口径
-    （死苗也算"干"，刻意不过滤）。
+    只有 `watered_outdoor` 把 `verified` 拽下来。
+
+    【task-84 口径收窄（重要）】Mod 侧从 0.7.27 起 `dryTiles`/`dryCrops` **只算活苗**
+    （`crop != null && !Crop.dead && !isWatered()`）：枯死作物不需要浇水，它们单独进
+    `farm.dryDeadCrops`。旧口径（task-50 "死苗也算"）让 run7 三天追着一株够不着的死苗，
+    也让 `verify-run3.py` 的"`no_work` ⇒ `dry == 0`"闸门在死苗清完前永不满足。
     """
     farm = obs.get("farm") or {}
     if farm.get("loaded") is False or farm.get("complete") is not True:
@@ -687,6 +692,32 @@ def farm_dry_tiles(obs: dict[str, Any]) -> tuple[list[tuple[int, int]], str]:
             seen.add(t)
             out.append(t)
     return out, ("truncated" if farm.get("dryTilesTruncated") else "ok")
+
+
+def farm_dry_dead_crops(obs: dict[str, Any]) -> tuple[int, str]:
+    """Mod 报的"枯死作物且没浇水"的格数（`farm.dryDeadCrops`，task-84）。
+
+    返回 `(格数, 状态)`：
+
+    * `"ok"` —— `farm.dryDeadCrops` 可信（`complete == true` 且 `loaded != false`）；
+    * `"unavailable"` —— 旧 Mod 没有这个字段，或 `farm` 证据不可信 ⇒ 格数回 **0**，
+      但调用方**绝不**能把 0 当成"没有干着的死苗"（那只是"不知道"；`tools\\verify-run3.py`
+      对"缺字段"的态度同样是"无法判定 ≠ 通过"）。
+
+    为什么要它：`farm.dryCrops` 从 0.7.27 起只算**活苗**，死苗的"干"要单独可见 ——
+    否则日账本会显示"dry=0"却仍有 33 株死苗占着地（用户 m11003 的形态），
+    无法区分"今天真浇完了"和"该浇水的一个都没有、该清的死苗一堆"。
+    """
+    farm = obs.get("farm") or {}
+    if farm.get("loaded") is False or farm.get("complete") is not True:
+        return 0, "unavailable"
+    raw = farm.get("dryDeadCrops")
+    if raw is None:
+        return 0, "unavailable"
+    try:
+        return max(0, int(raw)), "ok"
+    except (TypeError, ValueError):
+        return 0, "unavailable"
 
 
 def farm_dead_crops(obs: dict[str, Any]) -> tuple[int, str]:
@@ -1966,6 +1997,13 @@ class FarmWorker:
         r.before = self.tile_essence(tv)
         if not (tv or {}).get("crop"):
             r.code, r.reason = "skipped", "这一格没有作物"
+            return r
+        if (tv or {}).get("dead"):
+            # 【task-84】枯死作物**不浇水**（用户 m11003：死苗还在被浇，白烧体力与水）。
+            # 这是"世界给的前置事实"，不是"浇了没做成" ⇒ `skipped`（`failed` 为假、也不吃
+            # `tile_attempts` 配额）；清它走 `clear_dead`（镰刀/锄头），不是水壶。
+            r.code = "skipped"
+            r.reason = "这一格的作物已经枯死 ⇒ 不浇水（该走 clear_dead 清掉）"
             return r
         if (tv or {}).get("watered"):
             r.ok, r.code, r.reason = True, "already", "今天已经浇过了"

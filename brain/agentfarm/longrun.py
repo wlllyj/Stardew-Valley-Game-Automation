@@ -43,8 +43,9 @@ from typing import Any, Callable, Iterable
 
 from .bridge import MOD_VERSION_EXPECTED, BridgeClient, BridgeError
 from .farmwork import (ENV_BLOCK_STATUSES, FRONTIER_KINDS, SEED_KEEP_FACTOR, STAGE_ACTION,
-                       FarmWorker, StageResult, StepResult, farm_dead_crops, farm_dry_tiles,
-                       pick_seed_offer, seed_items, surplus_sell_plan, till_blocked_by)
+                       FarmWorker, StageResult, StepResult, farm_dead_crops,
+                       farm_dry_dead_crops, farm_dry_tiles, pick_seed_offer, seed_items,
+                       surplus_sell_plan, till_blocked_by)
 from .planner import (BoundaryPlanner, Brief, PlannerState, TaskIntent, TaskOutcome,
                       deterministic_plan)
 
@@ -340,6 +341,18 @@ class DayReport:
     #: 它们的用途是给出**证据**（run6 的 42 格"走不到"里有多少其实是"开不了路"）与下一步归因。
     encircled: int = 0
     encircled_tiles: list[Any] = field(default_factory=list)
+    #: 【task-84】当天账本里的"枯死"证据（用户 m11003：死苗还在被浇）：
+    #: * `dead_crops` = Mod `farm.deadCrops`（全农场枯死作物格数）= `(格数, 状态 ok|unavailable)`；
+    #: * `dry_dead` = Mod `farm.dryDeadCrops`（枯死**且没浇**的格数，0.7.27 新增字段）；
+    #: * `gave_up_tiles` = 当天已认输（`far_dry_given_up`）的窗口外干格坐标 —— 它们不再进
+    #:   `work_reasons` 的"还有活"，当天以 `gave_up_dry` 如实收尾（`day_justified=false`）。
+    #: 旧 Mod / farm 证据不可信时计数回 0 **但状态是 `unavailable`** —— 调用方绝不许把
+    #: "不知道"当成"没有"（与 `farm_dry_tiles` 同一条纪律）。
+    dead_crops: int = 0
+    dead_crops_status: str = "unavailable"
+    dry_dead: int = 0
+    dry_dead_status: str = "unavailable"
+    gave_up_tiles: list[Any] = field(default_factory=list)
     #: 【task-73】这一天是 `stuck`、但**已经睡过去翻篇**了（有界 `MAX_STUCK_FLUSH`/整轮）。
     #: 注意语义：`ended_by` 仍然是 `stuck`、`checks.day_justified=False`、`verified=False`
     #: —— 这一天**如实算失败**，只是"游戏日往前走了一格"，让整轮能继续跑下一天，
@@ -406,6 +419,13 @@ class DayReport:
             "encircled_tiles": [list(t) for t in self.encircled_tiles],
             # 【task-73】stuck 日是否已翻篇（睡过去了）—— 只作证据；验收口径不变
             "stuck_flushed": self.stuck_flushed,
+            # 【task-84】枯死作物证据：farm 级计数（**带状态**：0 只代表"没有"当且仅当 ok）
+            # + 当天已认输（够不着）的干格坐标。`watered_outdoor`/`final_water.dry` 只按活苗算。
+            "dead_crops": self.dead_crops,
+            "dead_crops_status": self.dead_crops_status,
+            "dry_dead": self.dry_dead,
+            "dry_dead_status": self.dry_dead_status,
+            "gave_up_tiles": [list(t) for t in self.gave_up_tiles],
         }
 
 
@@ -836,6 +856,19 @@ class LongRun:
             return f"农场口径还有 {dry_f} 格干作物{where} ⇒ 想浇但走不到（不再重试）"
         return f"农场口径还有 {dry_f} 格干作物（窗口里看不到坐标）"
 
+    def _far_dry_all_given_up(self, obs: dict[str, Any]) -> bool:
+        """窗口外的干作物**全部**已认输（`far_dry_given_up`）且坐标可信（task-84 ③）。
+
+        用途：`work_reasons` 不再把"够不着的干格"当"还有活"（否则守卫每轮拒绝收工，
+        run7 的 summer 3/5 整天换片地、summer 6 空转 4.5 分钟）；改由 `sleep_guard`
+        用 `gave_up_dry` **如实**收尾（不在 `JUSTIFIED_END_REASONS` 里 ⇒ `day_justified=False`
+        ⇒ 当天 `verified=false`，绝不洗成 `no_work`/`night`/`stamina`）。
+        """
+        outside, status = self._far_dry_outside(obs)
+        if status == "unavailable" or not outside:
+            return False
+        return all(t in self.far_dry_given_up for t in outside)
+
     def _water_far_dry(self, obs: dict[str, Any], rep: DayReport) -> bool:
         """走过去浇一格"窗口外"的干作物（task-50）。返回 `True` = 本轮真动了一次手。
 
@@ -936,16 +969,22 @@ class LongRun:
             "money": p.get("money"),
             "isInBed": p.get("isInBed"),
             "crops": len(crops),
-            "unwatered_crops": len([t for t in crops if not tiles[t].get("watered")]),
+            # 【task-84】`unwatered_crops` 只数**活苗**（死苗不该浇水，用户 m11003）；
+            # 死苗单独给 `dead_crops`，两列不许混（否则 run7 的"还该浇"会包含没救的苗）。
+            "unwatered_crops": len([t for t in crops
+                                    if not tiles[t].get("watered") and not tiles[t].get("dead")]),
+            "dead_crops": len([t for t in crops if tiles[t].get("dead")]),
             "ripe": len([t for t in crops if tiles[t].get("ripe")]),
             "tillable": len(loc.get("tillable") or []),
             "waterLeft": (p.get("wateringCan") or {}).get("waterLeft"),
             "seeds": [list(x) for x in seed_items(p)],
             # task-19：上面 `crops`/`unwatered_crops` 是**窗口口径**（≤400 格、以玩家为中心；在室内恒 0），
             # 这里逐字标注，并把 `farm.*` 读数整体放进**独立命名空间** —— 两套仪器不混列。
+            # 【task-84】`farm.dryCrops`/`dryTiles` 自 0.7.27 起只算活苗；死苗的"干"看 `dryDeadCrops`。
             "counts_scope": "window",
             "farm": {k: (obs.get("farm") or {}).get(k)
-                     for k in ("loaded", "complete", "crops", "dryCrops", "unwateredCrops", "hoeDirt")},
+                     for k in ("loaded", "complete", "crops", "dryCrops", "dryDeadCrops",
+                               "unwateredCrops", "hoeDirt", "deadCrops")},
         }
 
     # ------------------------------------------------------------ 浇水证据（task-19）
@@ -988,7 +1027,9 @@ class LongRun:
                 "crops": crops,
                 "dry": dry,
                 "scope": "farm",
-                "note": ("farm 口径：dry 来自 farm.dryCrops（全农场 crop!=null && !HoeDirt.isWatered()），"
+                "note": ("farm 口径：dry 来自 farm.dryCrops（**0.7.27 起只算活苗**："
+                         "全农场 crop!=null && !Crop.dead && !HoeDirt.isWatered()；"
+                         "枯死且没浇的格单独进 farm.dryDeadCrops、不参与本判据），"
                          f"tiles=farm.hoeDirt={tiles}、crops=farm.crops={crops}；"
                          f"farm.unwateredCrops={farm.get('unwateredCrops')} 不是干格数、不参与判定"),
             }
@@ -1007,7 +1048,9 @@ class LongRun:
             return False, info
         win = FarmWorker.tiles_of(outdoor_obs)
         crops_t = [t for t, v in win.items() if v.get("crop")]
-        dry_t = [t for t in crops_t if not win[t].get("watered")]
+        # 【task-84】窗口口径也**只数活苗**：死苗浇水是浪费（用户 m11003），它的"干"不该
+        # 让 `dry > 0` 把当天判成"没浇完"（farm 口径已由 Mod 收窄；两条口径必须一致）。
+        dry_t = [t for t in crops_t if not win[t].get("watered") and not win[t].get("dead")]
         info = {
             "t": round(float(outdoor_t), 3),
             "location": outdoor_name or str((outdoor_obs.get("location") or {}).get("name") or ""),
@@ -1208,8 +1251,11 @@ class LongRun:
         真出现这种自相矛盾时按 `stuck` 如实收尾，不洗成 `no_work`）。
         """
         tmap = FarmWorker.tiles_of(obs)
+        # 【task-84】枯死作物也算"活"（要去 `clear_dead` 清掉），所以 `dead` 也要收进来；
+        # 但它**不是**"该浇水"（`_stage_tiles("water_area")`/`counts["unwatered_crops"]`
+        # 都已剔除死苗），这里只是把它所在的格子当作业区容器用。
         tiles = [t for t, v in tmap.items()
-                 if v.get("crop") and (not v.get("watered") or v.get("ripe"))]
+                 if v.get("crop") and (not v.get("watered") or v.get("ripe") or v.get("dead"))]
         if not tiles:
             return None
         pt = FarmWorker.player_tile(obs)
@@ -1343,7 +1389,12 @@ class LongRun:
         limit = self.per_stage_tiles
 
         if task == "water_area":
-            pool = [t for t, v in tmap.items() if v.get("crop") and not v.get("watered")]
+            # 【task-84】**枯死作物不浇水**（用户 m11003）：死苗格从目标池里剔掉。
+            # 两道防线：Mod 0.7.27 起 `tiles[].tool` 对死苗不再返回 `"can"`，且
+            # `farm.dryCrops`/`dryTiles` 只算活苗；这里再加窗口级判据（旧 Mod 也管用），
+            # `farmwork.water()` 里还有第三道 `skipped` 兜底。
+            pool = [t for t, v in tmap.items()
+                    if v.get("crop") and not v.get("watered") and not v.get("dead")]
             limit = self.water_stage_tiles
         elif task == "harvest":
             pool = [t for t, v in tmap.items() if v.get("crop") and v.get("ripe")]
@@ -1397,7 +1448,9 @@ class LongRun:
         tillable = FarmWorker.tillable_of(obs)
         local = [tuple(t) for t in plot["tiles"]]
         if task == "water_area":
-            return [t for t, v in tmap.items() if v.get("crop") and not v.get("watered")]
+            # 【task-84】与 `_stage_tiles` 同口径：枯死作物不该浇水 ⇒ 不算"该浇而没浇"的剩余。
+            return [t for t, v in tmap.items()
+                    if v.get("crop") and not v.get("watered") and not v.get("dead")]
         if task == "harvest":
             return [t for t, v in tmap.items() if v.get("crop") and v.get("ripe")]
         if task == "clear_dead":
@@ -1431,7 +1484,10 @@ class LongRun:
         """"还有活可做"的理由（空 = 真的没活了）。"""
         reasons: list[str] = []
         tmap = FarmWorker.tiles_of(obs)
-        unwatered = [t for t, v in tmap.items() if v.get("crop") and not v.get("watered")]
+        # 【task-84】"该浇水"只看**活苗**：枯死作物浇了也没用（用户 m11003）⇒ 死苗不算活，
+        # 它的去处是 `clear_dead`（`_stage_tiles("clear_dead")` 单独管）。
+        unwatered = [t for t, v in tmap.items()
+                     if v.get("crop") and not v.get("watered") and not v.get("dead")]
         if unwatered:
             reasons.append(f"有 {len(unwatered)} 格作物没浇水")
         ripe = [t for t, v in tmap.items() if v.get("crop") and v.get("ripe")]
@@ -1473,7 +1529,12 @@ class LongRun:
             if dry_f > len(unwatered):
                 # 【task-50】干作物常常在玩家 400 格窗口之外 ⇒ 理由里带上 Mod 报的坐标，
                 # 否则"还有 1 格干"既没法行动、也没法在收尾时点名（run5 三天全挂的形态）。
-                reasons.append(self._far_dry_reason(obs, dry_f))
+                # 【task-84 ③】但**全部已认输**时不再当"有活"：run7 summer 3/5 就是
+                # 追着一株够不着的死苗整天换片地（每天 11 片 × 空转），summer 6 空转
+                # 4.5 分钟后靠 `stuck_flush` 翻篇。收尾交给 `sleep_guard` 的 `gave_up_dry`
+                # 如实记（`day_justified=False`、当天不 VERIFIED），而不是刷"还有活"。
+                if not self._far_dry_all_given_up(obs):
+                    reasons.append(self._far_dry_reason(obs, dry_f))
             if ripe_f > len(ripe):
                 reasons.append(f"农场口径还有 {ripe_f} 格熟作物（当前窗口只看到 {len(ripe)} 格）")
         # 【task-49】今天**已经见过、但还没做完**的格子（`_step_stage` 的 `leftover`）。
@@ -1605,7 +1666,9 @@ class LongRun:
         if tod >= self.sleep_at or tod < 600:
             return True, "night", f"时间 {tod} 已经到夜里（≥{self.sleep_at}）"
         tmap = FarmWorker.tiles_of(obs)
-        unwatered = [t for t, v in tmap.items() if v.get("crop") and not v.get("watered")]
+        # 【task-84】与 `work_reasons` 同口径：只有**活苗**才算"该浇水"。
+        unwatered = [t for t, v in tmap.items()
+                     if v.get("crop") and not v.get("watered") and not v.get("dead")]
         if unwatered:
             can, why = self._can_water(obs)
             if can and tod < 2500 and stam >= self.water_min_stamina:
@@ -1643,6 +1706,14 @@ class LongRun:
                 # 【task-50】那一格干作物常常在玩家窗口之外：把 Mod 报的坐标写进理由，
                 # 这样"当天以 stuck 收尾"时 `ended_reason` 能点名到底哪一格没浇成。
                 where = self._far_dry_where(obs)
+                # 【task-84 ③】窗口外的干格**全部已认输** ⇒ 不再空转，也不再假称"还有活"：
+                # 用 `gave_up_dry` 如实收尾。它**不在** `JUSTIFIED_END_REASONS` 里 ⇒
+                # `day_justified=False` ⇒ 当天 `verified=false`（run7 summer 3/5 的形态：
+                # 追一株够不着的死苗整天换片地，summer 6 空转 4.5 分钟才靠 stuck_flush 翻篇）。
+                if self._far_dry_all_given_up(obs):
+                    return True, "gave_up_dry", (
+                        f"农场口径还有 {dry_f} 格干作物{where}，坐标都够不着（已放弃当天，"
+                        "不再空转）——这不是「没活可做」，当天按 needs_review 如实收尾")
                 if can and tod < 2500 and stam >= self.water_min_stamina:
                     return False, "keep_working", (
                         f"农场口径还有 {dry_f} 格干作物{where}（{why}），先把水浇完再谈收工")
@@ -2518,17 +2589,25 @@ class LongRun:
     def _policy_intents(self, intents: list[TaskIntent],
                         obs: dict[str, Any]) -> tuple[list[TaskIntent], list[str]]:
         tmap = FarmWorker.tiles_of(obs)
-        unwatered = [t for t, v in tmap.items() if v.get("crop") and not v.get("watered")]
+        # 【task-84】"该浇水"只认**活苗**（死苗浇了也没用 ⇒ 去处是 `clear_dead`），
+        # 且政策顺序跟 `planner.deterministic_plan` 一致：harvest → clear_dead → water_area。
+        unwatered = [t for t, v in tmap.items()
+                     if v.get("crop") and not v.get("watered") and not v.get("dead")]
         ripe = [t for t, v in tmap.items() if v.get("crop") and v.get("ripe")]
+        dead = [t for t, v in tmap.items() if v.get("crop") and v.get("dead")]
         must: list[TaskIntent] = []
         notes: list[str] = []
+        if ripe:
+            must.append(TaskIntent(
+                "harvest", "", f"政策：{len(ripe)} 格作物熟了，先收掉腾地", ()))
+        if dead:
+            must.append(TaskIntent(
+                "clear_dead", "",
+                f"政策：{len(dead)} 格枯死作物占着耕地（浇水对它们无用），先清掉", ()))
         if unwatered:
             must.append(TaskIntent(
                 "water_area", "",
                 f"政策：{len(unwatered)} 格作物没浇水，当天不浇就补不回来", ()))
-        if ripe:
-            must.append(TaskIntent(
-                "harvest", "", f"政策：{len(ripe)} 格作物熟了，先收掉腾地", ()))
         if not must:
             return list(intents), notes
         out = list(must)
@@ -3301,9 +3380,30 @@ class LongRun:
                 f"（stage_midway_leftover，当天第 {mid['round']} 条阶段记录）")
         # task-19：日级浇水证据。**唯一证据**是 `checks.watered_outdoor`（farm.dryCrops 或当天最后一个
         # 户外快照逐格 watered）；窗口口径的 `crops_watered` 保留但只作旁证（室内恒 0，会白过）。
+        # 【task-84】`farm.dryCrops`/`dryTiles` 自 0.7.27 起**只算活苗** ⇒ `watered_outdoor`
+        # 不再被"够不着的死苗"拖住（run7 的 summer 3/5 三天全挂就是这个）。
         watered_outdoor, water_info = self._water_evidence(
             last_obs, outdoor_obs=outdoor_obs, outdoor_t=outdoor_t, outdoor_name=outdoor_name)
         rep.final_water = water_info
+        # 【task-84】枯死作物的日账本证据（用户 m11003）。**带状态**：0 只代表"没有"当且仅当
+        # `ok`；旧 Mod 缺字段 ⇒ `unavailable`（"不知道"，绝不当 0 用，与 `farm_dry_tiles` 同纪律）。
+        rep.dead_crops, rep.dead_crops_status = farm_dead_crops(last_obs)
+        rep.dry_dead, rep.dry_dead_status = farm_dry_dead_crops(last_obs)
+        rep.gave_up_tiles = [list(t) for t in sorted(self.far_dry_given_up)]
+        if rep.dead_crops_status == "ok" and rep.dead_crops > 0:
+            self._journal("dead_crops_summary", dead_crops=rep.dead_crops,
+                          dry_dead=rep.dry_dead, dry_dead_status=rep.dry_dead_status,
+                          gave_up=len(rep.gave_up_tiles),
+                          tiles=rep.gave_up_tiles[:12],
+                          note=("农场里还有枯死作物：它们**不浇水**（`farm.dryCrops` 只算活苗），"
+                                "只能靠 `clear_dead` 清；窗口外的没有坐标 ⇒ 只留痕"))
+            rep.notes.append(
+                f"农场里还有 {rep.dead_crops} 格枯死作物（其中 {rep.dry_dead} 格没浇，"
+                f"状态 {rep.dry_dead_status}）—— 死苗不浇水，等 `clear_dead` 清（本卡口径）")
+        if rep.gave_up_tiles:
+            rep.notes.append(
+                f"当天有 {len(rep.gave_up_tiles)} 格干作物在窗口外且已放弃（坐标 "
+                f"{rep.gave_up_tiles[:3]}…）⇒ 不再当「还有活」，按 gave_up_dry 如实收尾")
         if not watered_outdoor:
             rep.notes.append(
                 "浇水证据不足/未浇完：" + str(water_info.get("note") or "")

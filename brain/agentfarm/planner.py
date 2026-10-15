@@ -532,7 +532,11 @@ class Brief:
                         counts["dead"] += 1
                     if tile.get("watered"):
                         counts["wet_crops"] += 1
-                    else:
+                    elif not tile.get("dead"):
+                        # 【task-84】枯死作物**不算"该浇水"**（用户 m11003：死苗还在被浇）。
+                        # 它们单独进 `counts["dead"]`，去处是 `clear_dead`。若不在这里剔除，
+                        # `deterministic_plan` 会先给出 `water_area` ⇒ 脑去浇一株没救的苗，
+                        # run7 的 `[12,30]` 就是这么被追了一整天。
                         counts["unwatered_crops"] += 1
         else:
             # summary 快照的退回口径：农场段的整场计数（粒度粗，但方向不会错）
@@ -803,13 +807,6 @@ def deterministic_plan(brief: Brief) -> tuple[TaskIntent, ...]:
             "player.stamina 上升",
         ),)
 
-    if int(brief.counts.get("unwatered_crops", 0)) > 0:
-        return (TaskIntent(
-            "water_area", "tiles.unwatered_crops",
-            f"有 {brief.counts.get('unwatered_crops', 0)} 格作物还没浇水（当天不浇就补不回来）",
-            "location.tiles[].watered=true 的作物数量上升",
-        ),)
-
     if int(brief.counts.get("ripe", 0)) > 0:
         return (TaskIntent(
             "harvest", "tiles.ripe",
@@ -817,10 +814,11 @@ def deterministic_plan(brief: Brief) -> tuple[TaskIntent, ...]:
             "location.tiles[].ripe 的格子数量下降",
         ),)
 
-    # 【task-51】收掉成熟作物之后、出货之前：清掉**枯死**作物。
-    # 位置理由与 harvest 同源——死苗占着耕地、挡着 till（`till_blocked_by` 见 crop 就拒），
-    # 不清掉这一季就再也种不上；而清死苗是**一次性**动作（清完当季不会再有），
-    # 所以排在"每天不做就永久亏"的浇/收/卖之后、"任何一天都能做"的清障/开垦之前。
+    # 【task-51 / task-84 位置调整】清掉**枯死**作物，排在**浇水之前**。
+    # 位置理由（Lead task-84 卡面建议序 `harvest → clear_dead → water_area → ship → …`）：
+    # 死苗占着耕地、挡着 till（`till_blocked_by` 见 crop 就拒），浇水对它是**纯浪费**
+    # （用户 m11003："植物过了时间死了变成枯草，还是继续浇水"）；先清掉，当天的浇水
+    # 目标集合才只剩"活苗"（`counts["unwatered_crops"]` 也已剔除死苗）。
     # 计数只认观测窗口里 `dead=true` 的格子（Mod 的 farm 级 `deadCrops` 是**农场全量**、
     # 没有坐标 ⇒ 不能拿它当目标；窗口外的死苗由 `clear_dead_scope` journal 留痕）。
     if int(brief.counts.get("dead", 0)) > 0:
@@ -828,6 +826,13 @@ def deterministic_plan(brief: Brief) -> tuple[TaskIntent, ...]:
             "clear_dead", "tiles.dead",
             f"有 {brief.counts.get('dead', 0)} 格枯死作物占着耕地，先清掉才能重种",
             "location.tiles[] 里 dead=true 的作物格数量下降",
+        ),)
+
+    if int(brief.counts.get("unwatered_crops", 0)) > 0:
+        return (TaskIntent(
+            "water_area", "tiles.unwatered_crops",
+            f"有 {brief.counts.get('unwatered_crops', 0)} 格作物还没浇水（当天不浇就补不回来）",
+            "location.tiles[].watered=true 的作物数量上升",
         ),)
 
     # 【task-42】收获之后立刻出货（用户 m08335："怎么到现在一分钱也没挣到呀"）。

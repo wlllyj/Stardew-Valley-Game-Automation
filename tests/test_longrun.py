@@ -2995,7 +2995,14 @@ class TestTask50FarDryTiles(unittest.TestCase):
         self.assertEqual(w.watered_tiles, [], "全场没有任何一条路径真的浇过")
 
     def test_unreachable_far_dry_tile_ends_stuck_with_coordinates(self):
-        """②走不到 ⇒ 当天以 `stuck:` 收尾并**点名坐标**，绝不是 `no_work`。"""
+        """②走不到 ⇒ 当天**如实收尾并点名坐标**，绝不是 `no_work`。
+
+        【task-84 ①】收尾理由从 `stuck:` 改成 `gave_up_dry`：那一格试满 `FAR_DRY_MAX_TRIES`
+        次仍够不着之后进了 `far_dry_given_up`，此时 `work_reasons` 不再把"够不着的干格"当活
+        （run7 的 summer 3/5 就是靠"还有活"整天换片地空转），改由 `sleep_guard` 用
+        `gave_up_dry` 一次性如实收尾 —— 该理由**不在** `JUSTIFIED_END_REASONS` 里，
+        所以 `day_justified=False`、当天 `verified=false`，既不是 `no_work` 洗白、也不再空转。
+        """
         w = self._world()
         run = self._run_for(w, lambda _c: NoWalkFarDryWorker(w, unreachable=[self.FAR]),
                             max_days=1)
@@ -3004,16 +3011,23 @@ class TestTask50FarDryTiles(unittest.TestCase):
 
         rep = run.days[0]
         self.assertNotEqual(code, 0, "那一格始终干着 ⇒ 不许报达标")
-        self.assertTrue(str(rep.ended_reason).startswith("stuck:"),
-                        f"必须是 stuck 而不是 no_work：{rep.ended_reason}")
-        self.assertIn("[61, 10]", rep.ended_reason, "坐标必须点名（task-50 硬要求）")
+        self.assertFalse(str(rep.ended_reason).startswith("no_work"),
+                         f"干作物还在时不许 no_work 收工：{rep.ended_reason}")
+        self.assertTrue(str(rep.ended_reason).startswith("gave_up_dry"),
+                        f"task-84：够不着的干格必须如实记 gave_up_dry：{rep.ended_reason}")
+        self.assertIn("[61, 10]", rep.ended_reason, "坐标必须点名（task-50 硬要求延续）")
         self.assertIn("干作物", rep.ended_reason)
+        self.assertIn("够不着", rep.ended_reason)
         self.assertFalse(rep.checks.get("watered_outdoor"))
-        self.assertFalse(rep.checks.get("day_justified"))
+        self.assertFalse(rep.checks.get("day_justified"),
+                         "gave_up_dry 不在 JUSTIFIED_END_REASONS 里 ⇒ 绝不许算达标收工")
+        self.assertFalse(rep.verified)
         ev = self._events(run, "water_far")
-        self.assertEqual(len(ev), 2, f"同一格最多试 {2} 次：{ev}")
+        self.assertEqual(len(ev), 2, f"同一格最多试 {2} 次（有界，不空转）：{ev}")
         self.assertFalse(any(e["walked"] for e in ev))
         self.assertTrue(ev[-1]["given_up"])
+        self.assertEqual(rep.gave_up_tiles, [list(self.FAR)],
+                         "【task-84】认输的干格要进日账本（带坐标）")
 
     def test_old_mod_without_dry_tiles_is_not_no_dry_tiles(self):
         """③旧 Mod 没有 `dryTiles` ⇒ 不许当成"没有干格"：不判 `no_work`，但如实记"不可用"。"""
@@ -3330,9 +3344,13 @@ class TestTask51ClearDead(unittest.TestCase):
         self.assertTrue(rep.verified, f"{rep.checks} / {rep.stages}")
 
     def test_planner_puts_clear_dead_between_harvest_and_ship(self):
-        """策略顺序：浇水 → 收获 → **清死苗** → 出货 → 清障 → 开垦 → 播种。
+        """策略顺序（【task-84】改序）：收获 → **清死苗** → 浇水 → 出货 → 清障 → 开垦 → 播种。
 
         `deterministic_plan` 每次只回**最高优先级**那一条，所以顺序用"同时有几件事时先挑谁"来验。
+
+        改序理由（Lead task-84 卡面建议序 + 用户 m11003）：枯死作物浇水是**纯浪费**
+        （run7 追着 `[12,30]` 那株够不着的死苗浇了一整天），必须先清掉，
+        当天的浇水目标集合才只剩活苗。收获仍排在最前（熟作物不等人、收完腾地）。
         """
 
         def top(*, sellable: int = 0, **counts) -> str:
@@ -3345,7 +3363,9 @@ class TestTask51ClearDead(unittest.TestCase):
 
         self.assertEqual(top(dead=3), "clear_dead")
         self.assertEqual(top(dead=3, ripe=2), "harvest", "收获压过清死苗")
-        self.assertEqual(top(dead=3, unwatered_crops=1), "water_area", "浇水压过清死苗")
+        self.assertEqual(top(dead=3, unwatered_crops=1), "clear_dead",
+                         "【task-84】清死苗压过浇水：死苗浇了也没用（改序前是 water_area）")
+        self.assertEqual(top(unwatered_crops=1), "water_area", "没有死苗时浇水仍是第一优先的日常活")
         self.assertEqual(top(dead=3, sellable=5), "clear_dead", "清死苗压过出货")
         self.assertEqual(top(sellable=5), "ship", "没有死苗时才轮到出货")
         self.assertEqual(top(dead=3, sellable=5, blockers=2), "clear_dead", "清障排在最后")
@@ -4386,6 +4406,122 @@ class TestTask55SurplusSell(unittest.TestCase):
         self.assertTrue(buys[0]["ok"], buys[0])
         self.assertEqual(w.money, 214, "买了 10 包 × 20g")
         self.assertGreaterEqual(run._seed_outlook(w.obs())[0], 1)
+
+
+class TestTask84DeadCropWatering(unittest.TestCase):
+    """【task-84】死苗不浇水：窗口目标 / 窗口证据 / 策略 / 日账本 四条链口径一致（用户 m11003）。
+
+    真机 run7 形态：`[12,30]` 一株死苗既不可达、又被算成"该浇水" —— Mod 的 `TileView.Tool`
+    是 `watered ? "none" : "can"`（不看 `crop.dead`），`farm.dryCrops`/`dryTiles` 也把死苗算"干"
+    ⇒ `water_far` 追它 10 次（8 次 `unreachable`＋2 次回执 ok 但 `dry 6→6`），`given_up=true`，
+    summer 3/5 整天换片地、summer 6 空转 4.5 分钟才靠 `stuck_flush` 翻篇。
+
+    0.7.27 的修法：Mod 拆开干/死（`dryCrops`/`dryTiles` 只算活苗 + 新 `dryDeadCrops` +
+    `tool` 对死苗给 `none`），脑侧**所有**"该浇水"的口径只认活苗，死苗单独进日账本。
+
+    变异自检（脚本复制 brain+tests 到临时目录做文本替换、跑完即弃；基线 6/6 绿）：
+    `m84a`（`longrun._stage_tiles("water_area")` 的 `and not v.get("dead")` 去掉）⇒
+    `test_water_targets_and_leftover_exclude_dead_crops` 红；
+    `m84c`（`planner` 的 `elif not tile.get("dead"):` 改成 `elif True:`）⇒
+    `test_planner_never_calls_a_dead_crop_unwatered` 红。
+    """
+
+    DEAD = (60, 10)
+    LIVE = (61, 10)
+
+    def _world(self, **kw):
+        kw.setdefault("weeds", 0)
+        w = FakeWorld(**kw)
+        self._add(w, self.DEAD, dead=True)
+        return w
+
+    @staticmethod
+    def _add(w, tile, *, dead, watered=False, ripe=False):
+        w.crops[tile] = {"ripe": ripe, "watered": watered, "dead": dead}
+        w.dirt.add(tile)
+
+    def _plot(self):
+        return {"zone": "", "label": "", "anchor": [62, 12],
+                "tiles": [self.DEAD, self.LIVE], "note": ""}
+
+    def test_water_targets_and_leftover_exclude_dead_crops(self):
+        """死苗既不进浇水目标池，也不算"该浇而没浇"的剩余（与 `_stage_tiles` 同口径）。"""
+        w = self._world()
+        run = make_run(w)
+        obs = w.obs()
+        self.assertEqual(run._stage_tiles("water_area", obs, self._plot()), [],
+                         "死苗不许进浇水目标池")
+        self.assertEqual(run._leftover("water_area", obs, self._plot()), [],
+                         "死苗不算『该浇而没浇』的剩余（否则当天永远判定没做完）")
+        reasons = run.work_reasons(obs)
+        self.assertFalse([r for r in reasons if "没浇水" in r],
+                         f"工作理由里不许出现『没浇水』：{reasons}")
+
+    def test_window_water_evidence_counts_only_live_crops(self):
+        """窗口口径的浇水证据也只数活苗：只有死苗时 `dry=0`，不许判"没浇完"。"""
+        w = self._world()          # `farm` 块留空 ⇒ 走窗口口径
+        run = make_run(w)
+        obs = w.obs()
+        ok, info = run._water_evidence(obs, outdoor_obs=obs, outdoor_t=0.0,
+                                       outdoor_name="Farm")
+        self.assertEqual(info["scope"], "window", info)
+        self.assertEqual(info["dry"], 0, "死苗的『干』不算没浇完（task-84 口径）")
+        self.assertTrue(ok, "只有死苗时不许判『浇水证据不足』")
+        ess = run._essence(obs)
+        self.assertEqual(ess["unwatered_crops"], 0)
+        self.assertEqual(ess["dead_crops"], 1, "死苗单独一列，不许混进 unwatered_crops")
+
+    def test_planner_never_calls_a_dead_crop_unwatered(self):
+        """`Brief` 的计数与策略序：死苗走 `clear_dead`，不会伪装成 `water_area`。"""
+        w = self._world()
+        brief = Brief.from_observe(w.obs())
+        self.assertEqual(int(brief.counts.get("unwatered_crops") or 0), 0, brief.counts)
+        self.assertEqual(int(brief.counts.get("dead") or 0), 1, brief.counts)
+        self.assertEqual(deterministic_plan(brief)[0].task, "clear_dead")
+
+    def test_policy_intents_put_clear_dead_before_water(self):
+        """政策层（`_policy_intents`）同样把 `clear_dead` 排在 `water_area` 之前。"""
+        w = self._world()
+        self._add(w, self.LIVE, dead=False)
+        run = make_run(w)
+        out, _notes = run._policy_intents([], w.obs())
+        self.assertEqual([i.task for i in out][:2], ["clear_dead", "water_area"],
+                         f"政策顺序必须是清死苗 → 浇水：{[i.task for i in out]}")
+
+    def test_day_end_carries_dead_crop_evidence(self):
+        """日账本：`dead_crops`/`dry_dead`/`gave_up_tiles` 进 `day_end`（带状态，供对账）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.farm = {"loaded": True, "complete": True, "crops": 5, "dryCrops": 0,
+                  "dryDeadCrops": 3, "deadCrops": 4, "unwateredCrops": 5, "hoeDirt": 5}
+        run = make_run(w, target_days=1, max_days=1)
+
+        run.run()
+
+        rep = run.days[0]
+        self.assertEqual((rep.dead_crops, rep.dead_crops_status), (4, "ok"))
+        self.assertEqual((rep.dry_dead, rep.dry_dead_status), (3, "ok"))
+        ev = [e for e in run.entries if e.get("event") == "dead_crops_summary"]
+        self.assertEqual(len(ev), 1, f"应当恰有一条 dead_crops_summary：{run.entries}")
+        end = [e for e in run.entries if e.get("event") == "day_end"][0]
+        for key in ("dead_crops", "dead_crops_status", "dry_dead", "dry_dead_status",
+                    "gave_up_tiles"):
+            self.assertIn(key, end, f"`day_end` 必须有 {key}")
+        self.assertEqual((end["dead_crops"], end["dry_dead"]), (4, 3))
+
+    def test_old_mod_without_the_field_is_unavailable_not_zero(self):
+        """旧 Mod 没有 `deadCrops`/`dryDeadCrops` ⇒ 状态必须是 `unavailable`，不是"没有"。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.farm = {"loaded": True, "complete": True, "crops": 5, "dryCrops": 0, "hoeDirt": 5}
+        run = make_run(w, target_days=1, max_days=1)
+
+        run.run()
+
+        rep = run.days[0]
+        self.assertEqual((rep.dead_crops, rep.dead_crops_status), (0, "unavailable"),
+                         "缺字段 = 不知道，绝不许当成 0（『没有死苗』）")
+        self.assertEqual(rep.dry_dead_status, "unavailable")
+        end = [e for e in run.entries if e.get("event") == "day_end"][0]
+        self.assertEqual(end["dead_crops_status"], "unavailable")
 
 
 if __name__ == "__main__":  # pragma: no cover
