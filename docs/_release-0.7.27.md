@@ -122,3 +122,19 @@ python tools\start-detached-longrun.py --journal logs\longrun-3day-llm-run8.json
 - **task-97**（deputy-lead，`blocked_by task-96`）：复跑 task-92 的 C6c/C6d/C8b/C8c（必须由 FAIL 转 PASS）+ 朝新修法进攻（部分可用证据 / 真没活的日子不许被关成死循环也不许洗白 / `crops>0` 但全是死苗时 `watered_outdoor` 该是什么 / 窗口与 farm 口径打架谁优先 / 畸形 `complete` 值）。
 - **task-97 = FAIL**（`docs/_review-task96.md`，`30158c7`）：task-96 的 B 段四条 FAIL→PASS，但 C 段第①条有**残留 fail-open** —— `longrun.py:776-780 _farm_totals()` 在 `complete=true` 且 **`dryCrops` 缺失**时返回 `(0,0)` ⇒ `no_work` + `watered_outdoor=true` + VERIFIED。**真实可达**（`dryCrops` 是 0.7.22 才有的字段，`watchdog` 的版本不符只是 WARN）⇒ **task-99**：`dry is None ⇒ return None`（一行）+ **NIT-6** 夹具语义（`farm=None` 不许隐式变成"世界一致扫描"，那会让探针"看着修好了"）。严格口径的代价（`<0.7.22` 的 Mod 再也拿不到绿 run）被 Lead 接受：诚实优先。
 - 顺序：**task-96 交付（`486203d`）⇒ task-97 FAIL ⇒ task-99（一行 + NIT-6）⇒ task-100 复验 PASS ⇒ §7.2 第 1 步起跑全链**。task-96 在 task-100 PASS 前**不算关闭**。
+
+### §7.4 装机与起跑执行记录（2026-10-15 夜，Lead 实际执行）
+
+- **task-100（deputy-lead，`4b68e94`）= PASS-WITH-NITS，无必修项** ⇒ 放行。C1 真洞 FAIL→PASS（拦截点 `brain/agentfarm/longrun.py:1538/1544` 给理由、`:1724/1729` 不放行 `no_work`）；C6c/C6d/C8b/C8c 防回归全 PASS；残留 NIT 全不阻塞（真实 Mod 不可达）⇒ 立 **task-101** 归 0.7.28（`_farm_totals` 类型校验——`"abc"` 会让整天崩、窗口全死苗字段级收口、`-1` 自相矛盾、夹具 `farm_scan()` 死苗口径）。
+- **Lead 工具侧配套（`d849cd7`）**：`farm_evidence_unavailable` 的标签从「室内」改准为「室内或人在农场」+ 新增 `on_farm` 计数（task-96 配套，1 用例）；口径结论写进 `docs/_run6-criteria.md` **§3.3**。
+- **提交 `2bf0d8f`**（criteria §3.3）+ 条目 052 入库后即冻结起点。
+- **`tools/check-release.py --expect 0.7.27`（实际输出）**：✅ `manifest==brain==0.7.27`｜✅ 版本==期望｜✅ dll（21:26:06）不比源码旧（最新 `WorldSnapshot.cs` 21:01:38）｜✅ `py_compile` 21 文件｜✅ **`Ran 594 tests / OK`**｜✅ 树干净 ⇒ exit 0。
+- **`python tools/deploy-mod.py --no-quit`**：装机 0.7.26 → 0.7.27；`AgentFarm.Bridge.dll` **172032 B** / `manifest.json` **21468 B**；启动 `StardewModdingAPI.exe`（flags=0x210）；桥就绪 `modVersion=0.7.27 port=17890`；自动读档 `Wahaha_450799035`（FarmHouse (9,9)）。原文 `logs/deploy-0.7.27.log`。
+- **`python -m agentfarm goto Farm`**：OK，7656ms；`FarmHouse(9,9) → Farm(64,15)`，hop1 `source=[3,12] landing=[64,15] used=[3,12]` 7611ms。
+- **`python tools/preflight.py --expect 0.7.27 --save-baseline logs/run8-baseline.json`**：四项全绿、结论「可以起跑」。基线 = 第1年 **夏11日 06:20** / `Farm(64,15)` / 体力 270 / **钱 14g** / **种子 `[]`** / 作物 6 / `dryCrops` 6 / `waterLeft` 38 / `tillable` 155 / `worldAdvancing=true`。
+- **task-89 已 reassign machine-runner（rev6）并发 GO**：**不做操作员预置**（这就是 task-55 经济闭环的验收场景）；要求起跑前 `scratch\run8-snapshot.py --tag start`、结束后 `--tag end`；结束先别退游戏，等 Lead live observe 对账。HEAD = `2bf0d8f`（含本条记录的提交）。
+
+### §7.5 放行依据一句话
+
+`check-release` 六项全绿 + `preflight` 四项全绿 + task-100 PASS（无必修项）+ 两条对抗验收（task-97 FAIL 的洞已由 task-99/100 收口）⇒ **0.7.27 具备起 run8 的资格**；run8 的成败按 §4 五问 + `_run6-criteria.md`（含 §3.3）判定，两侧口径（尾部窗口 + 严格整本）都要写进 `docs/_run8-evidence.md` §4。
+
