@@ -158,6 +158,29 @@ class TestVerifyRun3(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(any("dry_dead=2" in p for p in s["problems"]), s["problems"])
 
+    def test_window_evidence_without_any_crop_is_problem(self):
+        """task-92 NIT-2：`scope=window` 且窗口里 `crops==0` 时，`dry==0 ⇒ watered_outdoor=true` 不可采信
+        —— 没看到的干作物（run7 的 `[12,30]`）正是被这条放过去的。"""
+        rows = green_rows()
+        for i, r in enumerate(rows):
+            if r.get("event") == "day_end":
+                rows[i] = day_end(r["final"]["day"], r["day_after"], dry=0,
+                                  checks={"watered_outdoor": True},
+                                  final_water={"t": r["t"] - 1, "location": "Farm", "tiles": 1,
+                                               "crops": 0, "dry": 0, "scope": "window"})
+                break
+        ok, s = self.check(rows)
+        self.assertFalse(ok)
+        self.assertTrue(any("crops=0" in p for p in s["problems"]), s["problems"])
+
+    def test_farm_scope_evidence_is_still_fine(self):
+        """正对照：farm 口径（真扫全场）依旧被信任，不许把 NIT-2 修成"凡 window 就红"。"""
+        rows = tweak(green_rows(), "day_end",
+                     final_water={"t": 199.0, "location": "Farm", "tiles": 30, "crops": 5,
+                                  "dry": 0, "scope": "farm"})
+        ok, s = self.check(rows)
+        self.assertTrue(ok, s["problems"])
+
     def test_gave_up_dry_is_honest_info_not_problem(self):
         """`gave_up_dry` 是如实收尾（当天不达标），工具不许把它当异常。"""
         rows = green_rows()

@@ -747,16 +747,24 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
                 )
             # task-19 要求 5④：**没有任何户外快照**时必须如实 False/缺省，禁止默认 true。
             # window 口径覆盖 0 格 = 当天没有户外快照 ⇒ 这条 true 在账本里自相矛盾（证据来源为空）。
-            # 这不是世界校验（本工具仍是账本检查器），只是抓"自述与自己的证据口径打架"。
+            # 【task-92 NIT-2（deputy 对抗验收 2026-10-15）】窗口里**一格作物都没看到**（`crops == 0`）
+            # 同样不能当证据：`dry == 0` 只说明"窗口里没看到干作物"，而**没看到的干作物**（run7 那颗
+            # `[12,30]`）正是被这条放过去的 —— 脑侧 `_water_evidence` 的 window 分支必须要求窗口内
+            # `crops > 0`，否则范围"没证据"当"浇过了"。两情形同判。
             if (
                 checks.get("watered_outdoor") is True
                 and fw.get("scope") == "window"
-                and int(fw.get("tiles") or 0) == 0
+                and (int(fw.get("tiles") or 0) == 0 or int(fw.get("crops") or 0) == 0)
             ):
+                _why = (
+                    "覆盖 0 格（当天没有任何户外快照）"
+                    if int(fw.get("tiles") or 0) == 0
+                    else "覆盖的窗口里 crops=0（一格作物都没看到）"
+                )
                 problems.append(
-                    f"[{name}] checks.watered_outdoor=true 但 final_water.scope=window 且覆盖 0 格"
-                    "（当天没有任何户外快照）⇒ 该 true 不可采信：task-19 要求 5④ 规定此时必须如实"
-                    " False/缺省，禁止默认 true"
+                    f"[{name}] checks.watered_outdoor=true 但 final_water.scope=window 且{_why}"
+                    "（窗口口径下\"没看到\"不等于\"没有\"，尤其看不到的干作物正是 run7 那颗 [12,30]）"
+                    "⇒ 该 true 不可采信：应退回 farm 口径或如实写 False"
                 )
         elif checks.get("watered_outdoor") is True:
             infos.append(
