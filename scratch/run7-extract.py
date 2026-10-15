@@ -93,12 +93,11 @@ w("=== day_start ===")
 for i, r in enumerate(recs):
     if r.get("event") != "day_start":
         continue
-    final = r.get("final") if isinstance(r.get("final"), dict) else r
+    # run7 的 day_start 是扁平结构：location 是字符串、没有嵌套 counts/player
     w(f"#{i:4} t={r.get('t')} day={r.get('day')} started_at={r.get('started_at')} "
-      f"clock={clock(final.get('clock'))} loc={g(final, 'location', 'name')} "
-      f"tile={g(final, 'player', 'tile')} stamina={g(final, 'player', 'stamina')} money={g(final, 'player', 'money')} "
-      f"crops={g(final, 'counts', 'crops')} unwatered={g(final, 'counts', 'unwatered_crops')} "
-      f"scope={g(final, 'counts_scope')} seeds={g(final, 'player', 'seeds')}")
+      f"location={r.get('location')!r} tod={r.get('timeOfDay')} weather={r.get('weather')!r} "
+      f"stamina={r.get('stamina')} money={r.get('money')} crops={r.get('crops')} "
+      f"unwatered={r.get('unwatered')}")
 
 # ---- day_end ----
 w("")
@@ -115,9 +114,17 @@ for i, r in enumerate(recs):
         "verified": r.get("verified"), "day_after": r.get("day_after"),
         "ok": r.get("ok_steps"), "skip": r.get("skipped_steps"), "fail": r.get("failed_steps"),
         "checks": r.get("checks"), "fw": fw,
-        "loc": g(fin, "location", "name"), "tile": g(fin, "player", "tile"),
+        # run7 的 day_end.final 也是扁平的：location 是字符串、tile 是 [x,y]
+        "loc": fin.get("location") if isinstance(fin.get("location"), str) else g(fin, "location", "name"),
+        "tile": fin.get("tile") if isinstance(fin.get("tile"), list) else g(fin, "player", "tile"),
         "tod": g(fin, "clock", "timeOfDay") if isinstance(fin.get("clock"), dict) else fin.get("timeOfDay"),
         "counts_scope": g(fin, "counts_scope"),
+        "fin_crops": fin.get("crops") if isinstance(fin.get("crops"), int) else g(fin, "counts", "crops"),
+        "fin_unwatered": fin.get("unwatered_crops") if isinstance(fin.get("unwatered_crops"), int) else g(fin, "counts", "unwatered_crops"),
+        "fin_waterleft": fin.get("waterLeft") if isinstance(fin.get("waterLeft"), int) else g(fin, "player", "wateringCan", "waterLeft"),
+        "fin_stamina": fin.get("stamina"), "fin_money": fin.get("money"),
+        "fin_seeds": fin.get("seeds"), "fin_isinbed": fin.get("isInBed"),
+        "fin_tillable": fin.get("tillable") if isinstance(fin.get("tillable"), int) else g(fin, "counts", "tillable"),
         "unreachable": r.get("unreachable"), "unreachable_tiles": r.get("unreachable_tiles"),
         "unreachable_bound": r.get("unreachable_bound"), "unreachable_exempt": r.get("unreachable_exempt"),
         "refused": r.get("refused"), "refused_tiles": r.get("refused_tiles"),
@@ -128,7 +135,10 @@ for i, r in enumerate(recs):
     w(f"#{i:4} t={row['t']} day={row['day']} ended_by={row['ended_by']} verified={row['verified']} "
       f"ok/skip/fail={row['ok']}/{row['skip']}/{row['fail']} day_after={row['day_after']}")
     w(f"      ended_reason={(row['ended_reason'] or '')[:200]}")
-    w(f"      final: loc={row['loc']} tile={row['tile']} tod={row['tod']} scope={row['counts_scope']}")
+    w(f"      final: loc={row['loc']!r} tile={row['tile']} tod={row['tod']} scope={row['counts_scope']} "
+      f"crops={row['fin_crops']} unwatered={row['fin_unwatered']} tillable={row['fin_tillable']} "
+      f"waterLeft={row['fin_waterleft']} stamina={row['fin_stamina']} money={row['fin_money']} "
+      f"seeds={row['fin_seeds']} isInBed={row['fin_isinbed']}")
     w(f"      final_water={json.dumps(fw, ensure_ascii=False)[:300]}")
     w(f"      checks={json.dumps(row['checks'], ensure_ascii=False)}")
     if row["unreachable"] is not None or row["refused"] is not None:
