@@ -2134,11 +2134,19 @@ class TestDeadCropsAccounting(unittest.TestCase):
         self.assertIn("missed:dry_dead_bad_field", rep["red"]["subjects"],
                       "dry_dead 不是整数 ⇒ 账目不可信，必须判红")
 
-    def test_gave_up_tiles_with_verified_is_red(self):
+    def test_gave_up_tiles_with_verified_is_warning_not_red(self):
         dead = dict(self.DEAD_OK, gave_up_tiles=[[12, 30]])
         rep = self._report(self._day([1, "summer", 3], dead=dead), "dc_gaveup.jsonl")
-        self.assertIn("missed:verified_with_gave_up", rep["red"]["subjects"],
-                      "有认输格却自称 VERIFIED ⇒ 判红（本工具比 verify-run3 严一格）")
+        self.assertNotIn("missed:verified_with_gave_up", rep["red"]["subjects"],
+                         "Lead m04997：认输格 + VERIFIED 只作警告不判红（认输格当天被解决时是假红）")
+        self.assertEqual(rep["red"]["total"], 0)
+        self.assertEqual(rep["dead_crops"]["verified_with_gave_up"], [2],
+                         "警告行号仍要留下（day_end 在第 2 行）")
+        text = mod.render_text(rep, 50)
+        self.assertIn("warn:verified_with_gave_up", text, "警告必须在头部一眼可见")
+        advice = " ".join(str(a["text"]) for a in rep["advice"])
+        self.assertIn("只作警告、不判红", advice, "建议 0m 也要点明它不判红")
+        self.assertIn("放弃格非空", advice)
 
     def test_missing_fields_is_undecidable_never_pass(self):
         rep = self._report(self._day([1, "summer", 3]), "dc_missing.jsonl")

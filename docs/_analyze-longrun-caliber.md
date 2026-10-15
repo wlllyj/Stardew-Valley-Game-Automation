@@ -385,13 +385,14 @@ python tools/analyze-longrun.py --journal <ledger> | rg "种子经济/出货"
 | `day_end.dead_crops_status` | `ok` / `unavailable` | 死苗计数的可信状态；缺失 ⇒ 总数【无法判定】 |
 | `day_end.dry_dead` | Mod `farm.dryDeadCrops`（枯死**且没浇**，0.7.27 新字段） | `>0` 且 `ended_reason` 以 `no_work` 开头 ⇒ 红 |
 | `day_end.dry_dead_status` | `ok` / `unavailable` | 同上；缺失 ⇒ 【无法判定】 |
-| `day_end.gave_up_tiles` | 当天认输的窗口外干格坐标 | 非空却自称 `verified=true` ⇒ 红 |
+| `day_end.gave_up_tiles` | 当天认输的窗口外干格坐标 | 非空却自称 `verified=true` ⇒ **只警告（`warn:verified_with_gave_up`），不判红** |
 | `dead_crops_summary`（事件） | `dead_crops` / `dry_dead` / `dry_dead_status` / `gave_up` / `tiles[]` / `note` | 日级汇总（只在 `dead_crops>0` 且状态 ok 时写） |
 
-- **两条红口径**：①`missed:dry_dead_uncleared` —— `dry_dead > 0` 且 `ended_reason` 以 `no_work` 开头（死苗不许当"今天没活"的借口；正确归宿是 `clear_dead`，够不着就如实 `stuck`/`gave_up_dry`；`tools\verify-run3.py:803-808` 同判 problem）。②`missed:verified_with_gave_up` —— `gave_up_tiles` 非空却自称 VERIFIED；**本工具比 `verify-run3.py` 严一格**（它对 `gave_up` 只记 info）⇒ 两边"一眼相反"时**以它为准并停下报 Lead**。另有 `missed:dry_dead_bad_field`：`dry_dead` 不是整数 ⇒ 账目不可信、判红。
+- **两条红口径**：①`missed:dry_dead_uncleared` —— `dry_dead > 0` 且 `ended_reason` 以 `no_work` 开头（死苗不许当"今天没活"的借口；正确归宿是 `clear_dead`，够不着就如实 `stuck`/`gave_up_dry`；`tools\verify-run3.py:803-808` 同判 problem）。②`missed:dry_dead_bad_field`：`dry_dead` 不是整数 ⇒ 账目不可信、判红（`verify-run3.py:802` 同判 problem）。
+- **一条警告（曾经是红，Lead m04997 裁定降级）**：`warn:verified_with_gave_up` —— `gave_up_tiles` 非空却自称 `verified=true`。**为什么只警告**：(1) 真洗白通道已被 `verify-run3` 更根本的闸门堵住 —— 认输格上的作物是干的 ⇒ `farm.dryCrops > 0`，脑若仍写 `watered_outdoor=true` 会被「`checks.watered_outdoor=true` 但 `final_water.dry>0` ⇒ 账本自相矛盾」判红，脑若不写 true 那天就 `verified=false`；(2) 能走到"VERIFIED + 认输格非空"的只剩"那些格当天后来被别的动作解决了、`dry==0`"的干净情形 ⇒ 判红是**假红**；(3) 两工具纪律是"同向"，**假红和假绿一样会让人不再信工具**（task-88 修的就是这个）。可见性不变：头部 `⚠ ...（warn:verified_with_gave_up；行 …）` + 建议 `0m`，`report["dead_crops"]["verified_with_gave_up"]` 保留行号，`rg` 可查。
 - **缺失行为**：五个字段与 `dead_crops_summary` 都没有 ⇒ 头部写 `死苗/放弃格: <缺失>`，并进【无法判定】（`缺失 ≠ 0，绝不当"没有死苗"通过`），**不判红也不当通过**；部分缺 ⇒ 逐字段显示 `<缺失>`（看 `report["dead_crops"]["missing_fields"]`）。
-- **呈现**：头部一行「死苗/放弃格: 枯死 N 格（状态 ok）、其中没浇 M 格（状态 ok）、当天认输格 K 格（坐标…）；口径：死苗不计浇水证据」+ 建议 `0m`；命中红口径时追加 `⚠` 与行号。
-- **单测**：`tests/test_analyze_longrun.py::TestDeadCropsAccounting`（6 条：`dead_crops_summary` 有桶不落未映射 / 干净日不判红且头部可见 / `dry_dead>0`+`no_work` ⇒ 红 / `dry_dead` 非整数 ⇒ 红 / 认输格 + VERIFIED ⇒ 红 / 字段缺失 ⇒ 只进【无法判定】且头部 `<缺失>`）。
+- **呈现**：头部一行「死苗/放弃格: 枯死 N 格（状态 ok）、其中没浇 M 格（状态 ok）、当天认输格 K 格（坐标…）；口径：死苗不计浇水证据」+ 建议 `0m`；命中红口径或警告时追加 `⚠` 与行号。
+- **单测**：`tests/test_analyze_longrun.py::TestDeadCropsAccounting`（6 条：`dead_crops_summary` 有桶不落未映射 / 干净日不判红且头部可见 / `dry_dead>0`+`no_work` ⇒ 红 / `dry_dead` 非整数 ⇒ 红 / **认输格 + VERIFIED ⇒ 只警告不判红且头部/建议可见** / 字段缺失 ⇒ 只进【无法判定】且头部 `<缺失>`）。
 - **回归**：7 本账本（green/run2/run3/run5/run6/run7/vacuum）的 rc 与红数**一个没变**（旧账本全无 task-84 字段 ⇒ 只多【无法判定】行，不判红也不变绿）。
 
 ```

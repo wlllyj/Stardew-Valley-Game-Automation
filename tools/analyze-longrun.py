@@ -60,9 +60,10 @@
      `farm.dryCrops`/`dryTiles` 自 0.7.27 起只算活苗；死苗的“干”看 `farm.dryDeadCrops`）——
      `dry_dead > 0` 而 `ended_reason` 以 `no_work` 开头 ⇒ **判红** `missed:dry_dead_uncleared`
      （死苗不许当“今天没活”的借口；正确归宿是 `clear_dead`，够不着要如实 `stuck`/`gave_up_dry`）；
-     `dry_dead` 不是整数 ⇒ 红（账目不可信）；`gave_up_tiles` 非空却自称 `verified=true` ⇒ 红
-     `missed:verified_with_gave_up`（**本工具比 verify-run3 严一格**：它对 gave_up 只记 info；
-     两边相反 ⇒ 以 verify-run3 为准并停下报 Lead）。`day_end.dead_crops`/`dead_crops_status`/
+     `dry_dead` 不是整数 ⇒ 红（账目不可信）；`gave_up_tiles` 非空却自称 `verified=true` ⇒
+     **只作警告 `warn:verified_with_gave_up`，不判红**（Lead m04997：真洗白通道已被 verify-run3 的
+     `watered_outdoor=true` + `final_water.dry>0` 自相矛盾闸门堵住；认输格当天后来被解决、`dry==0`
+     时判红就是假红）。`day_end.dead_crops`/`dead_crops_status`/
      `dry_dead`/`dry_dead_status`/`gave_up_tiles`（以及 `dead_crops_summary` 事件）**缺失 ⇒ 只进
      【无法判定】，既不算通过也不算失败**（缺失 ≠ 0）。
   * 事件映射不许漂移（Lead m02395）：brain 里 `_journal("<name>"` 的**每个**事件名都要在
@@ -257,7 +258,7 @@ FIELD_PROBES = [
      "枯死没浇计数的可信状态（ok / unavailable；task-84）"),
     ("day_end.gave_up_tiles", "gave_up_tiles",
      "当天认输的窗口外干格坐标 [[x,y],…]（task-84：不再当『还有活』，按 gave_up_dry 如实收尾）；"
-     "非空且自称 VERIFIED ⇒ 判红（fail-closed）"),
+     "非空且自称 VERIFIED ⇒ **只警告不判红**（`warn:verified_with_gave_up`，Lead m04997）"),
     ("event:dead_crops_summary", "dead_crops_summary",
      "日级死苗汇总（task-84：dead_crops/dry_dead/dry_dead_status/gave_up/tiles；只在 dead_crops>0 "
      "且状态 ok 时写）"),
@@ -1052,13 +1053,15 @@ def cat_missed(sessions, top):
                         subject="missed:bound_inflated",
                     )
                 )
-        # 1i: task-84（死苗不浇水）—— fail-closed 三条：
+        # 1i: task-84（死苗不浇水）—— 两条红 + 一条警告：
         #   ① `dry_dead > 0` 且 `ended_reason` 以 `no_work` 开头 ⇒ 红（死苗不许当"今天没活"的借口；
         #      verify-run3.py:803-808 同判 problem）；
         #   ② `dry_dead` 不是整数 ⇒ 红（账目不可信；verify-run3.py:802 同判 problem）；
-        #   ③ `gave_up_tiles` 非空却自称 `verified=true` ⇒ 红（卡面 fail-closed：放弃格还在，当天
-        #      不该 VERIFIED）—— **本工具比 verify-run3 严一格**（它对 gave_up 只记 info，
-        #      见 verify-run3.py:809-819；若 run8 出现两边相反，以 verify-run3 为准并报 Lead）。
+        #   ③ `gave_up_tiles` 非空却自称 `verified=true` ⇒ **只作警告，不判红**（Lead m04997）：
+        #      真洗白通道已被 verify-run3 的「`watered_outdoor=true` 但 `final_water.dry>0` ⇒ 账本
+        #      自相矛盾」闸门堵住（干格还在 ⇒ 要么 verified=false，要么矛盾判红）；剩下能走到这种
+        #      形态的是"认输格当天后来被别的动作解决了、`dry==0`" ⇒ 判红就是假红。警告仍在头部
+        #      `⚠` 与建议 0m 里可见（`report["dead_crops"]["verified_with_gave_up"]`）。
         # 字段缺失（旧账本）⇒ 不在这里判红，只由 FIELD_PROBES 记【无法判定】。
         for lineno, ev in sess["day_ends"]:
             _ev = as_dict(ev)
@@ -1084,19 +1087,9 @@ def cat_missed(sessions, top):
                     )
                 )
             elif _status == "ok" and as_list(_gave_up) and _ev.get("verified") is True:
-                out.append(
-                    finding(
-                        lineno, "day_end",
-                        f"放弃格非空却自称 VERIFIED：gave_up_tiles={len(as_list(_gave_up))} 格"
-                        f"（坐标 {str(as_list(_gave_up))[:80]}）⇒ 当天不该 VERIFIED"
-                        f"（ended_by={_ev.get('ended_by')}、ended_reason="
-                        f"{str(_ev.get('ended_reason') or '')[:60]!r}）",
-                        hint="task-84 fail-closed：放弃格 = 还有没做完的活；本工具比 verify-run3 严一格"
-                             "（它对 `gave_up_dry` 只记 info）。若两边对同一账本相反 ⇒ 以 verify-run3 "
-                             "为准并停下报 Lead（Lead m01934 规则）",
-                        subject="missed:verified_with_gave_up",
-                    )
-                )
+                # task-84 ③ 经 Lead m04997 裁定：**只作警告、不判红**（假红比漏报更伤工具信任）。
+                # 可见性由 `report["dead_crops"]["verified_with_gave_up"]` → 头部 ⚠ + 建议 0m 保证。
+                pass
     return out[:top] if top else out
 
 
@@ -1921,9 +1914,10 @@ def build_advice(report, top=8):
         if dci.get("verified_with_gave_up"):
             _parts.append(
                 f"放弃格非空却自称 VERIFIED ×{len(dci['verified_with_gave_up'])}"
-                f"（行 {dci['verified_with_gave_up'][:6]}）：放弃格 = 当天还有没做完的活，不该 VERIFIED；"
-                "注意本工具比 verify-run3 严一格（它对 gave_up 只记 info），"
-                "若两边对同一账本相反 ⇒ 以 verify-run3 为准并停下报 Lead")
+                f"（行 {dci['verified_with_gave_up'][:6]}）：**只作警告、不判红**（Lead m04997）—— "
+                "真洗白通道已被 verify-run3 的「`watered_outdoor=true` 但 `final_water.dry>0` ⇒ "
+                "账本自相矛盾」堵住；认输格当天后来被解决、`dry==0` 时判红就是假红，"
+                "所以这里只点名供人工复核")
         if dci.get("bad_fields"):
             _parts.append(f"dry_dead 不是整数（账目不可信，行 {dci['bad_fields'][:6]}）")
         advice.append({
@@ -3137,13 +3131,14 @@ MAPPING_TEXT = [
      "`surplus_sell_skip` = 想卖但没有材料超过保留线（short=缺口 g）⇒ 不是失败；"
      "逐叠字段见 `sell.strategy/keep/below_keep/slot/qid/stack`"),
     ("dead_crops_summary / day_end.dead_crops|dry_dead|gave_up_tiles（task-84）",
-     "死苗/放弃格（**有两条红口径**）：`dead_crops`=Mod `farm.deadCrops`（全农场枯死格数）、"
+     "死苗/放弃格（**两条红 + 一条警告**）：`dead_crops`=Mod `farm.deadCrops`（全农场枯死格数）、"
      "`dry_dead`=Mod `farm.dryDeadCrops`（枯死**且没浇**，0.7.27 新字段）、"
      "`gave_up_tiles`=当天认输的窗口外干格坐标。口径：**死苗不浇水**（`dry` 只算活苗；死苗走 `clear_dead`，"
      "且 `clear_dead` 排在 water 之前）；`dry_dead>0` 而 `ended_reason` 以 `no_work` 开头 ⇒ 判红"
      "（`missed:dry_dead_uncleared`，verify-run3.py:803-808 同判 problem）；"
-     "`gave_up_tiles` 非空却自称 VERIFIED ⇒ 判红（`missed:verified_with_gave_up`，**本工具比 "
-     "verify-run3 严一格**，它对 gave_up 只记 info ⇒ 两边相反时以它为准并报 Lead）；"
+     "`gave_up_tiles` 非空却自称 VERIFIED ⇒ **只警告不判红**"
+     "（`warn:verified_with_gave_up`，Lead m04997：真洗白通道已被 verify-run3 的 "
+     "`watered_outdoor=true` + `final_water.dry>0` 自相矛盾闸门堵住，认输格当天被解决时判红即假红）；"
      "字段缺失（旧账本）⇒ 只进【无法判定】、绝不判红也不当通过；头部'死苗/放弃格'行 + 建议 0m"),
     ("encircled / encircled_stage / encircled_summary（task-68、task-76）",
      "5 环境挡路·可达性/开路（信息项，**无硬闸门 ⇒ 一律不判红**）：被不可清障物围住（四邻没有"
@@ -3344,7 +3339,10 @@ def render_text(report, top):
             "；口径：死苗不计浇水证据（dry 只算活苗，死苗走 clear_dead）"
             + (f"  ⚠ 死苗没清却判 no_work（行 {dci['no_work_uncleared'][:6]}）"
                if dci.get("no_work_uncleared") else "")
-            + (f"  ⚠ 放弃格非空却自称 VERIFIED（行 {dci['verified_with_gave_up'][:6]}）"
+            + (f"  ⚠ 放弃格非空却自称 VERIFIED（warn:verified_with_gave_up；"
+               f"行 {dci['verified_with_gave_up'][:6]}；"
+               "**只作警告、不判红**：干格还在的话 verify-run3 的 dry>0 互斥闸门会先判红，"
+               "认输格当天被解决时则为假红）"
                if dci.get("verified_with_gave_up") else "")
             + (f"  ⚠ dry_dead 不是整数（账目不可信，行 {dci['bad_fields'][:6]}）"
                if dci.get("bad_fields") else ""))
