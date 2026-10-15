@@ -2069,5 +2069,85 @@ class TestSurplusSellAccounting(unittest.TestCase):
         self.assertEqual(rep["red"]["total"], 0, "没有这些事件不该引入任何红")
 
 
+class TestDeadCropsAccounting(unittest.TestCase):
+    """task-95 / task-84：死苗不浇水（`dead_crops` / `dry_dead` / `gave_up_tiles`）。
+
+    口径：`dry_dead > 0` 且 `ended_reason` 以 `no_work` 开头 ⇒ 红 `missed:dry_dead_uncleared`；
+    `dry_dead` 不是整数 ⇒ 红（账目不可信）；`gave_up_tiles` 非空却自称 VERIFIED ⇒ 红
+    `missed:verified_with_gave_up`（本工具比 `tools/verify-run3.py` 严一格：它对 gave_up 只记 info，
+    两边相反时以它为准并报 Lead）；字段缺失 ⇒ 只进【无法判定】，**缺失 ≠ 0，绝不当通过**。
+    `dead_crops_summary` 必须有桶（不许静默丢弃）。
+    """
+
+    SUM_OK = {"event": "dead_crops_summary", "t": 8.0, "dead_crops": 3, "dry_dead": 0,
+              "dry_dead_status": "ok", "gave_up": 0, "tiles": [], "note": "死苗不计浇水证据"}
+    DEAD_OK = {"dead_crops": 3, "dead_crops_status": "ok", "dry_dead": 0, "dry_dead_status": "ok",
+               "gave_up_tiles": []}
+
+    def _report(self, events, name, *, days=1):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=days, top=50)
+
+    def _day(self, day, *, verified=True, ended_reason="night", stage_ok=5, extra=(), dead=None):
+        nxt = [day[0], day[1], day[2] + 1]
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": verified,
+                  "watered_outdoor": True}
+        end = {"event": "day_end", "t": 9.0, "day": day, "day_text": "", "ended_by": "sleep",
+               "ended_reason": ended_reason, "verified": verified, "checks": checks,
+               "stages": [{"stage": "clear_dead", "ok": stage_ok, "skipped": 0, "failed": 0,
+                           "env_block": 0, "inconclusive": 0, "stopped": None, "leftover": 0}],
+               "outcomes": [], "ok_steps": stage_ok, "skipped_steps": 0, "failed_steps": 0,
+               "notes": [], "final": final(nxt),
+               "final_water": {"t": 9.0, "location": "Farm", "tiles": 84, "crops": 31,
+                               "dry": 0, "scope": "farm"}}
+        if dead:
+            end.update(dead)
+        return [day_start(day), *extra, end]
+
+    def test_summary_event_has_bucket_and_is_not_unmapped(self):
+        self.assertIn("dead_crops_summary", mod.EVENT_BUCKETS,
+                      "brain 会发 dead_crops_summary，没有桶就会静默消失")
+        rep = self._report(self._day([1, "summer", 3], extra=[dict(self.SUM_OK)]), "dc_bucket.jsonl")
+        self.assertEqual(rep["unmapped_events"], {})
+        self.assertEqual(rep["events"]["dead_crops_summary"], 1)
+
+    def test_clean_dead_crops_day_is_not_red_and_visible(self):
+        rep = self._report(self._day([1, "summer", 3], dead=dict(self.DEAD_OK)), "dc_clean.jsonl")
+        self.assertTrue(rep["dead_crops"]["has_fields"])
+        self.assertEqual(rep["red"]["total"], 0, "死苗已清、没有认输格 ⇒ 不判红")
+        text = mod.render_text(rep, 50)
+        self.assertIn("死苗/放弃格: 枯死 3 格", text)
+        self.assertIn("其中没浇 0 格", text)
+
+    def test_dry_dead_with_no_work_reason_is_red(self):
+        dead = dict(self.DEAD_OK, dry_dead=1)
+        rep = self._report(self._day([1, "summer", 3], ended_reason="no_work:确实找不到可做的活",
+                                     dead=dead), "dc_nowork.jsonl")
+        self.assertIn("missed:dry_dead_uncleared", rep["red"]["subjects"],
+                      "死苗没清却拿 no_work 收工 ⇒ 必须判红（verify-run3.py:803-808 同判 problem）")
+
+    def test_non_int_dry_dead_is_red(self):
+        dead = dict(self.DEAD_OK, dry_dead="1")
+        rep = self._report(self._day([1, "summer", 3], dead=dead), "dc_bad.jsonl")
+        self.assertIn("missed:dry_dead_bad_field", rep["red"]["subjects"],
+                      "dry_dead 不是整数 ⇒ 账目不可信，必须判红")
+
+    def test_gave_up_tiles_with_verified_is_red(self):
+        dead = dict(self.DEAD_OK, gave_up_tiles=[[12, 30]])
+        rep = self._report(self._day([1, "summer", 3], dead=dead), "dc_gaveup.jsonl")
+        self.assertIn("missed:verified_with_gave_up", rep["red"]["subjects"],
+                      "有认输格却自称 VERIFIED ⇒ 判红（本工具比 verify-run3 严一格）")
+
+    def test_missing_fields_is_undecidable_never_pass(self):
+        rep = self._report(self._day([1, "summer", 3]), "dc_missing.jsonl")
+        self.assertFalse(rep["dead_crops"]["has_fields"])
+        self.assertEqual(rep["red"]["total"], 0, "字段缺失既不算通过也不算失败 ⇒ 不许判红")
+        self.assertIn("缺失 ≠ 0", str(rep["undecidable"]),
+                      "缺 task-84 字段要进【无法判定】，绝不能当'没有死苗'通过")
+        self.assertIn("<缺失>", mod.render_text(rep, 50))
+
+
 if __name__ == "__main__":
     unittest.main()

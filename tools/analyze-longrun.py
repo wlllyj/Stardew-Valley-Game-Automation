@@ -56,6 +56,15 @@
     **分开计数**、不进任何豁免分子、不封格；`day_end.encircled*` **缺失 ⇒ 只进【无法判定】**。
     额外把 `stuck` + `Σ stage.ok == 0` 的"零动作收工"单列（头部 ⚠ + 建议 0j），让 run6 那种
     "19 秒零动作收工"下次一眼可见。
+  * 死苗/放弃格（task-84，与 `tools\verify-run3.py:793-818` 对齐）：**死苗不浇水**（Mod 的
+     `farm.dryCrops`/`dryTiles` 自 0.7.27 起只算活苗；死苗的“干”看 `farm.dryDeadCrops`）——
+     `dry_dead > 0` 而 `ended_reason` 以 `no_work` 开头 ⇒ **判红** `missed:dry_dead_uncleared`
+     （死苗不许当“今天没活”的借口；正确归宿是 `clear_dead`，够不着要如实 `stuck`/`gave_up_dry`）；
+     `dry_dead` 不是整数 ⇒ 红（账目不可信）；`gave_up_tiles` 非空却自称 `verified=true` ⇒ 红
+     `missed:verified_with_gave_up`（**本工具比 verify-run3 严一格**：它对 gave_up 只记 info；
+     两边相反 ⇒ 以 verify-run3 为准并停下报 Lead）。`day_end.dead_crops`/`dead_crops_status`/
+     `dry_dead`/`dry_dead_status`/`gave_up_tiles`（以及 `dead_crops_summary` 事件）**缺失 ⇒ 只进
+     【无法判定】，既不算通过也不算失败**（缺失 ≠ 0）。
   * 事件映射不许漂移（Lead m02395）：brain 里 `_journal("<name>"` 的**每个**事件名都要在
     `EVENT_BUCKETS` 里有桶（结构性事件 `day_start`/`day_end`/`finish` 除外，见 `STRUCTURAL_EVENTS`）；
     账本里出现没桶的事件 ⇒ 报告头部逐条点名（名字×次数+行号）+ 建议 0a，**绝不静默丢弃**。
@@ -233,6 +242,25 @@ FIELD_PROBES = [
      "逐叠出货字段（task-55/task-42：strategy=surplus_materials / keep / below_keep / slot / qid / stack）"),
     ("event:cannot_afford.money", "cannot_afford_money",
      "钱不够买当季种子（task-55：money/seed_price/short 缺口；**不是失败**、当天不走 buy）"),
+    # task-84（死苗不浇水 + `given_up` 守卫）：Mod `farm.deadCrops`（枯死格数）与 `farm.dryDeadCrops`
+    # （枯死**且没浇**）；brain 侧日级字段 `dead_crops`/`dead_crops_status`/`dry_dead`/`dry_dead_status`/
+    # `gave_up_tiles` 见 `longrun.py:3390-3406`。缺失 ⇒【无法判定】（缺失 ≠ 0），绝不因此判通过；
+    # `dry_dead>0` 且 `ended_reason` 以 `no_work` 开头 ⇒ 判红（见 cat_missed 1i）。
+    ("day_end.dead_crops", "dead_crops",
+     "Mod farm.deadCrops：全农场枯死作物格数（task-84；死苗不浇水、等 clear_dead 清，不计浇水证据）"),
+    ("day_end.dead_crops_status", "dead_crops_status",
+     "死苗计数的可信状态（ok / unavailable；task-84；缺失 ⇒ 死苗总数无法判定）"),
+    ("day_end.dry_dead", "dry_dead",
+     "枯死**且没浇**的格数（Mod farm.dryDeadCrops，0.7.27 新字段，task-84）；>0 且 ended_reason "
+     "以 no_work 开头 ⇒ 判红（死苗不许当『今天没活』的借口，应走 clear_dead / 如实 stuck/gave_up_dry）"),
+    ("day_end.dry_dead_status", "dry_dead_status",
+     "枯死没浇计数的可信状态（ok / unavailable；task-84）"),
+    ("day_end.gave_up_tiles", "gave_up_tiles",
+     "当天认输的窗口外干格坐标 [[x,y],…]（task-84：不再当『还有活』，按 gave_up_dry 如实收尾）；"
+     "非空且自称 VERIFIED ⇒ 判红（fail-closed）"),
+    ("event:dead_crops_summary", "dead_crops_summary",
+     "日级死苗汇总（task-84：dead_crops/dry_dead/dry_dead_status/gave_up/tiles；只在 dead_crops>0 "
+     "且状态 ok 时写）"),
 ]
 OUTCOME_RE = re.compile(
     r"目标\s*(\d+)\s*步：做成\s*(\d+)、跳过\s*(\d+)、失败\s*(\d+)"
@@ -384,6 +412,8 @@ EVENT_BUCKETS = {
     #     `surplus_sell_skip` = 想卖但没有材料超过保留线（带 short 缺口）⇒ **不是失败**。
     "surplus_sell": "surplus_sells",
     "surplus_sell_skip": "surplus_sell_skips",
+    # task-84：日级死苗汇总（`dead_crops_summary`，只在 `dead_crops>0` 且状态 ok 时写一条）。
+    "dead_crops_summary": "dead_crops_summaries",
 }
 
 #: 结构性事件：由报告的其他字段单独统计（day_start/day_end 切会话与验收、finish 自述），
@@ -418,6 +448,8 @@ NEW_EVENT_BUCKETS = (
     "stuck_flushes", "stuck_flush_skips", "stuck_flush_resnap_failures",
     # task-55/task-91：盈余材料换种子钱（钱次日 NewDay 结算；skips/below_keep 都不是失败）
     "surplus_sells", "surplus_sell_skips",
+    # task-84：死苗汇总（一眼看出"还有 N 格枯死、其中 M 格没浇、今天认输 K 格"）
+    "dead_crops_summaries",
 )
 
 
@@ -683,6 +715,42 @@ def no_work_with_dry(ev):
     if isinstance(dry, bool) or not isinstance(dry, (int, float)):
         return None
     return int(dry) if dry > 0 else None
+
+
+def dry_dead_check(ev):
+    """task-84：死苗/放弃格字段的 fail-closed 判定（与 `tools/verify-run3.py:793-818` 同向）。
+
+    brain 侧日级字段（`brain/agentfarm/longrun.py:351-355` 声明、`:424-428` as_dict、
+    `:3390-3406` 汇总/留痕）：`dead_crops` + `dead_crops_status`（Mod `farm.deadCrops`）、
+    `dry_dead` + `dry_dead_status`（Mod `farm.dryDeadCrops`，枯死**且没浇**）、
+    `gave_up_tiles`（当天认输的窗口外干格坐标）。
+
+    口径：
+      * 字段缺失（task-84 之前的旧账本）⇒ `"missing"`：只作【无法判定】，**既不算通过也不算失败**；
+      * `dry_dead` 不是整数 ⇒ `"bad"`（账目不可信 ⇒ 判红）；
+      * `dry_dead > 0` 且 `ended_reason` 以 `no_work` 开头 ⇒ `"no_work_uncleared"`（判红）：
+        "还有枯死作物没清却判今天没活" = 拿死苗当没活的借口（用户 m11003 第 3 条抱怨的形态），
+        正确归宿是 `clear_dead`，够不着要如实 `stuck`/`gave_up_dry`。
+      * 其余 ⇒ `"ok"`。
+
+    返回 `(status, dry_dead, gave_up_tiles, note)`。
+    """
+    if not any(k in ev for k in ("dead_crops", "dry_dead", "gave_up_tiles")):
+        return ("missing", None, None, "")
+    gave_up = ev.get("gave_up_tiles")
+    raw = ev.get("dry_dead")
+    if raw is None:
+        return ("missing", None, gave_up, "")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return ("bad", None, gave_up,
+                f"day_end.dry_dead 不是整数（{raw!r}）⇒ 账目不可信")
+    dd = int(raw)
+    if dd > 0 and str(ev.get("ended_reason") or "").startswith("no_work"):
+        return ("no_work_uncleared", dd, gave_up,
+                f"ended_reason 以 no_work 开头，但 day_end.dry_dead={dd}"
+                "（还有枯死作物没清却判『今天没活』⇒ 死苗被当成没活的借口；"
+                "应走 `clear_dead`，够不着应如实 `stuck`/`gave_up_dry`，见 task-84）")
+    return ("ok", dd, gave_up, "")
 
 
 def bound_self_check(*, basis_field, attempted, encircled, ledger_bound):
@@ -982,6 +1050,51 @@ def cat_missed(sessions, top):
                              "基数/上界比自算大 ⇒ 可能把真失败洗成豁免（deputy V5 打法）；"
                              "verify-run3.py 同判 problem",
                         subject="missed:bound_inflated",
+                    )
+                )
+        # 1i: task-84（死苗不浇水）—— fail-closed 三条：
+        #   ① `dry_dead > 0` 且 `ended_reason` 以 `no_work` 开头 ⇒ 红（死苗不许当"今天没活"的借口；
+        #      verify-run3.py:803-808 同判 problem）；
+        #   ② `dry_dead` 不是整数 ⇒ 红（账目不可信；verify-run3.py:802 同判 problem）；
+        #   ③ `gave_up_tiles` 非空却自称 `verified=true` ⇒ 红（卡面 fail-closed：放弃格还在，当天
+        #      不该 VERIFIED）—— **本工具比 verify-run3 严一格**（它对 gave_up 只记 info，
+        #      见 verify-run3.py:809-819；若 run8 出现两边相反，以 verify-run3 为准并报 Lead）。
+        # 字段缺失（旧账本）⇒ 不在这里判红，只由 FIELD_PROBES 记【无法判定】。
+        for lineno, ev in sess["day_ends"]:
+            _ev = as_dict(ev)
+            _status, _dd, _gave_up, _note = dry_dead_check(_ev)
+            if _status == "no_work_uncleared":
+                out.append(
+                    finding(
+                        lineno, "day_end",
+                        f"死苗没清却判没活：{_note}（ended_by={_ev.get('ended_by')}）",
+                        hint="死苗不浇水（dry 只算活苗）：`clear_dead` 应在 water 之前；够不着要如实 "
+                             "`stuck`/`gave_up_dry`。run7 曾追着一株够不着的死苗烧掉两个整天"
+                             "（用户 m11003 第 3 条）；verify-run3.py:803-808 同判 problem",
+                        subject="missed:dry_dead_uncleared",
+                    )
+                )
+            elif _status == "bad":
+                out.append(
+                    finding(
+                        lineno, "day_end", f"死苗账目不可信：{_note}",
+                        hint="task-84：`dry_dead` 必须是整数；不是整数说明账本/字段被改坏，"
+                             "verify-run3.py:802 同判 problem",
+                        subject="missed:dry_dead_bad_field",
+                    )
+                )
+            elif _status == "ok" and as_list(_gave_up) and _ev.get("verified") is True:
+                out.append(
+                    finding(
+                        lineno, "day_end",
+                        f"放弃格非空却自称 VERIFIED：gave_up_tiles={len(as_list(_gave_up))} 格"
+                        f"（坐标 {str(as_list(_gave_up))[:80]}）⇒ 当天不该 VERIFIED"
+                        f"（ended_by={_ev.get('ended_by')}、ended_reason="
+                        f"{str(_ev.get('ended_reason') or '')[:60]!r}）",
+                        hint="task-84 fail-closed：放弃格 = 还有没做完的活；本工具比 verify-run3 严一格"
+                             "（它对 `gave_up_dry` 只记 info）。若两边对同一账本相反 ⇒ 以 verify-run3 "
+                             "为准并停下报 Lead（Lead m01934 规则）",
+                        subject="missed:verified_with_gave_up",
                     )
                 )
     return out[:top] if top else out
@@ -1796,6 +1909,28 @@ def build_advice(report, top=8):
                     "本工具只给这两个候选与证据行，**不下结论**。",
             "lines": [x["line"] for x in sl["sold_days_with_no_buy_next"] if x.get("line") is not None],
         })
+    # 0m) task-84：死苗没清却判 no_work / 放弃格非空却自称 VERIFIED / dry_dead 非整数
+    dci = report.get("dead_crops") or {}
+    if dci.get("no_work_uncleared") or dci.get("verified_with_gave_up") or dci.get("bad_fields"):
+        _parts = []
+        if dci.get("no_work_uncleared"):
+            _parts.append(
+                f"有没清的死苗却判 no_work ×{len(dci['no_work_uncleared'])}"
+                f"（行 {dci['no_work_uncleared'][:6]}）：死苗不浇水、也不许当『今天没活』的借口 —— "
+                "`clear_dead` 要排在 water 之前；够不着应如实 `stuck`/`gave_up_dry`（task-84 口径）")
+        if dci.get("verified_with_gave_up"):
+            _parts.append(
+                f"放弃格非空却自称 VERIFIED ×{len(dci['verified_with_gave_up'])}"
+                f"（行 {dci['verified_with_gave_up'][:6]}）：放弃格 = 当天还有没做完的活，不该 VERIFIED；"
+                "注意本工具比 verify-run3 严一格（它对 gave_up 只记 info），"
+                "若两边对同一账本相反 ⇒ 以 verify-run3 为准并停下报 Lead")
+        if dci.get("bad_fields"):
+            _parts.append(f"dry_dead 不是整数（账目不可信，行 {dci['bad_fields'][:6]}）")
+        advice.append({
+            "text": "死苗/放弃格（task-84）：" + "；".join(_parts),
+            "lines": (dci.get("no_work_uncleared", []) + dci.get("verified_with_gave_up", [])
+                      + dci.get("bad_fields", [])),
+        })
     # 0j) 可达性/开路（task-76：task-68 的被围住 + frontier_clear + clear_neighbor；**不判红**）
     rc = report.get("reachability") or {}
     if (rc.get("encircled_events") or rc.get("frontier_clear_attempts")
@@ -2069,6 +2204,19 @@ def build_undecidable(rows, sessions, prelude, report):
     if not has_modal_event and not has_modal_check:
         out.append("本账本没有任何模态事件（modal_*/levelup_*）、也没有 checks.no_blocking_modal："
                    "无法判定当天是否被模态打断过（task-11 之前的账本）—— **缺失不等于没被挡过**")
+    # task-84：旧账本没有死苗字段 ⇒ 死苗口径无法判定（缺失 ≠ 0；绝不当"没有死苗"通过）
+    _dc_ends = [ev for _, ev in rows if ev.get("event") == "day_end"]
+    _dc_has = [ev for ev in _dc_ends
+               if any(k in ev for k in ("dead_crops", "dry_dead", "gave_up_tiles"))]
+    if _dc_ends and not _dc_has:
+        out.append("本账本没有任何 task-84 死苗字段（day_end.dead_crops/dead_crops_status/dry_dead/"
+                   "dry_dead_status/gave_up_tiles，也没有 dead_crops_summary 事件）："
+                   "无法判定死苗（枯死作物）与当天放弃格 —— **缺失 ≠ 0，绝不当'没有死苗'通过**")
+    elif _dc_has:
+        _dc_missing = sorted({k for ev in _dc_has
+                              for k in ("dead_crops", "dry_dead", "gave_up_tiles") if k not in ev})
+        if _dc_missing:
+            out.append(f"死苗字段只写了一部分（缺 {_dc_missing}）：无法判定缺的那一列（缺失 ≠ 0）")
     # task-36：自称浇过、却没有 final_water 可核对的那些天（verify-run3.py:414-418 同口径：只记信息项）
     no_fw = [
         lineno for lineno, ev in rows
@@ -2301,6 +2449,49 @@ def build_report(rows, path, args, bad_lines):
                 seed_money = ev.get("money")
             if seed_price is None:
                 seed_price = ev.get("seed_price")
+    # task-84：死苗/放弃格（Mod `farm.deadCrops` / `farm.dryDeadCrops` + 当天认输的窗口外干格）。
+    # 缺失 ⇒【无法判定】（缺失 ≠ 0）；`dry_dead>0` 且 `no_work`、`gave_up` 非空却自称 VERIFIED
+    # 在 cat_missed 1i 判红；这里只做聚合与呈现。
+    dc = {
+        "dead_crops": None, "dead_crops_status": None,
+        "dry_dead": None, "dry_dead_status": None,
+        "gave_up_count": 0, "gave_up_tiles": [],
+        "lines": [], "missing_fields": [],
+        "no_work_uncleared": [], "verified_with_gave_up": [], "bad_fields": [],
+        "summary_events": 0, "summary_lines": [],
+    }
+    _dc_seen = set()
+    for ln, ev in rows:
+        _name = str(ev.get("event") or "")
+        if _name == "dead_crops_summary":
+            dc["summary_events"] += 1
+            dc["summary_lines"].append(ln)
+            continue
+        if _name != "day_end":
+            continue
+        dc["lines"].append(ln)
+        for _k in ("dead_crops", "dead_crops_status", "dry_dead", "dry_dead_status"):
+            if _k in ev:
+                _dc_seen.add(_k)
+                if ev.get(_k) is not None:
+                    dc[_k] = ev.get(_k)
+        if "gave_up_tiles" in ev:
+            _dc_seen.add("gave_up_tiles")
+            _tiles = as_list(ev.get("gave_up_tiles"))
+            if len(_tiles) > len(dc["gave_up_tiles"]):
+                dc["gave_up_tiles"] = _tiles
+            dc["gave_up_count"] = max(dc["gave_up_count"], len(_tiles))
+        _status, _dd, _gu, _note = dry_dead_check(ev)
+        if _status == "bad":
+            dc["bad_fields"].append(ln)
+        elif _status == "no_work_uncleared":
+            dc["no_work_uncleared"].append(ln)
+        elif _status == "ok" and as_list(_gu) and ev.get("verified") is True:
+            dc["verified_with_gave_up"].append(ln)
+    dc["missing_fields"] = [k for k in ("dead_crops", "dead_crops_status", "dry_dead",
+                                         "dry_dead_status", "gave_up_tiles") if k not in _dc_seen]
+    dc["has_fields"] = bool(_dc_seen)
+    dead_crops = dc
     seed_economy = {
         "total": sum(seed_counts.values()),
         "no_seed_for_sale": seed_counts["no_seed_for_sale"],
@@ -2483,6 +2674,8 @@ def build_report(rows, path, args, bad_lines):
         "sell": sell,
         # task-70：种子经济（task-67 的种子三事件；与 buy 一起才是守卫死锁的完整指纹）
         "seed_economy": seed_economy,
+        # task-84：死苗/放弃格（`dead_crops`/`dry_dead`/`gave_up_tiles`；缺失 ⇒【无法判定】）
+        "dead_crops": dead_crops,
         "unmapped_events": unmapped_events,
         "no_day_progress": [
             {"line": ln, "reason": ev.get("reason"), "ended_by": ev.get("ended_by")}
@@ -2943,6 +3136,15 @@ MAPPING_TEXT = [
      "**钱要等下一次 NewDay 才结算 ⇒ 当天 money 不变是设计**）；"
      "`surplus_sell_skip` = 想卖但没有材料超过保留线（short=缺口 g）⇒ 不是失败；"
      "逐叠字段见 `sell.strategy/keep/below_keep/slot/qid/stack`"),
+    ("dead_crops_summary / day_end.dead_crops|dry_dead|gave_up_tiles（task-84）",
+     "死苗/放弃格（**有两条红口径**）：`dead_crops`=Mod `farm.deadCrops`（全农场枯死格数）、"
+     "`dry_dead`=Mod `farm.dryDeadCrops`（枯死**且没浇**，0.7.27 新字段）、"
+     "`gave_up_tiles`=当天认输的窗口外干格坐标。口径：**死苗不浇水**（`dry` 只算活苗；死苗走 `clear_dead`，"
+     "且 `clear_dead` 排在 water 之前）；`dry_dead>0` 而 `ended_reason` 以 `no_work` 开头 ⇒ 判红"
+     "（`missed:dry_dead_uncleared`，verify-run3.py:803-808 同判 problem）；"
+     "`gave_up_tiles` 非空却自称 VERIFIED ⇒ 判红（`missed:verified_with_gave_up`，**本工具比 "
+     "verify-run3 严一格**，它对 gave_up 只记 info ⇒ 两边相反时以它为准并报 Lead）；"
+     "字段缺失（旧账本）⇒ 只进【无法判定】、绝不判红也不当通过；头部'死苗/放弃格'行 + 建议 0m"),
     ("encircled / encircled_stage / encircled_summary（task-68、task-76）",
      "5 环境挡路·可达性/开路（信息项，**无硬闸门 ⇒ 一律不判红**）：被不可清障物围住（四邻没有"
      "「可站+可清」的突破口）＝与 `unreachable`（物理走不到）**分开计数**、不封格、不进任何豁免分子；"
@@ -3121,6 +3323,31 @@ def render_text(report, top):
     if weak:
         add(f"弱日: {len(weak)} 天（VERIFIED 但成功动作只有 0<ok<5 步，信息项供复核）"
             f"（行 {[w['line'] for w in weak][:10]}）")
+    # task-84：死苗/放弃格 —— 死苗不浇水（dry 只算活苗，旧口径让 run7 追着一株够不着的死苗烧两个整天）
+    dci = report.get("dead_crops") or {}
+    if not dci.get("has_fields"):
+        add("死苗/放弃格: <缺失>（本账本没有 dead_crops/dry_dead/gave_up_tiles ⇒ 死苗口径无法判定；"
+            "缺失 ≠ 0，绝不当'没有死苗'通过）")
+    else:
+        _dc_missing = set(dci.get("missing_fields") or [])
+
+        def _dc_or_missing(key):
+            return dci.get(key) if key not in _dc_missing else "<缺失>"
+
+        _gu_txt = ("<缺失>" if "gave_up_tiles" in _dc_missing
+                   else f"{dci.get('gave_up_count')} 格（坐标 {str(dci.get('gave_up_tiles'))[:80]}）")
+        add(f"死苗/放弃格: 枯死 {_dc_or_missing('dead_crops')} 格"
+            f"（状态 {_dc_or_missing('dead_crops_status')}）"
+            f"、其中没浇 {_dc_or_missing('dry_dead')} 格"
+            f"（状态 {_dc_or_missing('dry_dead_status')}）"
+            f"；当天认输格 {_gu_txt}"
+            "；口径：死苗不计浇水证据（dry 只算活苗，死苗走 clear_dead）"
+            + (f"  ⚠ 死苗没清却判 no_work（行 {dci['no_work_uncleared'][:6]}）"
+               if dci.get("no_work_uncleared") else "")
+            + (f"  ⚠ 放弃格非空却自称 VERIFIED（行 {dci['verified_with_gave_up'][:6]}）"
+               if dci.get("verified_with_gave_up") else "")
+            + (f"  ⚠ dry_dead 不是整数（账目不可信，行 {dci['bad_fields'][:6]}）"
+               if dci.get("bad_fields") else ""))
     dc = report.get("decision_counts") or {}
     if dc.get("total"):
         src_txt = "、".join(f"{k}={v}" for k, v in sorted(dc["by_source"].items()))

@@ -375,14 +375,39 @@ rg -n '"surplus_sell|"sell"|"cannot_afford' logs/longrun-*.jsonl
 python tools/analyze-longrun.py --journal <ledger> | rg "种子经济/出货"
 ```
 
+## 3.14 死苗 / 放弃格（task-84，dev `a29b170` Mod + `3b00761` 脑侧）—— 死苗不浇水
+
+**为什么**：run7 的 `water_far [12,30]` 被记了 8 次 `unreachable` + 2 次「回执说浇了但 `farm.dryCrops` 没降」，为了一株够不着的**死苗**烧掉两个整天。task-84 起：`farm.dryCrops`/`dryTiles` **只算活苗**（死苗的"干"另走 `farm.dryDeadCrops`），`clear_dead` 排在浇水之前，够不着的干格如实 `gave_up_dry`。
+
+| 字段 / 事件 | 关键键 | 本工具怎么读 |
+| --- | --- | --- |
+| `day_end.dead_crops` | Mod `farm.deadCrops`（全农场枯死格数） | 头部「死苗/放弃格:」；缺失 ⇒ 该字段记 `<缺失>` |
+| `day_end.dead_crops_status` | `ok` / `unavailable` | 死苗计数的可信状态；缺失 ⇒ 总数【无法判定】 |
+| `day_end.dry_dead` | Mod `farm.dryDeadCrops`（枯死**且没浇**，0.7.27 新字段） | `>0` 且 `ended_reason` 以 `no_work` 开头 ⇒ 红 |
+| `day_end.dry_dead_status` | `ok` / `unavailable` | 同上；缺失 ⇒ 【无法判定】 |
+| `day_end.gave_up_tiles` | 当天认输的窗口外干格坐标 | 非空却自称 `verified=true` ⇒ 红 |
+| `dead_crops_summary`（事件） | `dead_crops` / `dry_dead` / `dry_dead_status` / `gave_up` / `tiles[]` / `note` | 日级汇总（只在 `dead_crops>0` 且状态 ok 时写） |
+
+- **两条红口径**：①`missed:dry_dead_uncleared` —— `dry_dead > 0` 且 `ended_reason` 以 `no_work` 开头（死苗不许当"今天没活"的借口；正确归宿是 `clear_dead`，够不着就如实 `stuck`/`gave_up_dry`；`tools\verify-run3.py:803-808` 同判 problem）。②`missed:verified_with_gave_up` —— `gave_up_tiles` 非空却自称 VERIFIED；**本工具比 `verify-run3.py` 严一格**（它对 `gave_up` 只记 info）⇒ 两边"一眼相反"时**以它为准并停下报 Lead**。另有 `missed:dry_dead_bad_field`：`dry_dead` 不是整数 ⇒ 账目不可信、判红。
+- **缺失行为**：五个字段与 `dead_crops_summary` 都没有 ⇒ 头部写 `死苗/放弃格: <缺失>`，并进【无法判定】（`缺失 ≠ 0，绝不当"没有死苗"通过`），**不判红也不当通过**；部分缺 ⇒ 逐字段显示 `<缺失>`（看 `report["dead_crops"]["missing_fields"]`）。
+- **呈现**：头部一行「死苗/放弃格: 枯死 N 格（状态 ok）、其中没浇 M 格（状态 ok）、当天认输格 K 格（坐标…）；口径：死苗不计浇水证据」+ 建议 `0m`；命中红口径时追加 `⚠` 与行号。
+- **单测**：`tests/test_analyze_longrun.py::TestDeadCropsAccounting`（6 条：`dead_crops_summary` 有桶不落未映射 / 干净日不判红且头部可见 / `dry_dead>0`+`no_work` ⇒ 红 / `dry_dead` 非整数 ⇒ 红 / 认输格 + VERIFIED ⇒ 红 / 字段缺失 ⇒ 只进【无法判定】且头部 `<缺失>`）。
+- **回归**：7 本账本（green/run2/run3/run5/run6/run7/vacuum）的 rc 与红数**一个没变**（旧账本全无 task-84 字段 ⇒ 只多【无法判定】行，不判红也不变绿）。
+
+```
+rg -n '"dead_crops_summary' logs/longrun-*.jsonl
+rg -n 'dead_crops|dry_dead|gave_up_tiles' logs/longrun-*.jsonl
+python tools/analyze-longrun.py --journal <ledger> | rg "死苗/放弃格"
+```
+
 ## 4. 复核命令
 
 ```
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run5.jsonl   # 有红 ⇒ rc=1（--advisory 才恒 0）
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run6.jsonl   # run6：守卫死锁 + 同日重试
-python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run7.jsonl --days 7   # run7：窗口口径 ⇒ rc=0
+python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run7.jsonl --days 7   # run7：窗口口径 ⇒ rc=0；死苗字段缺失 ⇒ <缺失> + 【无法判定】
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
-python -m unittest tests.test_analyze_longrun  # 当前 109 OK（task-91）
-python -m unittest discover -s tests           # 当前 559 OK
+python -m unittest tests.test_analyze_longrun  # 当前 115 OK（task-95）
+python -m unittest discover -s tests           # 当前 578 OK（0.7.27 装机放行条件）
 ```
