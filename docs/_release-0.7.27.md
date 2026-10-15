@@ -48,17 +48,18 @@ python -m agentfarm goto Farm --no-focus        # 需要 PYTHONPATH=<repo>\brain
 # 8) 起跑前自检 + 权威基线
 python tools\preflight.py --expect 0.7.27 --save-baseline logs\run8-baseline.json
 
-# 9) 交 task-88（machine-runner）用起跑器发 run8（先 --dry-run 看四要素）
+# 9) 交 task-89（machine-runner）用起跑器发 run8（先 --dry-run 看四要素）
 python tools\start-detached-longrun.py --journal logs\longrun-3day-llm-run8.jsonl --expect-version 0.7.27
 ```
 
-## §3 run8 起跑卡（Lead 建 task-88 派 machine-runner）
+## §3 run8 起跑卡（Lead 建 task-89 派 machine-runner）
 
 - 起跑器（首选）：`python tools\start-detached-longrun.py --journal logs\longrun-3day-llm-run8.jsonl --expect-version 0.7.27`；先 `--dry-run` 看四要素（HEAD / 5 个文件的 SHA256+mtime，含 Mod dll 与 manifest / PID / `git status --short`）。
 - 手工 `Start-Process` 仅作备用（托管后台作业会在回合边界被连根收掉，见条目 040/041）。
 - 轮询只读三样（PID 存活 / console 尾部 / 账本行数与尾事件），**不用 `job_output` 跑长跑**。
 - `eventUp=true` 立刻停手上报，**绝不 dismiss**。
 - 交付 `docs/_run8-evidence.md`（§1 起跑与版本四要素 / §2 外部证据 / §3 逐日表 / §4 判据对照（**两侧结论都要写**：旧口径 + 尾部窗口口径）/ §5 归因与遗留）。
+- **起止外部快照必须做**（run7 的教训：`scratch/run7-external-snapshots.jsonl` 不存在 ⇒ 窗口内中间 5 次落盘 size 永久不可恢复）：起跑前 `python scratch\run8-snapshot.py --tag start`、结束后立刻 `--tag end`，输出 `scratch/run8-external-snapshots.jsonl`（存档 main + `_old` 的 size/mtime、SMAPI `lines/newday/save` 累计、账本行数与 `finish`、PID 存活、`bridge_info` 对 `--expected-mod-version 0.7.27`）。游戏存档只留两代 ⇒ 别承诺中间值。
 
 ## §4 run8 判据
 
