@@ -105,7 +105,7 @@ python tools\start-detached-longrun.py --journal logs\longrun-3day-llm-run8.json
 - **放行条件**：`check-release.py --expect 0.7.27` 必须六项全绿 —— 首次跑时唯一红是 `TestEventMappingDrift`（task-84 的新事件 `dead_crops_summary` 未入 `EVENT_BUCKETS`），作 **task-95** 派 log-analyst；**树不绿不装机**（v0.7.17 教训）。
 
 ### §7.2 装机与起跑前预置（**放行链见 §7.3，先过 task-96/97 再执行**）
-0. **前置闸门（2026-10-15 夜新增）**：`task-92` 对抗验收 **FAIL** ⇒ 发现一条**早于 task-84** 的 fail-open 老洞（人 在农场 + `farm` 证据不可用 ⇒ `no_work` + `watered_outdoor=true` + `verified=true`，真·没浇的活苗在 400 格窗外；run7 那颗 `[12,30]` 正是此形态）。修法 = **task-96**（brain-only，dev-coder）+ **task-97**（deputy-lead 对抗验收修法本身）。**task-96 未交付、task-97 未 PASS 之前不许装机、不许起 run8**——否则 run8 可能拿假 VERIFIED 当成绩。
+0. **前置闸门（2026-10-15 夜新增，最终形态见 §7.3）**：`task-92` 对抗验收 **FAIL** ⇒ 发现一条**早于 task-84** 的 fail-open 老洞（人 在农场 + `farm` 证据不可用 ⇒ `no_work` + `watered_outdoor=true` + `verified=true`，真·没浇的活苗在 400 格窗外；run7 那颗 `[12,30]` 正是此形态）。修法 = **task-96**（brain-only，dev-coder）+ **task-97** 对抗验收；task-97 又打出残留洞 ⇒ **task-99**（`dryCrops` 缺失时 `_farm_totals` 返回 `(0,0)`）+ **task-100** 复验。**task-100 PASS 之前不许装机、不许起 run8**。
 1. `python tools/check-release.py --expect 0.7.27` ⇒ 六项全绿（含 `Ran N tests / OK`、工作树干净）。此时 HEAD 应含 task-96（brain-only 改动**不需要**重新 bump Mod，四要素里的 HEAD/SHA256 会记它）。
 2. `python tools/deploy-mod.py --no-quit`（0.7.26 → 0.7.27；记录 dll/manifest 字节数与 `modVersion`）。
 3. `python -m agentfarm goto Farm --no-focus`（需 `PYTHONPATH=<repo>\brain`）⇒ 户外农场，否则 `preflight` 的户外判据红。
@@ -120,4 +120,5 @@ python tools\start-detached-longrun.py --journal logs\longrun-3day-llm-run8.json
 - **工具侧补洞（Lead，`23e13c7`）**：`tools/verify-run3.py` 把 `final_water.scope=window && crops==0` 也判红（原先只堵 `tiles==0`）——"窗口里没看到作物"不等于"浇过了"；+2 用例（含 farm 口径正对照）⇒ `tests.test_verify_run3` 52 OK；七账本判决不变（green 0 / vacuum 3 / run2 11 / run3 17 / run5 21 / run6 9 / run7 0+严格 9）。
 - **task-96**（dev-coder，brain-only）：①`_farm_scope_work` 在"人在农场 + farm 证据可用"时也给值；②证据不可用且人在农场 ⇒ `work_reasons()` 给理由 + `sleep_guard` 不许放行 `no_work`（journal `farm_evidence_unavailable` 每天一次）；③`_water_evidence` 的 window 分支要求 `crops > 0`；④不许把诚实日洗成 `no_work`；⑤单测 ≥6 + 变异 ≥2。
 - **task-97**（deputy-lead，`blocked_by task-96`）：复跑 task-92 的 C6c/C6d/C8b/C8c（必须由 FAIL 转 PASS）+ 朝新修法进攻（部分可用证据 / 真没活的日子不许被关成死循环也不许洗白 / `crops>0` 但全是死苗时 `watered_outdoor` 该是什么 / 窗口与 farm 口径打架谁优先 / 畸形 `complete` 值）。
-- 顺序：**task-96 交付 ⇒ task-97 PASS ⇒ §7.2 第 1 步起跑全链**。
+- **task-97 = FAIL**（`docs/_review-task96.md`，`30158c7`）：task-96 的 B 段四条 FAIL→PASS，但 C 段第①条有**残留 fail-open** —— `longrun.py:776-780 _farm_totals()` 在 `complete=true` 且 **`dryCrops` 缺失**时返回 `(0,0)` ⇒ `no_work` + `watered_outdoor=true` + VERIFIED。**真实可达**（`dryCrops` 是 0.7.22 才有的字段，`watchdog` 的版本不符只是 WARN）⇒ **task-99**：`dry is None ⇒ return None`（一行）+ **NIT-6** 夹具语义（`farm=None` 不许隐式变成"世界一致扫描"，那会让探针"看着修好了"）。严格口径的代价（`<0.7.22` 的 Mod 再也拿不到绿 run）被 Lead 接受：诚实优先。
+- 顺序：**task-96 交付（`486203d`）⇒ task-97 FAIL ⇒ task-99（一行 + NIT-6）⇒ task-100 复验 PASS ⇒ §7.2 第 1 步起跑全链**。task-96 在 task-100 PASS 前**不算关闭**。
