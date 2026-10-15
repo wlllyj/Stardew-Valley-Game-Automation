@@ -33,6 +33,11 @@ python tools\_bump-mod-version.py 0.7.27 --note-file tools\_note-0727.txt
 # 3) 编译（必须 0 警 0 错）
 dotnet build .\mod\AgentFarm.Bridge\AgentFarm.Bridge.csproj -c Release --nologo --no-incremental
 
+# 3b) 【Lead 独占】工具侧对齐本版新字段/事件（task-84 的 dead_crops/dry_dead/gave_up_tiles + task-55 的 sell 家族）
+#     tools\verify-run3.py + tests\test_verify_run3.py：新字段缺失 ⇒ 只记 info（缺失≠通过）、
+#     活苗 dry 口径对齐、不新增硬闸门；跑 `python -m unittest tests.test_verify_run3` 全绿。
+#     ⚠️ 纪律（task-86 教训）：**任何口径变更都必须过一轮独立对抗验收**才能拿去判真机账本。
+
 # 4) 提交冻结
 git add -A; git commit -m "release: 0.7.27 (task-55 economy + task-84 dead-crop watering + task-83 layout)"
 
