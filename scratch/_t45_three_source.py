@@ -12,7 +12,12 @@
   秒内要么有 `SaveGame.Save() completed`，要么存档 mtime 前进。
 * **存档**：`Wahaha_450799035` / `SaveGameInfo`（含 `_old`）的 size/mtime，以及存档 XML 里的
   `<money>` / `<dayOfMonth>` / `<currentSeason>` / `<year>`（**游戏自己写的真值**）。
-  账本收尾那天必须与存档 XML 的那天一致；若存档 mtime 早于账本收尾（落盘滞后）则降级为 info 并说明。
+  P4 四态（task-93 采纳 NIT-5）：相等 ⇒ ✅；**落后 ≤1 天 ⇒ info**；**新 1 天且账本有 `finish` ⇒ info**
+  （跑批窗口 < 游戏会话）；**新 ≥2 天，或新而无 `finish` ⇒ problem**（fail-closed）。
+* **严格口径第二判决**（task-93）：`tools/verify-run3.py` 自 `7c4ff68` 起按"尾部连续 N 天"判 VERIFIED，
+  窗口之外的日级问题降级为 `history_problems`。本工具只读加载它（**不改它**），当历史问题非空时多打一段
+  `严格口径（整本零问题）：…` 并逐条列出，供 `_runN-evidence.md` §4 抄录；**只打印、不改本工具退出码**
+  （`--strict-days` 默认 3；`--no-strict` 关闭；也可用它做"打印不影响 rc"的对照实验）。
 * **窗口 delta**（`--snapshots` 的 start/end 两行）：save size/mtime 必须前进、SMAPI 行数必须前进、
   `smapi_newday` 的增量必须 ≥ 账本跨日次数。
 
@@ -68,6 +73,8 @@ class Report:
         self.problems: list[str] = []
         self.infos: list[str] = []
         self.oks: list[str] = []
+        # 「严格口径第二判决」（task-93）：**只打印、不进 problems/infos/oks、不改退出码**。
+        self.strict: list[str] = []
 
     def problem(self, msg: str) -> None:
         self.problems.append(msg)
@@ -349,16 +356,25 @@ def check_save(advances: list[dict], sv, led, rep: Report) -> None:
                     f"（落后 {gap} 天）⇒ 超出『save-day 语义差 + 游戏跳过保存』能解释的 1 天，"
                     f"是少了天数/money 没落盘（存档 mtime {fmt_mtime(main['mtime']) if main else '-'}）")
     else:
-        # 跑批进行中：最后一天可能已经在游戏里跨过去了、账本还没写 day_end/收尾 ⇒ 领先 1 天记 info；
-        # 收工后（有 finish）或在跑也领先 ≥2 天 ⇒ 仍是 problem（账本少记了天数）。
-        unfinished = led is not None and led.get("finish") is None
-        if unfinished and gap == -1:
-            rep.info(f"跑批进行中（没有 finish）：存档已到 {ordinal_str(triple)}、账本收尾 "
-                     f"{ordinal_str(last['end_day'])} —— 领先 1 天属收尾未写 ⇒ 本次不判红"
-                     f"（存档 mtime {fmt_mtime(main['mtime']) if main else '-'}）")
+        # ---- NIT-5（task-93 采纳）：存档比账本收尾**新** ⇒ 三态
+        #  * 新 1 天 **且账本里有 finish** ⇒ info（跑批窗口 < 游戏会话，run7 实例：finish 之后游戏又跨日并正常落盘）
+        #  * 新 1 天但**没有 finish**（跑批被中断、账本没跑完）⇒ problem（fail-closed）
+        #  * 新 ≥2 天（有 finish 与否）⇒ problem
+        newer = abs(gap)
+        has_finish = led is not None and led.get("finish") is not None
+        mtime_s = fmt_mtime(main["mtime"]) if main else "-"
+        if newer == 1 and has_finish:
+            rep.info(f"存档比账本收尾新 1 天（存档 {ordinal_str(triple)} / 账本 "
+                     f"{ordinal_str(last['end_day'])}）：账本已有 `finish` ⇒ 跑批结束后游戏会话仍在继续并"
+                     f"正常落盘（run7 实例：finish 之后游戏又跨了一次日并落盘）⇒ 记 info，不判 problem"
+                     f"（跨日与落盘另有 SMAPI NewDay/Save 配对与窗口 delta 三处硬证据把关；"
+                     f"存档 mtime {mtime_s}）")
         else:
-            rep.problem(f"存档比账本收尾还新 {abs(gap)} 天（存档 {ordinal_str(triple)} / 账本 "
-                        f"{ordinal_str(last['end_day'])}）⇒ 账本少记了天数（或存档不是这一局的）")
+            why = ("账本没有 `finish`（跑批被中断、账本没跑完）⇒ 存档领先**不能**用『跑批窗口 < 游戏会话』解释"
+                   if not has_finish else
+                   f"超出『跑批窗口 < 游戏会话』能解释的 1 天 ⇒ 账本少记了天数（或存档不是这一局的）")
+            rep.problem(f"存档比账本收尾还新 {newer} 天（存档 {ordinal_str(triple)} / 账本 "
+                        f"{ordinal_str(last['end_day'])}）⇒ {why}（存档 mtime {mtime_s}）")
 
 
 def check_window(snap, advances, sm, sv, rep: Report) -> None:
@@ -412,6 +428,57 @@ def check_payout(led, baseline, rep: Report) -> None:
         rep.info(f"账本记了 {len(sells)} 笔出货（{items} 个），但缺 baseline/起跑 money ⇒ 到账链只能靠窗口 delta 旁证")
 
 
+# ------------------------------------------------------- 严格口径第二判决（只打印）
+def _load_verify_run3():
+    """只读加载 `tools/verify-run3.py`（**不改它**），拿到它的人类/JSON 判决。"""
+    tool = ROOT / "tools" / "verify-run3.py"
+    if not tool.exists():
+        return None
+    import importlib.util
+    try:
+        spec = importlib.util.spec_from_file_location("_vr3_readonly_for_t45", tool)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        return mod
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def strict_second_verdict(ledger_path: Path, days: int, rep: Report) -> None:
+    """task-93 第 2 项：**严格口径第二判决**（整本零问题）——只打印，不改 rc。
+
+    verify-run3（`7c4ff68` 起）按「尾部连续 N 天」判 VERIFIED，窗口**之外**的日级问题降级成
+    `history_problems`。对账器在历史问题非空时多打一段严格口径（= 旧整本口径），逐条列出
+    `history_problems`，供 `_runN-evidence.md` §4 抄录。失败/缺文件只记一行"不可用"，绝不判红。
+    """
+    mod = _load_verify_run3()
+    if mod is None:
+        rep.strict.append("严格口径第二判决不可用：加载 tools/verify-run3.py 失败（本段只打印，不影响结论）")
+        return
+    try:
+        rows = mod.load(str(ledger_path))
+        window_ok, summary = mod.report(rows, target_days=days)
+    except Exception as exc:  # noqa: BLE001
+        rep.strict.append(f"严格口径第二判决不可用：{type(exc).__name__}: {exc}（不影响结论）")
+        return
+    problems = [str(x) for x in (summary.get("problems") or [])]
+    hist = [str(x) for x in (summary.get("history_problems") or [])]
+    if not hist:
+        return  # 没有窗口外历史 ⇒ 两种口径一致，不必多打
+    strict_ok = not problems and not hist
+    rep.strict.append(
+        f"严格口径（整本零问题）：{'VERIFIED' if strict_ok else 'needs_review'}，"
+        f"问题 {len(problems) + len(hist)} 条（窗口内 {len(problems)} + 窗口外历史 {len(hist)}；"
+        f"`tools/verify-run3.py --days {days}` 的窗口口径 = "
+        f"{'VERIFIED' if window_ok else 'needs_review'}）"
+    )
+    for p in problems:
+        rep.strict.append(f"  · [窗口内] {p}")
+    for h in hist:
+        rep.strict.append(f"  · [窗口外历史] {h}")
+    rep.strict.append("  （本段只是提示，**不影响本工具退出码**；run8 的 `_run8-evidence.md` §4 要抄录以上逐条）")
+
+
 # --------------------------------------------------------------------------- 主流程
 def main() -> int:
     ap = argparse.ArgumentParser(description="task-45 三源对账（账本 ↔ SMAPI ↔ 存档），只读")
@@ -424,6 +491,9 @@ def main() -> int:
     ap.add_argument("--end-tag", default="end")
     ap.add_argument("--date", default=None, help="SMAPI 日志所属日期 YYYY-MM-DD（默认用日志 mtime）")
     ap.add_argument("--save-grace", type=float, default=180.0)
+    ap.add_argument("--strict-days", type=int, default=3,
+                    help="严格口径第二判决的尾部窗口天数（默认 3，与 tools/verify-run3.py --days 对齐）")
+    ap.add_argument("--no-strict", action="store_true", help="不打印严格口径第二判决（其余判据不变）")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -494,6 +564,8 @@ def main() -> int:
     check_save(advances, sv, led, rep)
     check_window(snap, advances, sm, sv, rep)
     check_payout(led, baseline, rep)
+    if not args.no_strict:
+        strict_second_verdict(ledger_path, args.strict_days, rep)
 
     if led["finish"]:
         f = led["finish"]
@@ -505,7 +577,8 @@ def main() -> int:
 
 def _emit(rep: Report, as_json: bool) -> None:
     if as_json:
-        print(json.dumps({"problems": rep.problems, "infos": rep.infos, "oks": rep.oks},
+        print(json.dumps({"problems": rep.problems, "infos": rep.infos, "oks": rep.oks,
+                          "strict": rep.strict},  # 只打印，不参与退出码
                          ensure_ascii=False, indent=2))
         return
     for m in rep.oks:
@@ -521,6 +594,11 @@ def _emit(rep: Report, as_json: bool) -> None:
         print("对不上的原文：")
         for m in rep.problems:
             print(f"  * {m}")
+    if rep.strict:
+        print("-" * 90)
+        print("严格口径第二判决（只打印，**不影响上面的结论与退出码**）：")
+        for m in rep.strict:
+            print(f"  {m}")
 
 
 if __name__ == "__main__":

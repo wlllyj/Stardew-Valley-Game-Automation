@@ -402,3 +402,49 @@ $env:PYTHONUTF8="1"
 & $py -m unittest tests.test_verify_run3     # Ran 46 / OK
 ```
 
+---
+
+## §13 task-93 实测：NIT-5 采纳（存档 vs 账本收尾四态）+ 严格第二判决只打印（2026-10-15）
+
+**背景（run7 实例）**：run7 结束后游戏会话仍在继续，`finish` 之后又正常落了两次盘 ⇒ 存档天数比账本收尾**新 1 天**。旧口径把"存档比账本新"一律判 problem ⇒ 一次**已经完全成功**的 run 在外部证据上被打红；语义真相是"跑批窗口 < 游戏会话"。
+
+**P4 四态（`scratch/_t45_three_source.py`，task-93 采纳）**
+
+| 情形 | 判定 | 说明 |
+| --- | --- | --- |
+| 存档天 == 账本收尾天 | ✅ ok | |
+| 存档**落后** ≤1 天 | info | 沿用（save-day=睡前那天 的语义差 / 落盘滞后），另有三处硬证据把关 |
+| 存档落后 ≥2 天 | problem | 沿用 |
+| 存档**新 1 天 且账本有 `finish`** | **info（新增）** | 跑批结束后游戏会话仍在继续并正常落盘（run7 实证） |
+| 存档**新 1 天 但账本无 `finish`** | **problem（新增，fail-closed）** | 跑批被中断 / 账本没跑完 ⇒ 领先不能用"窗口短于会话"解释 |
+| 存档**新 ≥2 天** | problem | 无论有没有 `finish` |
+
+**严格口径第二判决（只打印、不改 rc）**：对账器**只读**加载 `tools/verify-run3.py`（不改它），当它的 `history_problems` 非空时多打一段
+`严格口径（整本零问题）：needs_review，问题 N 条（窗口内 X + 窗口外历史 Y；tools/verify-run3.py --days 3 的窗口口径 = VERIFIED）`，并把窗口外历史逐条列出（供 `_runN-evidence.md` §4 抄录）；`--strict-days` 默认 3，`--no-strict` 关闭（用于对照"打印不影响 rc"）。
+
+**负例矩阵（`scratch/_t93_matrix.py` → `scratch/_t93_matrix_out.txt`，全部符合期望）**
+
+| 用例 | 期望 | 实测 |
+| --- | --- | --- |
+| `t93-pos-newer1-finish`（存档新 1 天 + `finish`） | exit 0 + info | **exit 0 / problem 0**，info = "新 1 天…账本已有 `finish` ⇒ 跑批结束后游戏会话仍在继续并正常落盘" |
+| `t93-neg-newer1-nofinish`（同上去掉 `finish`） | exit 1 + problem | **exit 1**，problem = "还新 1 天…账本没有 `finish`（跑批被中断、账本没跑完）" |
+| `t93-neg-newer2-finish`（存档新 2 天 + `finish`） | exit 1 + problem | **exit 1**，problem = "还新 2 天…超出……能解释的 1 天" |
+| `t93-pos-behind1`（存档落后 1 天） | exit 0 + info | **exit 0**，info 沿用（现状未变） |
+| `t93-pos-run7-live`（run7 真实样本） | exit 0 + 严格口径段 | **exit 0 / problem 0**（task-90 时是 problem 1）＋ 严格口径段 + **9 条**窗口外历史逐条列出（`--days 3` 窗口口径 = VERIFIED） |
+| `t93-run7-no-strict`（同 run7 加 `--no-strict`） | rc/问题数与上一条一致 | **exit 0 / problem 0 / info 6，与上一条完全一致** ⇒ 打印不影响 rc |
+
+**既有夹具回归（`scratch/_t45_run_matrix.py`）**：10 例中 **9 例读数逐字不变**；唯一变化 = `pos-I-midrun-last-day-open`（跑批进行中：最后一天无 `day_end`、无 `finish`，而存档已领先 1 天）由 **exit 0 → exit 1**，是 NIT-5 fail-closed 的直接后果 ⇒ 已在该矩阵里把期望改成 1 并注明原因。
+
+**观察 / NIT（交 Lead 定，本卡未改）**："跑批**进行中**"与"跑批**被中断**"在账本里都是"没有 `finish`"，而前者存档领先 1 天属正常。若不想让**在跑**的 run 被这条打红，可用"SMAPI 日志 mtime 仍在前进 / 最后一行在 N 秒内"当"仍在跑"的旁证，与"中断"分开（卡面要求 fail-closed，故本卡严格照做）。
+
+**对 run8 的一句话结论**：run8 正常收工、`finish` 之后游戏又跨了 1 天并落盘时，**不会再打红**（记 info）；只有"账本无 `finish`"或"存档新 ≥2 天"才红。
+
+**复跑命令**
+
+```powershell
+$py = "C:\Users\admin\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
+$env:PYTHONUTF8="1"
+& $py scratch\_t93_matrix.py          # task-93 六项正/负例 → scratch\_t93_matrix_out.txt
+& $py scratch\_t45_run_matrix.py      # 既有 10 例回归（pos-I 期望已按 NIT-5 改成 1）
+```
+

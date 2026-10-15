@@ -20,7 +20,10 @@ CASES = [
     ("ok", 0),
     ("pos-E-save-one-day-behind", 0),
     ("pos-G-one-day-no-save", 0),
-    ("pos-I-midrun-last-day-open", 0),
+    # task-93（NIT-5 三态）后此例**故意**由 0 变 1：跑批进行中（无 `finish`）而存档已领先 1 天
+    # ⇒ fail-closed 判 problem（Lead 口径：无 finish 的领先不许用「跑批窗口 < 游戏会话」解释）。
+    # 若将来加「SMAPI 日志仍在写 ⇒ 视为跑批中」的例外，这里再改回 0。
+    ("pos-I-midrun-last-day-open", 1),
     ("neg-A-ledger-cut", 1),
     ("neg-B-smapi-short", 1),
     ("neg-C-no-save", 1),
