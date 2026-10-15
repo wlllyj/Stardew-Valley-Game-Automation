@@ -103,6 +103,13 @@
   2. 若 run6 全程无种子，则引用既有真机证据（run5 `播种 ok=7`、run2 `播种 ok=1`）+ **一次装机后的单独播种探针**，并在开发日志里写明"run6 只覆盖三腿"。
 - 参照数字：run5 = 清障/开垦 **284** / 播种 **7** / 浇水 **172**；run2 = **66 / 1 / 31**。
 
+### 3.3 「窗口全死苗」时 `watered_outdoor` 的证明力（Lead 2026-10-15，源自 deputy-lead task-100 的 NIT-3 结论）
+
+- 形态：窗口口径 `crops > 0` 但**全部是死苗**（`dry_dead > 0`、`dry == 0`）、且 farm 级证据不可用 ⇒ `day_end.checks.watered_outdoor` **仍可能写成 `true`**（字段偏乐观）。
+- **该字段此时不具证明力**：这种形态在 task-96 + task-99 之后**必 fail-closed** —— 人（无论室内或农场）在 farm 证据不可用时会拿到「farm 证据不可用」的 `work_reasons`，`sleep_guard` 不放行 `no_work` ⇒ `ended_by=stuck`、`verified=False`、`day_justified=False`；`tools/verify-run3.py` 的窗口闸门只在 `scope=="window" && crops==0` 判红，`crops>0` 不触发，但当天已经因为别的闸门红了 ⇒ **不产生假绿**。
+- 因此**不另立卡**；字段级收口（让全死苗时直接写 `false`）列为 0.7.28 可选 NIT（见 `docs/_review-task99.md` NIT-2、`longrun.py:1071/:1085-1093`）。
+- 实测出处：`scratch/_t100_b.py` / `scratch/_t100_b_out.txt`（task-100，`4b68e94`）。
+
 ## 4. run6 起跑与收口纪律
 
 - 起跑前：`tools/preflight.py --expect 0.7.25 --save-baseline logs/run6-baseline.json` 四项全绿；记「版本四要素」（HEAD / 被测文件 SHA256+mtime / PID+StartTime / 工作树干净）。
