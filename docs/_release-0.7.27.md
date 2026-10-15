@@ -9,8 +9,8 @@
 
 | 卡 | 内容 | 作者 | 写盘范围 | 状态 |
 |---|---|---|---|---|
-| **task-55** | 经济闭环（二）：卖**盈余材料**换种子钱（每 id 保留 K=10、三条件门闸 `money < 5×seed_price` 且 `seeds_total==0` 且 `farm.emptyDirt>0`、`Money +=` 零写入） | dev-coder | `brain/agentfarm/{farmwork,longrun}.py` + `tests/` | in_progress |
-| **task-84** | 死苗不浇水：Mod 把 dry 拆「活苗/死苗」+ `water()` 排除死苗 + `clear_dead` 提到 `water_area` 之前 | dev-coder | `mod/AgentFarm.Bridge/{FarmScan,Contracts}.cs` + `brain/agentfarm/{farmwork,longrun}.py` + `tests/` | pending |
+| **task-55** | 经济闭环（二）：卖**盈余材料**换种子钱（每 id 保留 K=10、三条件门闸 `money < 5×seed_price` 且 `seeds_total==0` 且 `farm.emptyDirt>0`、`Money +=` 零写入） | dev-coder | `brain/agentfarm/{farmwork,longrun}.py` + `tests/` | **已交付 `6948bb4`**（Lead 代码级 PASS；桶漂移红归 task-91，标 completed 已授权） |
+| **task-84** | 死苗不浇水：Mod 把 dry 拆「活苗/死苗」+ `water()` 排除死苗 + `clear_dead` 提到 `water_area` 之前 + `given_up` 格当天剔出「还有活」 | dev-coder | `mod/AgentFarm.Bridge/{FarmScan,Contracts}.cs` + `brain/agentfarm/{farmwork,longrun}.py` + `tests/` | in_progress（0.7.27 最后一张 Mod 卡） |
 | **task-83** | 田块规整：固定当家田块 + `next_plant_tiles()` 行优先连续填空 + 同日不跨 zone | dev-coder | `brain/agentfarm/` + `tests/` | pending（**赶不上就挪 0.7.28**） |
 
 ⚠️ **Mod 有无改动决定是否 bump**：task-84 动 `mod/` ⇒ 必须 bump 到 0.7.27；若 task-84 掉卡（只剩 brain-only 卡），**不要 bump**，直接以 0.7.26 起 run8（此时本文件改名为「run8 执行记录」，本版号作废）。
