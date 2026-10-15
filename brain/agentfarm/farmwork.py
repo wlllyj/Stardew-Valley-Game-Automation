@@ -47,6 +47,7 @@ __all__ = [
     "STAGE_ACTION",
     "SURPLUS_MATERIAL_IDS",
     "SURPLUS_MATERIAL_KEEP",
+    "SURPLUS_MIN_UNIT_PRICE",
     "SURPLUS_MONEY_FACTOR",
     "TILE_INERT_STATUSES",
     "UNREACHABLE_CODE",
@@ -803,6 +804,12 @@ SURPLUS_MATERIAL_KEEP = 10
 #: 触发门闸的倍数：`money < SURPLUS_MONEY_FACTOR × seed_price` 才值得动出货箱（卡面 5 倍）。
 SURPLUS_MONEY_FACTOR = 5
 
+#: 【Lead m08064 硬要求】"唯一一大叠整叠卖"这条路只有在**真能把钱补到 `seed_price`** 时才走。
+#: ⚠ 脑侧看不到售价（`ItemView` 既无 `sellToStorePrice` 也无 category）⇒ 只能按**最保守下界**
+#: 估计收益：每件至少 `SURPLUS_MIN_UNIT_PRICE` g（白名单里的材料真机售价都 ≥1g，纤维/史莱姆
+#: 是最低档）。下界都补不上缺口 ⇒ 卖完也买不起种子 ⇒ 干脆不动（记 `surplus_sell_skip` 带缺口）。
+SURPLUS_MIN_UNIT_PRICE = 1
+
 #: 允许卖的**材料 id 白名单**（fail-closed：不在表里的一件都不卖）。
 #:
 #: 为什么用 id 表而不是游戏分类：`mod\AgentFarm.Bridge\Contracts.cs` 的 `ItemView` 只有
@@ -873,9 +880,15 @@ def surplus_sell_plan(
     卖法：**每 id 留够 `keep` 件，只卖超出的整叠**（`ShipSkill` 只能整叠出货、没有
     "卖一部分"的能力）⇒ 某个槽只有当"卖掉它之后该 id 仍 ≥ keep"时才进名单。
 
+    【Lead m08064 硬要求】在一件都挑不出、却存在 `stack > keep` 的**唯一一大叠**时，
+    破例整叠卖**只有在下限估计下真能把钱补到 `seed_price`** 时才允许
+    （`money + stack × SURPLUS_MIN_UNIT_PRICE >= seed_price`）；补不上缺口就 skip，
+    并把缺口原文放进 `skipReason`（脑侧看不到售价 ⇒ 用最保守下界，fail-closed）。
+
     返回：`should`（要不要动手）、`gate`（三条门闸是否都成立）、`slots`（要卖的槽位，升序）、
     `whitelist`（对应 qualifiedId 列表，交给 Mod 做精确白名单）、`items`（逐 id 账本：
-    `total/sell/left/keep`）、`trigger`（触发理由原文：money/seeds/emptyDirt/threshold）。
+    `total/sell/left/keep`）、`trigger`（触发理由原文：money/seeds/emptyDirt/threshold）、
+    `belowKeep`（是否破例整叠卖）、`short`（买种子还差多少钱）、`skipReason`（不卖的原因原文）。
     """
     player = FarmWorker.player_of(obs)
     money = FarmWorker.money(obs)
@@ -926,6 +939,8 @@ def surplus_sell_plan(
                 picked.append(st)
                 left -= st["stack"]
     below_keep = False
+    short = max(0, int(seed_price) - int(money))
+    skip_reason = ""
     if gate and not picked:
         # 【整叠限制】`ShipSkill` 只调 `Farm.shipItem(item, who)`，**没有"卖一部分"的能力**：
         # 一叠要么整叠进箱、要么一件都卖不动。于是"保留 K 件"与"卖得出去"在**唯一一大叠**
@@ -933,11 +948,22 @@ def surplus_sell_plan(
         # 取"卖"：这一叠本身就超过保留线，留着它等于永远换不到种子钱（run7 的石头/木头大概率
         # 就是一大叠）。但**如实标记** `belowKeep`，账本与日报告都能看见"卖完只剩 X 件 < K"。
         # 想改成严格保留 K：把这段去掉即可（那时代价是"大叠永远卖不出去"）。
+        #
+        # 【Lead m08064 硬要求】只有它**真能把钱补到 `seed_price`** 时才走这条路：
+        # `money + 收益 >= seed_price`。⚠ 脑侧**看不到售价**（`ItemView` 没有
+        # `sellToStorePrice`/category）⇒ 用 `SURPLUS_MIN_UNIT_PRICE = 1g/件` 的**下界**估计：
+        # 下界都补不上缺口 ⇒ 卖了也买不起种子，那就别动（skip 时把缺口写进 skipReason）。
         cands = [s for s in stacks if int(s["stack"]) > int(keep)]
         if cands:
             best = max(cands, key=lambda s: (int(s["stack"]), -int(s["slot"])))
-            picked = [best]
-            below_keep = True
+            est = int(best["stack"]) * int(SURPLUS_MIN_UNIT_PRICE)
+            if est >= short:
+                picked = [best]
+                below_keep = True
+            else:
+                skip_reason = (f"唯一一大叠 {best['name'] or best['qid']}×{int(best['stack'])} "
+                               f"按最低价（{int(SURPLUS_MIN_UNIT_PRICE)}g/件）也只值 {est}g，"
+                               f"补不上买种子的缺口 {short}g（钱 {int(money)}g）⇒ 卖了也买不起，先不动")
     picked.sort(key=lambda s: s["slot"])
     items = []
     for qid in sorted(totals):
@@ -951,6 +977,8 @@ def surplus_sell_plan(
         "should": bool(gate and picked),
         "gate": bool(gate),
         "belowKeep": bool(below_keep),
+        "short": int(short),
+        "skipReason": skip_reason,
         "slots": [int(s["slot"]) for s in picked],
         "whitelist": sorted({str(s["qid"]) for s in picked}),
         "items": items,

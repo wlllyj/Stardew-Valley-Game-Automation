@@ -4315,6 +4315,26 @@ class TestTask55SurplusSell(unittest.TestCase):
         self.assertEqual(summary["items"][0]["left"], 0)
         self.assertTrue(any("K=10" in n for n in rep.notes), rep.notes)
 
+    def test_lone_stack_is_skipped_when_it_cannot_cover_the_seed_price(self):
+        """【Lead m08064 硬要求】唯一一大叠"卖了也买不起种子"时**不许卖**，如实记 skip + 缺口。
+
+        钱 0g、缺口 20g、一大叠 11 件 ⇒ 最低价下界只有 11g < 20g ⇒ skip，并把缺口原文写进
+        `surplus_sell_skip`（`short`/`reason`），不要制造"卖了还是买不起"的假动作。
+        """
+        w = self._world(money=0, materials=(self._material(6, "390", "Stone", 11),))
+        run = self._run(w)
+        rep = DayReport(day_key=("summer", 1, 7), started_at=0.0)
+        run._preconditions(w.obs(), rep)
+        self.assertEqual(run.worker.sell_calls, [])
+        self.assertEqual(self._events(run, "sell"), [])
+        skips = self._events(run, "surplus_sell_skip")
+        self.assertEqual(len(skips), 1, run.entries)
+        self.assertEqual(skips[0]["short"], 20)
+        self.assertIn("缺口 20g", skips[0]["reason"])
+        self.assertFalse(skips[0]["below_keep"])
+        self.assertTrue(run.surplus_sold_today, "门闸成立就算处理过，别每轮重算")
+        self.assertTrue(any("买不起" in n or "补不上" in n for n in rep.notes), rep.notes)
+
     def test_sell_failure_is_recorded_but_never_a_hard_failure(self):
         w = self._world(materials=(self._material(6, "388", "Wood", 25),
                                    self._material(7, "388", "Wood", 5)))

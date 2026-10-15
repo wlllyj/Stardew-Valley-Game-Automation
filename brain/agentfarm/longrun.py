@@ -1687,10 +1687,15 @@ class LongRun:
         # 每轮都会往 notes 里塞同一句话（`_preconditions` 是每轮都调的）。
         self.surplus_sold_today = True
         if not plan["slots"]:
-            reason = (f"钱 {trig['money']}g < {trig['threshold']}g 且种子 0 且空耕地 "
-                      f"{trig['emptyDirt']} 格 ⇒ 该卖材料换钱，但没有任何材料 id 超过保留线"
-                      f" K={plan['keep']}")
-            self._journal("surplus_sell_skip", reason=reason, trigger=trig, items=plan["items"])
+            # `surplus_sell_plan` 可能在"唯一一大叠也补不上种子钱"时主动拒绝（Lead m08064
+            # 硬要求）⇒ 用它的 `skipReason` 原文，别让账本只剩一句笼统的"没有材料超线"。
+            reason = str(plan.get("skipReason") or "").strip() or (
+                f"钱 {trig['money']}g < {trig['threshold']}g 且种子 0 且空耕地 "
+                f"{trig['emptyDirt']} 格 ⇒ 该卖材料换钱，但没有任何材料 id 超过保留线"
+                f" K={plan['keep']}")
+            self._journal("surplus_sell_skip", reason=reason, short=int(plan.get("short") or 0),
+                          below_keep=bool(plan.get("belowKeep")), trigger=trig,
+                          items=plan["items"])
             rep.notes.append(f"想卖盈余材料换种子钱：{reason}")
             self._say(f"  · {reason}")
             return False

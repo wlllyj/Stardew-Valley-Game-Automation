@@ -1951,6 +1951,71 @@ class TestTask55SurplusPlan(unittest.TestCase):
             else:
                 self.assertEqual(got, (0, "unavailable"), bad)
 
+    def test_lone_oversized_stack_is_skipped_when_even_the_floor_cannot_cover_it(self):
+        """【Lead m08064 硬要求】唯一一大叠也只有"**真能把钱补到 `seed_price`**"时才卖。
+
+        脑侧看不到售价（`ItemView` 没有 `sellToStorePrice`）⇒ 用 `SURPLUS_MIN_UNIT_PRICE`
+        （1g/件）做**最保守下界**：下界都够不上缺口（这里钱 0g、缺口 20g、一大叠 11 件 ⇒ 11g）
+        就干脆不动，并把缺口原文写进 `skipReason`（fail-closed：宁可少卖，不做"卖了还是买不起"）。
+        反过来，下界够得上时仍照旧整叠卖并标 `belowKeep`（见下一条断言）。
+        """
+        tiny = [{"slot": 6, "id": "390", "qualifiedId": "(O)390", "name": "Stone",
+                 "stack": 11, "isTool": False}]
+        plan = surplus_sell_plan(self._world(money=0, inventory=tiny).obs())
+        self.assertTrue(plan["gate"])
+        self.assertFalse(plan["should"])
+        self.assertFalse(plan["belowKeep"])
+        self.assertEqual(plan["slots"], [])
+        self.assertEqual(plan["short"], 20)
+        self.assertIn("补不上", plan["skipReason"])
+        self.assertIn("缺口 20g", plan["skipReason"])
+        # 够得上：同样钱 0g、一大叠 30 件 ⇒ 30g >= 20g ⇒ 卖
+        enough = [{"slot": 6, "id": "390", "qualifiedId": "(O)390", "name": "Stone",
+                   "stack": 30, "isTool": False}]
+        plan2 = surplus_sell_plan(self._world(money=0, inventory=enough).obs())
+        self.assertTrue(plan2["should"])
+        self.assertEqual(plan2["slots"], [6])
+        self.assertTrue(plan2["belowKeep"])
+        self.assertEqual(plan2["skipReason"], "")
+
+    def test_seed_like_names_are_structurally_kept_out_of_the_whitelist(self):
+        """【Lead m08064 硬要求】白名单必须**结构性**排除种子：id 表 + 名字双保险。
+
+        两道闸门是同一个判据的两侧：`surplus_sell_plan` 只认材料 id 表，且名字带
+        seed/种子 的叠**既不算材料、又会被 `seed_items()` 当成种子** ⇒ 只要背包里出现
+        种子（或名字像种子的东西），门闸里的 `seeds_total == 0` 当场不成立、整条卖货路径
+        直接关掉。这里把这两种形态都钉死：种子 id 472、材料 id 却起名 "Stone Seeds"。
+        `isTool=True` 的材料 id 同样永远不进白名单（工具不卖）。
+        """
+        # ① 种子 id（哪怕 stack 99）⇒ 门闸关闭（seeds_total=99）、一件不卖
+        with_seed = self._world(inventory=[
+            {"slot": 5, "id": "472", "qualifiedId": "(O)472", "name": "Parsnip Seeds",
+             "stack": 99, "isTool": False}])
+        plan = surplus_sell_plan(with_seed.obs())
+        self.assertFalse(plan["gate"])
+        self.assertFalse(plan["should"])
+        self.assertEqual(plan["slots"], [])
+        self.assertEqual(plan["whitelist"], [])
+        # ② 名字像种子的材料 id（"Stone Seeds" + (O)390）⇒ 同样按种子计数 ⇒ 门闸关闭
+        fake = self._world(inventory=[
+            {"slot": 6, "id": "390", "qualifiedId": "(O)390", "name": "Stone Seeds",
+             "stack": 99, "isTool": False}])
+        plan2 = surplus_sell_plan(fake.obs())
+        self.assertFalse(plan2["gate"])
+        self.assertEqual(plan2["slots"], [])
+        self.assertEqual([i["id"] for i in plan2["items"]], [])
+        # ③ 只有真材料才算：工具（isTool=True，id 388）+ Stone 99 ⇒ 白名单只有 Stone
+        mixed = self._world(inventory=[
+            {"slot": 5, "id": "388", "qualifiedId": "(O)388", "name": "Wood",
+             "stack": 99, "isTool": True},
+            {"slot": 8, "id": "390", "qualifiedId": "(O)390", "name": "Stone",
+             "stack": 99, "isTool": False}])
+        plan3 = surplus_sell_plan(mixed.obs())
+        self.assertTrue(plan3["gate"])
+        self.assertEqual(plan3["whitelist"], ["(O)390"])
+        self.assertEqual(plan3["slots"], [8])
+        self.assertEqual({i["id"] for i in plan3["items"]}, {"(O)390"})
+
     def test_material_id_table_is_documented_and_small(self):
         """白名单表必须是"已知资源 id"的小表（防止有人顺手加个通配规则把种子也算进去）。"""
         self.assertIn("390", SURPLUS_MATERIAL_IDS)
