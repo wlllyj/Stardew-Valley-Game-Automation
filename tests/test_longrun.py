@@ -46,11 +46,10 @@ from agentfarm.planner import BoundaryPlanner, Brief, TaskIntent, deterministic_
 SEED_ID = "472"
 SEED_NAME = "Parsnip Seeds"
 
-#: 【task-96】`FakeWorld.farm` 的默认值：**桥在线、扫描完整、农场级无事可报**。
-#: 真机 0.7.27 的桥每张快照都会发 `farm`（`complete=true`），所以"普通日"用例不该掉进
-#: 脑侧新增的 fail-closed（人在农场 + 证据不可用 ⇒ 不许收工）。要测"证据不可用"就把
-#: `w.farm` 显式设成 `{}` / `{"complete": False}` / `{"loaded": False}`；要世界一致的
-#: 真实计数用 `w.farm_scan()`。
+#: 【task-99 ② / NIT-6】`None` = **证据不可用**（等价于 `{}`：桥没给 farm 块）。
+#: task-96 曾经把 `None` 解释成"按世界状态自动生成 `farm_scan()`" ⇒ 任何用 `None` 表示
+#: "证据不可用"的用例/探针会**静默变成"证据可用"**（deputy 的 C6d/C8c 就是这样看着像修好了）。
+#: 现在要"世界一致的真实扫描"必须**显式**写 `w.farm = w.farm_scan()`。
 _EMPTY_FARM_SCAN = {
     "loaded": True, "complete": True,
     "crops": 0, "ripeCrops": 0, "deadCrops": 0,
@@ -86,11 +85,13 @@ class FakeWorld:
         #: task-19：`location.isOutdoorFarm`（浇水证据要区分室内/户外快照）与 `farm` 块
         #: （`FarmView` 的字段）。
         self.is_outdoor_farm = True
-        #: 【task-96】`farm` 块（`FarmView` 字段）。默认 = **「桥在线、扫描完整、农场级无事
-        #: 可报」的空计数块** —— 真机 0.7.27 的桥每张快照都会发 `farm`（`complete=true`），
-        #: 脑侧新增的 fail-closed 判据（人在农场 + 证据不可用 ⇒ 不许收工）因此不该在"普通
-        #: 日"用例里触发。想测**证据不可用**就显式赋 `{}` / `{"complete": False}` /
-        #: `{"loaded": False}`；想要一份**与世界状态一致**的真实扫描用 `self.farm_scan()`。
+        #: 【task-96 / task-99 ②】`farm` 块（`FarmView` 字段）。默认 = **「桥在线、扫描完整、
+        #: 农场级无事可报」的空计数块** —— 真机 0.7.27 的桥每张快照都会发 `farm`
+        #: （`complete=true`），脑侧的 fail-closed 判据（人在农场 + 证据不可用 ⇒ 不许收工）
+        #: 因此不该在"普通日"用例里触发。
+        #: **`None` = 证据不可用**（等价 `{}`，NIT-6：不许再被解释成"自动扫描"）；
+        #: 想测**证据不可用**就显式赋 `None` / `{}` / `{"complete": False}` / `{"loaded": False}`；
+        #: 想要一份**与世界状态一致**的真实扫描必须显式调 `self.farm_scan()`。
         self.farm: dict | None = _EMPTY_FARM_SCAN
         self.seq = 1
         self.sleeps = 0
@@ -161,10 +162,12 @@ class FakeWorld:
                          "tillable": [list(t) for t in free], "refillTiles": [[70, 10], [70, 11]],
                          "refillTilesTruncated": False, "furniture": [], "doors": []},
             # task-19：真机观测里 `farm` 永远存在（未加载时 loaded=false/complete=true/全 0）。
-            # 【task-96】默认 `_EMPTY_FARM_SCAN`（桥在线、扫描完整、农场级无事可报）；显式赋值
-            # （含 `{}` / `complete=false` / `loaded=false`）原样发出，用于测 fail-closed；
-            # 赋 `None` 才会走"按世界状态自动生成"的 `farm_scan()`。
-            "farm": dict(self.farm) if self.farm is not None else self.farm_scan(),
+            # 【task-96 / task-99 ②】默认 `_EMPTY_FARM_SCAN`（桥在线、扫描完整、农场级无事可报）；
+            # 显式赋值（含 `{}` / `complete=false` / `loaded=false`）原样发出；
+            # **`None` = 证据不可用 ⇒ 发 `{}`**（NIT-6：task-96 曾把它当"自动 farm_scan()"，
+            # 会让用 `None` 表示"不可用"的用例/探针静默变绿）；要世界一致的扫描必须显式
+            # `self.farm = self.farm_scan()`。
+            "farm": {} if self.farm is None else dict(self.farm),
             "ui": self.current_ui(),
             "liveness": {"worldAdvancing": True, "secondsSinceClockMoved": 1.0},
         }
@@ -4610,9 +4613,13 @@ class TestTask96EvidenceFailClosed(unittest.TestCase):
     """
 
     def test_on_farm_with_unavailable_farm_evidence_never_ends_no_work(self):
-        """人在农场 + 桥整块没给 `farm` ⇒ 一天绝不许以 `no_work` 收场（C8b/C8c）。"""
+        """人在农场 + 桥整块没给 `farm` ⇒ 一天绝不许以 `no_work` 收场（C8b/C8c）。
+
+        【task-99 ② / NIT-6】这里用 **`None`** 表示"没有 farm 块"（过去 `None` 会被夹具解释成
+        "自动生成与世界一致的扫描" ⇒ 这一条会**静默变绿**）；变异：把夹具改回自动扫描 ⇒ 必红。
+        """
         w = FakeWorld(weeds=0, seeds=0, money=0)
-        w.farm = {}
+        w.farm = None
         run = make_run(w, target_days=1, max_days=1)
 
         run.run()
@@ -4722,6 +4729,112 @@ class TestTask96EvidenceFailClosed(unittest.TestCase):
         self.assertEqual(info["dry"], 0, info)
 
 
+class TestTask99DryCropsMissing(unittest.TestCase):
+    """task-99：`complete=true` 但 **`dryCrops` 缺失** ⇒ 干作物数**未知**（≠ 0）⇒ fail-closed。
+
+    deputy task-97 的 C1（`docs/_review-task96.md`）：`_farm_totals()` 旧写法 `dry is None and
+    ripe is None` 只在**两个字段都没有**时才返回 `None`；`<0.7.22` 的 Mod 是"`ripeCrops` 有值 +
+    没有 `dryCrops`" ⇒ 返回 `(0, 0)` ⇒ 守卫拿不到"还有干作物"、`_water_evidence` 退回窗口口径
+    （窗外那株没浇的活苗看不见）⇒ `no_work` + `watered_outdoor=true` + **假 VERIFIED**。
+    一行修法：`dry is None ⇒ return None`。代价（Lead 明示接受）：旧 Mod 下每个在场日都
+    fail-closed、拿不到 VERIFIED —— 诚实优先。
+
+    变异自检（`%TEMP%\t99_mutate.py`，复制 brain+tests 到临时目录、文本替换、跑本类、跑完即弃）：
+    **基线 6/6 绿**；**m99a**（把 `dry is None ⇒ return None` 退回 `dry is None and ripe is None` +
+    `int(dry or 0)`）红 **2** = `test_farm_totals_unknown_when_dry_missing` /
+    `test_missing_dry_crops_never_no_work_or_verified`（`test_missing_dry_crops_with_ripe_is_never_no_work`
+    在变异下仍绿：`ripe>0` 本来就能让守卫继续干，符合预期）；
+    **m99b**（夹具把 `None` 改回"自动 `farm_scan()`"）红 **1** =
+    `test_fixture_none_means_evidence_unavailable`。
+    """
+
+    #: `<0.7.22` 的 Mod：`complete=true` + `ripeCrops` 有值 + **没有** `dryCrops`。
+    LEGACY = {"loaded": True, "complete": True, "crops": 6, "ripeCrops": 0, "deadCrops": 0,
+              "unwateredCrops": 6, "hoeDirt": 6, "emptyDirt": 0, "dryTiles": []}
+
+    def test_farm_totals_unknown_when_dry_missing(self):
+        """单元级：`dryCrops` 缺失 ⇒ `None`（未知），补上 ⇒ `(dry, ripe)`；这正是 C1 的那一行。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.farm = dict(self.LEGACY)
+        run = make_run(w)
+        self.assertIsNone(run._farm_totals(w.obs()), "缺 dryCrops ⇒ 未知，不许当 0")
+
+        w.farm = {**self.LEGACY, "dryCrops": 0}
+        self.assertEqual(run._farm_totals(w.obs()), (0, 0), "补上 dryCrops 才是『没有干作物』")
+        w.farm = {**self.LEGACY, "dryCrops": 3, "ripeCrops": 2}
+        self.assertEqual(run._farm_totals(w.obs()), (3, 2))
+
+    def test_missing_dry_crops_never_no_work_or_verified(self):
+        """C1 反例：缺 `dryCrops` + `ripe==0` ⇒ 一天**绝不出** `no_work`、`verified` 必须 False。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.farm = dict(self.LEGACY)               # 窗外/全农场读数不完整
+        run = make_run(w, target_days=1, max_days=1)
+
+        run.run()
+
+        rep = run.days[0]
+        self.assertFalse(str(rep.ended_reason).startswith("no_work"), rep.ended_reason)
+        self.assertIn("farm 证据不可用", rep.ended_reason)
+        self.assertFalse(rep.verified, f"{rep.checks} / {rep.ended_reason}")
+        self.assertFalse(rep.checks["day_justified"], rep.checks)
+        events = [e for e in run.entries if e.get("event") == "farm_evidence_unavailable"]
+        self.assertEqual(len(events), 1, "每天最多一条")
+        self.assertTrue(events[0]["on_farm"])
+        ok, info = run._water_evidence(w.obs(), outdoor_obs=w.obs(), outdoor_t=1.0,
+                                      outdoor_name="Farm")
+        self.assertFalse(ok, info)               # 不许退回窗口口径自称浇过
+
+    def test_missing_dry_crops_with_ripe_is_never_no_work(self):
+        """缺 `dryCrops` 但 `ripeCrops>0` ⇒ 至少不许 `no_work`（熟作物也是活）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.farm = {**self.LEGACY, "ripeCrops": 2}
+        run = make_run(w, target_days=1, max_days=1)
+
+        run.run()
+
+        rep = run.days[0]
+        self.assertFalse(str(rep.ended_reason).startswith("no_work"), rep.ended_reason)
+        self.assertFalse(rep.verified, rep.checks)
+
+    def test_missing_dry_crops_positive_control_can_still_finish(self):
+        """正对照：同一世界**补上** `dryCrops=0` ⇒ 证据齐、守卫不再因"证据不可用"否决。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.farm = {**self.LEGACY, "dryCrops": 0, "ripeCrops": 0, "crops": 0, "hoeDirt": 0}
+        run = make_run(w)
+
+        allow, code, why = run.sleep_guard(w.obs())
+
+        self.assertNotIn("farm 证据不可用", why)
+        self.assertTrue(allow, why)
+        self.assertEqual(code, "no_work")
+
+    def test_fixture_none_means_evidence_unavailable(self):
+        """NIT-6：夹具 `farm=None` ⇒ 观测里**没有**可用的 `farm`（不再是"自动扫描"）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.dirt.add((60, 10))
+        w.crops[(60, 10)] = {"ripe": False, "watered": False}
+        w.farm = None
+        run = make_run(w)
+
+        obs = w.obs()
+
+        self.assertEqual(obs["farm"], {}, "None 必须表示『证据不可用』")
+        self.assertIsNone(run._farm_totals(obs))
+        self.assertFalse(run.sleep_guard(obs)[0], "证据不可用 ⇒ 不许放行")
+        # 显式要"世界一致扫描"时仍然拿得到（且与窗口一致：1 株没浇的活苗）
+        w.farm = w.farm_scan()
+        scan = w.obs()["farm"]
+        self.assertIs(scan["complete"], True)
+        self.assertEqual((scan["crops"], scan["dryCrops"]), (1, 1), scan)
+        self.assertEqual(run._farm_totals(w.obs()), (1, 0))
+
+    def test_default_fixture_is_a_live_bridge_with_nothing_to_report(self):
+        """默认值语义：桥在线、扫描完整、农场级无事可报（普通日用例靠它才不触发 fail-closed）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = make_run(w)
+        self.assertIs(w.obs()["farm"]["complete"], True)
+        self.assertEqual(run._farm_totals(w.obs()), (0, 0))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
-

@@ -769,15 +769,26 @@ class LongRun:
 
         字段口径（`mod\\AgentFarm.Bridge\\Contracts.cs` 的 `FarmView`）：`dryCrops` 才是干格数；
         `unwateredCrops` 数的是 `NeedsWatering`（run3 里整天 32→32）⇒ 不能当判据。
+
+        【task-99 ① / task-97 C1】**`dryCrops` 缺失 ⇒ `None`（未知 ≠ 0）**：`dryCrops` 是
+        0.7.22（`bacd55a`）才有的字段，而 `watchdog.py:139-148` 的 `mod_version_mismatch`
+        只是 `LEVEL_WARN`（不停机）⇒ 任何 `<0.7.22` 的 Mod 都是"`complete=true` +
+        `ripeCrops` 有值 + **没有 `dryCrops`**"。旧代码在这时返回 `(0, 0)` ⇒ 守卫拿不到
+        "还有干作物"理由、`_water_evidence` 退回窗口口径（窗外那株真·没浇的活苗看不见）
+        ⇒ `no_work` + `watered_outdoor=true` + **假 VERIFIED**。`None` 一律只表示
+        **证据不可用**，交给 task-96 的 fail-closed 路径（work_reasons 给理由、守卫不放行
+        `no_work`，允许诚实 `stuck:` 收尾）。代价（Lead 明示接受）：旧 Mod 下每个在场日
+        都会 fail-closed、拿不到 VERIFIED —— 诚实优先，版本不匹配本来就该先升级 Mod。
         """
         farm = obs.get("farm") or {}
         if farm.get("complete") is not True or farm.get("loaded") is False:
             return None                     # 旧 Mod / 未加载（全 0）⇒ 不算证据
         dry = farm.get("dryCrops")
         ripe = farm.get("ripeCrops")
-        if dry is None and ripe is None:
+        if dry is None:
+            # 【task-99 ①】干作物数**未知**（<0.7.22 的 Mod）⇒ 不是 0，是"拿不到证据"。
             return None
-        return (int(dry or 0), int(ripe or 0))
+        return (int(dry), int(ripe or 0))
 
     def _farm_scope_work(self, obs: dict[str, Any]) -> tuple[int, int] | None:
         """`farm` 块的"还有活"读数 `(dry, ripe)`；`None` = **拿不到可用证据**。
