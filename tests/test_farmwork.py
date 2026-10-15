@@ -26,7 +26,8 @@ from agentfarm.farmwork import (  # noqa: E402
     NEIGHBORS, FarmWorker, KIND_TOOL, MAX_CLEAR_SWINGS, StepResult as SR, StageResult,
     SURPLUS_MATERIAL_IDS, farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles,
     farm_empty_dirt, is_seed_offer,
-    is_unreachable, pick_seed_offer, seed_offers_from, surplus_sell_plan, till_blocked_by,
+    is_unreachable, pick_seed_offer, player_free_slots, seed_offers_from, surplus_sell_plan,
+    till_blocked_by,
     tool_missing_reason, tool_presence,
 )
 
@@ -1940,7 +1941,11 @@ class TestTask55SurplusPlan(unittest.TestCase):
         self.assertEqual((by_id["(O)771"]["total"], by_id["(O)771"]["sell"]), (10, 0))
         self.assertEqual(plan["trigger"], {"money": 14, "seeds": 0, "emptyDirt": 40,
                                            "emptyDirtStatus": "ok", "seedPrice": 20,
-                                           "threshold": 100, "keep": 10})
+                                           "threshold": 100, "keep": 10,
+                                           # 【task-102】空格死锁路径的账目（本用例走钱路径，
+                                           # 所以 freeSlots 缺证据、slotsNeeded 恒为 1）
+                                           "freeSlots": None, "freeSlotsStatus": "unavailable",
+                                           "slotsNeeded": 1})
 
     def test_never_offers_tools_seeds_crops_or_artisan_goods(self):
         """fail-closed：材料 id 表外的一律不卖（工具/种子/作物/工匠品）。
@@ -2101,6 +2106,64 @@ class TestTask55SurplusPlan(unittest.TestCase):
         self.assertIn("388", SURPLUS_MATERIAL_IDS)
         self.assertNotIn("472", SURPLUS_MATERIAL_IDS)     # 防风草种子
         self.assertNotIn("24", SURPLUS_MATERIAL_IDS)      # 防风草（作物）
+
+
+class TestTask102PlayerFreeSlots(unittest.TestCase):
+    """task-102：背包空格 = `inventoryCount`（容量）− `len(inventory)`（只含非空格）。
+
+    真机口径（`mod\\AgentFarm.Bridge\\WorldSnapshot.cs`）：`inventoryCount` 读 `p.Items.Count`，
+    `ReadInventory` 跳过 null。任一字段缺失（`detail != full` 的旧桥）⇒ `unavailable`
+    （**不知道**，绝不是 0 —— 否则会去卖东西腾格）。
+    """
+
+    def test_free_slots_is_capacity_minus_occupied(self):
+        self.assertEqual(player_free_slots(
+            {"inventoryCount": 12, "inventory": [{"slot": 0}, {"slot": 5}]}), (10, "ok"))
+        self.assertEqual(player_free_slots({"inventoryCount": 12, "inventory": []}), (12, "ok"))
+        self.assertEqual(player_free_slots({"inventoryCount": 36, "inventory": [{}] * 36}),
+                         (0, "ok"))
+
+    def test_missing_or_bogus_fields_are_unavailable_not_zero(self):
+        for player in ({},
+                       {"inventoryCount": 12},                       # 旧桥没有 inventory[]
+                       {"inventory": [{"slot": 0}]},                 # 旧桥没有 inventoryCount
+                       {"inventoryCount": None, "inventory": []},
+                       {"inventoryCount": "12", "inventory": []},    # 类型不对
+                       {"inventoryCount": 0, "inventory": []},       # 容量 0 = 说不清
+                       {"inventoryCount": 12, "inventory": {}}):
+            self.assertEqual(player_free_slots(player), (0, "unavailable"), player)
+
+
+class TestTask102BuyNoSpace(unittest.TestCase):
+    """task-102：`no_inventory_space` 必须给**独立结果码** `no_space`（不是笼统 `failed`）。
+
+    真机（run8 day 12/13）：钱 188g、当季 Wheat Seeds 10g、背包 0 空格 ⇒ 26 次 `buy` 全废、
+    成交 0、白开 23 个 `ShopMenu`。脑侧要靠这个码"当天不再重试 + 卖一叠腾格"。
+
+    变异自检（同 `%TEMP%\\t102_mutate.py`）：**m102c**（`buy()` 里不再把
+    `no_inventory_space` 映射成 `no_space`）红 `test_no_inventory_space_maps_to_its_own_code`。
+    """
+
+    def test_no_inventory_space_maps_to_its_own_code(self):
+        w = MiniWorld(records=[weed_rec((60, 10))], inventory=[], money=188)
+        w.buy_fail_status = "no_inventory_space"
+        worker = make_worker(w)
+        r = worker.buy("(O)483", 10, shop="SeedShop")
+        self.assertFalse(r.ok)
+        self.assertEqual(r.code, "no_space", "独立结果码")
+        self.assertEqual(r.status, "no_inventory_space", "Mod 回执原文照留")
+        self.assertIn("no_inventory_space", r.reason)
+        self.assertIn("空格", r.reason)
+
+    def test_other_failures_still_report_failed(self):
+        """反面：`item_not_sold` 一类仍是 `failed`（不能被 `no_space` 吞掉）。"""
+        w = MiniWorld(records=[weed_rec((60, 10))], inventory=[], money=188)
+        w.buy_fail_status = "item_not_sold"
+        worker = make_worker(w)
+        r = worker.buy("(O)472", 10, shop="SeedShop")
+        self.assertFalse(r.ok)
+        self.assertEqual(r.code, "failed")
+        self.assertEqual(r.status, "item_not_sold")
 
 
 if __name__ == "__main__":  # pragma: no cover

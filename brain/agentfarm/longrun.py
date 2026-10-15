@@ -44,8 +44,8 @@ from typing import Any, Callable, Iterable
 from .bridge import MOD_VERSION_EXPECTED, BridgeClient, BridgeError
 from .farmwork import (ENV_BLOCK_STATUSES, FRONTIER_KINDS, SEED_KEEP_FACTOR, STAGE_ACTION,
                        FarmWorker, StageResult, StepResult, farm_dead_crops,
-                       farm_dry_dead_crops, farm_dry_tiles, pick_seed_offer, seed_items,
-                       surplus_sell_plan, till_blocked_by)
+                       farm_dry_dead_crops, farm_dry_tiles, pick_seed_offer, player_free_slots,
+                       seed_items, surplus_sell_plan, till_blocked_by)
 from .planner import (BoundaryPlanner, Brief, PlannerState, TaskIntent, TaskOutcome,
                       deterministic_plan)
 
@@ -108,6 +108,14 @@ MAX_STUCK_FLUSH = 2
 #: 取 2 与 `MAX_TILE_ATTEMPTS` 同口径：第一次多半是寻路的一次性抖动，第二次还不行就
 #: 认账（当天以 `stuck:` 收尾并点名坐标，而不是洗成"没活"）。
 FAR_DRY_MAX_TRIES = 2
+
+#: 【task-102】一天最多发起几次 `buy`（含探测与照清单复购）。
+#:
+#: run8 day 12/13：`buy` 一共 26 次、成交 0 —— 背包 0 空格，每次都 `no_inventory_space`，
+#: 还每次都白开一个 `ShopMenu`（当天 23 次 `modal_dismissed ShopMenu`）。
+#: 取 3：够走完"探测 → 照清单复购 → 卖一叠腾格后再买一次"这条最小闭环；
+#: 再多就是在同一堵墙上反复撞（当天的结论已经写进 `buy_no_space` journal）。
+MAX_BUY_TRIES_PER_DAY = 3
 
 #: 【task-11 模态守卫】**只等、绝不 dismiss** 的模态：新一天的自动存档。
 #: 真机实测（Lead 2026-10-11 22:2x）：`SaveGameMenu` 自己约 30s 走完 ⇒ `isModal=false`、
@@ -304,6 +312,10 @@ class DayReport:
     #: 跨日证据必须靠这一条（`tools\verify-run3.py` 优先读它，其次才退回 `final`）；
     #: 只在 `ended_by=="sleep"` 且睡后观测成功时非空 —— 它是**观测**，不是回执。
     day_after: list[Any] | None = None
+    #: 【task-102】今天是否"0 农场动作就想去睡"（被 `_do_sleep(require_work=True)` 拒绝）：
+    #: 这种日子**不推进**游戏日、`verified=false`，如实留痕（run8 day 12：06:20 起床、0 农场
+    #: 动作、直接睡到 day 13）。它和 `ended_by="stuck"`+`stuck_flush` 是两条不同的路径。
+    slept_without_work: bool = False
     verified: bool = False
     #: 【task-52】当天判为"走不到"（四邻都站不过去 / 寻路到不了）的**格数**与**逐格坐标**。
     #: 字段名与 `tools\verify-run3.py` 的交叉核对口径逐字对齐（Lead m04925）：
@@ -419,6 +431,8 @@ class DayReport:
             "encircled_tiles": [list(t) for t in self.encircled_tiles],
             # 【task-73】stuck 日是否已翻篇（睡过去了）—— 只作证据；验收口径不变
             "stuck_flushed": self.stuck_flushed,
+            # 【task-102】"0 农场动作就想睡"被拒绝（本日不推进、不 VERIFIED）—— 只作证据
+            "slept_without_work": self.slept_without_work,
             # 【task-84】枯死作物证据：farm 级计数（**带状态**：0 只代表"没有"当且仅当 ok）
             # + 当天已认输（够不着）的干格坐标。`watered_outdoor`/`final_water.dry` 只按活苗算。
             "dead_crops": self.dead_crops,
@@ -658,6 +672,19 @@ class LongRun:
         # 在买种子之前就短路了；账本侧看不出"是没钱还是任务失败"。每天只记一次（`_preconditions`
         # 每轮都调），次日清零。
         self.cannot_afford_noted = False
+        # 【task-102】经济闭环死锁的每日状态（run8 day 12/13：`buy` 26 次全废、0 农场动作就睡）：
+        #  * `buy_attempts_today` —— 今天发过几次 `buy`（上界 `MAX_BUY_TRIES_PER_DAY`）；
+        #  * `buy_no_space_today` —— 今天撞过 `no_inventory_space`（背包没空格）⇒ 当天不再重试，
+        #    并且守卫**不许**再拿"没种子但钱够 ⇒ 该去买"当理由（那理由今天已证明走不通）；
+        #  * `slot_sold_today` —— 今天是否已为"腾格"卖过一叠（一天一次，防每轮重复出货）；
+        #  * `farm_actions_today` —— 今天**真的动过农场**的动作数（锄/清/种/浇/收/开路）。
+        #    用于 `_do_sleep(require_work=True)`：一天 0 农场动作就睡 = 用睡觉跳过整天的活
+        #    （run8 day 12：06:20 起床、0 农场动作、直接睡到 day 13，`day_justified=false`）。
+        self.buy_attempts_today = 0
+        self.buy_no_space_today = False
+        self.buy_no_space_noted = False
+        self.slot_sold_today = False
+        self.farm_actions_today = 0
 
     # ------------------------------------------------------------------ 小工具
     def _mark_no_target(self, task: str) -> None:
@@ -746,6 +773,28 @@ class LongRun:
         self._actions += 1
         self._journal("goto_farm", ok=st.ok, code=st.code, reason=st.reason,
                       where="day_start", before=st.before, after=st.after, receipt=st.receipt)
+        if not st.ok and st.code in ENV_BLOCK_STATUSES:
+            # 【task-102 B】晨间 `ShippingMenu`（上一夜 sleep 留下的）会把 `goto_farm` 挡成
+            # `ui_modal`，而本方法**一天只调一次** ⇒ 玩家整天留在室内（run8 day 12 的形态：
+            # 全天 0 农场动作、守卫说还有 6 格干作物、最后 8 秒后收工）。
+            # 先清一次残留菜单、再试一次；仍不成才如实记失败（task-104 会接手"人不在农场
+            # 就别去浇窗口外干作物"，本卡只保证"能回就回"）。
+            fresh = self._dismiss_stray_menu(obs, rep, where="goto_farm")
+            if not self._is_farm(fresh):
+                st2 = self.worker.ensure_location(self.farm)
+                self._actions += 1
+                self._journal("goto_farm", ok=st2.ok, code=st2.code, reason=st2.reason,
+                              where="day_start_retry", before=st2.before, after=st2.after,
+                              receipt=st2.receipt,
+                              after_modal=str(((obs.get("ui") or {}).get("activeMenu")) or ""))
+                if st2.ok:
+                    self._say(f"  · 清掉残留模态后回到 {self.farm}：{st2.reason}")
+                    try:
+                        return self._snap()
+                    except BridgeError as exc:
+                        rep.notes.append(f"回到 {self.farm} 之后观测失败：{exc}")
+                        return fresh
+                st = st2
         if not st.ok:
             rep.notes.append(f"回不去 {self.farm}：{st.reason}")
             self._say(f"  × 回 {self.farm} 失败：{st.reason}")
@@ -810,6 +859,26 @@ class LongRun:
         "干着的作物格数"**，`unwateredCrops` 数的是 `NeedsWatering`（run3 里整天 32→32）。
         """
         return self._farm_totals(obs)
+
+    def _unfinished_work(self, obs: dict[str, Any]) -> bool:
+        """今天是否还有"该干没干"的活 —— task-102 的 `_do_sleep` 拦截判据。
+
+        下列任一成立即为"有活"：
+
+        * `work_reasons(obs)` 非空（守卫口径的"还有活"）；
+        * `farm` 口径 `dryCrops > 0` 或 `ripeCrops > 0`（含"人不在农场"的场景）；
+        * 今天撞过 `no_inventory_space`（钱够、种子买不进来 ⇒ 卖一叠腾格就是活）。
+
+        为什么**不**用"农场动作 = 0"单独判：真正的空农场（没作物、没目标）本来就应该能睡
+        （`no_work` 是诚实收工理由）。要拦的是 run8 day 12 那种"守卫说还有活、却一次没干就睡"
+        —— 那是拿睡觉跳过一整天的活。
+        """
+        if self.work_reasons(obs):
+            return True
+        totals = self._farm_totals(obs)
+        if totals is not None and (totals[0] > 0 or totals[1] > 0):
+            return True
+        return bool(self.buy_no_space_today)
 
     # --------------------------------------------------- task-50：窗口外的干作物
     @staticmethod
@@ -961,6 +1030,9 @@ class LongRun:
                       note="窗口外干作物：Mod 的 farm.dryTiles 给了坐标 ⇒ 走过去浇"
                            "（farm.dryCrops>0 时不许 no_work 收工；判据=该格 watered 或 dryCrops 下降）")
         if ok:
+            # 【task-102】浇成一格窗口外的干作物 = 一次真实的农场动作（`_do_sleep` 的
+            # "0 动作不许睡"判据看它）。
+            self.farm_actions_today += 1
             rep.notes.append(f"浇了窗口外那格干作物 {list(tile)}（第 {tries} 次尝试；"
                              f"farm.dryCrops {before_dry}→{after_dry}）")
             self._say(f"  · 浇窗口外干作物 {list(tile)}：{code}")
@@ -1630,6 +1702,7 @@ class LongRun:
             res = self.worker.run_stage("clear_area", [tile], min_stamina=self.min_stamina,
                                         max_steps=1)
             self._actions += len(res.steps)
+            self.farm_actions_today += sum(1 for s in res.steps if s.tile and not s.skipped)
             self._count_attempts(res.steps)
             self._mark_blocked(obs, self._snap(), res.steps, rep, stage="clear_area")
             self.frontier_clears += 1
@@ -1757,6 +1830,13 @@ class LongRun:
                     return True, "no_water", (
                         f"农场口径还有 {dry_f} 格干作物{where}，但{why}（想浇但无水；"
                         "这不是「没活可做」，当天按 needs_review 如实收尾）")
+        # 【task-102】钱够、没种子、却买不进来（背包没空格）：**不许睡**。
+        # run8 day 12/13 就是这条缺失 ⇒ 26 次 `no_inventory_space` 之后直接睡，把"买种子→播种"
+        # 整条腿跳过整整一天。腾格路径见 `_sell_surplus_for_slot`（同一天就能腾出来）。
+        if self.buy_no_space_today:
+            return False, "keep_working", (
+                "钱够但背包没有空格、种子买不进来（no_inventory_space）⇒ 先卖一叠腾格/腾背包，"
+                "今天不能靠睡觉跳过这条活")
         reasons = self.work_reasons(obs)
         if not reasons:
             return True, "no_work", "确实找不到可做的活（地里的活干完了、也没法/没必要买种子）"
@@ -1846,6 +1926,97 @@ class LongRun:
                           reason=bad[0].reason, code=bad[0].code)
         return bool(good)
 
+    def _dismiss_stray_menu(self, obs: dict[str, Any], rep: DayReport, *,
+                            where: str = "before_buy") -> dict[str, Any]:
+        """【task-102】关掉"不该开着"的残留菜单（`ShopMenu` / `ShippingMenu` 一类），返回新鲜观测。
+
+        run8 的连锁：`buy` 每次都留下一个 `ShopMenu`（当天 23 次 `modal_dismissed ShopMenu`），
+        下一次技能就被 `ui_modal` 拒；同一夜 sleep 留下的 `ShippingMenu` 还会挡住第二天的
+        `goto_farm`（`t=107.91` 失败 → `t=107.95` 才关掉），把玩家整天留在 FarmHouse 里。
+
+        只关"不该开着的"：`MODAL_WAIT_ONLY`（存档）与 `eventUp` 一律不碰（task-11/task-41）。
+        """
+        ui = obs.get("ui") or {}
+        menu = str(ui.get("activeMenu") or "")
+        if ui.get("eventUp") or menu in MODAL_WAIT_ONLY:
+            return obs
+        if not menu and not ui.get("isModal"):
+            return obs
+        assert self.client is not None
+        try:
+            res = self.client.dismiss_modal(timeout_ms=5000)
+        except BridgeError as exc:
+            self._journal("modal_dismiss_failed", where=where, menu=menu,
+                          reason=str(exc)[:200], status=str(getattr(exc, "status", "") or ""))
+            return obs
+        self._journal("modal_dismissed", where=where, menu=menu,
+                      ok=bool((res or {}).get("ok")) if isinstance(res, dict) else True)
+        return self._snap()
+
+    def _sell_surplus_for_slot(self, obs: dict[str, Any], rep: DayReport) -> bool:
+        """【task-102】为**腾出背包格子**卖一叠盈余材料（`why="need_slot"`）。
+
+        与 `_sell_surplus_for_seeds` 的区别（两条独立门闸，见 `farmwork.surplus_sell_plan`）：
+
+        * 凑钱那条：`money < 5 × seed_price` 且有空耕地 ⇒ 卖超 K 的叠换钱；
+        * 腾格这条（本方法）：**钱已经够**，但 `free_slots < 1` ⇒ 卖**一叠**把格子腾出来。
+          run8 day 12/13 的死锁就是缺这条：钱 188g、Wheat Seeds 10g，却因 0 空格 26 次买不成。
+
+        一天只做一次（`slot_sold_today`）；仍然只走 `SURPLUS_MATERIAL_IDS` 白名单，
+        尽量保留 K=10 件，整叠出货的事实如实记账。
+        """
+        assert self.worker is not None
+        if self.slot_sold_today:
+            return False
+        free_slots, fs_status = player_free_slots(FarmWorker.player_of(obs))
+        plan = surplus_sell_plan(obs, seed_price=self.seed_price, need_slot=True,
+                                 free_slots=free_slots, free_slots_status=fs_status,
+                                 slots_needed=1)
+        if not plan["slotGate"]:
+            return False
+        self.slot_sold_today = True
+        trig = plan["trigger"]
+        if not plan["slots"]:
+            reason = str(plan.get("skipReason") or "").strip() or (
+                f"背包放不下种子（空格状态 {fs_status}）⇒ 想卖一叠腾格，但没有任何材料叠可卖")
+            self._journal("surplus_sell_skip", why="need_slot", reason=reason, trigger=trig,
+                          items=plan["items"])
+            rep.notes.append(f"想卖一叠材料腾背包格子：{reason}")
+            self._say(f"  · {reason}")
+            return False
+        steps: list[StepResult] = []
+        for slot in plan["slots"]:
+            st = self.worker.sell(int(slot), whitelist=list(plan["whitelist"]),
+                                  timeout_ms=self.sell_timeout_ms)
+            self._actions += 1
+            steps.append(st)
+            before = st.before if isinstance(st.before, dict) else {}
+            self._journal("sell", ok=st.ok, code=st.code, strategy="surplus_materials",
+                          why="need_slot", slot=before.get("slot", slot), qid=before.get("qid"),
+                          stack=before.get("stack"), keep=plan["keep"],
+                          below_keep=bool(plan["belowKeep"]), trigger=trig,
+                          before=st.before, after=st.after, reason=st.reason, receipt=st.receipt)
+            if not st.ok:
+                break
+        good = [s for s in steps if s.ok]
+        bad = [s for s in steps if not s.ok]
+        sold = sum(int((s.before or {}).get("stack") or 0) for s in good)
+        self._journal("surplus_sell", ok=bool(good), why="need_slot",
+                      strategy="surplus_materials", keep=plan["keep"], slots=plan["slots"],
+                      whitelist=plan["whitelist"], items=plan["items"], trigger=trig, sold=sold,
+                      ok_count=len(good), fail_count=len(bad),
+                      below_keep=bool(plan["belowKeep"]), reason=(bad[0].reason if bad else ""),
+                      note="腾背包格子：钱够但种子买不进来；卖出的叠当天就腾出空格，"
+                           "钱仍要等下一次 NewDay 结算")
+        if good:
+            rep.notes.append(f"为腾格子卖了 {len(good)} 叠共 {sold} 个材料进箱"
+                             "（钱要等下一次 NewDay 结算；空格当天就腾出来）")
+            self._say(f"  · 腾格子：卖了 {len(good)} 叠共 {sold} 个材料")
+        if bad:
+            self._journal("sell_failed", why="need_slot", strategy="surplus_materials",
+                          reason=bad[0].reason, code=bad[0].code)
+        return bool(good)
+
     def _preconditions(self, obs: dict[str, Any], rep: DayReport) -> None:
         """种子没了就买**当季能买到的**种子。买不成如实记账，不让后面每一格去撞同一堵墙。
 
@@ -1863,6 +2034,13 @@ class LongRun:
             return
         assert self.worker is not None
         money = FarmWorker.money(obs)
+        # 【task-102】空格死锁（run8 day 12/13 的主因）：钱够、没种子，但背包**放不下**买来的种子
+        # ⇒ `buy` 只会回 `no_inventory_space`（当天 26 次、成交 0，还白开 23 个 `ShopMenu`）。
+        # 先卖一叠盈余材料腾格；这是独立于"凑钱"的第二条卖货门闸（见 `surplus_sell_plan`）。
+        free_slots, fs_status = player_free_slots(player)
+        if (seeds_total == 0 and money >= self.seed_price and fs_status == "ok"
+                and free_slots < 1 and not self.slot_sold_today):
+            self._sell_surplus_for_slot(obs, rep)
         # 【task-55】钱不够买种子时，先把"超出保留线的盈余材料"换成钱（钱要等下一次 NewDay
         # 才到账）—— 这是 run7 缺的那条腿：脑从没自己挣过钱、也没自己买过种子。
         # 门闸与"卖哪几叠"都由 `farmwork.surplus_sell_plan()` 判（每 id 留 K 件、只卖整叠）。
@@ -1870,11 +2048,27 @@ class LongRun:
         if not self.allow_buy:
             rep.notes.append("没种子（本轮禁止买种子）")
             return
+        if self.buy_no_space_today:
+            # 今天已经撞过"背包没空格"：再买还是同一堵墙（run8 一天撞 13 次）。
+            if not self.buy_no_space_noted:
+                self.buy_no_space_noted = True
+                rep.notes.append("今天背包没有空格、种子买不进来（no_inventory_space）⇒ 当天不再试 buy；"
+                                 "腾格要等同一天卖出/次日结算（见 buy_no_space / surplus_sell journal）")
+            return
+        if self.buy_attempts_today >= MAX_BUY_TRIES_PER_DAY:
+            rep.notes.append(f"今天已经发过 {self.buy_attempts_today} 次 buy（上限 "
+                             f"{MAX_BUY_TRIES_PER_DAY}）⇒ 不再试")
+            return
         if self.seed_dead_today:
             if not self.seed_dead_noted:
                 self.seed_dead_noted = True
                 rep.notes.append(f"今天已确认买不到合适种子（{self.seed_dead_today}），不再试")
             return
+        # 【task-102】买之前先把残留菜单关掉（run8：前一次 `buy` 留下的 `ShopMenu` 会让
+        # 下一次技能被 `ui_modal` 拒掉、也会挡住 `goto_farm`），并顺手刷新观测。
+        obs = self._dismiss_stray_menu(obs, rep, where="before_buy")
+        player = FarmWorker.player_of(obs)
+        money = FarmWorker.money(obs)
         if self.shop_offers:
             # 有清单：直接挑，**不发注定失败的请求**（清单跨天保留）。
             pick, code = pick_seed_offer(self.shop_offers, money)
@@ -1905,6 +2099,10 @@ class LongRun:
         st = self._buy_seed(self.buy_item, money, "probe", rep)
         if st is not None and st.ok:
             return
+        # 【task-102】`no_space` 是"背包放不下"，跟"这个 id 不在售"无关 ⇒ 换 id 也白搭，
+        # 当天到此为止（run8 一天 13 次就是这么白撞出来的）。
+        if st is not None and st.code == "no_space":
+            return
         # 探测失败：若回执带了货架清单，就照它重挑一次（换 id）；仍不成才下结论。
         pick, code = pick_seed_offer(self.shop_offers, money)
         if pick is not None:
@@ -1915,10 +2113,21 @@ class LongRun:
 
     def _buy_seed(self, item: str, money: int, source: str, rep: DayReport,
                   *, price: int = 0) -> StepResult | None:
-        """发一次 `buy`；把回执里的货架清单收进 `self.shop_offers`，并如实记 `buy` journal。"""
+        """发一次 `buy`；把回执里的货架清单收进 `self.shop_offers`，并如实记 `buy` journal。
+
+        【task-102】计数与"空格"分流：每次调用都记 `buy_attempts_today`（上界
+        `MAX_BUY_TRIES_PER_DAY`）；回执是 `no_space`（`no_inventory_space`）时置
+        `buy_no_space_today` 并记 `buy_no_space` —— 当天不再重试，守卫也不许再拿
+        "没种子但钱够 ⇒ 该去买"当理由（run8 day 12/13 就是在这条上撞了 26 次）。
+        """
         assert self.worker is not None
         if not item:
             return None
+        if self.buy_attempts_today >= MAX_BUY_TRIES_PER_DAY:
+            # 【task-102】上界要在**发请求之前**判：一次 `_preconditions` 里"探一次 + 照清单
+            # 换 id 再买一次"是两次请求，只靠调用方入口判会让当天总量漂到 4 次。
+            return None
+        self.buy_attempts_today += 1
         st = self.worker.buy(item, self.buy_count, shop=self.shop)
         self._actions += 1
         if st.available:
@@ -1927,8 +2136,20 @@ class LongRun:
         self._say(f"  · 补种子：{st.reason}")
         self._journal("buy", ok=st.ok, code=st.code, reason=st.reason, item=item,
                       count=self.buy_count, price=price, source=source,
+                      attempt=self.buy_attempts_today, limit=MAX_BUY_TRIES_PER_DAY,
                       before=st.before, after=st.after, receipt=st.receipt,
                       available=len(st.available))
+        if st.code == "no_space":
+            self.buy_no_space_today = True
+            _free, fs_status = player_free_slots(FarmWorker.player_of(self._snap()))
+            self._journal("buy_no_space", item=item, price=price, source=source,
+                          attempt=self.buy_attempts_today, free_slots_status=fs_status,
+                          reason=st.reason,
+                          note="背包没有空格 ⇒ 当天不再重试 buy（run8 一天 13 次同堵墙）；"
+                               "腾格路径见 `surplus_sell{why=need_slot}`，或等次日结算后背包腾出来")
+            if not self.buy_no_space_noted:
+                self.buy_no_space_noted = True
+                rep.notes.append(f"背包没空格，种子买不进来（{item} {price}g）⇒ 当天不再试 buy")
         return st
 
     def _seed_dead(self, code: str, rep: DayReport, *, money: int,
@@ -1951,8 +2172,35 @@ class LongRun:
         self._say(f"  · 买不到合适种子（{self.seed_dead_today}），今天不再试")
 
     # ------------------------------------------------------------------ 睡觉
-    def _do_sleep(self, obs: dict[str, Any], rep: DayReport, why: str) -> tuple[str, str]:
+    def _do_sleep(self, obs: dict[str, Any], rep: DayReport, why: str,
+                  *, require_work: bool = True) -> tuple[str, str]:
+        """睡一觉（被守卫放行时由调用方发起）。
+
+        【task-102】`require_work=True`（默认）时，**今天一次农场动作都没有就不许睡**：
+        run8 day 12 是 06:20 起床、当天 0 农场动作（goto_farm 被晨间 `ShippingMenu` 挡掉、
+        `water_far` 全 unreachable、`buy` 26 次全废）就睡到 day 13 ⇒ `verified=false`、
+        `day_justified=false`，等于用睡觉把一天的活跳过去。返回 `("slept_without_work", why)`
+        并**不推进游戏日**（`run()` 会照 `no_day_progress` 如实停下，绝不静默跳天）。
+
+        唯一的例外是 `_stuck_flush`（task-73 的有界翻篇）：它显式传 `require_work=False` ——
+        那条路径本日已用有界尝试证明"动不了"，翻篇是它的设计语义。
+        """
         assert self.worker is not None
+        if require_work and self.farm_actions_today <= 0 and self._unfinished_work(obs):
+            rep.slept_without_work = True
+            rep.notes.append(f"拒绝睡觉：今天还没有任何农场动作（{why}）⇒ 先干活再谈收工")
+            self._journal("slept_without_work", why=why, farm_actions=0,
+                          reasons=self.work_reasons(obs)[:6],
+                          note="0 农场动作就睡 = 用睡觉跳过整天的活（run8 day 12 形态）；"
+                               "本日不推进、按 needs_review 停在这里")
+            self._say("  × 今天还没动过农场，拒绝睡觉")
+            return "slept_without_work", why
+        # 【task-102】睡前先把残留模态关掉一次：run8 day 13 的 `sleep` 就是被 `ShopMenu`
+        # 卡成 `sleep_failed`（`ui.isModal` 为真时所有技能都会被 `ui_modal` 拒）。
+        # 存档类模态（`SaveGameMenu`/`NewDaySavingMenu`）与 `eventUp` 一律不碰（task-11/task-41）。
+        fresh = self._dismiss_stray_menu(obs, rep, where="before_sleep")
+        if fresh is not obs:
+            obs = fresh
         rep.final = self._essence(obs)          # ← 睡前观测：一天的验收就拿它当差分右端
         st = self.worker.sleep(home=self.home)
         self._actions += 1
@@ -2002,7 +2250,7 @@ class LongRun:
             return False
         self.stuck_flushes += 1
         why_txt = why or "守卫没有再给理由"
-        by, detail = self._do_sleep(obs, rep, f"stuck_flush:{why_txt}")
+        by, detail = self._do_sleep(obs, rep, f"stuck_flush:{why_txt}", require_work=False)
         ok = by == "sleep"
         if ok:
             # 睡成功后重新观测一次（`rep.final` 是**睡前**证据，跨日必须靠观测）：
@@ -2298,6 +2546,9 @@ class LongRun:
                 task, tiles, min_stamina=wmin, max_steps=self.per_stage_tiles)
             all_steps.extend(res.steps)
             self._actions += len(res.steps)
+            # 【task-102】"今天真的动过农场"的计数：只数**发出去过**的格子动作
+            # （`skipped` 是"judged before acting"，不算动作 ⇒ 0 动作的日子不许拿去睡觉）。
+            self.farm_actions_today += sum(1 for s in res.steps if s.tile and not s.skipped)
             # **每轮就封格 + 记发起次数**（不是等阶段跑完）：
             # 撞到 `budget` 会 continue 再跑一轮，而 `_stage_tiles` 是每轮现算的 ——
             # 若等到阶段结束才 `_mark_blocked`，同一格注定干不动的格子会在后续每一轮
@@ -2986,6 +3237,12 @@ class LongRun:
         # 【task-55】卖盈余材料的"今天已卖过"标志：每天清零（次日钱已到账、材料也变了）。
         self.surplus_sold_today = False
         self.cannot_afford_noted = False
+        # 【task-102】buy 尝试上限 / 空格死锁 / 腾格卖货 / 农场动作计数：每天清零。
+        self.buy_attempts_today = 0
+        self.buy_no_space_today = False
+        self.buy_no_space_noted = False
+        self.slot_sold_today = False
+        self.farm_actions_today = 0
         self.dead_scope_noted = set()
         self.no_target = set()
         self.no_target_global = set()

@@ -60,6 +60,7 @@ __all__ = [
     "farm_dead_crops",
     "farm_dry_dead_crops",
     "farm_empty_dirt",
+    "player_free_slots",
     "is_seed_offer",
     "is_unreachable",
     "pick_seed_offer",
@@ -886,6 +887,26 @@ def farm_empty_dirt(obs: dict[str, Any]) -> tuple[int, str]:
         return 0, "unavailable"
 
 
+def player_free_slots(player: dict[str, Any]) -> tuple[int, str]:
+    """背包还剩几个空格：`(数量, 状态)`；`"unavailable"` = 证据不可用（**不知道**，不是 0）。
+
+    【task-102】run8 day 2 的真死锁：钱 188g、当季 Wheat Seeds 只要 10g，但背包 0 空格 ⇒
+    `buy` 连续 13 次 `no_inventory_space`（每次都白开一个 `ShopMenu`），而卖货策略认为
+    "钱够了"就停手 ⇒ 没种子不能种 / 背包满不能买 / 钱够了不再卖。
+
+    口径（`mod\\AgentFarm.Bridge\\Contracts.cs` + `WorldSnapshot.cs`）：
+      * `player.inventoryCount` = **背包槽位容量**（`p.Items.Count`，12/24/36）；
+      * `player.inventory[]` = 只含**非空**格子（`ReadInventory` 跳过 null）。
+    ⇒ 空格数 = 容量 − 非空件数。任一字段缺失（`detail != full` 的旧桥）⇒ `unavailable`，
+    调用方按"不知道"处理（绝不因此去卖东西腾格）。
+    """
+    inv = player.get("inventory")
+    cap = player.get("inventoryCount")
+    if not isinstance(inv, list) or not isinstance(cap, int) or cap <= 0:
+        return 0, "unavailable"
+    return max(0, int(cap) - len(inv)), "ok"
+
+
 def _bare_item_id(value: Any) -> str:
     """`"(O)390"` / `"390"` ⇒ `"390"`（去掉 qualified 前缀）。"""
     s = str(value or "").strip()
@@ -901,24 +922,38 @@ def surplus_sell_plan(
     seed_price: int = 20,
     money_factor: int = SURPLUS_MONEY_FACTOR,
     max_items: int = 24,
+    need_slot: bool = False,
+    free_slots: int | None = None,
+    free_slots_status: str = "unavailable",
+    slots_needed: int = 1,
 ) -> dict[str, Any]:
     """决定"要不要为了买种子去卖盈余材料、以及卖哪几格"。**纯决策，不发请求。**
 
-    三条门闸**同时**满足才触发（卡面）：`money < money_factor × seed_price` 且
-    `seeds_total == 0` 且 `farm.emptyDirt > 0`（且 `emptyDirt` 证据状态必须是 `"ok"` ——
-    证据不可信时宁可不卖，fail-closed）。
+    两条触发路径（`why` 字段区分）：
+
+    * **`need_money`**（task-55）：三条门闸**同时**满足才触发（卡面）：`money < money_factor ×
+      seed_price` 且 `seeds_total == 0` 且 `farm.emptyDirt > 0`（且 `emptyDirt` 证据状态必须是
+      `"ok"` —— 证据不可信时宁可不卖，fail-closed）。
+    * **`need_slot`**（task-102）：`seeds_total == 0` 且 `money >= seed_price` 且
+      `free_slots < slots_needed`（背包没空格，种子买不进来）⇒ 卖**一叠**材料腾格。这条不看
+      钱门闸（钱够），也不要求有空耕地——**卡点是格子，不是钱**。run8 day 2 就是这条缺失：
+      钱 188g、当季种子 10g，却因为 0 空格把 13 次 `buy` 全撞死。
 
     卖法：**每 id 留够 `keep` 件，只卖超出的整叠**（`ShipSkill` 只能整叠出货、没有
     "卖一部分"的能力）⇒ 某个槽只有当"卖掉它之后该 id 仍 ≥ keep"时才进名单。
+    `need_slot` 时只挑**一叠**，并且按"损失最小"排：先看真正超线的叠（卖完仍 ≥ keep）里
+    最小的那叠，没有超线叠才退而卖最小的那叠并标 `belowKeep`（腾格优先，如实记账）。
 
     【Lead m08064 硬要求】在一件都挑不出、却存在 `stack > keep` 的**唯一一大叠**时，
     破例整叠卖**只有在下限估计下真能把钱补到 `seed_price`** 时才允许
     （`money + stack × SURPLUS_MIN_UNIT_PRICE >= seed_price`）；补不上缺口就 skip，
     并把缺口原文放进 `skipReason`（脑侧看不到售价 ⇒ 用最保守下界，fail-closed）。
+    这条只对 `need_money` 生效（`need_slot` 的钱本来就够）。
 
-    返回：`should`（要不要动手）、`gate`（三条门闸是否都成立）、`slots`（要卖的槽位，升序）、
+    返回：`should`（要不要动手）、`gate`（`need_money` 三条门闸是否都成立）、`why`
+    （`"need_money"` / `"need_slot"` / `""`）、`needSlot`、`slots`（要卖的槽位，升序）、
     `whitelist`（对应 qualifiedId 列表，交给 Mod 做精确白名单）、`items`（逐 id 账本：
-    `total/sell/left/keep`）、`trigger`（触发理由原文：money/seeds/emptyDirt/threshold）、
+    `total/sell/left/keep`）、`trigger`（触发理由原文：money/seeds/emptyDirt/freeSlots/threshold）、
     `belowKeep`（是否破例整叠卖）、`short`（买种子还差多少钱）、`skipReason`（不卖的原因原文）。
     """
     player = FarmWorker.player_of(obs)
@@ -934,9 +969,18 @@ def surplus_sell_plan(
         "seedPrice": int(seed_price),
         "threshold": int(threshold),
         "keep": int(keep),
+        "freeSlots": (None if free_slots is None else int(free_slots)),
+        "freeSlotsStatus": str(free_slots_status),
+        "slotsNeeded": int(slots_needed),
     }
     gate = (empty_status == "ok" and int(money) < threshold
             and int(seeds_total) == 0 and int(empty_dirt) > 0)
+    # 【task-102】腾格路径：钱够、没种子、但背包放不下买来的种子。
+    slot_gate = bool(
+        need_slot and free_slots_status == "ok" and free_slots is not None
+        and int(free_slots) < int(slots_needed)
+        and int(seeds_total) == 0 and int(money) >= int(seed_price)
+    )
 
     totals: dict[str, int] = {}
     stacks: list[dict[str, Any]] = []
@@ -996,6 +1040,23 @@ def surplus_sell_plan(
                                f"按最低价（{int(SURPLUS_MIN_UNIT_PRICE)}g/件）也只值 {est}g，"
                                f"补不上买种子的缺口 {short}g（钱 {int(money)}g）⇒ 卖了也买不起，先不动")
     picked.sort(key=lambda s: s["slot"])
+    # 【task-102】腾格路径：`need_slot` 时**只卖一叠** —— 先挑"卖了仍 ≥ keep"的真盈余叠里最小的一叠
+    # （损失最小），没有真盈余叠才退而卖最小的一叠并标 `belowKeep`（腾格优先、如实记账）。
+    if slot_gate and not picked:
+        surplus = sorted([s for s in stacks if int(totals[s["qid"]]) - int(s["stack"]) >= int(keep)],
+                         key=lambda s: (int(s["stack"]), int(s["slot"])))
+        if surplus:
+            picked = [surplus[0]]
+        elif stacks:
+            picked = [min(stacks, key=lambda s: (int(s["stack"]), int(s["slot"])))]
+            below_keep = True
+        else:
+            skip_reason = ("背包里没有可卖的盈余材料（只走 SURPLUS_MATERIAL_IDS 白名单，"
+                           "种子/工具/作物/工匠品一律不卖）⇒ 腾不出格子")
+        picked.sort(key=lambda s: s["slot"])
+    why = ""
+    if picked:
+        why = "need_slot" if slot_gate and not gate else "need_money"
     items = []
     for qid in sorted(totals):
         sold = sum(int(s["stack"]) for s in picked if s["qid"] == qid)
@@ -1005,8 +1066,11 @@ def surplus_sell_plan(
                       "sell": int(sold), "left": int(left),
                       "keptBelowKeep": bool(sold and left < int(keep))})
     return {
-        "should": bool(gate and picked),
+        "should": bool(picked and (gate or slot_gate)),
         "gate": bool(gate),
+        "slotGate": bool(slot_gate),
+        "why": why,
+        "needSlot": bool(need_slot),
         "belowKeep": bool(below_keep),
         "short": int(short),
         "skipReason": skip_reason,
@@ -2672,9 +2736,11 @@ class FarmWorker:
             r.receipt = _receipt(exc)
             # 失败回执原文在 `exc.payload`（`bridge.py::_request`）⇒ 一样能读货架。
             r.available = seed_offers_from(getattr(exc, "payload", None))
+            r.status = _exc_status(exc)
         else:
             # 旧桥（0.7.24 及之前）返回 None ⇒ `seed_offers_from` 给空表，语义 = "没有清单"。
             r.available = seed_offers_from(res if isinstance(res, dict) else None)
+            r.status = str(res.get("status") or "") if isinstance(res, dict) else ""
         obs = self.snap()
         money_after = self.money(obs)
         have_after = _count_item(self.player_of(obs), item)
@@ -2685,6 +2751,15 @@ class FarmWorker:
             r.ok = True
             r.reason = (f"买到 {have_after - have_before} 个 {item}（钱 {money_before}→{money_after}"
                         f"；货架 {len(r.available)} 条）")
+            return r
+        # 【task-102】背包含量卡死：钱够、种子在售、但背包既没有空格也没有同类堆叠可并入
+        # （run8 day 12 连撞 13 次）⇒ 给**独立结果码**，长跑侧才能"当天不再重试 + 卖一叠腾格"。
+        if r.status == "no_inventory_space":
+            r.code = "no_space"
+            r.reason = ("没成交：背包没有空格、也没有同类堆叠可并入（Mod status="
+                        f"no_inventory_space）；物品 {have_before}→{have_after}，"
+                        f"钱 {money_before}→{money_after}"
+                        + (f"；回执={r.receipt}" if r.receipt else ""))
             return r
         r.code = "failed"
         r.reason = (f"没成交：物品 {have_before}→{have_after}，钱 {money_before}→{money_after}"

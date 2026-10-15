@@ -38,8 +38,8 @@ from agentfarm.farmwork import (  # noqa: E402
 )
 from agentfarm.longrun import (  # noqa: E402
     DEFAULT_LLM_MAX_TOKENS, ENDED_BY_EVENT, ENDED_BY_MODAL, FRONTIER_CLEAR_MAX,
-    JUSTIFIED_END_REASONS, MAX_ENV_ATTEMPTS, MAX_STUCK_FLUSH, MAX_TILE_ATTEMPTS, DayReport,
-    LongRun, _till_blocked_by, is_justified_end, plot_observe,
+    JUSTIFIED_END_REASONS, MAX_BUY_TRIES_PER_DAY, MAX_ENV_ATTEMPTS, MAX_STUCK_FLUSH,
+    MAX_TILE_ATTEMPTS, DayReport, LongRun, _till_blocked_by, is_justified_end, plot_observe,
 )
 from agentfarm.planner import BoundaryPlanner, Brief, TaskIntent, deterministic_plan  # noqa: E402
 
@@ -102,6 +102,11 @@ class FakeWorld:
         self.buy_offers: list[dict] = []
         self.buy_calls: list[dict] = []      # 每一次 `buy` 请求的 item/count（证明不再硬编码 472）
         self.buy_price = 20                  # 配置项（默认 472）的单价
+        #: 【task-102】非空 = 每一次 `buy` 都回这个 Mod status（复刻 run8 day 12/13 的
+        #: `no_inventory_space`：钱够、种子在售、背包 0 空格）。
+        self.buy_fail_status: str = ""
+        #: 【task-102】背包容量（`player.inventoryCount`）；占格 = `len(inventory)` ⇒ 空格 = 差。
+        self.inventory_capacity = 12
         # 睡前那一刻"还有几格没浇" —— 跨日会把 watered 全部清零（世界语义），
         # 所以"这天有没有浇完"只能在睡前问，事后问必然为假。
         self.unwatered_at_sleep: list[int] = []
@@ -155,6 +160,9 @@ class FakeWorld:
             "player": {"name": "测试员", "location": self.location, "tile": list(self.player_tile), "facing": 2,
                        "stamina": self.stamina, "maxStamina": self.max_stamina, "money": self.money,
                        "isInBed": self.is_in_bed, "inventory": [dict(i) for i in self.inventory],
+                       # 【task-102】`inventoryCount` = 背包**容量**（真机 `WorldSnapshot.cs:260`
+                       # 读 `p.Items.Count`）；空格 = `inventoryCount - len(inventory)`。
+                       "inventoryCount": self.inventory_capacity,
                        "wateringCan": {"present": True, "waterLeft": self.water_left,
                                        "max": 40, "bottomless": False, "upgradeLevel": 0}},
             "location": {"name": self.location, "isOutdoorFarm": self.is_outdoor_farm, "tiles": tiles,
@@ -405,6 +413,11 @@ class FakeWorld:
         self.buy_calls.append({"item": str(item), "count": int(count)})
         price = self.buy_price
         offers = [dict(o) for o in self.buy_offers]
+        if self.buy_fail_status:
+            # 【task-102】背包含量卡死等 Mod 侧的失败码：回执带 status + 在售清单。
+            return StepResult("buy", code="failed", status=self.buy_fail_status,
+                              reason=f"没成交（Mod status={self.buy_fail_status}）",
+                              available=offers)
         if offers:
             want = "".join(ch for ch in str(item) if ch.isdigit())
             on_shelf = any(want and want == "".join(ch for ch in str(o.get("id") or "") if ch.isdigit())
@@ -4834,6 +4847,261 @@ class TestTask99DryCropsMissing(unittest.TestCase):
         run = make_run(w)
         self.assertIs(w.obs()["farm"]["complete"], True)
         self.assertEqual(run._farm_totals(w.obs()), (0, 0))
+
+
+class _NoSpaceWorker(_SurplusWorker):
+    """task-102：`buy` 回 `code="no_space"`（真 `FarmWorker.buy()` 在 `no_inventory_space` 时的结果码）。
+
+    `status` 用真桥原文（`no_inventory_space`），`code` 是脑侧分流后的结果码。
+    """
+
+    def __init__(self, world: FakeWorld, *, status: str = "no_inventory_space",
+                 code: str = "no_space") -> None:
+        super().__init__(world)
+        self.buy_status = status
+        self.buy_code = code
+        self.buy_requests: list[dict] = []
+
+    def buy(self, item, count=10, *, shop="SeedShop", timeout_ms=25000):
+        self.buy_requests.append({"item": str(item), "count": int(count)})
+        st = StepResult("buy", None, ok=False, code=self.buy_code,
+                        reason=f"没成交：背包没有空格、也没有同类堆叠可并入（Mod status={self.buy_status}）")
+        st.status = self.buy_status
+        # 真桥的成败回执都带货架清单（`availableItems`）⇒ 脑才有"换 id 重挑"的依据。
+        st.available = [dict(o) for o in self.w.buy_offers]
+        return st
+
+
+class _ModalThenFarmWorker(_SurplusWorker):
+    """task-102：第一次 `ensure_location` 被晨间 `ShippingMenu` 挡成 `ui_modal`，第二次成功。
+
+    复刻 run8 day 12：`goto_farm` 失败（`t=107.91`）→ 关掉 `ShippingMenu`（`t=107.95`）→
+    本卡要求"清模态后**重试一次**"，否则玩家整天留在 FarmHouse。
+    """
+
+    def __init__(self, world: FakeWorld) -> None:
+        super().__init__(world)
+        self.ensure_calls = 0
+
+    def ensure_location(self, name, *, tile=None, timeout_ms=30000):
+        self.ensure_calls += 1
+        st = StepResult("ensure_location", None)
+        if self.ensure_calls == 1:
+            st.code = "ui_modal"
+            st.reason = "[ui_modal] 有菜单/对话挡着（'ShippingMenu'），所有技能都会被拒"
+            st.receipt = "ui_modal"
+            return st
+        self.w.location = "Farm"
+        self.w.is_outdoor_farm = True
+        self.w.player_tile = [62, 14]
+        st.ok = True
+        st.code = "ok"
+        st.reason = "已到 Farm"
+        return st
+
+
+class TestTask102BuySlotDeadlock(unittest.TestCase):
+    """task-102：run8 day 12/13 的经济闭环死锁（背包 0 空格 ⇒ 26 次 buy 全废）+ 早睡防线。
+
+    真机证据（`logs/longrun-3day-llm-run8.jsonl`）：day 12 早晨 `goto_farm` 被上一夜留下的
+    `ShippingMenu` 挡掉（`t=107.91`）⇒ 人整天留 FarmHouse；`buy` 选品是对的（跳过春季 472、
+    选当季 Wheat Seeds 10g，钱 188g 够），但回 `no_inventory_space` —— 当天 13 次 + 次日 11 次、
+    成交 0、白开 23 个 `ShopMenu`；期间 `water_far` 全 `unreachable`、`dry 6→6`；最后 0 农场动作
+    就睡（day 2 06:20 直接睡到 day 13）。
+
+    变异自检（`%TEMP%\\t102_mutate.py`，跑完即弃）：基线 **12/12 绿**；**m102a**（空格死锁那条
+    分支短路）红 `test_slot_deadlock_sells_a_stack_then_buys_once`；**m102b**（`_do_sleep` 的
+    0 动作拦截短路）红 `test_do_sleep_refuses_a_day_with_work_but_no_actions`；**m102c**
+    （`no_inventory_space` 不再映射成 `no_space`）红
+    `test_farmwork.TestTask102BuyNoSpace.test_no_inventory_space_maps_to_its_own_code`。
+    """
+
+    SEED_OFFERS = [{"id": "(O)483", "name": "Wheat Seeds", "price": 10}]
+
+    @staticmethod
+    def _material(slot: int, iid: str, name: str, stack: int) -> dict:
+        return {"slot": slot, "id": iid, "qualifiedId": f"(O){iid}", "name": name,
+                "stack": stack, "isTool": False}
+
+    def _world(self, *, money: int = 188, seeds: int = 0, materials: tuple = (),
+               capacity: int | None = None) -> FakeWorld:
+        w = FakeWorld(weeds=0, seeds=seeds, money=money)
+        w.buy_offers = [dict(o) for o in self.SEED_OFFERS]
+        for m in materials:
+            w.inventory.append(dict(m))
+        if capacity is not None:
+            w.inventory_capacity = int(capacity)
+        return w
+
+    def _run(self, w: FakeWorld, worker=None):
+        run = make_run(w, target_days=1)
+        run.worker = worker if worker is not None else _NoSpaceWorker(w)
+        run.client = FakeClient(w)
+        return run
+
+    @staticmethod
+    def _events(run, name: str) -> list[dict]:
+        return [e for e in run.entries if e.get("event") == name]
+
+    @staticmethod
+    def _rep(day: int = 12) -> DayReport:
+        return DayReport(day_key=("summer", 1, day), started_at=0.0)
+
+    # ------------------------------------------------------------------ ① no_space 独立分流
+    def test_no_space_is_its_own_code_and_the_day_stops_buying(self):
+        """`no_inventory_space` ⇒ `code="no_space"` + `buy_no_space` journal；当天不再重试。"""
+        w = self._world()
+        run = self._run(w)
+        # run8 里"当季筛选本身是对的"：清单已在手（上一次回执带回来的），直接挑当季最便宜那包。
+        run.shop_offers = [dict(o) for o in self.SEED_OFFERS]
+        rep = self._rep()
+        run._preconditions(w.obs(), rep)
+        self.assertEqual(len(run.worker.buy_requests), 1)
+        self.assertEqual(run.worker.buy_requests[0]["item"], "(O)483",
+                         "按当季货架清单挑（不是硬编码 472）")
+        buy = self._events(run, "buy")
+        self.assertEqual(len(buy), 1)
+        self.assertEqual(buy[0]["code"], "no_space")
+        self.assertEqual(buy[0]["attempt"], 1)
+        self.assertEqual(buy[0]["limit"], MAX_BUY_TRIES_PER_DAY)
+        self.assertTrue(run.buy_no_space_today)
+        ns = self._events(run, "buy_no_space")
+        self.assertEqual(len(ns), 1)
+        self.assertEqual(ns[0]["item"], "(O)483")
+        self.assertTrue(any("背包没有空格" in n or "空格" in n for n in rep.notes), rep.notes)
+        # run8 是"同一天撞 13 次"：这里再调 10 次，一次请求都不许发出去
+        for _ in range(10):
+            run._preconditions(w.obs(), rep)
+        self.assertEqual(len(run.worker.buy_requests), 1, "撞到 no_space 后当天不许再试")
+
+    # ------------------------------------------------------------------ ② 每天 buy 次数上界
+    def test_buy_attempts_are_capped_at_three_per_day(self):
+        """普通失败（不是 no_space）也要有每天上界：`MAX_BUY_TRIES_PER_DAY`。"""
+        w = self._world()
+        worker = _NoSpaceWorker(w, status="some_other_error", code="failed")
+        run = self._run(w, worker)
+        rep = self._rep()
+        for _ in range(6):
+            run._preconditions(w.obs(), rep)
+        self.assertEqual(len(worker.buy_requests), MAX_BUY_TRIES_PER_DAY)
+        self.assertEqual(len(self._events(run, "buy")), MAX_BUY_TRIES_PER_DAY)
+        self.assertEqual(run.buy_attempts_today, MAX_BUY_TRIES_PER_DAY)
+        self.assertTrue(any("上限" in n for n in rep.notes), rep.notes)
+
+    # ------------------------------------------------------------------ ③ 空格死锁 ⇒ 卖一叠腾格
+    def test_slot_deadlock_sells_a_stack_then_buys_once(self):
+        """钱够但 0 空格 ⇒ 先卖一叠盈余材料腾格（`why="need_slot"`），再照常走一次 buy。"""
+        w = self._world(materials=(self._material(6, "390", "Stone", 200),))
+        w.inventory_capacity = len(w.inventory)          # 0 空格（run8 形态）
+        run = self._run(w)
+        rep = self._rep()
+        run._preconditions(w.obs(), rep)
+        self.assertEqual(run.worker.sell_calls and [c["slot"] for c in run.worker.sell_calls], [6])
+        sells = self._events(run, "sell")
+        self.assertEqual(len(sells), 1)
+        self.assertEqual(sells[0]["why"], "need_slot")
+        self.assertEqual(sells[0]["qid"], "(O)390")
+        summary = self._events(run, "surplus_sell")
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary[0]["why"], "need_slot")
+        self.assertTrue(run.slot_sold_today)
+        self.assertEqual(len(run.worker.buy_requests), 1, "卖掉一叠之后照常走一次 buy")
+        self.assertTrue(any("腾格" in n or "腾格子" in n for n in rep.notes), rep.notes)
+
+    # ------------------------------------------------------------------ ④ 守卫不许放行"睡过去"
+    def test_sleep_guard_refuses_while_seeds_cannot_come_in(self):
+        """`buy_no_space_today` ⇒ 守卫必须 keep_working（否则就是拿睡觉跳过买种子的活）。"""
+        w = self._world()
+        run = self._run(w)
+        run.buy_no_space_today = True
+        allow, why, detail = run.sleep_guard(w.obs())
+        self.assertFalse(allow)
+        self.assertEqual(why, "keep_working")
+        self.assertIn("背包没有空格", detail)
+
+    # ------------------------------------------------------------------ ⑤ 0 动作 + 有活 ⇒ 拒绝睡觉
+    def test_do_sleep_refuses_a_day_with_work_but_no_actions(self):
+        """有活却一次没干就睡 ⇒ `slept_without_work`，**不推进**游戏日（run8 day 12）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.dirt.add((60, 10))
+        w.crops[(60, 10)] = {"ripe": False, "watered": False}
+        w.farm = w.farm_scan()
+        run = self._run(w)
+        run.worker = FakeWorker(w)          # 不需要 sell/buy，只看睡觉拦截
+        rep = self._rep()
+        day_before = w.day
+        by, why = run._do_sleep(w.obs(), rep, "no_work:确实找不到可做的活")
+        self.assertEqual(by, "slept_without_work")
+        self.assertTrue(rep.slept_without_work)
+        self.assertEqual(w.day, day_before, "拒绝了就不许推进游戏日")
+        ev = self._events(run, "slept_without_work")
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["farm_actions"], 0)
+        self.assertTrue(any("拒绝睡觉" in n for n in rep.notes), rep.notes)
+
+    # ------------------------------------------------------------------ ⑥ 真空农场仍可 no_work 睡
+    def test_a_genuinely_empty_farm_can_still_sleep_no_work(self):
+        """反面：农场真的没活（无作物、无目标）⇒ `no_work` 睡觉照旧允许（不许把正常日憋死）。"""
+        w = self._world(money=0)
+        run = self._run(w)
+        run.worker = FakeWorker(w)
+        rep = self._rep()
+        by, _why = run._do_sleep(w.obs(), rep, "no_work:确实找不到可做的活")
+        self.assertEqual(by, "sleep")
+        self.assertFalse(rep.slept_without_work)
+        self.assertEqual(w.day, 7)
+
+    # ------------------------------------------------------------------ ⑦ 买之前清残留菜单
+    def test_a_stray_shop_menu_is_dismissed_before_buying(self):
+        """`ShopMenu` 是 `buy` 自己上一次留下的：买之前必须先关掉（run8 白开 23 个）。"""
+        w = self._world()
+        w.ui_script = [{"activeMenu": "ShopMenu", "isModal": True}]
+        run = self._run(w)
+        rep = self._rep()
+        run._preconditions(w.obs(), rep)
+        self.assertEqual(w.dismiss_calls, 1)
+        ev = self._events(run, "modal_dismissed")
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["where"], "before_buy")
+        self.assertEqual(ev[0]["menu"], "ShopMenu")
+        self.assertEqual(len(run.worker.buy_requests), 1)
+
+    # ------------------------------------------------------------------ ⑧ goto_farm 清模态重试一次
+    def test_goto_farm_retries_once_after_clearing_a_stray_menu(self):
+        """晨间 `ShippingMenu` 挡住 `goto_farm` ⇒ 清掉后**重试一次**（run8 day 12 的形态）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.player_tile = [9, 9]
+        w.location = "FarmHouse"
+        w.is_outdoor_farm = False
+        w.ui_script = [{"activeMenu": "ShippingMenu", "isModal": True}]
+        worker = _ModalThenFarmWorker(w)
+        run = self._run(w, worker)
+        rep = self._rep()
+        run._ensure_on_farm(w.obs(), rep)
+        self.assertEqual(worker.ensure_calls, 2, "失败后必须重试一次")
+        self.assertEqual(w.dismiss_calls, 1)
+        gotos = self._events(run, "goto_farm")
+        self.assertEqual([g["where"] for g in gotos], ["day_start", "day_start_retry"])
+        self.assertTrue(gotos[-1]["ok"])
+        self.assertEqual(w.location, "Farm")
+        self.assertFalse(rep.notes, rep.notes)
+
+
+    # ------------------------------------------------------------------ ⑨ 睡前清残留菜单
+    def test_a_stray_shop_menu_is_dismissed_before_sleeping(self):
+        """run8 day 13：`ShopMenu` 残留会把 `sleep` 卡成 `sleep_failed` ⇒ 睡前先关一次。"""
+        w = self._world(money=0)
+        run = self._run(w)
+        run.worker = FakeWorker(w)
+        rep = self._rep(13)
+        w.ui_script = [{"activeMenu": "ShopMenu", "isModal": True}]
+        by, _why = run._do_sleep(w.obs(), rep, "no_work:确实找不到可做的活")
+        self.assertEqual(by, "sleep")
+        self.assertEqual(w.dismiss_calls, 1, "睡前必须关掉残留模态")
+        ev = self._events(run, "modal_dismissed")
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["where"], "before_sleep")
+        self.assertFalse(rep.slept_without_work)
 
 
 if __name__ == "__main__":  # pragma: no cover
