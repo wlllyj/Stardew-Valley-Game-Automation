@@ -526,24 +526,29 @@ namespace AgentFarm.Bridge
         [JsonPropertyName("unwateredCrops")] public int UnwateredCrops { get; set; }
 
         /// <summary>
-        /// **有作物且当前没有浇水**的耕地格数（farm-wide 真值：判据 = `HoeDirt.crop != null &amp;&amp; !HoeDirt.isWatered()`，
-        /// 与逐格 `tiles[].watered` 是同一个 `isWatered()`）。`dryCrops == 0` 才等于"今天所有作物都浇过了"。
+        /// **有活苗且当前没有浇水**的耕地格数（farm-wide 真值：判据 =
+        /// `HoeDirt.crop != null &amp;&amp; !Crop.dead &amp;&amp; !HoeDirt.isWatered()`，
+        /// 与逐格 `tiles[].watered` 是同一个 `isWatered()`）。`dryCrops == 0` 才等于"今天所有活苗都浇过了"。
+        ///
+        /// 【task-84 收窄】枯死作物**不再计入本字段**（它们不需要浇水，用户 m11003：死苗还在被浇）。
+        /// 死苗的干格数见 <see cref="DryDeadCrops"/>。这条收窄同时修掉了 run7 的一个死锁：
+        /// `tools/verify-run3.py` 的闸门"`ended_reason` 以 `no_work` 开头 ⇒ `final_water.dry` 必须为 0"
+        /// 在死苗清完之前**永远不可能满足**（旧口径把死苗混进"该浇水"），导致 summer 3/5/6 三天损失。
         /// 只在 <see cref="Complete"/> == true（整场 Farm 分帧扫描跑完）时可信。
         /// </summary>
         [JsonPropertyName("dryCrops")] public int DryCrops { get; set; }
 
         /// <summary>
         /// **干作物格的坐标**（`[[x, y], …]`）。坐标是**农场地图格坐标**，与 <see cref="DryCrops"/>
-        /// 同一次扫描口径：`HoeDirt.crop != null &amp;&amp; !HoeDirt.isWatered()`。
+        /// 同一次扫描口径（**只含活苗**：`HoeDirt.crop != null &amp;&amp; !Crop.dead &amp;&amp; !HoeDirt.isWatered()`）。
         ///
         /// 【为什么需要】脑侧能看到的只有玩家周围最近的 400 格（`location.tiles[]`，
         /// 且带 `tilesTruncated=true`），农场另一头那 1 格干作物既看不到也没坐标
         /// ⇒ run5 三天 `final_water.dry` 恒为 1、`watered_outdoor=false`（task-50）。
         ///
-        /// 【与 <see cref="DryCrops"/> 严格同口径】**死苗也算**（`Crop.dead` 的格子本来也能浇水，
-        /// 且 `dryCrops` 把它们计入"干"）。Mod 侧刻意**不做任何过滤**：过滤会让两个字段将来对不上账
-        /// （Lead 2026-10-13 更正）。要不要浇死苗由脑侧按"能不能省"决定；清死苗走 task-51，
-        /// 清掉之后 <see cref="DryCrops"/> 自然下降。
+        /// 【task-84 收窄】死苗坐标**不再出现在这里**（旧口径 task-50 曾刻意"死苗也算"，run7 证明那会让
+        /// 脑整天追一个不该浇的格）。死苗只给计数 <see cref="DryDeadCrops"/>，逐格死苗仍走玩家窗口
+        /// `location.tiles[].dead`；要不要清死苗走 task-51 的 `clear_dead`。
         ///
         /// 排序：先 `y` 再 `x`（确定性，便于测试与人工核对）。
         /// 上限 <see cref="FarmScanCache.DryTilesMax"/> = 64 条；超出时坐标列表截断并置
@@ -551,6 +556,19 @@ namespace AgentFarm.Bridge
         /// 只在 <see cref="Complete"/> == true（整场 Farm 跑完一轮）时可信；旧 Mod 无此字段 ⇒ null。
         /// </summary>
         [JsonPropertyName("dryTiles")] public int[][] DryTiles { get; set; }
+
+        /// <summary>
+        /// **枯死作物且没有浇水的耕地格数**（farm-wide，判据 =
+        /// `HoeDirt.crop != null &amp;&amp; Crop.dead &amp;&amp; !HoeDirt.isWatered()`）。task-84 新增。
+        ///
+        /// 【为什么单独给】死苗**不需要浇水**（`HoeDirt.performToolAction` 里死苗只有镰刀/锄头能清），
+        /// 但它们会和活苗一样"干着"。只给计数、不给坐标，理由同 <see cref="DeadCrops"/>：
+        /// 逐格死苗走玩家窗口 `tiles[].dead`，清不完的根治属"农场级坐标"家族。
+        ///
+        /// ⚠️ 旧 Mod 无此字段 ⇒ JSON 里为 null：脑侧**不许把"没这个字段"当成 0**（那是"不知道"）。
+        /// 只在 <see cref="Complete"/> == true 时可信。
+        /// </summary>
+        [JsonPropertyName("dryDeadCrops")] public int DryDeadCrops { get; set; }
 
         /// <summary>
         /// <see cref="DryTiles"/> 是否因超过 64 条上限被截断。

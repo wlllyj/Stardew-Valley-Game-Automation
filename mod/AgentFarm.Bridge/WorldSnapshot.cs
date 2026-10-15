@@ -499,7 +499,10 @@ namespace AgentFarm.Bridge
                                     t.Crop = cr.indexOfHarvest?.Value;
                                     t.Ripe = cr.fullyGrown != null && cr.fullyGrown.Value;
                                     t.Dead = cr.dead != null && cr.dead.Value;
-                                    t.Tool = t.Ripe ? "none" : "can";
+                                    // task-84：枯死作物**不该浇水**（用户 m11003：死苗还在被浇）⇒
+                                    // Tool 不再对死苗返回 "can"（观测层就不再把它当"该浇水"）。
+                                    // 清死苗走 task-51 的 clear_dead（镰刀/锄头），不是水壶。
+                                    t.Tool = (t.Ripe || t.Dead) ? "none" : "can";
                                 }
                                 else
                                 {

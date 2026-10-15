@@ -292,15 +292,26 @@ namespace AgentFarm.Bridge
                     catch { }
                     // 真正的"今天还没浇"格数：判据与逐格 tiles[].watered 完全一致（HoeDirt.isWatered()）。
                     // 上面那个 UnwateredCrops 用的是 needsWatering()，它不看浇水状态（docs\_analyze-farmcounts.md）。
+                    // 【task-84 收窄】只算**活苗**：枯死作物不需要浇水（用户 m11003），单独进 DryDeadCrops，
+                    // 且**不进** dryTiles（dryTiles 是"还能救的活苗"坐标，脑侧照它去浇）。旧口径（task-50
+                    // "死苗也算"）让 run7 三天追着一株够不着的死苗，并让 verify-run3 的 no_work⇒dry==0 闸门
+                    // 在死苗清完前永不满足。
                     try
                     {
                         if (!dirt.isWatered())
                         {
-                            _acc.DryCrops++;
-                            // task-50：把坐标也带上（脑侧只有玩家周围 400 格窗口，看不到农场另一头）。
-                            // 口径与 dryCrops 严格一致：只判 !isWatered()，**死苗也照报**
-                            // （Lead 2026-10-13 更正：Mod 侧不许自作主张过滤，否则两个字段对不上账）。
-                            _dryTiles.Add(new[] { (int)entry.Key.X, (int)entry.Key.Y });
+                            bool dead = false;
+                            try { dead = crop.dead != null && crop.dead.Value; } catch { }
+                            if (dead)
+                            {
+                                _acc.DryDeadCrops++;
+                            }
+                            else
+                            {
+                                _acc.DryCrops++;
+                                // task-50：把坐标也带上（脑侧只有玩家周围 400 格窗口，看不到农场另一头）。
+                                _dryTiles.Add(new[] { (int)entry.Key.X, (int)entry.Key.Y });
+                            }
                         }
                     }
                     catch { }
