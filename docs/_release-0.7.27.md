@@ -93,3 +93,22 @@ python tools\start-detached-longrun.py --journal logs\longrun-3day-llm-run8.json
 - `task-53`（农场级待清障/待开垦计数）、`task-58/59`（带决策史 + 收工复盘，B/C 件）、`task-14`（逐帧 warp 活锁）、`task-17`（world_stuck 自愈）、`task-20`（工具等级选择）。
 - 结构性缺口：仓库**没有 C# 测试工程** ⇒ Mod 内部数值（跳预算、白名单判定）只能靠 build + 真机验收。
 - 窗口外的 1 格干作物可能永远 `unreachable`（run7 的 summer 3/5）⇒ task-68 的 `encircled` 只解决"能开路的围住"，解决不了"整簇没有落脚点"。
+
+## §7 冻结与装机执行记录（Lead 独占）
+
+### §7.1 冻结（2026-10-15）
+- `tools/_note-0727.txt`（首串 `v0.7.27（经济闭环第一步 + 死苗不再浇水）`，列 task-55/84）→ `python tools/_bump-mod-version.py 0.7.27 --note-file tools/_note-0727.txt` ⇒ `manifest: Version 0.7.26 -> 0.7.27`（**脚本末句 `print` 在 cp1252 下抛 `UnicodeEncodeError` ⇒ 退出码 1 但版本已写盘；核对一律用 `json.load` 读 Version，不看退出码**）。
+- `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.27"`（注释列本版两项内容）。
+- `dotnet build .\mod\AgentFarm.Bridge\AgentFarm.Bridge.csproj -c Release --nologo --no-incremental` ⇒ **0 警 0 错**；`AgentFarm.Bridge.dll` **172032 B @21:26:06**、`manifest.json` **21468 B @21:26:04**。
+- 工作树清干净后提交 **`e23481e`**（`git add -A` 必需：未跟踪的 `scratch/*.py` 会被 `check-release` 算成脏）。
+- 工具侧对齐提交 **`fdb87d8`**（`tools/verify-run3.py` 收 task-84 的 5 个 `day_end` 字段 + 新闸门 `no_work` + `dry_dead>0` ⇒ problem；`gave_up_dry` 只记 info；缺 `dry_dead` 的旧账本只记 info；`tests/test_verify_run3.py` 50 OK）。
+- **放行条件**：`check-release.py --expect 0.7.27` 必须六项全绿 —— 首次跑时唯一红是 `TestEventMappingDrift`（task-84 的新事件 `dead_crops_summary` 未入 `EVENT_BUCKETS`），作 **task-95** 派 log-analyst；**树不绿不装机**（v0.7.17 教训）。
+
+### §7.2 装机与起跑前预置（待 task-95 交付后执行）
+1. `python tools/check-release.py --expect 0.7.27` ⇒ 六项全绿（含 `Ran N tests / OK`、工作树干净）。
+2. `python tools/deploy-mod.py --no-quit`（0.7.26 → 0.7.27；记录 dll/manifest 字节数与 `modVersion`）。
+3. `python -m agentfarm goto Farm --no-focus`（需 `PYTHONPATH=<repo>\brain`）⇒ 户外农场，否则 `preflight` 的户外判据红。
+4. `python tools/preflight.py --expect 0.7.27 --save-baseline logs/run8-baseline.json` ⇒ 四项全绿才算"可以起跑"。
+5. **预置（若 `seeds_total==0` 且 `money < seed_price`）**：`scratch/run6-preseed.py` 出货（**每 id 保留 K=10 做不到：Mod `ShipSkill` 只能整叠出货**，见 §7.1 备注）→ `scratch/verify-sleep-brain.py --from-farm` 睡一夜收款 → 复核 `money ≥ 20g`；红线：只走 `sell`/`sleep`/`buy` 三条已验收路径，**绝不 `Money +=`、绝不手改存档**；同夜「有 `ShippingMenu` 时保存被设计推迟」属正常（`docs/_il-newday-save.md`）。
+6. 起跑（**脱离式**，见 `docs/00-开发日志.md` 条目 040：DSH 托管后台作业会在回合边界被连根收掉）：`python tools/start-detached-longrun.py --journal logs/longrun-3day-llm-run8.jsonl --expect-version 0.7.27`（先 `--dry-run` 看四要素）；交付 `docs/_run8-evidence.md`（5 节）。
+7. 证据纪律：跑完**先别退游戏**；`docs/_runN-evidence.md` §4 必须并列 `tools/verify-run3.py` 的 `verdict` 与 `strict_verdict` 两行（严格口径只呈现、不改 rc），并逐条抄出 `history_problems`。
