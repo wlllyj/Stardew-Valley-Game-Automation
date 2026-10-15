@@ -1,0 +1,6 @@
+v0.7.28（run8 复盘：经济闭环"买"死锁 + 早晨 0 动作连睡 + 场外浇水额度）
+- task-102（dev-coder）：A 经济闭环空格死锁 —— `buy` 的 `no_inventory_space` 记为独立结果（`no_space`/`buy_no_space`），当天同物不再重试（每天 buy ≤3）；`seeds_total==0 && money>=seed_price && free_slots==0` ⇒ 主动整叠卖一叠盈余材料腾格（`surplus_sell{why:"need_slot"}`，白名单、绝不碰种子/工具/武器/建材、尽量保留 K=10）；`buy` 前先关残留模态（含 `ShopMenu`），`sleep` 前 `ui.isModal` 先清一次；`buy` 优先当季在售且买得起的作物种子。B 早睡防线 —— 钱够但买不到 / 农场有干作物时 `sleep_guard` 不许放行 `_do_sleep`；每天必须有农场动作，否则记 `slept_without_work` 且当天不 VERIFIED；`goto_farm` 遇模态先清一次再重试。
+- task-104（dev-coder）：`_water_far_dry` 只在**人在户外农场**时才逐格尝试；场外（如晨间被 `ShippingMenu` 挡在屋内）先回农场（清模态 + 重试一次），回不去则记 `water_far_skipped{reason:"not_on_farm"}`、**不扣当日额度、不进 `given_up`**，当天收尾 `stuck` 必须点名 `not_on_farm`。
+- task-106（log-analyst）：`tools/analyze-longrun.py` 收本版新事件/字段（`slept_without_work`/`buy_no_space`/`surplus_sell.why`），漂移红清零（`check-release` 要求全量单测 0 红）。
+- 验收：task-103（task-102 对抗验收）、task-108（task-104 对抗验收）—— 均由 deputy-lead 独立执行。
+- 真机验收：run9（task-89 家族），判据见 `docs/_run6-criteria.md` §3.4 的 N1–N5 与 `docs/_release-0.7.28.md` §4。

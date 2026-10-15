@@ -115,6 +115,7 @@
 run8（0.7.27）尾部 **0/3 VERIFIED**：day 1 全绿（且**首次自主卖出成功**：`sell`/`surplus_sell` 在 day 1 `t=0.2` 卖出 `(O)771 Fiber` 174 ⇒ 钱 14→188，次日 `NewDay` 结算），day 2「早晨 0 动作直接睡」、day 3「`buy` 26 次 0 成交（`no_inventory_space`×25）+ `sleep_failed`」。据此新增：
 
 - **N1 每天必须有农场动作**：`ended_by=="sleep"` 的日子必须 `ok_steps >= 1`；0 动作收工要留 `slept_without_work` 且 `verified=false`。**不许**靠睡眠跳过一天。
+  - **口径澄清（task-103 对抗验收，deputy-lead `7e2ad95`；Lead 2026-10-15 采纳）**：task-73 的 `_stuck_flush` 是**设计内**的有界翻篇例外（0 动作 + 有活仍翻页，但必须 `ended_by=stuck`、`verified=false`、工具 `needs_review`）。因此 N1 的判据写成**不变量**：**`day_after 推进` ∧ `ok_steps==0` ∧ `verified==true` 三者绝不同时出现**（任何一项单独出现都合法：翻篇日、`no_work` 真空日、真·空农场收工日）。
 - **N2 经济闭环四步留痕**：`sell`/`surplus_sell` → 次日 `day_start.money` 增加（到账，钱由游戏在 `NewDay` 结算）→ `buy` 成功（**当季**在售）→ `sow`/`plant_area` ≥1 格成功。四步缺一，evidence 必须点名是哪一步、为什么。
 - **N3 无空格死锁**：同一天 `buy` 尝试 ≤3，`no_inventory_space` 之后不再重试；若因背包满而买不到，必须出现 `surplus_sell{why:"need_slot"}`（只卖盈余白名单，绝不碰种子/工具/武器/建材）。
 - **N4 跨日与落盘**：`day_after` 恰 +1；落盘缺口（SMAPI 有 `NewDay` 无 `SaveGame.Save() called.`）必须能用"日终菜单链（`ShippingMenu`/`SaveGameMenu`）"解释，否则记红（run8 的 summer 11→12 属此型，与条目 049 的 task-47 同因）。

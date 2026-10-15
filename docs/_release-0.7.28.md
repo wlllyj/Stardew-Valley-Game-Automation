@@ -7,11 +7,11 @@
 
 | 卡 | owner | 内容 | 状态 |
 |---|---|---|---|
-| **task-102** | dev-coder | **A 经济闭环空格死锁**（`no_space` 独立结果 + 当天 ≤3 次；`seeds_total==0 && money>=seed_price && free_slots==0` ⇒ 整叠卖一叠盈余材料腾格，白名单、不碰种子/工具/武器/建材；buy 前清残留模态；优先当季在售买得起的种子）+ **B 早睡防线**（钱够买不到/农场有干作物时 `sleep_guard` 不许放行；不许 0 动作收工；`goto_farm` 遇模态先清一次再重试） | **已交 `9b09735`**（代码级 PASS） |
+| **task-102** | dev-coder | **A 经济闭环空格死锁**（`no_space` 独立结果 + 当天 ≤3 次；`seeds_total==0 && money>=seed_price && free_slots==0` ⇒ 整叠卖一叠盈余材料腾格，白名单、不碰种子/工具/武器/建材；buy 前清残留模态；优先当季在售买得起的种子）+ **B 早睡防线**（钱够买不到/农场有干作物时 `sleep_guard` 不许放行；不许 0 动作收工；`goto_farm` 遇模态先清一次再重试） | **已交 `9b09735`**（Lead 已核范围与读数） |
 | **task-103** | deputy-lead | 对 task-102 的独立对抗验收（空格死锁复现 FAIL→PASS、腾格卖出不得碰种子/工具/K、跨天重试有界性、`no_space` 谎报成功、睡前后模态 fail-closed） | in_progress |
-| **task-104** | dev-coder | **`_water_far_dry` 人在农场之外不许扣当日额度**（run8 day12：晨间 `ShippingMenu` 挡掉 `goto_farm` ⇒ 人在室内逐格试 6 格全 `unreachable`、当天全体认输、0 动作早睡）⇒ 入口先回农场（清模态 + 重试一次）、`water_far_skipped{reason:"not_on_farm"}` 不 `try_++`/不进 `given_up`、收尾 `not_on_farm` 点名 | in_progress |
-| **task-108** | deputy-lead | 对 task-104 的独立对抗验收（`not_on_farm` 不扣额度、收尾点名、回不去时的有界性、回农场后仍能浇的正例） | pending（`blocked_by task-104`） |
-| **task-106** | log-analyst | **analyze-longrun 收 task-102 新事件/字段**（`slept_without_work`/`buy_no_space`/`surplus_sell.why=need_slot`）——`TestEventMappingDrift` 那条红**必须清零**（`check-release` 要求全量 0 红，本卡在关键路径上） | in_progress |
+| **task-104** | dev-coder | **`_water_far_dry` 人在农场之外不许扣当日额度**（run8 day12：晨间 `ShippingMenu` 挡掉 `goto_farm` ⇒ 人在室内逐格试 6 格全 `unreachable`、当天全体认输、0 动作早睡）⇒ 入口先回农场（清模态 + 重试一次）、`water_far_skipped{reason:"not_on_farm"}` 不 `try_++`/不进 `given_up`、收尾 `not_on_farm` 点名 | **已交 `9b5b592`**（Lead 已核：2 文件 +246/−2、越界零命中、`tests.test_farmwork tests.test_longrun` 281 OK） |
+| **task-108** | deputy-lead | 对 task-104 的独立对抗验收（`not_on_farm` 不扣额度、收尾点名、回不去时的有界性、回农场后仍能浇的正例） | in_progress |
+| **task-106** | log-analyst | **analyze-longrun 收 task-102 新事件/字段**（`slept_without_work`/`buy_no_space`/`surplus_sell.why=need_slot`，另补 `modal_dismiss_failed`/`water_far_skipped`）——`TestEventMappingDrift` 那条红**必须清零** | **已交 `6293696`**（Lead 已核：3 文件 +372/−2、越界零命中、`tests.test_analyze_longrun` 122 OK、全量 618 OK 零红） |
 
 ## 2. 冻结与装机九步（Lead 独占，链式，不许并行）
 
