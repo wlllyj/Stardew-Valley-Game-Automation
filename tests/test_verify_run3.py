@@ -699,6 +699,41 @@ class TestVerifyRun3(unittest.TestCase):
         self.assertIn("> 自算=5", blob)
         self.assertFalse(ok)
 
+    def test_early_bad_day_does_not_invalidate_the_tail_streak(self):
+        """口径（Lead 2026-10-15，run7 定）：验收是"尾部连续 N 天"，窗口外的问题只算历史。
+
+        run7 现场：summer 3/5 被窗口外那 1 格干作物卡住、summer 6 靠 stuck 翻篇自己过去，
+        之后 summer 7/8/9 连续三天全绿 ⇒ 必须判达标，并把早期问题列进 `history_problems`。
+        """
+        bad = [
+            day_start([1, "spring", 8], t=0.0),
+            sleep_ok(t=100.0),
+            day_end([1, "spring", 8], [1, "spring", 9], t=200.0, verified=False,
+                    ended_by="stuck", ended_reason="stuck:换过 11 片地都没有目标",
+                    dry=1, checks={"watered_outdoor": False, "day_justified": False}),
+        ]
+        rows = bad + green_rows(3)
+        ok, s = self.check(rows)
+        self.assertTrue(ok, s["problems"])
+        self.assertEqual(s["verified_streak_tail"], 3)
+        self.assertEqual(s["problems"], [])
+        self.assertTrue(any("spring 8" in p for p in s["history_problems"]), s["history_problems"])
+
+    def test_run_ending_on_a_bad_day_is_still_not_ok(self):
+        """窗口没打满时不降级：尾部一天坏 ⇒ streak 0 ⇒ 仍判未达标，问题不许被搬进 history。"""
+        rows = green_rows(3) + [
+            day_start([1, "spring", 13], t=900.0),
+            sleep_ok(t=1000.0),
+            day_end([1, "spring", 13], [1, "spring", 14], t=1100.0, verified=False,
+                    ended_by="stuck", ended_reason="stuck:连续 3 轮世界没有任何变化",
+                    dry=1, checks={"watered_outdoor": False, "day_justified": False}),
+        ]
+        ok, s = self.check(rows)
+        self.assertFalse(ok)
+        self.assertEqual(s["verified_streak_tail"], 0)
+        self.assertEqual(s["history_problems"], [])
+        self.assertTrue(any("spring 13" in p for p in s["problems"]), s["problems"])
+
     def test_stuck_flushed_day_must_not_be_verified(self):
         """task-73：卡死翻篇只许翻页，不许洗白 —— `stuck_flushed=true` 的日子记 verified ⇒ problem。"""
         rows = green_rows()

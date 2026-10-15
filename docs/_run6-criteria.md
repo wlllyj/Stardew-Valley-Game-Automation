@@ -50,6 +50,11 @@
 ## 2. 连续性与外部证据
 
 - **尾部连续 3 天**：`verified == true` 且 `ended_by == "sleep"` 且 `day_after` 比 `day_key` **恰好 +1 天**。
+- **【口径澄清 · Lead 2026-10-15（run7 后定，适用于 run7 起）】达标窗口 = "尾部连续 N 天"，不是"整本账本零问题"。**
+  - 长跑允许早期日子不达标后**自主恢复**（task-73 的 `stuck` 翻篇就是为此而生）⇒ 落在**窗口之内**的那几天的问题、以及不带 `[day]` 前缀的全局问题（journal 损坏、`mod_version_mismatch`、`finish` 自相矛盾等）才是 fatal；
+  - 窗口**之外**日子的问题降级为 `tools/verify-run3.py` 输出里的 **`history_problems`**（逐条列出、可复盘、不影响结论）；
+  - **窗口没打满时（`streak < --days`）不降级**，维持原判；**run 必须停在窗口上**（尾部那天坏 ⇒ streak 归零 ⇒ 不过）。
+  - 记录在案：run7 在**旧口径（整本零问题）下是 `needs_review`**，在新口径下 **VERIFIED**；差异的 9 条问题（summer 3/5/6）已在输出里逐条列出，不是被抹掉。
 - 存档 `Wahaha_450799035` 的 **size 与 mtime 应前进**（对应 SMAPI `SaveGame.Save() called/completed`）。
   **口径按 task-47 定案（`docs/_il-newday-save.md`）更正**：落盘唯一通道是 `SaveGameMenu.update` 的 master 分支；`SaveGameMenu` 只在
   `Game1.showEndOfNightStuff()` 且 **`endOfNightMenus.Count == 0`** 时被创建 ⇒ **当天早晨有日终菜单（`ShippingMenu`＝有货要结算 / `LevelUpMenu` / `Billboard`）时，存档是被设计延后的**。

@@ -25,6 +25,10 @@
    （Lead 2026-10-14 裁定，回答 log-analyst 在 run2 L17 上发现的口径分歧）。
 5. **尾部连续 VERIFIED 天数** >= `--days`；存在 `finish` 事件时**核对自述**：`code` 必须与
    本工具结论同向（自称达标而判未达标、或反之，都算账本自相矛盾）、`verified_streak` 不同则记信息项。
+   【口径（Lead 2026-10-15，run7 后）】**达标窗口是"尾部连续 N 天"**：只有落在窗口内的那几天的问题
+   （以及不带 `[day]` 前缀的全局问题）才是 fatal；窗口**之外**日子的问题降级为 `history_problems`
+   逐条列出、不影响结论。理由：长跑允许早期日子不达标后自主恢复（task-73 的 stuck 翻篇就是为此），
+   否则"先坏后好"的账本永远过不了。窗口本身没打满时（streak < --days）不降级，维持原判。
 6. **账本内部自洽**（deputy-lead `docs/_verify-run3-limits.md` §6 加固项）：
    - `t` 不许回退（全局），每天 `day_start.t <= day_end.t`；
    - 跨日必须**恰好 +1 天**（按 28 天/季折算绝对日序），不是"日期字符串不一样"（盲区 B5）；
@@ -894,6 +898,26 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         else:
             break
 
+    # 口径（Lead 2026-10-15，run7 后定）：验收目标是"**尾部**连续 N 个游戏日无人介入达标"，
+    # **不是**"整本账本一个毛病都不许有"。run7 实测：summer 3/5 被窗口外那 1 格干作物卡住
+    # （task-50 的 far-dry 追两次没够着）、summer 6 靠 task-73 的 stuck 翻篇自己翻过去，
+    # 之后 summer 7/8/9 连续三天全绿 —— 早期那几天不该把已达成的连续窗口翻红。
+    # 规则：**只有达标窗口内那几天的问题**（以及不带 `[day]` 前缀的全局问题：journal 损坏、
+    # finish 自相矛盾、版本不符等）才算 fatal；窗口外的问题降级成 `history_problems`
+    # 逐条列出（看得到、可复盘），且**只在 streak 已经够 target_days 时才降级** ——
+    # 没打出窗口的失败账本维持原判，不因这条口径变松。
+    history_problems: list[str] = []
+    if streak >= target_days:
+        tail_names = {d["key"] for d in days[-streak:]}
+        kept: list[str] = []
+        for p in problems:
+            head = p[1:].split("]", 1)[0] if p.startswith("[") else ""
+            if head and head not in tail_names:
+                history_problems.append(p)
+            else:
+                kept.append(p)
+        problems = kept
+
     finish = next((r for r in reversed(rows) if r.get("event") == "finish"), None)
     decisions = [r for r in rows if r.get("event") == "decision"]
     llm_true = sum(1 for r in decisions if r.get("llm"))
@@ -1045,6 +1069,7 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         "leg_ok": leg_ok,
         "finish": {k: v for k, v in (finish or {}).items() if k != "_lineno"},
         "problems": problems,
+        "history_problems": history_problems,
         "infos": infos,
         "verdict": "VERIFIED" if ok else "needs_review",
     }
@@ -1095,6 +1120,11 @@ def main(argv: list[str] | None = None) -> int:
         print("信息（不影响结论）：")
         for i in summary["infos"]:
             print(f"  - {i}")
+    if summary.get("history_problems"):
+        print("")
+        print(f"历史问题（达标窗口**之外**的日子，不影响结论，共 {len(summary['history_problems'])} 条）：")
+        for p in summary["history_problems"]:
+            print(f"  - {p}")
     if summary["problems"]:
         print("")
         print("问题：")
