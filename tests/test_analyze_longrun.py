@@ -37,9 +37,12 @@ FALLBACK = os.path.join(ROOT, "scratch", "_ledger_fallback.jsonl")
 WASH = os.path.join(ROOT, "scratch", "_ledger_leftover_verified.jsonl")
 
 
-def report_for(path, days=3, top=50):
+def report_for(path, days=3, top=50, window=None):
     rows, bad_lines = mod.load_journal(path)
-    args = mod.parse_args(["--journal", path, "--days", str(days), "--top", str(top)])
+    argv = ["--journal", path, "--days", str(days), "--top", str(top)]
+    if window is not None:
+        argv += ["--window", str(window)]
+    args = mod.parse_args(argv)
     return mod.build_report(rows, path, args, bad_lines)
 
 
@@ -1802,6 +1805,152 @@ class TestBoundBasisAccounting(unittest.TestCase):
         self.assertNotIn("20% × attempted", text)
         self.assertIn("20%×bound_basis", text)
         self.assertIn("被围住的格不参与起界", text)
+
+
+class TestWindowAndSettledClassification(unittest.TestCase):
+    """task-88：窗口降级（窗口外的日级红 → history_problems，不进 rc）/"瞬间态已结清"/
+    finish 的达标目标 = 目标窗口 / `seed_gate` 钱不够不是购买任务失败。"""
+
+    RUN7 = os.path.join(ROOT, "logs", "longrun-3day-llm-run7.jsonl")
+
+    def _day_events(self, day, *, verified, stage_ok=None, checks_over=None, extra=()):
+        nxt = [day[0], day[1], day[2] + 1]
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": verified,
+                  "watered_outdoor": True}
+        checks.update(checks_over or {})
+        stages = ([{"stage": "clear_area", "ok": stage_ok, "skipped": 0, "failed": 0,
+                    "env_block": 0, "inconclusive": 0, "stopped": None, "leftover": 0}]
+                  if stage_ok else [])
+        end = {"event": "day_end", "t": 9.0, "day": day, "day_text": "", "ended_by": "sleep",
+               "ended_reason": "night", "verified": verified, "checks": checks,
+               "stages": stages, "outcomes": [], "ok_steps": stage_ok or 0,
+               "skipped_steps": 0, "failed_steps": 0, "notes": [], "final": final(nxt),
+               "final_water": {"t": 9.0, "location": "Farm", "tiles": 84, "crops": 31,
+                               "dry": 0, "scope": "farm"}}
+        return [day_start(day), *extra, end]
+
+    def _report(self, events, name, *, days=1, window=None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=days, window=window)
+
+    def test_out_of_window_red_becomes_history_and_exit_goes_clean(self):
+        events = self._day_events([1, "summer", 3], verified=False,
+                                  checks_over={"crops_watered": False})
+        for dom in (4, 5, 6):
+            events += self._day_events([1, "summer", dom], verified=True, stage_ok=5)
+        rep = self._report(events, "win3.jsonl", days=3, window=3)
+        self.assertTrue(rep["window"]["active"], "尾部连续 3 天 VERIFIED ⇒ 窗口生效")
+        self.assertEqual(rep["red"]["total"], 0, "窗口外的日级红不进退出码")
+        self.assertIn("missed:check:crops_watered", rep["history_problems"]["subjects"])
+        self.assertEqual(rep["history_problems"]["total"], len(rep["history_problems"]["items"]))
+        text = mod.render_text(rep, 50)
+        self.assertIn("窗口外历史问题", text)
+        self.assertIn("窗口内红 0 条", text)
+        # `--window 0` = task-88 之前的旧行为：同一条红照旧 fatal
+        old = self._report(events, "win0.jsonl", days=3, window=0)
+        self.assertGreater(old["red"]["total"], 0)
+        self.assertEqual(old["history_problems"]["total"], 0)
+
+    def test_short_streak_keeps_reds_fatal(self):
+        events = self._day_events([1, "summer", 3], verified=False,
+                                  checks_over={"crops_watered": False})
+        events += self._day_events([1, "summer", 4], verified=False,
+                                   checks_over={"crops_watered": False})
+        events += self._day_events([1, "summer", 5], verified=True, stage_ok=5)
+        events += self._day_events([1, "summer", 6], verified=True, stage_ok=5)
+        rep = self._report(events, "streak2.jsonl", days=3, window=3)
+        self.assertEqual(rep["window"]["tail_streak"], 2)
+        self.assertFalse(rep["window"]["active"], "连续 VERIFIED < 窗口 ⇒ 不降级")
+        self.assertGreater(rep["red"]["total"], 0)
+        self.assertEqual(rep["history_problems"]["total"], 0)
+
+    def test_global_red_is_never_demoted(self):
+        events = self._day_events([1, "summer", 3], verified=False,
+                                  checks_over={"crops_watered": False})
+        # 账目自相矛盾（全局红）：failed_steps 与 stages[].failed 的差额无 env/inconclusive 解释
+        events[-1]["failed_steps"] = 3
+        events[-1]["stages"] = [{"stage": "clear_area", "ok": 0, "failed": 0,
+                                 "env_block": 0, "inconclusive": 0, "leftover": 3}]
+        for dom in (4, 5, 6):
+            events += self._day_events([1, "summer", dom], verified=True, stage_ok=5)
+        rep = self._report(events, "global.jsonl", days=3, window=3)
+        self.assertTrue(rep["window"]["active"])
+        self.assertIn("missed:stage_account", rep["red"]["subjects"],
+                      "全局红（账目自相矛盾）永远 fatal")
+        self.assertIn("missed:check:crops_watered", rep["history_problems"]["subjects"])
+
+    def test_settled_momentary_event_is_info_only(self):
+        events = self._day_events([1, "summer", 3], verified=True, stage_ok=5, extra=[
+            {"event": "stage_exhausted", "t": 4.0, "stage": "clear_area", "leftover": 2,
+             "capped": 0, "tiles": [[61, 26]]},
+        ])
+        rep = self._report(events, "settled.jsonl", days=1)
+        self.assertEqual(rep["red"]["total"], 0, "瞬间态事件被同日结清 ⇒ 不进 rc")
+        self.assertIn("missed:stage_exhausted", rep["settled"]["subjects"])
+        self.assertIn("已结清", mod.render_text(rep, 50))
+        self.assertIn("已结清：当天 VERIFIED",
+                      " ".join(str(i["summary"]) for i in rep["settled"]["items"]))
+
+    def test_settled_not_applied_when_day_not_settled(self):
+        events = self._day_events([1, "summer", 3], verified=False,
+                                  checks_over={"no_unmet_stages": False}, extra=[
+            {"event": "stage_exhausted", "t": 4.0, "stage": "clear_area", "leftover": 2,
+             "capped": 0, "tiles": [[61, 26]]},
+        ])
+        rep = self._report(events, "notsettled.jsonl", days=1)
+        self.assertIn("missed:stage_exhausted", rep["red"]["subjects"])
+        self.assertEqual(rep["settled"]["total"], 0)
+
+    def test_finish_self_report_uses_target_window(self):
+        # 账本记录 7 天（窗口上限 = 账本天数），finish 自述 streak=3：
+        #   --window 3 ⇒ 目标 3、streak 3 达标 ⇒ 不报；
+        #   --window 7 ⇒ 目标 7 > streak 3 ⇒ 自述"code=0 达标"不成立 ⇒ 报。
+        finish = {"event": "finish", "t": 20.0, "code": 0, "verified_streak": 3, "actions": 9,
+                  "minutes": 1.0, "stages_seen": ["clear_area"]}
+        events = []
+        for dom in range(3, 10):
+            events += self._day_events([1, "summer", dom], verified=True, stage_ok=5)
+        events.append(finish)
+        rep3 = self._report(events, "fin3.jsonl", days=3, window=3)
+        self.assertNotIn("wasted:finish_incoherent", rep3["red"]["subjects"],
+                         "streak 3 >= 目标窗口 3 ⇒ 不该报自述不自洽")
+        rep7 = self._report(events, "fin7.jsonl", days=7, window=7)
+        self.assertIn("wasted:finish_incoherent", rep7["red"]["subjects"],
+                      "目标窗口 7 > streak 3 ⇒ 自述达标不成立")
+
+    def test_seed_gate_afford_is_not_a_failed_purchase(self):
+        events = self._day_events([1, "summer", 3], verified=True, stage_ok=5, extra=[
+            {"event": "seed_gate", "t": 5.0, "seeds": 0, "money": 14, "seed_price": 20,
+             "tillable": 12},
+        ])
+        rep = self._report(events, "seed.jsonl", days=1)
+        se = rep["seed_economy"]
+        self.assertEqual(se["seed_gate"], 1)
+        self.assertEqual(se["afford_blocked"], 1)
+        self.assertEqual(se["afford_blocked_lines"], [2])
+        text = mod.render_text(rep, 50)
+        self.assertIn("缺种子钱（money=14 < seed_price=20）", text)
+        self.assertIn("未发起购买，不是任务失败", text)
+        self.assertEqual(rep["buy"]["total"], 0, "run7 没有 buy 事件")
+        self.assertEqual(rep["red"]["total"], 0, "买不起不是失败，不许判红")
+        advice = " ".join(str(a["text"]) for a in rep["advice"])
+        self.assertIn("不是任务失败", advice)
+
+    @unittest.skipUnless(os.path.isfile(os.path.join(ROOT, "logs", "longrun-3day-llm-run7.jsonl")),
+                         "缺少 run7 账本")
+    def test_real_run7_window_switch_keeps_history(self):
+        rep3 = report_for(self.RUN7, days=7, top=0)
+        self.assertEqual(rep3["window"]["days"], 3)
+        self.assertEqual(rep3["red"]["total"], 0, "默认窗口 3：run7 是达标运行，红必须为 0")
+        self.assertGreater(rep3["history_problems"]["total"], 100)
+        self.assertIn("missed:check:watered_outdoor", rep3["history_problems"]["subjects"])
+        rep7 = report_for(self.RUN7, days=7, top=0, window=7)
+        self.assertFalse(rep7["window"]["active"])
+        self.assertEqual(rep7["history_problems"]["total"], 0)
+        self.assertGreater(sum(1 for ln in rep7["red"]["lines"] if 435 <= ln <= 1013), 50,
+                           "summer 6 的历史红条不许因为窗口切换而消失")
 
 
 if __name__ == "__main__":

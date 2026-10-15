@@ -449,6 +449,34 @@ RED_SUBJECTS = (
 )
 
 
+#: task-88（Lead m04300）：窗口口径（与 `tools\verify-run3.py` 的"尾部窗口"同义）。
+#: * 窗口 = 账本最后 `--window N` 天（默认 3）。窗口**内**的日级红照常 fatal；
+#:   窗口**外**的日级红降级为 `history_problems`（**逐条列出、不进退出码**）。
+#: * `连续 VERIFIED 天数 < N` ⇒ 本跑没达标，**不降级**（历史问题不能替它开脱），维持原判。
+#: * 无日期归属的**全局红**（finish 自述不一致 / 账目自相矛盾 / journal 损坏）**永远 fatal**。
+#: * `--window 0` = 关闭窗口（task-88 之前的旧行为）。
+GLOBAL_RED_SUBJECTS = (
+    "wasted:finish_incoherent",
+    "wasted:finish_vs_days",
+    "missed:stage_account",
+)
+#: task-88：事件级"瞬间态"class-1 —— 当天 `day_end.verified=true` 且 `checks.no_unmet_stages=true`
+#: ⇒ 降级为 info（逐条列出并标"已结清"，不进 rc）。理由：这些事件记录的是**某一轮的瞬间状态**
+#: （阶段这一刻没目标 / 意图被取消），当天随后结清时 verify-run3 的日级口径不会判它问题。
+SETTLED_SUBJECT_PREFIXES = (
+    "missed:cancel:",
+    "missed:stage_no_target",
+    "missed:stage_exhausted",
+    "missed:plot_exhausted",
+)
+
+
+def is_settleable(item):
+    """这条 finding 是否属于"瞬间态 class-1"（可能被同日结清降级）。"""
+    subject = str((item or {}).get("subject") or "")
+    return any(subject.startswith(prefix) for prefix in SETTLED_SUBJECT_PREFIXES)
+
+
 def is_red_finding(item):
     """这条 finding 算不算"红"（退出码 1 的依据）。口径写进 `--help` 与口径卡 §1.5。"""
     subject = str((item or {}).get("subject") or "")
@@ -696,9 +724,24 @@ def _bound_basis_text(env, side):
     return txt
 
 
+def _settle(item, settled):
+    """task-88：给"瞬间态 class-1"finding 打 `settled` 标记（同日结清 ⇒ info，不进 rc）。"""
+    if settled:
+        item["settled"] = True
+        item["summary"] = (str(item.get("summary") or "")
+                           + "（已结清：当天 VERIFIED 且 no_unmet_stages=true ⇒ 只作 info）")
+    return item
+
+
 def cat_missed(sessions, top):
     out = []
     for sess in sessions:
+        # task-88：本会话是否"瞬间态已结清"（当天 VERIFIED 且 checks.no_unmet_stages=true）
+        # ⇒ 1a/1b 这类**事件级**红降级为 info（仍逐条列出、不进 rc）；
+        #   日级红与全局红不受影响。
+        _last_end = as_dict(sess["day_ends"][-1][1]) if sess["day_ends"] else {}
+        settled = (_last_end.get("verified") is True
+                   and as_dict(_last_end.get("checks")).get("no_unmet_stages") is True)
         # 1a: intent_verdict=cancel，且该任务当天再没做成过
         for lineno, ev in sess["verdicts"]:
             for verdict in as_list(ev.get("verdicts")):
@@ -715,16 +758,15 @@ def cat_missed(sessions, top):
                 else:
                     end_line = sess["day_ends"][-1][0] if sess["day_ends"] else None
                     note = f"；当天再没做过（直到 L{end_line}）" if end_line else "；当天再没做过（这天没有 day_end）"
-                out.append(
-                    finding(
-                        lineno,
-                        "intent_verdict",
-                        f"cancel：{task} @ zone={ev.get('zone')} —— {verdict.get('reason')}{note}",
-                        hint="cancel 的依据是'看得见却没有一格可动目标'；若该任务其实有事可做，"
-                             "问题在 _verify_intents 的观测范围（OBSERVE_REACH）或目标口径",
-                        subject=f"missed:cancel:{task}",
-                    )
+                item = finding(
+                    lineno,
+                    "intent_verdict",
+                    f"cancel：{task} @ zone={ev.get('zone')} —— {verdict.get('reason')}{note}",
+                    hint="cancel 的依据是'看得见却没有一格可动目标'；若该任务其实有事可做，"
+                         "问题在 _verify_intents 的观测范围（OBSERVE_REACH）或目标口径",
+                    subject=f"missed:cancel:{task}",
                 )
+                out.append(_settle(item, settled and is_settleable(item)))
         # 1b: 阶段没目标 / 换片，且收工时还有待办
         for key, hint in (
             ("no_targets", "该阶段当天没有目标；若收工时该阶段仍有待办，就是'该做没做'"),
@@ -733,16 +775,15 @@ def cat_missed(sessions, top):
         ):
             for lineno, ev in sess[key]:
                 leftover = ev.get("leftover", ev.get("recovered"))
-                out.append(
-                    finding(
-                        lineno,
-                        ev.get("event"),
-                        f"{ev.get('event')}：stage={ev.get('stage') or '-'} zone={ev.get('zone')} "
-                        f"leftover/recovered={leftover} note={str(ev.get('note') or '')[:60]}",
-                        hint=hint,
-                        subject=f"missed:{ev.get('event')}",
-                    )
+                item = finding(
+                    lineno,
+                    ev.get("event"),
+                    f"{ev.get('event')}：stage={ev.get('stage') or '-'} zone={ev.get('zone')} "
+                    f"leftover/recovered={leftover} note={str(ev.get('note') or '')[:60]}",
+                    hint=hint,
+                    subject=f"missed:{ev.get('event')}",
                 )
+                out.append(_settle(item, settled and is_settleable(item)))
         end = sess["day_ends"][-1][1] if sess["day_ends"] else None
         end_line = sess["day_ends"][-1][0] if sess["day_ends"] else None
         oks = {}
@@ -1603,24 +1644,32 @@ def cat_self_report(report):
     code = finish.get("code")
     streak = as_int(finish.get("verified_streak"))
     requested = as_int(report.get("days_requested"))
+    window = as_int(report.get("window_days"), requested) or requested
+    recorded = len(report.get("days") or [])
     days = as_int(finish.get("days"), requested)
     verified_days = as_int(report.get("verified_days"))
-    if days > 0 and (code == 0) != (streak >= days):
+    # task-88：finish 自洽的达标目标 = **目标窗口**（`--window N`，默认 3），不是账本自己的
+    # `finish.days`（那是自述字段）。窗口不可能大于账本记录的天数 ⇒ 取 `min(窗口, 记录天数)`。
+    # `streak >= 目标` ⇒ 不报；否则报。
+    target = min(window, recorded) if (window > 0 and recorded) else days
+    if target > 0 and (code == 0) != (streak >= target):
         out.append(
             finding(
                 line, "finish",
-                f"finish 自身不自洽：code={code} 与 verified_streak={streak}/days={days} 不符",
-                hint="finish 是自述字段：code==0 必须等价于连续 VERIFIED 天数达标"
-                     "（verify-run3.py 同口径）",
+                f"finish 自身不自洽：code={code} 与 verified_streak={streak}/目标窗口={target} 不符"
+                + (f"（finish 自述 days={days}）" if days != target else ""),
+                hint="finish 是自述字段：code==0 必须等价于连续 VERIFIED 天数达到**目标窗口**"
+                     "（task-88；verify-run3.py 按它的 --days 同口径）",
                 subject="wasted:finish_incoherent",
             )
         )
-    elif days > 0 and days == requested and (code == 0) != (verified_days >= days):
+    elif target > 0 and (code == 0) != (verified_days >= target):
         out.append(
             finding(
                 line, "finish",
-                f"finish 自述 code={code}，但账本正文里 verified 天数只有 {verified_days}/{days}（应同向）",
-                hint="自述与正文必须同向（verify-run3.py 盲区 B1）；自述达标而正文一天没达标 "
+                f"finish 自述 code={code}，但账本正文里 verified 天数只有 {verified_days}/{target}"
+                "（应同向）",
+                hint="自述与正文必须同向（verify-run3.py 盲区 B1）；自述达标而正文天数不达标 "
                      "= 自述在洗账",
                 subject="wasted:finish_vs_days",
             )
@@ -1705,6 +1754,16 @@ def build_advice(report, top=8):
             "lines": (se["lines"].get("no_seed_for_sale", [])
                       + se["lines"].get("cannot_afford", [])
                       + se["lines"].get("seed_unavailable_today", [])),
+        })
+    # 0i-2) task-88 ④：`seed_gate` 钱不够分叉 —— **不是任务失败**（不要读成失败）
+    if se.get("afford_blocked"):
+        advice.append({
+            "text": f"种子经济（信息项，**不是任务失败**）：seed_gate {se.get('seed_gate')} 次里"
+                    f"有 {se.get('afford_blocked')} 次是 money={se.get('seed_gate_money')} < "
+                    f"seed_price={se.get('seed_gate_price')}（或背包 0 种子）⇒ 当天没发起购买。"
+                    "这是经济约束，不是购买任务失败；run7 的 5 次 seed_gate 都是这个形态"
+                    "（建议 3 的 brain 半边已进 task-84）",
+            "lines": se.get("afford_blocked_lines", []),
         })
     # 0j) 可达性/开路（task-76：task-68 的被围住 + frontier_clear + clear_neighbor；**不判红**）
     rc = report.get("reachability") or {}
@@ -2180,8 +2239,26 @@ def build_report(rows, path, args, bad_lines):
     seed_offers = ""
     seed_money = None
     seed_price = None
+    # task-88 ④：`seed_gate` 的"钱不够"分叉 —— 买不起种子 ⇒ **未发起购买**，不是任务失败。
+    seed_gate_lines = []
+    seed_gate_blocked_lines = []
+    seed_gate_money = None
+    seed_gate_price = None
     for ln, ev in rows:
         seed_name = str(ev.get("event") or "")
+        if seed_name == "seed_gate":
+            seed_gate_lines.append(ln)
+            gate_money = ev.get("money")
+            gate_price = ev.get("seed_price")
+            gate_seeds = as_int(ev.get("seeds"))
+            if ((gate_money is not None and gate_price is not None
+                 and as_num(gate_money) < as_num(gate_price)) or gate_seeds == 0):
+                seed_gate_blocked_lines.append(ln)
+                if seed_gate_money is None:
+                    seed_gate_money = gate_money
+                if seed_gate_price is None:
+                    seed_gate_price = gate_price
+            continue
         if seed_name not in seed_counts:
             continue
         seed_counts[seed_name] += 1
@@ -2205,6 +2282,13 @@ def build_report(rows, path, args, bad_lines):
         # run6 死锁指纹：确认买不到、却**没有**当天失效留痕 ⇒ 守卫很可能还在要"去买"
         "deadlock_risk": (seed_counts["no_seed_for_sale"] + seed_counts["cannot_afford"]) > 0
                          and seed_counts["seed_unavailable_today"] == 0,
+        # task-88 ④：`seed_gate` 这条"钱不够"分叉（≠ 购买任务失败）
+        "seed_gate": len(seed_gate_lines),
+        "seed_gate_lines": seed_gate_lines,
+        "afford_blocked": len(seed_gate_blocked_lines),
+        "afford_blocked_lines": seed_gate_blocked_lines,
+        "seed_gate_money": seed_gate_money,
+        "seed_gate_price": seed_gate_price,
     }
     sleep_ok = sum(1 for _, ev in rows if ev.get("event") == "sleep" and ev.get("ok"))
     sleep_failed = sum(1 for _, ev in rows if ev.get("event") == "sleep" and not ev.get("ok"))
@@ -2597,6 +2681,8 @@ def build_report(rows, path, args, bad_lines):
     }
     # `t` 回退（只记信息项）
     report["t_regressions"] = t_regressions
+    # task-88：`cat_self_report` 要按**目标窗口**（`--window N`）而不是 `finish.days` 判自洽。
+    report["window_days"] = as_int(getattr(args, "window", 3), 3)
     self_report = cat_self_report(report)
     report["categories"] = {
         "manual": cat_manual(all_sessions, args.top),
@@ -2619,16 +2705,94 @@ def build_report(rows, path, args, bad_lines):
     # task-65：退出码（默认：有红 ⇒ 1 / 0 红 ⇒ 0 / 跑不动 ⇒ 2；`--advisory` 恒 0）。
     # **计数必须走全量**：`report["categories"]` 被 `--top` 截断过，拿它当计数源会出现
     # "有红但退出码 0"的假绿（与 task-60 浇水建议同一教训）。
-    red_all = []
+    #
+    # task-88（Lead m04300）：窗口口径 —— 与 `tools\verify-run3.py` 的"尾部窗口"同义。
+    #   * 窗口 = 最后 `--window N` 天（默认 3）；窗口**外**的日级红 ⇒ `history_problems`（逐条列出、
+    #     **不进退出码**）；窗口**内**照常 fatal。
+    #   * `连续 VERIFIED 天数 < N` ⇒ 本跑没达标，不降级（维持原判）。
+    #   * 事件级"瞬间态"class-1（cancel / stage_no_target / stage_exhausted / plot_exhausted）
+    #     当天 `verified=true` 且 `no_unmet_stages=true` ⇒ 降级 `settled`（info，逐条列出）。
+    #   * 无日期归属的**全局红**（GLOBAL_RED_SUBJECTS）永远 fatal。
+    windows = as_int(getattr(args, "window", 3), 3)
+    tail_streak = 0
+    for day_row in reversed(days):
+        if day_row.get("verified") is True:
+            tail_streak += 1
+        else:
+            break
+    window_active = windows > 0 and tail_streak >= windows
+    window_labels = {d.get("label") for d in days[-windows:]} if windows > 0 else set()
+    day_bounds = []
+    for i, sess in enumerate(sessions):
+        start = sess["start_line"]
+        stop = (sessions[i + 1]["start_line"] - 1) if i + 1 < len(sessions) else None
+        day_bounds.append((start, stop, days[i].get("label") if i < len(days) else None))
+
+    def day_of_line(lineno):
+        if lineno is None:
+            return None
+        for start, stop, label in day_bounds:
+            if lineno >= start and (stop is None or lineno <= stop):
+                return label
+        return None
+
+    red_all, history_all, settled_all = [], [], []
     for items in (cat_manual(all_sessions, 0),
                   cat_missed(sessions, 0),
                   cat_wasted(sessions, 0) + cat_self_report(report)):
-        red_all.extend(item for item in items if is_red_finding(item))
+        for item in items:
+            if not is_red_finding(item):
+                continue
+            if item.get("settled"):
+                settled_all.append(item)
+                continue
+            subject = str(item.get("subject") or "")
+            label = day_of_line(item.get("line"))
+            if subject in GLOBAL_RED_SUBJECTS or label is None:
+                red_all.append(item)
+                continue
+            if window_active and label not in window_labels:
+                history_all.append(item)
+                continue
+            red_all.append(item)
+    report["window"] = {
+        "days": windows,
+        "tail_streak": tail_streak,
+        "active": window_active,
+        "labels": [d.get("label") for d in (days[-windows:] if windows > 0 else [])],
+        "history_total": len(history_all),
+        "settled_total": len(settled_all),
+    }
+    report["history_problems"] = {
+        "total": len(history_all),
+        "subjects": sorted({str(item.get("subject")) for item in history_all}),
+        "lines": sorted({item["line"] for item in history_all if item.get("line") is not None}),
+        "items": [{"line": item.get("line"), "subject": item.get("subject"),
+                   "summary": item.get("summary"), "hint": item.get("hint")}
+                  for item in history_all],
+    }
+    report["settled"] = {
+        "total": len(settled_all),
+        "subjects": sorted({str(item.get("subject")) for item in settled_all}),
+        "lines": sorted({item["line"] for item in settled_all if item.get("line") is not None}),
+        "items": [{"line": item.get("line"), "subject": item.get("subject"),
+                   "summary": item.get("summary"), "hint": item.get("hint")}
+                  for item in settled_all],
+    }
+    report["categories"]["history"] = history_all[:args.top]
+    report["categories_total"]["history"] = len(history_all)
+    report["categories"]["settled"] = settled_all[:args.top]
+    report["categories_total"]["settled"] = len(settled_all)
     report["red"] = {
         "total": len(red_all),
         "subjects": sorted({str(item.get("subject")) for item in red_all}),
         "lines": sorted({item["line"] for item in red_all if item.get("line") is not None}),
         "advisory": bool(getattr(args, "advisory", False)),
+        "window": windows,
+        "tail_streak": tail_streak,
+        "window_active": window_active,
+        "history_total": len(history_all),
+        "settled_total": len(settled_all),
     }
     return report
 
@@ -2796,6 +2960,12 @@ def render_text(report, top):
                if se.get("offers") else "")
             + ("  ⚠ 有买不到结论但没有当天失效留痕 ⇒ 守卫可能还在要「去买」（run6 死锁形态）"
                if se.get("deadlock_risk") else ""))
+    # task-88 ④：`seed_gate` 的"钱不够"分叉 —— 未发起购买，**不是任务失败**
+    if se.get("afford_blocked"):
+        add(f"种子经济: 本日缺种子钱（money={se.get('seed_gate_money')} < "
+            f"seed_price={se.get('seed_gate_price')}）⇒ 未发起购买，不是任务失败"
+            f"（seed_gate {se.get('seed_gate')} 次、其中钱不够/背包 0 种子 "
+            f"{se.get('afford_blocked')} 次；行 {se.get('afford_blocked_lines', [])[:10]}）")
     # task-32：两种新事件形态的计数（信息项）；task-38：跨日证据覆盖度
     pc, ws = report["events"].get("plots_capped", 0), report["events"].get("work_spot", 0)
     add(f"软上限/收尾: plots_capped {pc} 次（作业区配额到顶，信息项）；work_spot {ws} 次（收尾作业区）")
@@ -2851,6 +3021,17 @@ def render_text(report, top):
         + f"；有红 {rc_total} 条"
         + (f"（{', '.join(rc_info.get('subjects') or [])}）" if rc_total else "")
         + "；0=无红 / 1=有红 / 2=跑不动；判决权威仍是 tools\\verify-run3.py")
+    # task-88：窗口口径（窗口外的日级红 → 历史问题，不进 rc）与"瞬间态已结清"
+    win = report.get("window") or {}
+    hist = report.get("history_problems") or {}
+    settled = report.get("settled") or {}
+    add(f"窗口: --window {win.get('days')}（尾部连续 VERIFIED {win.get('tail_streak')} 天"
+        + ("，窗口生效" if win.get("active")
+           else "，不足 ⇒ **不启用窗口降级**（窗口外也照常 fatal，历史问题不能替本跑开脱）")
+        + f"）；窗口内红 {rc_total} 条；窗口外历史问题 {hist.get('total', 0)} 条"
+        + (f"（行 {hist.get('lines')[:10]}）" if hist.get("total") else "")
+        + f"；已结清（当天 VERIFIED）{settled.get('total', 0)} 条"
+        + (f"（行 {settled.get('lines')[:10]}）" if settled.get("total") else ""))
     env = report.get("env_inconclusive") or {}
     add(f"环境挡路: {env.get('env_fail_events', 0)} 条（{env.get('env_fail_tiles', 0)} 格，"
         f"其中 {env.get('env_fail_unfinished_tiles', 0)} 格所在阶段最终没做成）；"
@@ -2970,6 +3151,9 @@ def render_text(report, top):
         ("3 无效挥动", "ineffective", "无效挥动"),
         ("4 睡觉时机", "sleep", "睡觉时机"),
         ("5 环境挡路 / 没拿到结论", "environment", "环境挡路 / 没拿到结论"),
+        # task-88：窗口外的历史问题与"瞬间态已结清"逐条列出（都不进退出码）
+        ("6 历史问题（窗口外，info 不进 rc）", "history", "历史问题（窗口外）"),
+        ("7 已结清（瞬间态事件，info）", "settled", "已结清（瞬间态）"),
     ]
     for title, key, _ in sections:
         items = report["categories"][key]
@@ -3010,6 +3194,12 @@ def parse_args(argv):
             "                     `wasted:*`：洗白 / 0 步却 VERIFIED / 浇水矛盾 / 账目自述不一致）；\n"
             "                  2 = 跑不动（读不到 journal、空账本、参数错）。\n"
             "`--advisory` 诊断模式：无论有没有红都返回 0（老行为）。\n"
+            "窗口（task-88）：`--window N`（默认 3，与 tools\\verify-run3.py 的尾部窗口同义）——\n"
+            "                 窗口**外**的日级红降级为 history_problems（逐条列出、**不进退出码**）；\n"
+            "                 窗口**内**照常 fatal；`连续 VERIFIED 天数 < N` 时不降级（维持原判）；\n"
+            "                 事件级「瞬间态」（cancel / stage_no_target / stage_exhausted /\n"
+            "                 plot_exhausted）当天 VERIFIED 且 no_unmet_stages=true ⇒ 记「已结清」（info）；\n"
+            "                 无日期归属的全局红（finish 自述不一致 / 账目自相矛盾）永远 fatal。\n"
             "**判决权威仍是 tools\\verify-run3.py**：本工具是四路复核之一，退出码只表达\n"
             "\"有没有红\"，不表达\"整跑是否达标\"（达标看 verify-run3 的 0/1/2 与 docs\\_run6-criteria.md）。"
         ),
@@ -3017,6 +3207,11 @@ def parse_args(argv):
     parser.add_argument("--journal", default=None,
                         help="账本路径（默认取 logs\\longrun-*.jsonl 里 mtime 最新）")
     parser.add_argument("--days", type=int, default=3, help="领跑天数（只用于 'X/N 天 VERIFIED' 的分母）")
+    parser.add_argument("--window", type=int, default=3,
+                        help="尾部窗口天数（默认 3，与 tools\\verify-run3.py 的尾部窗口同义）："
+                             "窗口外的日级红 → history_problems（逐条列出、不进退出码）；"
+                             "窗口内照常 fatal；尾部连续 VERIFIED 天数 < N 时不降级；"
+                             "0 = 关闭窗口（task-88 之前的旧行为）")
     parser.add_argument("--top", type=int, default=10, help="每类明细最多显示条数（默认 10）")
     parser.add_argument("--json", action="store_true", help="输出机器可读 JSON（同结构）")
     parser.add_argument("--advisory", action="store_true",

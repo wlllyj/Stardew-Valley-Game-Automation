@@ -328,13 +328,42 @@ rg -n 'bound_basis' docs\_verify-run3-limits.md
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run6.jsonl | rg 'bound_basis|上界自检'
 ```
 
+## 3.12 窗口口径 + 瞬间态已结清（task-88，Lead m04300）
+
+### 两个病
+- run7 有 7 天 / 683 个动作：summer 3–5 的红绝大多数是"当天后来真做成了"的**事件瞬间态**（阶段那一刻没目标、意图被取消），summer 6 的 74 条 `stage_exhausted` 里 70 条当晚被 `water_far` 补做；而 run7 的验收判据本来就是**尾部窗口**（`tools\verify-run3.py` 只要求窗口内达标）⇒ 旧行为"一条历史红就 rc=1"既误导（把已结清的历史当成当前问题）又挡住窗口验收。
+- run7 的 `finish` 自述 `verified_streak=3`，而 task-65 的 finish 自洽检查拿 `--days`（默认 3）当目标 ⇒ 在 `--days 7` 下 `streak 3 < 7` ⇒ 误报 `wasted:finish_incoherent`。
+
+### 口径（默认 `--window 3`，与 `verify-run3.py` 的尾部窗口同义）
+1. **窗口** = 账本最后 N 天（默认 3；`--window 0` 关闭 = task-88 之前的行为）。窗口**内**的日级红照常 fatal；窗口**外**的日级红降级 `history_problems`：**逐条列出、不进退出码**（报告新增第 6 节「历史问题（窗口外，不进 rc）」）。
+2. **不降级**的两种：①`连续 VERIFIED 天数 < N`（本跑没达标，历史问题不能替它开脱）；②**无日期归属的全局红**（`wasted:finish_incoherent` / `wasted:finish_vs_days` / `missed:stage_account`）永远 fatal。
+3. **瞬间态 class-1**（`missed:cancel:*` / `missed:stage_no_target` / `missed:stage_exhausted` / `missed:plot_exhausted`）：当天 `day_end.verified=true` 且 `checks.no_unmet_stages=true` ⇒ 降级为 info（报告新增第 7 节「已结清」，文案带`（已结清…）`）。缺 `no_unmet_stages` ⇒ **不降级**（缺失 ≠ 结清）。
+4. **finish 目标窗口** = `min(--window, 账本实际天数)`（`--window 0` 时退回 `--days`）⇒ `streak >= 目标窗口` 就不该报；`--window 7` 对 run7（7 天全 VERIFIED）不报自述问题。
+5. **`seed_gate` 钱不够**：`seed_gate` 带 `money`/`seed_price`；`money < seed_price` 或 `seeds==0` ⇒ 呈现行点名「缺种子钱（money=14 < seed_price=20）」+「**未发起购买，不是任务失败**」（与 task-70 的 `cannot_afford` 同类语义）。缺字段 ⇒ 不加这半句（绝不臆断）。
+
+### run7 读数（验收）
+- `python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run7.jsonl --days 7` ⇒ **rc=0、红 0**（窗口内 0、窗口外历史问题 129、已结清 9）。
+- `--window 7` ⇒ rc=1、红 130（严格口径，与 `tools\verify-run3.py --days 7` 的 rc=1 同向）；`--window 0` ⇒ rc=1（旧行为）。
+- 五账本不变：green 0(0)、run2 1(19)、run3 1(17)、run5 1(62)、run6 1(14)、vacuum 1(3)。
+
+### 单测
+`tests/test_analyze_longrun.py::TestWindowAndSettledClassification`（9 条）：`test_window_demotes_out_of_window_reds` / `test_short_streak_keeps_reds_fatal` / `test_global_red_is_never_demoted` / `test_settled_momentary_event_is_info` / `test_settled_needs_no_unmet_stages` / `test_finish_self_report_uses_target_window` / `test_seed_gate_shortfall_line` / `test_real_run7_window_zero_red`。
+
+### grep 配方
+```
+python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run7.jsonl --days 7 | rg "窗口|历史问题|已结清"
+python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run7.jsonl --days 7 --window 0   # 旧口径对照
+rg -n '"seed_gate' logs\longrun-*.jsonl
+```
+
 ## 4. 复核命令
 
 ```
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run5.jsonl   # 有红 ⇒ rc=1（--advisory 才恒 0）
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run6.jsonl   # run6：守卫死锁 + 同日重试
-python tools\verify-run3.py      --journal logs\longrun-3day-llm-run6.jsonl   # 判决权威（rc=1 needs_review）
+python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run7.jsonl --days 7   # run7：窗口口径 ⇒ rc=0
+python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
-python -m unittest tests.test_analyze_longrun  # 当前 95 OK（task-80）
-python -m unittest discover -s tests           # 当前 522，其中 2 条红属 dev 在制（tests/test_longrun.py::TestTask78HonestEncircledWording）
+python -m unittest tests.test_analyze_longrun  # 当前 104 条（其中 1 条漂移红属 task-91 的 surplus_sell 在制）
+python -m unittest discover -s tests
 ```
