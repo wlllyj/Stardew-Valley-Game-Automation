@@ -4154,6 +4154,220 @@ class TestTask78HonestEncircledWording(unittest.TestCase):
         self.assertNotIn("树/桩/大石", str(summary[0].get("note") or ""))
 
 
+class _SurplusWorker(FakeWorker):
+    """task-55：给假执行层补 `sell(slot, *, whitelist=…)`（真 `FarmWorker.sell` 的最小替身）。
+
+    `ShipSkill` 的语义照搬：白名单是**精确 qualifiedId** 列表，出货当天钱**不变**
+    （钱要等游戏下一次 `NewDay` 结算）。
+    """
+
+    def __init__(self, world: FakeWorld, *, mode: str = "ship") -> None:
+        super().__init__(world)
+        self.mode = mode
+        self.sell_calls: list[dict] = []
+        self.shipped: list[dict] = []
+
+    def _slot_item(self, slot: int):
+        """按 **slot 字段**找，而不是列表下标 —— 真桥收到的 `args.slot` 就是快照里的 slot 号。"""
+        for it in self.w.inventory:
+            if int(it.get("slot", -1)) == slot:
+                return it
+        return None
+
+    def sell(self, slot, *, whitelist=None, timeout_ms=8000):
+        slot = int(slot)
+        allow = [str(x) for x in (whitelist or [])]
+        item = self._slot_item(slot)
+        before = {"slot": slot, "qid": (item or {}).get("qualifiedId"),
+                  "stack": int((item or {}).get("stack") or 0),
+                  "count": len(self.shipped), "money": self.w.money}
+        self.sell_calls.append({"slot": slot, "whitelist": allow})
+        if self.mode != "ship":
+            st = StepResult("sell", None, ok=False, code=self.mode,
+                            reason=f"假执行层：sell 失败（{self.mode}）")
+            st.before = before
+            return st
+        if item is None:
+            st = StepResult("sell", None, ok=False, code="empty_slot", reason="槽位是空的")
+            st.before = before
+            return st
+        qid = str(item.get("qualifiedId") or item.get("id") or "")
+        if qid not in allow:
+            st = StepResult("sell", None, ok=False, code="not_whitelisted",
+                            reason=f"{qid} 不在白名单里")
+            st.before = before
+            return st
+        self.w.inventory.remove(item)
+        self.shipped.append(dict(item))
+        st = StepResult("sell", None, ok=True, code="ok",
+                        reason="已放进出货箱（钱要下一次 NewDay 才结算）")
+        st.before = before
+        st.after = {"slot": slot, "qid": qid, "stack": 0, "count": len(self.shipped),
+                    "money": self.w.money}
+        st.receipt = f"slot={slot} qid={qid}"
+        return st
+
+
+class TestTask55SurplusSell(unittest.TestCase):
+    """task-55：`_preconditions` 里"卖盈余材料换种子钱"这条腿的接线与账本。
+
+    铁律（task-42 起）：绝不自己写 `Money +=`，判据一律观测差分；出货当天钱不变，
+    要等游戏下一次 `NewDay`。
+
+    变异自检（`%TEMP%\\t55_mutate.py`，跑完即弃；结论同 `test_farmwork.TestTask55SurplusPlan`）：
+    基线 14/14 绿；m55a 红 2、m55b 红 1（`test_sells_at_most_once_per_day`）、m55c 红 1
+    （`test_cannot_afford_trail_is_written_once_with_the_shortfall`）。
+    """
+
+    K = 10
+
+    @staticmethod
+    def _material(slot: int, iid: str, name: str, stack: int) -> dict:
+        return {"slot": slot, "id": iid, "qualifiedId": f"(O){iid}", "name": name,
+                "stack": stack, "isTool": False}
+
+    def _world(self, *, money: int = 14, seeds: int = 0, empty_dirt: int = 40,
+               materials: tuple = (), farm: bool = True) -> FakeWorld:
+        w = FakeWorld(weeds=0, seeds=seeds, money=money)
+        if farm:
+            w.farm = {"loaded": True, "complete": True, "emptyDirt": empty_dirt,
+                      "dryCrops": 0, "crops": 0, "ripeCrops": 0, "deadCrops": 0, "hoeDirt": 0}
+        for m in materials:
+            w.inventory.append(dict(m))
+        return w
+
+    def _run(self, w: FakeWorld, **kw):
+        run = make_run(w, target_days=1, **kw)
+        run.worker = _SurplusWorker(w)
+        run.client = FakeClient(w)
+        return run
+
+    @staticmethod
+    def _events(run, name: str) -> list[dict]:
+        return [e for e in run.entries if e.get("event") == name]
+
+    def test_gate_sells_surplus_materials_and_writes_journal(self):
+        w = self._world(materials=(self._material(6, "388", "Wood", 25),
+                                   self._material(7, "388", "Wood", 5),
+                                   self._material(8, "390", "Stone", 3)))
+        run = self._run(w)
+        rep = DayReport(day_key=("summer", 1, 7), started_at=0.0)
+        run._preconditions(w.obs(), rep)
+        # 只有"卖掉后仍 >= K"的那叠（5 件）进白名单；整叠出货 ⇒ 卖 5 留 25
+        self.assertEqual(run.worker.sell_calls,
+                         [{"slot": 7, "whitelist": ["(O)388"]}])
+        self.assertIsNone(run.worker._slot_item(7), "卖出去的那叠要从背包消失")
+        self.assertEqual(len(run.worker.shipped), 1)
+        self.assertEqual(w.money, 14, "出货当天钱不变（NewDay 才由游戏结算）")
+        sells = self._events(run, "sell")
+        self.assertEqual(len(sells), 1, run.entries)
+        self.assertEqual(sells[0]["strategy"], "surplus_materials")
+        self.assertEqual(sells[0]["keep"], self.K)
+        self.assertEqual(sells[0]["qid"], "(O)388")
+        self.assertEqual(sells[0]["trigger"]["money"], 14)
+        self.assertEqual(sells[0]["trigger"]["threshold"], 5 * 20)
+        summary = self._events(run, "surplus_sell")
+        self.assertEqual(len(summary), 1, run.entries)
+        self.assertEqual(summary[0]["sold"], 5)
+        self.assertFalse(summary[0]["below_keep"])
+        self.assertEqual(summary[0]["trigger"]["emptyDirt"], 40)
+        self.assertTrue(any("NewDay" in n for n in rep.notes), rep.notes)
+        self.assertTrue(run.surplus_sold_today)
+
+    def test_no_sell_when_money_seeds_or_dirt_are_fine(self):
+        for kw, why in (({"money": 500}, "钱够"),
+                        ({"seeds": 5}, "还有种子"),
+                        ({"empty_dirt": 0}, "没有空地"),
+                        ({"farm": False}, "farm 证据不可用")):
+            w = self._world(materials=(self._material(6, "390", "Stone", 200),), **kw)
+            run = self._run(w)
+            rep = DayReport(day_key=("summer", 1, 7), started_at=0.0)
+            run._preconditions(w.obs(), rep)
+            self.assertEqual(run.worker.sell_calls, [], why)
+            self.assertEqual(self._events(run, "sell"), [], why)
+            self.assertEqual(self._events(run, "surplus_sell"), [], why)
+            self.assertFalse(run.surplus_sold_today, why)
+
+    def test_sells_at_most_once_per_day(self):
+        # 两叠 Wood：第 1 轮卖 5（留 25）；若"当天只卖一次"的守卫失效，第 2 轮会把 25 也卖掉
+        w = self._world(materials=(self._material(6, "388", "Wood", 25),
+                                   self._material(7, "388", "Wood", 5)))
+        run = self._run(w)
+        rep = DayReport(day_key=("summer", 1, 7), started_at=0.0)
+        run._preconditions(w.obs(), rep)
+        run._preconditions(w.obs(), rep)
+        self.assertEqual([c["slot"] for c in run.worker.sell_calls], [7],
+                         "同一天只许卖一次（每轮都会跑 _preconditions）")
+        self.assertEqual(len(run.worker.shipped), 1)
+        # 次日 `_run_day` 会清零 ⇒ 还能再来一次
+        run.surplus_sold_today = False
+        run._preconditions(w.obs(), rep)
+        self.assertGreater(len(run.worker.sell_calls), 1)
+
+    def test_lone_oversized_stack_is_sold_and_flagged_honestly(self):
+        w = self._world(materials=(self._material(6, "390", "Stone", 200),))
+        run = self._run(w)
+        rep = DayReport(day_key=("summer", 1, 7), started_at=0.0)
+        run._preconditions(w.obs(), rep)
+        self.assertEqual([c["slot"] for c in run.worker.sell_calls], [6])
+        summary = self._events(run, "surplus_sell")[0]
+        self.assertTrue(summary["below_keep"], "唯一一大叠整叠出货 ⇒ 必须如实标 below_keep")
+        self.assertEqual(summary["items"][0]["left"], 0)
+        self.assertTrue(any("K=10" in n for n in rep.notes), rep.notes)
+
+    def test_sell_failure_is_recorded_but_never_a_hard_failure(self):
+        w = self._world(materials=(self._material(6, "388", "Wood", 25),
+                                   self._material(7, "388", "Wood", 5)))
+        run = self._run(w)
+        run.worker.mode = "not_whitelisted"
+        rep = DayReport(day_key=("summer", 1, 7), started_at=0.0)
+        run._preconditions(w.obs(), rep)
+        sells = self._events(run, "sell")
+        self.assertEqual(len(sells), 1, run.entries)
+        self.assertFalse(sells[0]["ok"])
+        self.assertEqual(sells[0]["code"], "not_whitelisted")
+        self.assertEqual(self._events(run, "sell_failed")[0]["strategy"], "surplus_materials")
+        self.assertEqual(w.money, 14)
+        self.assertFalse(self._events(run, "surplus_sell")[0]["ok"])
+        self.assertEqual(run.worker.sell_calls, [{"slot": 7, "whitelist": ["(O)388"]}] * 1)
+
+    def test_cannot_afford_trail_is_written_once_with_the_shortfall(self):
+        w = self._world()          # 没材料、没货架、钱 14 < seed_price 20
+        run = self._run(w)
+        run.shop_offers = []
+        rep = DayReport(day_key=("summer", 1, 7), started_at=0.0)
+        run._preconditions(w.obs(), rep)
+        run._preconditions(w.obs(), rep)
+        ev = self._events(run, "cannot_afford")
+        self.assertEqual(len(ev), 1, run.entries)
+        self.assertEqual((ev[0]["money"], ev[0]["seed_price"], ev[0]["short"]), (14, 20, 6))
+        self.assertEqual(self._events(run, "buy"), [], "钱不够时不该发注定失败的 buy")
+        self.assertEqual(self._events(run, "sell_failed"), [])
+
+    def test_money_arrived_next_day_then_buys_and_never_calls_it_a_failure(self):
+        w = self._world(materials=(self._material(6, "390", "Stone", 200),))
+        run = self._run(w)
+        rep = DayReport(day_key=("summer", 1, 7), started_at=0.0)
+        run._preconditions(w.obs(), rep)                    # 第 1 天：卖；钱当天没到账
+        self.assertEqual(len(self._events(run, "sell")), 1)
+        self.assertEqual(self._events(run, "buy"), [])
+        self.assertEqual(self._events(run, "sell_failed"), [],
+                         "「钱要等 NewDay」绝不许被记成失败")
+        # 游戏结算（假世界手动模拟 NewDay）⇒ 次日必须真的能买
+        w.money = 414
+        w.day = 8
+        run.surplus_sold_today = False
+        run.seed_dead_today = ""
+        run.cannot_afford_noted = False
+        rep2 = DayReport(day_key=("summer", 1, 8), started_at=0.0)
+        run._preconditions(w.obs(), rep2)
+        buys = self._events(run, "buy")
+        self.assertEqual(len(buys), 1, run.entries)
+        self.assertTrue(buys[0]["ok"], buys[0])
+        self.assertEqual(w.money, 214, "买了 10 包 × 20g")
+        self.assertGreaterEqual(run._seed_outlook(w.obs())[0], 1)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 

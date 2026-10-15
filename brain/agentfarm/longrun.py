@@ -44,7 +44,7 @@ from typing import Any, Callable, Iterable
 from .bridge import MOD_VERSION_EXPECTED, BridgeClient, BridgeError
 from .farmwork import (ENV_BLOCK_STATUSES, FRONTIER_KINDS, SEED_KEEP_FACTOR, STAGE_ACTION,
                        FarmWorker, StageResult, StepResult, farm_dead_crops, farm_dry_tiles,
-                       pick_seed_offer, seed_items, till_blocked_by)
+                       pick_seed_offer, seed_items, surplus_sell_plan, till_blocked_by)
 from .planner import (BoundaryPlanner, Brief, PlannerState, TaskIntent, TaskOutcome,
                       deterministic_plan)
 
@@ -629,6 +629,15 @@ class LongRun:
         # 【task-67】最近一次 `buy` 回执带回来的货架清单（`availableItems`）。**跨天保留**：
         # 货架是稳定事实，留着就能直接挑 id 下单，少发注定失败的那一次请求。
         self.shop_offers: list[dict[str, Any]] = []
+        # 【task-55】今天是否已经为买种子卖过一次盈余材料（一天只卖一次，防每轮重复出货）。
+        # run7 真形态：`seed_gate {seeds:0, money:14}` 出现 5 次、`sell`/`buy` 事件 0 条 ⇒
+        # 脑从来没自己挣过钱、也没自己买过种子。这条链的第一步就是"把超 K 的材料换成钱"。
+        self.surplus_sold_today = False
+        # 【task-55·留痕】今天是否已经记过"钱不够买种子"（`cannot_afford`）。
+        # 为什么要这条：run7 的 `buy` 事件 0 条**不是**"买了没买成"，而是 `money 14g < 20g`
+        # 在买种子之前就短路了；账本侧看不出"是没钱还是任务失败"。每天只记一次（`_preconditions`
+        # 每轮都调），次日清零。
+        self.cannot_afford_noted = False
 
     # ------------------------------------------------------------------ 小工具
     def _mark_no_target(self, task: str) -> None:
@@ -1647,6 +1656,84 @@ class LongRun:
         return False, "keep_working", "；".join(reasons)
 
     # ------------------------------------------------------------------ 前置条件
+    def _sell_surplus_for_seeds(self, obs: dict[str, Any], rep: DayReport) -> bool:
+        """【task-55】为买种子，把"超出保留线 K 的盈余材料"送进出货箱。
+
+        为什么需要（run7 真形态，Lead 用 Python 逐条数过账本）：`sell`/`buy`/`ship` 事件 0 条、
+        `seed_gate {seeds:0, money:14}` 出现 5 次 —— 那 4 格播种吃的是背包里原有的
+        MixedFlowerSeeds；脑**从来没有自己挣过钱、也没自己买过种子**。缺的正是
+        "卖盈余材料 → 钱到账 → 买当季种子 → 播种"这条闭环的第一步。
+
+        纪律（全部来自用户 m08335 与 task-42 铁律）：
+
+        * 三条门闸（`money < 5 × seed_price`、`seeds_total == 0`、`farm.emptyDirt > 0`）
+          由 `farmwork.surplus_sell_plan()` 判 —— 证据不可信（`emptyDirt` 状态非 `"ok"`）
+          时宁可不卖（fail-closed）；
+        * **每 id 留够 K 件**、只卖整叠（`ShipSkill` 没有"卖一部分"的能力）；
+        * 白名单是**精确 qualifiedId 列表**，只含超线材料；种子（名字含 seed/种子）、
+          工具武器、可放置物、表外 id **永远进不来**；
+        * 判据是观测差分（槽位真空了 + 该 id 总数下降）；**绝不写 `Money +=`**：
+          钱要等游戏下一次 `NewDay` 结算，当天钱不变是**正常**的（账本里写明这一点）；
+        * 当天只卖一次（`surplus_sold_today`），次日钱到账后再走 `_preconditions` 的买种子路。
+        """
+        assert self.worker is not None
+        if self.surplus_sold_today:
+            return False
+        plan = surplus_sell_plan(obs, seed_price=self.seed_price)
+        trig = plan["trigger"]
+        if not plan["gate"]:
+            return False
+        # 门闸成立就记账"今天处理过这件事"，无论有没有东西可卖 —— 否则每轮都会重算、
+        # 每轮都会往 notes 里塞同一句话（`_preconditions` 是每轮都调的）。
+        self.surplus_sold_today = True
+        if not plan["slots"]:
+            reason = (f"钱 {trig['money']}g < {trig['threshold']}g 且种子 0 且空耕地 "
+                      f"{trig['emptyDirt']} 格 ⇒ 该卖材料换钱，但没有任何材料 id 超过保留线"
+                      f" K={plan['keep']}")
+            self._journal("surplus_sell_skip", reason=reason, trigger=trig, items=plan["items"])
+            rep.notes.append(f"想卖盈余材料换种子钱：{reason}")
+            self._say(f"  · {reason}")
+            return False
+        steps: list[StepResult] = []
+        for slot in plan["slots"]:
+            st = self.worker.sell(int(slot), whitelist=list(plan["whitelist"]),
+                                  timeout_ms=self.sell_timeout_ms)
+            self._actions += 1
+            steps.append(st)
+            before = st.before if isinstance(st.before, dict) else {}
+            self._journal("sell", ok=st.ok, code=st.code, strategy="surplus_materials",
+                          slot=before.get("slot", slot), qid=before.get("qid"),
+                          stack=before.get("stack"), keep=plan["keep"],
+                          below_keep=bool(plan["belowKeep"]), trigger=trig,
+                          before=st.before, after=st.after, reason=st.reason, receipt=st.receipt)
+            if not st.ok:
+                break
+        good = [s for s in steps if s.ok]
+        bad = [s for s in steps if not s.ok]
+        sold = sum(int((s.before or {}).get("stack") or 0) for s in good)
+        self._journal("surplus_sell", ok=bool(good), strategy="surplus_materials",
+                      keep=plan["keep"], slots=plan["slots"], whitelist=plan["whitelist"],
+                      items=plan["items"], trigger=trig, sold=sold, ok_count=len(good),
+                      fail_count=len(bad), below_keep=bool(plan["belowKeep"]),
+                      reason=(bad[0].reason if bad else ""),
+                      note="钱要等下一次 NewDay 才由游戏结算（当天 money 不变是正常的）")
+        if good:
+            note = (f"卖盈余材料 {len(good)} 叠共 {sold} 个进箱（每 id 留够 K={plan['keep']} 件）；"
+                    f"钱要等下一次 NewDay 才由游戏结算")
+            if plan["belowKeep"]:
+                left = "、".join(f"{i['id']} 剩 {i['left']}" for i in plan["items"] if i["sell"])
+                note = (f"卖盈余材料 {len(good)} 叠共 {sold} 个进箱（整叠出货没有「卖一部分」的能力"
+                        f"⇒ 这一叠整叠进箱，出完 {left} 件 < K={plan['keep']}，已如实记账）；"
+                        f"钱要等下一次 NewDay 才由游戏结算")
+            rep.notes.append(note)
+            self._say(f"  · {note}")
+        if bad:
+            rep.notes.append(f"卖盈余材料失败：{bad[0].reason}")
+            self._say(f"  × 卖盈余材料失败：{bad[0].reason}")
+            self._journal("sell_failed", strategy="surplus_materials",
+                          reason=bad[0].reason, code=bad[0].code)
+        return bool(good)
+
     def _preconditions(self, obs: dict[str, Any], rep: DayReport) -> None:
         """种子没了就买**当季能买到的**种子。买不成如实记账，不让后面每一格去撞同一堵墙。
 
@@ -1664,6 +1751,10 @@ class LongRun:
             return
         assert self.worker is not None
         money = FarmWorker.money(obs)
+        # 【task-55】钱不够买种子时，先把"超出保留线的盈余材料"换成钱（钱要等下一次 NewDay
+        # 才到账）—— 这是 run7 缺的那条腿：脑从没自己挣过钱、也没自己买过种子。
+        # 门闸与"卖哪几叠"都由 `farmwork.surplus_sell_plan()` 判（每 id 留 K 件、只卖整叠）。
+        self._sell_surplus_for_seeds(obs, rep)
         if not self.allow_buy:
             rep.notes.append("没种子（本轮禁止买种子）")
             return
@@ -1685,7 +1776,19 @@ class LongRun:
         # ⚠️ 探测**成功**时绝不能下"买不到"的结论 —— 上面那次 `no_seed_for_sale` 的误判
         # （探到了种子还说商店没有）会把 `seed_dead_today` 置上，当天后半程直接瘫掉。
         if money < self.seed_price:
-            rep.notes.append(f"没种子且钱不够（{money}g < {self.seed_price}g），只能干等/清障开垦")
+            # 【task-55·留痕】"是没钱，不是任务失败"必须能在账本里一眼看出来
+            # （run7：`buy` 0 条、`seed_gate {seeds:0, money:14}` 5 次，账本侧看不出因果）。
+            short = int(self.seed_price) - int(money)
+            if not self.cannot_afford_noted:
+                self.cannot_afford_noted = True
+                self._journal("cannot_afford", money=int(money), seed_price=int(self.seed_price),
+                              short=short, count=self.buy_count, shop=self.shop,
+                              note="钱不够买当季种子（连配置单价都不到）⇒ 今天不走 buy；"
+                                   "这不是任务失败，是账上没钱（先卖盈余材料，钱要等下一次 NewDay）")
+                self._say(f"  · 没种子且钱不够（{money}g < {self.seed_price}g，差 {short}g）"
+                          "⇒ 今天不买（没钱，不是失败）")
+            rep.notes.append(f"没种子且钱不够（{money}g < {self.seed_price}g，差 {short}g），"
+                             "只能干等/清障开垦")
             return
         st = self._buy_seed(self.buy_item, money, "probe", rep)
         if st is not None and st.ok:
@@ -2760,6 +2863,9 @@ class LongRun:
         self.seed_dead_today = ""
         self.seed_unavail_noted = False
         self.seed_dead_noted = False
+        # 【task-55】卖盈余材料的"今天已卖过"标志：每天清零（次日钱已到账、材料也变了）。
+        self.surplus_sold_today = False
+        self.cannot_afford_noted = False
         self.dead_scope_noted = set()
         self.no_target = set()
         self.no_target_global = set()

@@ -45,6 +45,9 @@ __all__ = [
     "SEED_NAME_HINTS",
     "SKIP_KINDS",
     "STAGE_ACTION",
+    "SURPLUS_MATERIAL_IDS",
+    "SURPLUS_MATERIAL_KEEP",
+    "SURPLUS_MONEY_FACTOR",
     "TILE_INERT_STATUSES",
     "UNREACHABLE_CODE",
     "UNREACHABLE_HINTS",
@@ -54,11 +57,13 @@ __all__ = [
     "StepResult",
     "farm_dry_tiles",
     "farm_dead_crops",
+    "farm_empty_dirt",
     "is_seed_offer",
     "is_unreachable",
     "pick_seed_offer",
     "seed_items",
     "seed_offers_from",
+    "surplus_sell_plan",
     "till_blocked_by",
     "tool_missing_reason",
     "tool_presence",
@@ -784,6 +789,176 @@ def pick_seed_offer(
         return None, "cannot_afford"
     pick = min(afford, key=lambda o: (int(o.get("price") or 0), str(o.get("id") or "")))
     return pick, "ok"
+
+
+# ======================================================================
+#  卖盈余材料换种子钱（task-55）
+# ======================================================================
+
+#: 每 id **至少留这么多件**，只把超出的部分送去出货箱（卡面 K=10）。
+#: 为什么留 K 而不是清仓：材料是后续建造/工具的原料，清仓换来的钱买不回等级；
+#: 而 run7 的真形态是"背包里有一堆石头/木头/纤维，钱只有 14g、种子 0、地里有空地"。
+SURPLUS_MATERIAL_KEEP = 10
+
+#: 触发门闸的倍数：`money < SURPLUS_MONEY_FACTOR × seed_price` 才值得动出货箱（卡面 5 倍）。
+SURPLUS_MONEY_FACTOR = 5
+
+#: 允许卖的**材料 id 白名单**（fail-closed：不在表里的一件都不卖）。
+#:
+#: 为什么用 id 表而不是游戏分类：`mod\AgentFarm.Bridge\Contracts.cs` 的 `ItemView` 只有
+#: `slot/id/qualifiedId/name/stack/isTool` —— 既没有 `category` 也没有 `sellToStorePrice`，
+#: 而本卡是 brain-only（不动 Mod）⇒ 脑侧无法按游戏分类判断"这是不是材料"。
+#: 于是只认这份**已知资源 id 表**，表外一律视为"不许卖"：种子（名字含 seed/种子）、
+#: 作物/工匠品/鱼/矿物、工具武器、可放置物**自然全部落在外侧**（沿用 task-42 铁律）。
+#: 名字也不能当判据：中文环境显示名是「石头/木材」，英文才是 Stone/Wood。
+SURPLUS_MATERIAL_IDS = frozenset({
+    "388",   # Wood
+    "390",   # Stone
+    "771",   # Fiber
+    "330",   # Clay
+    "382",   # Coal
+    "378",   # Copper Ore
+    "380",   # Iron Ore
+    "384",   # Gold Ore
+    "386",   # Iridium Ore
+    "909",   # Radioactive Ore
+    "92",    # Sap
+    "766",   # Slime
+})
+
+
+def farm_empty_dirt(obs: dict[str, Any]) -> tuple[int, str]:
+    """Mod 报的"全农场空耕地格数"（`farm.emptyDirt`，task-55）。
+
+    返回 `(格数, 状态)`：`"ok"` = 字段可信（`complete == true` 且 `loaded != false`）、
+    `"unavailable"` = 旧 Mod 没这个字段或证据不可信 ⇒ 格数回 **0**，但调用方**绝不**能把
+    0 当成"没有空地"（那只是"不知道"）—— 与 `farm_dead_crops`/`farm_dry_tiles` 同一条纪律。
+
+    为什么需要它：`emptyDirt > 0` 是"卖材料换种子钱"三条门闸之一（有地可种才值得换钱）。
+    """
+    farm = obs.get("farm") or {}
+    if farm.get("loaded") is False or farm.get("complete") is not True:
+        return 0, "unavailable"
+    raw = farm.get("emptyDirt")
+    if raw is None:
+        return 0, "unavailable"
+    try:
+        return max(0, int(raw)), "ok"
+    except (TypeError, ValueError):
+        return 0, "unavailable"
+
+
+def _bare_item_id(value: Any) -> str:
+    """`"(O)390"` / `"390"` ⇒ `"390"`（去掉 qualified 前缀）。"""
+    s = str(value or "").strip()
+    if s.startswith("(") and ")" in s:
+        return s.split(")", 1)[1].strip()
+    return s
+
+
+def surplus_sell_plan(
+    obs: dict[str, Any],
+    *,
+    keep: int = SURPLUS_MATERIAL_KEEP,
+    seed_price: int = 20,
+    money_factor: int = SURPLUS_MONEY_FACTOR,
+    max_items: int = 24,
+) -> dict[str, Any]:
+    """决定"要不要为了买种子去卖盈余材料、以及卖哪几格"。**纯决策，不发请求。**
+
+    三条门闸**同时**满足才触发（卡面）：`money < money_factor × seed_price` 且
+    `seeds_total == 0` 且 `farm.emptyDirt > 0`（且 `emptyDirt` 证据状态必须是 `"ok"` ——
+    证据不可信时宁可不卖，fail-closed）。
+
+    卖法：**每 id 留够 `keep` 件，只卖超出的整叠**（`ShipSkill` 只能整叠出货、没有
+    "卖一部分"的能力）⇒ 某个槽只有当"卖掉它之后该 id 仍 ≥ keep"时才进名单。
+
+    返回：`should`（要不要动手）、`gate`（三条门闸是否都成立）、`slots`（要卖的槽位，升序）、
+    `whitelist`（对应 qualifiedId 列表，交给 Mod 做精确白名单）、`items`（逐 id 账本：
+    `total/sell/left/keep`）、`trigger`（触发理由原文：money/seeds/emptyDirt/threshold）。
+    """
+    player = FarmWorker.player_of(obs)
+    money = FarmWorker.money(obs)
+    seeds_total = sum(n for _i, _nm, n in seed_items(player))
+    empty_dirt, empty_status = farm_empty_dirt(obs)
+    threshold = int(money_factor) * int(seed_price)
+    trigger = {
+        "money": int(money),
+        "seeds": int(seeds_total),
+        "emptyDirt": int(empty_dirt),
+        "emptyDirtStatus": empty_status,
+        "seedPrice": int(seed_price),
+        "threshold": int(threshold),
+        "keep": int(keep),
+    }
+    gate = (empty_status == "ok" and int(money) < threshold
+            and int(seeds_total) == 0 and int(empty_dirt) > 0)
+
+    totals: dict[str, int] = {}
+    stacks: list[dict[str, Any]] = []
+    for it in (player.get("inventory") or []):
+        if not isinstance(it, dict) or it.get("isTool"):
+            continue
+        qid = str(it.get("qualifiedId") or it.get("id") or "").strip()
+        bare = _bare_item_id(qid)
+        if not bare or bare not in SURPLUS_MATERIAL_IDS:
+            continue                      # fail-closed：表外一律不卖（种子/作物/工匠品/工具…）
+        name = str(it.get("name") or "")
+        if any(hint in name.lower() for hint in SEED_NAME_HINTS):
+            continue                      # 双保险：名字像种子的一律不卖
+        try:
+            stack, slot = int(it.get("stack") or 0), int(it.get("slot"))
+        except (TypeError, ValueError):
+            continue
+        if stack <= 0:
+            continue
+        totals[qid] = totals.get(qid, 0) + stack
+        stacks.append({"slot": slot, "qid": qid, "bareId": bare, "name": name, "stack": stack})
+
+    picked: list[dict[str, Any]] = []
+    for qid in sorted(totals):
+        left = totals[qid]
+        for st in sorted((s for s in stacks if s["qid"] == qid),
+                         key=lambda s: (-s["stack"], s["slot"])):
+            if len(picked) >= int(max_items):
+                break
+            if left - st["stack"] >= int(keep):   # 卖掉它之后仍留够 K 才允许
+                picked.append(st)
+                left -= st["stack"]
+    below_keep = False
+    if gate and not picked:
+        # 【整叠限制】`ShipSkill` 只调 `Farm.shipItem(item, who)`，**没有"卖一部分"的能力**：
+        # 一叠要么整叠进箱、要么一件都卖不动。于是"保留 K 件"与"卖得出去"在**唯一一大叠**
+        # （`stack > keep` 且没有别的叠可以拆开卖）时互相冲突。
+        # 取"卖"：这一叠本身就超过保留线，留着它等于永远换不到种子钱（run7 的石头/木头大概率
+        # 就是一大叠）。但**如实标记** `belowKeep`，账本与日报告都能看见"卖完只剩 X 件 < K"。
+        # 想改成严格保留 K：把这段去掉即可（那时代价是"大叠永远卖不出去"）。
+        cands = [s for s in stacks if int(s["stack"]) > int(keep)]
+        if cands:
+            best = max(cands, key=lambda s: (int(s["stack"]), -int(s["slot"])))
+            picked = [best]
+            below_keep = True
+    picked.sort(key=lambda s: s["slot"])
+    items = []
+    for qid in sorted(totals):
+        sold = sum(int(s["stack"]) for s in picked if s["qid"] == qid)
+        left = int(totals[qid]) - int(sold)
+        items.append({"id": qid, "name": next((s["name"] for s in stacks if s["qid"] == qid), ""),
+                      "total": int(totals[qid]), "keep": int(keep),
+                      "sell": int(sold), "left": int(left),
+                      "keptBelowKeep": bool(sold and left < int(keep))})
+    return {
+        "should": bool(gate and picked),
+        "gate": bool(gate),
+        "belowKeep": bool(below_keep),
+        "slots": [int(s["slot"]) for s in picked],
+        "whitelist": sorted({str(s["qid"]) for s in picked}),
+        "items": items,
+        "stacks": [{"slot": int(s["slot"]), "qid": str(s["qid"]), "stack": int(s["stack"])}
+                   for s in picked],
+        "trigger": trigger,
+        "keep": int(keep),
+    }
 
 
 class FarmWorker:
