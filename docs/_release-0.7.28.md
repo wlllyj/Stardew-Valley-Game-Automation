@@ -1,21 +1,21 @@
 # 0.7.28 发布 / 验收计划（run9）
 
-> 起草：2026-10-15 22:35（Lead）。状态：**未冻结**（等 task-102 交付 + task-103 对抗验收 PASS）。
+> 起草：2026-10-15 22:35（Lead）。状态：**未冻结**（等 task-104/task-106 交付 + task-103/task-108 对抗验收 PASS）。
 > 上游：`docs/_release-0.7.27.md`（0.7.27 已装机并跑出 run8，证据见 `docs/_run8-evidence.md`、开发日志条目 053）。
 
 ## 1. 本版内容（卡片即权威）
 
 | 卡 | owner | 内容 | 状态 |
 |---|---|---|---|
-| **task-102** | dev-coder | **A 经济闭环空格死锁**（`no_space` 独立结果 + 当天 ≤3 次；`seeds_total==0 && money>=seed_price && free_slots==0` ⇒ 整叠卖一叠盈余材料腾格，白名单、不碰种子/工具/武器/建材；buy 前清残留模态；优先当季在售买得起的种子）+ **B 早睡防线**（钱够买不到/农场有干作物时 `sleep_guard` 不许放行；不许 0 动作收工；`goto_farm` 遇模态先清一次再重试） | in_progress |
-| **task-103** | deputy-lead | 对 task-102 的独立对抗验收（空格死锁复现 FAIL→PASS、腾格卖出不得碰种子/工具/K、跨天重试有界性、`no_space` 谎报成功、睡前后模态 fail-closed） | pending（`blocked_by task-102`） |
-| **task-101** | 待派 | 0.7.28 候选 NIT：`_farm_totals` 类型校验（`"abc"` 会抛 `ValueError` 穿出整天）、窗口全死苗的 `watered_outdoor` 字段级收口、`-1` 自相矛盾、夹具 `farm_scan()` 死苗口径 | pending |
-
-**可选并入**：task-101 是否随本版一起冻结由 Lead 在 task-102 验收后决定（若并入，需先派 owner 并过独立对抗验收或至少逐条复现）。
+| **task-102** | dev-coder | **A 经济闭环空格死锁**（`no_space` 独立结果 + 当天 ≤3 次；`seeds_total==0 && money>=seed_price && free_slots==0` ⇒ 整叠卖一叠盈余材料腾格，白名单、不碰种子/工具/武器/建材；buy 前清残留模态；优先当季在售买得起的种子）+ **B 早睡防线**（钱够买不到/农场有干作物时 `sleep_guard` 不许放行；不许 0 动作收工；`goto_farm` 遇模态先清一次再重试） | **已交 `9b09735`**（代码级 PASS） |
+| **task-103** | deputy-lead | 对 task-102 的独立对抗验收（空格死锁复现 FAIL→PASS、腾格卖出不得碰种子/工具/K、跨天重试有界性、`no_space` 谎报成功、睡前后模态 fail-closed） | in_progress |
+| **task-104** | dev-coder | **`_water_far_dry` 人在农场之外不许扣当日额度**（run8 day12：晨间 `ShippingMenu` 挡掉 `goto_farm` ⇒ 人在室内逐格试 6 格全 `unreachable`、当天全体认输、0 动作早睡）⇒ 入口先回农场（清模态 + 重试一次）、`water_far_skipped{reason:"not_on_farm"}` 不 `try_++`/不进 `given_up`、收尾 `not_on_farm` 点名 | in_progress |
+| **task-108** | deputy-lead | 对 task-104 的独立对抗验收（`not_on_farm` 不扣额度、收尾点名、回不去时的有界性、回农场后仍能浇的正例） | pending（`blocked_by task-104`） |
+| **task-106** | log-analyst | **analyze-longrun 收 task-102 新事件/字段**（`slept_without_work`/`buy_no_space`/`surplus_sell.why=need_slot`）——`TestEventMappingDrift` 那条红**必须清零**（`check-release` 要求全量 0 红，本卡在关键路径上） | in_progress |
 
 ## 2. 冻结与装机九步（Lead 独占，链式，不许并行）
 
-1. `team_task_get task-102` 确认已 completed；`task-103` PASS 或 PASS-WITH-NITS（无必修）。
+1. `team_task_get` 确认 **task-102 / task-104 / task-106 已 completed**；**task-103 / task-108** PASS 或 PASS-WITH-NITS（无必修）。
 2. 确认 `tools/_note-0728.txt` 存在且**首串是 `v0.7.28`**（列本版卡片）。
 3. `python tools/_bump-mod-version.py 0.7.28 --note-file tools\_note-0728.txt`（⚠️ cp1252 下末句 print 会 `UnicodeEncodeError` 且退出码 1，但**版本已写盘** ⇒ 一律用 `json.load` 核对 `manifest.json` 的 `Version`）。
 4. `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.28"`。
@@ -58,8 +58,10 @@ python tools\start-detached-longrun.py ^
 | 0 动作收工 | ❌ day 12（8 秒就睡） | ✅ 0 次 |
 | 假 VERIFIED | ✅ 0 次（fail-closed 生效） | ✅ 0 次 |
 
-## 6. 遗留（不进本版）
+## 6. 遗留（不进本版 → 0.7.29 候选）
 
+- **task-101**（0.7.29）：`_farm_totals` 类型校验（`dryCrops="abc"` 会抛 `ValueError` 穿出整天；`"0"` 与合法 0 不可区分；`-1` 状态自相矛盾）、窗口全死苗时 `watered_outdoor` 的字段级收口、夹具 `farm_scan()` 的死苗口径。
+- **task-107**（0.7.29，Mod）：`farm.dryTiles` 与 `farm.dryCrops` **同一次扫描 + 共用 `scanSeq`**（解释 run8 `[12,30]` 记 `ok` 但计数 `6→6`；dev-coder 已判定既非死苗也非一拍滞后 ⇒ 最可能同一次发布里不同源）。**脑侧 `_water_far_dry` 的 `ok` 判据不收紧**（计数若真滞后，收紧会造假失败）。
 - task-83 rev2（田块规整：坐标级留痕 `sow_step`/`till_step` + `plant_layout.tiles` 坐标 + 五指标）—— 需要 run9 的数据才有意义。
-- task-82/58/59（LLM 反馈/自省：决策→结果 join + `<journal>-lessons.json`）、task-14（逐帧 warp 活锁）、task-18（职业选择耕种优先）、task-53（农场级待清/待垦计数）、task-98。
+- task-82/58/59（LLM 反馈/自省：决策→结果 join + `<journal>-lessons.json`）、task-14（逐帧 warp 活锁）、task-18（职业选择耕种优先）、task-53（农场级待清/待垦计数）、task-98（`Brief.from_observe` 无 tiles 时回退 farm 计数的耦合）。
 - Mod `ShipSkill` 只能整叠出货 ⇒ 每 id 保留 K=10 做不到（详见条目 053 待决②）。
