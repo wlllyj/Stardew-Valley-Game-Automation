@@ -2,7 +2,7 @@
 
 - 验收人：deputy-lead（只读 `tools/`、`brain/`；未碰游戏/桥；自写脚本都在 `scratch/`）
 - 对象：`7c4ff68`（`docs/_run6-criteria.md` +5、`scratch/_run7_summary.py` +44、`tests/test_verify_run3.py` +35、`tools/verify-run3.py` +30，共 114 insertions / **0 deletions**）；父 `1ffe2ca`
-- 冻结副本：`scratch/_t86_tool_old.py` = `7c4ff68^`（1109 行，sha256 `EB18658498E540B810B6622E4D0CFDEB5353E6F576703D65261EE86A4097BD5B`）、`scratch/_t86_tool_new.py` = `7c4ff68`（1139 行，sha256 `3573A39700B9BDD397023DDA6B60B9C7F2AD4C34432B7F17E6A1F973CAA46EA0`，与仓库现行 `tools/verify-run3.py` 逐字节相同）
+- 冻结副本（`python scratch/_t86_freeze.py` 可随时重生成）：`scratch/_t86_tool_old.py` = `7c4ff68^`（1109 行，**LF** sha256 `7532E7836F75417E5D61E6BB150BC858FF6EC6D47FAD5F877BC888C8888E0872`；早前我用 `git show > file` 生成的副本是 CRLF，sha256 `EB186584…`，行数与行为相同）、`scratch/_t86_tool_new.py` = `7c4ff68`（1139 行，sha256 `3573A39700B9BDD397023DDA6B60B9C7F2AD4C34432B7F17E6A1F973CAA46EA0`，与仓库现行 `tools/verify-run3.py` 逐字节相同）
 
 ## §1 判定
 
@@ -103,6 +103,8 @@
 ```powershell
 $py = "C:\Users\admin\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
 $env:PYTHONUTF8="1"
+# 先冻结两侧工具（生成 scratch/_t86_tool_old.py / _t86_tool_new.py）
+& $py scratch\_t86_freeze.py
 # 两侧并排（78 本）
 & $py scratch\_t86_side.py --days 3      # → scratch\_t86_side_d3.txt
 & $py scratch\_t86_side.py --days 5      # 零本改变

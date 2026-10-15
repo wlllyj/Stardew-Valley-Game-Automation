@@ -296,7 +296,7 @@ Lead 原倾向是"密农场下上界公式偏小 + 42 格确实无落脚点"。�
 
 **两侧并排（78 本既有账本，`scratch/_t86_side.py --days 3`）**
 
-| 类别 | 旧（`7c4ff68^`，1109 行 sha256 `EB186584…`） | 新（`7c4ff68`，1139 行 sha256 `3573A397…`） |
+| 类别 | 旧（`7c4ff68^`，1109 行 LF sha256 `7532E783…`） | 新（`7c4ff68`，1139 行 sha256 `3573A397…`） |
 | --- | --- | --- |
 | `logs/longrun-3day-llm-run7.jsonl` | rc 1 / 9 问题 / needs_review | **rc 0 / 0 问题 / 9 history / streak 3 / VERIFIED** |
 | 其余 77 本（含 green、neg-A..Q、K/K2/K3/K4、t54/t72/t77/t79/t81 全系列） | — | **判决、问题数逐字不变** |
@@ -323,6 +323,7 @@ run7 的 9 条 history 原文（summer 3×2、summer 5×2、summer 6×5）见 `d
 ```powershell
 $py = "C:\Users\admin\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
 $env:PYTHONUTF8="1"
+& $py scratch\_t86_freeze.py               # 先重生成两侧冻结副本（不入库）
 & $py scratch\_t86_side.py --days 3        # 两侧并排 → scratch\_t86_side_d3.txt
 & $py scratch\_t86_adv.py                 # A1/A2/A3/A4a/A4b/A5/A6 → scratch\_t86_adv_out.txt
 & $py scratch\_t86_tool_old.py --journal scratch\review-t86-a4b-inwindow-contradiction-injected-key.jsonl --days 3   # rc 1
