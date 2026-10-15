@@ -5104,5 +5104,187 @@ class TestTask102BuySlotDeadlock(unittest.TestCase):
         self.assertFalse(rep.slept_without_work)
 
 
+class _StuckIndoorsWorker(FakeWorker):
+    """task-104：`ensure_location` 永远失败 ⇒ 玩家留在室内。"""
+
+    def __init__(self, world: FakeWorld) -> None:
+        super().__init__(world)
+        self.ensure_calls = 0
+
+    def ensure_location(self, name, *, tile=None, timeout_ms=30000):
+        self.ensure_calls += 1
+        st = StepResult("ensure_location", None)
+        st.ok = False
+        st.code = "ui_modal"
+        st.reason = "[ui_modal] 有菜单/对话挡着（'ShippingMenu'），所有技能都会被拒"
+        st.receipt = "ui_modal"
+        return st
+
+
+class _IndoorPrepareWorker(_StuckIndoorsWorker):
+    """`_prepare` 那一次 `ensure_location` 放行（否则 `run()` 直接起不来，code 2），之后全失败。
+
+    复刻 run8 day 12 的下半段：`_prepare` 之后玩家仍在 FarmHouse，晨间 `ShippingMenu`
+    把当天的 `goto_farm` 挡死 ⇒ 一整天在室内、`_water_far_dry` 够不着窗口外那格。
+    """
+
+    def ensure_location(self, name, *, tile=None, timeout_ms=30000):
+        self.ensure_calls += 1
+        st = StepResult("ensure_location", None)
+        if self.ensure_calls == 1:
+            st.ok = True
+            st.code = "ok"
+            st.reason = "（预备阶段）已在 Farm"
+            return st
+        st.ok = False
+        st.code = "ui_modal"
+        st.reason = "[ui_modal] 有菜单/对话挡着（'ShippingMenu'），所有技能都会被拒"
+        st.receipt = "ui_modal"
+        return st
+
+
+class _FarmOnEnsureWorker(FakeWorker):
+    """第一次回农场就成功（模态清掉之后回得去）：验"清模态 + 重试一次"真的能把人送回农场。"""
+
+    def __init__(self, world: FakeWorld) -> None:
+        super().__init__(world)
+        self.ensure_calls = 0
+
+    def ensure_location(self, name, *, tile=None, timeout_ms=30000):
+        self.ensure_calls += 1
+        self.w.location = "Farm"
+        self.w.is_outdoor_farm = True
+        st = StepResult("ensure_location", None)
+        st.ok = True
+        st.code = "ok"
+        st.reason = f"已到 {name}"
+        return st
+
+
+class TestTask104FarDryNotOnFarm(unittest.TestCase):
+    """task-104：人不在户外农场时，`_water_far_dry` 不许消耗额度、不许认输。
+
+    真机证据（run8 day 12）：晨间 `ShippingMenu` 把 `goto_farm` 挡成 `ui_modal` ⇒ 人整天留
+    FarmHouse，而 `_water_far_dry` 照样对着窗口外坐标走过去 ⇒ 6 格 × 2 次全 `unreachable`、
+    6 格当天全进 `far_dry_given_up`，喂出"守卫说还有活、但没有任何作业区拿得出目标"⇒ 8 秒后
+    0 农场动作就睡。修法：入口先确认人在户外农场（复用 task-102 的"清模态 + 重试一次"），
+    不在就记 `water_far_skipped{reason:"not_on_farm"}`（**不 `try_++`、不进 `given_up`**），
+    并让收尾理由点名 `not_on_farm`。人在农场时的行为一字不改。
+
+    变异自检（`%TEMP%\\t104_mutate.py`，跑完即弃）：基线 **4/4 绿**；**m104a**（把入口的
+    `if not self._is_farm(obs):` 整段短路）红 **3**（`test_indoors_does_not_consume_the_tile_quota`
+    + `test_the_day_names_not_on_farm` + `test_a_stray_modal_is_cleared_and_the_player_returns`）。
+    """
+
+    #: 离玩家 [62,14] 曼哈顿距离 5 > 半径 3 ⇒ 不在观测窗口里（run8 的真实形态）。
+    FAR = (61, 10)
+
+    def _indoor_world(self, **kw) -> DryTilesWorld:
+        w = DryTilesWorld(seeds=0, money=0, weeds=0, water_left=40, with_dry_tiles=True, **kw)
+        w.dirt.add(self.FAR)
+        w.crops[self.FAR] = {"watered": False, "ripe": False}
+        w.player_tile = [62, 14]
+        w.location = "FarmHouse"
+        w.is_outdoor_farm = False
+        return w
+
+    def _rep(self, day: int = 12) -> DayReport:
+        return DayReport(day_key=("summer", day, 12), started_at=0.0)
+
+    def _run(self, w: FakeWorld, worker: FakeWorker, *, max_days: int = 1):
+        run = make_run(w, target_days=1, max_days=max_days,
+                       client_factory=lambda: FakeClient(w),
+                       worker_factory=lambda _c: worker)
+        run.worker = worker
+        run.client = FakeClient(w)
+        return run
+
+    def _events(self, run, event):
+        return [e for e in run.entries if e["event"] == event]
+
+    def test_indoors_does_not_consume_the_tile_quota(self):
+        """①人在室内 ⇒ 该格当日额度一次都不扣、不认输，只记 `water_far_skipped`。"""
+        w = self._indoor_world()
+        run = self._run(w, _StuckIndoorsWorker(w))
+        rep = self._rep()
+
+        moved = run._water_far_dry(w.obs(), rep)
+
+        self.assertFalse(moved)
+        self.assertEqual(run.far_dry_tries, {}, "人在室内不许消耗该格当日尝试额度")
+        self.assertEqual(run.far_dry_given_up, set(), "人在室内不许把格子判死")
+        self.assertTrue(run.water_far_not_on_farm)
+        self.assertEqual([e for e in run.entries if e["event"] == "water_far"], [],
+                         "人在室内根本不该发 water_far")
+        skipped = self._events(run, "water_far_skipped")
+        self.assertEqual(len(skipped), 1, f"应当恰记一条 water_far_skipped：{skipped}")
+        self.assertEqual(skipped[0]["reason"], "not_on_farm")
+        self.assertEqual(skipped[0]["count"], 1)
+        self.assertEqual(skipped[0]["tiles"], [list(self.FAR)])
+        self.assertEqual(len(self._events(run, "goto_farm")), 1, "仍要先试着回农场（清模态+重试）")
+
+    def test_the_day_names_not_on_farm(self):
+        """②当天因"人在室内"颗粒无收 ⇒ `ended_reason` 点名 `not_on_farm`、零认输、不 VERIFIED。"""
+        w = self._indoor_world()
+        run = self._run(w, _IndoorPrepareWorker(w), max_days=2)
+
+        code = run.run()
+
+        self.assertTrue(run.days, "至少该跑出一天（用来验收尾理由）")
+        rep = run.days[0]
+        self.assertNotEqual(code, 0, "一整天没动过农场 ⇒ 不许算达标")
+        self.assertIn("not_on_farm", rep.ended_reason)
+        # 两条诚实出口都可能走到（"没有作业区拿得出目标" 或 "连续 3 轮世界没变"）；关键是
+        # **不许**洗成 `no_work`、不许 VERIFIED —— task-73 的有界翻篇（`stuck`）不在本卡改动范围。
+        self.assertIn(rep.ended_by, ("slept_without_work", "stuck"))
+        self.assertNotEqual(rep.ended_by, "no_work")
+        self.assertFalse(rep.checks.get("day_justified"))
+        self.assertFalse(rep.verified)
+        self.assertEqual(w.watered_tiles, [], "室内根本浇不到那一格")
+        self.assertEqual(run.far_dry_given_up, set())
+        self.assertEqual(rep.gave_up_tiles, [])
+        self.assertEqual([e for e in run.entries if e["event"] == "water_far"], [])
+        self.assertTrue(self._events(run, "water_far_skipped"))
+
+    def test_a_stray_modal_is_cleared_and_the_player_returns(self):
+        """③复用 task-102 的"清模态 + 重试一次"：`ShippingMenu` 挡着 ⇒ 清掉后回农场再浇。"""
+        w = self._indoor_world()
+        w.ui_script = [{"activeMenu": "ShippingMenu", "isModal": True}]
+        run = self._run(w, _FarmOnEnsureWorker(w))
+        rep = self._rep()
+
+        moved = run._water_far_dry(w.obs(), rep)
+
+        self.assertTrue(moved, "清掉残留模态后应当能回农场并浇到那一格")
+        self.assertEqual(run.far_dry_tries.get(self.FAR), 1)
+        self.assertEqual(run.far_dry_given_up, set())
+        self.assertFalse(run.water_far_not_on_farm)
+        self.assertEqual([e["where"] for e in self._events(run, "modal_dismissed")], ["water_far"])
+        self.assertEqual([e["where"] for e in self._events(run, "goto_farm")], ["water_far"])
+        ev = self._events(run, "water_far")
+        self.assertEqual(len(ev), 1)
+        self.assertTrue(ev[0]["ok"])
+
+    def test_on_farm_behaviour_is_unchanged(self):
+        """④人在农场时的行为一字不改（回归：照旧走过去浇、额度照扣）。"""
+        w = self._indoor_world()
+        w.location = "Farm"
+        w.is_outdoor_farm = True
+        run = self._run(w, FakeWorker(w))
+        rep = self._rep()
+
+        moved = run._water_far_dry(w.obs(), rep)
+
+        self.assertTrue(moved)
+        self.assertFalse(run.water_far_not_on_farm)
+        self.assertEqual(self._events(run, "water_far_skipped"), [])
+        self.assertEqual(run.far_dry_tries.get(self.FAR), 1)
+        ev = self._events(run, "water_far")
+        self.assertEqual(len(ev), 1)
+        self.assertTrue(ev[0]["ok"])
+        self.assertEqual(ev[0]["dry_before"], 1)
+        self.assertEqual(ev[0]["dry_after"], 0)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

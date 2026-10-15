@@ -647,6 +647,10 @@ class LongRun:
         # 观测窗口之外，脑侧连坐标都没有，只能 `no_work` 收工（`day_justified=true` 白拿）。
         self.far_dry_tries: dict[tuple[int, int], int] = {}
         self.far_dry_given_up: set[tuple[int, int]] = set()
+        #: 【task-104】当天出现过"人在室内 ⇒ 窗口外干作物没去浇"。用来给收尾理由点名
+        #: `not_on_farm`（run8 day 12：被晨间 `ShippingMenu` 挡在 FarmHouse，`_water_far_dry`
+        #: 照样对窗口外坐标走 6 格 × 2 次全 unreachable ⇒ 6 格当天全进 `given_up`）。
+        self.water_far_not_on_farm = False
         # 本日是否已经播报过"旧 Mod 没给 dryTiles 坐标"（一天只提醒一次，不刷屏）。
         self.far_dry_unavailable_noted = False
         # 【task-67】今天"买不到合适种子"的结论（"" = 还没确认；否则是 `no_seed_for_sale` 或
@@ -956,6 +960,37 @@ class LongRun:
             return False
         return all(t in self.far_dry_given_up for t in outside)
 
+    def _goto_farm_for_water(self, obs: dict[str, Any], rep: DayReport) -> dict[str, Any]:
+        """`_water_far_dry` 专用：人在室内时"能回就回"（task-104）。
+
+        与 `_ensure_on_farm` 的区别：①可在**一天中间**再调（后者假设开工前）；
+        ②先清残留模态（task-102 的 `ShopMenu`/`ShippingMenu` 形态）再 `ensure_location` 一次；
+        ③失败只如实记 notes/journal，**不认输、不扣额度**（额度决策留给调用方）。
+        """
+        assert self.worker is not None
+        fresh = self._dismiss_stray_menu(obs, rep, where="water_far")
+        if self._is_farm(fresh):
+            return fresh
+        st = self.worker.ensure_location(self.farm)
+        self._actions += 1
+        self._journal("goto_farm", ok=st.ok, code=st.code, reason=st.reason, where="water_far",
+                      before=st.before, after=st.after, receipt=st.receipt)
+        if not st.ok:
+            rep.notes.append(f"窗口外还有干作物，但回不去 {self.farm}：{st.reason}")
+            return fresh
+        try:
+            return self._snap()
+        except BridgeError as exc:
+            rep.notes.append(f"回到 {self.farm} 之后观测失败：{exc}")
+            return fresh
+
+    def _not_on_farm_suffix(self) -> str:
+        """收尾理由后缀（task-104）：当天因"人在室内"没浇到窗口外干作物时点名 `not_on_farm`。"""
+        if not self.water_far_not_on_farm:
+            return ""
+        return ("；not_on_farm：人在室内，窗口外干作物这轮没去浇"
+                "（不扣该格当日额度、不进 given_up）")
+
     def _water_far_dry(self, obs: dict[str, Any], rep: DayReport) -> bool:
         """走过去浇一格"窗口外"的干作物（task-50）。返回 `True` = 本轮真动了一次手。
 
@@ -963,6 +998,13 @@ class LongRun:
         就进 `far_dry_given_up`，当天不再试它 —— 于是 `_far_dry_tiles` 会变空、守卫
         仍因 `farm.dryCrops > 0` 不放行 ⇒ `_run_day` 以 `stuck:` 收尾并点名坐标
         （**绝不**是 `no_work`）。
+
+        【task-104】入口先确认人在户外农场（复用 task-102 的"清模态 + 重试一次"）：
+        run8 day 12 早晨 `goto_farm` 被晨间 `ShippingMenu` 挡成 `ui_modal`、人留在
+        FarmHouse，而这里照样对着窗口外坐标走过去 ⇒ 6 格 × 2 次全 `unreachable`、
+        6 格当天全进 `given_up`，喂出"守卫说还有活、但没有任何作业区拿得出目标"。
+        人不在农场时：**不扣**该格当日额度、**不认输**，只记
+        `water_far_skipped{reason:"not_on_farm"}`，并让收尾理由点名 `not_on_farm`。
         """
         assert self.worker is not None
         far, status = self._far_dry_tiles(obs)
@@ -975,6 +1017,24 @@ class LongRun:
                               note="farm 说还有干作物，但没有 dryTiles 坐标（旧 Mod / 证据不可信）"
                                    "⇒ 不判「没活」，按有活继续干（当天会以 stuck 如实收尾）")
             return False
+        if not self._is_farm(obs):
+            # 【task-104】有坐标要浇、但人不在户外农场 ⇒ 先试着回去（清模态 + 一次
+            # `ensure_location`）；回不去就**不扣额度、不认输**，且**一天只试一次**
+            # （否则每轮都发一次注定失败的 `goto_farm`，把账本刷满）。
+            if self.water_far_not_on_farm:
+                return False
+            obs = self._goto_farm_for_water(obs, rep)
+            if not self._is_farm(obs):
+                self.water_far_not_on_farm = True
+                self._journal("water_far_skipped", reason="not_on_farm",
+                              tiles=[list(t) for t in far[:6]], count=len(far),
+                              where=self._far_dry_where(obs),
+                              note="窗口外还有干作物，但人不在户外农场（走过去也够不着）⇒ "
+                                   "不消耗该格当日额度、不进 given_up；先回农场再说")
+                return False
+            far, status = self._far_dry_tiles(obs)
+            if not far:
+                return False
         pt = FarmWorker.player_tile(obs) or far[0]
         tile = min(far, key=lambda t: (_dist(t, pt), t[1], t[0]))
         tries = int(self.far_dry_tries.get(tile, 0)) + 1
@@ -3258,6 +3318,7 @@ class LongRun:
         # 【task-50】窗口外干作物的重试记账，每天清零（第二天壶/世界都变了，重新判）。
         self.far_dry_tries = {}
         self.far_dry_given_up = set()
+        self.water_far_not_on_farm = False      # 【task-104】每日重置（理由后缀用）
         self.far_dry_unavailable_noted = False
         # 【task-42】新的一天 ⇒ 清空出货白名单：昨天收获的东西昨天该出就出了，
         # 今天再拿白名单去卖会变成"卖一件不存在的东西"（`sellable_slots` 找不到就不动，但语义要干净）。
@@ -3363,7 +3424,7 @@ class LongRun:
                         continue
                     why = ("no_work" if not reasons else
                            "stuck:守卫说还有活（" + "；".join(reasons)
-                           + "）但没有任何作业区拿得出目标")
+                           + "）但没有任何作业区拿得出目标" + self._not_on_farm_suffix())
                     rep.ended_by, rep.ended_reason = self._do_sleep(obs, rep, why)
                     break
                 plot = spot
@@ -3507,7 +3568,8 @@ class LongRun:
                         continue
                     rep.ended_by, rep.ended_reason = "stuck", (
                         f"stuck:连续 {self.idle_rounds} 轮世界没有任何变化（最后意图："
-                        f"{[i.task for i in decision.intents]}；策略说有进展：{acted}）{why}")
+                        f"{[i.task for i in decision.intents]}；策略说有进展：{acted}）{why}"
+                        + self._not_on_farm_suffix())
                     # 【task-73】不再直接让外层 break：先试一晚**有界翻篇**（睡过去、让整轮继续
                     # 跑下一天 —— run6 就是在这里 19 秒 `no_day_progress` 终止的）。`ended_by`
                     # 保持 `stuck`：这一天仍如实算失败，只是游戏日往前走了一格。
