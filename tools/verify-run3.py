@@ -1106,6 +1106,10 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         "history_problems": history_problems,
         "infos": infos,
         "verdict": "VERIFIED" if ok else "needs_review",
+        # 严格口径第二判决（**只呈现**，不参与 rc）：把窗口外历史问题也算进来。run8 的
+        # `_run8-evidence.md` §4 必须并列这一行，避免「窗口外不计」变成默认沉默。
+        "strict_verdict": "needs_review" if (problems or history_problems) else "VERIFIED",
+        "strict_problem_count": len(problems) + len(history_problems),
     }
     return ok, summary
 
@@ -1166,6 +1170,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {p}")
     print("")
     print(f"结论：{summary['verdict']}")
+    if summary.get("strict_verdict") and summary["strict_verdict"] != summary["verdict"]:
+        print(
+            f"严格口径（整本零问题，**仅呈现、不参与退出码**）：{summary['strict_verdict']}"
+            f"（问题共 {summary['strict_problem_count']} 条 = 窗口内 {len(summary['problems'])}"
+            f" + 窗口外历史 {len(summary.get('history_problems') or [])}）"
+        )
     return 0 if ok else 1
 
 

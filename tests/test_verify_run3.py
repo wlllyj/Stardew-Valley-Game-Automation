@@ -719,6 +719,30 @@ class TestVerifyRun3(unittest.TestCase):
         self.assertEqual(s["problems"], [])
         self.assertTrue(any("spring 8" in p for p in s["history_problems"]), s["history_problems"])
 
+    def test_strict_verdict_is_reported_but_does_not_change_the_tail_verdict(self):
+        """严格口径第二判决：窗口外历史问题只进 `strict_verdict`，**不许**改变 rc / `verdict`。
+
+        动机（deputy-lead task-90 §顺带①）："窗口外不计"不能变成默认沉默 —— run8 的
+        `_run8-evidence.md` §4 要能一条命令抄到"严格口径是什么"。
+        """
+        bad = [
+            day_start([1, "spring", 8], t=0.0),
+            sleep_ok(t=100.0),
+            day_end([1, "spring", 8], [1, "spring", 9], t=200.0, verified=False,
+                    ended_by="stuck", ended_reason="stuck:换过 11 片地都没有目标",
+                    dry=1, checks={"watered_outdoor": False, "day_justified": False}),
+        ]
+        ok, s = self.check(bad + green_rows(3))
+        self.assertTrue(ok, s["problems"])
+        self.assertEqual(s["verdict"], "VERIFIED")
+        self.assertEqual(s["strict_verdict"], "needs_review")
+        self.assertEqual(s["strict_problem_count"], len(s["history_problems"]))
+        # 反面：整本干净时两个判决必须一致（不许无病呻吟）。
+        ok2, s2 = self.check(green_rows(3))
+        self.assertTrue(ok2)
+        self.assertEqual(s2["strict_verdict"], "VERIFIED")
+        self.assertEqual(s2["strict_problem_count"], 0)
+
     def test_run_ending_on_a_bad_day_is_still_not_ok(self):
         """窗口没打满时不降级：尾部一天坏 ⇒ streak 0 ⇒ 仍判未达标，问题不许被搬进 history。"""
         rows = green_rows(3) + [
