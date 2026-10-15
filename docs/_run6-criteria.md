@@ -110,6 +110,17 @@
 - 因此**不另立卡**；字段级收口（让全死苗时直接写 `false`）列为 0.7.28 可选 NIT（见 `docs/_review-task99.md` NIT-2、`longrun.py:1071/:1085-1093`）。
 - 实测出处：`scratch/_t100_b.py` / `scratch/_t100_b_out.txt`（task-100，`4b68e94`）。
 
+### 3.4 run8 之后新增的四条（Lead 2026-10-15，源自 run8 的两个病灶；run9 起生效）
+
+run8（0.7.27）尾部 **0/3 VERIFIED**：day 1 全绿（且**首次自主卖出成功**：`sell`/`surplus_sell` 在 day 1 `t=0.2` 卖出 `(O)771 Fiber` 174 ⇒ 钱 14→188，次日 `NewDay` 结算），day 2「早晨 0 动作直接睡」、day 3「`buy` 26 次 0 成交（`no_inventory_space`×25）+ `sleep_failed`」。据此新增：
+
+- **N1 每天必须有农场动作**：`ended_by=="sleep"` 的日子必须 `ok_steps >= 1`；0 动作收工要留 `slept_without_work` 且 `verified=false`。**不许**靠睡眠跳过一天。
+- **N2 经济闭环四步留痕**：`sell`/`surplus_sell` → 次日 `day_start.money` 增加（到账，钱由游戏在 `NewDay` 结算）→ `buy` 成功（**当季**在售）→ `sow`/`plant_area` ≥1 格成功。四步缺一，evidence 必须点名是哪一步、为什么。
+- **N3 无空格死锁**：同一天 `buy` 尝试 ≤3，`no_inventory_space` 之后不再重试；若因背包满而买不到，必须出现 `surplus_sell{why:"need_slot"}`（只卖盈余白名单，绝不碰种子/工具/武器/建材）。
+- **N4 跨日与落盘**：`day_after` 恰 +1；落盘缺口（SMAPI 有 `NewDay` 无 `SaveGame.Save() called.`）必须能用"日终菜单链（`ShippingMenu`/`SaveGameMenu`）"解释，否则记红（run8 的 summer 11→12 属此型，与条目 049 的 task-47 同因）。
+
+判据出处与读数：`docs/_run8-evidence.md`、`logs/longrun-3day-llm-run8.jsonl`、`logs/run8-smapi-window.txt`（133851 B / SHA256 `A3FABA90…`）；计划见 `docs/_release-0.7.28.md` §4。
+
 ## 4. run6 起跑与收口纪律
 
 - 起跑前：`tools/preflight.py --expect 0.7.25 --save-baseline logs/run6-baseline.json` 四项全绿；记「版本四要素」（HEAD / 被测文件 SHA256+mtime / PID+StartTime / 工作树干净）。
