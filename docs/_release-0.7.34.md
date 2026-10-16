@@ -8,7 +8,7 @@
 
 | 卡 | 负责 | 内容 | 状态 |
 |---|---|---|---|
-| **task-176** | dev-coder | P0：三处真相修正 —— ①`harvestMethod` 正确来源（先 api-probe）+ **必须输出键**（拿不到写 null）②`Ready()` 反射不可用 ⇒ `null`（不许宽松字段兜底当 true）+ 新增 `readySource ∈ {"game","fields",null}` ③`acted` 由可独立观测的变化推导（拿不准 ⇒ `false` + `status="no_action"`） | in_progress |
+| **task-176** | dev-coder | P0：三处真相修正 —— ①改用 **`Crop.GetHarvestMethod()`（public 无参）**（`Crop.HarvestMethod` 在 1.6.15 **不存在**）+ **必须输出键**（拿不到写 null）②`ready` **如实 + 来源可辨**（**更正**：`HoeDirt.readyForHarvest()` 的 IL 与字段判据**逐条等价**，"末阶段未熟却 `ready=true`"是**游戏口径的真相**，不是 fail-open；反射不可用 + 字段齐全 ⇒ 照字段判、`readySource="fields"`；字段缺项才 `null`）+ 新增 `readySource ∈ {"game","fields",null}` ③`acted` 由可独立观测的变化推导（拿不准 ⇒ `false` + `status="no_action"`） | in_progress |
 | **task-177** | machine-runner | 0.7.34 上同格复测：字段核对 → 受制裁腾格 → 同格 `harvest` → （必要时）镰刀路径 → 对照格；交付 `docs\_run10b-harvest-verify.md` | pending（blocked_by task-176） |
 | **task-178** | deputy-lead | task-176 的独立对抗验收（≥6 条作弊通道 + 自建变异 + 全量回归 + "0.7.34 能否冻结"结论） | pending（blocked_by task-176） |
 
@@ -34,8 +34,12 @@
 
 ## 4. 已知风险 / 未决
 
+- **诊断更正（Lead 已用 il-probe 实证，2026-10-17）**：
+  - `StardewValley.Crop.HarvestMethod` 字段/属性在 1.6.15 **不存在**（probe 直查 `(未找到 StardewValley.Crop.HarvestMethod)`）⇒ 正确路径是 **`Crop.GetHarvestMethod()`**（public 无参；IL = `data = GetData(); return data == null ? 0 : data.HarvestMethod;`，枚举 `0`=Grab、`1`=Scythe）。原"缺陷 A"成立（键缺失 ⇒ `harvest_tool()` 恒 None ⇒ 只能 `interact`）。
+  - `StardewValley.TerrainFeatures.HoeDirt.readyForHarvest()` 的完整 IL = `crop==null→false`；`fullyGrown && dayOfCurrentPhase>0→false`；`currentPhase < phaseDays.Count-1→false`；`dead→false`；`forageCrop→(whichForageCrop!="2")`；否则 `true`。**与 Mod 字段判据逐条等价** ⇒ 原"缺陷 B（fail-open）"**不成立**：`ready=true` 是游戏口径的真相。
+  - 因此 0.7.34 必须**同时**防两个方向：字段缺项 ⇒ `null`（不摘）；反射不可用 + 字段齐全 ⇒ **照字段判**（等价，不许一刀切 null/false）。
 - `harvest_gave_up` 的窗口依赖部分豁免（task-175 NIT-1）**不在本批**；若复测期间观察到"放弃格离窗 + `farm.readyCrops>0` 仍 `verified=true`"，如实记录并报 Lead。
-- 若 task-176 修复后 `readyCrops` 骤降为 0（反射失败导致全 null），那就是**从 fail-open 变成 fail-closed 过头**：脑侧会整天不摘 ⇒ 同样要报，不能静默接受（判据：`readySource=null` 的格占比 > 0 且当天 `farm.crops > 0` 时必须有 `harvest` 的【无法判定】记录）。
+- 若修复后 `readyCrops` 骤降为 0（把"反射失败 + 字段齐全"误判成 null），那就是 **fail-closed 过头**：脑侧会整天不摘 ⇒ 必须报，不能静默接受（判据：`readySource=null` 的格占比 > 0 且当天 `farm.crops > 0` 时必须有 `harvest` 的【无法判定】记录）。
 - `acted` 语义变化会影响 `use_tool`/`plant`/`interact` 三条既有路径 ⇒ 回归必须覆盖旧路径（`tests/test_farmwork.py`/`test_longrun.py` 全绿为硬要求）。
 
 ## 5. 执行记录（逐步追加）
