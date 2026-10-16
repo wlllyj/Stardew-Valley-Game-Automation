@@ -38,10 +38,10 @@ from agentfarm.farmwork import (  # noqa: E402
     seed_items,
 )
 from agentfarm.longrun import (  # noqa: E402
-    DEFAULT_LLM_MAX_TOKENS, ENDED_BY_EVENT, ENDED_BY_MODAL, FRONTIER_CLEAR_MAX,
-    JUSTIFIED_END_REASONS, MAX_BUY_TRIES_PER_DAY, MAX_ENV_ATTEMPTS, MAX_STUCK_FLUSH,
-    MAX_TILE_ATTEMPTS, PLOT_EXHAUSTED_BURST, DayReport, LongRun, _till_blocked_by,
-    is_justified_end, plot_observe,
+    DEFAULT_LLM_MAX_TOKENS, ENDED_BY_EVENT, ENDED_BY_MODAL, FAR_DRY_REFILL_MAX,
+    FRONTIER_CLEAR_MAX, JUSTIFIED_END_REASONS, MAX_BUY_TRIES_PER_DAY, MAX_ENV_ATTEMPTS,
+    MAX_STUCK_FLUSH, MAX_TILE_ATTEMPTS, PLOT_EXHAUSTED_BURST, DayReport, LongRun,
+    _till_blocked_by, is_justified_end, plot_observe,
 )
 from agentfarm.planner import (DECISION_LINE_MAX_CHARS, DECISIONS_KEPT, LESSONS_MAX, LESSON_SRC,
                                REVIEW_MAX_TOKENS, REVIEW_RETRY_MAX_TOKENS,
@@ -3183,6 +3183,231 @@ class TestTask50FarDryTiles(unittest.TestCase):
         self.assertLessEqual(run._actions, 40, f"整天动作数必须收敛：{run._actions}")
         self.assertTrue(all(not e["ok"] for e in ev))
         self.assertTrue(ev[-1]["given_up"])
+
+
+# --------------------------------------------- task-133：窗口外浇水的"壶空"与逐格判据
+class NeedRefillOnceWorker(FakeWorker):
+    """第一次 `water()` 假装"走到格子跟前才发现壶空"（`need_refill`），之后照常。
+
+    复刻 run9b t=896.64/924.27/1280.08：卡面要求补一次水后**重试同一格**，
+    而不是把这次 `need_refill` 记成这一格的一次失败（壶空是前置条件，不是"够不着"）。
+    """
+
+    def __init__(self, world: DryTilesWorld) -> None:
+        super().__init__(world)
+        self.need_refill_once = True
+        self.water_tiles: list[tuple[int, int]] = []
+
+    def water(self, tile, *, timeout_ms=15000):
+        self.water_tiles.append(tuple(tile))
+        if self.need_refill_once:
+            self.need_refill_once = False
+            st = StepResult("water", tuple(tile), code="need_refill",
+                            reason="假回执：走到跟前壶空了")
+            self.steps.append(st)
+            return st
+        return super().water(tile, timeout_ms=timeout_ms)
+
+
+class DryRefillWorker(FakeWorker):
+    """补水永远失败（"补水点走不到"）⇒ 验"补不上水要有界认输、且因由写壶空"。"""
+
+    def __init__(self, world: DryTilesWorld) -> None:
+        super().__init__(world)
+        self.refill_calls = 0
+
+    def refill_can(self, *, timeout_ms=15000):
+        self.refill_calls += 1
+        st = StepResult("refill_can", code="unreachable", reason="假回执：补水点走不到")
+        self.steps.append(st)
+        return st
+
+
+class StaleDryCountWorld(DryTilesWorld):
+    """复刻 run9b t=1233.68 的**错账现场**（task-107 的病灶）：
+
+    别的格浇了水把全局 `dryCrops`/`unwateredCrops` 打下去，而本格的 `dryTiles` 还在
+    （同一次发布不同源）。旧判据（全局差值）会因此把**本格**误判成"浇成功"。
+    """
+
+    def __init__(self, **kw) -> None:
+        super().__init__(**kw)
+        self.fake_dry_drop = False
+
+    def obs(self) -> dict:
+        o = super().obs()
+        if self.fake_dry_drop:
+            o["farm"]["dryCrops"] = 0
+            o["farm"]["unwateredCrops"] = 0
+        return o
+
+
+class GlobalDropOnlyWorker(FakeWorker):
+    """回执 `ok=true`、全局 `dryCrops` 也掉了，但**本格作物一动不动**（run9b 反例）。
+
+    `run_stage` 一并哑掉：否则 `_policy_intents` 看到未浇作物会强推 `water_area`，
+    假世界会"合法地"真浇上，判据就证不出来了（同 `LyingWaterWorker` 的理由）。
+    """
+
+    def run_stage(self, stage, tiles, *, min_stamina=12.0, max_steps=200):
+        return StageResult(stage=stage, tiles=list(tiles), stopped="world")
+
+    def water(self, tile, *, timeout_ms=15000):
+        self.w.fake_dry_drop = True
+        st = StepResult("water", tuple(tile), ok=True,
+                        reason="假回执：浇过了（顺手把全局 dryCrops 打下去）")
+        self.steps.append(st)
+        return st
+
+
+class TestTask133FarDryRefillAndPerTileEvidence(unittest.TestCase):
+    """task-133：run9b "窗口外干作物永远浇不上" 的两处病灶。
+
+    ①**壶空是前置条件、不是"够不着"**：动手前壶空 ⇒ 先补水；`water()` 回
+      `need_refill` ⇒ 补一次水后**重试同一格**；补不上才算这一格的一次失败，
+      补水总量一天有界（≤ `FAR_DRY_REFILL_MAX`）。run9b 现场：`[12,30]` 能走到也能浇上
+      （t=408.26 / 1483.17 都成），却三次 `need_refill` 记满 try 认输、
+      全账本 `refill` 只有 2 次，收尾文案还错写成"够不着"。
+    ②**逐格判据**：`ok` 只认这一格自己的证据（该格 `watered=true`，或该格**不在**
+      `farm.dryTiles` 里）；**禁止**全局 `dryCrops` 差值 —— t=1233.68 的 `[12,30]`
+      就是被别格 `[59,21]` 的全局差值顶替成"浇成功"的。
+
+    变异自检（`scratch/_t133_mutate.py`，把 `brain/`+`tests/` 一起拷临时目录；跑完即删）：
+    baseline 6/6 绿；**m133a**（把逐格判据换回全局 `dryCrops` 差值）红
+    `...is_not_this_tiles_evidence`；**m133b**（去掉动手前的补水）红
+    `...refill_failure_is_bounded_and_names_the_real_cause`；**m133c**（`need_refill`
+    后不重试同一格）红 `...need_refill_at_the_tile_retries_the_same_tile`。
+    """
+
+    FAR = (61, 10)
+
+    def _world(self, *, water_left: int = 40, with_dry_tiles: bool = True,
+               truncated: bool = False) -> StaleDryCountWorld:
+        w = StaleDryCountWorld(seeds=0, money=0, weeds=0, water_left=water_left,
+                               with_dry_tiles=with_dry_tiles, truncated=truncated)
+        w.dirt.add(self.FAR)
+        w.crops[self.FAR] = {"watered": False, "ripe": False}
+        w.player_tile = [62, 14]
+        return w
+
+    def _run_for(self, w, factory, *, max_days: int = 1):
+        return make_run(w, target_days=1, max_days=max_days,
+                        client_factory=lambda: FakeClient(w),
+                        worker_factory=factory)
+
+    def _events(self, run, event):
+        return [e for e in run.entries if e["event"] == event]
+
+    def test_empty_can_refills_before_watering_the_far_tile(self):
+        """①动手前壶空 ⇒ 先补水再浇，**同一格一次就成了**（壶空不算一次失败）。"""
+        w = self._world(water_left=0)
+        run = self._run_for(w, lambda _c: FakeWorker(w))
+
+        code = run.run()
+
+        rf = self._events(run, "water_far_refill")
+        self.assertEqual(len(rf), 1, f"壶空必须先补水一次：{rf}")
+        self.assertTrue(rf[0]["ok"], f"补水必须成：{rf[0]}")
+        self.assertEqual(rf[0]["water_before"], 0)
+        self.assertGreater(rf[0]["water_after"], 0)
+        ev = self._events(run, "water_far")
+        self.assertEqual(len(ev), 1, f"补完水就该直接浇成，不许多试：{ev}")
+        self.assertTrue(ev[0]["ok"])
+        self.assertEqual(ev[0]["try_"], 1, "壶空是前置条件，不该算这一格的一次失败")
+        self.assertEqual(w.watered_tiles, [self.FAR], "那一格必须真的被浇")
+        self.assertEqual(code, 0, "唯一的干格浇掉了 ⇒ 这天该达标")
+
+    def test_need_refill_at_the_tile_retries_the_same_tile(self):
+        """②`water()` 回 `need_refill` ⇒ 补一次水、**重试同一格**，只记一次 try。"""
+        w = self._world(water_left=40)
+        worker = NeedRefillOnceWorker(w)
+        run = self._run_for(w, lambda _c: worker)
+
+        run.run()
+
+        ev = self._events(run, "water_far")
+        self.assertEqual(len(ev), 1, f"补完水重试成功 ⇒ 只该留一条 water_far：{ev}")
+        self.assertTrue(ev[0]["ok"])
+        self.assertTrue(ev[0]["retried_after_refill"], "必须留痕：这次成功是补水重试换来的")
+        self.assertEqual(ev[0]["try_"], 1, "重试成功不算第二次失败")
+        self.assertEqual([e["tile"] for e in ev], [list(self.FAR)], "重试的必须是同一格")
+        self.assertEqual(worker.water_tiles, [self.FAR, self.FAR],
+                         "对同一格发了两次 water 请求（第一次 need_refill、第二次成功）")
+        self.assertEqual(len(self._events(run, "water_far_refill")), 1)
+
+    def test_refill_failure_is_bounded_and_names_the_real_cause(self):
+        """③补不上水 ⇒ 有界认输，收尾必须写"壶里没水"、**不许**写成"够不着"。"""
+        w = self._world(water_left=0)
+        worker = DryRefillWorker(w)
+        run = self._run_for(w, lambda _c: worker)
+
+        run.run()
+
+        rep = run.days[0]
+        rf = self._events(run, "water_far_refill")
+        self.assertEqual(len(rf), FAR_DRY_REFILL_MAX, f"补水必须有界：{rf}")
+        self.assertTrue(all(not e["ok"] for e in rf))
+        ev = self._events(run, "water_far")
+        self.assertEqual(len(ev), 2, f"每格一天最多 {2} 次：{ev}")
+        self.assertTrue(all(e["code"] == "need_refill" for e in ev), ev)
+        self.assertTrue(all(e["cause"] == "need_refill" for e in ev), ev)
+        self.assertTrue(ev[-1]["given_up"])
+        self.assertFalse(str(rep.ended_reason).startswith("no_work"))
+        self.assertTrue(str(rep.ended_reason).startswith("gave_up_dry"), rep.ended_reason)
+        self.assertIn("壶里没水", rep.ended_reason, "因由必须写壶空")
+        self.assertNotIn("坐标都够不着", rep.ended_reason,
+                         "壶空绝不能写成够不着（task-133 第 3 条；这里只允许出现『不是「够不着」』这种否定）")
+        self.assertEqual(w.watered_tiles, [], "一次都没真浇上")
+
+    def test_a_global_dry_drop_from_another_tile_is_not_this_tiles_evidence(self):
+        """④run9b 反例：全局 `dryCrops` 掉了但**本格还在 `dryTiles` 里** ⇒ 不许算成功。"""
+        w = self._world()
+        run = self._run_for(w, lambda _c: GlobalDropOnlyWorker(w))
+
+        run.run()
+
+        ev = self._events(run, "water_far")
+        self.assertTrue(ev, "应当至少试过一次")
+        self.assertTrue(ev[0]["receipt_ok"], "前提：执行层回执确实是 ok=true")
+        self.assertFalse(ev[0]["ok"], "全局 dryCrops 掉了不是这一格的证据")
+        self.assertTrue(ev[0]["in_dry_tiles_after"], "该格仍在上报的 dryTiles 里")
+        self.assertIn("仍在 farm.dryTiles", str(ev[0]["evidence"]))
+        self.assertEqual(ev[0]["cause"], "not_watered")
+        self.assertEqual(w.watered_tiles, [], "本格从未真的被浇")
+        self.assertEqual((ev[0]["dry_before"], ev[0]["dry_after"]), (1, 0),
+                         "前提：全局计数确实掉了（旧判据会误判成成功）")
+
+    def test_missing_dry_tile_evidence_is_not_a_success(self):
+        """⑤证据被截断/不可用且**该格也没有 watered 证据** ⇒ `ok=false`（判不了≠浇成了）。"""
+        w = self._world(truncated=True)
+        run = self._run_for(w, lambda _c: LyingWaterWorker(w))
+
+        run.run()
+
+        ev = self._events(run, "water_far")
+        self.assertTrue(ev, f"截断时仍该尝试（不能因为列表被截断就当成没有干格）：{ev}")
+        self.assertFalse(any(e["ok"] for e in ev), f"截断 ⇒ 判不了，不许算成功：{ev}")
+        self.assertTrue(all(e["cause"] == "no_evidence" for e in ev), ev)
+        self.assertTrue(all(e["receipt_ok"] for e in ev), "前提：回执是 ok=true")
+        rep = run.days[0]
+        self.assertFalse(rep.checks.get("watered_outdoor"))
+
+    def test_refill_budget_is_shared_across_the_day(self):
+        """⑥补水上限是**整天**的、不是每格一个（否则 64 格干作物能刷 128 次补水）。"""
+        w = self._world(water_left=0)
+        far2 = (63, 10)
+        w.dirt.add(far2)
+        w.crops[far2] = {"watered": False, "ripe": False}
+        worker = DryRefillWorker(w)
+        run = self._run_for(w, lambda _c: worker)
+
+        run.run()
+
+        rf = self._events(run, "water_far_refill")
+        self.assertLessEqual(len(rf), FAR_DRY_REFILL_MAX,
+                             f"补水总量一天有界：{len(rf)} 次")
+        self.assertLessEqual(worker.refill_calls, FAR_DRY_REFILL_MAX * 2,
+                             "补水请求也不能无限刷")
 
 
 class TestTask56LlmTraceWiring(unittest.TestCase):

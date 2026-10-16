@@ -119,6 +119,17 @@ MAX_STUCK_FLUSH = 2
 #: 认账（当天以 `stuck:` 收尾并点名坐标，而不是洗成"没活"）。
 FAR_DRY_MAX_TRIES = 2
 
+#: 【task-133】窗口外浇水时，一天最多为"壶空"补几次水。
+#:
+#: run9b 实证（`logs/longrun-3day-llm-run9b.jsonl`）：`[12,30]` 明明能走到、也能浇上
+#: （t=408.26 / t=1483.17 都 `ok=true`），但 t=896.64 / 924.27 / 1280.08 三次都是
+#: `code=need_refill`「壶里没水了（先补水）」⇒ `try_` 到 2 就 `given_up=true`，
+#: **全账本 `refill` 只有 2 次**；summer 15/16 因此以 `gave_up_dry` 收尾，
+#: 而收尾文案把它写成"够不着"（错因，误导验收）。
+#: ⇒ 壶空是**前置条件**（先补水再浇），不该算成一次"够不着"；但补水也要有界（≤2），
+#: 免得在"补水点走不到"时把整天耗在这一格上。
+FAR_DRY_REFILL_MAX = 2
+
 #: 【task-102】一天最多发起几次 `buy`（含探测与照清单复购）。
 #:
 #: run8 day 12/13：`buy` 一共 26 次、成交 0 —— 背包 0 空格，每次都 `no_inventory_space`，
@@ -693,6 +704,11 @@ class LongRun:
         # 观测窗口之外，脑侧连坐标都没有，只能 `no_work` 收工（`day_justified=true` 白拿）。
         self.far_dry_tries: dict[tuple[int, int], int] = {}
         self.far_dry_given_up: set[tuple[int, int]] = set()
+        #: 【task-133】每格的失败**因由**（`need_refill`/`unreachable`/`no_evidence`/…）：
+        #: 收尾文案必须分清因 —— run9b 把"壶空"写成"够不着"，验收就被误导了。
+        self.far_dry_causes: dict[tuple[int, int], str] = {}
+        #: 【task-133】当天为窗口外浇水补了几次水（上界 `FAR_DRY_REFILL_MAX`）。
+        self.far_dry_refills_today = 0
         #: 【task-104】当天出现过"人在室内 ⇒ 窗口外干作物没去浇"。用来给收尾理由点名
         #: `not_on_farm`（run8 day 12：被晨间 `ShippingMenu` 挡在 FarmHouse，`_water_far_dry`
         #: 照样对窗口外坐标走 6 格 × 2 次全 unreachable ⇒ 6 格当天全进 `given_up`）。
@@ -991,17 +1007,57 @@ class LongRun:
             return [], status
         return [t for t in outside if t not in self.far_dry_given_up], status
 
+    def _far_dry_give_up_cause(self) -> str:
+        """窗口外干格"认输"的因由归类：`need_refill` / `unreachable` / `mixed` / `""`（task-133）。
+
+        为什么要归类：run9b summer 15/16 的 `gave_up_dry` 全被写成"够不着"，其实是
+        **壶里没水**（`code=need_refill`，全账本只有 2 次 `refill`、一次都没为这些格补水）。
+        错因会直接误导验收（task-133 卡面第 3 条）。
+        """
+        causes = {self.far_dry_causes.get(t, "") for t in self.far_dry_given_up}
+        causes.discard("")
+        if not causes:
+            return "mixed"
+        if causes == {"need_refill"}:
+            return "need_refill"
+        if causes == {"unreachable"}:
+            return "unreachable"
+        if causes == {"no_evidence"}:
+            return "no_evidence"
+        if causes == {"not_watered"}:
+            return "not_watered"
+        return "mixed"
+
+    def _far_dry_give_up_cause_text(self) -> str:
+        """认输因由的中文短语（收尾文案/守卫理由共用，避免两处口径漂移）。"""
+        cause = self._far_dry_give_up_cause()
+        if cause == "need_refill":
+            return (f"壶里没水、补水也没成（当天补水 {self.far_dry_refills_today}/"
+                    f"{FAR_DRY_REFILL_MAX} 次）——**不是「够不着」**")
+        if cause == "unreachable":
+            return "坐标都够不着"
+        if cause == "no_evidence":
+            return ("缺证据（`farm.dryTiles` 不可用或被截断，判不了这一格）"
+                    "——**不是「够不着」**")
+        if cause == "not_watered":
+            return "走到了也浇了，但该格观测仍没变（回执不算证据）"
+        if cause == "mixed":
+            return "有的够不着、有的壶里没水（逐格因由见 journal `water_far` 的 code）"
+        return "当天没浇成（原因见 journal `water_far`）"
+
     def _far_dry_where(self, obs: dict[str, Any]) -> str:
-        """收尾/守卫文案里的"窗口外那几格在哪"（含坐标；认输的也点名，标"够不着"）。"""
+        """收尾/守卫文案里的"窗口外那几格在哪"（含坐标；认输的也点名，并**分清因由**）。"""
         outside, status = self._far_dry_outside(obs)
         if status == "unavailable" or not outside:
             return ""
         given = [t for t in outside if t in self.far_dry_given_up]
         mark = ""
         if given and len(given) == len(outside):
-            mark = f"；已试 {FAR_DRY_MAX_TRIES} 次都够不着，当天不再重试"
+            mark = (f"；其中 {len(given)} 格已放弃当天"
+                    f"（{self._far_dry_give_up_cause_text()}）")
         elif given:
-            mark = "；其中一部分已试过够不着"
+            mark = (f"；其中一部分已放弃当天"
+                    f"（{self._far_dry_give_up_cause_text()}）")
         return (f"，其中 {len(outside)} 格在玩家窗口之外（Mod 报的坐标 "
                 f"{[list(t) for t in outside[:3]]}{mark}）")
 
@@ -1015,7 +1071,14 @@ class LongRun:
             return (f"农场口径还有 {dry_f} 格干作物，但 farm.dryTiles 不可用（旧 Mod / "
                     "farm 证据不可信）⇒ 不许判「没活」，先回农场再判")
         if where:
-            return f"农场口径还有 {dry_f} 格干作物{where} ⇒ 想浇但走不到（不再重试）"
+            cause = self._far_dry_give_up_cause()
+            if cause == "need_refill":
+                return (f"农场口径还有 {dry_f} 格干作物{where} ⇒ 想浇但**壶里没水、补水也没成**"
+                        "（不是「够不着」；不再重试）")
+            if cause == "unreachable":
+                return f"农场口径还有 {dry_f} 格干作物{where} ⇒ 想浇但走不到（不再重试）"
+            return (f"农场口径还有 {dry_f} 格干作物{where} ⇒ 想浇但没成"
+                    f"（{self._far_dry_give_up_cause_text()}；不再重试）")
         return f"农场口径还有 {dry_f} 格干作物（窗口里看不到坐标）"
 
     def _far_dry_all_given_up(self, obs: dict[str, Any]) -> bool:
@@ -1108,11 +1171,40 @@ class LongRun:
                 return False
         pt = FarmWorker.player_tile(obs) or far[0]
         tile = min(far, key=lambda t: (_dist(t, pt), t[1], t[0]))
-        tries = int(self.far_dry_tries.get(tile, 0)) + 1
-        self.far_dry_tries[tile] = tries
         self._actions += 1
         before_farm = obs.get("farm") or {}
         before_dry = int(before_farm.get("dryCrops") or 0)
+        tiles_before, _before_status = farm_dry_tiles(obs)
+        in_tiles_before = tuple(tile) in {tuple(t) for t in tiles_before}
+
+        # 【task-133 ①】壶空是**前置条件**：动手前先补水（一天有界 ≤2 次），
+        # run9b 三次 need_refill 一条补水动作都没有就被记成"够不着"。
+        left0 = self._water_left_obs(obs)
+        if left0 is not None and left0 < 1:
+            obs, refilled = self._refill_for_water_far(obs, rep, tile)
+            left0 = self._water_left_obs(obs)
+            if not refilled or (left0 is not None and left0 < 1):
+                # 补不上水 ⇒ 这一格**确实浇不成**（算一次尝试），但**因由是壶空**，不是够不着。
+                tries = int(self.far_dry_tries.get(tile, 0)) + 1
+                self.far_dry_tries[tile] = tries
+                self.far_dry_causes[tile] = "need_refill"
+                if tries >= FAR_DRY_MAX_TRIES:
+                    self.far_dry_given_up.add(tile)
+                self._journal("water_far", tile=list(tile), ok=False, code="need_refill",
+                              try_=tries, limit=FAR_DRY_MAX_TRIES, walked=False, watered=False,
+                              dry_before=before_dry, dry_after=before_dry, status=status,
+                              receipt_ok=None, in_dry_tiles_before=in_tiles_before,
+                              cause="need_refill",
+                              refills=self.far_dry_refills_today,
+                              refill_limit=FAR_DRY_REFILL_MAX,
+                              reason="壶里没水，补水也没成 ⇒ 这一格今天浇不上",
+                              given_up=bool(tile in self.far_dry_given_up),
+                              note="壶空=前置条件问题：先补水再浇；补水失败才认输，"
+                                   "**绝不是「够不着」**（task-133）")
+                rep.notes.append(f"窗口外干作物 {list(tile)} 没浇成（第 {tries}/"
+                                 f"{FAR_DRY_MAX_TRIES} 次）：壶里没水且补水未成"
+                                 + ("；不再试这一格" if tile in self.far_dry_given_up else ""))
+                return False
 
         walked, walk_note = True, ""
         try:
@@ -1132,6 +1224,21 @@ class LongRun:
             except Exception as exc:                  # pragma: no cover
                 err = f"{type(exc).__name__}: {exc}"
 
+        # 【task-133 ①】`water()` 回 `need_refill`（走到半路壶空了）⇒ 补一次水、
+        # **重试同一格**；只有重试仍不成才算这一格的一次失败（壶空本身不算）。
+        retried_after_refill = False
+        if st is not None and st.code == "need_refill":
+            obs, refilled = self._refill_for_water_far(obs, rep, tile)
+            if refilled:
+                retried_after_refill = True
+                try:
+                    st = self.worker.water(tile)
+                    err = ""
+                except BridgeError as exc:
+                    err, st = str(exc), None
+                except Exception as exc:              # pragma: no cover
+                    err, st = f"{type(exc).__name__}: {exc}", None
+
         after_obs = obs
         try:
             after_obs = self._snap()
@@ -1141,37 +1248,134 @@ class LongRun:
         after_farm = after_obs.get("farm") or {}
         after_dry = int(after_farm.get("dryCrops") or 0)
         watered = bool(after_tv.get("watered"))
-        # 判据**只看观测差分**（task-50 卡面：该格 `watered==true`，或 `farm.dryCrops` 下降）。
-        # 回执 `st.ok=True` **不算证据** —— run1/run2 都栽在"回执 ok、世界没变"上；
-        # 实测（`scratch\\_t50_probe.py` 场景④）：把回执算进来的话，"回执说浇了、壶没动、
-        # 世界没变"会被记成浇成功，当天还白拿 `verified`。
-        ok = watered or (before_dry > 0 and 0 <= after_dry < before_dry)
+        tiles_after, tiles_status = farm_dry_tiles(after_obs)
+        in_tiles_after = tuple(tile) in {tuple(t) for t in tiles_after}
+        # 【task-133 ②】判据**只认这一格自己的证据**（卡面硬要求）：
+        #   ①该格 `watered=true`；或 ②Mod 按格给的 `dryTiles` 坐标里**没有**这一格。
+        # **严禁**再用全局 `dryCrops` 差值 —— run9b t=1233.68 的 `[12,30]` 报 `ok=true`
+        # 却 `code=need_refill`，是 t=1219.92 别的格 `[59,21]` 浇水的全局差值顶替的。
+        if watered:
+            ok, evidence = True, "该格观测 watered=true"
+        elif tiles_status == "ok" and not in_tiles_after:
+            ok, evidence = True, "该格已不在 farm.dryTiles 里（Mod 按格给坐标）"
+        elif tiles_status == "truncated":
+            ok, evidence = False, ("farm.dryTiles 被截断（>64 格）⇒ 该格不在列表里**不算证据**"
+                                   "⇒ 无法判定，不许当成功")
+        elif tiles_status == "unavailable":
+            ok, evidence = False, "farm.dryTiles 不可用 ⇒ 无法判定这一格（不许当成功）"
+        else:
+            ok, evidence = False, "该格仍在 farm.dryTiles 里（还干着）"
         code = (st.code if st is not None else ("unreachable" if not walked else "error"))
         receipt_ok = bool(st.ok) if st is not None else None
 
-        if not ok and tries >= FAR_DRY_MAX_TRIES:
-            self.far_dry_given_up.add(tile)
+        # 因由留痕：成功 ⇒ 清掉；失败 ⇒ 归类（收尾文案与守卫理由都读它）。
+        if ok:
+            self.far_dry_causes.pop(tile, None)
+        elif not walked:
+            self.far_dry_causes[tile] = "unreachable"
+        elif code == "need_refill":
+            self.far_dry_causes[tile] = "need_refill"
+        elif tiles_status in ("unavailable", "truncated"):
+            self.far_dry_causes[tile] = "no_evidence"
+        else:
+            self.far_dry_causes[tile] = "not_watered"
+
+        if not ok:
+            tries = int(self.far_dry_tries.get(tile, 0)) + 1
+            self.far_dry_tries[tile] = tries
+            if tries >= FAR_DRY_MAX_TRIES:
+                self.far_dry_given_up.add(tile)
+        else:
+            tries = int(self.far_dry_tries.get(tile, 0)) + 1
+            self.far_dry_tries[tile] = tries
         self._journal("water_far", tile=list(tile), ok=ok, code=code, try_=tries,
                       limit=FAR_DRY_MAX_TRIES, walked=bool(walked), watered=watered,
                       dry_before=before_dry, dry_after=after_dry, status=status,
-                      receipt_ok=receipt_ok,
+                      receipt_ok=receipt_ok, evidence=evidence,
+                      in_dry_tiles_before=in_tiles_before, in_dry_tiles_after=in_tiles_after,
+                      dry_tiles_status=tiles_status, cause=self.far_dry_causes.get(tile, ""),
+                      refills=self.far_dry_refills_today,
+                      retried_after_refill=bool(retried_after_refill),
                       reason=(st.reason if st is not None else (walk_note or err)),
                       receipt=(st.receipt if st is not None else err),
                       given_up=bool(tile in self.far_dry_given_up),
                       note="窗口外干作物：Mod 的 farm.dryTiles 给了坐标 ⇒ 走过去浇"
-                           "（farm.dryCrops>0 时不许 no_work 收工；判据=该格 watered 或 dryCrops 下降）")
+                           "（壶空先补水、补水后重试同一格；判据=**该格** watered=true 或"
+                           "该格已不在 dryTiles 里，绝不用全局 dryCrops 差值）")
         if ok:
             # 【task-102】浇成一格窗口外的干作物 = 一次真实的农场动作（`_do_sleep` 的
             # "0 动作不许睡"判据看它）。
             self.farm_actions_today += 1
             rep.notes.append(f"浇了窗口外那格干作物 {list(tile)}（第 {tries} 次尝试；"
-                             f"farm.dryCrops {before_dry}→{after_dry}）")
+                             f"{evidence}；farm.dryCrops {before_dry}→{after_dry}）")
             self._say(f"  · 浇窗口外干作物 {list(tile)}：{code}")
         else:
-            rep.notes.append(f"窗口外干作物 {list(tile)} 没浇成（第 {tries}/{FAR_DRY_MAX_TRIES} 次）："
-                             f"{walk_note or err or (st.reason if st is not None else code)}"
+            rep.notes.append(f"窗口外干作物 {list(tile)} 没浇成（第 {tries}/{FAR_DRY_MAX_TRIES} 次，"
+                             f"因由 {self.far_dry_causes.get(tile, '未定')}）："
+                             f"{walk_note or err or (st.reason if st is not None else code)}；{evidence}"
                              + ("；不再试这一格" if tile in self.far_dry_given_up else ""))
         return True
+
+    @staticmethod
+    def _water_left_obs(obs: dict[str, Any]) -> int | None:
+        """壶里还剩几格水（**静态**读法，假 worker 也能用）：`None` = 无尽壶/无壶/读不到。
+
+        为什么要单写一个：`farmwork.FarmWorker.water_left()` 是实例方法（要真 worker），
+        而长跑里判断"要不要补水"必须只看观测（假 worker 没有这个方法）。
+        """
+        can = FarmWorker.can_state(obs)
+        if not can.get("present") and not can.get("bottomless"):
+            return None
+        if can.get("bottomless"):
+            return None
+        left = can.get("waterLeft")
+        try:
+            return int(left) if left is not None else None
+        except (TypeError, ValueError):               # pragma: no cover - 观测坏了
+            return None
+
+    def _refill_for_water_far(self, obs: dict[str, Any], rep: DayReport,
+                             tile: tuple[int, int]) -> tuple[dict[str, Any], bool]:
+        """【task-133】窗口外浇水专用补水：壶空 ⇒ 先补水，**不许**把壶空算成"够不着"。
+
+        有界：一天最多 `FAR_DRY_REFILL_MAX` 次（免得"补水点走不到"时把整天耗在这一格）。
+        判据：`refill_can()` 的 `ok`，或补水后 `waterLeft` 变大（`refill_can` 本身就按水位判）。
+        返回 `(新观测, 是否补上)`。
+        """
+        assert self.worker is not None
+        if self.far_dry_refills_today >= FAR_DRY_REFILL_MAX:
+            return obs, False
+        self.far_dry_refills_today += 1
+        self._actions += 1
+        before = self._water_left_obs(obs)
+        ok, code, reason, receipt = False, "error", "", ""
+        try:
+            st = self.worker.refill_can()
+            ok, code, reason, receipt = bool(st.ok), st.code, st.reason, st.receipt
+        except BridgeError as exc:
+            code = str(getattr(exc, "status", "") or "error")
+            reason, receipt = str(exc), f"{code}: {str(exc)[:300]}"
+        except Exception as exc:                      # pragma: no cover - 假 worker 的意外
+            code, reason = "error", f"{type(exc).__name__}: {exc}"
+        fresh = obs
+        try:
+            fresh = self._snap()
+        except BridgeError:
+            pass
+        after = self._water_left_obs(fresh)
+        if not ok and before is not None and after is not None and after > before:
+            ok = True                               # 水确实变多了 = 补上了（回执可能不准）
+        self._journal("water_far_refill", tile=list(tile), ok=bool(ok), code=code,
+                      water_before=before, water_after=after,
+                      tries=self.far_dry_refills_today, limit=FAR_DRY_REFILL_MAX,
+                      reason=reason, receipt=receipt,
+                      note="窗口外浇水前补水：壶空是前置条件，不是「够不着」（task-133）")
+        if ok:
+            self._say(f"  · 为窗口外浇水补水：水 {before}→{after}")
+        else:
+            rep.notes.append(f"窗口外浇水前补水没成（第 {self.far_dry_refills_today}/"
+                             f"{FAR_DRY_REFILL_MAX} 次）：{reason or code}")
+        return fresh, bool(ok)
 
     @staticmethod
     def _essence(obs: dict[str, Any]) -> dict[str, Any]:
@@ -2321,7 +2525,8 @@ class LongRun:
                 # 追一株够不着的死苗整天换片地，summer 6 空转 4.5 分钟才靠 stuck_flush 翻篇）。
                 if self._far_dry_all_given_up(obs):
                     return True, "gave_up_dry", (
-                        f"农场口径还有 {dry_f} 格干作物{where}，坐标都够不着（已放弃当天，"
+                        f"农场口径还有 {dry_f} 格干作物{where}，"
+                        f"{self._far_dry_give_up_cause_text()}（已放弃当天，"
                         "不再空转）——这不是「没活可做」，当天按 needs_review 如实收尾")
                 if can and tod < 2500 and stam >= self.water_min_stamina:
                     return False, "keep_working", (
@@ -3834,6 +4039,9 @@ class LongRun:
         # 【task-50】窗口外干作物的重试记账，每天清零（第二天壶/世界都变了，重新判）。
         self.far_dry_tries = {}
         self.far_dry_given_up = set()
+        # 【task-133】失败因由与补水次数也每日清零（"壶里有没有水"是新的一天的事）。
+        self.far_dry_causes = {}
+        self.far_dry_refills_today = 0
         self.water_far_not_on_farm = False      # 【task-104】每日重置（理由后缀用）
         self.far_dry_unavailable_noted = False
         # 【task-42】新的一天 ⇒ 清空出货白名单：昨天收获的东西昨天该出就出了，
