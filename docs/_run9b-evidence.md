@@ -357,13 +357,25 @@ summer 18  final FarmHouse t=600  体力=270   钱=205 作物=0  未浇=0 熟=0 
 1. **没有拿到尾部连续 3 天 VERIFIED** —— 尾部窗口是 `summer 16（未过）/ 17（过）/ 18（未过）`；`finish.code=1`、`stuck_flushes=0`、`unmet_days=[summer 13, 14, 15]`。判 FAIL 是工具口径的直接结论，不是解释。
 2. **`run10-lessons.json` 的这次拷贝只作占位、不得用于判决** —— 本轮 22:30 把 `logs/longrun-3day-llm-run9b-lessons.json` 原样拷成了 `logs/longrun-3day-llm-run10-lessons.json`（两侧 SHA256 同为 `C2312F2D7FA3C9AAC3DBE3273E7DC9EBD220555AF5368A2F0AC8F342338486A0`），但 run9b 那本库里 `far_dry_given_up|water_far` 的 `hint` 与自身 `evidence`（`gave_up=3 dry_dead=0`）**自相矛盾**（Lead 已立 task-136）。run10 的注入基线必须以 **run9c（0.7.30 上的 run A）** 的 `logs\longrun-3day-llm-run9c-lessons.json` 重新原样拷贝为准，并在 `docs/_run10-evidence.md` 记"拷贝时刻 + 两侧 SHA256"。
 3. **存档只保留两代** ⇒ 窗口内中间几次落盘的 size 物理上不可恢复（每一次都由 SMAPI 六串 + `_old` 轮换佐证）。
-4. **收尾现场的 `money=105` 与 summer 18 `day_end.final.money=205` 不一致（-100g），成因未定** —— 期间（`22:30:17`–`22:33:16`）SMAPI **没有任何 `/v1/exec`**（只有我 `22:33:16` 的 health+observe），因此**不是脑侧动作造成的**；列为盲区，不做推测性解释。同理 `farm.crops` 在 17 日 `final=50` 与收尾现场 `55` 的差异（不同 `tod`/窗口口径）只作读数并列。
+4. **收尾现场的 `money=105` 与 summer 18 `day_end.final.money=205` 的 100g 差额：查清了，不是静默丢钱，是 `final` 快照滞后**（Lead 亲读账本尾部，证据链见下）。
+   - 账本 idx 顺序（`logs/longrun-3day-llm-run9b.jsonl`）：`idx 343 sleep t=1813.91`（跨到 summer 18）→ `idx 348 day_start` → `idx 349 goto_farm` → `idx 350 modal_dismissed{ShippingMenu} t=1820.91` → **`idx 351 buy (O)483 ×10 code=ok money 205→105 t=1821.0`** → `idx 352 slept_without_work t=1821.0` → `idx 353 lessons` → **`idx 354 day_end{day:[1,'summer',18], ended_by:'slept_without_work', final.money:205}`** → `idx 355 no_day_progress` → `idx 356 finish{code:1}`。
+   - 那 100g 就是**同一秒成功买到的 10 个 Wheat Seeds**，与收尾现场 `observe`（`scratch/run9b-live-observe.json`）完全对得上：`player.money=105`、`inventory[7]={Wheat Seeds, stack:10}`、`inventoryCount=12/12`。
+   - ⇒ `day_end.final` 是**买之前**那张快照，所以写着 205。**不是静默丢钱，是字段滞后**；证据 = `buy` at idx 351 + live observe `105g` & 10 Wheat Seeds。
+   - 同理 `farm.crops` 在 17 日 `final=50` 与收尾现场 `55` 的差异（不同 `tod`/窗口口径）只作读数并列。
 5. **`isInBed=true` 残留**：收尾现场玩家在 FarmHouse 走动（`canMove=true`）仍报 `isInBed=true`，与 run2 起记录的同一现象一致（`FarmWorker.sleep` 的"上床"判断会因此跳过，属已知风险，不影响本跑结论）。
 6. **`farm.unwateredCrops` 不是干格数**：收尾现场 `unwateredCrops=34` 而 `dryCrops=0`；浇水判据一律用 `dryCrops`/`final_water.dry`（`farm.unwateredCrops` 不参与判定）。
 7. **`plot` 观测被 400 格上限截断**（`tilesTruncated=true`）：田区统计与锚点打分只覆盖已返回的格，跨片地 leftover 的一部分成因可能在这个盲区里。
 8. **`eventUp` / 剧情事件本跑 0 次**；`modal_dismissed` 2 次（普通框，均成功）。若有 `eventUp`，按 task-41 纪律一律停手等人工，本条不适用（无样本）。
 9. **本跑没有可证伪的死苗样本**（`dead_crops=0`/`dry_dead=0` 6/6 天）⇒ 六问③ 判【无法判定】。
 10. **`save_called` 计数 6 vs 5 的工具坑**（§3）：插件描述行会被正则命中，两套独立工具（Lead 复核器）都踩了 ⇒ 后续自动化必须先过滤该行。
+11. **`day_end.final` 在非 `sleep` 收尾分支上可能滞后**（机制由第 4 条定案；**task-137** 候选、0.7.31 修）—— `final` 是验收/分析工具读"当天收尾状态"的字段（`money`/`seeds`/`crops`/`dry` 都取自它）；run9b 的 summer 18 以 `slept_without_work` 收尾，`final.money=205` 却是**买之前**那张快照，同一秒 `buy` 花掉的 100g 没进 `final` ⇒ **同日"买→种"链条会被工具读成"没买"**。
+   - **0.7.30 验收与 `final` 字段的注意点**：若某天以 `slept_without_work` / `gave_up_dry` / `blocked_modal` 收尾，`final` 的 `money`/`seeds` **不能单独作数**，必须以收尾现场 `observe` 复核。
+
+### §7.1 run9c 起跑时的"证据必查项"（task-137 相关，追加）
+
+- 若 run9c 出现 `slept_without_work` / `gave_up_dry` / `blocked_modal` 收尾：**收尾现场单独取一次 `observe?detail=full`**，用 `player.money` / `player.inventory[]` / `clock` 与当天 `day_end.final` 逐字段对照；不一致就按"`final` 滞后（task-137）"记录，**以现场观测为准**。
+- 经济四腿里的"买"必须同时看 `buy` 事件（`money` 前后）+ 收尾现场 `inventory`，避免把滞后的 `final` 读成"没买"。
+- 其它既有必查项不变：落盘五串配对、`verify-run3` 的 `verdict`+`strict_verdict` 两行、`analyze-longrun --window 3` 同向、L0 教训库 `total>=1` 与原文 SHA256、`<journal>.version.json` 四要素、存档四条 + `day_after` 恰 +1 链。
 
 ---
 
