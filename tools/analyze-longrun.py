@@ -105,6 +105,15 @@
     ①burst 当天却自称 `verified=true`（连发=没目标的证据，与 VERIFIED 互斥）；②弃权后当天
     `ended_reason` 仍说"守卫仍说还有活"（弃权没生效）；③兜底出简报抛异常。旧账本没有这些事件
     ⇒ 头部 `<缺失>` + 【无法判定】（**缺失 ≠ 0 = 没发生过**，绝不当"没发生"通过）。
+  * 部分购买 / 量力而行（task-123 在制 / task-132）：下单量 `n = min(buy_count, money//price)`，
+    `n >= 1` 就买下（`n < wanted` 时另记 `buy_partial`：`item`/`bought`/`wanted`/`price`/
+    `price_shelf`/`price_cfg`/`money`/`source`/`ok`/`code`），`n == 0` 一个都买不起 ⇒ 记
+    `cannot_afford` 且**一个请求都不发**。头部 `部分购买` 行 + 建议 0p-2；口径 = **买一半不是失败**
+    （`buy_ok` 类成交只算**买满 `wanted`** 的整笔；`tools\verify-run3.py` 对 `buy_partial` 零命中
+    ⇒ 本工具不判红、不进 rc）。只给两条**可证伪形态**的 ⚠ 警告：①`buy` 自称成交却
+    `count < wanted` 且当天没有对应 `buy_partial`（量力而行必须留痕）；②同日既有 `buy_partial`
+    又有 `cannot_afford`（可能是不同货品单价差、也可能判据打架，只提示人工核对）。
+    旧账本没有该事件、`buy` 也没有 `wanted` 字段 ⇒ 头部 `<缺失>` + 【无法判定】（缺失 ≠ 0）。
   * 事件映射不许漂移（Lead m02395）：brain 里 `_journal("<name>"` 的**每个**事件名都要在
     `EVENT_BUCKETS` 里有桶（结构性事件 `day_start`/`day_end`/`finish` 除外，见 `STRUCTURAL_EVENTS`）；
     账本里出现没桶的事件 ⇒ 报告头部逐条点名（名字×次数+行号）+ 建议 0a，**绝不静默丢弃**。
@@ -378,6 +387,14 @@ FIELD_PROBES = [
     ("event:plot_exhausted_burst", "plot_exhausted_burst",
      "同一秒 ≥5 次换片（task-124：count/zone；brain PLOT_EXHAUSTED_BURST=5）⇒ 按既有有界机制"
      "收尾，不判红；burst 当天仍自称 VERIFIED ⇒ ⚠ 警告（连发=没目标的证据，与 VERIFIED 互斥）"),
+    # task-132（task-123 在制）：量力而行买种子 —— 钱只够买 `bought < wanted` 时照样买，**不是失败**。
+    # 只有"自称买满却 count<wanted 且没有对应 buy_partial"或"同日既有 buy_partial 又有 cannot_afford"
+    # 这类**可证伪**形态才给 ⚠ 警告（verify-run3.py 对 `buy_partial` 零命中 ⇒ 判红会两边反向）。
+    ("event:buy_partial", "buy_partial",
+     "钱只够买一部分 ⇒ 量力而行买下这些（task-123：item/bought/wanted/price/price_shelf/price_cfg/"
+     "money/source/ok/code）⇒ **不是失败**，不进 failed；缺 `wanted` 字段的旧账本 ⇒【无法判定】"),
+    ("event:buy_partial.bought", "buy_partial_bought",
+     "实际买到的手数（task-123）；与 `wanted` 一起才能算出还缺多少（缺失 ≠ 0）"),
 ]
 OUTCOME_RE = re.compile(
     r"目标\s*(\d+)\s*步：做成\s*(\d+)、跳过\s*(\d+)、失败\s*(\d+)"
@@ -565,6 +582,10 @@ EVENT_BUCKETS = {
     "review_only_fallback_failed": "review_only_fallback_failures",
     "review_only_no_target": "review_only_no_targets",
     "plot_exhausted_burst": "plot_exhausted_bursts",
+    # task-132（task-123 在制）：量力而行买种子 —— 钱只够买一半照样买（`buy_partial`），
+    # **不是失败**（不进 failed、不判红；`tools\verify-run3.py` 对该名零命中），只作信息项 +
+    # 两条可证伪 ⚠ 警告（自称买满却买少且无留痕 / 同日 `buy_partial` 与 `cannot_afford` 同时出现）。
+    "buy_partial": "buy_partials",
 }
 
 #: 结构性事件：由报告的其他字段单独统计（day_start/day_end 切会话与验收、finish 自述），
@@ -613,6 +634,8 @@ NEW_EVENT_BUCKETS = (
     # task-124/task-130：review 兜底（work_spot/pending_walk）+ 弃权留痕 + 换片连发
     "review_only_fallbacks", "review_only_fallback_failures",
     "review_only_no_targets", "plot_exhausted_bursts",
+    # task-132（task-123 在制）：量力而行买种子（买一半不是失败；只给可证伪形态的 ⚠ 警告）
+    "buy_partials",
 )
 
 
@@ -2315,6 +2338,31 @@ def build_advice(report, top=8):
             "lines": sorted(set((rfa.get("fallback_lines") or []) + (rfa.get("no_target_lines") or [])
                                 + (rfa.get("burst_lines") or []) + (rfa.get("failed_lines") or []))),
         })
+    # 0p-2) task-132（task-123 在制）：量力而行买种子 —— **买一半不是失败**；只列两条可证伪 ⚠。
+    bpv = report.get("buy_partial") or {}
+    if bpv.get("has_events") or bpv.get("buy_has_wanted"):
+        _bparts = [f"部分购买 {bpv.get('events', 0)} 次（买到 {bpv.get('bought_total', 0)} 个 / 想要 "
+                   f"{bpv.get('wanted_total', 0)} 个；还缺 {bpv.get('short_total', 0)} 个）",
+                   f"买满成交 {bpv.get('buy_ok_full', 0)} 次"
+                   + (f"（另有 {bpv.get('buy_ok_missing_wanted')} 次成交没有 wanted 字段、无法区分是否买满）"
+                      if bpv.get("buy_ok_missing_wanted") else ""),
+                   f"cannot_afford {bpv.get('cannot_afford_events', 0)} 次（一个都买不起 ⇒ 不发请求）"]
+        if bpv.get("warn_missing_partial_lines"):
+            _bparts.append(f"⚠ buy 自称成交却买少（count<wanted）且当天没有对应 buy_partial：行 "
+                           f"{bpv.get('warn_missing_partial_lines', [])[:6]}")
+        if bpv.get("warn_cannot_afford_same_day_lines"):
+            _bparts.append(f"⚠ 同日既有 buy_partial 又有 cannot_afford："
+                           f"{bpv.get('warn_cannot_afford_same_day_days')}"
+                           f"（行 {bpv.get('warn_cannot_afford_same_day_lines', [])[:6]}；只提示人工核对）")
+        advice.append({
+            "text": "部分购买/量力而行（信息项，**买一半不是失败**）：" + "；".join(_bparts)
+                    + "。钱只够买 `n < wanted` 时照样买下、缺的种子等次日钱结算后再补"
+                      "（`cannot_afford` 只留给'一个都买不起'）；`buy_ok` 类成交只算买满 `wanted` 的整笔。"
+                      "verify-run3.py 对 `buy_partial` 零命中 ⇒ 本工具只给上面两条可证伪形态的 ⚠ 警告，"
+                      "**不判红、不进 rc**；旧账本缺这些字段 ⇒【无法判定】（缺失 ≠ 0）",
+            "lines": sorted(set((bpv.get("lines") or []) + (bpv.get("warn_missing_partial_lines") or [])
+                                + (bpv.get("cannot_afford_lines") or []))),
+        })
     # 0c) 环境挡路 / 没拿到结论（task-22 记账）
     env = report.get("env_inconclusive") or {}
     if env.get("env_fail_events"):
@@ -2611,6 +2659,15 @@ def build_undecidable(rows, sessions, prelude, report):
                    "（task-124/130）")
     elif _rf_ev and not _rf.get("has_events"):
         out.append("task-124 事件存在但没进聚合（工具 bug 迹象）：无法判定兜底/弃权/连发计数")
+    # task-132（task-123 在制）：量力而行买种子的证据是否存在（旧账本没有 `buy_partial`、`buy` 也
+    # 没有 `wanted` 字段）—— **缺失 ≠ 0，绝不当"没出现过买一半"通过**。
+    _bp_ev = [ev for _ln, ev in rows if ev.get("event") == "buy_partial"]
+    _bpv = report.get("buy_partial") or {}
+    if not _bp_ev and not _bpv.get("buy_has_wanted"):
+        out.append("本账本没有 `buy_partial` 事件，`buy` 也没有 `wanted` 字段（task-123 之前的形态）："
+                   "无法判定是否出现过「钱只够买一半」—— **缺失 ≠ 0，绝不当'没发生'通过**（task-132）")
+    elif _bp_ev and not _bpv.get("has_events"):
+        out.append("task-123 事件存在但没进聚合（工具 bug 迹象）：无法判定部分购买计数")
     # task-36：自称浇过、却没有 final_water 可核对的那些天（verify-run3.py:414-418 同口径：只记信息项）
     no_fw = [
         lineno for lineno, ev in rows
@@ -3301,6 +3358,88 @@ def build_report(rows, path, args, bad_lines):
             review_fallback["warn_no_target_still_guarded_lines"].append(_ln)
             if _lab not in review_fallback["warn_no_target_still_guarded_days"]:
                 review_fallback["warn_no_target_still_guarded_days"].append(_lab)
+    # task-132（task-123 在制 `buy_partial`）：**买一半不是失败** —— `n = min(buy_count, money//price)`，
+    # `n >= 1` 就买下，`n < wanted` 时另记 `buy_partial`（**不进** `failed`、不判红）。旧账本没有该事件、
+    # `buy` 也没有 `wanted` 字段 ⇒【无法判定】（缺失 ≠ 0 ≠ "没发生"）。两条**可证伪** ⚠ 警告（不判红：
+    # `tools\verify-run3.py` 对 `buy_partial` 零命中，判红会两边反向）：
+    #   ①`buy` 自称成交（`ok=true`）却 `count < wanted`，而当天没有对应的 `buy_partial` 留痕；
+    #   ②同一天既有 `buy_partial`（买到 ≥1）又有 `cannot_afford`（一个都买不起）—— 可能是不同货品的
+    #     单价差，也可能判据打架 ⇒ 只提示人工核对，不下结论。
+    _bp_partials = [(ln, ev) for ln, ev in rows if ev.get("event") == "buy_partial"]
+    _bp_cannot = [(ln, ev) for ln, ev in rows if ev.get("event") == "cannot_afford"]
+    buy_partial = {
+        "events": len(_bp_partials), "lines": [ln for ln, _ in _bp_partials],
+        "items": [], "plans": {}, "bought_total": 0, "wanted_total": 0, "short_total": 0,
+        "prices": [], "sources": [], "money": [],
+        "cannot_afford_events": len(_bp_cannot),
+        "cannot_afford_lines": [ln for ln, _ in _bp_cannot],
+        "warn_missing_partial_lines": [], "warn_missing_partial_days": [],
+        "warn_cannot_afford_same_day_lines": [], "warn_cannot_afford_same_day_days": [],
+        "has_events": bool(_bp_partials),
+        "buy_has_wanted": any(ev.get("event") == "buy" and "wanted" in ev for _ln, ev in rows),
+    }
+    _bp_pairs = set()
+    for _ln, ev in _bp_partials:
+        _it = str(ev.get("item") or "")
+        _b = as_int(ev.get("bought"), None)
+        _w = as_int(ev.get("wanted"), None)
+        if _it and _it not in buy_partial["items"]:
+            buy_partial["items"].append(_it)
+        if _b is not None:
+            buy_partial["bought_total"] += _b
+        if _w is not None:
+            buy_partial["wanted_total"] += _w
+        if _b is not None and _w is not None:
+            buy_partial["short_total"] += max(0, _w - _b)
+            _bp_pairs.add((_it, _b, _w))
+            if _it:
+                _cur = buy_partial["plans"].get(_it) or [0, 0]
+                buy_partial["plans"][_it] = [_cur[0] + _b, _cur[1] + _w]
+        _pr = as_int(ev.get("price"), None)
+        if _pr is not None and _pr not in buy_partial["prices"]:
+            buy_partial["prices"].append(_pr)
+        _src = str(ev.get("source") or "")
+        if _src and _src not in buy_partial["sources"]:
+            buy_partial["sources"].append(_src)
+        _mn = as_int(ev.get("money"), None)
+        if _mn is not None:
+            buy_partial["money"].append(_mn)
+    for _ln, ev in rows:
+        if ev.get("event") != "buy":
+            continue
+        _c = as_int(ev.get("count"), None)
+        _w = as_int(ev.get("wanted"), None)
+        if ev.get("ok") is True and _c is not None and _w is not None and _c < _w:
+            if (str(ev.get("item") or ""), _c, _w) not in _bp_pairs:
+                buy_partial["warn_missing_partial_lines"].append(_ln)
+                _lab, _di = _lr_day_of(_ln)
+                if _lab and _lab not in buy_partial["warn_missing_partial_days"]:
+                    buy_partial["warn_missing_partial_days"].append(_lab)
+    if _bp_partials and _bp_cannot:
+        _bp_partial_days = {}
+        for _ln, _ in _bp_partials:
+            _lab, _di = _lr_day_of(_ln)
+            _bp_partial_days.setdefault(_di, _lab)
+        for _ln, _ in _bp_cannot:
+            _lab, _di = _lr_day_of(_ln)
+            if _di in _bp_partial_days:
+                buy_partial["warn_cannot_afford_same_day_lines"].append(_ln)
+                _pdl = _bp_partial_days[_di] or _lab
+                if _pdl and _pdl not in buy_partial["warn_cannot_afford_same_day_days"]:
+                    buy_partial["warn_cannot_afford_same_day_days"].append(_pdl)
+    # 口径（task-132）：`buy_ok` 类"成交"只算**买满 `wanted`** 的整笔；买少了的那笔算 `buy_partial`。
+    # 旧账本没有 `wanted` ⇒ 单独计数、如实标注（无法区分是否买满，不硬当"买满"）。
+    buy_partial["buy_ok_full"] = 0
+    buy_partial["buy_ok_missing_wanted"] = 0
+    for _ln, ev in rows:
+        if ev.get("event") != "buy" or ev.get("ok") is not True:
+            continue
+        _w = as_int(ev.get("wanted"), None)
+        _c = as_int(ev.get("count"), None)
+        if _w is None:
+            buy_partial["buy_ok_missing_wanted"] += 1
+        elif _c is not None and _c >= _w:
+            buy_partial["buy_ok_full"] += 1
     sleep_ok = sum(1 for _, ev in rows if ev.get("event") == "sleep" and ev.get("ok"))
     sleep_failed = sum(1 for _, ev in rows if ev.get("event") == "sleep" and not ev.get("ok"))
     blocked_by_action = {}
@@ -3378,6 +3517,8 @@ def build_report(rows, path, args, bad_lines):
         # task-102：背包空格死锁（free_slots / buy_no_space / 腾格卖出 / slept_without_work /
         # modal_dismiss_failed；买不到不是失败，缺失 ⇒【无法判定】）
         "bag_space": bag_space,
+        # task-132（task-123 在制）：量力而行买种子 —— 买一半**不是失败**；两条可证伪 ⚠ 警告
+        "buy_partial": buy_partial,
         # task-111：LLM 收工复盘 / 跨日教训库（task-58/59/82；只有三条完整性红，其余信息项）
         "llm_review": llm_review,
         # task-124/task-130：review 兜底（work_spot/pending_walk）/ 弃权 / 换片连发
@@ -3900,6 +4041,17 @@ MAPPING_TEXT = [
      "⚠ 警告**：burst 当天却自称 VERIFIED（连发=没目标的证据，与 VERIFIED 互斥）/ 弃权后台 `ended_reason` "
      "仍说『守卫仍说还有活』（弃权没生效）/ 兜底抛异常；旧账本没有这些事件 ⇒ 头部 `<缺失>` + "
      "【无法判定】（缺失 ≠ 0，绝不当'没发生'通过）"),
+    ("buy_partial（task-123 在制、task-132 收录）",
+     "种子经济·量力而行（信息项，**买一半不是失败** —— `tools\\verify-run3.py` 对该事件零命中 ⇒ "
+     "本工具不判红、不进 rc）：下单量 `n = min(buy_count, money//price)`，`n >= 1` 就买下，"
+     "`n < wanted` 时另记 `buy_partial`（`item`/`bought`/`wanted`/`price`/`price_shelf`/`price_cfg`/"
+     "`money`/`source`/`ok`/`code`；缺的种子等次日钱结算后再补）；`n == 0` 一个都买不起 ⇒ 记 "
+     "`cannot_afford` 且**一个请求都不发**。`buy_ok` 类成交只算**买满 `wanted`** 的整笔"
+     "（旧账本没有 `wanted` ⇒ 单独计数、无法区分是否买满）。头部'部分购买'行 + 建议 0p-2；"
+     "**只给两条可证伪形态的 ⚠ 警告**：①`buy` 自称成交却 `count < wanted` 且当天没有对应 "
+     "`buy_partial`（量力而行必须留痕）；②同日既有 `buy_partial` 又有 `cannot_afford`（可能是不"
+     "同货品单价差、也可能判据打架，只提示人工核对）。旧账本没有该事件/字段 ⇒ 头部 `<缺失>` + "
+     "【无法判定】（缺失 ≠ 0，绝不当'没出现过买一半'通过）"),
     ("encircled / encircled_stage / encircled_summary（task-68、task-76）",
      "5 环境挡路·可达性/开路（信息项，**无硬闸门 ⇒ 一律不判红**）：被不可清障物围住（四邻没有"
      "「可站+可清」的突破口）＝与 `unreachable`（物理走不到）**分开计数**、不封格、不进任何豁免分子；"
@@ -4089,6 +4241,33 @@ def render_text(report, top):
            f"（行 {bs.get('modal_dismiss_failed_lines', [])[:6]}）"
            "——关模态时桥报错，只点名（verify-run3 未判它，判红会两边反向）"
            if bs.get("modal_dismiss_failures") else ""))
+    # task-132（task-123 在制）：量力而行买种子 —— 买一半**不是失败**（`buy_ok` 只算买满 `wanted`
+    # 的整笔成交）；旧账本没有该事件/字段 ⇒ `<缺失>` + 【无法判定】（缺失 ≠ 0）。
+    # 只给两条**可证伪**形态的 ⚠ 警告（不判红：verify-run3.py 对 `buy_partial` 零命中）。
+    bp = report.get("buy_partial") or {}
+    if not bp.get("has_events") and not bp.get("buy_has_wanted"):
+        add("部分购买: <缺失>（本账本没有 buy_partial 事件、buy 也没有 wanted 字段 ⇒ 无法判定是否"
+            "出现过「钱只够买一半」；缺失 ≠ 0）")
+    else:
+        _bp_plans = "、".join(f"{k} {v[0]}/{v[1]}" for k, v in (bp.get("plans") or {}).items())
+        add(f"部分购买: {bp.get('events', 0)} 次（买到 {bp.get('bought_total', 0)} 个 / 想要 "
+            f"{bp.get('wanted_total', 0)} 个；还缺 {bp.get('short_total', 0)} 个"
+            + (f"；{_bp_plans}" if _bp_plans else "")
+            + (f"；单价 {bp.get('prices')[:4]}" if bp.get("prices") else "")
+            + f"）；买满成交 {bp.get('buy_ok_full', 0)} 次"
+            + (f"（另有 {bp['buy_ok_missing_wanted']} 次成交没有 wanted 字段、无法区分是否买满）"
+               if bp.get("buy_ok_missing_wanted") else "")
+            + f"；cannot_afford {bp.get('cannot_afford_events', 0)} 次"
+            "；口径：**买一半不是失败**（不进 failed、不判红；verify-run3.py 对该事件零命中）"
+            + (f"  ⚠ buy 自称成交却买少（count<wanted）且当天没有对应 buy_partial：行 "
+               f"{bp.get('warn_missing_partial_lines', [])[:6]}（{bp.get('warn_missing_partial_days')}）"
+               "——量力而行必须留痕（只警告、不判红）"
+               if bp.get("warn_missing_partial_lines") else "")
+            + (f"  ⚠ 同日既有 buy_partial 又有 cannot_afford："
+               f"{bp.get('warn_cannot_afford_same_day_days')}"
+               f"（行 {bp.get('warn_cannot_afford_same_day_lines', [])[:6]}）"
+               "——可能是不同货品单价差、也可能判据打架，只提示人工核对（不判红）"
+               if bp.get("warn_cannot_afford_same_day_lines") else ""))
     pc, ws = report["events"].get("plots_capped", 0), report["events"].get("work_spot", 0)
     add(f"软上限/收尾: plots_capped {pc} 次（作业区配额到顶，信息项）；work_spot {ws} 次（收尾作业区）")
     # task-124/task-130：review 兜底 / 弃权 / 换片连发 —— 修复生效的证据（不判红），

@@ -615,6 +615,54 @@ rg -n '"event": ?"(review_only_fallback|review_only_no_target|plot_exhausted_bur
 python tools/analyze-longrun.py --journal logs/<run>.jsonl | rg "review 兜底/换片连发|burst 当天却自称"
 ```
 
+## 3.20 量力而行买种子（task-123 `25e9931`，task-132 收录）—— 买一半不是失败
+
+run9 的病灶：`money=14 < seed_price=20` ⇒ 一个都买不起 ⇒ `cannot_afford`、**一个请求都不发**、白丢一天。
+task-123 改成"钱只够买一半也买下"：`brain/agentfarm/farmwork.py` 的 `buy_count_for(price, money, want)`
+（纯函数，钱够几颗就买几颗、下限 1）由 `brain/agentfarm/longrun.py:2622-2675` 的 `_buy_seed(item, money, source, rep, *, price=0)`
+使用：`n = buy_count_for(price_used, money, want)`；`n < 1` ⇒ `cannot_afford`（不发请求）；`n >= 1` 就发请求，
+`st.ok and n < want` 时**另记一条 `buy_partial`**：
+
+| 事件 | brain 位置 | 字段 | 含义 |
+|---|---|---|---|
+| `buy`（既有，task-123 扩字段） | `longrun.py:2637` | `ok`/`code`/`reason`/`item`/`count=n`/`wanted=want`/`price=price_used`/`price_shelf`/`price_cfg`/`source`/`attempt`/`limit`/`before`/`after`/`receipt`/`available` | 一次真实购买请求（`count` 可能 < `wanted`） |
+| `buy_partial`（新） | `longrun.py:2658` | `item`/`bought=n`/`wanted=want`/`price`/`price_shelf`/`price_cfg`/`money`/`source`/`ok`/`code`/`note` | 钱只够买一半 ⇒ 量力而行，**不是失败** |
+
+### 口径：`buy_partial` **本身一律不判红**
+
+- `tools/verify-run3.py` 对 `buy_partial` **零命中** ⇒ 本工具判红会两边反向（"两侧判决一致"要求）。
+- 只给两条**可证伪形态**的 ⚠ 警告（不进 `red`、不进 rc）：
+  ①`buy.ok=true` 且 `count < wanted` 却**没有**当天的 `buy_partial`（声称买满却买少 ⇒ 覆盖被绕过/回执被改写）；
+  ②同一天既有 `buy_partial` 又有 `cannot_afford`（"量力而行"与"一个都买不起"互斥 ⇒ 只提示人工核对）。
+- 也不许把 `count < wanted` 当"购买任务失败"：`buy_ok` 的成交口径 = **买满 `wanted` 的整笔**（`buy_ok_full`）；
+  旧账本 `buy` 没有 `wanted` ⇒ 标注 `buy_ok_missing_wanted`、**不硬当买满**。
+- 头部 `部分购买:` 行（`部分购买 N 次（买到 X 个 / 想要 Y 个；还缺 Z 个）；买满成交 k 次；cannot_afford m 次`）+
+  建议 0p-2；旧账本没有 `buy_partial` 且 `buy` 也没有 `wanted` ⇒ `<缺失>` + 【无法判定】
+  （"无法判定当天是否出现过'买一半' —— 缺失 ≠ 0，绝不当'没发生'通过"）。
+
+### 单测（`tests/test_analyze_longrun.py::TestBuyPartialAccounting`，6 条）
+
+`test_buy_partial_has_bucket_and_is_not_unmapped`、`test_partial_buy_is_not_a_failure_and_is_visible`、
+`test_full_buy_counts_as_buy_ok_full_and_is_not_partial`、
+`test_buy_claiming_full_but_short_without_partial_is_warning`、
+`test_partial_and_cannot_afford_same_day_is_warning`、`test_old_ledger_without_fields_is_undecidable_not_zero`。
+
+### 读数（task-132，2026-10-16）
+
+`py_compile -W error::SyntaxWarning` exit 0；`tests.test_analyze_longrun` **152 OK**（+6）；
+`discover -s tests` **730 tests / OK（0 红 —— dev 的 task-123 已提交 `25e9931`，两条 dev 红随之转绿）**；
+机械枚举改前 **4 个未映射**（3 结构性 + `buy_partial`）⇒ 改后只剩 3 个结构性。
+九账本 rc（本工具 / `verify-run3.py`）：green 0/0、run2 1(19)/1、run3 1(17)/1、run5 1(62)/1、run6 1(14)/1、
+run7 0/0、run8 1(29)/1、run9 1(84)/1、vacuum 1(3)/1 —— 一字未变（输出留档 `scratch\_t132_*.txt` / `scratch\_t132_v3_*.txt`）。
+
+### grep 配方
+
+```
+git grep -n '_journal("buy_partial"' -- brain/agentfarm/longrun.py
+rg -n '"event": ?"buy_partial"' logs/longrun-*.jsonl
+python tools/analyze-longrun.py --journal logs/<run>.jsonl | rg "部分购买|买一半不是失败|自称成交却买少"
+```
+
 ## 4. 复核命令
 
 ```
@@ -625,6 +673,6 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run8.jsonl   # r
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
 python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
-python -m unittest tests.test_analyze_longrun  # 当前 146 OK（task-130）
-python -m unittest discover -s tests           # 当前 718 tests（其中 2 条 FAIL 属 dev 在制的 farmwork/longrun，非本工具）
+python -m unittest tests.test_analyze_longrun  # 当前 152 OK（task-132）
+python -m unittest discover -s tests           # 当前 730 tests / OK（0 红；task-123 `25e9931` 提交后）
 ```

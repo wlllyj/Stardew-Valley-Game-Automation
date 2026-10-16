@@ -2718,5 +2718,142 @@ class TestReviewFallbackAndBurst(unittest.TestCase):
         self.assertIn("没有任何 task-124 的兜底/弃权/连发事件", " ".join(rep["undecidable"]))
 
 
+class TestBuyPartialAccounting(unittest.TestCase):
+    """task-123（在制）/ task-132：量力而行买种子 —— `n = min(buy_count, money//price)`，`n >= 1` 就买下，
+    `n < wanted` 时另记 `buy_partial`（**不是失败**、不进 `failed`）；`n == 0` 一个都买不起 ⇒
+    `cannot_afford` 且一个请求都不发。
+
+    口径：`tools\\verify-run3.py` 对 `buy_partial` 零命中 ⇒ 本工具**不判红、不进 rc**，只给两条
+    可证伪形态的 ⚠ 警告（`buy` 自称成交却买少且没有对应 `buy_partial` / 同日既有 `buy_partial`
+    又有 `cannot_afford`）；旧账本没有该事件、`buy` 也没有 `wanted` 字段 ⇒ 头部 `<缺失>` +
+    【无法判定】（缺失 ≠ 0 ≠ 没发生）。
+    """
+
+    BUY_PARTIAL = {"event": "buy", "t": 4.0, "ok": True, "code": "ok", "reason": "买到了",
+                   "item": "472", "count": 3, "wanted": 10, "price": 20, "price_shelf": 20,
+                   "price_cfg": 20, "source": "day_start", "attempt": 1, "limit": 3,
+                   "receipt": "ok: [ok] (HTTP 200)", "available": 5}
+    PARTIAL = {"event": "buy_partial", "t": 4.1, "item": "472", "bought": 3, "wanted": 10,
+               "price": 20, "price_shelf": 20, "price_cfg": 20, "money": 60,
+               "source": "day_start", "ok": True, "code": "ok",
+               "note": "钱只够买 3 个（想买 10 个，单价 20g）⇒ 量力而行，这不是失败"}
+    BUY_FULL = {"event": "buy", "t": 4.0, "ok": True, "code": "ok", "reason": "买到了",
+                "item": "472", "count": 10, "wanted": 10, "price": 20, "price_shelf": 20,
+                "price_cfg": 20, "source": "day_start", "attempt": 1, "limit": 3,
+                "receipt": "ok: [ok] (HTTP 200)", "available": 12}
+    BUY_SHORT_NO_PARTIAL = {"event": "buy", "t": 4.0, "ok": True, "code": "ok",
+                            "reason": "买到了", "item": "472", "count": 2, "wanted": 10,
+                            "price": 20, "price_shelf": 20, "price_cfg": 20,
+                            "source": "day_start", "attempt": 1, "limit": 3,
+                            "receipt": "ok: [ok] (HTTP 200)", "available": 5}
+    CANNOT_AFFORD = {"event": "cannot_afford", "t": 4.2, "code": "cannot_afford", "money": 10,
+                     "seed_price": 20, "keep_factor": 1, "offers": "Parsnip Seeds(20g)",
+                     "note": "一个都买不起 ⇒ 今天不再发起 buy"}
+    BUY_OLD = {"event": "buy", "t": 4.0, "ok": True, "code": "ok", "reason": "买到了",
+               "item": "472", "count": 10, "price": 20, "source": "day_start",
+               "attempt": 1, "limit": 3, "receipt": "ok: [ok] (HTTP 200)", "available": 12}
+
+    def _day(self, day, *, extra=(), ended_reason="night"):
+        nxt = [day[0], day[1], day[2] + 1]
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": True,
+                  "watered_outdoor": True}
+        end = {"event": "day_end", "t": 9.0, "day": day, "day_text": "", "ended_by": "sleep",
+               "ended_reason": ended_reason, "verified": True, "checks": checks,
+               "stages": [{"stage": "plant_area", "ok": 5, "skipped": 0, "failed": 0,
+                           "env_block": 0, "inconclusive": 0, "stopped": None, "leftover": 0}],
+               "outcomes": [], "ok_steps": 5, "skipped_steps": 0, "failed_steps": 0,
+               "notes": [], "final": final(nxt),
+               "final_water": {"t": 9.0, "location": "Farm", "tiles": 84, "crops": 31,
+                               "dry": 0, "scope": "farm"}}
+        return [day_start(day), *extra, end]
+
+    def _report(self, events, name, *, days=1):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = write_ledger(tmp.name, name, events)
+        self._tmp = tmp
+        return report_for(path, days=days, top=50)
+
+    def test_buy_partial_has_bucket_and_is_not_unmapped(self):
+        self.assertIn("buy_partial", mod.EVENT_BUCKETS, "buy_partial 必须有桶（不许改名/藏事件）")
+        rep = self._report(self._day([1, "summer", 5],
+                                     extra=[dict(self.BUY_PARTIAL), dict(self.PARTIAL)]),
+                           "bp_bucket.jsonl")
+        self.assertEqual(rep["unmapped_events"], {}, "buy_partial 已入桶 ⇒ 不许再出现未映射")
+        self.assertIn("buy_partial", rep)
+
+    def test_partial_buy_is_not_a_failure_and_is_visible(self):
+        rep = self._report(self._day([1, "summer", 5],
+                                     extra=[dict(self.BUY_PARTIAL), dict(self.PARTIAL)]),
+                           "bp_info.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "买一半不是失败 ⇒ 绝不判红")
+        bp = rep["buy_partial"]
+        self.assertTrue(bp["has_events"])
+        self.assertEqual(bp["events"], 1)
+        self.assertEqual(bp["lines"], [3])
+        self.assertEqual(bp["bought_total"], 3)
+        self.assertEqual(bp["wanted_total"], 10)
+        self.assertEqual(bp["short_total"], 7)
+        self.assertEqual(bp["plans"], {"472": [3, 10]})
+        self.assertEqual(bp["buy_ok_full"], 0)
+        self.assertEqual(bp["warn_missing_partial_lines"], [], "有对应 buy_partial ⇒ 不该警告")
+        text = mod.render_text(rep, 50)
+        self.assertIn("部分购买: 1 次（买到 3 个 / 想要 10 个；还缺 7 个", text)
+        self.assertIn("买一半不是失败", text)
+        self.assertIn("买一半不是失败", " ".join(a["text"] for a in rep["advice"]))
+
+    def test_full_buy_counts_as_buy_ok_full_and_is_not_partial(self):
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.BUY_FULL)]),
+                           "bp_full.jsonl")
+        self.assertEqual(rep["red"]["total"], 0)
+        bp = rep["buy_partial"]
+        self.assertTrue(bp["buy_has_wanted"], "有 wanted 字段 ⇒ 0 次是真 0，不是 <缺失>")
+        self.assertFalse(bp["has_events"])
+        self.assertEqual(bp["buy_ok_full"], 1, "买满 wanted 的整笔才算成交")
+        self.assertEqual(bp["warn_missing_partial_lines"], [])
+        text = mod.render_text(rep, 50)
+        self.assertIn("部分购买: 0 次（买到 0 个 / 想要 0 个", text)
+        self.assertNotIn("部分购买: <缺失>", text)
+
+    def test_buy_claiming_full_but_short_without_partial_is_warning(self):
+        rep = self._report(self._day([1, "summer", 5],
+                                     extra=[dict(self.BUY_SHORT_NO_PARTIAL)]),
+                           "bp_warn.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "警告不是红：不进 rc")
+        self.assertNotIn("buy_partial", rep["red"]["subjects"])
+        bp = rep["buy_partial"]
+        self.assertEqual(bp["warn_missing_partial_lines"], [2])
+        self.assertEqual(bp["warn_missing_partial_days"], [rep["days"][-1]["label"]])
+        text = mod.render_text(rep, 50)
+        self.assertIn("⚠ buy 自称成交却买少", text)
+        self.assertIn("只警告、不判红", text)
+
+    def test_partial_and_cannot_afford_same_day_is_warning(self):
+        rep = self._report(self._day([1, "summer", 5],
+                                     extra=[dict(self.PARTIAL), dict(self.CANNOT_AFFORD)]),
+                           "bp_conflict.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "警告不是红：不进 rc")
+        bp = rep["buy_partial"]
+        self.assertEqual(bp["cannot_afford_events"], 1)
+        self.assertEqual(bp["warn_cannot_afford_same_day_lines"], [3])
+        self.assertEqual(bp["warn_cannot_afford_same_day_days"], [rep["days"][-1]["label"]])
+        text = mod.render_text(rep, 50)
+        self.assertIn("⚠ 同日既有 buy_partial 又有 cannot_afford", text)
+        self.assertIn("只提示人工核对", text)
+
+    def test_old_ledger_without_fields_is_undecidable_not_zero(self):
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.BUY_OLD)]),
+                           "bp_old.jsonl")
+        self.assertEqual(rep["red"]["total"], 0)
+        bp = rep["buy_partial"]
+        self.assertFalse(bp["buy_has_wanted"], "旧账本没有 wanted 字段")
+        self.assertEqual(bp["buy_ok_missing_wanted"], 1, "如实标注、不硬当买满")
+        text = mod.render_text(rep, 50)
+        self.assertIn("部分购买: <缺失>", text)
+        self.assertIn("缺失 ≠ 0", text)
+        self.assertIn("没有 `buy_partial` 事件", " ".join(rep["undecidable"]))
+
+
 if __name__ == "__main__":
     unittest.main()
