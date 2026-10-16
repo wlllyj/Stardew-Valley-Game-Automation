@@ -36,7 +36,15 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.33"   # v0.7.33：harvest 判据纠正（run A/B 第一病灶）—— Mod `CropMeta` 反射游戏 `HoeDirt.readyForHarvest()` 为权威（缺项 ⇒ null）、`TileView` 9 个形态字段 + `FarmView.readyCrops` + `ExecResponse.acted`、`tiles[].tool` 改按 `ready` 判浇水、`interact` 未动手 ⇒ `no_action`、镰刀类走工具路径；脑侧 `farmwork.tile_ready`（fail-closed）+ `harvest_gave_up` 同格上限（不进 `checks`、不扣 `_leftover`）
+MOD_VERSION_EXPECTED = "0.7.34"   # v0.7.34：harvest 三处 Mod 硬缺陷（task-173 真机事故）——
+                                  # ①`harvestMethod` 正解 = public 无参 `Crop.GetHarvestMethod()`
+                                  #   （1.6.15 根本没有 `Crop.HarvestMethod` 字段）；键**无条件输出**
+                                  #   （`JsonIgnoreCondition.Never`，读不到写 null）；
+                                  # ②新增 `tiles[].readySource ∈ {"game","fields",null}`
+                                  #   （反射成功 / 与 `HoeDirt.readyForHarvest()` IL 逐条等价的字段路径 / 判不了）；
+                                  # ③`interact` 的 `acted` 改由目标格可观测签名（`TileSig`）前后差分推导，
+                                  #   格没变 ⇒ `acted=false` + `status="no_action"`（回执不许自述成功）
+                                  # v0.7.33：harvest 判据纠正（run A/B 第一病灶）—— Mod `CropMeta` 反射游戏 `HoeDirt.readyForHarvest()` 为权威（缺项 ⇒ null）、`TileView` 9 个形态字段 + `FarmView.readyCrops` + `ExecResponse.acted`、`tiles[].tool` 改按 `ready` 判浇水、`interact` 未动手 ⇒ `no_action`、镰刀类走工具路径；脑侧 `farmwork.tile_ready`（fail-closed）+ `harvest_gave_up` 同格上限（不进 `checks`、不扣 `_leftover`）
                                  # v0.7.32：run9d 诊断后的目标 2 解药 —— ①`water_far` 够不着的活苗
                                  # 先**有界开路**再回浇（清出的路 ≠ 浇过的水）；②单日**体力预算**
                                  # （`water_reserve = 活苗×2+12`、`capacity`）与规模控制，预算不足
