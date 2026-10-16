@@ -88,6 +88,23 @@ def _tool_blocked_tv(tv: Mapping[str, Any] | None) -> bool:
         return False
     return tv.get("toolOk") is not True
 
+
+def _stamina_or_none(obs: Mapping[str, Any]) -> float | None:
+    """【task-161】读 `player.stamina`；**读不到就返回 `None`**（不许退化成 0.0）。
+
+    为什么不能用 `FarmWorker.stamina()`：那个助手把缺失当 `0.0`——对"还能不能干活"是
+    fail-safe 的，但对**事后标定**是灾难（"没观测到"会被记成"体力耗尽"，
+    标定出来的每格成本会被严重放大）。所以这里单独实现一个三态读数，
+    只用于 `stage.stamina_before/after/spent` 与 `day_end.stamina_calibration` 留痕。
+    """
+    player = obs.get("player") if isinstance(obs, Mapping) else None
+    if not isinstance(player, Mapping):
+        return None
+    value = player.get("stamina")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return round(float(value), 1)
+
 #: 看**全场**目标的任务（浇水/收获要伺候所有作物）；其余阶段只看**作业区**。
 #: 这个区分决定"没目标"这笔账当天会不会因为换了一片地而作废。
 WIDE_TASKS = ("water_area", "harvest")
@@ -469,6 +486,11 @@ class DayReport:
     #:   把**现有体力全留**给浇水（宁可早停手）；
     #: * `deferred_by_budget` **只**表示"因为预算而不做"（不是"没活"），**绝不**进 `checks`。
     stamina_budget: dict[str, Any] = field(default_factory=dict)
+    #: 【task-161】当天的**阶段体力实测**聚合（`stage -> {actions, stamina_spent, per_action}`）：
+    #: 由 `rep.stages` 逐条累加得到（`actions` = 该阶段 `ok` 数；`per_action = spent/actions`，
+    #: `actions == 0` ⇒ `null`）。**只用于事后标定 `farmwork.py` 的估算常量**，不进 `checks`、
+    #: 不改任何判据；观测缺 `stamina` 的条目不参与求和（`stamina_spent` 为 `null`）。
+    stamina_calibration: dict[str, Any] = field(default_factory=dict)
 
     @property
     def failed_steps(self) -> int:
@@ -547,6 +569,7 @@ class DayReport:
             "plot_pending_by_kind": dict(self.plot_pending_by_kind),
             "deferred_tiles": self.deferred_tiles,
             "stamina_budget": dict(self.stamina_budget),
+            "stamina_calibration": {k: dict(v) for k, v in self.stamina_calibration.items()},
         }
 
 
@@ -1884,6 +1907,37 @@ class LongRun:
             budget["deferred_by_budget"] = True
             budget["deferred"] = list(prev.get("deferred") or [])
         return budget
+
+    # ---- 【task-161】阶段体力实测聚合（只留痕） ----
+    def _stamina_calibration(self, rep: DayReport) -> dict[str, Any]:
+        """把当天 `rep.stages` 的实测体力按 stage 聚合：`{stage: {actions, stamina_spent, per_action}}`。
+
+        * `actions` = 该 stage 的 `ok` 数（和 `stage["ok"]` 一致）；
+        * `stamina_spent` = 该 stage 各条 `stamina_spent` 之和；**任何一条缺观测**（`null`）
+          都只是"不参与求和"，不清零、不猜测（缺就保持 `None`）；
+        * `per_action = stamina_spent / actions`（`actions == 0` ⇒ `null`）。
+
+        纯留痕：**不进 `checks`、不改任何判据/常量**。用途是下一次真机 run 之后，
+        用它替换 `farmwork.py` 里的 `STAMINA_COST_*` 估算常量（那一步单独过对抗验收）。
+        """
+        calib: dict[str, Any] = {}
+        for s in rep.stages:
+            name = str(s.get("stage") or "")
+            if not name:
+                continue
+            ent = calib.setdefault(name, {"actions": 0, "stamina_spent": None})
+            ent["actions"] = int(ent["actions"]) + int(s.get("ok") or 0)
+            spent = s.get("stamina_spent")
+            if isinstance(spent, (int, float)) and not isinstance(spent, bool):
+                base = ent["stamina_spent"]
+                ent["stamina_spent"] = round((float(base) if isinstance(base, (int, float)) else 0.0)
+                                             + float(spent), 1)
+        for ent in calib.values():
+            acts = int(ent["actions"])
+            spent = ent["stamina_spent"]
+            ent["per_action"] = (round(float(spent) / acts, 2)
+                                 if acts > 0 and isinstance(spent, (int, float)) else None)
+        return calib
 
     def _budget_defer_reason(self, task: str, obs: dict[str, Any]) -> str:
         """预算是否**拒绝**这一阶段（只针对 clear/till/plant 三类非浇水活）；空串 = 允许。
@@ -4014,6 +4068,15 @@ class LongRun:
             break
 
         fresh = self._snap()
+        # 【task-161】阶段体力实测留痕（**只留痕，不改任何判据/常量/checks**）：
+        # `stamina_before` 取阶段开始那张观测（也就是调用方用来算目标的 `obs`）、
+        # `stamina_after` 取阶段结束这张 `fresh`；取不到就是 `None`（**不许写 0**，
+        # 0 是"真的没体力了"，与"没观测到"是两件事）。`stamina_spent` 允许为负
+        # （中间吃过东西/升过级），如实记，不裁剪。
+        stamina_before = _stamina_or_none(obs)
+        stamina_after = _stamina_or_none(fresh)
+        stamina_spent = (round(stamina_before - stamina_after, 1)
+                         if stamina_before is not None and stamina_after is not None else None)
         # `_mark_blocked` 已改为**每轮**在循环内调用（见上），这里不再补一次：
         # 循环外的 `obs` 是阶段开始时的快照，用它当"动手前"会把中间几轮的变化算错。
         leftover = self._leftover(task, fresh, plot)
@@ -4138,6 +4201,12 @@ class LongRun:
             # 也没按规跳过的格数。日级 `no_unmet_stages` 从 task-134 起看 `assigned_undone`
             # （`leftover` 仍是"片区还剩多少格"，作为 `plot_pending` 落账、供守卫/换片/resume 用）。
             "assigned": len(assigned), "assigned_undone": assigned_undone,
+            # 【task-161】阶段体力实测（只留痕）：取不到观测就是 `None`，**不许写 0**。
+            # `day_end.stamina_calibration` 按 stage 聚合这三个数，用来**事后**标定
+            # `farmwork.py` 的估算常量（本卡不动常量、不动任何判据）。
+            "stamina_before": stamina_before,
+            "stamina_after": stamina_after,
+            "stamina_spent": stamina_spent,
         })
         if assigned_undone:
             self._journal("stage_shortfall", stage=task, zone=self.zone_name,
@@ -5173,6 +5242,9 @@ class LongRun:
         # 它**只**用于解释"为什么有些没浇完/没种上"，绝不参与 `checks`。
         if self.budget_today:
             rep.stamina_budget = dict(self.budget_today)
+        # 【task-161】日终把"每条 stage 的实测体力"按 stage 聚合（只留痕，不进 checks）：
+        # 下一次真机 run 之后用它标定 `farmwork.py` 的 `STAMINA_COST_*` 估算常量。
+        rep.stamina_calibration = self._stamina_calibration(rep)
         unreach_in_last = sum(int(s.get("unreachable_leftover") or 0) for s in last_by_stage.values()
                               if int(s.get("tiles") or 0) > 0)
         unreachable_exempt = min(unreachable_bound, unreach_in_last)

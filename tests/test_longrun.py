@@ -8219,5 +8219,142 @@ class TestTask20ToolGatedClumps(unittest.TestCase):
         self.assertEqual(run.days[-1].ended_reason.split(":", 1)[0], "no_work")
 
 
+class _NoStaminaWorld(FakeWorld):
+    """观测里**根本没有** `player.stamina`（老 Mod 快照 / 字段缺失）。
+
+    注意不能用"抠掉客户端返回的 stamina"来模拟：`LongRun._snap()` 走的是
+    `worker.snap()`（真机里 worker 自带客户端），只改 `run.client` 会留下后门。
+    所以缺字段必须做在**世界**这一层。
+    """
+
+    def obs(self, *args, **kwargs):
+        obs = super().obs(*args, **kwargs)
+        player = obs.get("player")
+        if isinstance(player, dict):
+            player.pop("stamina", None)
+        return obs
+
+
+class TestTask161StaminaCalibration(unittest.TestCase):
+    """【task-161】阶段体力实测留痕：`stage.stamina_before/after/spent` + `day_end.stamina_calibration`。
+
+    卡面口径（只留痕，**不改判据、不改常量、不动 `checks`**）：
+      * 三个数取当轮观测的 `player.stamina`，**取不到 ⇒ 显式 `None`（不许写 0）**；
+      * 日级按 stage 聚合 `{stage: {actions, stamina_spent, per_action}}`
+        （`actions` = 该 stage `ok` 数；`per_action = spent/actions`，`actions == 0` ⇒ `None`）；
+      * 用途 = 下一次真机 run 之后标定 `farmwork.py` 的 `STAMINA_COST_*`（那一步单独过对抗验收）。
+
+    变异实测（`scratch\\_t161_mutate.py`，brain+tests 一起拷临时目录再打补丁）：基线 7/7 绿；
+    **m161a**（缺 `stamina` 时返回 `0.0` 而不是 `None`）杀 `test_missing_stamina_is_null_not_zero`；
+    **m161b**（`actions == 0` 也算 `per_action`）杀 `test_actions_zero_means_null_per_action`；
+    **m161c**（stage 记录里删掉 `stamina_spent`）杀 `test_stage_records_carry_measured_stamina`
+    与 `test_missing_stamina_is_null_not_zero`。
+    """
+
+    @staticmethod
+    def _plot(*tiles) -> dict:
+        ts = list(tiles) or [(60, 10)]
+        return {"zone": "", "label": "", "anchor": list(ts[0]), "tiles": ts, "note": ""}
+
+    @staticmethod
+    def _rep(day: int = 6) -> DayReport:
+        return DayReport(day_key=("spring", 1, day), started_at=0.0)
+
+    def test_stage_records_carry_measured_stamina(self):
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        w.blockers[(61, 10)] = "weed"
+        run = make_run(w, target_days=1)
+        run.client = FakeClient(w)
+        run.worker = FakeWorker(w)          # `make_run` 不会自动装 worker
+        rep = self._rep()
+        run._step_stage("clear_area", w.obs(), self._plot((60, 10), (61, 10)), rep)
+        last = rep.stages[-1]
+        for key in ("stamina_before", "stamina_after", "stamina_spent"):
+            self.assertIn(key, last, f"stage 记录缺 {key}")
+        self.assertIsInstance(last["stamina_before"], float)
+        self.assertIsInstance(last["stamina_after"], float)
+        self.assertEqual(last["stamina_spent"],
+                         round(last["stamina_before"] - last["stamina_after"], 1))
+        self.assertLess(last["stamina_after"], last["stamina_before"],
+                        "清了两格草，体力必须真的掉了")
+
+    def test_missing_stamina_is_null_not_zero(self):
+        w = _NoStaminaWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        run = make_run(w, target_days=1)
+        run.client = FakeClient(w)
+        run.worker = FakeWorker(w)
+        rep = self._rep()
+        run._step_stage("clear_area", run.client.observe(), self._plot((60, 10)), rep)
+        last = rep.stages[-1]
+        self.assertIsNone(last["stamina_before"], "没观测到体力必须是 None，不是 0")
+        self.assertIsNone(last["stamina_after"])
+        self.assertIsNone(last["stamina_spent"])
+
+    def test_actions_zero_means_null_per_action(self):
+        rep = self._rep()
+        rep.stages.append({"stage": "water_area", "tiles": 3, "ok": 0, "skipped": 3,
+                           "stamina_spent": 0.0, "stamina_before": 100.0, "stamina_after": 100.0})
+        rep.stages.append({"stage": "till_area", "tiles": 4, "ok": 4, "skipped": 0,
+                           "stamina_spent": 20.0, "stamina_before": 100.0, "stamina_after": 80.0})
+        run = make_run(FakeWorld(), target_days=1)
+        calib = run._stamina_calibration(rep)
+        self.assertEqual(calib["water_area"]["actions"], 0)
+        self.assertIsNone(calib["water_area"]["per_action"],
+                          "一条都没做成 ⇒ per_action 必须是 null")
+        self.assertEqual(calib["till_area"]["actions"], 4)
+        self.assertEqual(calib["till_area"]["stamina_spent"], 20.0)
+        self.assertEqual(calib["till_area"]["per_action"], 5.0)
+
+    def test_missing_observation_keeps_spent_null(self):
+        rep = self._rep()
+        rep.stages.append({"stage": "clear_area", "tiles": 2, "ok": 2, "skipped": 0,
+                           "stamina_spent": None})
+        rep.stages.append({"stage": "clear_area", "tiles": 1, "ok": 1, "skipped": 0,
+                           "stamina_spent": 3.0})
+        run = make_run(FakeWorld(), target_days=1)
+        calib = run._stamina_calibration(rep)["clear_area"]
+        self.assertEqual(calib["actions"], 3)
+        self.assertEqual(calib["stamina_spent"], 3.0,
+                         "缺观测的那条不参与求和，也不许拿别的数去猜")
+
+    def test_day_calibration_agrees_with_stage_records(self):
+        rep = self._rep()
+        rep.stages.append({"stage": "till_area", "tiles": 2, "ok": 2, "skipped": 0,
+                           "stamina_spent": 10.0})
+        rep.stages.append({"stage": "till_area", "tiles": 1, "ok": 1, "skipped": 0,
+                           "stamina_spent": 5.0})
+        rep.stages.append({"stage": "water_area", "tiles": 4, "ok": 3, "skipped": 1,
+                           "stamina_spent": 6.0})
+        run = make_run(FakeWorld(), target_days=1)
+        calib = run._stamina_calibration(rep)
+        for name, ent in calib.items():
+            rows = [s for s in rep.stages if s.get("stage") == name]
+            self.assertEqual(ent["actions"], sum(int(s.get("ok") or 0) for s in rows))
+            spent = [s.get("stamina_spent") for s in rows
+                     if isinstance(s.get("stamina_spent"), (int, float))]
+            self.assertEqual(ent["stamina_spent"], round(sum(spent), 1) if spent else None)
+        self.assertEqual(calib["till_area"]["per_action"], 5.0)
+        self.assertEqual(calib["water_area"]["per_action"], 2.0)
+
+    def test_day_report_exposes_calibration(self):
+        rep = self._rep()
+        self.assertEqual(rep.stamina_calibration, {}, "默认空 dict（老账本读法不破）")
+        self.assertIn("stamina_calibration", rep.as_dict())
+        self.assertEqual(rep.as_dict()["stamina_calibration"], {})
+        rep.stamina_calibration = {"till_area": {"actions": 1, "stamina_spent": 5.0,
+                                                 "per_action": 5.0}}
+        self.assertEqual(rep.as_dict()["stamina_calibration"]["till_area"]["per_action"], 5.0)
+
+    def test_calibration_does_not_add_any_check(self):
+        """留痕不许变成洗白键：`checks` 的键集合与 task-161 之前逐字相同。"""
+        rep = self._rep()
+        rep.checks = {"slept_by_us": False, "no_blocking_modal": True}
+        rep.stamina_calibration = {"till_area": {"actions": 1, "stamina_spent": 5.0,
+                                                 "per_action": 5.0}}
+        self.assertEqual(set(rep.checks), {"slept_by_us", "no_blocking_modal"})
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
