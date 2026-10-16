@@ -85,3 +85,11 @@
 - run10 的演进判定按 `docs/_run10-criteria.md`（L0 要求 run A 的 `lessons.total>=1`，run9/run9b 实测 0 ⇒ run A 必须在 0.7.30 上重跑）。
 - 顺延卡见 §1 表（task-101/107/109/110/117/**137**），以及长期项 task-14（warp 活锁）、task-17（world_stuck）、task-18（职业选择）、task-20（工具等级）、task-53（农场级待清/待垦）、task-83/94（田块规整）。
 - **run9c 证据必查项（Lead 定的两条新注意点）**：①若 run9c 出现 `slept_without_work`/`gave_up_dry`/`blocked_modal` 收尾，**必须单独取一次收尾现场 `observe`**（这些分支的 `day_end.final` 可能是旧快照，见 task-137）；②`save_called` 的原始计数含 L16 插件描述行的假阳性 ⇒ 一律报"修正后 5/5"并附机制说明。
+
+## §7 冻结与装机执行记录（Lead 独占，2026-10-16 23:45–23:55）
+
+1. **放行闸门**：task-133（`57ef928`）/134（`903e6a4`）/136（`7d4450f`）/139（`1e1d2cf`）completed；**task-135 首轮 FAIL**（`1726d2e`）⇒ Lead 修 F1/F2（`5b070b4`）⇒ deputy 复验 **PASS-WITH-NITS**（`fdb83ea`，修后探针 18/18、`C-tool 同向` 四组全 PASS、伪造转 needs_review、`no_target` 组仍红）。全量 **776 OK / 0 红**。
+2. **冻结**：`tools/_note-0730.txt` 首串 `v0.7.30`（Mod 本版无源码改动）⇒ `_bump-mod-version.py 0.7.30` ⇒ manifest `0.7.29 → 0.7.30`（Description 头部已插）⇒ `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.30"` ⇒ `dotnet build --no-incremental` **0 警 0 错**（`AgentFarm.Bridge.dll` **177664 B**、`manifest.json` **30277 B**）⇒ 冻结提交 **`aa3ceaf`** ⇒ `check-release --expect 0.7.30` **六项全绿**（`manifest==brain==0.7.30` / dll 22:45:27 不旧 / `py_compile` 22 文件 / `Ran 776 tests` OK / 树干净）。
+3. **装机**：`deploy-mod --no-quit` ⇒ 0.7.29 → **0.7.30**（桥 `modVersion=0.7.30 port=17890`；自动读档 `Wahaha_450799035` → FarmHouse(9,9)）；日志 `logs\deploy-0.7.30.log`。
+4. **起跑前现场**：`goto Farm --no-focus` FarmHouse(9,9) → Farm(64,15) hop1 **7594ms**；`preflight --expect 0.7.30 --save-baseline logs\run9c-baseline.json` ⇒ **✅ 可以起跑**，基线 = **夏 18 日 06:10 / rain / Farm(64,15) / 体力 270 / 钱 205g / 种子 [] / farmingLevel 0 / 作物 55 / unwatered 34 / dryCrops 0 / waterLeft 8 / tillable 72 / 无模态 / worldAdvancing true**。**不做操作员预置**。
+5. **派卡**：**task-140**（run9c = run A）已派 machine-runner；起跑命令 `tools\start-detached-longrun.py --days 3 --size 5 --max-minutes 150 --max-days 9 --journal logs\longrun-3day-llm-run9c.jsonl --expect-version 0.7.30`。
