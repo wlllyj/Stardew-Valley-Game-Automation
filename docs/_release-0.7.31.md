@@ -2,7 +2,17 @@
 
 > Lead 独占落档。上一版：`docs/_release-0.7.30.md`（water_far 逐格判据 + resume 有界 + leftover 口径拆分 + 演进素材质量）。
 
-## §0 run9c（0.7.30，run A 的第一次尝试）诊断 —— 只作诊断，**不作 A/B 的 run A**
+## §0 run9c（0.7.30，run A 的第一次尝试）—— **真机首次 `finish code=0` / 尾部 3 连 VERIFIED**（诊断价值 + 待 task-146 独立复核定性）
+
+**run9c 结果（Lead 亲核，2026-10-17 00:17）**：
+- `finish {"code":0,"verified_streak":3,"actions":513,"minutes":28.03,"stages_seen":["clear_area","plant_area","till_area","water_area"],"no_unmet_stages":false,"unmet_days":["1年 summer 18日"],"stuck_flushes":0}`；
+- 逐日：summer 18 `False`（仅 `no_unmet_stages`，= 143/144 两条分配额口径）｜summer 19 `False`（仅 `watered_outdoor`，dry 1/83）｜**summer 20/21/22 `True`（尾部三连，九项 checks 全 true）**；
+- 落盘五串 5/5（`NewDay / before save / SaveGame.Save() called. / Saving without compression / completed`），存档 `5766683 / 22:30:13.053` → `3860602 / 2026-10-17T00:16:44.786` 逐次前进；SMAPI 冻结 `logs\run9c-smapi-window.txt`（379854 B / SHA256 `7B95E0F2…2CBF70`）；
+- 经济闭环四腿真机走通：`sell` 2（含 `why=need_slot`）→ 次日到账（5→545）→ `buy` 6 中 5 成交（当季 `(O)483 Wheat Seeds`）→ 每天 `plant_area` 落格；
+- 有界性：`plot_exhausted_burst`/`review_only_fallback`/`slept_without_work`/`no_day_progress`/`stuck_flushes` 全 0；`modal_dismissed` 2、`eventUp` 0；
+- 两侧工具 + 我的复核器：`verify-run3 --days 3` ⇒ **rc=0 `VERIFIED`**（严格口径 `needs_review`，窗口外历史 4 条）；`scratch\run9-lead-check.py` ⇒ **rc=0**（SMAPI 5/5/5/5、自述 vs 自算 5/5 ✅）；`analyze-longrun --window 3` ⇒ rc=1（窗口外历史问题）。
+- **诚实披露**：独立观测有 summer 18/19/19-2/21/22/22-2，**summer 20 是 23 秒真空短日、观测窗口错过 ⇒ 【无法判定·窗口错过】**。
+- ⇒ **待 `task-146`（deputy-lead 独立对抗复核）给出 PASS / PASS-WITH-CAVEATS / FAIL**，再决定它能否作为 P3 ⑥"连续 3 个游戏日无人工介入"的验收证据；143/144 仍要做（把整跑也做干净 + 与 run10 构成本版同构建的 A/B）。
 
 **已经修好的**（0.7.29/0.7.30 的成果在真机上兑现）：
 - **落盘**：跨日保存链 100% 走完（run9b 起 5/5，SMAPI 五串 `NewDay → before save → SaveGame.Save() called. → Saving without compression → completed → after save, starting <次日>` 逐次配对）；
@@ -63,10 +73,11 @@
 
 | 指标 | run9c（0.7.30，诊断） | run9d（0.7.31，run A） |
 |---|---|---|
-| 尾部连续 VERIFIED | 0/3（末尾待定） | 待填 |
-| 跨日落盘配对 | 5/5 ✅ | 待填 |
+| 尾部连续 VERIFIED | **3/3 ✅**（summer 20/21/22；`finish code=0`） | 待填 |
+| 跨日落盘配对 | **5/5 ✅** | 待填 |
 | 经济闭环四腿 | sell→到账→buy→plant 均有留痕 ✅ | 待填 |
-| `assigned_undone`（种子/壶空贡献） | >0（plant 1+3、water 27） | 期望 0 |
+| `assigned_undone`（种子/壶空贡献） | >0（summer 18 plant 1+3、water 27） | 期望 0 |
+| 独立观测覆盖 | 6 份（18/19/19-2/21/22/22-2）；**summer 20 窗口错过** | 期望每日 ≥1 |
 
 ## §6 决定与遗留
 
