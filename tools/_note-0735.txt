@@ -1,0 +1,7 @@
+v0.7.35：再生作物收获的因果链修正（run A/B 第一病灶的收尾）
+- Mod `Skills.interact`：`acted` 从"只看格内 TileSig"扩到**跨观测证据** —— ①TileSig（格内字段差分）②目标格 `ready` 由 true→false（或 `readySource` 变化）③`farm.readyCrops` 下降 ④背包逐 qid 栈数增加；任一命中 ⇒ `acted=true`，全不命中才允许 `false` + `status="no_action"`。口径不变：**不拿游戏返回值/自述当证据**。
+  背景：再生作物（`regrowsAfterHarvest=true`）收成后作物对象保留、阶段重置，格内 6 个字段一项都不变 ⇒ 0.7.34 的 `TileSig` 把**成功**误报成 `no_action`（task-177 真机：`readyCrops 102→101`、背包 `(O)270 +1`、`worldSeq 60→61` 而回执说没动手）。
+- Mod `ExecResponse` 新增 `actedEvidence`（`"tile"` / `"ready"` / `"readyCrops"` / `"inventory"` / `null`）：把 `acted` 的证据来源显式落回执，供脑侧与验收工具判读（`inventory` 是弱证据，格子级优先）。
+- Mod `CropMeta`：`forageCrop && whichForageCrop == null` 进闸 ⇒ 判"判不了"（`(null,null)`），与"任一判据缺项 ⇒ null"的文档一致（task-178 NIT-1）。
+- 新增零依赖 C# 自检工程 `mod/AgentFarm.Bridge.Tests`（纯控制台 + 手写断言，`dotnet run` 退出码当红绿）：承担 `CropMeta.Ready()` 的**行为化回归**，堵住"源码文本存在性断言"的逃逸（task-178 GAP-1 的 m178b 变异现在被杀死）。`bin/`、`obj/` 由根 `.gitignore` 覆盖，不入库。
+- 脑侧（同批，非 Mod 内容）：`farmwork.harvest()` 成功判据改为观测差分四择一 + 逐 qid loot 记账 + 背包满按 `inventory[]` 行数判；Mod 的 `acted` 降级为线索，不进判据（task-181）。
