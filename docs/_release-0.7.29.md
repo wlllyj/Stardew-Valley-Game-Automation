@@ -17,11 +17,11 @@ run9（0.7.28）**已收尾，实测 0/5 VERIFIED**：`finish {"code":1,"verifie
 ## 1. 卡片
 | 卡 | 内容 | 归属 | 是否本版 |
 |---|---|---|---|
-| task-121 | `REVIEW_MAX_TOKENS` 512→4096 + 截断自愈重试 1 次（8192）+ 失败留 `max_tokens`/`attempts` | dev-coder | ✅ |
-| **task-126** | **P0 闸门**：钉死 `showEndOfNightStuff()` 的日终菜单链（`ShippingMenu` → `SaveGameMenu`），修掉"我们清模态把日切保存链掐断"（run9 实测 **4 NewDay / 0 save**，整跑未落盘）；交付 `docs/_il-shipmenu-save.md` + 修法 | log-analyst（取证）+ Lead 定修法 | **✅ 必须先过** |
+| task-121 | `REVIEW_MAX_TOKENS` 512→4096 + 截断自愈重试 1 次（8192）+ 失败留 `max_tokens`/`attempts` | dev-coder | ✅ `9a4da64` |
+| **task-126** | **P0 闸门**：钉死 `showEndOfNightStuff()` 的日终菜单链（`ShippingMenu` → `SaveGameMenu`），修掉"我们清模态把日切保存链掐断"（run9 实测 **4 NewDay / 0 save**，整跑未落盘）；交付 `docs/_il-shipmenu-save.md` + 修法 | log-analyst（取证 `8fdd3bb`）+ **task-129** dev-coder 修 | ✅ 取证已交 / **修法 task-129 在制** |
 | task-122 | 教训库新增 `stuck_with_leftover` / `plot_exhausted` 两类（含"干净日仍然 0 条"用例） | dev-coder | ✅ `affa7c8` |
-| task-123 | 买种子量力而行（`n=min(buy_count, money//price)`，`n>=1` 则 `buy_partial`） | dev-coder | ✅ |
-| task-124 | review-only 决策不许白过：用守卫据以抱怨的那份 leftover 挑片地/挑格兜底（≥8 单测） | dev-coder | ✅ |
+| task-123 | 买种子量力而行（`n=min(buy_count, money//price)`，`n>=1` 则 `buy_partial`） | dev-coder | ❌ **未交付**（board = `pending`/无 owner；`git grep buy_partial` 零命中；Lead 2026-10-16 误标 ✅，已由 task-125 A 段揭穿）⇒ **0.7.29 闸门** |
+| task-124 | review-only 决策不许白过：用守卫据以抱怨的那份 leftover 挑片地/挑格兜底（≥8 单测） | dev-coder | ✅ `08a2ae0`（Lead 独立核：407 OK 定向 / 全量 707 含 2 条 analyzer 漂移 → task-130） |
 | task-101 | `_farm_totals` 类型校验（`"abc"` 会让整天崩）、窗口全死苗 `watered_outdoor` 字段级收口 | dev-coder | 择机 |
 | task-107 | Mod `farm.dryTiles` 与 `farm.dryCrops` 同源 + `scanSeq` | dev-coder | 择机 |
 | task-109 | 卖货如实性（`need_slot` 分支不可达/卖了最大叠）+ 卖后刷新 obs | dev-coder | 择机 |
