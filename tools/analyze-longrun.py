@@ -131,6 +131,18 @@
     不可信）；②当天补水预算用尽（`tries >= limit`）⇒ 剩下的干格今天注定浇不上。
     旧账本没有 `water_far_refill`、`water_far` 也没有 `cause` ⇒ 头部 `<缺失>` + 【无法判定】
     （缺失 ≠ 0）。
+  * 阶段自愈 + 如实收工（task-144，dev-coder 在制）：`refill_retry` = 阶段内壶空 ⇒ 补水后把这一轮
+    没成事的**已分配格原样重跑**（`stage`/`zone`/`ok`/`refills_today`/`limit`/`tiles`/`targets`；
+    不再重算窗口把格子从目标里丢掉）；`stage_stop_named` = 阶段自然走完（`stopped==""`）却仍有
+    分配未成事的格 ⇒ 补**如实** stop 原因（`cause`∈`need_refill`/`unreachable`/`no_seed`/`incomplete`；
+    `assigned`/`assigned_undone`/`tiles`/`codes`）。头部 `阶段自愈/如实收工` 行 + 建议 0s；
+    口径 = **两者都不是失败**（`tools\verify-run3.py` 对两名零命中 ⇒ 本工具不判红、不进 rc）。
+    只给三条 **可证伪形态**的 ⚠（不进 red / 不进 rc）：①当天重跑条数 > 当天 `refill` 条数；
+    ②`refill_retry{ok=true, tiles=0}`（说重跑却没格子）；③`stage_stop_named` 的 `cause` 缺失/未知、
+    `assigned_undone<=0`、或有过失却 `codes` 全空。**增量（`2438cae`）**：`refill_retry` 另带
+    `stage_refills`（该阶段已补水几次）/`stage_limit`（= `STAGE_REFILL_MAX`，brain 现值 2），头部
+    「阶段补水 <stage> N/M 次」呈现；`stage_refills > stage_limit` ⇒ 第四条 ⚠（同样不进 rc）。
+    旧账本没有这两个事件 ⇒ 头部 `<缺失>` +【无法判定】（缺失 ≠ 0）。
   * 事件映射不许漂移（Lead m02395）：brain 里 `_journal("<name>"` 的**每个**事件名都要在
     `EVENT_BUCKETS` 里有桶（结构性事件 `day_start`/`day_end`/`finish` 除外，见 `STRUCTURAL_EVENTS`）；
     账本里出现没桶的事件 ⇒ 报告头部逐条点名（名字×次数+行号）+ 建议 0a，**绝不静默丢弃**。
@@ -452,6 +464,21 @@ FIELD_PROBES = [
      "当天 Σ 阶段 assigned_undone（分下去没做完的格数，task-134 B；日级 `no_unmet_stages` 看它）"),
     ("day_end.deferred_tiles", "deferred_tiles",
      "当天诚实上限留下的片区待办格数（task-134 B；info、不进 no_unmet_stages）"),
+    # task-144（dev-coder 在制）：壶空先补水、再把"这一轮没成事的已分配格"原样重跑；以及
+    # `stopped==""` 与"分配过却没成事"不再共存（补如实 stop 原因）。两者都**不判红**。
+    ("event:refill_retry", "refill_retry",
+     "阶段内壶空 ⇒ 补水后把这一轮没成事的格子**原样**重跑（stage/zone/ok/refills_today/limit/"
+     "tiles/targets）⇒ **不是失败**；`ok=true` 当天却没有成功 `refill`、或 `tiles=0` 空转 ⇒ ⚠ 警告"),
+    ("event:stage_stop_named", "stage_stop_named",
+     "阶段自然走完（`stopped==\"\"`）却仍有分配未成事的格 ⇒ 补**如实** stop 原因（cause∈need_refill/"
+     "unreachable/no_seed/incomplete；assigned/assigned_undone/tiles/codes）⇒ **不判红**；"
+     "cause 缺失/未知、`assigned_undone<=0`、或有过失却 `codes` 全空 ⇒ ⚠ 警告"),
+    # task-144 增量（dev-coder `2438cae` 定稿）：阶段内补水的次数与上界（`STAGE_REFILL_MAX`）。
+    ("event:refill_retry.stage_refills", "refill_retry_stage_refills",
+     "该阶段已为「壶空」补过几次水（task-144 增量；同日/阶段上界见 `stage_limit`；"
+     "`stage_refills > stage_limit` ⇒ ⚠ 警告、**不进 rc**）"),
+    ("event:refill_retry.stage_limit", "refill_retry_stage_limit",
+     "该阶段补水上界（`STAGE_REFILL_MAX`，brain 现值 2；日级另有 `limit` = `max_refills_per_day` 兜底）"),
     # task-132（task-123 在制）：量力而行买种子 —— 钱只够买 `bought < wanted` 时照样买，**不是失败**。
     # 只有"自称买满却 count<wanted 且没有对应 buy_partial"或"同日既有 buy_partial 又有 cannot_afford"
     # 这类**可证伪**形态才给 ⚠ 警告（verify-run3.py 对 `buy_partial` 零命中 ⇒ 判红会两边反向）。
@@ -660,6 +687,12 @@ EVENT_BUCKETS = {
     "stage_shortfall": "stage_shortfalls",
     "stage_shortfall_day": "stage_shortfall_days",
     "deferred_tiles": "deferred_tiles",
+    # task-144（dev-coder 在制）：阶段内壶空 ⇒ 补水后把"这一轮没成事的已分配格"**原样**重跑
+    # （`refill_retry`，不再重算窗口把那几格丢掉）；阶段自然走完（`stopped==""`）却仍有分配未成事的
+    # 格 ⇒ 补一个**如实** stop 原因的留痕（`stage_stop_named`）。两者都是**修复生效的证据**、不是失败；
+    # `verify-run3.py` 对这两个名字零命中 ⇒ 本工具不判红，只给可证伪形态的 ⚠ 警告。
+    "refill_retry": "refill_retries",
+    "stage_stop_named": "stage_stop_names",
     # task-132（task-123 在制）：量力而行买种子 —— 钱只够买一半照样买（`buy_partial`），
     # **不是失败**（不进 failed、不判红；`tools\verify-run3.py` 对该名零命中），只作信息项 +
     # 两条可证伪 ⚠ 警告（自称买满却买少且无留痕 / 同日 `buy_partial` 与 `cannot_afford` 同时出现）。
@@ -720,6 +753,9 @@ NEW_EVENT_BUCKETS = (
     "review_only_no_targets", "plot_exhausted_bursts",
     # task-132（task-123 在制）：量力而行买种子（买一半不是失败；只给可证伪形态的 ⚠ 警告）
     "buy_partials",
+    # task-144（dev-coder 在制）：壶空先补水再"原样重跑"这一轮没成事的格（refill_retries）
+    # + 阶段自然走完却仍有分配未成事的格 ⇒ 补如实 stop 原因（stage_stop_names）；均不判红
+    "refill_retries", "stage_stop_names",
 )
 
 
@@ -2535,6 +2571,50 @@ def build_advice(report, top=8):
             "lines": sorted(set((wfv.get("far_lines") or []) + (wfv.get("refill_lines") or [])
                                 + (wfv.get("warn_refill_failed_but_watered_lines") or []))),
         })
+    # 0s) task-144：阶段内壶空 ⇒ 先补水再把"这一轮没成事的已分配格"**原样**重跑（refill_retry）；
+    #     阶段自然走完（stopped==""）却仍有分配未成事的格 ⇒ 补**如实** stop 原因（stage_stop_named）
+    #     —— 都是**修复生效的证据**，**不判红**；只有三条可证伪形态给 ⚠（不进 red / 不进 rc）。
+    rrv2 = report.get("refill_retry") or {}
+    snv2 = report.get("stage_stop_named") or {}
+    if rrv2.get("has_events") or snv2.get("has_events"):
+        _sparts2 = [
+            f"壶空后原样重跑 {rrv2.get('events', 0)} 次（补水成功 {rrv2.get('ok', 0)} / 没成 "
+            f"{rrv2.get('failed', 0)}；重跑 {rrv2.get('tiles_total', 0)} 格）",
+            f"如实 stop 命名 {snv2.get('events', 0)} 次（cause "
+            f"{'、'.join(f'{k}×{v}' for k, v in list((snv2.get('causes') or {}).items())[:4]) or '<缺失>'}；"
+            f"分下去 {snv2.get('assigned_total', 0)} / 没做完 {snv2.get('undone_total', 0)} 格）",
+        ]
+        # task-144 增量：阶段补水次数 / 阶段上界（`STAGE_REFILL_MAX`）；越界只给 ⚠。
+        _srb2 = rrv2.get("stage_refill_by_stage") or {}
+        _sparts2.append(
+            "阶段补水 " + "、".join(
+                f"{_k} {_v.get('stage_refills') if _v.get('stage_refills') is not None else '<缺失>'}"
+                f"/{_v.get('stage_limit') if _v.get('stage_limit') is not None else '<缺失>'}"
+                for _k, _v in list(_srb2.items())[:3]) + " 次（stage_refills/stage_limit）"
+            if _srb2 else "阶段补水 <缺失>（旧账本没有 `stage_refills`/`stage_limit` 字段 ⇒ 缺失 ≠ 0）")
+        if rrv2.get("warn_over_stage_refill_lines"):
+            _sparts2.append(f"⚠ 阶段补水次数超过该阶段上界（行 "
+                            f"{rrv2['warn_over_stage_refill_lines'][:6]}）"
+                            "——`stage_refills > stage_limit`，只警告")
+        if rrv2.get("warn_over_retry_lines"):
+            _sparts2.append(f"⚠ 重跑条数多于当天 refill（行 {rrv2['warn_over_retry_lines'][:6]}）"
+                            "——两个口径打架，只警告")
+        if rrv2.get("warn_empty_lines"):
+            _sparts2.append(f"⚠ 补水成功却 0 格可重跑（行 {rrv2['warn_empty_lines'][:6]}）"
+                            "——空转嫌疑，只警告")
+        if (snv2.get("warn_bad_cause_lines") or snv2.get("warn_no_undone_lines")
+                or snv2.get("warn_no_codes_lines")):
+            _sparts2.append("⚠ stage_stop_named 自相矛盾（cause 缺失/未知 / assigned_undone≤0 / "
+                            "有过失却 codes 空）——只警告")
+        advice.append({
+            "text": "阶段自愈/如实收工（信息项，**不是失败**）：" + "；".join(_sparts2)
+                    + "。verify-run3.py 对 `refill_retry`/`stage_stop_named` 零命中 ⇒ 本工具不判红、"
+                      "不进 rc；旧账本没有这两个事件 ⇒【无法判定】（缺失 ≠ 0）",
+            "lines": sorted(set((rrv2.get("lines") or []) + (snv2.get("lines") or [])
+                                + (rrv2.get("warn_over_retry_lines") or [])
+                                + (rrv2.get("warn_over_stage_refill_lines") or [])
+                                + (rrv2.get("warn_empty_lines") or []))),
+        })
     # 0c) 环境挡路 / 没拿到结论（task-22 记账）
     env = report.get("env_inconclusive") or {}
     if env.get("env_fail_events"):
@@ -2876,6 +2956,16 @@ def build_undecidable(rows, sessions, prelude, report):
                    "**缺失 ≠ 0，绝不当'都做完了'通过**（task-134 B）")
     elif _sf_ev and not _shf.get("has_events"):
         out.append("task-134 B 事件存在但没进聚合（工具 bug 迹象）：无法判定分配额/诚实上限计数")
+    # task-144（dev-coder 在制）：壶空"原样重跑"与"如实 stop 命名"的证据是否存在 —— 缺失 ≠ 0。
+    _t144_ev = [ev for _ln, ev in rows if ev.get("event") in ("refill_retry", "stage_stop_named")]
+    if not _t144_ev:
+        out.append("本账本没有任何 task-144 的 `refill_retry` / `stage_stop_named` 事件 ⇒ "
+                   "无法判定「阶段内壶空后有没有把这一轮没成事的格**原样**重跑」与「阶段自然结束"
+                   "（stopped=\"\"）却还有分配未成事的格有没有**如实命名** stop 原因」—— "
+                   "**缺失 ≠ 0，绝不当'这个洞不存在'通过**（task-144）")
+    elif not ((report.get("refill_retry") or {}).get("has_events")
+              or (report.get("stage_stop_named") or {}).get("has_events")):
+        out.append("task-144 事件存在但没进聚合（工具 bug 迹象）：无法判定阶段自愈/如实收工计数")
     # task-36：自称浇过、却没有 final_water 可核对的那些天（verify-run3.py:414-418 同口径：只记信息项）
     no_fw = [
         lineno for lineno, ev in rows
@@ -3748,6 +3838,85 @@ def build_report(rows, path, args, bad_lines):
         shortfall["deferred_tiles"] += as_int(_ev.get("tiles")) or 0
         if _ev.get("night") is True:
             shortfall["deferred_night"] += 1
+    # task-144（dev-coder 在制）：阶段内壶空 ⇒ 补水后把"这一轮没成事的已分配格"**原样**重跑
+    # （`refill_retry`，不再重算窗口把那几格丢掉）；阶段自然走完（`stopped==""`）却仍有分配未成事的
+    # 格 ⇒ 补一个**如实** stop 原因的留痕（`stage_stop_named`）。两者都是**修复生效的证据**、不是
+    # 失败（`verify-run3.py` 对这两个名字零命中 ⇒ 判红会两边反向）；只有三条可证伪形态给 ⚠
+    # （都不进 red、不进 rc）：①当天重跑条数 > 当天 `refill` 条数；②`ok=true` 却 `tiles=0`（空转）；
+    # ③`stage_stop_named` 的 `cause` 缺失/未知、`assigned_undone<=0`、或有过失却 `codes` 全空。
+    _rr_events = [(ln, ev) for ln, ev in rows if ev.get("event") == "refill_retry"]
+    _rr_refills = [(ln, ev) for ln, ev in rows if ev.get("event") == "refill"]
+    _sn_events = [(ln, ev) for ln, ev in rows if ev.get("event") == "stage_stop_named"]
+    refill_retry = {
+        "events": len(_rr_events), "lines": [ln for ln, _ in _rr_events],
+        "ok": sum(1 for _, ev in _rr_events if ev.get("ok") is True),
+        "failed": sum(1 for _, ev in _rr_events if ev.get("ok") is not True),
+        "tiles_total": sum(as_int(ev.get("tiles")) or 0 for _, ev in _rr_events),
+        "stages": sorted({str(ev.get("stage") or "?") for _, ev in _rr_events}),
+        "zones": sorted({str(ev.get("zone") or "?") for _, ev in _rr_events}),
+        "refill_events_total": len(_rr_refills),
+        "refills_today": [as_int(ev.get("refills_today"), None) for _, ev in _rr_events],
+        "limits": [as_int(ev.get("limit"), None) for _, ev in _rr_events],
+        "stage_refills": [], "stage_limits": [], "stage_refill_by_stage": {},
+        "warn_over_retry_lines": [], "warn_empty_lines": [],
+        "warn_over_stage_refill_lines": [],
+        "has_events": bool(_rr_events),
+    }
+    _rr_days, _rr_refill_days = {}, {}
+    for _ln, _ev in _rr_events:
+        _lab, _di = _lr_day_of(_ln)
+        if _di is not None:
+            _rr_days.setdefault(_di, []).append(_ln)
+        if _ev.get("ok") is True and (as_int(_ev.get("tiles")) or 0) == 0:
+            refill_retry["warn_empty_lines"].append(_ln)
+        # task-144 增量：阶段补水次数 / 阶段上界（`STAGE_REFILL_MAX`）。越界 ⇒ ⚠（不进 rc）。
+        _sr = as_int(_ev.get("stage_refills"), None)
+        _sl = as_int(_ev.get("stage_limit"), None)
+        if _sr is not None:
+            refill_retry["stage_refills"].append(_sr)
+        if _sl is not None:
+            refill_retry["stage_limits"].append(_sl)
+        _sr_stage = refill_retry["stage_refill_by_stage"].setdefault(
+            str(_ev.get("stage") or "?"), {"stage_refills": None, "stage_limit": None})
+        if _sr is not None and (_sr_stage["stage_refills"] is None
+                               or _sr > _sr_stage["stage_refills"]):
+            _sr_stage["stage_refills"] = _sr
+        if _sl is not None:
+            _sr_stage["stage_limit"] = _sl
+        if _sr is not None and _sl is not None and _sr > _sl:
+            refill_retry["warn_over_stage_refill_lines"].append(_ln)
+    for _ln, _ev in _rr_refills:
+        _lab, _di = _lr_day_of(_ln)
+        if _di is not None:
+            _rr_refill_days[_di] = _rr_refill_days.get(_di, 0) + 1
+    for _di, _lns in _rr_days.items():
+        if len(_lns) > _rr_refill_days.get(_di, 0):
+            refill_retry["warn_over_retry_lines"].extend(_lns)
+    _KNOWN_STOP_CAUSES = ("need_refill", "unreachable", "no_seed", "incomplete")
+    stage_stop_named = {
+        "events": len(_sn_events), "lines": [ln for ln, _ in _sn_events],
+        "causes": {}, "assigned_total": 0, "undone_total": 0, "tiles_listed": 0,
+        "codes": {}, "stages": sorted({str(ev.get("stage") or "?") for _, ev in _sn_events}),
+        "zones": sorted({str(ev.get("zone") or "?") for _, ev in _sn_events}),
+        "warn_bad_cause_lines": [], "warn_no_undone_lines": [], "warn_no_codes_lines": [],
+        "has_events": bool(_sn_events),
+    }
+    for _ln, _ev in _sn_events:
+        _cause = str(_ev.get("cause") or "") or "<缺失>"
+        stage_stop_named["causes"][_cause] = stage_stop_named["causes"].get(_cause, 0) + 1
+        stage_stop_named["assigned_total"] += as_int(_ev.get("assigned")) or 0
+        _undone = as_int(_ev.get("assigned_undone")) or 0
+        stage_stop_named["undone_total"] += _undone
+        stage_stop_named["tiles_listed"] += len(as_list(_ev.get("tiles")))
+        for _code in as_list(_ev.get("codes")):
+            _c = str(_code or "")
+            stage_stop_named["codes"][_c] = stage_stop_named["codes"].get(_c, 0) + 1
+        if _cause not in _KNOWN_STOP_CAUSES:
+            stage_stop_named["warn_bad_cause_lines"].append(_ln)
+        if _undone <= 0:
+            stage_stop_named["warn_no_undone_lines"].append(_ln)
+        elif not as_list(_ev.get("codes")):
+            stage_stop_named["warn_no_codes_lines"].append(_ln)
     # task-133（run9b 的 need_refill 病）：窗口外浇水 + 壶空先补水 —— 两个事件都**不是失败**，
     # 但两条可证伪形态要点名（都只给 ⚠ 警告、不进 red / 不进 rc，`verify-run3.py` 对
     # `water_far_refill` 零命中）：①补水没成（回执不 ok 且水位没涨）当天却把那格浇成了；
@@ -3897,6 +4066,10 @@ def build_report(rows, path, args, bad_lines):
         "water_far": water_far,
         # task-134 B：分配额口径（阶段没做完 / 日级 unmet / 诚实上限 deferred；均 info、不判红）
         "shortfall": shortfall,
+        # task-144（dev-coder 在制）：壶空先补水再"原样重跑"（refill_retry）+ 阶段如实 stop 原因
+        # （stage_stop_named）—— 修复生效的证据，不判红；三条可证伪形态只给 ⚠
+        "refill_retry": refill_retry,
+        "stage_stop_named": stage_stop_named,
         # task-111：LLM 收工复盘 / 跨日教训库（task-58/59/82；只有三条完整性红，其余信息项）
         "llm_review": llm_review,
         # task-124/task-130：review 兜底（work_spot/pending_walk）/ 弃权 / 换片连发
@@ -4364,6 +4537,13 @@ MAPPING_TEXT = [
      "（只供守卫/换片/resume）；`deferred_tiles` = 体力/夜里收工/撞 budget 留下的片区待办，"
      "**只作 info、绝不进 no_unmet_stages**；唯一可证伪 ⚠ = 日级 `stopped_night=false` 而当天 "
      "`ended_reason` 是 night（口径打架，只警告）"),
+    ("event:refill_retry / stage_stop_named (task-144)",
+     "信息项：**修复生效的证据**、不是失败（`verify-run3.py` 对两名零命中 ⇒ 本工具不判红、不进 rc）。"
+     "`refill_retry` = 阶段内壶空 ⇒ 补水后把这一轮没成事的已分配格**原样**重跑（不再重算窗口把格子丢掉）；"
+     "`stage_stop_named` = 阶段自然走完（`stopped==\"\"`）却仍有分配未成事的格 ⇒ 补**如实** stop 原因"
+     "（cause∈need_refill/unreachable/no_seed/incomplete）。只三条可证伪 ⚠：①当天重跑条数 > 当天 `refill` "
+     "条数；②`refill_retry{ok=true, tiles=0}` 空转；③`stage_stop_named` 的 cause 缺失/未知、"
+     "`assigned_undone<=0`、或有过失却 `codes` 全空。旧账本没有这两个事件 ⇒ `<缺失>` +【无法判定】（缺失 ≠ 0）"),
     ("event:seed_gate / stage_midway_leftover (task-15)",
      "信息项：种子闸门（种子/钱不够 ⇒ till/plant 被跳过，不算硬失败）+ 阶段中途遗留"),
     ("event:no_seed_for_sale / cannot_afford / seed_unavailable_today (task-67)",
@@ -4743,6 +4923,44 @@ def render_text(report, top):
             + (f"  ⚠ 日级说 stopped_night=false 但当天 ended_reason 是 night（行 "
                f"{shf.get('warn_stopped_night_mismatch_lines', [])[:4]}）——两个口径打架，只警告、不判红"
                if shf.get("warn_stopped_night_mismatch_lines") else ""))
+    # task-144（dev-coder 在制）：壶空先补水再"原样重跑"（`refill_retry`）+ 阶段自然走完却仍有
+    # 分配未成事的格 ⇒ 如实 stop 命名（`stage_stop_named`）—— 都是**修复生效的证据**、不判红。
+    rrv = report.get("refill_retry") or {}
+    snv = report.get("stage_stop_named") or {}
+    if not rrv.get("has_events") and not snv.get("has_events"):
+        add("阶段自愈/如实收工: <缺失>（本账本没有 refill_retry / stage_stop_named 事件 ⇒ "
+            "无法判定「壶空后有没有把这一轮没成事的格原样重跑」与「阶段自然结束却还有分配未成事的格"
+            "有没有如实命名 stop 原因」；缺失 ≠ 0）")
+    else:
+        # task-144 增量（`2438cae`）：该阶段已补水几次 / 阶段上界（`STAGE_REFILL_MAX`）。
+        _srb = rrv.get("stage_refill_by_stage") or {}
+        _srb_txt = "、".join(
+            f"{_k} {(_v.get('stage_refills') if _v.get('stage_refills') is not None else '<缺失>')}"
+            f"/{(_v.get('stage_limit') if _v.get('stage_limit') is not None else '<缺失>')} 次"
+            for _k, _v in list(_srb.items())[:3])
+        add(f"阶段自愈/如实收工: 壶空重跑 {rrv.get('events', 0)} 次"
+            f"（补水成功 {rrv.get('ok', 0)} / 没成 {rrv.get('failed', 0)}；重跑 "
+            f"{rrv.get('tiles_total', 0)} 格；当天 refill {rrv.get('refill_events_total', 0)} 次"
+            + (f"；阶段补水 {_srb_txt}" if _srb_txt else "") + "）；"
+            + f"如实 stop 命名 {snv.get('events', 0)} 次"
+            f"（cause {'、'.join(f'{k}×{v}' for k, v in list((snv.get('causes') or {}).items())[:4]) or '<缺失>'}；"
+            f"分下去 {snv.get('assigned_total', 0)} 格 / 没做完 {snv.get('undone_total', 0)} 格）"
+            + ("  ⚠ 重跑条数多于当天 refill（行 "
+               f"{(rrv.get('warn_over_retry_lines') or [])[:4]}）——两个口径打架，只警告、不判红"
+               if rrv.get("warn_over_retry_lines") else "")
+            + ("  ⚠ 补水成功却 0 格可重跑（行 "
+               f"{(rrv.get('warn_empty_lines') or [])[:4]}）——空转嫌疑，只警告、不判红"
+               if rrv.get("warn_empty_lines") else "")
+            + ("  ⚠ 阶段补水次数超过该阶段上界（行 "
+               f"{(rrv.get('warn_over_stage_refill_lines') or [])[:4]}）"
+               "——`stage_refills > stage_limit`，口径打架，只警告、不判红"
+               if rrv.get("warn_over_stage_refill_lines") else "")
+            + ("  ⚠ stage_stop_named 自相矛盾（cause 缺失/未知 行 "
+               f"{(snv.get('warn_bad_cause_lines') or [])[:4]}；assigned_undone≤0 行 "
+               f"{(snv.get('warn_no_undone_lines') or [])[:4]}；有过失却 codes 空 行 "
+               f"{(snv.get('warn_no_codes_lines') or [])[:4]}）——只警告、不判红"
+               if (snv.get("warn_bad_cause_lines") or snv.get("warn_no_undone_lines")
+                   or snv.get("warn_no_codes_lines")) else ""))
     # task-111：LLM 收工复盘 / 跨日教训库（task-58/59/82）—— "模型没学到东西"不是失败，只呈现
     lri = report.get("llm_review") or {}
     if not lri.get("has_events"):

@@ -3227,5 +3227,162 @@ class TestLessonQualityHintDrop(unittest.TestCase):
         self.assertIn("绝不当'没有矛盾 hint'通过", text)
 
 
+class TestStageRefillRetryAndStopNamed(unittest.TestCase):
+    """task-144（dev-coder 在制）：`refill_retry` / `stage_stop_named` 收录 + 三条可证伪 ⚠（**不判红**）。"""
+
+    REFILL = {"event": "refill", "t": 9.1, "ok": True, "reason": "补水成功",
+              "before": {"waterLeft": 0}, "after": {"waterLeft": 40}}
+    RETRY_OK = {"event": "refill_retry", "t": 9.2, "stage": "water_area", "zone": "field_ne",
+                "ok": True, "refills_today": 1, "limit": 2, "tiles": 3,
+                "targets": [[61, 20], [62, 20], [63, 20]], "note": "原样重跑这一轮没成事的格"}
+    RETRY_FAIL = {"event": "refill_retry", "t": 9.25, "stage": "water_area", "zone": "field_ne",
+                  "ok": False, "refills_today": 1, "limit": 2, "tiles": 3,
+                  "targets": [[61, 20]], "note": "补水不成 ⇒ 保持 stopped=need_refill"}
+    RETRY_EMPTY = {"event": "refill_retry", "t": 9.3, "stage": "water_area", "zone": "field_ne",
+                   "ok": True, "refills_today": 1, "limit": 2, "tiles": 0, "targets": [],
+                   "note": "说重跑却没有格子"}
+    STOP_NAMED = {"event": "stage_stop_named", "t": 9.4, "stage": "till_area", "zone": "field_se",
+                  "cause": "need_refill", "assigned": 12, "assigned_undone": 3,
+                  "tiles": [[61, 20], [62, 20]], "codes": ["need_refill"],
+                  "note": "阶段自然结束却仍有分配未成事的格 ⇒ 补如实 stop 原因"}
+    STOP_BAD_CAUSE = {"event": "stage_stop_named", "t": 9.5, "stage": "till_area",
+                      "zone": "field_se", "cause": "wat", "assigned": 12,
+                      "assigned_undone": 1, "tiles": [[61, 20]], "codes": ["tool_ineffective"],
+                      "note": "未知 cause"}
+    STOP_NO_UNDONE = {"event": "stage_stop_named", "t": 9.6, "stage": "till_area",
+                      "zone": "field_se", "cause": "incomplete", "assigned": 12,
+                      "assigned_undone": 0, "tiles": [], "codes": [],
+                      "note": "没有未成事的格却命名 stop"}
+    STOP_NO_CODES = {"event": "stage_stop_named", "t": 9.7, "stage": "till_area",
+                     "zone": "field_se", "cause": "incomplete", "assigned": 12,
+                     "assigned_undone": 2, "tiles": [[61, 20]], "codes": [],
+                     "note": "有过失却没有任何 codes"}
+    RETRY_STAGE = {"event": "refill_retry", "t": 9.35, "stage": "water_area", "zone": "field_ne",
+                   "ok": True, "refills_today": 1, "limit": 2, "tiles": 2,
+                   "stage_refills": 1, "stage_limit": 2, "targets": [[61, 20], [62, 20]],
+                   "note": "阶段内第一次补水"}
+    RETRY_STAGE_OVER = {"event": "refill_retry", "t": 9.37, "stage": "water_area",
+                        "zone": "field_ne", "ok": True, "refills_today": 2, "limit": 2,
+                        "tiles": 2, "stage_refills": 3, "stage_limit": 2,
+                        "targets": [[61, 20]], "note": "阶段补水越界形态"}
+
+    def _day(self, day, *, extra=(), ended_reason="night"):
+        nxt = [day[0], day[1], day[2] + 1]
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": True,
+                  "watered_outdoor": True}
+        end = {"event": "day_end", "t": 9.9, "day": day, "day_text": "", "ended_by": "sleep",
+               "ended_reason": ended_reason, "verified": True, "checks": checks,
+               "stages": [{"stage": "water_area", "ok": 5, "skipped": 0, "failed": 0,
+                           "env_block": 0, "inconclusive": 0, "stopped": None, "leftover": 0}],
+               "outcomes": [], "ok_steps": 5, "skipped_steps": 0, "failed_steps": 0,
+               "notes": [], "final": final(nxt),
+               "final_water": {"t": 9.9, "location": "Farm", "tiles": 84, "crops": 31,
+                               "dry": 0, "scope": "farm"}}
+        return [day_start(day), *extra, end]
+
+    def _report(self, events, name, *, days=1):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = write_ledger(tmp.name, name, events)
+        self._tmp = tmp
+        return report_for(path, days=days, top=50)
+
+    def test_events_have_buckets_and_are_not_unmapped(self):
+        for _name in ("refill_retry", "stage_stop_named"):
+            self.assertIn(_name, mod.EVENT_BUCKETS, f"{_name} 必须有桶（不许改名/藏事件）")
+        rep = self._report(self._day([1, "summer", 5],
+                                     extra=[dict(self.REFILL), dict(self.RETRY_OK),
+                                            dict(self.STOP_NAMED)]),
+                           "t144_bucket.jsonl")
+        self.assertEqual(rep["unmapped_events"], {}, "已入桶 ⇒ 不许再出现未映射")
+        self.assertTrue(rep["refill_retry"]["has_events"])
+        self.assertTrue(rep["stage_stop_named"]["has_events"])
+
+    def test_refill_retry_and_stop_named_are_info_only_and_visible(self):
+        rep = self._report(self._day([1, "summer", 5],
+                                     extra=[dict(self.REFILL), dict(self.RETRY_OK),
+                                            dict(self.STOP_NAMED)]),
+                           "t144_info.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "两者都是修复生效的证据 ⇒ 不判红")
+        rr, sn = rep["refill_retry"], rep["stage_stop_named"]
+        self.assertEqual((rr["events"], rr["ok"], rr["failed"], rr["tiles_total"]), (1, 1, 0, 3))
+        self.assertEqual(rr["warn_over_retry_lines"], [])
+        self.assertEqual(rr["warn_empty_lines"], [])
+        self.assertEqual(sn["causes"], {"need_refill": 1})
+        self.assertEqual((sn["assigned_total"], sn["undone_total"]), (12, 3))
+        text = mod.render_text(rep, 50)
+        self.assertIn("阶段自愈/如实收工: 壶空重跑 1 次", text)
+        self.assertIn("如实 stop 命名 1 次", text)
+        self.assertIn("不是失败", text)
+
+    def test_over_retry_without_refill_is_warning_not_red(self):
+        """当天重跑条数 > 当天 refill 条数 ⇒ 口径打架，只给 ⚠。"""
+        rep = self._report(self._day([1, "summer", 5],
+                                     extra=[dict(self.RETRY_OK), dict(self.RETRY_FAIL)]),
+                           "t144_over.jsonl")
+        self.assertEqual(rep["red"]["total"], 0)
+        self.assertEqual(len(rep["refill_retry"]["warn_over_retry_lines"]), 2)
+        self.assertIn("重跑条数多于当天 refill", mod.render_text(rep, 50))
+
+    def test_empty_refill_retry_is_warning_not_red(self):
+        rep = self._report(self._day([1, "summer", 5],
+                                     extra=[dict(self.REFILL), dict(self.RETRY_EMPTY)]),
+                           "t144_empty.jsonl")
+        self.assertEqual(rep["red"]["total"], 0)
+        self.assertEqual(len(rep["refill_retry"]["warn_empty_lines"]), 1)
+        self.assertIn("补水成功却 0 格可重跑", mod.render_text(rep, 50))
+
+    def test_stop_named_self_contradictions_are_warnings(self):
+        rep = self._report(self._day([1, "summer", 5],
+                                     extra=[dict(self.STOP_BAD_CAUSE), dict(self.STOP_NO_UNDONE),
+                                            dict(self.STOP_NO_CODES)]),
+                           "t144_stop.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "三条可证伪形态都只给 ⚠、不进 rc")
+        sn = rep["stage_stop_named"]
+        self.assertEqual(len(sn["warn_bad_cause_lines"]), 1)
+        self.assertEqual(len(sn["warn_no_undone_lines"]), 1)
+        self.assertEqual(len(sn["warn_no_codes_lines"]), 1)
+        self.assertIn("stage_stop_named 自相矛盾", mod.render_text(rep, 50))
+
+    def test_stage_refill_fields_are_visible(self):
+        """task-144 增量：`stage_refills`/`stage_limit` 必须在头部「阶段补水 N/M 次」里可见。"""
+        rep = self._report(self._day([1, "summer", 5],
+                                     extra=[dict(self.REFILL), dict(self.RETRY_STAGE)]),
+                           "t144_stage.jsonl")
+        self.assertEqual(rep["red"]["total"], 0)
+        rr = rep["refill_retry"]
+        self.assertEqual(rr["stage_refills"], [1])
+        self.assertEqual(rr["stage_limits"], [2])
+        self.assertEqual(rr["stage_refill_by_stage"],
+                         {"water_area": {"stage_refills": 1, "stage_limit": 2}})
+        self.assertEqual(rr["warn_over_stage_refill_lines"], [])
+        self.assertIn("阶段补水 water_area 1/2 次", mod.render_text(rep, 50))
+
+    def test_over_stage_refill_limit_is_warning_not_red(self):
+        """`stage_refills > stage_limit` ⇒ 只给 ⚠（第四条可证伪形态），不进 rc。"""
+        rep = self._report(self._day([1, "summer", 5],
+                                     extra=[dict(self.REFILL), dict(self.RETRY_STAGE),
+                                            dict(self.RETRY_STAGE_OVER)]),
+                           "t144_stage_over.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "越界只给 ⚠、不进 rc")
+        rr = rep["refill_retry"]
+        self.assertEqual(len(rr["warn_over_stage_refill_lines"]), 1)
+        self.assertEqual(rr["stage_refill_by_stage"]["water_area"]["stage_refills"], 3)
+        text = mod.render_text(rep, 50)
+        self.assertIn("阶段补水次数超过该阶段上界", text)
+        self.assertIn("只警告、不判红", text)
+
+    def test_old_ledger_without_events_is_undecidable_not_zero(self):
+        rep = self._report(self._day([1, "summer", 5]), "t144_old.jsonl")
+        self.assertEqual(rep["red"]["total"], 0)
+        self.assertFalse(rep["refill_retry"]["has_events"])
+        self.assertFalse(rep["stage_stop_named"]["has_events"])
+        text = mod.render_text(rep, 50)
+        self.assertIn("阶段自愈/如实收工: <缺失>", text)
+        self.assertIn("缺失 ≠ 0", text)
+        self.assertIn("没有任何 task-144", " ".join(rep["undecidable"]))
+
+
 if __name__ == "__main__":
     unittest.main()

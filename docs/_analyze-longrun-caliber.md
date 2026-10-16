@@ -750,6 +750,59 @@ rg -n '"event": ?"lessons"' logs/longrun-*.jsonl | rg "hint_dropped"
 python tools/analyze-longrun.py --journal logs/longrun-3day-llm-run9b.jsonl --days 7 | rg "教训素材质量|hint 丢弃"
 ```
 
+## 3.23 阶段自愈 + 如实收工（task-144 `2438cae`，task-148 收录）—— 修复生效的证据，不是失败
+
+| journal | 桶名 | 字段 | 含义 |
+|---|---|---|---|
+| `refill_retry` | `refill_retries` | `stage`/`zone`/`ok`/`refills_today`/`limit`/`tiles`/`targets` + **`stage_refills`/`stage_limit`** | 阶段内壶空 ⇒ **先补水**，再把这一轮没成事的**已分配格原样重跑**（不再重算窗口把格子从目标里丢掉） |
+| `stage_stop_named` | `stage_stop_names` | `stage`/`zone`/`cause`/`assigned`/`assigned_undone`/`tiles`/`codes` | 阶段自然走完（`stopped==""`）却仍有分配未成事的格 ⇒ 补一个**如实** stop 原因 |
+
+`cause ∈ {need_refill, unreachable, no_seed, incomplete}`；`stage_limit = STAGE_REFILL_MAX`（brain 现值 2，
+`brain/agentfarm/longrun.py`），`stage_refills` = 该阶段已为「壶空」补过几次水；日级另有
+`refill_retry.limit` = `max_refills_per_day` 兜底。**`stage_refills`/`stage_limit` 是 task-144 定稿后的增量**
+（Lead m06977，"这条不阻 0.7.31 冻结"）。
+
+口径：**两者都不是失败**（`tools\verify-run3.py` 对这两个名字零命中 ⇒ 判红会两边反向）；不进 red、不进 rc。
+头部行：`阶段自愈/如实收工: 壶空重跑 N 次（补水成功 a / 没成 b；重跑 T 格；当天 refill R 次；阶段补水 <stage> r/l 次）；
+如实 stop 命名 M 次（cause …；分下去 A 格 / 没做完 U 格）` + 建议 0s；旧账本没有这两个事件 ⇒ 头部 `<缺失>`
++【无法判定】（缺失 ≠ 0，绝不当"没发生"通过）。
+
+四条**可证伪**形态只给 ⚠（都不进 red / rc）：①当天重跑条数 > 当天 `refill` 条数；②`refill_retry{ok=true, tiles=0}`
+（说重跑却没格子）；③`stage_stop_named` 的 `cause` 缺失/未知、`assigned_undone≤0`、或有过失却 `codes` 全空；
+④**`stage_refills > stage_limit`**（阶段补水越界）。
+
+### 单测（`tests/test_analyze_longrun.py::TestStageRefillRetryAndStopNamed`，8 条）
+
+`test_events_have_buckets_and_are_not_unmapped`、`test_refill_retry_and_stop_named_are_info_only_and_visible`、
+`test_over_retry_without_refill_is_warning_not_red`、`test_empty_refill_retry_is_warning_not_red`、
+`test_stop_named_self_contradictions_are_warnings`、`test_stage_refill_fields_are_visible`、
+`test_over_stage_refill_limit_is_warning_not_red`、`test_old_ledger_without_events_is_undecidable_not_zero`。
+
+### 读数（task-148 + 增量，2026-10-17）
+
+`py_compile -W error::SyntaxWarning` **exit 0**；`tests.test_analyze_longrun` **179 OK**；
+`python -m unittest discover -s tests` **`Ran 807 tests / FAILED (failures=9)`** —— 9 条**全在 `tests/test_longrun.py`**
+（`TestMorningIndoor`/`TestOneDay`/`TestTask133FarDryRefillAndPerTileEvidence`/`TestTask32PlotsCap`/
+`TestTask38DayProgressAfterSleepRetry`/`TestTask49CrossPlotNoWork`/`TestTask50FarDryTiles`），根因是 dev-coder
+**当时未提交的 ` M brain/agentfarm/longrun.py`**（在制 task-149）；本工具的两个文件从不 import brain ⇒ 零接触；
+我这轮的 179 条里零红。机械枚举：brain 103 个 `_journal` 名、未映射 **5 → 3**（只剩结构性白名单
+`day_start`/`day_end`/`finish`；桶里多 1 个 `stage` = fixture 形态）。
+
+**十一账本** rc（本工具 / `tools\verify-run3.py`，`--days 7`）：green 0(0)/0、run2 1(19)/1、run3 1(17)/1、
+run5 1(62)/1、run6 1(14)/1、run7 0(0)/0、run8 1(29)/1、run9 1(84)/1、run9b 1(45)/1、vacuum 1(3)/1 —— 一字未变；
+**run9c 0(0)/1（唯一一处不并排）**：它判红的原因是 Lead m06977 刚给 verify-run3 收紧的**内容判据**
+（`[summer 20] 当天 0 个阶段却自称 VERIFIED，且没有任何户外农场的在场证据`），Lead 明确"你的 analyzer **不用**跟"。
+本工具对同一天走 `wasted:verified_zero_steps` 时因该天 `ended_reason` 以 `no_work` 开头（有 excuse）而放行 ⇒
+**授权内的有意分歧**，不是回归（run9c 头部的 `阶段自愈/如实收工` 是 `<缺失>`：该本录于 task-144 之前）。
+
+### grep 配方
+
+```
+git grep -n "refill_retry\|stage_stop_named\|stage_refills" -- brain/agentfarm/
+python tools/analyze-longrun.py --journal logs/longrun-3day-llm-run9c.jsonl --days 7 | rg "阶段自愈/如实收工|阶段补水"
+rg -n '"event": ?"refill_retry"' logs/longrun-*.jsonl | rg "stage_refills|stage_limit"
+```
+
 ## 4. 复核命令
 
 ```
@@ -758,9 +811,10 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run6.jsonl   # r
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run7.jsonl --days 7   # run7：窗口口径 ⇒ rc=0；死苗字段缺失 ⇒ <缺失> + 【无法判定】
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run8.jsonl   # run8：背包空格死锁 ⇒ rc=1（回执 no_inventory_space×25）
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run9b.jsonl --days 7  # run9b：教训素材质量（hint_dropped 缺失 ⇒ ⚠ + 【无法判定】）
+python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run9c.jsonl --days 7  # run9c：阶段自愈/如实收工 <缺失>（录于 task-144 前）；本工具 rc=0，verify-run3 rc=1（Lead m06977 收紧的"户外在场"判据，本工具按指示不跟）
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
 python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
-python -m unittest tests.test_analyze_longrun  # 当前 171 OK（task-139 收录）
-python -m unittest discover -s tests           # 当前 774 tests / OK（0 红）
+python -m unittest tests.test_analyze_longrun  # 当前 179 OK（task-148 + stage_refills/stage_limit 增量）
+python -m unittest discover -s tests           # 当前 807 tests（我这轮 179 条零红；dev 在制的 brain/agentfarm/longrun.py 让 test_longrun 出 9 红，与本工具无关）
 ```
