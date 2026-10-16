@@ -4,9 +4,9 @@
 > 诚实边界（**必须与结论一起写**）：本机制是「会话内记忆 + 提示词反馈」（每次调用留痕 + 夜间复盘 notes + 跨日教训库），**不是权重更新、不是在线训练**。没有下面的 A→B 对照证据，**不许**写"自我进化已实现"。
 
 ## 0. 设定
-- **run A = 累积轮**（原本排的 `logs/longrun-3day-llm-run9.jsonl`；**实测 run9 = 0/3 达标、`lessons.total=0`** —— 见 `docs/_run9-evidence.md` 与条目 055/056，两大病灶已立 task-121（复盘预算 512→4096，`9a4da64`）与 task-122/124（教训覆盖面缺口 + review-only 空转）⇒ **run A 必须在 0.7.29 上重跑**，run9 只作"病灶取证轮"，不参与 A→B 对照；重跑卡 = **task-131**，journal `logs\longrun-3day-llm-run9b.jsonl`，出口 `…-run9b-lessons.json` 拷成 `…-run10-lessons.json` 再起 run B）。
-- **run B = 对照轮**：**同一存档线的下一段**（run A 收工后的世界继续），同一 Mod、同一 brain 代码，**唯一差异 = 注入的教训/笔记/决策史**（路径由 `--journal` 自动推导，没有新增开关）。
-- run B 起跑前必须先从 run A 的账本+教训库导出「待验证教训清单」（`tools/compare-runs.py` 的 §lessons 段），**先写下预测再跑**（避免事后挑证据）。
+- **run A = 累积轮 = `logs\longrun-3day-llm-run9d.jsonl`**（**0.7.31**、**5 天**、`--days 5 --max-days 12`，卡 = **task-147**）：跑完把 `…-run9d-lessons.json` **原样拷**成 `…-run10-lessons.json`（记拷贝时刻 + 两侧 SHA256）。历史轮次：run9（`lessons.total=0`，病灶取证轮）、run9b（落盘 5/5、首个整天全绿，但 `buy` 死锁/空转未修）、run9c（尾部 3/3 但含 summer 20 的"0 动作自称 VERIFIED"假达标日 ⇒ 由 task-149/150 修掉）**都不参与 A→B 对照**。
+- **run B = 对照轮 = `logs\longrun-3day-llm-run10.jsonl`**（同 0.7.31、同 5 天、同存档线的下一段；卡 = **task-113**）：同一 Mod、同一 brain，**唯一差异 = 注入的教训/笔记/决策史**（路径由 `--journal` 自动推导，没有新增开关）；两份 sidecar 的 `argv` 必须逐字对齐（除 journal 路径）。
+- run B 起跑前必须先从 run A 的账本+教训库导出「待验证教训清单」（`tools/compare-runs.py` 的 lessons 段 + `criteria` 段），**先写下预测再跑**（避免事后挑证据）。
 
 ## 1. 五条判定（全部要有原文读数）
 | # | 判据 | 证据来源 | 通过条件 |
@@ -29,5 +29,5 @@
 - `tools/compare-runs.py` 的原文输出（含 lessons/hints/decision 三段）。
 
 ## 4. 与主目标的关系
-- P3 ⑥ 主目标仍以 **run A 的尾部连续 3 个游戏日 VERIFIED + 四腿 + 经济闭环** 为准（run9 已实测 0/3 ⇒ 必须在 0.7.29 上重跑）；演进只是附加能力，**不得**用"学到教训"替代达标判定。
+- 主目标（用户 2026-10-17 改定**目标 2**）以 **run A 的尾部连续 5 个游戏日 VERIFIED + 四腿 + 经济闭环** 为准（run9 实测 0/3、run9b 首个整天全绿、run9c 诊断性 3/3 ⇒ 必须在 **0.7.31** 上重跑为 **run9d（5 天）**）；演进（L0–L5）是**同一目标里的能力项**，仍**不得**用"学到教训"替代达标判定，也不得用达标替代演进证据。
 - 若 run A 达标而 run B 因世界条件退化而未达标，按 L4 如实记录，不掩盖、不重跑刷分（重跑必须写明是第几次、为什么）。
