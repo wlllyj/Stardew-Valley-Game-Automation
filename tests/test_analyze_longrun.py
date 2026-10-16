@@ -2591,5 +2591,132 @@ class TestUntrustedLessonsAccounting(unittest.TestCase):
         self.assertIn("没有 `untrusted` 字段", " ".join(rep["undecidable"]))
 
 
+class TestReviewFallbackAndBurst(unittest.TestCase):
+    """task-124 / task-130：review 兜底（`review_only_fallback`）、弃权（`review_only_no_target`）、
+    换片连发（`plot_exhausted_burst`）、兜底失败（`review_only_fallback_failed`）。
+
+    口径：这些事件是**修复生效的证据**，本身一律**不判红**（`tools\\verify-run3.py` 对这四个名字
+    零命中 ⇒ 判红会两边反向）；只给三条可证伪形态的 ⚠ 警告：burst 当天却自称 VERIFIED /
+    弃权后 `ended_reason` 仍说"守卫仍说还有活" / 兜底抛异常。缺事件 ⇒ 头部 `<缺失>` +
+    【无法判定】（缺失 ≠ 0 = 没发生过）。
+    """
+
+    FALLBACK = {"event": "review_only_fallback", "t": 5.0, "source": "work_spot",
+                "plot_tiles": 3, "intents": ["water_area", "harvest"],
+                "reasons": ["field_ne还有地要清"], "note": "只有 review 却有活"}
+    PENDING_WALK = {"event": "review_only_fallback", "t": 5.2, "source": "pending_walk",
+                    "tiles": 4, "walked": True, "attempt": 1,
+                    "reasons": ["field_se还有地要清"], "note": "回到跨片地 leftover 旁边再看一次"}
+    NO_TARGET = {"event": "review_only_no_target", "t": 5.4, "pending": 6,
+                 "tiles": [[61, 20], [62, 20]], "reasons": ["field_se还有地要清"],
+                 "note": "确定性计划也拿不出目标"}
+    BURST = {"event": "plot_exhausted_burst", "t": 6.0, "count": 12, "zone": "field_ne",
+             "note": "同一秒内连发换片"}
+    FALLBACK_FAILED = {"event": "review_only_fallback_failed", "t": 6.5, "source": "work_spot",
+                       "error": "KeyError: 'tiles'"}
+
+    def _day(self, day, *, extra=(), ended_reason="night"):
+        nxt = [day[0], day[1], day[2] + 1]
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": True,
+                  "watered_outdoor": True}
+        end = {"event": "day_end", "t": 9.0, "day": day, "day_text": "", "ended_by": "sleep",
+               "ended_reason": ended_reason, "verified": True, "checks": checks,
+               "stages": [{"stage": "water_area", "ok": 5, "skipped": 0, "failed": 0,
+                           "env_block": 0, "inconclusive": 0, "stopped": None, "leftover": 0}],
+               "outcomes": [], "ok_steps": 5, "skipped_steps": 0, "failed_steps": 0,
+               "notes": [], "final": final(nxt),
+               "final_water": {"t": 9.0, "location": "Farm", "tiles": 84, "crops": 31,
+                               "dry": 0, "scope": "farm"}}
+        return [day_start(day), *extra, end]
+
+    def _report(self, events, name, *, days=1):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = write_ledger(tmp.name, name, events)
+        self._tmp = tmp
+        return report_for(path, days=days, top=50)
+
+    def test_new_events_have_buckets_and_are_not_unmapped(self):
+        for name in ("review_only_fallback", "review_only_fallback_failed",
+                     "review_only_no_target", "plot_exhausted_burst"):
+            self.assertIn(name, mod.EVENT_BUCKETS, f"{name} 必须有桶（不许改名/藏事件）")
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.FALLBACK)]),
+                           "rf_bucket.jsonl")
+        self.assertEqual(rep["unmapped_events"], {}, "四个事件都已入桶 ⇒ 不许再出现未映射")
+
+    def test_fallback_no_target_and_burst_are_info_and_visible(self):
+        events = self._day([1, "summer", 5],
+                           extra=[dict(self.FALLBACK), dict(self.PENDING_WALK),
+                                  dict(self.NO_TARGET), dict(self.BURST)])
+        rep = self._report(events, "rf_info.jsonl")
+        self.assertEqual(rep["red"]["total"], 0,
+                         "兜底/弃权/连发是修复生效的证据 ⇒ 绝不判红")
+        rf = rep["review_fallback"]
+        self.assertTrue(rf["has_events"])
+        self.assertEqual(rf["fallback_events"], 2)
+        self.assertEqual(rf["fallback_work_spot"], 1)
+        self.assertEqual(rf["fallback_pending_walk"], 1)
+        self.assertEqual(rf["fallback_walked"], 1)
+        self.assertEqual(rf["fallback_tiles"], 7)
+        self.assertEqual(rf["fallback_intents"], {"water_area": 1, "harvest": 1})
+        self.assertEqual(rf["no_target_events"], 1)
+        self.assertEqual(rf["no_target_pending"], 6)
+        self.assertEqual(rf["no_target_tiles"], [[61, 20], [62, 20]])
+        self.assertEqual(rf["burst_events"], 1)
+        self.assertEqual(rf["burst_max"], 12)
+        self.assertEqual(rf["burst_zones"], ["field_ne"])
+        text = mod.render_text(rep, 50)
+        self.assertIn("review 兜底/换片连发: 兜底 2 次", text)
+        self.assertIn("弃权 1 次（6 格当日放弃、次日重试）", text)
+        self.assertIn("换片连发 1 次（最多一次 count=12、zone=['field_ne']）", text)
+        self.assertIn("task-124 修复生效的证据", " ".join(a["text"] for a in rep["advice"]))
+
+    def test_burst_with_verified_is_warning_not_red(self):
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.BURST)]),
+                           "rf_burst_verified.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "警告不是红：不进 rc")
+        self.assertNotIn("wasted:", rep["red"]["subjects"])
+        rf = rep["review_fallback"]
+        self.assertEqual(rf["warn_burst_verified_lines"], [2])
+        self.assertEqual(rf["warn_burst_verified_days"], [rep["days"][-1]["label"]])
+        text = mod.render_text(rep, 50)
+        self.assertIn("⚠ burst 当天却自称 VERIFIED", text)
+        self.assertIn("只警告、不判红", text)
+        self.assertIn("burst 当天却自称 VERIFIED", " ".join(a["text"] for a in rep["advice"]))
+
+    def test_no_target_then_guard_still_complains_is_warning(self):
+        rep = self._report(
+            self._day([1, "summer", 5], extra=[dict(self.NO_TARGET)],
+                      ended_reason="stuck:换过 3 片地都没有目标（守卫仍说还有活：field_se还有地要清）"),
+            "rf_guard.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "警告不是红：不进 rc")
+        rf = rep["review_fallback"]
+        self.assertEqual(rf["warn_no_target_still_guarded_lines"], [2])
+        self.assertEqual(rf["warn_no_target_still_guarded_days"], [rep["days"][-1]["label"]])
+        text = mod.render_text(rep, 50)
+        self.assertIn("⚠ 弃权后守卫仍抱怨同批 leftover", text)
+        self.assertIn("弃权没生效", " ".join(a["text"] for a in rep["advice"]))
+
+    def test_fallback_failed_is_warning_not_red(self):
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.FALLBACK_FAILED)]),
+                           "rf_failed.jsonl")
+        self.assertEqual(rep["red"]["total"], 0)
+        rf = rep["review_fallback"]
+        self.assertEqual(rf["failed_lines"], [2])
+        self.assertEqual(rf["failed_errors"], ["KeyError: 'tiles'"])
+        text = mod.render_text(rep, 50)
+        self.assertIn("⚠ 兜底抛异常 1 次", text)
+
+    def test_old_ledger_without_events_is_undecidable_not_zero(self):
+        rep = self._report(self._day([1, "summer", 5]), "rf_missing.jsonl")
+        self.assertEqual(rep["red"]["total"], 0)
+        self.assertFalse(rep["review_fallback"]["has_events"])
+        text = mod.render_text(rep, 50)
+        self.assertIn("review 兜底/换片连发: <缺失>", text)
+        self.assertIn("缺失 ≠ 0", text)
+        self.assertIn("没有任何 task-124 的兜底/弃权/连发事件", " ".join(rep["undecidable"]))
+
+
 if __name__ == "__main__":
     unittest.main()

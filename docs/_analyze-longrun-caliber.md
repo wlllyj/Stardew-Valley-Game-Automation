@@ -562,6 +562,59 @@ python tools/analyze-longrun.py --journal logs/<run>.jsonl | rg "教训库写入
 python -c "import json;d=json.load(open('logs/<run>-lessons.json',encoding='utf-8'));print([it.get('src') for it in (d.get('lessons') if isinstance(d,dict) else d)])"
 ```
 
+## 3.19 review 兜底 / 弃权 / 换片连发（task-124 `08a2ae0`，task-130 收录）—— 修复生效的证据
+
+run9 第 1 天的病灶：四条分支全不成立 ⇒ 决策只剩 `review`（独苗）而守卫仍说"还有活"；第 2 天更糟：
+同一秒连发 12 次换片、纯空转。task-124 给了两条出路 + 一条弃权 + 一条防御，`brain/agentfarm/longrun.py`
+各留一条 journal：
+
+| 事件 | brain 位置 | 字段 | 含义 |
+|---|---|---|---|
+| `review_only_fallback` | `:2096`（`source="work_spot"`）/ `:2111`（`source="pending_walk"`） | 前者 `source`/`plot_tiles`/`intents`/`reasons`；后者 `source`/`tiles`/`walked`/`attempt`/`reasons` | review 独苗却有活 ⇒ ①按观测里看得见的收尾活出简报、改走确定性策略；②或把人带回跨片 leftover 旁边再看一次 |
+| `review_only_no_target` | `:2137`（`_abandon_guard_leftover`） | `pending` / `tiles` / `reasons` | 兜底也拿不出目标 ⇒ 把守卫据以抱怨的 leftover 如实记为"今天放弃"（只动 `leftover_targets`，次日重试、**不碰判定字段**） |
+| `plot_exhausted_burst` | `:4035` | `count` / `zone` | 同一秒 ≥5 次换片（`PLOT_EXHAUSTED_BURST=5`，`longrun.py:101`）⇒ 判定"本片真没目标"，随后 `_do_sleep(..., "stuck:同一秒连发 N 次换片都没有目标…")` 有界收尾（那一天仍是 `stuck`、不 VERIFIED） |
+| `review_only_fallback_failed` | `:2087` | `source` / `error` | 兜底出简报抛异常（防御性，正常路径不该出现） |
+
+### 口径：这四个事件**本身一律不判红**
+
+- `tools/verify-run3.py` 对这四个名字**零命中** ⇒ 本工具判红会两边反向（Lead 的"两侧判决一致"要求）。
+  它们是 **task-124 修复生效的证据**，不是失败。
+- 只给三条**可证伪形态**的 ⚠ 警告（不进 `red`、不进 rc）：
+  ①`plot_exhausted_burst` 当天却自称 `verified=true`（连发=没目标的证据，与 VERIFIED 互斥）；
+  ②`review_only_no_target` 之后当天 `ended_reason` 仍含"守卫仍说还有活"（弃权没生效）；
+  ③`review_only_fallback_failed` 抛异常。
+- 头部 `review 兜底/换片连发:` 行 + 建议 0p（含"修复生效 ⇒ 不判红"）；缺失这些事件（旧账本）⇒ `<缺失>` +
+  【无法判定】"无法判定当天是否出现过 review 兜底与换片连发 —— 缺失 ≠ 0，绝不当'没发生'通过"。
+
+### 单测（`tests/test_analyze_longrun.py::TestReviewFallbackAndBurst`，6 条）
+
+`test_new_events_have_buckets_and_are_not_unmapped`、`test_fallback_no_target_and_burst_are_info_and_visible`、
+`test_burst_with_verified_is_warning_not_red`、`test_no_target_then_guard_still_complains_is_warning`、
+`test_fallback_failed_is_warning_not_red`、`test_old_ledger_without_events_is_undecidable_not_zero`。
+
+**实现坑（写在这防复发）**：`as_int(value, default=0)`（`tools/analyze-longrun.py:628`）会把缺失值变 0 ⇒
+`pending_walk` 形态只有 `tiles` 没有 `plot_tiles`，一开始被算成 `plot_tiles=0`；改成
+`as_int(ev.get("plot_tiles"), None)`。
+
+### 读数（task-130，2026-10-16）
+
+`py_compile -W error::SyntaxWarning` exit 0；`tests.test_analyze_longrun` **146 OK**（+6）；
+`discover -s tests` **718 tests**（其中 2 条 FAIL 属 dev 在制的 `brain/agentfarm/farmwork.py` +
+`tests/test_farmwork.py::TestSeedOffers::test_pick_three_codes`（`assertIsNone(pick)` 拿到 `(O)482 Pepper Seeds`）
+与 `tests/test_longrun.py::TestTask67SeedChoice::test_cannot_afford_does_not_buy`（`['472','(O)482'] != ['472']`）
+—— 与本工具零接触面，我的两个文件从不 import farmwork）；
+机械枚举改前 **7 个未映射**（3 结构性 + 上述 4 个真事件）⇒ 改后只剩 3 个结构性。
+九账本 rc（本工具 / `verify-run3.py`）：green 0/0、run2 1/1、run3 1/1、run5 1/1、run6 1/1、run7 0/0、
+run8 1/1、**run9 1/1**、vacuum 1/1 —— 一字未变（输出留档 `scratch\_t130_*.txt` / `scratch\_t130_v3_*.txt`）。
+
+### grep 配方
+
+```
+git grep -n "_journal(\"review_only\|_journal(\"plot_exhausted_burst" -- brain/agentfarm/longrun.py
+rg -n '"event": ?"(review_only_fallback|review_only_no_target|plot_exhausted_burst)"' logs/longrun-*.jsonl
+python tools/analyze-longrun.py --journal logs/<run>.jsonl | rg "review 兜底/换片连发|burst 当天却自称"
+```
+
 ## 4. 复核命令
 
 ```
@@ -572,6 +625,6 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run8.jsonl   # r
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
 python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
-python -m unittest tests.test_analyze_longrun  # 当前 140 OK（task-120）
-python -m unittest discover -s tests           # 当前 690 OK（0 红；0.7.28 装机放行条件）
+python -m unittest tests.test_analyze_longrun  # 当前 146 OK（task-130）
+python -m unittest discover -s tests           # 当前 718 tests（其中 2 条 FAIL 属 dev 在制的 farmwork/longrun，非本工具）
 ```

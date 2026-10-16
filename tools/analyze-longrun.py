@@ -95,6 +95,16 @@
     头部 `LLM 复盘/教训库` 行给可 grep 的 `教训库写入 N 条 / 跳过 M 条（不可信）/ 拒收 K 条（其中不可信 J 条）`；
     **全部不判红**（`skipped_untrusted>0` 是好事），只有 `skipped_untrusted>0 且 written==0` **连续 ≥2 天**
     给 `warn:lessons_all_untrusted` 可视行；缺字段 ⇒ 只进【无法判定】（缺失 ≠ 0，绝不当"没有不可信条目"通过）。
+  * review 兜底与换片连发（task-124 / task-130）：`review_only_fallback`（review 独苗却有活 ⇒
+    换成能落地的意图 `source=work_spot` / 把人带回跨片 leftover `source=pending_walk`）、
+    `review_only_no_target`（兜底也拿不出目标 ⇒ 把守卫抱怨的 leftover 如实记为"今天放弃"，
+    `pending`/`tiles`，次日重试、不碰判定字段）、`plot_exhausted_burst`（同一秒 ≥5 次换片 ⇒
+    按有界机制收尾；brain `PLOT_EXHAUSTED_BURST=5`）、`review_only_fallback_failed`（防御性）。
+    头部 `review 兜底/换片连发` 行 + 建议 0p。**本身一律不判红**（它们是修复生效的证据，
+    `tools\verify-run3.py` 对这四个名字零命中 ⇒ 判红会两边反向）；只给三条**可证伪形态**的 ⚠ 警告：
+    ①burst 当天却自称 `verified=true`（连发=没目标的证据，与 VERIFIED 互斥）；②弃权后当天
+    `ended_reason` 仍说"守卫仍说还有活"（弃权没生效）；③兜底出简报抛异常。旧账本没有这些事件
+    ⇒ 头部 `<缺失>` + 【无法判定】（**缺失 ≠ 0 = 没发生过**，绝不当"没发生"通过）。
   * 事件映射不许漂移（Lead m02395）：brain 里 `_journal("<name>"` 的**每个**事件名都要在
     `EVENT_BUCKETS` 里有桶（结构性事件 `day_start`/`day_end`/`finish` 除外，见 `STRUCTURAL_EVENTS`）；
     账本里出现没桶的事件 ⇒ 报告头部逐条点名（名字×次数+行号）+ 建议 0a，**绝不静默丢弃**。
@@ -352,6 +362,22 @@ FIELD_PROBES = [
      "决策史条数（task-58 的 `Brief.recent_decisions` 注入 = 账本里 `decision` 事件数；每条还补了 "
      "terminal/leftover/unreachable/refused/where 具名田区，**无坐标**）⇒ 头部`决策:`行已给总数；"
      "复盘/教训库是否被注入要看 `review_llm.notes` / `lessons.total`"),
+    # task-124 / task-130：review 兜底（决策被换成能落地的意图）+ 弃权 + 换片连发。
+    # ⇒ 这些事件是**修复生效的证据**，本身不判红（verify-run3.py 对这四个名字零命中
+    # ⇒ 判红会两边反向）；只有可证伪形态才给 ⚠ 警告（burst 连发当天却自称 VERIFIED /
+    # 弃权后守卫仍抱怨同批 leftover / 兜底路径抛异常）。缺失 ⇒【无法判定】（缺失 ≠ 0）。
+    ("event:review_only_fallback", "review_only_fallback",
+     "review 独苗却有活 ⇒ 换成能落地的意图（source=work_spot）或把人带回跨片 leftover"
+     "（source=pending_walk）（task-124：plot_tiles|tiles/walked/attempt/reasons/intents）"
+     "⇒ **修复生效的证据，不判红**"),
+    ("event:review_only_fallback_failed", "review_only_fallback_failed",
+     "兜底时出简报抛异常（task-124：source/error）⇒ 防御性事件，正常路径不该出现 ⇒ 只给 ⚠ 警告"),
+    ("event:review_only_no_target", "review_only_no_target",
+     "确定性计划也拿不出目标 ⇒ 把守卫据以抱怨的 leftover 如实记为「今天放弃」（task-124："
+     "pending/tiles/reasons）⇒ 弃权本身不判红；当天 ended_reason 仍说『守卫仍说还有活』⇒ ⚠ 警告"),
+    ("event:plot_exhausted_burst", "plot_exhausted_burst",
+     "同一秒 ≥5 次换片（task-124：count/zone；brain PLOT_EXHAUSTED_BURST=5）⇒ 按既有有界机制"
+     "收尾，不判红；burst 当天仍自称 VERIFIED ⇒ ⚠ 警告（连发=没目标的证据，与 VERIFIED 互斥）"),
 ]
 OUTCOME_RE = re.compile(
     r"目标\s*(\d+)\s*步：做成\s*(\d+)、跳过\s*(\d+)、失败\s*(\d+)"
@@ -529,6 +555,16 @@ EVENT_BUCKETS = {
     # task-114 F1：教训库 schema 校验丢条留痕 ⇒ **拒收本身不判红**（外部篡改/损坏时拒收是正确行为），
     # 只有「dropped>0 且 kept==0 连续 ≥2 天」给 `warn:` 可视行（不判红、不进 rc）
     "lessons_rejected": "lessons_rejections",
+    # task-124（`08a2ae0`）/ task-130：**review 兜底与换片连发** —— 不是失败，是修复生效的证据：
+    #     `review_only_fallback` = review 独苗却有活 ⇒ 换成能落地的意图（work_spot）或把人带回
+    #     跨片 leftover（pending_walk）；`review_only_no_target` = 兜底也拿不出目标 ⇒ 把守卫抱怨的
+    #     leftover 如实记为"今天放弃"（次日重试、不碰判定字段）；`plot_exhausted_burst` = 同一秒
+    #     ≥5 次换片 ⇒ 按既有有界机制收尾；`review_only_fallback_failed` = 防御性（抛异常）。
+    #     `verify-run3.py` 对这四个名字零命中 ⇒ 本工具**不判红**，只给可证伪形态的 ⚠ 警告。
+    "review_only_fallback": "review_only_fallbacks",
+    "review_only_fallback_failed": "review_only_fallback_failures",
+    "review_only_no_target": "review_only_no_targets",
+    "plot_exhausted_burst": "plot_exhausted_bursts",
 }
 
 #: 结构性事件：由报告的其他字段单独统计（day_start/day_end 切会话与验收、finish 自述），
@@ -574,6 +610,9 @@ NEW_EVENT_BUCKETS = (
     "lessons_load_failures", "lessons_save_failures",
     # task-114：教训库拒收留痕（拒收本身不是失败；连续全丢才给 warn）
     "lessons_rejections",
+    # task-124/task-130：review 兜底（work_spot/pending_walk）+ 弃权留痕 + 换片连发
+    "review_only_fallbacks", "review_only_fallback_failures",
+    "review_only_no_targets", "plot_exhausted_bursts",
 )
 
 
@@ -2248,6 +2287,34 @@ def build_advice(report, top=8):
                        if sf.get("skipped") else ""),
             "lines": sf.get("lines") or [],
         })
+    # 0p) task-124/task-130：review 兜底 / 弃权 / 换片连发 —— **修复生效的证据，不判红**；
+    # 只有可证伪形态给 ⚠ 警告（burst 当天却 VERIFIED / 弃权后守卫仍抱怨 / 兜底抛异常）。
+    rfa = report.get("review_fallback") or {}
+    if rfa.get("has_events"):
+        _rparts = [f"兜底 {rfa.get('fallback_events', 0)} 次"
+                   f"（work_spot {rfa.get('fallback_work_spot', 0)} / pending_walk "
+                   f"{rfa.get('fallback_pending_walk', 0)}；带路成功 {rfa.get('fallback_walked', 0)} 次）",
+                   f"弃权 {rfa.get('no_target_events', 0)} 次（{rfa.get('no_target_pending', 0)} 格当日放弃、"
+                   "次日重试）",
+                   f"换片连发 {rfa.get('burst_events', 0)} 次（最多一次 count={rfa.get('burst_max', 0)}）"]
+        if rfa.get("warn_burst_verified_lines"):
+            _rparts.append(f"⚠ burst 当天却自称 VERIFIED：{'、'.join(str(x) for x in (rfa.get('warn_burst_verified_days') or [])[:3])}"
+                           "（连发=没目标的证据，与 VERIFIED 互斥；只警告）")
+        if rfa.get("warn_no_target_still_guarded_lines"):
+            _rparts.append(f"⚠ 弃权后守卫仍抱怨同批 leftover："
+                           f"{'、'.join(str(x) for x in (rfa.get('warn_no_target_still_guarded_days') or [])[:3])}"
+                           "（弃权没生效；只警告）")
+        if rfa.get("failed_events"):
+            _rparts.append(f"⚠ 兜底抛异常 {rfa.get('failed_events')} 次（{rfa.get('failed_errors', [])[:2]}）")
+        advice.append({
+            "text": "review 兜底/换片连发（信息项，**不是失败**）：" + "；".join(_rparts)
+                    + "。这些事件是 task-124 修复生效的证据（review 独苗时改走能落地的意图 / "
+                      "把人带回跨片 leftover / 把换片空转按有界机制收尾）；verify-run3.py 对它们零命中 "
+                      "⇒ 本工具只给上面这几条可证伪形态的 ⚠ 警告，**不判红、不进 rc**；"
+                      "旧账本没有这些事件 ⇒ 写【无法判定】（缺失 ≠ 0）",
+            "lines": sorted(set((rfa.get("fallback_lines") or []) + (rfa.get("no_target_lines") or [])
+                                + (rfa.get("burst_lines") or []) + (rfa.get("failed_lines") or []))),
+        })
     # 0c) 环境挡路 / 没拿到结论（task-22 记账）
     env = report.get("env_inconclusive") or {}
     if env.get("env_fail_events"):
@@ -2531,6 +2598,19 @@ def build_undecidable(rows, sessions, prelude, report):
         if _lr.get("rejected_events") and not _lr.get("rejected_untrusted_lines"):
             out.append("`lessons_rejected` 没有 `untrusted` 字段（或恒 0）：无法判定这次载入"
                        "有没有不可信条目（缺失 ≠ 0；task-118 A / task-120）")
+    # task-124/task-130：review 兜底 / 弃权 / 换片连发 的证据是否存在
+    # （缺失 ⇒【无法判定】；**缺失 ≠ 0 = 没发生过**，也绝不当"没有兜底/没连发"通过）
+    _rf_ev = [ev for _ln, ev in rows
+              if ev.get("event") in ("review_only_fallback", "review_only_fallback_failed",
+                                     "review_only_no_target", "plot_exhausted_burst")]
+    _rf = report.get("review_fallback") or {}
+    if rows and not _rf_ev:
+        out.append("本账本没有任何 task-124 的兜底/弃权/连发事件（`review_only_fallback`/"
+                   "`review_only_fallback_failed`/`review_only_no_target`/`plot_exhausted_burst`）："
+                   "无法判定当天是否出现过 review 兜底与换片连发 —— **缺失 ≠ 0，绝不当'没发生'通过**"
+                   "（task-124/130）")
+    elif _rf_ev and not _rf.get("has_events"):
+        out.append("task-124 事件存在但没进聚合（工具 bug 迹象）：无法判定兜底/弃权/连发计数")
     # task-36：自称浇过、却没有 final_water 可核对的那些天（verify-run3.py:414-418 同口径：只记信息项）
     no_fw = [
         lineno for lineno, ev in rows
@@ -3156,6 +3236,71 @@ def build_report(rows, path, args, bad_lines):
                 llm_review["file_status"] = "corrupt"
                 llm_review["file_error"] = f"{type(exc).__name__}: {exc}"
     llm_reds = llm_review_findings(llm_review)
+    # task-124/task-130：review 兜底 / 弃权 / 换片连发 —— **修复生效的证据**（本身不判红；
+    # verify-run3.py 对这四个事件零命中 ⇒ 判红会两边反向）。只给可证伪形态的 ⚠ 警告：
+    #   ①`plot_exhausted_burst` 当天却自称 VERIFIED（连发=没目标的证据，与 VERIFIED 互斥）；
+    #   ②弃权（`review_only_no_target`）之后当天 ended_reason 仍说"守卫仍说还有活"（弃权没生效）；
+    #   ③兜底路径抛异常（`review_only_fallback_failed`，防御性事件）。
+    _rv_fb = [(ln, ev) for ln, ev in rows if ev.get("event") == "review_only_fallback"]
+    _rv_fbf = [(ln, ev) for ln, ev in rows if ev.get("event") == "review_only_fallback_failed"]
+    _rv_nt = [(ln, ev) for ln, ev in rows if ev.get("event") == "review_only_no_target"]
+    _rv_burst = [(ln, ev) for ln, ev in rows if ev.get("event") == "plot_exhausted_burst"]
+    review_fallback = {
+        "fallback_events": len(_rv_fb), "fallback_lines": [ln for ln, _ in _rv_fb],
+        "fallback_work_spot": 0, "fallback_pending_walk": 0, "fallback_walked": 0,
+        "fallback_tiles": 0, "fallback_intents": {},
+        "failed_events": len(_rv_fbf), "failed_lines": [ln for ln, _ in _rv_fbf],
+        "failed_errors": [],
+        "no_target_events": len(_rv_nt), "no_target_lines": [ln for ln, _ in _rv_nt],
+        "no_target_pending": 0, "no_target_tiles": [],
+        "burst_events": len(_rv_burst), "burst_lines": [ln for ln, _ in _rv_burst],
+        "burst_max": 0, "burst_zones": [],
+        "warn_burst_verified_days": [], "warn_burst_verified_lines": [],
+        "warn_no_target_still_guarded_days": [], "warn_no_target_still_guarded_lines": [],
+        "has_events": bool(_rv_fb or _rv_fbf or _rv_nt or _rv_burst),
+    }
+    for _ln, ev in _rv_fb:
+        _src = str(ev.get("source") or "")
+        if _src == "work_spot":
+            review_fallback["fallback_work_spot"] += 1
+        elif _src == "pending_walk":
+            review_fallback["fallback_pending_walk"] += 1
+        _pt = as_int(ev.get("plot_tiles"), None)
+        if _pt is None:
+            _pt = as_int(ev.get("tiles"))
+        review_fallback["fallback_tiles"] += _pt or 0
+        if ev.get("walked") is True:
+            review_fallback["fallback_walked"] += 1
+        for _tk in (ev.get("intents") or []):
+            _tks = str(_tk)
+            review_fallback["fallback_intents"][_tks] = \
+                review_fallback["fallback_intents"].get(_tks, 0) + 1
+    for _ln, ev in _rv_fbf:
+        review_fallback["failed_errors"].append(str(ev.get("error") or ""))
+    for _ln, ev in _rv_nt:
+        review_fallback["no_target_pending"] += as_int(ev.get("pending")) or 0
+        for _tl in (ev.get("tiles") or [])[:12]:
+            if isinstance(_tl, list) and len(_tl) >= 2:
+                review_fallback["no_target_tiles"].append([_tl[0], _tl[1]])
+    for _ln, ev in _rv_burst:
+        review_fallback["burst_max"] = max(review_fallback["burst_max"], as_int(ev.get("count")) or 0)
+        _z = str(ev.get("zone") or "")
+        if _z and _z not in review_fallback["burst_zones"]:
+            review_fallback["burst_zones"].append(_z)
+        _lab, _di = _lr_day_of(_ln)
+        if _di is not None and _di < len(days) and days[_di].get("verified") is True:
+            review_fallback["warn_burst_verified_lines"].append(_ln)
+            if _lab not in review_fallback["warn_burst_verified_days"]:
+                review_fallback["warn_burst_verified_days"].append(_lab)
+    for _ln, ev in _rv_nt:
+        _lab, _di = _lr_day_of(_ln)
+        if _di is None or _di >= len(days):
+            continue
+        _der = str(days[_di].get("ended_reason") or "")
+        if "守卫仍说还有活" in _der:
+            review_fallback["warn_no_target_still_guarded_lines"].append(_ln)
+            if _lab not in review_fallback["warn_no_target_still_guarded_days"]:
+                review_fallback["warn_no_target_still_guarded_days"].append(_lab)
     sleep_ok = sum(1 for _, ev in rows if ev.get("event") == "sleep" and ev.get("ok"))
     sleep_failed = sum(1 for _, ev in rows if ev.get("event") == "sleep" and not ev.get("ok"))
     blocked_by_action = {}
@@ -3235,6 +3380,9 @@ def build_report(rows, path, args, bad_lines):
         "bag_space": bag_space,
         # task-111：LLM 收工复盘 / 跨日教训库（task-58/59/82；只有三条完整性红，其余信息项）
         "llm_review": llm_review,
+        # task-124/task-130：review 兜底（work_spot/pending_walk）/ 弃权 / 换片连发
+        # —— 修复生效的证据，不判红；只有 burst+VERIFIED、弃权后守卫仍抱怨 给 ⚠ 警告
+        "review_fallback": review_fallback,
         "unmapped_events": unmapped_events,
         "no_day_progress": [
             {"line": ln, "reason": ev.get("reason"), "ended_by": ev.get("ended_by")}
@@ -3739,6 +3887,19 @@ MAPPING_TEXT = [
      "`skipped_untrusted>0` 是**好事**（防洗白生效），只有 `skipped_untrusted>0 且 written==0` **连续 ≥2 天**"
      "才给 `warn:lessons_all_untrusted` 可视行（库被外部整版污染，只警告、不进 rc）；"
      "缺 `written`/`skipped_untrusted`/`untrusted` ⇒ 只进【无法判定】（缺失 ≠ 0，绝不当'没有不可信条目'通过）"),
+    ("review_only_fallback / review_only_fallback_failed / review_only_no_target / "
+     "plot_exhausted_burst（task-124、task-130）",
+     "review 兜底与换片连发（**本身一律不判红** —— 它们是 task-124 修复生效的证据，"
+     "verify-run3.py 对这四个名字零命中 ⇒ 判红会两边反向）：①`review_only_fallback` = review 独苗"
+     "却有活 ⇒ 换成能落地的意图（`source=work_spot`：按观测里看得见的待浇/待收/待清作物出简报）"
+     "或把人带回跨片 leftover（`source=pending_walk` + `walked`）；②`review_only_no_target` = 兜底"
+     "也拿不出目标 ⇒ 把守卫抱怨的 leftover 如实记为「当天放弃」（`pending`/`tiles`，次日重试、"
+     "不碰判定字段）；③`plot_exhausted_burst` = 同一秒 ≥5 次换片（`count`/`zone`；brain "
+     "`PLOT_EXHAUSTED_BURST=5`）⇒ 按既有有界机制收尾；④`review_only_fallback_failed` = 兜底出简报"
+     "抛异常（防御性，正常路径不该出现）。头部'review 兜底/换片连发'行 + 建议 0p；**只给可证伪形态的 "
+     "⚠ 警告**：burst 当天却自称 VERIFIED（连发=没目标的证据，与 VERIFIED 互斥）/ 弃权后台 `ended_reason` "
+     "仍说『守卫仍说还有活』（弃权没生效）/ 兜底抛异常；旧账本没有这些事件 ⇒ 头部 `<缺失>` + "
+     "【无法判定】（缺失 ≠ 0，绝不当'没发生'通过）"),
     ("encircled / encircled_stage / encircled_summary（task-68、task-76）",
      "5 环境挡路·可达性/开路（信息项，**无硬闸门 ⇒ 一律不判红**）：被不可清障物围住（四邻没有"
      "「可站+可清」的突破口）＝与 `unreachable`（物理走不到）**分开计数**、不封格、不进任何豁免分子；"
@@ -3930,6 +4091,32 @@ def render_text(report, top):
            if bs.get("modal_dismiss_failures") else ""))
     pc, ws = report["events"].get("plots_capped", 0), report["events"].get("work_spot", 0)
     add(f"软上限/收尾: plots_capped {pc} 次（作业区配额到顶，信息项）；work_spot {ws} 次（收尾作业区）")
+    # task-124/task-130：review 兜底 / 弃权 / 换片连发 —— 修复生效的证据（不判红），
+    # 只给可证伪形态的 ⚠ 警告；旧账本没有这些事件 ⇒ `<缺失>`（缺失 ≠ 0 = 没发生过）。
+    rf = report.get("review_fallback") or {}
+    if not rf.get("has_events"):
+        add("review 兜底/换片连发: <缺失>（本账本没有 review_only_* / plot_exhausted_burst 事件 ⇒ "
+            "无法判定是否出现过；缺失 ≠ 0）")
+    else:
+        _itxt = "、".join(f"{k}×{v}" for k, v in list((rf.get("fallback_intents") or {}).items())[:4])
+        add(f"review 兜底/换片连发: 兜底 {rf.get('fallback_events', 0)} 次"
+            f"（work_spot {rf.get('fallback_work_spot', 0)} / pending_walk {rf.get('fallback_pending_walk', 0)}"
+            f"；带路成功 {rf.get('fallback_walked', 0)} 次、覆盖 {rf.get('fallback_tiles', 0)} 格"
+            + (f"；意图 {_itxt}" if _itxt else "") + "）；"
+            f"弃权 {rf.get('no_target_events', 0)} 次（{rf.get('no_target_pending', 0)} 格当日放弃、次日重试）；"
+            f"换片连发 {rf.get('burst_events', 0)} 次（最多一次 count={rf.get('burst_max', 0)}"
+            + (f"、zone={rf.get('burst_zones')}" if rf.get("burst_zones") else "") + "）"
+            + (f"  ⚠ burst 当天却自称 VERIFIED：{rf.get('warn_burst_verified_days')}"
+               f"（行 {rf.get('warn_burst_verified_lines', [])[:4]}）"
+               "——连发=没目标的证据，与 VERIFIED 互斥（只警告、不判红）"
+               if rf.get("warn_burst_verified_lines") else "")
+            + (f"  ⚠ 弃权后守卫仍抱怨同批 leftover：{rf.get('warn_no_target_still_guarded_days')}"
+               f"（行 {rf.get('warn_no_target_still_guarded_lines', [])[:4]}）——弃权没生效（只警告）"
+               if rf.get("warn_no_target_still_guarded_lines") else "")
+            + (f"  ⚠ 兜底抛异常 {rf.get('failed_events')} 次（{rf.get('failed_errors', [])[:2]}）"
+               if rf.get("failed_events") else "")
+            + "；口径：这些事件**不是失败**（是 task-124 修复生效的证据）"
+              "，verify-run3.py 对它们零命中 ⇒ 本工具只警告不判红")
     # task-111：LLM 收工复盘 / 跨日教训库（task-58/59/82）—— "模型没学到东西"不是失败，只呈现
     lri = report.get("llm_review") or {}
     if not lri.get("has_events"):
