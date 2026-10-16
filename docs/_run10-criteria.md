@@ -27,9 +27,9 @@
 4. **长度/预算**：教训注入 ≤3 条、notes ≤3 条、decision 史 ≤5 条（`Brief` 口径），预算挤干时按 核心 > 教训 > 决策史 > 笔记 丢弃 —— run B 的证据里要写清"这次到底注入了哪几条"。
 
 ## 3. 交付物
-- `docs/_run10-evidence.md`：§1 起跑四要素（必须与 run9 同 Mod/同 brain，只有 journal 不同）；§2 两侧工具原文（`verify-run3` 的 `verdict` + `strict_verdict` 两行、`analyze-longrun --window` 默认口径）；§3 外部证据（存档 size/mtime、SMAPI 窗口冻结、`NewJourney`/`Save` 配对）；§4 **L1–L5 逐条**（附 `tools/compare-runs.py` 原文）；§5 反混淆与盲区；§6 结论（**要么给出可复核的 A→B 对照，要么写"不足以判定自我进化"**）。
+- `docs/_run10-evidence.md`：§1 起跑四要素（必须与 run A 同 Mod/同 brain，只有 journal 不同）；§2 两侧工具原文（`verify-run3` 的 `verdict` + `strict_verdict` 两行、`analyze-longrun --window` 默认口径）；§3 外部证据（存档 size/mtime、SMAPI 窗口冻结、`NewJourney`/`Save` 配对）；§4 **L1–L5 逐条**（附 `tools/compare-runs.py` 原文）；§5 反混淆与盲区；§6 结论（**要么给出可复核的 A→B 对照，要么写"不足以判定自我进化"**）。
 - `tools/compare-runs.py` 的原文输出（含 lessons/hints/decision 三段）。
 
 ## 4. 与主目标的关系
-- 主目标（用户 2026-10-17 改定**目标 2**）以 **run A 的尾部连续 5 个游戏日 VERIFIED + 四腿 + 经济闭环** 为准（run9 实测 0/3、run9b 首个整天全绿、run9c 诊断性 3/3 ⇒ 必须在 **0.7.31** 上重跑为 **run9d（5 天）**）；演进（L0–L5）是**同一目标里的能力项**，仍**不得**用"学到教训"替代达标判定，也不得用达标替代演进证据。
+- 主目标（用户 2026-10-17 改定**目标 2**）以 **run A（0.7.32，5 天）的小尾巴连续 5 个游戏日 VERIFIED + 四腿 + 经济闭环** 为准；历史轮只作诊断：run9（0/3）、run9b（首个整天全绿但尾部 0/3）、run9c（诊断性 3/3，含假达标日）、run9d（0/5，落盘 8/8 但两条结构性病灶 ⇒ task-157/158 修）。演进（L0–L5）是**同一目标里的能力项**，仍**不得**用"学到教训"替代达标判定，也不得用达标替代演进证据。
 - 若 run A 达标而 run B 因世界条件退化而未达标，按 L4 如实记录，不掩盖、不重跑刷分（重跑必须写明是第几次、为什么）。
