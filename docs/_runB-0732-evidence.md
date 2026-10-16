@@ -1,6 +1,6 @@
 # run B（task-113）证据 —— 0.7.32 · 与 run A 同构建
 
-> **状态：已提前叫停**（脑进程 PID `10480` 于 `2026-10-17T04:50:42` 停止；**没有 `finish` 行**；游戏保持运行 `fall 11 tod 700`）。
+> **状态：已提前叫停；游戏已优雅退出**（脑进程 PID `10480` 于 `2026-10-17T04:50:42` 停止，**没有 `finish` 行**；叫停时游戏在 `fall 11 tod 700`，其后游戏自行走时钟到 `05:04:35` 自动跨夜，随后按 m02833 用 `tools\stop-game.py` 退出 ⇒ 见 §7 诚实声明）。
 > 叫停理由与停止点留档见 **§0**（Lead m02439 裁定：`[60,29]` 熟了却摘不到 ⇒ 0.7.32 代码病 ⇒ B 臂是"因病退化的无效对照臂"）。
 > 结构：§0 提前叫停 / §1 起跑与前置 / §2 `[60,29]` 现场 / §3 SMAPI 六串 / §4 逐日表与两侧工具 / §5 存档链与观测计数 / §6 世界差分 / §7 保留物·不确定项·诚实声明 / §8 A/B 对照（结论标"L2 及以下不可用"）。
 > 判据纪律：**只认独立观测差分**（`observe?detail=full`），回执不作证据；缺失字段写【无法判定】，**缺失 ≠ 通过**。
@@ -140,7 +140,7 @@ farm                 = {"crops": 102, "ripeCrops": 1, "unwateredCrops": 5, "dryC
 
 - `logs\longrun-runB-0732-llm.jsonl`：**48 行 = 47 条 `decision` + 1 条 `review`**；**47/47 条 `decision` 的 prompt 里都出现「教训」节**，唯一不含的是那 1 条非决策的 `review` 行（#42）。
 - 现场教训库（会被 B 持续重写）此刻 = `{"lessons":[6 条]}`：`stuck_with_leftover|harvest` count **48**、`stage_incomplete|harvest` count **120**、`dead_crops_blocking|farm` count 4、`stuck_with_leftover|water_area` count 4、`stuck_with_leftover|plant_area` count 1、`stuck_with_leftover|till_area` count 1（Lead 04:3x 直查时 `stage_incomplete|harvest` 还是 79 ⇒ 它在跑动中增长）。
-- `tools\compare-runs.py` 存在（`--run-a/--run-b/--label-a/--label-b/--json`）；其 `lessons_total / lessons_hits / injection_effective` 三键已抄进 **§8.1**：工具报 `injection_effective = false`（0/6 命中），与本节直查的 **47/47** 矛盾 ⇒ **已按 Lead 要求先上报、本文件不下结论**。
+- `tools\compare-runs.py` 存在（`--run-a/--run-b/--label-a/--label-b/--json`）；其 `lessons_total / lessons_hits / injection_effective` 三键见 **§8.1**：**修正后（`2e3289e`）= `lessons_total 6` / `lessons_hits 4` / `injection_effective true` / `lesson_section_present true`**，与本节直查的 **47/47** 同向（旧版 `false`/0 命中是工具字段口径错误导致的误报，已裁定）。
 
 ---
 
@@ -208,9 +208,11 @@ farm                 = {"crops": 102, "ripeCrops": 1, "unwateredCrops": 5, "dryC
 2. run B 的 fall 10 端点 A 是 `FarmHouse` 观测 ⇒ 该日 tile 差分不可比（已在 §6 标注）。
 3. `fall 9` 当天 `ok_steps=0` 却 `zero_action_evidenced=false` ⇒ **守卫没有为"0 步成功的一天"落下零动作标记**（与 fall 10 的 `zero_action_evidenced=true` 形成对照），这条留给 harvest/守卫相关任务（task-169 现场）。
 4. `deferred_tiles=1` 与按阶段自算 `0` 不一致；`assigned_undone=1` 无 `stage_shortfall_day` 落痕 ⇒ 无法交叉核对。
-5. **L1 口径冲突（已报 Lead，待裁）**：`compare-runs.py` 报"0/6 条教训文本命中"、`injection_effective` 警告"教训根本没送到"；我的直查是 `llm.jsonl` **47/47 条 `decision` 的 prompt 都含「教训」节**（唯一不含的是 1 条非决策 `review`）。两把尺子量的不是同一个东西，**不作结论**。
+5. **L1 口径冲突（已裁定：工具误报，已修 `2e3289e`）**：旧版 `compare-runs.py` 报"0/6 条教训文本命中"、`injection_effective=false`；根因是 `lesson_text()` 只认 `lesson/text/summary/note/why/reason`，而 brain 写进 `<journal>-lessons.json` 的字段是 `id/symptom/evidence/hint/count` ⇒ 取不到值后退化成"把所有字段拼成长串"，永远不可能命中。修正后 = **4/6 命中 + 教训节抬头 ✅ + L1 ✅**，与我的直查同向：`llm.jsonl` **47/47 条 `decision` 的 prompt 都含「教训」节**（唯一不含的是 1 条非决策 `review`）。**L1 成立；L2 及以下仍不可用（见 §8.4）。**
 
-**诚实声明**：run B 是**提前叫停的无效对照臂**（0/2 天 VERIFIED、无 `finish`）；本文件**不据此宣称"有进化"也不宣称"没有进化"**；游戏进程保留未退（`fall 11 tod 700`、桥就绪），`[60,29]` 现场已按 Lead 要求另存。
+**诚实声明**：run B 是**提前叫停的无效对照臂**（0/2 天 VERIFIED、无 `finish`）；本文件**不据此宣称"有进化"也不宣称"没有进化"**；`[60,29]` 现场已按 Lead 要求另存（`scratch\runB-0732-tile6029-live.json`）。
+
+**收尾后续（Lead m02500 之后补记）**：脑进程停在 `fall 11 tod 700`（人站在 `Farm[60,28]`）之后**游戏继续自行走时钟**，到 `05:04:35` 已自动跨过一次夜 ⇒ 退出前存档 = **`Wahaha_450799035` 4310486 B / `2026-10-17 05:04:35.296`**（`SaveGameInfo` 28707 / `05:04:35.298`；`_old` = 4281756 / `04:49:43.856`、`SaveGameInfo_old` 28760 / `04:49:43.857`）。随后按 m02833 用 `tools\stop-game.py` **优雅退出**（rc=0、`✅ 游戏已退出（原 pids=[20672]）`）：进程 **0** / `bridge.json` **已删** / 17890 **无 LISTENING（2 条 TIME_WAIT）** / 存档四条**退出前后逐字未变**。⇒ **将来重开读档时的起点是夜里自动推进后的那一天**（`fall 12` 06:00 一带，不是 `fall 11`），`[60,29]` 的熟作物样本仍在存档里、可直接做 harvest 修复后的同格对照。
 
 ## §8 A/B 对照（结论：**L0/L1 成立；L2 及以下不可用**）
 
@@ -226,30 +228,32 @@ farm                 = {"crops": 102, "ripeCrops": 1, "unwateredCrops": 5, "dryC
 
 ⇒ **B 的起点比 A 干净得多（dry 0 vs 125）**，且 A→B 之间游戏自行推进了 6 个游戏日（含一次升级）。**这行背景必须与 L2 以下同读；不得把它当作"B 更差/更好"的因果。**
 
-### 8.1 `[5] run A 教训库 → run B 提示词命中`（原文照抄，含争议）
+### 8.1 `[5] run A 教训库 → run B 提示词命中`（**修正后原文**）
+
+> **旧版"0/6 + 教训根本没送到"是工具误报，已由 Lead 裁定并修复（commit `2e3289e`）**：根因 `tools\compare-runs.py` 的 `lesson_text()` 只认 `lesson/text/summary/note/why/reason`，而 brain 写进 `<journal>-lessons.json` 的字段是 `id/symptom/evidence/hint/count` ⇒ 取不到值后退化成"把所有字段拼成长串"，自然不可能是提示词子串。修法：按渲染顺序取键（`hint` 优先）做子串命中、新增 `lesson_full_text()`（症状+证据+自述）供 L3 同指涉词表用、新增教训节抬头结构性核对 `LESSON_SECTION_MARK = "从过去几天的账本里总结的教训"`、命中 0 但节在只报「比对口径警告」、`tests\test_compare_runs.py` 加 6 条回归用例（`Ran 23 tests … OK`）。**我的直查（`llm.jsonl` 47/47 条 `decision` 的 prompt 含「教训」节）是对的，工具错了。**
 
 ```
 [5] run A 教训库 → run B 提示词命中
   教训库 D:\Deepseek Harness Workspace\星露谷游戏自动化\logs\longrun-runA-0732-lessons.json：6 条
-   1. [❌ 未见] stuck_with_leftover|harvest / stuck_with_leftover / harvest / harvest 收尾时还剩 1 格没做成、当天以 stuck 结束
-   2. [❌ 未见] stuck_with_leftover|plant_area / stuck_with_leftover / plant_area / plant_area 收尾时还剩 1 格没做成、当天以
-   3. [❌ 未见] stuck_with_leftover|till_area / stuck_with_leftover / till_area / till_area 收尾时还剩 4 格没做成、当天以 stu
-   4. [❌ 未见] stage_incomplete|harvest / stage_incomplete / harvest / harvest 有 1 格没做成，还剩 1 格 / failed=1 lefto
-   5. [❌ 未见] dead_crops_blocking|farm / dead_crops_blocking / farm / 枯死作物占着地，浇水和当天验收过不去 / dead_crops=1 dry_de
-   6. [❌ 未见] stuck_with_leftover|water_area / stuck_with_leftover / water_area / water_area 收尾时还剩 46 格没做成、当天以
-  ⇒ 0/6 条教训文本出现在 run B 的 72 次 LLM 调用提示词里（子串比对；注入后被裁掉的部分算未见）
-  ❌ 注入口径警告：run A 有教训、run B 也有 LLM 调用，却一条教训都没进提示词
-     —— 这不是「未观察到演进」，而是「教训根本没送到」；先查文件发现路径/裁切顺序。
+   1. [✅ 进提示词] 体力已归零，明天别一早就硬撑，留出回程和补给的余量。
+   2. [❌ 未见] 西北那片地进场先收成熟作物，今天有一次采收没摘到；摘完再看其他田区，别被同一格卡住。
+   3. [❌ 未见] 西北那片地进场先收成熟作物，今天有一次采收没摘到；摘完再看其他田区，别被同一格卡住。
+   4. [✅ 进提示词] 体力已归零，明天别一早就硬撑，留出回程和补给的余量。
+   5. [✅ 进提示词] 体力已归零，明天别一早就硬撑，留出回程和补给的余量。
+   6. [✅ 进提示词] 体力已归零，明天别一早就硬撑，留出回程和补给的余量。
+  ⇒ 4/6 条教训文本出现在 run B 的 72 次 LLM 调用提示词里（子串比对；注入后被裁掉的部分算未见）
+  教训节抬头「从过去几天的账本里总结的教训」在 run B 提示词里：✅ 出现
 ```
 
-**与 §2.4 直查的冲突（待 Lead 裁）**：`logs\longrun-runB-0732-llm.jsonl` = 48 行 = **47 条 `decision` + 1 条 `review`**，**47/47 条 `decision` 的 prompt 都出现「教训」节** ⇒ 教训节确实进了决策提示词，但工具的"6 条教训文本子串"一条都没命中。三键口径：`lessons_total`（工具读数）= 6；`lessons_hits` = **0**；`injection_effective` = **false**（工具口径）——**与直查的决策行覆盖率 47/47 = 100% 矛盾，先报 Lead，本文件不下结论。**
+**三键口径（`--json logs\runB-0732-compare.json` 实测）**：`lessons_total = 6`、`lessons_hits = 4`、`injection_effective = true`、`lesson_section_present = true`（另有 `b_prompt_calls`）。
+**逐条判读**：命中的 4 条是同一句 `hint`（"体力已归零…"），未中的 2 条是 `stuck_with_leftover|plant_area` 与 `|till_area` 的 `hint`（"西北那片地进场先收成熟作物…"）⇒ 更像**按需筛选**（该形态当天不是当前决策的教训）而非长度裁切；已请 dev-coder 核对渲染选择规则（`lesson_section_present=true` 已排除"节没进去"）。
 
-### 8.2 `[6] 演进判据（L0–L5）`（原文照抄）
+### 8.2 `[6] 演进判据（L0–L5）`（**修正后原文**，工具修于 `2e3289e`；L3 六行不变，仍是 0 次同指涉）
 
 ```
 [6] 演进判据（L0–L5，机械可算部分 + 旁证）
   L0 run A 有教训库（≥1 条）            : ✅  (6 条)
-  L1 教训确实进了 run B 提示词          : ❌  (0/6 命中，run B 72 次调用)
+  L1 教训确实进了 run B 提示词          : ✅  (4/6 命中，run B 72 次调用)
   L2 同形态在 run B 减少                : ✅
        · stuck_with_leftover  ended_by:stuck               runA-0732=0 → runB-0732=0  ✅ 减少
        · stuck_with_leftover  ended_by:stuck               runA-0732=0 → runB-0732=0  ✅ 减少
@@ -265,10 +269,12 @@ farm                 = {"crops": 102, "ripeCrops": 1, "unwateredCrops": 5, "dryC
        · 决策理由里同指涉出现 0 次 ｜ stage_incomplete|harvest / stage_incomplete / harvest / harvest 有 1 格没做成，还剩 1 格 / failed=1 leftover=1
        · 决策理由里同指涉出现 0 次 ｜ dead_crops_blocking|farm / dead_crops_blocking / farm / 枯死作物占着地，浇水和当天验收过不去 / dead_crops=1 dry_dead=0
        · 决策理由里同指涉出现 0 次 ｜ stuck_with_leftover|water_area / stuck_with_leftover / water_area / water_area 收尾时还剩 46 格没做成、当天以 stuck 结束
-  L5 结论：不足以判定自我进化（教训没有进 run B 的提示词）
+  L5 结论：有演进痕迹，但 run B 未达标（尾部连续 VERIFIED 天数不足）
 
   ⚠ 本工具的 L 判据只做机械对照；「自我进化」的正式结论必须并列 `verify-run3`/`analyze-longrun` 的判决与 L3 的人工核对。
 ```
+
+（本节 L1 已按 `2e3289e` 修正为 ✅ 4/6；L4 的 `zero_action_evidenced` 是 run B 新增失败项，与本跑被 harvest 缺陷支配有关，**不单独归因于教训注入**。）
 
 ### 8.3 `[1]`–`[4]` 对照摘要（L2 相关的机械计数）
 
@@ -285,6 +291,6 @@ farm                 = {"crops": 102, "ripeCrops": 1, "unwateredCrops": 5, "dryC
 ### 8.4 结论（按 Lead m02439 口径）
 
 - **L0 成立**：run A 有教训库（6 条 `logs\longrun-runA-0732-lessons.json`）。
-- **L1 成立（以直查口径为准）**：run B 的 **47/47 条 `decision` 提示词含教训节**；`lessons` 文件为**原样字节拷贝**（`3220 B`，两侧 SHA256 `C42AF6BE…D642` 一致，拷贝时刻 `2026-10-17T04:25:53+0700`）。工具的 `injection_effective=false` 与之矛盾，**已作为口径冲突上报 Lead，尚未裁定**。
+- **L1 成立（Lead 已裁定：直查对、工具错）**：run B 的 **47/47 条 `decision` 提示词含教训节**；工具修正后为 **4/6 条教训文本命中 + 教训节抬头 ✅**（`lessons_total 6 / lessons_hits 4 / injection_effective true / lesson_section_present true`）；`lessons` 文件为**原样字节拷贝**（`3220 B`，两侧 SHA256 `C42AF6BE…D642` 一致，拷贝时刻 `2026-10-17T04:25:53+0700`）。旧版 `injection_effective=false` 是 `lesson_text()` 字段口径错误导致的误报，已修 `2e3289e`。
 - **L2 及以下不可用**：B 臂被 `harvest` 缺陷支配（fall 9 一天 `ok 0 / fail 41`；fall 10 持续同一格打转，`[60,29]` 跨两次跨日仍 `ripe` 未摘），叠加 A→B 的世界差异（起点 `dry 125 → dry 0`、多推进 6 个游戏日、`farmingLevel 0→1`）构成**世界差异 + 代码缺陷的双重混淆** ⇒ **不据此宣称"没有进化"，也不宣称"有进化"**，只记事实：`finish` 缺失、尾部 0/2、L4 反而多出 `zero_action_evidenced` 一项。
 - **本跑最有价值的产出不是 A/B 对照，而是 `[60,29]` 这一格的现场**（§0.2）：窗口内、`standable/actionable/watered/ripe` 全真、玩家就在正邻居、反复 `postcondition_met=false` ⇒ harvest 修复后可直接做"同格前后对照"（期望 `farm.ripeCrops 1→0`）。
