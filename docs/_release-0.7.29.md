@@ -4,18 +4,21 @@
 > 上一版：`docs/_release-0.7.28.md`（run8 两病灶 + LLM 演进第一批；2026-10-16 已装机，run9 = run A 正在跑）。
 
 ## 0. 为什么有这一版（run9 实证）
-run9（0.7.28）第一天就把「决策演进」的**素材链**堵点暴露了：
-1. `review_llm_failed {"t":217.45,"reason":"llm_error:truncated: 回答被 max_tokens 截断且内容为空（推理占用了约 512 个 token）…"}` ⇒ 复盘笔记永远为空 ⇒ 教训库 `hint` 永远空 ⇒ run B 无教训可注入（**L1 不可能成立**）。
-2. `lessons {"total":0,"added":[],"written":0}` ⇒ 落盘库就是 `{"lessons": []}`（现有 8 种 kind 覆盖不到「`stuck` 收尾 + leftover 而 `failed=0`」这种最典型退化形态）。
+run9（0.7.28）**已收尾，实测 0/5 VERIFIED**：`finish {"code":1,"verified_streak":0,"actions":436,"minutes":23.62,"no_unmet_stages":false,"unmet_days":["1年 summer 13日","1年 summer 16日"],"stuck_flushes":2}`；5 个日报告 13 `stuck`(ok35) / 14 `sleep`(ok62) / 15 `sleep`(ok94) / 16 `stuck`(ok108) / 17 `slept_without_work`(**ok0**)，**每天都 `day_justified=false`**。它把「决策演进」的**素材链**与「白丢整天」的堵点一起暴露了：
+
+1. `review_llm_failed {"t":217.45,"reason":"llm_error:truncated: 回答被 max_tokens 截断且内容为空（推理占用了约 512 个 token）…"}` ⇒ 复盘笔记基本为空（整轮 `review_llm` 成功 **1** 次、失败 **3** 次）⇒ 教训库 `hint` 永远空 ⇒ run B 无教训可注入（**L1 不可能成立**）。
+2. `lessons {"total":0,"added":[],"written":0}` 前四天，第五天才 1 条（`slept_without_work|day`）⇒ 现有 8 种 kind 覆盖不到「`stuck` 收尾 + leftover 而 `failed=0`」这种最典型退化形态。
 3. `cannot_afford {"money":88,"seed_price":20,…}` 而当天更早已用 88g 买到 10 个 Wheat Seeds ⇒ 判据按「买满 `--buy-count`」算账，钱只够买一半时**当天一粒不买**。
-> 好消息（同一次真机取证）：经济闭环前四腿已跑通（`sell{need_slot}` 腾格 → 自动跳过春季 `472` → 买当季 `(O)483` → 播种 4→13；次日出货到账 88→415 → 再买 10 个），窗外干作物 `[12,30]`/`[60,29]` 也浇成 `ok`。
+4. **review-only 空转（本版新增的第 4 张卡）**：61 条 `['review']` 独苗决策全是 `source=deterministic, llm=false`（LLM 的 20 条边界决策每条都带真活）——`deterministic_plan()` 只看**当前片地**的 `_plot_brief`（`brain/agentfarm/planner.py:1441-1527`），守卫 `work_reasons()` 看的是**跨片地当日 leftover**，两边**没有对账路径**（`brain/agentfarm/longrun.py:3183-3185` 放行非阶段意图、`:3264-3266` review 不置 `acted`、`:3199-3207` 兜底只在 kept 为空时调用）⇒ 空转 3 轮 ⇒ `stuck`。第 5 天同族：守卫说"没种子但钱够该去买 + 73 格干作物"，却**没有任何片地拿得出目标**。
+> 好消息（同一次真机取证）：经济闭环四腿已跑通（`sell{need_slot}` 腾格 → 自动跳过春季 `472` → 买当季 `(O)483` → 播种 4→13；次日出货到账 88→415 → 再买 10 个；整轮 `sell` 5 次成功、`buy` 8 ok / 1 failed），窗外干作物 `[12,30]`/`[60,29]` 也浇成 `ok`。
 
 ## 1. 卡片
 | 卡 | 内容 | 归属 | 是否本版 |
 |---|---|---|---|
 | task-121 | `REVIEW_MAX_TOKENS` 512→4096 + 截断自愈重试 1 次（8192）+ 失败留 `max_tokens`/`attempts` | dev-coder | ✅ |
-| task-122 | 教训库新增 `stuck_with_leftover` / `plot_exhausted` 两类（含"干净日仍然 0 条"用例） | dev-coder | ✅ |
+| task-122 | 教训库新增 `stuck_with_leftover` / `plot_exhausted` 两类（含"干净日仍然 0 条"用例） | dev-coder | ✅ `affa7c8` |
 | task-123 | 买种子量力而行（`n=min(buy_count, money//price)`，`n>=1` 则 `buy_partial`） | dev-coder | ✅ |
+| task-124 | review-only 决策不许白过：用守卫据以抱怨的那份 leftover 挑片地/挑格兜底（≥8 单测） | dev-coder | ✅ |
 | task-101 | `_farm_totals` 类型校验（`"abc"` 会让整天崩）、窗口全死苗 `watered_outdoor` 字段级收口 | dev-coder | 择机 |
 | task-107 | Mod `farm.dryTiles` 与 `farm.dryCrops` 同源 + `scanSeq` | dev-coder | 择机 |
 | task-109 | 卖货如实性（`need_slot` 分支不可达/卖了最大叠）+ 卖后刷新 obs | dev-coder | 择机 |
@@ -50,11 +53,11 @@ run9（0.7.28）第一天就把「决策演进」的**素材链**堵点暴露了
 ## 5. 与 run9 对比（填表）
 | 项 | run9（0.7.28，run A） | run9b（0.7.29，run A） | run10（run B） |
 |---|---|---|---|
-| `review_llm` 成功次数 | 0（全部 truncated） | | |
-| `lessons.total` / `written` | 0 / 0 | | |
-| 经济闭环四腿 | 卖✅ 到账✅ 买✅ 种✅（首日） | | |
-| 尾部 VERIFIED 天数 | 待 run9 收尾 | | |
-| `unreachable`/`stuck` 形态 | day1 stuck（剩 2 格） | | |
+| `review_llm` 成功次数 | **1**（`review_llm_failed` 3 次，全 truncated@512） | | |
+| `lessons.total` / `written` | **0 / 0**（前四天）→ 第五天 1 条 `slept_without_work\|day` | | |
+| 经济闭环四腿 | 卖✅ 到账✅ 买✅ 种✅（`sell` 5 / `buy` 8ok+1fail） | | |
+| 尾部 VERIFIED 天数 | **0/5**（`finish code=1, streak=0`） | | |
+| `unreachable`/`stuck` 形态 | 13/16 `stuck`（剩 14 与 2 格）、14/15 `sleep` 仅挂 `day_justified`、17 `slept_without_work` ok0 | | |
 
 ## 6. 遗留
 - task-101 / 107 / 109 / 110 / 117（若本版未做，顺延到 0.7.30）。
