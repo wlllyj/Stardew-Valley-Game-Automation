@@ -89,6 +89,12 @@
     （文件被外部改过/结构不符时拒收是**正确**行为）⇒ 头部可 grep 的 `拒收 N 次 / M 条（原因…）`；
     只有 `dropped>0` 且 `kept==0` **连续 ≥2 天**给 `warn:lessons_all_rejected` 可视行（不判红、不进 rc）；
     缺 `kept`/缺事件 ⇒ 只进【无法判定】（缺失 ≠ 0，绝不当"没被拒收"通过）。
+  * 不可信条目与防洗白（task-118 A / task-120）：`lessons_rejected.untrusted`（这次载入被判不可信的
+    条数）、`lessons.written` / `lessons.skipped_untrusted`（回写只持久化 `src=agentfarm` 的可信条目 ⇒
+    这一对就是"防洗白生效"的直接证据；不可信条目在注入行里带 `[外部条目·未验证]` 前缀、**绝不回写**）。
+    头部 `LLM 复盘/教训库` 行给可 grep 的 `教训库写入 N 条 / 跳过 M 条（不可信）/ 拒收 K 条（其中不可信 J 条）`；
+    **全部不判红**（`skipped_untrusted>0` 是好事），只有 `skipped_untrusted>0 且 written==0` **连续 ≥2 天**
+    给 `warn:lessons_all_untrusted` 可视行；缺字段 ⇒ 只进【无法判定】（缺失 ≠ 0，绝不当"没有不可信条目"通过）。
   * 事件映射不许漂移（Lead m02395）：brain 里 `_journal("<name>"` 的**每个**事件名都要在
     `EVENT_BUCKETS` 里有桶（结构性事件 `day_start`/`day_end`/`finish` 除外，见 `STRUCTURAL_EVENTS`）；
     账本里出现没桶的事件 ⇒ 报告头部逐条点名（名字×次数+行号）+ 建议 0a，**绝不静默丢弃**。
@@ -331,6 +337,17 @@ FIELD_PROBES = [
      "task-114：这次载入后**留下来**的教训条数（`kept==0` 表示这一版库一条都没通过 schema 校验）"),
     ("event:lessons_rejected.dropped", "lessons_rejected_dropped",
      "task-114：这次载入被**丢掉**的条数（>0 且 kept==0 ⇒ 整库不可用；两侧都要看，别只看一边）"),
+    ("event:lessons_rejected.untrusted", "lessons_rejected_untrusted",
+     "task-118 A：这次载入被判为**不可信**的条数（没有 `src` 标记 / 旧格式 / 外部改过）⇒ 不抢 20 名额、"
+     "注入行带 `[外部条目·未验证]` 前缀、**绝不回写**（防洗白）⇒ 只记信息、不判红"),
+    ("event:lessons.written", "lessons_written",
+     "task-118 A.4：这一轮真正**落盘**的教训条数（只写 `src=agentfarm` 的可信条目；"
+     "写不进去/空库都只记信息）"),
+    ("event:lessons.skipped_untrusted", "lessons_skipped_untrusted",
+     "task-118 A.4：落盘时**跳过**的不可信条数 —— (written, skipped_untrusted) 这一对就是"
+     "『防洗白生效』的直接证据：跳过多说明库里有外部条目、而它们绝不会被重新盖戳写回 ⇒ "
+     "只记信息、不判红；`skipped_untrusted>0 且 written==0` 连续 ≥2 天 ⇒ "
+     "`warn:lessons_all_untrusted` 可视行（库被外部整版污染，只警告不进 rc）"),
     ("event:decision", "decision_memory",
      "决策史条数（task-58 的 `Brief.recent_decisions` 注入 = 账本里 `decision` 事件数；每条还补了 "
      "terminal/leftover/unreachable/refused/where 具名田区，**无坐标**）⇒ 头部`决策:`行已给总数；"
@@ -2142,6 +2159,9 @@ def build_advice(report, top=8):
         if (lri.get("warn_all_rejected_run") or 0) >= 2:
             _lparts.append(f"教训库连续整版被拒 ×{lri.get('warn_all_rejected_run')} 天"
                            "（warn:lessons_all_rejected，**不判红**）")
+        if (lri.get("warn_all_untrusted_run") or 0) >= 2:
+            _lparts.append(f"教训库连续整版不可信 ×{lri.get('warn_all_untrusted_run')} 天"
+                           "（warn:lessons_all_untrusted：written==0 且 skipped_untrusted>0，**不判红**）")
         advice.append({
             "text": "LLM 复盘/教训库（task-111）：" + "；".join(_lparts),
             "lines": (lri.get("without_notes_lines", []) + lri.get("over_limit_lines", [])
@@ -2156,16 +2176,31 @@ def build_advice(report, top=8):
                     "看一眼这个文件是不是被改坏、或被写成了别的 schema（task-114）；缺字段照旧【无法判定】",
             "lines": (lri.get("rejected_lines") or [])[:6],
         })
+    elif (lri.get("warn_all_untrusted_run") or 0) >= 2:
+        advice.append({
+            "text": "教训库连续整版不可信（warn:lessons_all_untrusted，**不判红**）：连续 "
+                    f"{lri.get('warn_all_untrusted_run')} 天 written==0 且 skipped_untrusted>0（"
+                    f"{'、'.join([str(x) for x in (lri.get('warn_all_untrusted_days') or [])][:3])}）"
+                    "⇒ 防洗白**生效**（不可信条目一条也没被写回），但整库都是外部条目 ⇒ "
+                    "看一眼文件是不是被外部整版替换过（task-118 A）；缺字段照旧【无法判定】",
+            "lines": (lri.get("lessons_lines") or [])[:6],
+        })
     elif lri.get("has_events"):
         _rej_txt = (f"；拒收 {lri.get('rejected_events', 0)} 次 / {lri.get('rejected_dropped', 0)} 条"
                     f"（原因 {'、'.join([str(x) for x in (lri.get('rejected_reasons') or ['—'])][:2])}）"
+                    + (f"（其中不可信 {lri.get('rejected_untrusted', 0)} 条）"
+                       if lri.get("rejected_untrusted") else "")
                     if lri.get("rejected_events") else "")
+        _wr_txt = (f"；落盘写入 {lri.get('lessons_written')} 条 / 跳过不可信 "
+                   f"{lri.get('lessons_skipped_untrusted')} 条（跳过 >0 = 防洗白生效，**不是失败**）"
+                   if (lri.get("lessons_written") is not None
+                       or lri.get("lessons_skipped_untrusted") is not None) else "")
         advice.append({
             "text": f"LLM 复盘/教训库（信息项，**不是失败**）：复盘 {lri.get('review_events', 0)} 次 "
                     f"/ notes {lri.get('notes_count', 0)} 条；教训库 total "
                     f"{lri.get('lessons_total')} 条（本日新增 {lri.get('lessons_added')}）"
-                    + _rej_txt
-                    + "；空库 / 0 新增 / 复盘失败 / 拒收都只记信息（task-111/114）",
+                    + _rej_txt + _wr_txt
+                    + "；空库 / 0 新增 / 复盘失败 / 拒收都只记信息（task-111/114/118）",
             "lines": (lri.get("review_lines", []) + lri.get("lessons_lines", [])
                       + lri.get("rejected_lines", []))[:8],
         })
@@ -2487,6 +2522,15 @@ def build_undecidable(rows, sessions, prelude, report):
         if _lr.get("rejected_events") and _lr.get("rejected_kept") is None:
             out.append("`lessons_rejected` 缺 `kept` 字段：无法判定这次载入是否'整版被拒'"
                        "（缺失 ≠ 0；只有 dropped>0 且 kept==0 连续 ≥2 天才给 warn，task-114）")
+        if _lr.get("lessons_events") and (
+                _lr.get("lessons_written") is None
+                or _lr.get("lessons_skipped_untrusted") is None):
+            out.append("`lessons` 缺 `written`/`skipped_untrusted` 字段：无法判定这次落盘"
+                       "有没有被外部不可信条目污染、以及防洗白是否生效"
+                       "（缺失 ≠ 0，绝不当'没有不可信条目'通过；task-118 A / task-120）")
+        if _lr.get("rejected_events") and not _lr.get("rejected_untrusted_lines"):
+            out.append("`lessons_rejected` 没有 `untrusted` 字段（或恒 0）：无法判定这次载入"
+                       "有没有不可信条目（缺失 ≠ 0；task-118 A / task-120）")
     # task-36：自称浇过、却没有 final_water 可核对的那些天（verify-run3.py:414-418 同口径：只记信息项）
     no_fw = [
         lineno for lineno, ev in rows
@@ -2986,6 +3030,10 @@ def build_report(rows, path, args, bad_lines):
         "rejected_events": len(_ls_rejected), "rejected_lines": [ln for ln, _ in _ls_rejected],
         "rejected_dropped": 0, "rejected_kept": None, "rejected_reasons": [],
         "rejected_by_day": {}, "warn_all_rejected_run": 0, "warn_all_rejected_days": [],
+        # task-118 A（task-120）：不可信条目的读写证据 —— skipped_untrusted>0 = 防洗白生效（好事）
+        "rejected_untrusted": 0, "rejected_untrusted_lines": [],
+        "lessons_written": None, "lessons_skipped_untrusted": None,
+        "all_untrusted_by_day": {}, "warn_all_untrusted_run": 0, "warn_all_untrusted_days": [],
         "file_status": "unknown", "file_path": "", "file_count": None, "file_error": "",
         "has_events": bool(_rev_events or _rev_failed or _ls_events or _ls_load_failed
                            or _ls_save_failed or _ls_rejected),
@@ -3012,6 +3060,13 @@ def build_report(rows, path, args, bad_lines):
         _t = as_int(ev.get("total"))
         if _t is not None and _t > LESSONS_MAX:
             llm_review["over_limit_lines"].append(_ln)
+        # task-120：`written==0 且 skipped_untrusted>0`（库被外部整版污染）逐日留痕，供连续 warn
+        _lw = as_int(ev.get("written"), None)
+        _lsu = as_int(ev.get("skipped_untrusted"), None)
+        _lab, _di = _lr_day_of(_ln)
+        if _di is not None and _lw == 0 and (_lsu or 0) > 0:
+            llm_review["all_untrusted_by_day"][_di] = {
+                "label": _lab, "written": _lw, "skipped_untrusted": _lsu, "line": _ln}
     if _ls_events:
         _ln, _last = _ls_events[-1]
         llm_review["lessons_total"] = as_int(_last.get("total"))
@@ -3019,6 +3074,8 @@ def build_report(rows, path, args, bad_lines):
         llm_review["lessons_added"] = len(_added) if isinstance(_added, list) else None
         llm_review["lessons_dropped"] = as_int(_last.get("dropped"))
         llm_review["lessons_path"] = str(_last.get("path") or "")
+        llm_review["lessons_written"] = as_int(_last.get("written"), None)
+        llm_review["lessons_skipped_untrusted"] = as_int(_last.get("skipped_untrusted"), None)
     for _ln, ev in _ls_load_failed:
         llm_review["load_errors"].append(str(ev.get("error") or ""))
     for _ln, ev in _ls_save_failed:
@@ -3035,6 +3092,12 @@ def build_report(rows, path, args, bad_lines):
             _rst = str(_rs)
             if _rst and _rst not in llm_review["rejected_reasons"]:
                 llm_review["rejected_reasons"].append(_rst)
+        # task-118 A / task-120：不可信条数（信息项；>0 = 库里有外部条目，不是失败）
+        _ut = as_int(ev.get("untrusted"), None)
+        if _ut is not None:
+            llm_review["rejected_untrusted"] += _ut
+            if _ut > 0:
+                llm_review["rejected_untrusted_lines"].append(_ln)
         _lab, _di = _lr_day_of(_ln)
         if _di is not None and (_dr or 0) > 0 and _kp == 0:
             llm_review["rejected_by_day"][_di] = {
@@ -3051,6 +3114,19 @@ def build_report(rows, path, args, bad_lines):
         llm_review["warn_all_rejected_days"] = [
             (llm_review["rejected_by_day"].get(_i) or {}).get("label")
             for _i in sorted(llm_review["rejected_by_day"])]
+    # task-120：同一套「连续 ≥2 天」算法，判据换成 written==0 且 skipped_untrusted>0
+    _run = _best2 = 0
+    for _i in range(len(days)):
+        if _i in llm_review["all_untrusted_by_day"]:
+            _run += 1
+            _best2 = max(_best2, _run)
+        else:
+            _run = 0
+    llm_review["warn_all_untrusted_run"] = _best2
+    if _best2 >= 2:
+        llm_review["warn_all_untrusted_days"] = [
+            (llm_review["all_untrusted_by_day"].get(_i) or {}).get("label")
+            for _i in sorted(llm_review["all_untrusted_by_day"])]
     _lp = None
     try:
         _jp = os.path.abspath(str(path))
@@ -3655,6 +3731,14 @@ MAPPING_TEXT = [
      "`path/dropped/reasons/kept/note`；头部'LLM 复盘/教训库'行里有可 grep 的 `拒收 N 次 / M 条（原因…）`；"
      "只有 `dropped>0` 且 `kept==0` **连续 ≥2 天**时给 `warn:lessons_all_rejected` 可视行"
      "（只警告、不判红、不进 rc）；缺 `kept` 字段 ⇒ 只进【无法判定】（缺失 ≠ 0）"),
+    ("lessons_rejected.untrusted / lessons.written|skipped_untrusted（task-118 A、task-120）",
+     "不可信条目与**防洗白生效**的直接证据（**全部不判红**）：`untrusted`=这次载入被判不可信的条数"
+     "（没有 `src` 标记/旧格式/外部改过 ⇒ 不抢 20 名额、注入行带 `[外部条目·未验证]` 前缀、**绝不回写**）；"
+     "`written`=真正落盘的条数（只写 `src=agentfarm`）、`skipped_untrusted`=落盘时跳过的不可信条数；"
+     "头部'LLM 复盘/教训库'行有可 grep 的 `教训库写入 N 条 / 跳过 M 条（不可信）/ 拒收 K 条（其中不可信 J 条）`；"
+     "`skipped_untrusted>0` 是**好事**（防洗白生效），只有 `skipped_untrusted>0 且 written==0` **连续 ≥2 天**"
+     "才给 `warn:lessons_all_untrusted` 可视行（库被外部整版污染，只警告、不进 rc）；"
+     "缺 `written`/`skipped_untrusted`/`untrusted` ⇒ 只进【无法判定】（缺失 ≠ 0，绝不当'没有不可信条目'通过）"),
     ("encircled / encircled_stage / encircled_summary（task-68、task-76）",
      "5 环境挡路·可达性/开路（信息项，**无硬闸门 ⇒ 一律不判红**）：被不可清障物围住（四邻没有"
      "「可站+可清」的突破口）＝与 `unreachable`（物理走不到）**分开计数**、不封格、不进任何豁免分子；"
@@ -3869,6 +3953,10 @@ def render_text(report, top):
             + (f"；拒收 {lri.get('rejected_events', 0)} 次 / {lri.get('rejected_dropped', 0)} 条"
                f"（原因 {'、'.join([str(x) for x in (lri.get('rejected_reasons') or ['—'])][:3])}）"
                if lri.get("rejected_events") else "")
+            + (f"；教训库写入 {lri.get('lessons_written') if lri.get('lessons_written') is not None else '<缺失>'}"
+               f" 条 / 跳过 {lri.get('lessons_skipped_untrusted') if lri.get('lessons_skipped_untrusted') is not None else '<缺失>'}"
+               f" 条（不可信）/ 拒收 {lri.get('rejected_events', 0)} 条"
+               f"（其中不可信 {lri.get('rejected_untrusted', 0)} 条）")
             + ("  ⚠ 复盘声称成功却 0 条 notes"
                if lri.get("without_notes_lines") else "")
             + ("  ⚠ 教训库超上限" if lri.get("over_limit_lines") else "")
@@ -3877,6 +3965,11 @@ def render_text(report, top):
                f"{'、'.join([str(x) for x in (lri.get('warn_all_rejected_days') or [])][:3])}"
                "；只作警告、不判红 —— 拒收本身是正确行为，这里只是提示'库连续整版不可用'）"
                if (lri.get("warn_all_rejected_run") or 0) >= 2 else "")
+            + (f"  ⚠ warn:lessons_all_untrusted（连续 {lri.get('warn_all_untrusted_run')} 天 "
+               f"skipped_untrusted>0 且 written==0："
+               f"{'、'.join([str(x) for x in (lri.get('warn_all_untrusted_days') or [])][:3])}"
+               "；只作警告、不判红 —— 库被外部整版污染，但不可信条目一条也没被写回）"
+               if (lri.get("warn_all_untrusted_run") or 0) >= 2 else "")
             + "；口径：**没学到东西不是失败**（空 notes/空库只记信息）")
     sleep_days = [d for d in report["days"] if d.get("ended_by") == "sleep"]
     if sleep_days:

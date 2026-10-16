@@ -520,6 +520,48 @@ python tools/analyze-longrun.py --journal logs/<run>.jsonl | rg "拒收|warn:les
 python -c "import json;d=json.load(open('logs/<run>-lessons.json',encoding='utf-8'));print(type(d))"
 ```
 
+## 3.18 不可信条目与「防洗白生效」的直接证据（task-118 A，task-120 收录）
+
+**背景**：task-118（`9df8c3b`）把「外部写进来的东西」变成**可观测**：①载入时没有 `src` 标记（或旧格式）
+的条目标为不可信；②不可信条目的 `last_seq` 钳到 `max(可信 last_seq)+1`（结构性防止"写个 999999 就排第一"）；
+③注入行前缀 `[外部条目·未验证]`（`brain/agentfarm/planner.py:457 UNTRUSTED_LESSON_PREFIX`）；
+④**回写只持久化 `src == agentfarm` 的可信条目** ⇒ 外部条目被读过一次也**不会**被重新盖戳写回。
+
+事件与字段（brain 权威）：
+
+| 事件 | 字段 | 来源 |
+|---|---|---|
+| `lessons_rejected` | `path` / `dropped` / `reasons` / `kept` / **`untrusted`**（这次载入被判不可信的条数）/ `note` | `brain/agentfarm/longrun.py:1680-1684` |
+| `lessons` | `day_key` / `added` / `total` / `dropped` / **`written`**（真正落盘条数）/ **`skipped_untrusted`**（落盘时跳过的不可信条数）/ `path` / `note` | `brain/agentfarm/longrun.py:1780-1786`（值来自 `planner.save_lessons_file` 的 `report["written"]` / `report["skipped"]`） |
+
+`(written, skipped_untrusted)` 这一对就是**防洗白生效的直接证据**：`skipped_untrusted>0` 说明库里有
+外部条目，而它们**一条都没被写回**。
+
+**红口径（本卡不加任何红）**
+1. `skipped_untrusted>0` = **好事**（防洗白生效）⇒ 只记信息，绝不判红。
+2. 只有 `skipped_untrusted>0 && written==0` **连续 ≥2 天** ⇒ `warn:lessons_all_untrusted` 可视行
+   （库被外部**整版**污染；与 3.17 的 `warn:lessons_all_rejected` 并列、是同一种"连续 ≥2 天才提示"的算法）。
+3. 缺 `written` / `skipped_untrusted` / `untrusted` ⇒ 只进【无法判定】（**缺失 ≠ 0**，绝不当"没有不可信条目"通过）。
+4. `warn:` 不是红：`report["red"]` 不含它，`rc` 不变。
+
+**呈现**：头部 `LLM 复盘/教训库:` 行追加可 grep 的
+`；教训库写入 N 条 / 跳过 M 条（不可信）/ 拒收 K 条（其中不可信 J 条）`（旧账本缺字段写 `<缺失>`）；
+连续整版不可信时再追加 `⚠ warn:lessons_all_untrusted（连续 K 天 …；只作警告、不判红）`；
+建议 0o 增「落盘写入 N / 跳过不可信 M（跳过 >0 = 防洗白生效、不是失败）」。
+
+**读数（task-120，2026-10-16）**：`py_compile -W error::SyntaxWarning` → `RC=0`；
+`tests.test_analyze_longrun` **140 OK**（+5：`TestUntrustedLessonsAccounting` —— 写入/跳过可见且不判红 /
+两连续天整版不可信只给警告 / 单天不给警告 / 缺 `written` ⇒ 无法判定不许当 0 / 缺 `untrusted` ⇒ 无法判定）；
+全量 `discover -s tests` **690 OK（0 红）**（基线 685）。八账本 rc 并排（本工具 / `verify-run3.py`）：
+green 0/0、run2 1/1、run3 1/1、run5 1/1、run6 1/1、run7 0/0、run8 1/1、vacuum 1/1 —— **一字未变**。
+
+```
+rg -n '"event": ?"lessons"' logs/longrun-*.jsonl | rg "written|skipped_untrusted"
+rg -n 'untrusted' logs/longrun-*.jsonl
+python tools/analyze-longrun.py --journal logs/<run>.jsonl | rg "教训库写入|warn:lessons_all_untrusted"
+python -c "import json;d=json.load(open('logs/<run>-lessons.json',encoding='utf-8'));print([it.get('src') for it in (d.get('lessons') if isinstance(d,dict) else d)])"
+```
+
 ## 4. 复核命令
 
 ```
@@ -530,6 +572,6 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run8.jsonl   # r
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
 python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
-python -m unittest tests.test_analyze_longrun  # 当前 135 OK（task-116）
-python -m unittest discover -s tests           # 当前 677 OK（0 红；0.7.28 装机放行条件）
+python -m unittest tests.test_analyze_longrun  # 当前 140 OK（task-120）
+python -m unittest discover -s tests           # 当前 690 OK（0 红；0.7.28 装机放行条件）
 ```

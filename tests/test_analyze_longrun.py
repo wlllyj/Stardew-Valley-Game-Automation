@@ -2493,5 +2493,103 @@ class TestLessonsRejected(unittest.TestCase):
                       "旧账本要进【无法判定】（缺失 ≠ 0）")
 
 
+class TestUntrustedLessonsAccounting(unittest.TestCase):
+    """task-120（Lead m05784）：task-118 的不可信条目证据（`lessons.written` /
+    `skipped_untrusted` / `lessons_rejected.untrusted`）。
+
+    口径：**不加红**。`skipped_untrusted>0` 是**好事**（回写只持久化可信条目 ⇒ 防洗白生效）；
+    只有 `skipped_untrusted>0 且 written==0` **连续 ≥2 天**才给 `warn:lessons_all_untrusted`
+    可视行（不进 rc）；缺字段 ⇒ 【无法判定】（缺失 ≠ 0，绝不当"没有不可信条目"通过）。
+    """
+
+    WRITE_OK = {"event": "lessons", "t": 8.4, "day_key": [1, "summer", 5], "added": ["a1"],
+                "total": 7, "dropped": 0, "written": 4, "skipped_untrusted": 3,
+                "path": "<journal>-lessons.json", "note": "只写可信条目（task-118 A.4）"}
+    WRITE_ALL_UNTRUSTED = {"event": "lessons", "t": 8.4, "day_key": [1, "summer", 5],
+                           "added": [], "total": 2, "dropped": 0, "written": 0,
+                           "skipped_untrusted": 2, "path": "<journal>-lessons.json",
+                           "note": "整库都是外部条目 ⇒ 一条也没回写"}
+    REJECT_UNTRUSTED = {"event": "lessons_rejected", "t": 8.5, "path": "<journal>-lessons.json",
+                        "dropped": 0, "kept": 7, "untrusted": 3,
+                        "reasons": ["clamped:last_seq"], "note": "不可信条目上界被钳（task-118 A.2）"}
+
+    def _day(self, day, *, extra=()):
+        nxt = [day[0], day[1], day[2] + 1]
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": True,
+                  "watered_outdoor": True}
+        end = {"event": "day_end", "t": 9.0, "day": day, "day_text": "", "ended_by": "sleep",
+               "ended_reason": "night", "verified": True, "checks": checks,
+               "stages": [{"stage": "water_area", "ok": 5, "skipped": 0, "failed": 0,
+                           "env_block": 0, "inconclusive": 0, "stopped": None, "leftover": 0}],
+               "outcomes": [], "ok_steps": 5, "skipped_steps": 0, "failed_steps": 0,
+               "notes": [], "final": final(nxt),
+               "final_water": {"t": 9.0, "location": "Farm", "tiles": 84, "crops": 31,
+                               "dry": 0, "scope": "farm"}}
+        return [day_start(day), *extra, end]
+
+    def _report(self, events, name, *, days=1):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = write_ledger(tmp.name, name, events)
+        self._tmp = tmp
+        return report_for(path, days=days, top=50)
+
+    def test_written_and_skipped_untrusted_are_visible_and_never_red(self):
+        rep = self._report(self._day([1, "summer", 5],
+                                     extra=[dict(self.WRITE_OK), dict(self.REJECT_UNTRUSTED)]),
+                           "lu_ok.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "防洗白生效是好事 ⇒ 绝不判红")
+        lr = rep["llm_review"]
+        self.assertEqual(lr["lessons_written"], 4)
+        self.assertEqual(lr["lessons_skipped_untrusted"], 3)
+        self.assertEqual(lr["rejected_untrusted"], 3)
+        self.assertEqual(lr["rejected_untrusted_lines"], [3])
+        text = mod.render_text(rep, 50)
+        self.assertIn("教训库写入 4 条 / 跳过 3 条（不可信）/ 拒收 1 条（其中不可信 3 条）", text)
+        self.assertNotIn("⚠ warn:lessons_all_untrusted", text)
+        self.assertIn("跳过不可信", " ".join(a["text"] for a in rep["advice"]))
+        self.assertIn("防洗白生效", " ".join(a["text"] for a in rep["advice"]))
+
+    def test_all_untrusted_two_days_is_warning_not_red(self):
+        events = (self._day([1, "summer", 5], extra=[dict(self.WRITE_ALL_UNTRUSTED)])
+                  + self._day([1, "summer", 6], extra=[dict(self.WRITE_ALL_UNTRUSTED)]))
+        rep = self._report(events, "lu_warn.jsonl", days=2)
+        self.assertEqual(rep["red"]["total"], 0, "warn 不是红：不进 rc")
+        self.assertGreaterEqual(rep["llm_review"]["warn_all_untrusted_run"], 2)
+        text = mod.render_text(rep, 50)
+        self.assertIn("warn:lessons_all_untrusted", text)
+        self.assertIn("只作警告、不判红", text)
+        self.assertIn("整版不可信", " ".join(a["text"] for a in rep["advice"]))
+
+    def test_all_untrusted_single_day_has_no_warning(self):
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.WRITE_ALL_UNTRUSTED)]),
+                           "lu_single.jsonl")
+        self.assertEqual(rep["red"]["total"], 0)
+        self.assertLess(rep["llm_review"]["warn_all_untrusted_run"], 2)
+        self.assertNotIn("⚠ warn:lessons_all_untrusted", mod.render_text(rep, 50))
+
+    def test_missing_written_is_undecidable_not_zero(self):
+        no_w = {k: v for k, v in self.WRITE_OK.items()
+                if k not in ("written", "skipped_untrusted")}
+        events = (self._day([1, "summer", 5], extra=[dict(no_w)])
+                  + self._day([1, "summer", 6], extra=[dict(no_w)]))
+        rep = self._report(events, "lu_nofield.jsonl", days=2)
+        self.assertEqual(rep["red"]["total"], 0)
+        self.assertIsNone(rep["llm_review"]["lessons_written"], "缺 written ⇒ 不许当成 0")
+        self.assertIsNone(rep["llm_review"]["lessons_skipped_untrusted"])
+        text = mod.render_text(rep, 50)
+        self.assertIn("教训库写入 <缺失> 条 / 跳过 <缺失> 条（不可信）", text)
+        self.assertNotIn("⚠ warn:lessons_all_untrusted", text)
+        self.assertIn("缺 `written`/`skipped_untrusted` 字段", " ".join(rep["undecidable"]))
+
+    def test_rejected_without_untrusted_field_is_undecidable(self):
+        no_u = {k: v for k, v in self.REJECT_UNTRUSTED.items() if k != "untrusted"}
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(no_u)]), "lu_nountrusted.jsonl")
+        self.assertEqual(rep["red"]["total"], 0)
+        self.assertEqual(rep["llm_review"]["rejected_untrusted_lines"], [])
+        self.assertIn("没有 `untrusted` 字段", " ".join(rep["undecidable"]))
+
+
 if __name__ == "__main__":
     unittest.main()
