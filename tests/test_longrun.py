@@ -43,7 +43,8 @@ from agentfarm.longrun import (  # noqa: E402
 )
 from agentfarm.planner import (DECISION_LINE_MAX_CHARS, DECISIONS_KEPT, REVIEW_MAX_TOKENS,
                                BoundaryPlanner, Brief,
-                               TaskIntent, deterministic_plan, find_coordinate_like)  # noqa: E402
+                               TaskIntent, deterministic_plan, find_coordinate_like,
+                               make_lesson, save_lessons_file)  # noqa: E402
 
 #: 【task-59】收工复盘与边界决策**共用同一个 LLM seam**，靠 system 提示词里的固定短语分辨
 #: （复盘提示词是 `REVIEW_SYSTEM_PROMPT`，开头写着"收工复盘助手"）。
@@ -5344,9 +5345,35 @@ class TestTask58DecisionMemory(unittest.TestCase):
         outcome = "VERIFIED" if run.days[0].verified else "needs_review"
         for line in run.decision_memory:
             self.assertLessEqual(len(line), DECISION_LINE_MAX_CHARS, line)
-            self.assertIn(f"outcome={outcome}", line)
+            self.assertIn(f"terminal={outcome}", line, "【task-82】join：终态计数必须在行里")
+            self.assertIn("where=", line, "【task-82】join：要点名具名田区（不是坐标）")
             self.assertIsNone(find_coordinate_like(line), line)
         self.assertGreaterEqual(chat.calls, 1)
+
+    def test_join_numbers_come_from_the_day_ledger(self):
+        """【task-82】有真实失败的那天：记忆行必须带上账本数字（不再只是"结局一句话"）。
+
+        用真 `FarmWorker` + `_RefusalClient`（注入的 `fail_status` 只对真客户端生效），
+        让这一天的 `till_area` 真的留下 `refused` 与 `leftover`。
+        """
+        w = RefusedWorld(refused=[(60, 10), (61, 10)], seeds=10, money=500)
+        client = _RefusalClient(w)
+        worker = FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+        chat = _BoomChat()
+        with tempfile.TemporaryDirectory() as tmp:
+            run = make_run(w, target_days=1, max_days=1, llm_enabled=True, llm_chat=chat,
+                           journal_path=str(Path(tmp) / "run-t82-join.jsonl"),
+                           client_factory=lambda: client, worker_factory=lambda c: worker)
+            run.worker = worker
+            run.client = client
+            run.state.last_task_kind = "review"
+            run.run()
+        joined = " ".join(run.decision_memory)
+        self.assertTrue(joined, "这一天必须发生过真实边界决策")
+        self.assertIn("refused=", joined, joined)
+        self.assertIn("leftover=", joined, joined)
+        self.assertLessEqual(len(run.decision_memory[0]), DECISION_LINE_MAX_CHARS)
+        self.assertIsNone(find_coordinate_like(joined), joined)
 
     def test_memory_is_capped_and_survives_days(self):
         w = FakeWorld(weeds=4, seeds=10, money=500)
@@ -5520,6 +5547,178 @@ class TestTask59ReviewNotes(unittest.TestCase):
             return out
 
         self.assertEqual(once(True), once(False), "复盘只许影响提示词文本，判决必须逐字相同")
+
+
+class TestTask82Lessons(unittest.TestCase):
+    """【task-82】跨日教训库（`<journal>-lessons.json`）：决策→结果 join、跨日累积、只喂提示词。
+
+    五条硬要求各有用例：①路径由 `--journal` **自动推导**（同目录同前缀，无新命令行开关）；
+    ②join 只读账本、客观字段齐全、**无坐标**；③同类跨日合并（count 累加）且 `hint`
+    只可能来自收工复盘；④读不了/写不了/JSON 坏 ⇒ 记一笔 journal、跑批照常；
+    ⑤教训开/关对同一假世界的判决**逐字相同**（只多出 journal 事件与提示词文本）。
+
+    变异自检（**实测**，脚本 `scratch/_t82_mutate.py`，跑完即删；基线 10 条全绿）：
+    * `m82a_inject_off`（`_plot_brief` 的 `recent_lessons` 恒空）⇒ **1 条红**（注入对照）。
+    * `m82b_no_merge`（教训不再按 `id` 合并）⇒ **2 条红**（含本类跨天合并用例）。
+    * `m82c_no_cap`（上限 1000）⇒ **1 条红**（`LessonLibraryTests` 的上限用例）。
+    * `m82d_join_off`（决策行不再带 `terminal`/`leftover`/`unreachable`/`refused`/`where`）
+      ⇒ **2 条红**（本类 join 用例 + `TestTask58DecisionMemory` 的行内容用例）。
+    * `m82e_no_wash`（`decision_line` 不再洗 `where` 里的坐标）⇒ **1 条红**（坐标用例）。
+    """
+
+    def _events(self, run, name):
+        return [e for e in run.entries if e["event"] == name]
+
+    def _rep(self, day, *, stages=(), **kw):
+        return DayReport(day_key=(1, "summer", day), started_at=0.0,
+                         stages=[dict(s) for s in stages], **kw)
+
+    def _stage(self, **over):
+        base = {"stage": "clear_area", "tiles": 4, "ok": 0, "skipped": 1, "failed": 1,
+                "leftover": 4, "unreachable": 3, "refused": 0, "encircled": 0, "attempted": 4}
+        base.update(over)
+        return base
+
+    def test_path_is_derived_from_journal_without_new_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / "run9.jsonl"
+            run = make_run(FakeWorld(), journal_path=str(journal))
+            self.assertEqual(run.lessons_path, Path(tmp) / "run9-lessons.json")
+        self.assertIsNone(make_run(FakeWorld()).lessons_path, "没有 journal ⇒ 不落库（只在内存里）")
+
+    def test_objective_lessons_are_stored_without_coordinates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = make_run(FakeWorld(), journal_path=str(Path(tmp) / "run9.jsonl"))
+            run._lessons_flush(self._rep(12, stages=[self._stage()]))
+            data = json.loads(run.lessons_path.read_text(encoding="utf-8"))
+            self.assertEqual({it["kind"] for it in data["lessons"]},
+                             {"unreachable", "stage_incomplete"})
+            blob = json.dumps(data, ensure_ascii=False)
+            self.assertIsNone(find_coordinate_like(blob), blob)
+            self.assertTrue(all(it["hint"] == "" for it in data["lessons"]),
+                            "没有收工复盘 ⇒ hint 必须是空的（绝不自己编）")
+            mine = [it for it in data["lessons"] if it["kind"] == "unreachable"][0]
+            self.assertEqual(mine["evidence"], "unreachable=3 leftover=4", "证据只搬账本数字")
+            self.assertEqual(mine["severity"], 3)
+            ev = self._events(run, "lessons")
+            self.assertEqual(len(ev), 1)
+            self.assertEqual(ev[0]["total"], 2)
+            self.assertEqual(sorted(ev[0]["added"]),
+                             ["stage_incomplete|clear_area", "unreachable|clear_area"])
+            self.assertEqual(ev[0]["dropped"], 0)
+
+    def test_same_lesson_across_days_merges_and_hint_comes_from_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = make_run(FakeWorld(), journal_path=str(Path(tmp) / "run9.jsonl"))
+            run.days.append(self._rep(11))
+            run._lessons_flush(self._rep(12, stages=[self._stage()]))
+            # 第二天的收工复盘（LLM）给了笔记 ⇒ 今晚新增的教训才带 hint
+            run.lessons_hints = ["水壶记得提前补"]
+            run.days.append(self._rep(12))
+            run._lessons_flush(self._rep(13, stages=[self._stage()]))
+            data = json.loads(run.lessons_path.read_text(encoding="utf-8"))
+            unreach = [it for it in data["lessons"] if it["kind"] == "unreachable"]
+            self.assertEqual(len(unreach), 1, "同类跨天必须合并成一条")
+            self.assertEqual(unreach[0]["count"], 2)
+            self.assertEqual(unreach[0]["last_day"], [1, "summer", 13])
+            self.assertEqual(unreach[0]["hint"], "水壶记得提前补", "hint 只能来自复盘笔记")
+            self.assertEqual(self._events(run, "lessons")[1]["added"],
+                             ["unreachable|clear_area", "stage_incomplete|clear_area"])
+
+    def test_corrupt_and_unwritable_files_are_harmless(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / "run9.jsonl"
+            lessons = Path(tmp) / "run9-lessons.json"
+            lessons.write_text("{ 坏掉的 JSON", encoding="utf-8")
+            run = make_run(FakeWorld(), journal_path=str(journal))
+            run._lessons_flush(self._rep(12, stages=[self._stage()]))
+            self.assertEqual(len(self._events(run, "lessons_load_failed")), 1)
+            self.assertEqual(len(self._events(run, "lessons")), 1, "读不了也要照常往下走")
+            self.assertEqual(len(json.loads(lessons.read_text(encoding="utf-8"))["lessons"]), 2,
+                             "坏库被一次成功的写入覆盖回良构 JSON")
+
+            journal2 = Path(tmp) / "run10.jsonl"
+            target = Path(tmp) / "run10-lessons.json"
+            target.mkdir()
+            (target / "x").write_text("x", encoding="utf-8")
+            run2 = make_run(FakeWorld(), journal_path=str(journal2))
+            run2._lessons_flush(self._rep(12, stages=[self._stage()]))   # 绝不抛
+            self.assertEqual(len(self._events(run2, "lessons_save_failed")), 1)
+            self.assertEqual(len(self._events(run2, "lessons")), 1)
+
+    def test_lessons_are_injected_but_never_change_any_verdict(self):
+        """同一个假世界、同一套假决策：**只差一份教训库**，判决必须逐字相同。"""
+
+        def once(seed_lessons: bool):
+            w = FakeWorld(weeds=4, seeds=10, money=500)
+            with tempfile.TemporaryDirectory() as tmp:
+                journal = Path(tmp) / ("b.jsonl" if seed_lessons else "a.jsonl")
+                if seed_lessons:
+                    save_lessons_file(Path(tmp) / "b-lessons.json", [
+                        make_lesson(kind="unreachable", scope="clear_area", day_key=(1, "summer", 11),
+                                    day_seq=1, symptom="某片田区总有走不到的目标",
+                                    evidence="unreachable=8 leftover=9"),
+                    ])
+                chat = _ReviewChat()
+                run = make_run(w, target_days=2, max_days=3, llm_enabled=True, llm_chat=chat,
+                               journal_path=str(journal))
+                self.assertEqual(run.run(), 0, run.logs)
+                prompts = []
+                trace = Path(str(journal)[:-6] + "-llm.jsonl")
+                if trace.exists():
+                    prompts = [json.loads(ln).get("prompt") or ""
+                               for ln in trace.read_text(encoding="utf-8").splitlines() if ln.strip()]
+                out = []
+                for day in run.days:
+                    water = dict(day.final_water)
+                    water.pop("t", None)
+                    out.append({"verified": day.verified, "ended_by": day.ended_by,
+                                "ended_reason": day.ended_reason, "checks": dict(day.checks),
+                                "final_water": water, "final": dict(day.final),
+                                "stages": [dict(s) for s in day.stages],
+                                "intents": [e["intents"] for e in run.entries if e["event"] == "decision"]})
+                return out, prompts
+
+        plain, plain_prompts = once(False)
+        seeded, seeded_prompts = once(True)
+        self.assertEqual(plain, seeded, "教训库只许影响提示词文本，判决必须逐字相同")
+        self.assertTrue(seeded_prompts, "开了 LLM 就该有 trace")
+        self.assertTrue(any("lessons（" in p for p in seeded_prompts),
+                        "次日提示词里必须出现教训一节")
+        self.assertFalse(any("lessons（" in p for p in plain_prompts),
+                         "没有教训库时不许凭空出现这一节")
+
+    def test_a_real_day_writes_lessons_for_the_next_run(self):
+        """端到端：真跑一天（拒绝格 + 复盘）⇒ 文件里留下客观教训 + LLM hint。
+
+        必须用**真** `FarmWorker`（`FakeWorker` 不经过 `FakeClient`，注入的
+        `fail_status` 就不会生效）—— 与 `TestTask63Refused._run` 同一条装配路径。
+        """
+        w = RefusedWorld(refused=[(60, 10), (61, 10)], seeds=10, money=500,
+                         tillable=[(60, 10), (61, 10), (62, 10), (63, 10)])
+        client = _RefusalClient(w)
+        worker = FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / "run9.jsonl"
+            chat = _ReviewChat(notes=("这片地被拒绝的格先换工具",))
+            run = make_run(w, target_days=1, max_days=1, llm_enabled=True, llm_chat=chat,
+                           journal_path=str(journal), client_factory=lambda: client,
+                           worker_factory=lambda c: worker)
+            run.worker = worker
+            run.client = client
+            run.run()
+            self.assertTrue(run.lessons_path.exists(), "跑完必须留下教训库文件")
+            data = json.loads(run.lessons_path.read_text(encoding="utf-8"))
+            self.assertLessEqual(len(data["lessons"]), 20)
+            self.assertIsNone(find_coordinate_like(json.dumps(data, ensure_ascii=False)))
+            kinds = {it["kind"] for it in data["lessons"]}
+            self.assertIn("tool_refused", kinds, f"被游戏拒绝的格必须留一条教训：{kinds}")
+            refused_lesson = [it for it in data["lessons"] if it["kind"] == "tool_refused"][0]
+            self.assertEqual(refused_lesson["hint"], "这片地被拒绝的格先换工具",
+                             "hint 只能来自当晚收工复盘")
+            flushed = self._events(run, "lessons")
+            self.assertTrue(flushed, "日终必须记一条 lessons 事件")
+            self.assertIn("path", flushed[0])
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -969,6 +969,29 @@ class DecisionMemoryTests(unittest.TestCase):
         self.assertIn("某格", line)                      # 坐标被洗成占位
         self.assertIsNone(P.find_coordinate_like(line), line)
 
+    def test_decision_line_carries_the_result_join_without_coordinates(self):
+        """【task-82】一行里要能看出"这条决策后来怎么样了"：终态计数 + 三个数字 + 具名田区。"""
+        intent = P.TaskIntent("clear_dead", "field_ne", "清死苗", "dead 下降")
+        line = P.decision_line(day_key=(1, "summer", 12), boundary=P.BOUNDARY_NEW_DAY,
+                               intents=[intent], verdict_counts={"cancel": 1},
+                               outcome="needs_review", ended_by="stuck",
+                               ended_reason="stuck:连续 3 轮没有变化",
+                               terminal={"needs_review": 2, "VERIFIED": 1},
+                               leftover=4, unreachable=3, refused=1,
+                               where="field_ne [60, 10]")
+        self.assertLessEqual(len(line), P.DECISION_LINE_MAX_CHARS)
+        self.assertIn("terminal=VERIFIED1/needs_review2", line)
+        self.assertIn("leftover=4", line)
+        self.assertIn("unreachable=3", line)
+        self.assertIn("refused=1", line)
+        self.assertIn("where=field_ne", line)
+        self.assertIsNone(P.find_coordinate_like(line), "`where` 里的坐标也必须洗掉")
+        # 全是 0/空时不许留下空壳字段（旧调用点不传就该和以前一模一样）
+        bare = P.decision_line(day_key=(1, "summer", 12), boundary=P.BOUNDARY_NEW_DAY,
+                               outcome="VERIFIED", ended_by="sleep")
+        for token in ("terminal=", "leftover=", "unreachable=", "refused=", "where="):
+            self.assertNotIn(token, bare)
+
     def test_decisions_section_appears_and_is_bounded(self):
         brief = self._brief([f"summer {d} new_day outcome=VERIFIED ended_by=sleep" for d in (11, 12, 13)])
         text = brief.situation_text()
@@ -1077,6 +1100,98 @@ class ReviewNoteTests(unittest.TestCase):
         self.assertFalse(res_off["ok"])
         self.assertEqual(off.call_count, 0)
         self.assertEqual(res_off["reason"], "llm_disabled")
+
+
+class LessonLibraryTests(unittest.TestCase):
+    """【task-82】跨日教训库的纯逻辑：客观字段由代码写、`hint` 只许 LLM 写、只喂提示词。
+
+    四条：①`make_lesson` 洗坐标 + 同类合并（count 累加、取最新证据）；
+    ②淘汰与排序（近 > 严重 > 反复），上限硬；
+    ③文件读写**绝不抛**（缺文件/坏 JSON/不是列表/写不进去各一条）；
+    ④简报里那一节有界、且预算紧张时**最先被裁**（本体字段一个都不许被挤掉）。
+
+    变异自检（**实测**，脚本 `scratch/_t82_mutate.py`，跑完即删；基线本类 + `TestTask82Lessons`
+    共 10 条全绿）：
+    * `m82b_no_merge`：`prune_lessons` 不再按 `id` 合并（每个 id 各自成条）⇒ **2 条红**
+      （合并用例 + 端到端 hint 用例）。
+    * `m82c_no_cap`：把 `prune_lessons` 的默认上限从 `LESSONS_MAX` 改成 1000 ⇒ **1 条红**
+      （上限用例）。
+    * `m82a_inject_off`：`longrun` 不再把教训喂回提示词 ⇒ `TestTask82Lessons` **1 条红**
+      （注入对照用例）。
+    """
+
+    def test_make_lesson_strips_coordinates_and_merges_same_id(self):
+        a = P.make_lesson(kind="unreachable", scope="clear_area", day_key=(1, "summer", 12),
+                          day_seq=1, symptom="去 (12,30) 那格", evidence="unreachable=2 leftover=3")
+        self.assertEqual(a["id"], "unreachable|clear_area")
+        self.assertIsNone(P.find_coordinate_like(a["symptom"]), a["symptom"])
+        self.assertIn("某格", a["symptom"])
+        self.assertEqual(a["count"], 1)
+        self.assertEqual(a["severity"], P.LESSON_SEVERITY["unreachable"])
+        b = P.make_lesson(kind="unreachable", scope="clear_area", day_key=(1, "summer", 13),
+                          day_seq=2, symptom="还是走不到", evidence="unreachable=1 leftover=1")
+        merged = P.prune_lessons([a, b])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["count"], 2, "同类跨天必须合并")
+        self.assertEqual(merged[0]["last_day"], [1, "summer", 13])
+        self.assertEqual(merged[0]["evidence"], "unreachable=1 leftover=1", "取最新那次的证据")
+
+    def test_prune_keeps_newest_and_severe_within_cap(self):
+        old = P.make_lesson(kind="stage_incomplete", scope="t1", day_seq=1, symptom="老问题")
+        new = P.make_lesson(kind="stage_incomplete", scope="t2", day_seq=9, symptom="新问题")
+        bad = P.make_lesson(kind="tool_refused", scope="t3", day_seq=5, symptom="被拒")
+        self.assertEqual([it["symptom"] for it in P.prune_lessons([old, new, bad])],
+                         ["新问题", "被拒", "老问题"], "近的优先、其次看严重度")
+        many = [P.make_lesson(kind="stage_incomplete", scope=f"s{i}", day_seq=i, symptom=f"第{i}条")
+                for i in range(P.LESSONS_MAX + 5)]
+        kept = P.prune_lessons(many)
+        self.assertEqual(len(kept), P.LESSONS_MAX)
+        self.assertIn("第24条", [it["symptom"] for it in kept], "最新的必须留")
+        self.assertNotIn("第0条", [it["symptom"] for it in kept], "最旧的先被淘汰")
+
+    def test_lessons_file_round_trip_and_failures_are_swallowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run9-lessons.json"
+            self.assertEqual(P.load_lessons_file(path), ([], ""), "缺文件 ⇒ 空库、不算错")
+            lesson = P.make_lesson(kind="unreachable", scope="clear_area", day_seq=1, symptom="走不到")
+            self.assertEqual(P.save_lessons_file(path, [lesson]), "")
+            loaded, err = P.load_lessons_file(path)
+            self.assertEqual(err, "")
+            self.assertEqual(len(loaded), 1)
+            path.write_text("{ 这不是 JSON", encoding="utf-8")
+            loaded, err = P.load_lessons_file(path)
+            self.assertEqual(loaded, [])
+            self.assertIn("read_failed", err, "坏 JSON 只报原因，绝不抛")
+            path.write_text('{"lessons": {"nope": 1}}', encoding="utf-8")
+            self.assertEqual(P.load_lessons_file(path)[1], "not_a_list")
+            # 写不进去（把目标做成非空目录）⇒ 只返回原因串
+            bad = Path(tmp) / "dir-lessons.json"
+            bad.mkdir()
+            (bad / "x").write_text("x", encoding="utf-8")
+            self.assertIn("write_failed", P.save_lessons_file(bad, [lesson]))
+            self.assertEqual(P.prune_lessons([{"no_id": 1}, "junk"]), [], "坏条目直接跳过")
+
+    def test_lessons_section_is_bounded_and_dropped_first(self):
+        brief = P.Brief(location="Farm", is_farm=True, has_save=True, day_key=(1, "summer", 12))
+        self.assertEqual(brief.lessons_section(), "")
+        self.assertNotIn("lessons（", brief.situation_text())
+        long_text = P.render_lessons([
+            P.make_lesson(kind="unreachable", scope=f"s{i}", day_seq=i, symptom="某片地有走不到的目标" * 3)
+            for i in range(P.LESSONS_MAX)
+        ])
+        self.assertLessEqual(len(long_text), P.LESSONS_INJECT_CHARS)
+        self.assertEqual(long_text.count("\n- "), P.LESSONS_INJECT_MAX, "最多注入 3 条")
+        brief2 = P.Brief(location="Farm", is_farm=True, has_save=True, day_key=(1, "summer", 12),
+                         recent_lessons=long_text, recent_notes=("笔记一",), recent_decisions=("d1",))
+        text = brief2.situation_text()
+        self.assertIn("lessons（", text)
+        self.assertLessEqual(len(brief2.lessons_section()), P.LESSONS_SECTION_MAX_CHARS)
+        # 预算挤干时：教训先丢，本体字段一个都不许掉
+        squeezed = P.Brief(location="Farm", is_farm=True, has_save=True, day_key=(1, "summer", 12),
+                           recent_lessons="lessons（x）:", recent_notes=("笔记一",), counts={"crops": 3})
+        self.assertLessEqual(len(squeezed.situation_text()), P.PROMPT_BRIEF_MAX_CHARS)
+        self.assertIn("location=Farm", squeezed.situation_text())
+        self.assertIn("counts=", squeezed.situation_text())
 
 
 if __name__ == "__main__":

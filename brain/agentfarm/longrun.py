@@ -46,8 +46,10 @@ from .farmwork import (ENV_BLOCK_STATUSES, FRONTIER_KINDS, SEED_KEEP_FACTOR, STA
                        FarmWorker, StageResult, StepResult, farm_dead_crops,
                        farm_dry_dead_crops, farm_dry_tiles, pick_seed_offer, player_free_slots,
                        seed_items, surplus_sell_plan, till_blocked_by)
-from .planner import (DECISIONS_KEPT, BoundaryPlanner, Brief, PlannerState, TaskIntent, TaskOutcome,
-                      decision_line, deterministic_plan)
+from .planner import (DECISIONS_KEPT, LESSONS_INJECT_CHARS, LESSONS_INJECT_MAX, BoundaryPlanner, Brief,
+                      PlannerState, TaskIntent, TaskOutcome, decision_line, deterministic_plan,
+                      load_lessons_file, make_lesson, prune_lessons, render_lessons,
+                      save_lessons_file)
 
 try:  # 田区规划是**可选**依赖：拿不到就退回"玩家周围窗口"，不让长跑起不来
     from . import fields as fields_mod
@@ -620,6 +622,17 @@ class LongRun:
         self.recent_notes: list[str] = []
         # 【task-59】今天是否已经复盘过（每天**最多一次**独立调用）。
         self.review_done_today = False
+        # 【task-82】跨日教训库：路径由 `--journal` **自动推导**（同目录同前缀：
+        # `X.jsonl` ⇒ `X-lessons.json`），刻意**不新增** `--lessons` 之类开关。
+        # 为什么：run9/run10 的对照实验只许 journal 路径不同；教训是**跨 run** 的记忆，
+        # 只能靠这个文件（task-58 的会话内记忆不跨 run）。
+        # 内容诚实边界：客观字段由代码从当天账本搬，`hint` 只允许来自收工复盘的笔记；
+        # 只喂提示词，绝不参与 `verified`/`ended_by`/`checks`（与 task-58/59 同级）。
+        self.lessons_path = self._derive_lessons_path(self.journal_path)
+        self.lessons: list[dict[str, Any]] = []
+        self.lessons_loaded = False
+        # 今晚复盘产出的笔记 ⇒ 挂到今天新增的教训上当 `hint`（hint 只许 LLM 写）。
+        self.lessons_hints: list[str] = []
         # 【task-49】今天**已经见过、但还没做完**的格子（`_step_stage` 每轮的 `leftover`，排除已封格）。
         # 为什么必须记：观测是**以玩家为中心**的窗口（真机 `tiles[]` 上限 400、近处优先），
         # 人一换到别的片地，原来那片地的格子就"看不见"了 ⇒ `work_reasons`/`_plot_candidates`
@@ -743,6 +756,19 @@ class LongRun:
         suffix = journal_path.suffix or ".jsonl"
         stem = journal_path.name[: -len(journal_path.suffix)] if journal_path.suffix else journal_path.name
         return journal_path.with_name(f"{stem}-llm{suffix}")
+
+    @staticmethod
+    def _derive_lessons_path(journal_path: Path | None) -> Path | None:
+        """【task-82】`logs/run9.jsonl` ⇒ `logs/run9-lessons.json`（教训库放日记旁边）。
+
+        刻意**只**靠 journal 路径推导、不加命令行开关：run9/run10 的对照实验只许
+        journal 路径不同，而教训库是唯一**跨 run** 的记忆通道（会话内记忆不跨 run）。
+        journal 为 None（一次性 `agentfarm plan`）⇒ 不落库（只在内存里）。
+        """
+        if journal_path is None:
+            return None
+        stem = journal_path.name[: -len(journal_path.suffix)] if journal_path.suffix else journal_path.name
+        return journal_path.with_name(f"{stem}-lessons.json")
 
     def _elapsed_minutes(self) -> float:
         return (self.now() - self.started) / 60.0
@@ -1469,6 +1495,8 @@ class LongRun:
         为什么浇水必须全局：一天的验收要求"所有作物都浇过"，只浇作业区里的作物会漏。
         为什么开垦要按区：全场 245 个障碍会让策略永远停在"清障"（见模块 docstring 铁律 3）。
         """
+        # 【task-82】第一次出简报时懒加载跨日教训库（新进程从第 1 天就能用上上一轮的教训）。
+        self._lessons_load()
         tiles = [tuple(t) for t in plot["tiles"]]
         # `skip=self.blocked`：今天已证明干不动的格子**不能**再算进 blockers/tillable，
         # 否则"执行层拿不出目标、策略还在喊去干"⇒ 每轮空转（真机 run1 的两格 grass）。
@@ -1547,6 +1575,9 @@ class LongRun:
             recent_decisions=tuple(self.decision_memory),
             # 【task-59】把昨晚的复盘笔记喂回提示词（空 ⇒ 不出现这一节）。
             recent_notes=tuple(self.recent_notes),
+            # 【task-82】把跨日教训库喂回提示词（空 ⇒ 不出现这一节；只读、只影响文本）。
+            recent_lessons=render_lessons(self.lessons, max_items=LESSONS_INJECT_MAX,
+                                          max_chars=LESSONS_INJECT_CHARS),
         )
 
     def _review_brief(self, obs: dict[str, Any]) -> Brief:
@@ -1593,6 +1624,8 @@ class LongRun:
             day_key = None
         if res.get("ok"):
             self.recent_notes = [str(n) for n in (res.get("notes") or [])][:3]
+            # 【task-82】今晚的笔记就是今天新增教训的 `hint`（hint 只许 LLM 写；拿不到就留空）。
+            self.lessons_hints = list(self.recent_notes)
             self._journal("review_llm", day_key=day_key, notes=list(self.recent_notes),
                           text=str(res.get("text") or ""), usage=res.get("usage"),
                           duration_ms=int(res.get("duration_ms") or 0),
@@ -1604,11 +1637,109 @@ class LongRun:
             self._say(f"  · 收工复盘：{len(self.recent_notes)} 条笔记")
         else:
             self.recent_notes = []
+            self.lessons_hints = []
             self._journal("review_llm_failed", day_key=day_key,
                           reason=str(res.get("reason") or "review_failed"),
                           called=bool(res.get("called")), rejected=list(res.get("rejected") or []),
                           note="复盘失败无害：睡觉与跨日照常，只是次日看不到笔记")
             rep.notes.append(f"收工复盘失败（无害）：{res.get('reason')}")
+
+    # ------------------------------------------------------------------ 跨日教训库（task-82）
+    def _lessons_load(self) -> None:
+        """懒加载教训库（一次）。读不了 ⇒ 记一笔 `lessons_load_failed`，当作"没有教训"继续跑。"""
+        if self.lessons_loaded:
+            return
+        self.lessons_loaded = True
+        if self.lessons_path is None:
+            return
+        lessons, err = load_lessons_file(self.lessons_path)
+        self.lessons = lessons
+        if err:
+            self._journal("lessons_load_failed", path=str(self.lessons_path), error=err,
+                          note="教训库读不了 ⇒ 本次当作没有教训（绝不影响判定）")
+
+    def _lessons_from_day(self, rep: DayReport) -> list[dict[str, Any]]:
+        """把今天的**客观账本**拍成教训（代码写事实；不写回执、不写坐标）。
+
+        `hint` 取今晚收工复盘的第一条笔记（LLM 写的）；没有复盘 ⇒ 空串（绝不自己编）。
+        """
+        out: list[dict[str, Any]] = []
+        seq = len(self.days) + 1
+        hints = [h for h in self.lessons_hints if str(h).strip()]
+        hint = str(hints[0]) if hints else ""
+        for stage in rep.stages:
+            task = str(stage.get("stage") or "")
+            if not task:
+                continue
+            leftover = int(stage.get("leftover") or 0)
+            unreach = int(stage.get("unreachable") or 0)
+            refused = int(stage.get("refused") or 0)
+            encircled = int(stage.get("encircled") or 0)
+            failed = int(stage.get("failed") or 0)
+            if unreach > 0:
+                out.append(make_lesson(kind="unreachable", scope=task, day_key=rep.day_key,
+                                       day_seq=seq, hint=hint,
+                                       symptom=f"{task} 有 {unreach} 格四邻都站不过去",
+                                       evidence=f"unreachable={unreach} leftover={leftover}"))
+            if encircled > 0:
+                out.append(make_lesson(kind="encircled", scope=task, day_key=rep.day_key,
+                                       day_seq=seq, hint=hint,
+                                       symptom=f"{task} 有 {encircled} 格被挡死（2 层内没有可清的突破口）",
+                                       evidence=f"encircled={encircled} leftover={leftover}"))
+            if refused > 0:
+                out.append(make_lesson(kind="tool_refused", scope=task, day_key=rep.day_key,
+                                       day_seq=seq, hint=hint,
+                                       symptom=f"{task} 有 {refused} 格被游戏拒绝（工具等级/前置不满足）",
+                                       evidence=f"refused={refused} leftover={leftover}"))
+            if failed > 0 and leftover > 0:
+                out.append(make_lesson(kind="stage_incomplete", scope=task, day_key=rep.day_key,
+                                       day_seq=seq, hint=hint,
+                                       symptom=f"{task} 有 {failed} 格没做成，还剩 {leftover} 格",
+                                       evidence=f"failed={failed} leftover={leftover}"))
+        if int(getattr(rep, "dry_dead", 0) or 0) > 0 and not rep.verified:
+            out.append(make_lesson(kind="dead_crops_blocking", scope="farm", day_key=rep.day_key,
+                                   day_seq=seq, hint=hint,
+                                   symptom="枯死作物占着地，浇水和当天验收过不去",
+                                   evidence=f"dead_crops={int(getattr(rep, 'dead_crops', 0) or 0)} "
+                                            f"dry_dead={int(rep.dry_dead or 0)}"))
+        if self.buy_no_space_today:
+            out.append(make_lesson(kind="no_inventory_space", scope="buy", day_key=rep.day_key,
+                                   day_seq=seq, hint=hint,
+                                   symptom="钱够但背包没有空格，种子买不进来（要先卖一叠腾格）",
+                                   evidence="空格=0 且 seeds=0"))
+        if rep.slept_without_work:
+            out.append(make_lesson(kind="slept_without_work", scope="day", day_key=rep.day_key,
+                                   day_seq=seq, hint=hint,
+                                   symptom="一天里一次农场动作都没做就想收工（被拦住、没推进游戏日）",
+                                   evidence=f"ended_by={rep.ended_by} 动作=0"))
+        if rep.gave_up_tiles:
+            out.append(make_lesson(kind="far_dry_given_up", scope="water_far", day_key=rep.day_key,
+                                   day_seq=seq, hint=hint,
+                                   symptom=f"有 {len(rep.gave_up_tiles)} 格窗口外干作物够不着（当天放弃）",
+                                   evidence=f"gave_up={len(rep.gave_up_tiles)} dry_dead={int(getattr(rep, 'dry_dead', 0) or 0)}"))
+        return out
+
+    def _lessons_flush(self, rep: DayReport) -> None:
+        """日终把今天的客观教训并进库并落盘（task-82）。
+
+        失败无害：读不了/写不了都只记一笔 journal，跑批照常继续（不许崩、不许少一天）。
+        """
+        self._lessons_load()
+        added = self._lessons_from_day(rep)
+        before = len(self.lessons)
+        self.lessons = prune_lessons(list(self.lessons) + added)
+        self.lessons_hints = []
+        if self.lessons_path is not None:
+            err = save_lessons_file(self.lessons_path, self.lessons)
+            if err:
+                self._journal("lessons_save_failed", path=str(self.lessons_path), error=err,
+                              note="教训库写不进去 ⇒ 本批教训只在内存里，跑批照常")
+                rep.notes.append(f"教训库写失败（无害）：{err}")
+        self._journal("lessons", day_key=list(rep.day_key) if rep.day_key else None,
+                      added=[str(it.get("id") or "") for it in added], total=len(self.lessons),
+                      dropped=max(0, before + len(added) - len(self.lessons)),
+                      path=str(self.lessons_path) if self.lessons_path else "",
+                      note="只有客观账本事实；hint 仅来自收工复盘的笔记；只喂提示词、不参与判定")
 
     def _stage_tiles(self, task: str, obs: dict[str, Any], plot: dict[str, Any]) -> list[tuple[int, int]]:
         """这一阶段要动的格子（已排序、已限数）。
@@ -3945,12 +4076,33 @@ class LongRun:
             reason = str(rep.ended_reason or "")
             if not rep.verified:
                 reason = (f"{rep.failed_steps} 格没做成" if rep.failed_steps else reason)
+            # 【task-82】决策→结果的 join：终态计数与三个数字**全部从当天的账本数出来**
+            # （`rep.outcomes` / `rep.stages`），这里只做汇总与排版；`where` 用**具名田区**
+            # （`rep.plots[].zone`），坐标不进提示词（沿用 task-58 的契约）。
+            term: dict[str, int] = {}
+            for _o in rep.outcomes:
+                _t = str((_o or {}).get("terminal") or "")
+                if _t:
+                    term[_t] = term.get(_t, 0) + 1
+            if not term:
+                term = {outcome: 1}
+            leftover_total = sum(int(s.get("leftover") or 0) for s in rep.stages)
+            unreach_total = sum(int(s.get("unreachable") or 0) for s in rep.stages)
+            refused_total = sum(int(s.get("refused") or 0) for s in rep.stages)
+            zones = [str(p.get("zone") or "") for p in rep.plots if p.get("zone")]
+            where = "/".join(dict.fromkeys(zones)) or "窗口"
             for _d in day_decisions:
                 self.decision_memory.append(decision_line(
                     day_key=rep.day_key, boundary=_d["boundary"], intents=_d["intents"],
                     verdict_counts=_d["verdicts"], outcome=outcome,
-                    ended_by=rep.ended_by, ended_reason=reason))
+                    ended_by=rep.ended_by, ended_reason=reason,
+                    terminal=term, leftover=leftover_total,
+                    unreachable=unreach_total, refused=refused_total, where=where))
             del self.decision_memory[:-DECISIONS_KEPT]
+        # 【task-82】日终把今天的**客观教训**并进跨日教训库（`<journal>-lessons.json`）。
+        # 只读账本写事实；`hint` 来自今晚收工复盘（没有 ⇒ 空）。读/写失败都只记一笔，
+        # 绝不影响 `rep` 的任何判定字段。
+        self._lessons_flush(rep)
         self._journal("day_end", **rep.as_dict())
         return rep
 

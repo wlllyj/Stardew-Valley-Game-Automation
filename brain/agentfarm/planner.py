@@ -75,6 +75,10 @@ __all__ = [
     # 【task-59】收工复盘（night 边界一次独立调用；只落 journal + 次日 `recent_notes`）
     "REVIEW_MAX_TOKENS", "REVIEW_NOTES_MAX", "REVIEW_NOTES_MAX_CHARS", "NOTES_SECTION_MAX_CHARS",
     "REVIEW_SYSTEM_PROMPT", "parse_review_notes", "build_review_messages",
+    # 【task-82】跨日教训库（客观事实由代码写、hint 只许 LLM 写；只喂提示词，不参与判定）
+    "LESSONS_MAX", "LESSONS_INJECT_MAX", "LESSONS_INJECT_CHARS", "LESSONS_SECTION_MAX_CHARS",
+    "LESSON_SEVERITY", "make_lesson", "prune_lessons", "render_lessons",
+    "load_lessons_file", "save_lessons_file",
     "BoundaryPlanner", "PLAN_SCHEMA_EXAMPLE",
 ]
 
@@ -394,9 +398,12 @@ DECISIONS_KEPT = 5
 #: 就整节丢掉 —— 决策史是**最先被裁**的东西（原有简报字段一个都不许被它挤掉）。
 DECISIONS_MAX_CHARS = 300
 #: 【task-58】单条决策史的上限（"结局 + 意图 + 校验 + 为什么"要紧凑，一行说完）。
-#: 120 ⇒ 一节 300 字符通常能放 2–3 条（**记忆**本身保留 `DECISIONS_KEPT=5` 条，
-#: 提示词里只呈现塞得下的那些 —— 卡面要求的是"条数 3–5"与"整节 ≤300"两条同时成立）。
-DECISION_LINE_MAX_CHARS = 140
+#: **记忆**本身保留 `DECISIONS_KEPT=5` 条，提示词里只呈现塞得下的那些 ——
+#: 卡面要求的是"条数 3–5"与"整节 ≤300"两条同时成立。
+#: 【task-82】补 join 摘要后字段变多（`terminal`/`leftover`/`unreachable`/`refused`/
+#: `where`），140 会把后两个数字与 `why` 一起截掉 ⇒ 提到 200：一节仍放得下 1–2 条
+#: （跟"最近发生了什么"比，"记得很多天"更不值钱）。
+DECISION_LINE_MAX_CHARS = 200
 
 #: 【task-59】收工复盘（night 边界）的**独立调用**预算：只写 1–3 条笔记，所以给它单独一个
 #: 小 `max_tokens`（卡面 ≤512）——**绝不挪用主决策的 16384**（那是给"长期推理 + 补问"留的）。
@@ -407,6 +414,27 @@ REVIEW_NOTES_MAX = 3
 REVIEW_NOTES_MAX_CHARS = 200
 #: 【task-59】次日简报里 `recent_notes` 这一节的硬上限。与决策史同口径：**最先被裁**。
 NOTES_SECTION_MAX_CHARS = 200
+
+#: 【task-82】跨日教训库（`<journal>-lessons.json`）：客观事实由代码从账本写，
+#: `hint` **只允许**来自 LLM（收工复盘的笔记），拿不到就留空、绝不自己编。
+#: 上限 20 条，按 `(last_seq, severity, count)` 从新到旧淘汰；次日注入 ≤3 条、≤200 字符。
+#: ⚠️ 与决策史/复盘笔记同一条诚实边界：只影响**提示词文本**，绝不参与任何判定。
+LESSONS_MAX = 20
+LESSONS_INJECT_MAX = 3
+LESSONS_INJECT_CHARS = 200
+LESSONS_SECTION_MAX_CHARS = 200
+#: 教训的严重度（越大越先保留）：同一批淘汰时"走不到/干不动"比"没做成"更值得留。
+LESSON_SEVERITY: dict[str, int] = {
+    "unreachable": 3,
+    "encircled": 3,
+    "tool_refused": 3,
+    "dead_crops_blocking": 3,
+    "far_dry_given_up": 2,
+    "no_inventory_space": 2,
+    "slept_without_work": 2,
+    "stage_incomplete": 1,
+}
+LESSON_SEVERITY_DEFAULT = 1
 
 #: 【task-59】复盘专用 system 提示词。和主决策提示词完全分开：它**不做决策**，
 #: 只让模型对着当天简报写 1–3 条给明天的短笔记（禁坐标、禁长篇行动计划）。
@@ -490,6 +518,178 @@ def build_review_messages(
     ]
 
 
+def _strip_coordinates(text: Any) -> str:
+    """把坐标样式的片段洗成「某格」（教训里**绝不许**出现坐标）。"""
+    out = str(text or "")
+    for _ in range(4):
+        hit = find_coordinate_like(out)
+        if not hit:
+            break
+        out = out.replace(hit, "某格")
+    return out
+
+
+def _day_key_values(day_key: Any) -> list[Any]:
+    """`day_key`（可能是 tuple/list/标量）拍成 JSON 友好的列表；坏输入 ⇒ `[]`。"""
+    if day_key is None:
+        return []
+    try:
+        return [int(v) if str(v).isdigit() else str(v) for v in day_key]
+    except TypeError:
+        return [str(day_key)]
+
+
+def make_lesson(
+    *,
+    kind: str,
+    scope: str = "",
+    symptom: str,
+    evidence: str = "",
+    day_key: Any = None,
+    day_seq: int = 0,
+    hint: str = "",
+    severity: int | None = None,
+) -> dict[str, Any]:
+    """造一条**客观**教训（task-82）。
+
+    客观字段（`kind`/`scope`/`symptom`/`evidence`/`first_day`/`last_day`/`count`）由代码
+    从当天账本搬；`hint` **只允许**来自 LLM（收工复盘的笔记），拿不到就留空 ——
+    绝不自己编。`symptom`/`evidence`/`hint` 里的坐标样式数字会被洗成「某格」。
+
+    同一个 `id`（`kind|scope`）在多天出现时由 `prune_lessons()` 合并（`count` 累加）。
+    """
+    scope_text = str(scope or "")
+    day_values = _day_key_values(day_key)
+    return {
+        "id": f"{kind}|{scope_text}",
+        "kind": str(kind),
+        "scope": scope_text,
+        "symptom": _strip_coordinates(symptom),
+        "evidence": _strip_coordinates(evidence),
+        "hint": _strip_coordinates(hint),
+        "count": 1,
+        "first_day": list(day_values),
+        "last_day": list(day_values),
+        "last_seq": int(day_seq),
+        "severity": int(LESSON_SEVERITY.get(str(kind), LESSON_SEVERITY_DEFAULT)
+                        if severity is None else severity),
+    }
+
+
+def prune_lessons(
+    lessons: Iterable[Mapping[str, Any]] | None,
+    *,
+    max_lessons: int = LESSONS_MAX,
+) -> list[dict[str, Any]]:
+    """合并同类教训并淘汰到 `max_lessons` 条 —— **纯函数、绝不抛**。
+
+    * 合并键 = `id`（`kind|scope`）：`count` 累加、`last_day`/`last_seq`/`evidence`
+      取最新那次、`severity` 取历次最大、`hint` 取第一个非空（**只来自 LLM**）；
+    * 排序 = `(last_seq, severity, count)` 从大到小 ⇒ 越近、越严重、越反复的越先留下；
+    * 非法条目（不是映射 / 没有 `id`）直接跳过，坏输入当空库。
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    for raw in lessons or ():
+        if not isinstance(raw, Mapping) or not raw.get("id"):
+            continue
+        lid = str(raw["id"])
+        item = dict(raw)
+        item.setdefault("count", 1)
+        cur = merged.get(lid)
+        if cur is None:
+            merged[lid] = item
+            continue
+        cur["count"] = int(cur.get("count") or 1) + int(item.get("count") or 1)
+        cur["severity"] = max(int(cur.get("severity") or LESSON_SEVERITY_DEFAULT),
+                              int(item.get("severity") or LESSON_SEVERITY_DEFAULT))
+        if int(item.get("last_seq") or 0) >= int(cur.get("last_seq") or 0):
+            cur["last_seq"] = item.get("last_seq") or cur.get("last_seq")
+            cur["last_day"] = item.get("last_day") or cur.get("last_day")
+            cur["evidence"] = item.get("evidence") or cur.get("evidence")
+            cur["symptom"] = item.get("symptom") or cur.get("symptom")
+        if not cur.get("hint") and item.get("hint"):
+            cur["hint"] = item["hint"]
+    ranked = sorted(
+        merged.values(),
+        key=lambda it: (int(it.get("last_seq") or 0), int(it.get("severity") or LESSON_SEVERITY_DEFAULT),
+                        int(it.get("count") or 1)),
+        reverse=True,
+    )
+    return [dict(it) for it in ranked[: max(0, int(max_lessons))]]
+
+
+def render_lessons(
+    lessons: Iterable[Mapping[str, Any]] | None,
+    *,
+    max_items: int = LESSONS_INJECT_MAX,
+    max_chars: int = LESSONS_INJECT_CHARS,
+) -> str:
+    """把教训库拍成简报里的一节（`lessons（…）:` + 每条一行）；空 ⇒ `""`（不出现空节）。
+
+    只取前 `max_items` 条、总长 ≤ `max_chars`；`hint` 非空时附在行尾（它来自 LLM）。
+    渲染前再洗一遍坐标 —— 双保险。
+    """
+    picked = prune_lessons(lessons)[: max(0, int(max_items))]
+    if not picked:
+        return ""
+    head = "lessons（从过去几天的账本里总结的教训，只作参考）:"
+    text = head
+    for it in picked:
+        symptom = str(it.get("symptom") or "").strip()
+        if not symptom:
+            continue
+        line = f"- {symptom}"
+        evidence = str(it.get("evidence") or "").strip()
+        if evidence:
+            line += f"｜{evidence}"
+        hint = str(it.get("hint") or "").strip()
+        if hint:
+            line += f"｜{hint}"
+        item = f"\n{_strip_coordinates(line)}"
+        if len(text) + len(item) > max(0, int(max_chars)):
+            break
+        text += item
+    return text if text != head else ""
+
+
+def load_lessons_file(path: Any) -> tuple[list[dict[str, Any]], str]:
+    """读跨日教训库（task-82）。**绝不抛**：成功 ⇒ `(lessons, "")`；缺文件 ⇒ `([], "")`；
+    读不了/不是 JSON/结构不对 ⇒ `([], 原因串)`（调用方记一笔 journal 后照常跑）。
+    """
+    try:
+        p = Path(path)
+    except Exception as exc:  # noqa: BLE001
+        return [], f"bad_path:{type(exc).__name__}"
+    if not p.exists():
+        return [], ""
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return [], f"read_failed:{type(exc).__name__}: {exc}"
+    if isinstance(raw, Mapping):
+        raw = raw.get("lessons")
+    if not isinstance(raw, list):
+        return [], "not_a_list"
+    return prune_lessons([it for it in raw if isinstance(it, Mapping) and it.get("id")]), ""
+
+
+def save_lessons_file(path: Any, lessons: Iterable[Mapping[str, Any]] | None) -> str:
+    """写跨日教训库（task-82）。**绝不抛**：成功 ⇒ `""`，失败 ⇒ 原因串。
+
+    先写临时文件再 `replace` ⇒ 中途崩掉不会留下半截 JSON（"文件损坏"面里最讨厌的一种）。
+    """
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        payload = {"lessons": [dict(it) for it in (lessons or ())]}
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(p)
+    except Exception as exc:  # noqa: BLE001
+        return f"write_failed:{type(exc).__name__}: {exc}"
+    return ""
+
+
 def decision_line(
     *,
     day_key: Any = None,
@@ -499,14 +699,21 @@ def decision_line(
     outcome: str = "",
     ended_by: str = "",
     ended_reason: str = "",
+    terminal: Mapping[str, int] | None = None,
+    leftover: int | None = None,
+    unreachable: int | None = None,
+    refused: int | None = None,
+    where: str = "",
     max_chars: int = DECISION_LINE_MAX_CHARS,
 ) -> str:
-    """把一条边界决策拍成**一行、无坐标**的决策史（task-58）。
+    """把一条边界决策拍成**一行、无坐标**的决策史（task-58 / task-82 补 join）。
 
     只搬运上层已经算好的东西：意图（`task` + 可选 `area_hint`）、校验关口的
-    `keep/unknown/cancel` 计数、当天的结局（`VERIFIED`/`needs_review`）与收尾原因。
+    `keep/unknown/cancel` 计数、当天的结局（`VERIFIED`/`needs_review`）与收尾原因；
+    task-82 再补上"决策→结果"的 join 摘要：当天的 `terminal` 计数、`leftover` /
+    `unreachable` / `refused` 数量、以及**具名田区**（`where`，如 `field_ne`）。
     **这里不观测、不判断、也不许出现坐标** —— 它是"给模型看的战绩摘要"，
-    不是新的真值来源。
+    不是新的真值来源；`where` 也会再洗一遍坐标。
     """
     tasks: list[str] = []
     for it in intents or ():
@@ -528,8 +735,22 @@ def decision_line(
         f"{day} {boundary}".strip(),
         "intents=[" + ",".join(tasks) + "]" if tasks else "intents=[]",
         f"verdicts={vtxt}" if vtxt else "",
-        f"outcome={outcome}" if outcome else "",
     ]
+    # 【task-82】决策→结果的 join 摘要（每一条都是上层从账本里数出来的，这里只排版）。
+    # `terminal` 在场时不再单列 `outcome=`（同一件事，前者更细）。
+    term = {str(k): int(v or 0) for k, v in (terminal or {}).items() if int(v or 0)}
+    if term:
+        parts.append("terminal=" + "/".join(f"{k}{v}" for k, v in sorted(term.items())))
+    elif outcome:
+        parts.append(f"outcome={outcome}")
+    nums = [f"{name}={int(val)}" for name, val in
+            (("leftover", leftover), ("unreachable", unreachable), ("refused", refused))
+            if val]
+    if nums:
+        parts.append(" ".join(nums))
+    area = _strip_coordinates(str(where or "")).strip()
+    if area:
+        parts.append(f"where={area}")
     reason = " ".join(str(ended_reason or "").split())
     # 【task-58】`ended_reason` 来自执行层，某些诚实文案里**点名过坐标**（如"坐标都够不着
     # （如 [12,30]）"）。决策史是要回填进提示词的 ⇒ 坐标一律洗成"某格"（prompt 契约：
@@ -613,6 +834,10 @@ class Brief:
     #: **无坐标**）。由长跑控制器在夜里回填、次日注入；复盘失败 ⇒ 空（不拿旧笔记冒充昨晚的）。
     #: ⚠️ 与决策史同一条诚实边界：只影响**提示词文本**，绝不参与任何判定。
     recent_notes: tuple[str, ...] = ()
+    #: 【task-82】跨日教训库注入的文本节（`render_lessons()` 已渲染好、≤`LESSONS_INJECT_CHARS`）。
+    #: 由长跑控制器从 `<journal>-lessons.json` 读取后注入；空 ⇒ 这一节不出现。
+    #: ⚠️ 与决策史/复盘笔记同一条诚实边界：只影响**提示词文本**，绝不参与任何判定。
+    recent_lessons: str = ""
 
     # ---- 派生量（确定性策略用） ----
     @property
@@ -668,6 +893,13 @@ class Brief:
         # 连一条都放不下：宁可整节不出现，也不发一个只有标题的空节
         return text if text != head else ""
 
+    def lessons_section(self) -> str:
+        """【task-82】跨日教训一节（≤ `LESSONS_SECTION_MAX_CHARS`）；空 ⇒ 空串（不出现空节）。"""
+        text = str(self.recent_lessons or "")
+        if not text:
+            return ""
+        return text[:LESSONS_SECTION_MAX_CHARS]
+
     def notes_text(self) -> str:
         """【task-59】复盘笔记一节（≤ `NOTES_SECTION_MAX_CHARS`）；空 ⇒ 空串（不出现空节）。"""
         if not self.recent_notes:
@@ -682,18 +914,19 @@ class Brief:
         return text if text != head else ""
 
     def situation_text(self) -> str:
-        """简报全文（进 prompt）【task-58/59】裁切优先级：
+        """简报全文（进 prompt）【task-58/59/82】裁切优先级：
 
         1. 先保证本体（`base_lines()`）完整；
         2. 可选节只在**本体之后**还有余量时追加，且各自有硬上限
-           （复盘笔记 `NOTES_SECTION_MAX_CHARS`、决策史 `DECISIONS_MAX_CHARS`）；
-        3. 余量为 0 ⇒ 该节**整节丢掉**。两节都塞不下时**先丢复盘笔记、再丢决策史**
-           （决策史带的是"我做过什么、结果如何"，比笔记更贴近判断依据；两节都属于
-           最先被裁的东西，原有简报字段一个都不许被挤掉）。
+           （教训 `LESSONS_SECTION_MAX_CHARS`、复盘笔记 `NOTES_SECTION_MAX_CHARS`、
+           决策史 `DECISIONS_MAX_CHARS`）；
+        3. 余量为 0 ⇒ 该节**整节丢掉**。三节都塞不下时**先丢教训、再丢复盘笔记、
+           最后才丢决策史**（决策史带的是"我做过什么、结果如何"，最贴近判断依据；
+           三节都属于最先被裁的东西，原有简报字段一个都不许被挤掉）。
         """
         base = "\n".join(self.base_lines())
         tail = ""
-        for block in (self.notes_text(), self.decisions_text()):
+        for block in (self.lessons_section(), self.notes_text(), self.decisions_text()):
             if not block:
                 continue
             room = PROMPT_BRIEF_MAX_CHARS - len(base) - len(tail) - 1
