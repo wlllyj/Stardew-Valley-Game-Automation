@@ -16,6 +16,7 @@ run9（0.7.28）**已收尾，实测 0/5 VERIFIED**：`finish {"code":1,"verifie
 | 卡 | 内容 | 归属 | 是否本版 |
 |---|---|---|---|
 | task-121 | `REVIEW_MAX_TOKENS` 512→4096 + 截断自愈重试 1 次（8192）+ 失败留 `max_tokens`/`attempts` | dev-coder | ✅ |
+| **task-126** | **P0 闸门**：钉死 `showEndOfNightStuff()` 的日终菜单链（`ShippingMenu` → `SaveGameMenu`），修掉"我们清模态把日切保存链掐断"（run9 实测 **4 NewDay / 0 save**，整跑未落盘）；交付 `docs/_il-shipmenu-save.md` + 修法 | log-analyst（取证）+ Lead 定修法 | **✅ 必须先过** |
 | task-122 | 教训库新增 `stuck_with_leftover` / `plot_exhausted` 两类（含"干净日仍然 0 条"用例） | dev-coder | ✅ `affa7c8` |
 | task-123 | 买种子量力而行（`n=min(buy_count, money//price)`，`n>=1` 则 `buy_partial`） | dev-coder | ✅ |
 | task-124 | review-only 决策不许白过：用守卫据以抱怨的那份 leftover 挑片地/挑格兜底（≥8 单测） | dev-coder | ✅ |
@@ -27,6 +28,7 @@ run9（0.7.28）**已收尾，实测 0/5 VERIFIED**：`finish {"code":1,"verifie
 
 ## 2. 冻结与装机（九步，Lead 独占）
 1. 确认 §1 标记 ✅ 的卡片全部 completed，且 task-122（口径/素材类）过了独立对抗验收。
+1b. **P0 硬闸门（task-126）**：`docs/_il-shipmenu-save.md` 定案 + 修法落地 + 真机验证"关掉日终菜单后仍完成一次 `SaveGame.Save()`"（判据 = SMAPI `NewDay` 次数 == `Context: before save.` 次数 == `SaveGame.Save() called.` 次数 == `completed without exceptions` 次数，逐条配对）。**未过此闸门不许起 run9b**——run9 的 0/4 落盘使整跑证据链作废（见 `docs/_run6-criteria.md` §2 新口径）。
 2. `tools/_note-0729.txt`：首串必须是 `v0.7.29（…）`，逐条写本版内容。
 3. `python tools\_bump-mod-version.py 0.7.29 --note-file tools\_note-0729.txt` ⇒ `json.load` 核对 `manifest.json` 的 Version（脚本末句在 cp1252 下会 `UnicodeEncodeError`、退出码 1，**版本已写盘**）。
 4. `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.29"`（注释列本版内容）。
