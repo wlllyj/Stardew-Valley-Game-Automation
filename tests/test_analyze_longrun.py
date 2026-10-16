@@ -3746,5 +3746,110 @@ class TestBudgetDeferralAndCapacity(unittest.TestCase):
         self.assertEqual((rep["red"] or {}).get("total"), 0)
 
 
+class TestHarvestGaveUpAndCropReady(unittest.TestCase):
+    """task-172：`harvest_gave_up`（task-170 ②：逐格**如实放弃**收获）+ task-170 ① 的新观测字段
+    （`tiles[].ready` / `farm.readyCrops` / `exec.acted` / 逐格作物元数据）。
+
+    口径：`harvest_gave_up` **不是豁免分子** —— brain 把它从目标池与守卫里扣掉
+    （`ripe_live = ripe − len(harvest_gave_up)`），但 `_leftover("harvest")` **不扣**
+    （`brain\\agentfarm\\longrun.py:4046-4069` 自己写明"如实 unmet、不洗白"）⇒ 它就是
+    「该做没做」的证据。`tools\\verify-run3.py` 对 `harvest_gave_up` 零命中 ⇒ 本工具不判红、
+    不进 rc；唯一给 ⚠ 的形态是「当天如实放弃了收获却自称 VERIFIED」（只警告）。
+    `ripe`（`Crop.fullyGrown`，看着熟）与 `ready`（`HoeDirt.readyForHarvest()`，真能收）两口径的
+    差值 = task-169 病根；`ready == null` 只记【无法判定】，**绝不当 false**。
+    旧账本没有这些事件/字段 ⇒ `<缺失>` +【无法判定】（缺失 ≠ 0）。
+    """
+
+    HGU = {"event": "harvest_gave_up", "t": 8.0, "tile": [60, 29], "attempts": 3, "limit": 3,
+           "codes": ["failed"],
+           "note": "同一格今天试满上限仍没摘下来 ⇒ 当天不再动人"}
+
+    def _day(self, day, *, extra=(), verified=True, ended_reason="night", farm=None):
+        nxt = [day[0], day[1], day[2] + 1]
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": True,
+                  "watered_outdoor": True}
+        _final = final(nxt)
+        if farm is not None:
+            _final = dict(_final)
+            _final["farm"] = farm
+        end = {"event": "day_end", "t": 9.0, "day": day, "ended_by": "sleep",
+               "ended_reason": ended_reason, "verified": verified, "checks": checks,
+               "stages": [{"stage": "harvest", "ok": 1, "skipped": 0, "failed": 0,
+                           "env_block": 0, "inconclusive": 0, "stopped": None, "leftover": 0}],
+               "ok_steps": 1, "skipped_steps": 0, "failed_steps": 0, "notes": [],
+               "final": _final,
+               "final_water": {"t": 9.0, "location": "Farm", "tiles": 84, "crops": 31,
+                               "dry": 0, "scope": "farm"}}
+        return [day_start(day), *extra, end]
+
+    def _report(self, events, name, *, days=1):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_ledger(tmp, name, events)
+            return report_for(path, days=days)
+
+    def test_harvest_gave_up_has_bucket_and_is_not_unmapped(self):
+        self.assertIn("harvest_gave_up", mod.EVENT_BUCKETS)
+        rep = self._report(self._day([1, "fall", 7], extra=[self.HGU]), "t172_buckets.jsonl")
+        self.assertEqual(rep["unmapped_events"], {})
+        self.assertEqual(rep["events"].get("harvest_gave_up"), 1)
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+
+    def test_gave_up_is_visible_and_never_an_exemption(self):
+        rep = self._report(self._day([1, "fall", 7], extra=[self.HGU]), "t172_visible.jsonl")
+        hg = rep["harvest_gave_up"]
+        self.assertTrue(hg["has_events"])
+        self.assertEqual(hg["events"], 1)
+        self.assertEqual(hg["tile_count"], 1)
+        self.assertEqual(hg["tiles"], [(60, 29)])
+        self.assertEqual(hg["attempts"], 3)
+        self.assertEqual(hg["limits"], [3])
+        self.assertEqual(hg["codes"], {"failed": 1})
+        text = mod.render_text(rep, 50)
+        self.assertIn("收获放弃（如实，**不是豁免**）: 1 次 / 1 格", text)
+        self.assertIn("绝不当已做完", text)
+        blob = " ".join(a.get("text", "") for a in rep.get("advice") or [])
+        self.assertIn("不是豁免配额", blob)
+        self.assertIn("该做没做", blob)
+
+    def test_gave_up_but_verified_is_warning_not_red(self):
+        rep = self._report(self._day([1, "fall", 7], extra=[self.HGU], verified=True),
+                           "t172_warn_verified.jsonl")
+        hg = rep["harvest_gave_up"]
+        self.assertTrue(hg["warn_gave_up_but_verified_lines"])
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+        self.assertNotIn("missed:", " ".join((rep["red"] or {}).get("subjects") or []))
+        text = mod.render_text(rep, 50)
+        self.assertIn("当天如实放弃了收获却自称 VERIFIED", text)
+
+    def test_ripe_minus_ready_diff_is_reported(self):
+        farm = {"loaded": True, "complete": True, "ripeCrops": 3, "readyCrops": 1}
+        rep = self._report(self._day([1, "fall", 7], farm=farm), "t172_cropready.jsonl")
+        cr = rep["crop_ready"]
+        self.assertTrue(cr["has_fields"])
+        self.assertEqual(cr["ripe_total"], 3)
+        self.assertEqual(cr["ready_total"], 1)
+        self.assertEqual(cr["diff_total"], 2)
+        text = mod.render_text(rep, 50)
+        self.assertIn("熟/可收对账: ripeCrops 3 − readyCrops 1 = 2", text)
+        self.assertIn("看着熟其实不能收", text)
+        blob = " ".join(a.get("text", "") for a in rep.get("advice") or [])
+        self.assertIn("task-169 的真病根", blob)
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+
+    def test_missing_task170_fields_is_undecidable_not_zero(self):
+        rep = self._report(self._day([1, "summer", 5]), "t172_old.jsonl")
+        self.assertFalse(rep["harvest_gave_up"]["has_events"])
+        self.assertFalse(rep["crop_ready"]["has_fields"])
+        text = mod.render_text(rep, 50)
+        self.assertIn("收获放弃: <缺失>", text)
+        self.assertIn("熟/可收对账: <缺失>", text)
+        blob = " ".join(rep.get("undecidable") or [])
+        self.assertIn("harvest_gave_up", blob)
+        self.assertIn("tiles[].ready", blob)
+        self.assertIn("缺失 ≠ 0", blob)
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

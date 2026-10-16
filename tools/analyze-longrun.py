@@ -450,6 +450,32 @@ FIELD_PROBES = [
      "task-136 C（task-139）：当天被『矛盾判据』（`hint_contradicts_evidence(symptom, evidence, hint)`）"
      "丢掉的 hint 条数（每日重置）⇒ **丢弃是设计行为、防污染生效的正面证据，不判红**；"
      "缺失/非整数 ⇒ ⚠ +【无法判定】（缺失 ≠ 0，绝不当'没有矛盾 hint'通过）"),
+    # task-172（dev task-170 `d88498d`）：**「看着熟」与「真能收」分家** + 逐格如实放弃。
+    #     `tiles[].ready` = Mod 反射游戏自己的 `HoeDirt.readyForHarvest()`（authoritative；
+    #     `null` = 读不到 ⇒ 只记【无法判定】，**绝不当 false**）；`farm.readyCrops` 与旧的
+    #     `farm.ripeCrops`（= `Crop.fullyGrown`）并列 ⇒ 差值 = 「看着熟其实不能收」= task-169 病根。
+    #     `harvest_gave_up` = 逐格如实放弃（试满 attempts/limit、当天不再回头）⇒ **不是豁免分子**：
+    #     brain 把它从目标池/守卫里扣掉，但 `_leftover("harvest")` 不扣 ⇒ 它就是「该做没做」的证据。
+    ("event:harvest_gave_up", "harvest_gave_up",
+     "task-170：逐格如实放弃（tile/attempts/limit/codes/note）⇒ 当天不再回头、目标池与守卫都把它"
+     "扣掉，但 `_leftover(\"harvest\")` **不扣** ⇒ **如实放弃 ≠ 已做完**，绝不当豁免配额；"
+     "头部'收获放弃'行 + 建议 0s-2；缺失 ⇒【无法判定】（缺失 ≠ 0）"),
+    ("tiles[].ready", "tile_ready",
+     "task-170 新观测：游戏口径「可收」= Mod 反射 `HoeDirt.readyForHarvest()`（`Crop.fullyGrown` "
+     "之外还排 regrow 期 `dayOfCurrentPhase>0` / `dead` / `forageCrop==\"2\"`）；true=真能收、"
+     "false=不能收、**null=读不到（≠不能收）**"),
+    ("tiles[].fullyGrown / harvestMethod / currentPhase / phaseDays / dayOfCurrentPhase / "
+     "forageCrop / whichForageCrop / regrowsAfterHarvest", "tile_crop_meta",
+     "task-170 逐格作物元数据（`ready` 的输入，用于解释「为什么看着熟却不能收」）；缺失 ⇒【无法判定】，"
+     "**不许用 ripe 顶替 ready**"),
+    ("farm.readyCrops", "farm_readyCrops",
+     "task-170 全农场「真能收」计数（与旧 `farm.ripeCrops` 并列）；两者差值 = 看着熟其实不能收"),
+    ("day_end.final.farm.readyCrops / ripeCrops", "final_farm_ready_ripe",
+     "日级 `final.farm` 白名单里**没有** ripeCrops/readyCrops（brain `longrun.py:1690-1692`）"
+     "⇒ 账本层对账缺证据，只能记【无法判定】+ 建议（要 brain 补白名单）"),
+    ("exec.acted", "exec_acted",
+     "task-170：skill 回执新增 `acted`（`mod\\AgentFarm.Bridge\\Skills.cs:237-241`："
+     "`Ok = err == null && acted`）⇒ task-3 那次「回执只保证没抛异常」的坑在 0.7.33 后应可见"),
     ("event:decision", "decision_memory",
      "决策史条数（task-58 的 `Brief.recent_decisions` 注入 = 账本里 `decision` 事件数；每条还补了 "
      "terminal/leftover/unreachable/refused/where 具名田区，**无坐标**）⇒ 头部`决策:`行已给总数；"
@@ -718,6 +744,10 @@ EVENT_BUCKETS = {
     #     （sold 件数 / ok_count 叠数 / below_keep / trigger{money,threshold,emptyDirt}；
     #      **钱要等下一次 NewDay 才结算 ⇒ 当天 money 不变是设计，绝不判红**）；
     #     `surplus_sell_skip` = 想卖但没有材料超过保留线（带 short 缺口）⇒ **不是失败**。
+    # task-172（dev task-170 `d88498d`）：**收获如实放弃**（试满 MAX_TILE_ATTEMPTS ⇒ 当天不再回头）。
+    #     brain 在 :4065 写 `tile/attempts/limit/codes/note`；目标池与守卫把它扣掉，
+    #     但 `_leftover("harvest")` **不扣** ⇒ **如实放弃不是豁免**、不进任何豁免分子。
+    "harvest_gave_up": "harvest_gave_ups",
     "surplus_sell": "surplus_sells",
     "surplus_sell_skip": "surplus_sell_skips",
     # task-84：日级死苗汇总（`dead_crops_summary`，只在 `dead_crops>0` 且状态 ok 时写一条）。
@@ -829,6 +859,8 @@ NEW_EVENT_BUCKETS = (
     "stuck_flushes", "stuck_flush_skips", "stuck_flush_resnap_failures",
     # task-55/task-91：盈余材料换种子钱（钱次日 NewDay 结算；skips/below_keep 都不是失败）
     "surplus_sells", "surplus_sell_skips",
+    # task-172：收获如实放弃（不是豁免分子；一眼看出"今天放了 N 格没收"）
+    "harvest_gave_ups",
     # task-84：死苗汇总（一眼看出"还有 N 格枯死、其中 M 格没浇、今天认输 K 格"）
     "dead_crops_summaries",
     # task-102：背包空格死锁（买不到不是失败；0 动作拒绝睡觉是有界停住，不是睡眠失败）
@@ -2817,6 +2849,33 @@ def build_advice(report, top=8):
                                 + (rrv2.get("warn_over_stage_refill_lines") or [])
                                 + (rrv2.get("warn_empty_lines") or []))),
         })
+    # 0s-2) task-172：收获如实放弃（**不是豁免分子**）+ 「看着熟其实不能收」对账
+    hg = report.get("harvest_gave_up") or {}
+    cr = report.get("crop_ready") or {}
+    if hg.get("has_events"):
+        advice.append({
+            "text": f"收获如实放弃 ×{hg['events']}（{hg.get('tile_count', 0)} 格；试满 attempts "
+                    f"合计 {hg.get('attempts', 0)}）：目标池与守卫都把它扣掉，但 `_leftover(\"harvest\")` "
+                    "不扣 ⇒ **这是「该做没做」的证据，不是豁免配额**；要么改掉让它摘不到的东西"
+                    "（task-169：Mod 的 `ripe`=`fullyGrown` 比游戏 `HoeDirt.readyForHarvest()` 松），"
+                    "要么如实按未完成验收",
+            "lines": hg.get("lines") or [],
+        })
+    if not cr.get("has_fields"):
+        advice.append({
+            "text": "「看着熟其实不能收」对账缺证据：账本 `day_end.final.farm` 里没有 "
+                    "`ripeCrops`/`readyCrops`（brain `longrun.py:1690-1692` 白名单不含）⇒ 只能【无法判定】；"
+                    "要判这一支请用 `observe?detail=full` 的 `farm.readyCrops` 采样",
+            "lines": [],
+        })
+    elif cr.get("diff_total", 0) > 0:
+        advice.append({
+            "text": f"看着熟其实不能收：ripeCrops {cr.get('ripe_total')} − readyCrops "
+                    f"{cr.get('ready_total')} = {cr.get('diff_total')}（差在 regrow 期 "
+                    "`fullyGrown && dayOfCurrentPhase>0`、`dead`、`forageCrop==\"2\"`）——"
+                    "task-169 的真病根就在这条差值上",
+            "lines": cr.get("ripe_without_ready_lines") or [],
+        })
     # 0c) 环境挡路 / 没拿到结论（task-22 记账）
     env = report.get("env_inconclusive") or {}
     if env.get("env_fail_events"):
@@ -3069,6 +3128,21 @@ def build_undecidable(rows, sessions, prelude, report):
         out.append("本账本没有 free_slots 证据（`surplus_sell`/`surplus_sell_skip`/`sell` 的 "
                    "`trigger.freeSlots`，或 `buy_no_space.free_slots_status`）：无法判定「背包空格」"
                    "这条死锁链（缺失 ≠ 空、≠ 没发生；task-102）")
+    # task-170/task-172：新观测字段是否存在（缺失 ⇒【无法判定】，绝不当"没有看着熟却不能收"通过）
+    if rows and not any(ev.get("event") == "harvest_gave_up" for _, ev in rows):
+        out.append("本账本没有 `harvest_gave_up` 事件（task-170）：无法判定是否发生过「如实放弃收获」"
+                   "—— **缺失 ≠ 0**，也绝不当成「收获了 / 没这回事」通过")
+    _has_ready = ("\"ready\"" in blob) or ("readyCrops" in blob)
+    _has_ripecrops = "ripeCrops" in blob
+    if rows and not _has_ready:
+        out.append("本账本没有 task-170 的 `tiles[].ready` / `farm.readyCrops`（游戏口径「真能收」）："
+                   "无法判定「看着熟其实不能收」这一支 —— 缺失 ≠ 0，"
+                   "**绝不当「熟了就都能收」通过**")
+    if rows and not _has_ripecrops:
+        out.append("本账本没有 `farm.ripeCrops`（旧口径 `Crop.fullyGrown`）："
+                   "无法判定「看着熟」的总量 —— 缺失 ≠ 0")
+    if _has_ready and not _has_ripecrops:
+        out.append("有 `ready` 但没有 `ripeCrops`：两口径无法对账（只能各看一边）")
     # task-111：复盘/教训库的证据是否存在（缺失 ⇒【无法判定】，绝不因此判通过、也不判红）
     _lr_ev = [ev for _ln, ev in rows
               if ev.get("event") in ("review_llm", "review_llm_failed", "lessons",
@@ -4470,6 +4544,100 @@ def build_report(rows, path, args, bad_lines):
         _lab, _di = _lr_day_of(_ln)
         if _di in _wf_ok_days:
             water_far["warn_refill_failed_but_watered_lines"].append(_ln)
+    # task-172：①`harvest_gave_up`（如实放弃 = 「该做没做」的证据，**不是豁免**）
+    #            ②`ripeCrops`（看着熟，`Crop.fullyGrown`）vs `readyCrops`（真能收，`readyForHarvest()`）
+    #              对账 + 窗口 `tiles[].ready`/`ripe` 交叉（task-169 病根一眼可见）。
+    harvest_gave_up = {
+        "events": 0, "lines": [], "tiles": [], "tile_count": 0, "attempts": 0,
+        "limits": [], "codes": {}, "days": [],
+        "warn_gave_up_but_verified_lines": [],
+        "has_events": False,
+    }
+    for _ln, _ev in rows:
+        if _ev.get("event") != "harvest_gave_up":
+            continue
+        harvest_gave_up["events"] += 1
+        harvest_gave_up["lines"].append(_ln)
+        _tl = _ev.get("tile", _ev.get("tiles"))
+        if isinstance(_tl, (list, tuple)) and len(_tl) == 2 and all(isinstance(_v, int) for _v in _tl):
+            _tl = [_tl]
+        for _t in (_tl or []):
+            if isinstance(_t, (list, tuple)) and len(_t) == 2:
+                try:
+                    harvest_gave_up["tiles"].append((int(_t[0]), int(_t[1])))
+                except (TypeError, ValueError):
+                    pass
+        _at = as_int(_ev.get("attempts"), None)
+        if _at is not None:
+            harvest_gave_up["attempts"] += _at
+        _lm = as_int(_ev.get("limit"), None)
+        if _lm is not None:
+            harvest_gave_up["limits"].append(_lm)
+        for _c in (_ev.get("codes") or []):
+            harvest_gave_up["codes"][str(_c)] = harvest_gave_up["codes"].get(str(_c), 0) + 1
+        _lab, _di = _lr_day_of(_ln)
+        if _di is not None:
+            harvest_gave_up["days"].append(_di)
+    harvest_gave_up["days"] = sorted(set(harvest_gave_up["days"]))
+    harvest_gave_up["tile_count"] = len(set(harvest_gave_up["tiles"]))
+    harvest_gave_up["has_events"] = harvest_gave_up["events"] > 0
+    for _di in harvest_gave_up["days"]:
+        _d = days[_di] if 0 <= _di < len(days) else None
+        if _d is not None and _d.get("verified") is True:
+            _hw = _d.get("day_end_lines") or []
+            harvest_gave_up["warn_gave_up_but_verified_lines"].append(_hw[0] if _hw else _d.get("start_line"))
+    crop_ready = {
+        "days_with_fields": 0, "ripe_total": 0, "ready_total": 0, "diff_total": 0,
+        "ripe_without_ready_lines": [], "window_tiles": 0, "window_ready_true": 0,
+        "window_ready_null": 0, "window_ripe_true": 0, "window_ripe_not_ready_lines": [],
+        "has_fields": False, "note": "",
+    }
+    for _ln, _ev in rows:
+        if _ev.get("event") != "day_end":
+            continue
+        _farm = (_ev.get("final") or {}).get("farm") or {}
+        _rp, _rd = as_int(_farm.get("ripeCrops"), None), as_int(_farm.get("readyCrops"), None)
+        if _rp is None and _rd is None:
+            continue
+        crop_ready["days_with_fields"] += 1
+        crop_ready["has_fields"] = True
+        if _rp is not None:
+            crop_ready["ripe_total"] += _rp
+        if _rd is not None:
+            crop_ready["ready_total"] += _rd
+        if _rp is not None and _rd is not None:
+            _diff = _rp - _rd
+            crop_ready["diff_total"] += _diff
+            if _diff > 0:
+                crop_ready["ripe_without_ready_lines"].append(_ln)
+
+    def _tile_dicts(node, depth=0):
+        if depth > 5:
+            return
+        if isinstance(node, dict):
+            if "ready" in node or "ripe" in node:
+                yield node
+            for _v in node.values():
+                yield from _tile_dicts(_v, depth + 1)
+        elif isinstance(node, (list, tuple)):
+            for _v in node:
+                yield from _tile_dicts(_v, depth + 1)
+
+    for _ln, _ev in rows:
+        for _t in _tile_dicts(_ev):
+            crop_ready["window_tiles"] += 1
+            if _t.get("ready") is True:
+                crop_ready["window_ready_true"] += 1
+            elif _t.get("ready") is None:
+                crop_ready["window_ready_null"] += 1
+            if _t.get("ripe") is True:
+                crop_ready["window_ripe_true"] += 1
+            if _t.get("ripe") is True and _t.get("ready") is False:
+                crop_ready["window_ripe_not_ready_lines"].append(_ln)
+    if not crop_ready["has_fields"]:
+        crop_ready["note"] = ("账本层没有 ripeCrops/readyCrops（`day_end.final.farm` 白名单 "
+                              "brain longrun.py:1690-1692 不含）⇒ 只能记【无法判定】；"
+                              "要判定请用 observe?detail=full 的 farm.readyCrops 采样")
     sleep_ok = sum(1 for _, ev in rows if ev.get("event") == "sleep" and ev.get("ok"))
     sleep_failed = sum(1 for _, ev in rows if ev.get("event") == "sleep" and not ev.get("ok"))
     blocked_by_action = {}
@@ -4551,6 +4719,9 @@ def build_report(rows, path, args, bad_lines):
         "buy_partial": buy_partial,
         # task-133：窗口外浇水 + 壶空先补水（壶空=前置条件、**不是「够不着」**；两条可证伪 ⚠）
         "water_far": water_far,
+        # task-172：收获如实放弃（不是豁免分子）+ 「看着熟 vs 真能收」对账
+        "harvest_gave_up": harvest_gave_up,
+        "crop_ready": crop_ready,
         "stamina_budget": stamina_budget,
         "tool_gate": tool_gate,
         # task-134 B：分配额口径（阶段没做完 / 日级 unmet / 诚实上限 deferred；均 info、不判红）
@@ -5155,6 +5326,20 @@ MAPPING_TEXT = [
      "③库文件里有条目 `hint` 为空（= 丢弃已生效）却全账本没有 `hint_dropped` 计数（疑字段被摘/没记账）。"
      "旧账本没有 `lessons` 事件或没有该字段 ⇒ 头部 `<缺失>` +【无法判定】（缺失 ≠ 0，"
      "绝不当'没有矛盾 hint'通过）"),
+    ("harvest_gave_up（task-170，task-172 收录）",
+     "**收获如实放弃**（逐格：tile/attempts/limit/codes）：试满后当天不再回头 —— brain 把它"
+     "从目标池与守卫里扣掉（`ripe_live = ripe − len(harvest_gave_up)`），但 "
+     "`_leftover(\"harvest\")` **不扣** ⇒ 它是**「该做没做」的证据，绝不是豁免分子**"
+     "（`tools\\verify-run3.py` 对 `harvest_gave_up` 零命中 ⇒ 本工具不判红、不进 rc）；"
+     "头部'收获放弃'行 + 建议 0s-2；缺失 ⇒【无法判定】（缺失 ≠ 0）"),
+    ("tiles[].ready / fullyGrown / harvestMethod / currentPhase / phaseDays / dayOfCurrentPhase / "
+     "forageCrop / whichForageCrop / regrowsAfterHarvest / farm.readyCrops / exec.acted（task-170）",
+     "**「看着熟」与「真能收」分家**（task-169 病根）：`ripe`=`Crop.fullyGrown`（旧口径，看着熟）；"
+     "`ready`=Mod 反射游戏 `HoeDirt.readyForHarvest()`（真能收；`null`=读不到 ⇒ 只记【无法判定】，"
+     "**绝不当 false**）；两口径差值 = 看着熟其实不能收（regrow 期 `fullyGrown && dayOfCurrentPhase>0` / "
+     "`dead` / `forageCrop==\"2\"`）。头部'熟/可收对账'行 + 建议 0s-2；日级 `day_end.final.farm` "
+     "白名单不含这两项（`brain longrun.py:1690-1692`）⇒ 账本层通常缺证据，要判定用 "
+     "`observe?detail=full` 采样。`exec.acted` = task-170 起回执带「游戏自己有没有执行动作」"),
     ("encircled / encircled_stage / encircled_summary（task-68、task-76）",
      "5 环境挡路·可达性/开路（信息项，**无硬闸门 ⇒ 一律不判红**）：被不可清障物围住（四邻没有"
      "「可站+可清」的突破口）＝与 `unreachable`（物理走不到）**分开计数**、不封格、不进任何豁免分子；"
@@ -5398,6 +5583,35 @@ def render_text(report, top):
                if wf.get("budget_exhausted_lines") else "")
             + (f"  ⚠ {wf.get('far_cause_missing')} 条 water_far 没有 cause 字段（旧账本形态）"
                if wf.get("far_cause_missing") else ""))
+    # task-172：收获如实放弃（**不是豁免分子**）+ ripeCrops/readyCrops 对账（task-169 病根）。
+    hg = report.get("harvest_gave_up") or {}
+    cr = report.get("crop_ready") or {}
+    if not hg.get("has_events"):
+        add("收获放弃: <缺失>（本账本没有 harvest_gave_up 事件 ⇒ 无法判定是否放弃过收获；缺失 ≠ 0）")
+    else:
+        add(f"收获放弃（如实，**不是豁免**）: {hg.get('events', 0)} 次 / "
+            f"{hg.get('tile_count', 0)} 格（试满 attempts 合计 {hg.get('attempts', 0)}；"
+            f"limit {hg.get('limits') or '<缺失>'}；codes {hg.get('codes') or '<缺失>'}）"
+            "；口径：目标池与守卫都会把它扣掉，但 `_leftover(\"harvest\")` 不扣 ⇒ 它就是"
+            "「该做没做」的证据，**绝不当已做完**"
+            + (f"  ⚠ 当天如实放弃了收获却自称 VERIFIED：行 "
+               f"{hg.get('warn_gave_up_but_verified_lines', [])[:6]}（只警告，不判红）"
+               if hg.get("warn_gave_up_but_verified_lines") else ""))
+    if not cr.get("has_fields"):
+        add("熟/可收对账: <缺失>（账本里没有 `ripeCrops`/`readyCrops` ⇒ 无法判定「看着熟其实不能收」"
+            "这一支；缺失 ≠ 0）")
+    else:
+        add(f"熟/可收对账: ripeCrops {cr.get('ripe_total')} − readyCrops {cr.get('ready_total')} "
+            f"= {cr.get('diff_total')}（{cr.get('days_with_fields')} 天有字段；窗口 "
+            f"ready=true {cr.get('window_ready_true')} / ready=null {cr.get('window_ready_null')} / "
+            f"ripe=true {cr.get('window_ripe_true')}）"
+            "；口径：`ripe`=`Crop.fullyGrown`（看着熟）、`ready`=`HoeDirt.readyForHarvest()`（真能收）"
+            + (f"  ⚠ 看着熟其实不能收（差值 >0）：行 {cr.get('ripe_without_ready_lines', [])[:6]}"
+               "——task-169 病根（regrow 期/dead/forage==\"2\"），改 Mod 判据后再看"
+               if cr.get("diff_total", 0) > 0 else "")
+            + (f"  ⚠ 窗口里 ripe=true 但 ready=false：行 "
+               f"{cr.get('window_ripe_not_ready_lines', [])[:6]}"
+               if cr.get("window_ripe_not_ready_lines") else ""))
     # task-157：够不着 ⇒ 有界开路（`water_far_open`）后重试同一格；开路后仍站不到 ⇒ `water_far_blocked`。
     # 两者都**不是失败**：开路成功也**不等于**浇上水；当天达不达标由 `checks.watered_outdoor` 说话。
     if wf.get("has_open_events"):

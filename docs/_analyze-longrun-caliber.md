@@ -896,6 +896,57 @@ python tools/analyze-longrun.py --journal logs/longrun-3day-llm-run9d.jsonl --da
 rg -n '"event": ?"budget_deferred_tiles"' logs/longrun-*.jsonl
 ```
 
+## 3.27 收获如实放弃 + 「看着熟 / 真能收」分家（task-170 `d88498d`，task-172 收录）
+
+**背景（task-169 定案）**：run A/B 里 `(60,29)` 一格 `ripe=true` 但游戏拒收，harvest 反复失败
+（run A 全天 0 成功 / 79 失败、run B 0/41），`veto sleep 35 次`、`recover 13 次`，两天都不可能 VERIFIED。
+根因：Mod 的 `ripe` = `Crop.fullyGrown`（**看着熟**），比游戏自己的 `HoeDirt.readyForHarvest()`
+（**真能收**）松 —— 后者还要求 `!(fullyGrown && dayOfCurrentPhase > 0)`（regrow 期）、`!dead`、
+`forageCrop != "2"`（`scratch\il-hv-3.txt:2-48`）。
+
+task-170 给的两件东西（brain/Mod 权威）：
+
+| 事件 / 字段 | 位置 | 含义 |
+|---|---|---|
+| `harvest_gave_up` | `brain/agentfarm/longrun.py:4046-4069`（journal `:4065`） | 逐格 `tile`/`attempts`/`limit`(`MAX_TILE_ATTEMPTS`)/`codes`/`note`：同一格试满上限 ⇒ 当天不再动人 |
+| `tiles[].ready` + 逐格作物元数据 | `mod\AgentFarm.Bridge\WorldSnapshot.cs`（`CropMeta` 反射 `HoeDirt.readyForHarvest()`） | `ready`：true=真能收 / false=不能收 / **null=读不到**；另有 `fullyGrown`/`harvestMethod`/`currentPhase`/`phaseDays`/`dayOfCurrentPhase`/`forageCrop`/`whichForageCrop`/`regrowsAfterHarvest` |
+| `farm.readyCrops` | 同上 | 全农场「真能收」计数（与旧 `farm.ripeCrops` 并列） |
+| `exec.acted` | `mod\AgentFarm.Bridge\Skills.cs:237-241` | 回执新增「游戏自己有没有执行动作」（`Ok = err == null && acted`） |
+
+### 口径：`harvest_gave_up` **不是豁免分子**
+- brain 把它从目标池与守卫里扣掉（`ripe_live = ripe − len(harvest_gave_up)`），
+  **但 `_leftover("harvest")` 不排除它们**（`longrun.py:4052` 注释原文："当天确实没收到 ⇒ 如实 unmet、不洗白"）
+  ⇒ 它就是**「该做没做」的证据**：0 条豁免、不进任何豁免分子、不进 `checks` 扣减。
+- `tools\verify-run3.py` 对 `harvest_gave_up` 零命中 ⇒ 本工具**不判红、不进 rc**；唯一 ⚠：
+  「当天如实放弃了收获却自称 VERIFIED」（`warn_gave_up_but_verified_lines`，只警告）。
+- `ripe` vs `ready`：两口径差值 = **看着熟其实不能收**（task-169 病根）。差值 >0 ⇒ 头部 ⚠ + 建议 0s-2；
+  窗口里 `ripe=true && ready=false` 另给一条 ⚠。`ready == null` ⇒ **只记【无法判定】，绝不当 false**。
+- 缺失行为：旧账本没有 `harvest_gave_up`/`ready`/`readyCrops` ⇒ 头部 `<缺失>` +【无法判定】
+  （**缺失 ≠ 0**，绝不当「今天没放弃过收获」「熟了就都能收」通过）。
+- **账本层的对账缺口**：`day_end.final.farm` 白名单（`brain/agentfarm/longrun.py:1690-1692`）只有
+  `loaded/complete/crops/dryCrops/dryDeadCrops/unwateredCrops/hoeDirt/deadCrops`，**没有** `ripeCrops`/`readyCrops`
+  ⇒ 日级「看着熟其实不能收」差值在账本里通常【无法判定】；要判定请用 `observe?detail=full` 的
+  `farm.readyCrops` 采样。建议：把 `ripeCrops`/`readyCrops` 加进该白名单（brain 侧，一行）。
+
+### 单测与读数
+- 单测：`tests/test_analyze_longrun.py::TestHarvestGaveUpAndCropReady` 5 条 —— 事件有桶且不落未映射 /
+  如实放弃可见且**明说不是豁免**（含头部与建议原文）/ 放弃却自称 VERIFIED ⇒ ⚠ 不判红 /
+  `ripeCrops − readyCrops` 差值进头部与建议 / 旧账本 ⇒ `<缺失>` +【无法判定】。
+- 读数：`python -W error::SyntaxWarning -m py_compile` RC=0；`tests.test_analyze_longrun` **200 OK**（+5）；
+  全量 `discover -s tests` **Ran 894 tests / OK（0 红）**。
+- 旧账本回归（`scratch\_t172_matrix.py`：HEAD 版 vs 新版，逐账本 rc/red 并排）：
+  run A 1(117)→1(117)、run B 1(84)→1(84)、run9d 1(29)→1(29)、run9c 0(0)→0(0)、run9b 1(45)→1(45)、
+  run9 1(84)→1(84) —— **判决与计数一字未变**（只多出两行新信息 + 两行映射）；`verify-run3.py` 同向
+  （run A/B/run9/9b/9d rc=1；run9c rc=1 为已知有意分歧 `docs\_verify-run3-limits.md`）。
+
+### grep 配方
+
+```
+git grep -n "harvest_gave_up\|readyCrops" -- brain/agentfarm/ mod/AgentFarm.Bridge/
+python tools\analyze-longrun.py --journal logs\longrun-runA-0732.jsonl --days 6 | rg "收获放弃|熟/可收对账"
+rg -n '"event": ?"harvest_gave_up"' logs/longrun-*.jsonl
+```
+
 ## 4. 复核命令
 
 ```
@@ -909,6 +960,6 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run9d.jsonl --da
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
 python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
-python -m unittest tests.test_analyze_longrun  # 当前 195 OK（task-165 + 预算延后/容量 5 条）
-python -m unittest discover -s tests           # 当前 Ran 874 tests / OK（0 红；task-157/158/20/163 四条漂移红已随 task-160/164/165 清零）
+python -m unittest tests.test_analyze_longrun  # 当前 200 OK（task-172 + 收获放弃/熟可收对账 5 条）
+python -m unittest discover -s tests           # 当前 Ran 894 tests / OK（0 红；task-170 的漂移红已随 task-172 清零）
 ```
