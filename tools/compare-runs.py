@@ -182,13 +182,53 @@ def lessons_of(journal: Path) -> tuple[list[dict], str]:
     return [], ""
 
 
+# 教训节在提示词里的固定抬头（brain 侧 `planner`/`longrun` 渲染；用于**结构性**判注入）
+LESSON_SECTION_MARK = "从过去几天的账本里总结的教训"
+
+
 def lesson_text(entry: dict) -> str:
-    for key in ("lesson", "text", "summary", "note", "why", "reason"):
+    """取"这条教训被渲染进提示词"的那段文本。
+
+    ⚠ 2026-10-17 事故（run A/B 对照误报「教训根本没送到」）：brain 写进
+    `<journal>-lessons.json` 的字段是 `id/symptom/evidence/hint/count/day`，
+    而这里原先只认 `lesson/text/summary/note/why/reason` ⇒ 取不到 ⇒ 退化成
+    "把所有字段拼成一长串"，那一长串当然不是提示词的子串 ⇒ `hits=0`。
+    实际提示词渲染的是 `- {symptom}〈{evidence}〉…{hint}`，**hint 与 symptom 都是逐字出现**。
+    所以这里按"渲染时最可能逐字出现"的顺序取键，并把 `hint`（模型自述）放在前面。
+    """
+    for key in ("hint", "lesson", "text", "summary", "note", "why", "reason", "symptom"):
         val = entry.get(key)
         if isinstance(val, str) and val.strip():
             return val.strip()
     parts = [str(v) for v in entry.values() if isinstance(v, (str, int, float))]
     return " / ".join(parts).strip()
+
+
+def lesson_full_text(entry: dict) -> str:
+    """L3 旁证与展示用的**完整**教训文本（症状 + 证据 + 模型自述）。
+
+    与 `lesson_text` 分工：`lesson_text` 负责"能不能在提示词里逐字找到"（子串命中），
+    `lesson_full_text` 负责"这条教训在讲什么"（同指涉词表）。混用会两头出错：
+    用完整文本做子串比对 ⇒ 拼出来的长串永不是提示词子串（2026-10-17 误报事故）；
+    用单字段做词表 ⇒ 丢掉 `evidence` 里的 `leftover=12` 这类可核对的具体数字。
+    """
+    parts: list[str] = []
+    for key in ("symptom", "evidence", "hint", "lesson", "text", "summary", "note", "why", "reason"):
+        val = entry.get(key)
+        if isinstance(val, str) and val.strip():
+            parts.append(val.strip())
+    if not parts:
+        return lesson_text(entry)
+    return " / ".join(dict.fromkeys(parts))
+
+
+def lesson_section_present(prompts: list[str]) -> bool:
+    """提示词里有没有「教训」这一节（结构性判据，不依赖逐条文本比对）。
+
+    与 `lesson_text` 的逐条命中互为交叉核对：节在 + 逐条 0 命中 ⇒ 是**比对口径**问题
+    （或该条被裁掉），不是"教训根本没送到"。
+    """
+    return any(LESSON_SECTION_MARK in p for p in prompts if isinstance(p, str))
 
 
 def prompts_of(journal: Path) -> list[str]:
@@ -257,19 +297,20 @@ def _tokens(text: str) -> set[str]:
 
 
 def criteria(info_a: dict, info_b: dict, lessons: list[dict], hits: int,
-             prompts_b: list[str], la: str = "runA", lb: str = "runB") -> dict:
+             prompts_b: list[str], la: str = "runA", lb: str = "runB",
+             section_present: bool | None = None) -> dict:
     tail_a, tail_b = tail_verified(info_a["days"]), tail_verified(info_b["days"])
     signals: list[dict] = []
     for entry in lessons:
         kind = lesson_kind(entry)
         signal = _LESSON_SIGNAL.get(kind)
         if not signal:
-            signals.append({"kind": kind, "lesson": lesson_text(entry)[:96], "signal": None,
+            signals.append({"kind": kind, "lesson": lesson_full_text(entry)[:96], "signal": None,
                             "a": None, "b": None, "improved": None})
             continue
         count_a, count_b = _signal_count(info_a, signal), _signal_count(info_b, signal)
         signals.append({
-            "kind": kind, "lesson": lesson_text(entry)[:96],
+            "kind": kind, "lesson": lesson_full_text(entry)[:96],
             "signal": f"{signal[0]}:{signal[1]}",
             "a": count_a, "b": count_b,
             "improved": (count_a == 0) or (count_b < count_a),
@@ -277,19 +318,21 @@ def criteria(info_a: dict, info_b: dict, lessons: list[dict], hits: int,
     mapped = [s for s in signals if s["signal"]]
     new_false = sorted(set(info_b.get("checks_false") or []) - set(info_a.get("checks_false") or []))
     l0 = len(lessons) >= 1
+    if section_present is None:
+        section_present = lesson_section_present(prompts_b)
     l1 = bool(lessons) and bool(prompts_b) and hits > 0
     l2 = bool(mapped) and all(bool(s["improved"]) for s in mapped)
     l4 = (tail_b >= tail_a) and not new_false
     # L3 只给旁证：教训里的具体指涉有没有出现在 run B 的决策理由/预期证据里
     influence: list[dict] = []
     for entry in lessons:
-        toks = _tokens(lesson_text(entry))
+        toks = _tokens(lesson_full_text(entry))
         mentioned = 0
         if toks:
             for text in info_b.get("decision_texts") or []:
                 if toks & _tokens(text):
                     mentioned += 1
-        influence.append({"lesson": lesson_text(entry)[:96], "decision_mentions": mentioned,
+        influence.append({"lesson": lesson_full_text(entry)[:96], "decision_mentions": mentioned,
                           "note": "旁证：只在「理由/预期证据里出现同一指涉」意义上成立，不等于决策被改变"})
     if not l0:
         verdict = "不足以判定自我进化（run A 没产出教训，A→B 对照作废）"
@@ -313,6 +356,7 @@ def criteria(info_a: dict, info_b: dict, lessons: list[dict], hits: int,
         "new_false_checks_in_b": new_false,
         "lesson_hits": hits,
         "lessons_total": len(lessons),
+        "lesson_section_present": bool(section_present),
         "b_prompt_calls": len(prompts_b),
     }
 
@@ -401,6 +445,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print("\n[5] run A 教训库 → run B 提示词命中")
     hits = 0
+    section_present = lesson_section_present(prompts_b)
     if not lessons:
         print(f"  ⚠ 读不到 run A 的教训库（期望 {sidecar(ja, '-lessons.json')} 或 `-lessons.jsonl`）"
               " ⇒ 无法证明「带教训再玩」，按未观察到演进处理")
@@ -415,15 +460,27 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {idx:>2}. [{mark}] {text[:96]}")
         print(f"  ⇒ {hits}/{len(lessons)} 条教训文本出现在 run B 的 {len(prompts_b)} 次 LLM 调用提示词里"
               "（子串比对；注入后被裁掉的部分算未见）")
+        print(f"  教训节抬头「{LESSON_SECTION_MARK}」在 run B 提示词里："
+              f"{'✅ 出现' if section_present else '❌ 未见'}")
         if prompts_b and hits == 0:
-            print("  ❌ 注入口径警告：run A 有教训、run B 也有 LLM 调用，却一条教训都没进提示词")
-            print("     —— 这不是「未观察到演进」，而是「教训根本没送到」；先查文件发现路径/裁切顺序。")
+            if section_present:
+                print("  ⚠ 比对口径警告：**教训节确实在提示词里**，但逐条文本一条都没匹配上")
+                print("     ⇒ 优先怀疑本工具的取文本口径（字段名/裁切/改写），不要断言「教训没送到」；")
+                print("        请把 `lessons_total/lessons_hits/section_present` 三个值一起看。")
+            else:
+                print("  ❌ 注入口径警告：run A 有教训、run B 也有 LLM 调用，提示词里既没有教训节、"
+                      "也没有任何一条教训文本")
+                print("     —— 这不是「未观察到演进」，而是「教训根本没送到」；先查文件发现路径/裁切顺序。")
     if not prompts_b:
         print(f"  ⚠ 读不到 run B 的 LLM 留痕（期望 {sidecar(jb, '-llm.jsonl')}）"
               " ⇒ 无法核对注入；若 run B 未开 --boundary-llm，此处属预期")
+    # L1 = 教训文本确实进了 run B 提示词（逐条子串命中）。
+    # 教训节抬头只作**交叉核对**：节在 + 逐条 0 命中 ⇒ 报"比对口径"，不断言"没送到"
+    # （2026-10-17 事故：本工具取文本的字段名与 brain 的 `hint/symptom` 不一致 ⇒ 误报 0/6）。
     injection_effective = bool(lessons) and bool(prompts_b) and hits > 0
 
-    crit = criteria(info_a, info_b, lessons, hits, prompts_b, args.label_a, args.label_b)
+    crit = criteria(info_a, info_b, lessons, hits, prompts_b, args.label_a, args.label_b,
+                    section_present)
     print_criteria(crit, args.label_a, args.label_b)
 
     verdict = {
@@ -433,6 +490,7 @@ def main(argv: list[str] | None = None) -> int:
                      and norm(lesson_text(e)) in joined_b_norm} for e in lessons],
         "lessons_total": len(lessons),
         "lessons_hits": hits,
+        "lesson_section_present": section_present,
         "injection_effective": injection_effective,
         "b_prompt_calls": len(prompts_b),
         "criteria": crit,

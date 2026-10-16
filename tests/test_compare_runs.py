@@ -268,5 +268,75 @@ class CliTests(unittest.TestCase):
         self.assertEqual(cr.norm("不要 反复\n派活，。"), "不要反复派活")
 
 
+class BrainLessonFieldTests(unittest.TestCase):
+    """2026-10-17 事故回归：brain 的教训条目用 `symptom/evidence/hint`，不是 `lesson/text`。
+
+    事故经过：run A/B 对照里工具报 `injection_effective=false`（"教训根本没送到"），
+    而 machine-runner 直查同一份 `-llm.jsonl` 得到 47/47 决策提示词都含教训节 ——
+    两把尺子量的不是同一个东西：`lesson_text()` 只认 `lesson/text/summary/...`，
+    对 brain 的字段取不到值，退化成"把所有字段拼成长串"，那当然不是提示词的子串。
+    """
+
+    _ENTRY = {
+        "id": "stuck_with_leftover|harvest",
+        "symptom": "harvest 收尾时还剩 1 格没做成、当天以 stuck 结束",
+        "evidence": "leftover=1 failed=1 stopped=incomplete",
+        "hint": "体力已归零，明天别一早就硬撑，留出回程和补给的余量。",
+        "count": 3,
+    }
+    _PROMPT = ("简报…\nlessons（从过去几天的账本里总结的教训，只作参考）:\n"
+               "- harvest 收尾时还剩 1 格没做成、当天以 stuck 结束"
+               "〈leftover=1 failed=1 stopped=incomplete〉[模型自述·未验证] "
+               "体力已归零，明天别一早就硬撑，留出回程和补给的余量。\n请给意图。")
+
+    def test_lesson_text_prefers_hint_for_brain_entries(self):
+        self.assertEqual(cr.lesson_text(self._ENTRY), self._ENTRY["hint"])
+
+    def test_lesson_text_still_accepts_legacy_keys(self):
+        self.assertEqual(cr.lesson_text({"lesson": "旧格式"}), "旧格式")
+        self.assertEqual(cr.lesson_text({"symptom": "只有症状"}), "只有症状")
+
+    def test_lesson_section_present_detects_header(self):
+        self.assertTrue(cr.lesson_section_present([self._PROMPT]))
+        self.assertFalse(cr.lesson_section_present(["没有教训节"]))
+        self.assertFalse(cr.lesson_section_present([]))
+
+    def _run(self, tmp: pathlib.Path, prompt: str) -> tuple[int, str, dict]:
+        write_jsonl(tmp / "a.jsonl", [day_end([1, "summer", 3], verified=False, stages=[])])
+        write_jsonl(tmp / "b.jsonl", [day_end([1, "summer", 4], verified=False, stages=[])])
+        (tmp / "a-lessons.json").write_text(
+            json.dumps({"lessons": [self._ENTRY]}, ensure_ascii=False), encoding="utf-8")
+        write_jsonl(tmp / "b-llm.jsonl", [{"kind": "decision", "prompt": prompt}])
+        out_json = tmp / "verdict.json"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cr.main(["--run-a", str(tmp / "a.jsonl"), "--run-b", str(tmp / "b.jsonl"),
+                            "--json", str(out_json)])
+        return code, buf.getvalue(), json.loads(out_json.read_text(encoding="utf-8"))
+
+    def test_brain_style_lessons_count_as_injected(self):
+        with tempfile.TemporaryDirectory() as raw:
+            code, out, verdict = self._run(pathlib.Path(raw), self._PROMPT)
+        self.assertEqual(code, 0)
+        self.assertIn("✅ 进提示词", out)
+        self.assertIn("1/1 条教训文本", out)
+        self.assertTrue(verdict["injection_effective"])
+        self.assertTrue(verdict["lesson_section_present"])
+        self.assertEqual(verdict["lessons_hits"], 1)
+
+    def test_section_present_without_text_hit_warns_about_caliber_not_missing_injection(self):
+        """节在、逐条文本没命中 ⇒ 必须报「比对口径」，不许断言「教训根本没送到」。"""
+        with tempfile.TemporaryDirectory() as raw:
+            code, out, verdict = self._run(
+                pathlib.Path(raw),
+                "简报…\nlessons（从过去几天的账本里总结的教训，只作参考）:\n- 被改写过的另一段文本\n")
+        self.assertEqual(code, 0)
+        self.assertIn("比对口径警告", out)
+        self.assertNotIn("教训根本没送到", out)
+        self.assertFalse(verdict["injection_effective"])
+        self.assertTrue(verdict["lesson_section_present"])
+        self.assertEqual(verdict["lessons_hits"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
