@@ -76,6 +76,15 @@
     **缺失 ⇒ 写 `<缺失>` + 进【无法判定】（缺失 ≠ 0）**；旧账本没有 `buy_no_space` 事件时
     从 `buy.receipt` 的 `no_inventory_space` 回执码补认（run8 就是这样被看见的）。
     `sell`/`surplus_sell` 成交**当天 `money` 不变是设计**（钱等下一次 `NewDay` 结算）⇒ 绝不判红。
+  * LLM 复盘 / 教训库（task-58/59/82，Lead m05325）：`review_llm`（收工复盘：notes/text/usage/
+    rejected/truncated）、`review_llm_failed`（复盘失败 ⇒ **失败无害**，只记信息）、`lessons`
+    （日终落盘：added/total/dropped/path）、`lessons_load_failed` / `lessons_save_failed`。
+    **「模型没学到东西」不是失败**（空 notes / 空库 / 0 新增只记信息）；只有三条完整性红：
+    ①`review_llm` 声称成功却 0 条 notes（`missed:review_llm_without_notes`）②教训库条数超上限
+    （`missed:lessons_over_limit`；事件 `total` 或落盘 `<journal>-lessons.json` 条数 > brain
+    `LESSONS_MAX=20`）③教训库读不了/文件损坏（`missed:lessons_load_failed`）。教训库路径由
+    journal 推导（`X.jsonl` ⇒ `X-lessons.json`，与 brain `_derive_lessons_path` 同约定，
+    **不新增命令行开关**）；旧账本没有这些事件 ⇒ 头部 `<缺失>` + 【无法判定】（缺失 ≠ 0）。
   * 事件映射不许漂移（Lead m02395）：brain 里 `_journal("<name>"` 的**每个**事件名都要在
     `EVENT_BUCKETS` 里有桶（结构性事件 `day_start`/`day_end`/`finish` 除外，见 `STRUCTURAL_EVENTS`）；
     账本里出现没桶的事件 ⇒ 报告头部逐条点名（名字×次数+行号）+ 建议 0a，**绝不静默丢弃**。
@@ -293,6 +302,27 @@ FIELD_PROBES = [
      "`trigger.freeSlotsStatus`；task-102 腾格路径的门闸就是这个数；缺失 ⇒ 写 `<缺失>`、不当 0）"),
     ("event:surplus_sell.why", "sell_why",
      "卖出触发路径（task-102：`need_money`=钱不够 / `need_slot`=钱够但背包没空格 ⇒ 卖一叠腾格）"),
+    ("event:review_llm", "review_llm",
+     "收工 LLM 复盘（task-59：day_key/notes(≤3 条)/text/usage/duration_ms/model/rejected/"
+     "truncated/note）；**声称成功却没有任何 notes ⇒ 判红**（`missed:review_llm_without_notes`，"
+     "task-111）；notes 为空列表、rejected 非空、truncated=true 都只记信息"),
+    ("event:review_llm_failed", "review_llm_failed",
+     "收工复盘失败（task-59：day_key/reason/called/rejected/note）⇒ **失败无害**（睡觉与跨日照常，"
+     "只是次日看不到笔记）⇒ 只记信息、不判红"),
+    ("event:lessons", "lessons_event",
+     "跨日教训库落盘（task-82：day_key/added(id 列表)/total/dropped/path/note）；`total` 超过"
+     f"上限 ⇒ 判红（`missed:lessons_over_limit`，上限见 brain planner.LESSONS_MAX）；"
+     "空库/本日 0 新增只记信息（**不因'模型没学到东西'判红**）"),
+    ("event:lessons_load_failed", "lessons_load_failed",
+     "教训库读不了（task-82：path/error/note：`read_failed:`=JSON 坏 / `not_a_list`=结构坏 / "
+     "`bad_path:`）⇒ 文件损坏/不可信 ⇒ 判红（`missed:lessons_load_failed`；brain 的'失败无害'"
+     "指不中断跑批，不指账目可信）"),
+    ("event:lessons_save_failed", "lessons_save_failed",
+     "教训库写不进去（task-82：path/error/note）⇒ 只记信息（本批教训只在内存里，跑批照常）"),
+    ("event:decision", "decision_memory",
+     "决策史条数（task-58 的 `Brief.recent_decisions` 注入 = 账本里 `decision` 事件数；每条还补了 "
+     "terminal/leftover/unreachable/refused/where 具名田区，**无坐标**）⇒ 头部`决策:`行已给总数；"
+     "复盘/教训库是否被注入要看 `review_llm.notes` / `lessons.total`"),
 ]
 OUTCOME_RE = re.compile(
     r"目标\s*(\d+)\s*步：做成\s*(\d+)、跳过\s*(\d+)、失败\s*(\d+)"
@@ -458,6 +488,15 @@ EVENT_BUCKETS = {
     # task-104（run8 day 12 的 `water_far` 前置）：窗口外有干作物但**人不在户外农场** ⇒ 不扣该格当日
     # 额度、不进 `given_up`，只记一条（`reason=not_on_farm`）⇒ **不是失败**。
     "water_far_skipped": "water_far_skips",
+    # task-58/59/82（Lead m05325）：收工 LLM 复盘 + 跨日教训库。**"模型没学到东西"不是失败**
+    # （空 notes / 空教训库只记信息）——只有两条完整性红线进来看：声称成功却一条 notes 都没有、
+    # 教训库条数超上限 / 文件损坏。复盘失败（`review_llm_failed`）与教训库读写失败（load/save）
+    # 按 brain 的"失败无害"契约只记信息（睡觉与跨日照常）。
+    "review_llm": "review_llms",
+    "review_llm_failed": "review_llm_failures",
+    "lessons": "lessons_events",
+    "lessons_load_failed": "lessons_load_failures",
+    "lessons_save_failed": "lessons_save_failures",
 }
 
 #: 结构性事件：由报告的其他字段单独统计（day_start/day_end 切会话与验收、finish 自述），
@@ -498,6 +537,9 @@ NEW_EVENT_BUCKETS = (
     "buy_no_spaces", "slept_without_works", "modal_dismiss_failures",
     # task-104：窗口外浇水被人不在农场挡下（不扣额度、不认输 ⇒ 不是失败）
     "water_far_skips",
+    # task-111：LLM 复盘 / 教训库（本日 notes、复盘失败、教训库新增/淘汰、读写失败）
+    "review_llms", "review_llm_failures", "lessons_events",
+    "lessons_load_failures", "lessons_save_failures",
 )
 
 
@@ -558,6 +600,10 @@ GLOBAL_RED_SUBJECTS = (
     "wasted:finish_incoherent",
     "wasted:finish_vs_days",
     "missed:stage_account",
+    # task-111：复盘/教训库的三条完整性红 —— 不能被窗口降级（旧账本升级后也一眼可见）
+    "missed:review_llm_without_notes",
+    "missed:lessons_over_limit",
+    "missed:lessons_load_failed",
 )
 #: task-88：事件级"瞬间态"class-1 —— 当天 `day_end.verified=true` 且 `checks.no_unmet_stages=true`
 #: ⇒ 降级为 info（逐条列出并标"已结清"，不进 rc）。理由：这些事件记录的是**某一轮的瞬间状态**
@@ -592,6 +638,53 @@ def finding(line, event, summary, hint="", subject=""):
         "summary": summary,
         "hint": hint,
     }
+
+
+def llm_review_findings(lr):
+    """task-111：LLM 收工复盘 / 教训库的**三条完整性红**（其余一律信息项）。
+
+    * `review_llm` 声称成功却一条 notes 都没有 ⇒ 红（声称学到东西却什么都没写）；
+    * 教训库条数超上限（brain `LESSONS_MAX = 20`；事件 `total` 或落盘文件条数）⇒ 红；
+    * 教训库读不了/文件损坏（`lessons_load_failed` 或落盘 JSON 解析失败）⇒ 红。
+    复盘失败（`review_llm_failed`）、教训库写失败（`lessons_save_failed`）、notes 为空列表、
+    空库 / 本日 0 新增 ⇒ **都不判红**（与 brain 的"失败无害"契约一致）。
+    """
+    lr = lr or {}
+    out = []
+    for ln in lr.get("without_notes_lines") or []:
+        out.append(finding(
+            ln, "review_llm",
+            f"复盘声称成功却一条 notes 都没有（notes={lr.get('notes_count')} 条）"
+            "⇒ 声称学到了东西却什么都没写（task-111：只有'没学到'不算失败，'假称学到'才算）",
+            hint="看 review_llm 的 rejected/truncated；模型输出被拒或被截断时 notes 会是空 —— "
+                 "要么修提示词，要么让调用如实记成 review_llm_failed",
+            subject="missed:review_llm_without_notes"))
+    for ln in lr.get("over_limit_lines") or []:
+        out.append(finding(
+            ln, "lessons",
+            f"教训库条数超上限：total={lr.get('lessons_total')} / 落盘文件 "
+            f"{lr.get('file_count')} 条 > {lr.get('lessons_max')}（brain `LESSONS_MAX`）"
+            "⇒ 淘汰逻辑没生效，库会无限膨胀（提示词预算被吃光）",
+            hint="brain/agentfarm/planner.py: prune_lessons(max_lessons=LESSONS_MAX)；"
+                 "本工具直接读 `<journal>-lessons.json`（路径同 brain 的推导约定，不加命令行开关）",
+            subject="missed:lessons_over_limit"))
+    if lr.get("load_failed"):
+        errs = "；".join(str(e) for e in (lr.get("load_errors") or [])[:3])
+        out.append(finding(
+            (lr.get("load_failed_lines") or [None])[0], "lessons_load_failed",
+            f"教训库读不了 ×{lr.get('load_failed')}（error={errs}）⇒ 教训库不可信："
+            "brain 的'失败无害'只保证不中断跑批，不保证账目可信 ⇒ 必须人工看这个文件",
+            hint="路径 = `<journal>-lessons.json`；`read_failed:` = JSON 坏、`not_a_list` = 结构坏、"
+                 "`bad_path:` = 路径用不了（task-111 判红）",
+            subject="missed:lessons_load_failed"))
+    if lr.get("file_status") == "corrupt":
+        out.append(finding(
+            None, "lessons_file",
+            f"教训库文件损坏（{lr.get('file_path')}：{lr.get('file_error')}）"
+            "⇒ 本工具按同一路径推导读它，读不动 ⇒ 教训库不可信（task-111 判红）",
+            hint="brain 写盘是 tmp+replace（planner.save_lessons_file），出现损坏说明被外部改过/截断过",
+            subject="missed:lessons_load_failed"))
+    return out
 
 
 def day_label(ev):
@@ -2011,6 +2104,37 @@ def build_advice(report, top=8):
                       + bsi.get("modal_dismiss_failed_lines", [])
                       + ([] if bsi.get("buy_no_space") else bsi.get("buy_lines", [])[:6])),
         })
+    # 0o) LLM 收工复盘 / 教训库（task-111）：没学到东西是信息项；三条完整性红才点名
+    lri = report.get("llm_review") or {}
+    if (lri.get("without_notes_lines") or lri.get("over_limit_lines")
+            or lri.get("load_failed") or lri.get("file_status") == "corrupt"):
+        _lparts = []
+        if lri.get("without_notes_lines"):
+            _lparts.append(f"复盘声称成功却 0 条 notes ×{len(lri['without_notes_lines'])}"
+                           f"（行 {lri['without_notes_lines'][:6]}）⇒ 假称学到东西（看 rejected/"
+                           "truncated；要么修提示词、要么如实记成 review_llm_failed）")
+        if lri.get("over_limit_lines"):
+            _lparts.append(f"教训库超上限（total={lri.get('lessons_total')} / 落盘 "
+                           f"{lri.get('file_count')} 条 > {lri.get('lessons_max')}）"
+                           "⇒ 淘汰逻辑没生效，提示词预算会被吃光")
+        if lri.get("load_failed"):
+            _lparts.append(f"教训库读不了 ×{lri['load_failed']}（{lri.get('load_errors', [])[:2]}）"
+                           "⇒ 教训库不可信（'失败无害'只指不中断跑批）")
+        if lri.get("file_status") == "corrupt":
+            _lparts.append(f"教训库文件损坏（{lri.get('file_path')}：{lri.get('file_error')}）")
+        advice.append({
+            "text": "LLM 复盘/教训库（task-111）：" + "；".join(_lparts),
+            "lines": (lri.get("without_notes_lines", []) + lri.get("over_limit_lines", [])
+                      + lri.get("load_failed_lines", [])),
+        })
+    elif lri.get("has_events"):
+        advice.append({
+            "text": f"LLM 复盘/教训库（信息项，**不是失败**）：复盘 {lri.get('review_events', 0)} 次 "
+                    f"/ notes {lri.get('notes_count', 0)} 条；教训库 total "
+                    f"{lri.get('lessons_total')} 条（本日新增 {lri.get('lessons_added')}）；"
+                    "空库 / 0 新增 / 复盘失败都只记信息（task-111）",
+            "lines": (lri.get("review_lines", []) + lri.get("lessons_lines", []))[:8],
+        })
     # 0j) 可达性/开路（task-76：task-68 的被围住 + frontier_clear + clear_neighbor；**不判红**）
     rc = report.get("reachability") or {}
     if (rc.get("encircled_events") or rc.get("frontier_clear_attempts")
@@ -2307,6 +2431,23 @@ def build_undecidable(rows, sessions, prelude, report):
         out.append("本账本没有 free_slots 证据（`surplus_sell`/`surplus_sell_skip`/`sell` 的 "
                    "`trigger.freeSlots`，或 `buy_no_space.free_slots_status`）：无法判定「背包空格」"
                    "这条死锁链（缺失 ≠ 空、≠ 没发生；task-102）")
+    # task-111：复盘/教训库的证据是否存在（缺失 ⇒【无法判定】，绝不因此判通过、也不判红）
+    _lr_ev = [ev for _ln, ev in rows
+              if ev.get("event") in ("review_llm", "review_llm_failed", "lessons",
+                                     "lessons_load_failed", "lessons_save_failed")]
+    _lr = report.get("llm_review") or {}
+    if rows and not _lr_ev:
+        out.append("本账本没有任何 task-59/82 的复盘/教训库事件（`review_llm`/`review_llm_failed`/"
+                   "`lessons`/`lessons_load_failed`/`lessons_save_failed`）：无法判定收工复盘与"
+                   "跨日教训库 —— **缺失 ≠ 0，绝不当'模型没学到东西'通过**（task-111）")
+    elif _lr_ev:
+        _lr_missing = []
+        if not _lr.get("review_events") and not _lr.get("failed_events"):
+            _lr_missing.append("review_llm/review_llm_failed")
+        if not _lr.get("lessons_events"):
+            _lr_missing.append("lessons")
+        if _lr_missing:
+            out.append(f"复盘/教训库只写了一部分（缺 {_lr_missing}）：无法判定缺的那一列（缺失 ≠ 0）")
     # task-36：自称浇过、却没有 final_water 可核对的那些天（verify-run3.py:414-418 同口径：只记信息项）
     no_fw = [
         lineno for lineno, ev in rows
@@ -2764,6 +2905,96 @@ def build_report(rows, path, args, bad_lines):
     bag["money_start"] = _bag_money_start
     bag["money_end"] = _bag_money_end
     bag_space = bag
+    # ---- task-111：LLM 收工复盘（task-59）+ 跨日教训库（task-58/82），Lead m05325
+    # 口径：**"模型没学到东西"不是失败**（空 notes / 空库 / 0 新增只记信息）；只有三条完整性红
+    # 在 `llm_review_findings()` 里。教训库路径由 journal 推导（`X.jsonl` ⇒ `X-lessons.json`，
+    # 与 brain `_derive_lessons_path` 同一约定；**不新增命令行开关**）。
+    LESSONS_MAX = 20  # brain/agentfarm/planner.py: `LESSONS_MAX = 20`
+    _rev_events = [(ln, ev) for ln, ev in rows if ev.get("event") == "review_llm"]
+    _rev_failed = [(ln, ev) for ln, ev in rows if ev.get("event") == "review_llm_failed"]
+    _ls_events = [(ln, ev) for ln, ev in rows if ev.get("event") == "lessons"]
+    _ls_load_failed = [(ln, ev) for ln, ev in rows if ev.get("event") == "lessons_load_failed"]
+    _ls_save_failed = [(ln, ev) for ln, ev in rows if ev.get("event") == "lessons_save_failed"]
+    llm_review = {
+        "lessons_max": LESSONS_MAX,
+        "review_events": len(_rev_events), "review_lines": [ln for ln, _ in _rev_events],
+        "notes_count": 0, "notes_chars": 0, "rejected_count": 0, "truncated": 0,
+        "without_notes_lines": [],
+        "failed_events": len(_rev_failed), "failed_lines": [ln for ln, _ in _rev_failed],
+        "failed_reasons": [], "reviewed_days": [],
+        "lessons_events": len(_ls_events), "lessons_lines": [ln for ln, _ in _ls_events],
+        "lessons_total": None, "lessons_added": None, "lessons_dropped": None,
+        "lessons_path": "", "over_limit_lines": [],
+        "load_failed": len(_ls_load_failed),
+        "load_failed_lines": [ln for ln, _ in _ls_load_failed], "load_errors": [],
+        "save_failed": len(_ls_save_failed),
+        "save_failed_lines": [ln for ln, _ in _ls_save_failed], "save_errors": [],
+        "file_status": "unknown", "file_path": "", "file_count": None, "file_error": "",
+        "has_events": bool(_rev_events or _rev_failed or _ls_events or _ls_load_failed
+                           or _ls_save_failed),
+    }
+    for _ln, ev in _rev_events:
+        notes = ev.get("notes")
+        if isinstance(notes, list):
+            llm_review["notes_count"] += len(notes)
+            llm_review["notes_chars"] += sum(len(str(n)) for n in notes)
+        if not (isinstance(notes, list) and any(str(n).strip() for n in notes)):
+            llm_review["without_notes_lines"].append(_ln)
+        rej = ev.get("rejected")
+        llm_review["rejected_count"] += len(rej) if isinstance(rej, list) else 0
+        if ev.get("truncated") is True:
+            llm_review["truncated"] += 1
+        dk = ev.get("day_key")
+        if isinstance(dk, list) and dk:
+            llm_review["reviewed_days"].append("/".join(str(x) for x in dk))
+    for _ln, ev in _rev_failed:
+        llm_review["failed_reasons"].append(str(ev.get("reason") or ""))
+        rej = ev.get("rejected")
+        llm_review["rejected_count"] += len(rej) if isinstance(rej, list) else 0
+    for _ln, ev in _ls_events:
+        _t = as_int(ev.get("total"))
+        if _t is not None and _t > LESSONS_MAX:
+            llm_review["over_limit_lines"].append(_ln)
+    if _ls_events:
+        _ln, _last = _ls_events[-1]
+        llm_review["lessons_total"] = as_int(_last.get("total"))
+        _added = _last.get("added")
+        llm_review["lessons_added"] = len(_added) if isinstance(_added, list) else None
+        llm_review["lessons_dropped"] = as_int(_last.get("dropped"))
+        llm_review["lessons_path"] = str(_last.get("path") or "")
+    for _ln, ev in _ls_load_failed:
+        llm_review["load_errors"].append(str(ev.get("error") or ""))
+    for _ln, ev in _ls_save_failed:
+        llm_review["save_errors"].append(str(ev.get("error") or ""))
+    _lp = None
+    try:
+        _jp = os.path.abspath(str(path))
+        _lp = os.path.join(os.path.dirname(_jp),
+                           os.path.splitext(os.path.basename(_jp))[0] + "-lessons.json")
+    except Exception:  # noqa: BLE001 - 路径怪就只记 unknown
+        _lp = None
+    if _lp is not None:
+        llm_review["file_path"] = _lp
+        if not os.path.exists(_lp):
+            llm_review["file_status"] = "missing"
+        else:
+            try:
+                with open(_lp, encoding="utf-8") as _fh:
+                    _raw = json.load(_fh)
+                if isinstance(_raw, dict):
+                    _raw = _raw.get("lessons")
+                if not isinstance(_raw, list):
+                    llm_review["file_status"] = "corrupt"
+                    llm_review["file_error"] = "not_a_list"
+                else:
+                    llm_review["file_status"] = "ok"
+                    llm_review["file_count"] = len(_raw)
+                    if len(_raw) > LESSONS_MAX:
+                        llm_review["over_limit_lines"].append(None)
+            except Exception as exc:  # noqa: BLE001 - 损坏就判红，别把工具带崩
+                llm_review["file_status"] = "corrupt"
+                llm_review["file_error"] = f"{type(exc).__name__}: {exc}"
+    llm_reds = llm_review_findings(llm_review)
     sleep_ok = sum(1 for _, ev in rows if ev.get("event") == "sleep" and ev.get("ok"))
     sleep_failed = sum(1 for _, ev in rows if ev.get("event") == "sleep" and not ev.get("ok"))
     blocked_by_action = {}
@@ -2841,6 +3072,8 @@ def build_report(rows, path, args, bad_lines):
         # task-102：背包空格死锁（free_slots / buy_no_space / 腾格卖出 / slept_without_work /
         # modal_dismiss_failed；买不到不是失败，缺失 ⇒【无法判定】）
         "bag_space": bag_space,
+        # task-111：LLM 收工复盘 / 跨日教训库（task-58/59/82；只有三条完整性红，其余信息项）
+        "llm_review": llm_review,
         "unmapped_events": unmapped_events,
         "no_day_progress": [
             {"line": ln, "reason": ev.get("reason"), "ended_by": ev.get("ended_by")}
@@ -3166,7 +3399,7 @@ def build_report(rows, path, args, bad_lines):
     self_report = cat_self_report(report)
     report["categories"] = {
         "manual": cat_manual(all_sessions, args.top),
-        "missed": cat_missed(sessions, args.top),
+        "missed": (cat_missed(sessions, args.top) + llm_reds)[:args.top],
         "wasted": (cat_wasted(sessions, args.top) + self_report)[:args.top],
         "ineffective": cat_ineffective(sessions, args.top),
         "sleep": cat_sleep(sessions, args.top, args.stamina_full, args.sleep_pct),
@@ -3174,7 +3407,7 @@ def build_report(rows, path, args, bad_lines):
     }
     report["categories_total"] = {
         "manual": len(manual_all),
-        "missed": len(cat_missed(sessions, 0)),
+        "missed": len(cat_missed(sessions, 0)) + len(llm_reds),
         "wasted": len(cat_wasted(sessions, 0)) + len(self_report),
         "ineffective": len(cat_ineffective(sessions, 0)),
         "sleep": len(cat_sleep(sessions, 0, args.stamina_full, args.sleep_pct)),
@@ -3218,7 +3451,7 @@ def build_report(rows, path, args, bad_lines):
 
     red_all, history_all, settled_all = [], [], []
     for items in (cat_manual(all_sessions, 0),
-                  cat_missed(sessions, 0),
+                  cat_missed(sessions, 0) + llm_reds,
                   cat_wasted(sessions, 0) + cat_self_report(report)):
         for item in items:
             if not is_red_finding(item):
@@ -3321,6 +3554,17 @@ MAPPING_TEXT = [
      "`tools\\verify-run3.py` 不判它 ⇒ 本工具只点名次数（判红会两边反向）；"
      "`free_slots` 取自 `sell`/`surplus_sell`/`surplus_sell_skip` 的 `trigger.freeSlots`，"
      "缺失 ⇒ 写 `<缺失>` + 【无法判定】、绝不当 0；`sell` 成交当天 `money` 不变是设计（次日结算）"),
+    ("review_llm / review_llm_failed / lessons / lessons_load_failed / lessons_save_failed"
+     "（task-58/59/82、Lead m05325）",
+     "LLM 收工复盘 + 跨日教训库（头部'LLM 复盘/教训库'行 + 建议 0o）：**"
+     "只有三条完整性红** —— ①`review_llm` 声称成功却一条 notes 都没有（`missed:review_llm_without_notes`）"
+     "②教训库条数超上限（`missed:lessons_over_limit`，brain `LESSONS_MAX=20`；事件 `total` 或落盘 "
+     "`<journal>-lessons.json` 条数）③教训库读不了/文件损坏（`missed:lessons_load_failed`："
+     "`lessons_load_failed` 事件或落盘 JSON 解析失败）；**「模型没学到东西」不是失败**（空 notes 列表、"
+     "空库、本日 0 新增、复盘失败 `review_llm_failed`、写失败 `lessons_save_failed` 一律只记信息）；"
+     "`recent_decisions` 的条数/长度看头部`决策:`行（task-58 给每条补了 terminal/leftover/"
+     "unreachable/refused/where，无坐标）；旧账本没有这些事件 ⇒ 头部 `<缺失>` + 【无法判定】"
+     "（缺失 ≠ 0，绝不当'模型没学到东西'通过）"),
     ("encircled / encircled_stage / encircled_summary（task-68、task-76）",
      "5 环境挡路·可达性/开路（信息项，**无硬闸门 ⇒ 一律不判红**）：被不可清障物围住（四邻没有"
      "「可站+可清」的突破口）＝与 `unreachable`（物理走不到）**分开计数**、不封格、不进任何豁免分子；"
@@ -3512,6 +3756,30 @@ def render_text(report, top):
            if bs.get("modal_dismiss_failures") else ""))
     pc, ws = report["events"].get("plots_capped", 0), report["events"].get("work_spot", 0)
     add(f"软上限/收尾: plots_capped {pc} 次（作业区配额到顶，信息项）；work_spot {ws} 次（收尾作业区）")
+    # task-111：LLM 收工复盘 / 跨日教训库（task-58/59/82）—— "模型没学到东西"不是失败，只呈现
+    lri = report.get("llm_review") or {}
+    if not lri.get("has_events"):
+        add("LLM 复盘/教训库: <缺失>（本账本没有 review_llm/lessons 事件 ⇒ 无法判定；缺失 ≠ 0，"
+            "绝不当'模型没学到东西'通过）")
+    else:
+        _fstat = {"ok": f"落盘 {lri.get('file_count')} 条",
+                  "missing": "落盘文件不存在（还没写过）",
+                  "corrupt": f"落盘文件损坏（{lri.get('file_error')}）",
+                  "unknown": "落盘未知"}.get(str(lri.get("file_status")), str(lri.get("file_status")))
+        add(f"LLM 复盘/教训库: 复盘 {lri.get('review_events', 0)} 次、notes "
+            f"{lri.get('notes_count', 0)} 条（{lri.get('notes_chars', 0)} 字；被拒 "
+            f"{lri.get('rejected_count', 0)} 条、截断 {lri.get('truncated', 0)} 次）；复盘失败 "
+            f"{lri.get('failed_events', 0)} 次"
+            + (f"（{lri.get('failed_reasons', [])[:2]}）" if lri.get("failed_events") else "")
+            + f"；教训库 total {lri.get('lessons_total') if lri.get('lessons_total') is not None else '<缺失>'}"
+            f" 条（上限 {lri.get('lessons_max')}；本日新增 {lri.get('lessons_added') if lri.get('lessons_added') is not None else '<缺失>'}"
+            f" / 淘汰 {lri.get('lessons_dropped') if lri.get('lessons_dropped') is not None else '<缺失>'}）"
+            f"；读写失败 load {lri.get('load_failed', 0)} / save {lri.get('save_failed', 0)}"
+            f"；{_fstat}"
+            + ("  ⚠ 复盘声称成功却 0 条 notes"
+               if lri.get("without_notes_lines") else "")
+            + ("  ⚠ 教训库超上限" if lri.get("over_limit_lines") else "")
+            + "；口径：**没学到东西不是失败**（空 notes/空库只记信息）")
     sleep_days = [d for d in report["days"] if d.get("ended_by") == "sleep"]
     if sleep_days:
         after_days = sum(1 for d in sleep_days if d.get("day_after"))

@@ -440,6 +440,50 @@ rg -n 'no_inventory_space|no_space' logs/longrun-3day-llm-run8.jsonl
 python tools/analyze-longrun.py --journal logs/longrun-3day-llm-run8.jsonl | rg "种子经济/背包|slept_without_work"
 ```
 
+## 3.16 LLM 收工复盘 / 跨日教训库（task-58/59/82，Lead m05325）—— 「没学到东西」不是失败
+
+**背景**：0.7.28 要装「决策演进」（用户 m12553）：夜里一次独立 LLM 复盘写 1–3 条笔记，次日注入
+`Brief.recent_notes`；客观教训由代码从账本写进 `<journal>-lessons.json`，次日注入 ≤3 条。
+brain 新增 5 个 journal 事件（机械枚举 `brain/agentfarm/{planner,longrun}.py` 得到，**一个都不能漏**）。
+
+| 事件 | 字段（brain 权威） | 本工具 |
+|---|---|---|
+| `review_llm` | `day_key` / `notes`(≤3 条) / `text` / `usage` / `duration_ms` / `model` / `rejected` / `truncated` / `note` | 信息项；**声称成功却 0 条 notes ⇒ 红** `missed:review_llm_without_notes` |
+| `review_llm_failed` | `day_key` / `reason` / `called` / `rejected` / `note` | 信息项（**失败无害**：睡觉与跨日照常） |
+| `lessons` | `day_key` / `added`(id 列表) / `total` / `dropped` / `path` / `note` | 信息项；`total` 超上限 ⇒ 红 `missed:lessons_over_limit` |
+| `lessons_load_failed` | `path` / `error` / `note`（`read_failed:`=JSON 坏、`not_a_list`=结构坏、`bad_path:`） | **红** `missed:lessons_load_failed`（教训库不可信） |
+| `lessons_save_failed` | `path` / `error` / `note` | 信息项（本批教训只在内存里，跑批照常） |
+
+**红口径（只有三条完整性红；全部进 `GLOBAL_RED_SUBJECTS` ⇒ 不被窗口降级）**
+1. `review_llm` 声称成功却一条 `notes` 都没有 ⇒ 红。**与"没学到"严格分开**：`notes` 是空列表、
+   模型输出被 `rejected`、`truncated=true` 都只记信息 —— 只有"事件声称成功、结果什么都没写"才红。
+2. 教训库条数超上限：`lessons.total > 20`（brain `planner.LESSONS_MAX`）**或**落盘
+   `<journal>-lessons.json` 条数 > 20 ⇒ 红（淘汰逻辑没生效，提示词预算会被吃光）。
+3. 教训库读不了/文件损坏：`lessons_load_failed` 事件，**或**本工具按同一路径推导读该文件失败
+   （JSON 坏 / 不是 list）⇒ 红。brain 的"失败无害"只保证**不中断跑批**，不保证账目可信。
+
+**呈现**：头部一行 `LLM 复盘/教训库: 复盘 N 次、notes M 条（…字；被拒 R 条、截断 T 次）；复盘失败 F 次；
+教训库 total X 条（上限 20；本日新增 A / 淘汰 D）；读写失败 load L / save S；落盘文件 …`，
+并带 `⚠ 复盘声称成功却 0 条 notes` / `⚠ 教训库超上限`；建议 0o（红时点名行号，正常时只记一行信息项）。
+**旧账本没有这些事件 ⇒ 头部 `<缺失>` + 【无法判定】（缺失 ≠ 0，绝不当"模型没学到东西"通过）。**
+
+**教训库路径**：本工具用与 brain `_derive_lessons_path`（`longrun.py:761-771`）**完全相同的推导**
+（`logs/run9.jsonl` ⇒ `logs/run9-lessons.json`），**不新增命令行开关**（Lead m05325 明确要求）。
+`recent_decisions` 的条数/长度看头部`决策:`行（task-58 给每条补了 terminal/leftover/unreachable/
+refused/where 具名田区、无坐标）；`recent_notes`/`recent_lessons` 是 `Brief` 的注入字段（同源于
+`review_llm.notes` 与 `lessons`），账本里没有独立事件。
+
+**读数（task-111，2026-10-16）**：`tests.test_analyze_longrun` **130 OK**（+8）；全量
+`discover -s tests` **665 OK（0 红）** ⇒ 0.7.28 放行条件的两条漂移红清零。八账本 rc 并排
+（本工具 / `verify-run3.py`）：green 0/0、run2 1/1、run3 1/1、run5 1/1、run6 1/1、run7 0/0、
+run8 1/1、vacuum 1/1 —— **一字未变**。
+
+```
+rg -n '"event": ?"(review_llm|review_llm_failed|lessons|lessons_load_failed|lessons_save_failed)"' logs/longrun-*.jsonl
+python tools/analyze-longrun.py --journal logs/<run>.jsonl | rg "LLM 复盘/教训库"
+python -c "import json;d=json.load(open('logs/<run>-lessons.json',encoding='utf-8'));print(len(d.get('lessons',[])))"
+```
+
 ## 4. 复核命令
 
 ```
@@ -449,6 +493,7 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run7.jsonl --day
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run8.jsonl   # run8：背包空格死锁 ⇒ rc=1（回执 no_inventory_space×25）
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
-python -m unittest tests.test_analyze_longrun  # 当前 122 OK（task-106）
-python -m unittest discover -s tests           # 当前 618 OK（0 红；0.7.28 装机放行条件）
+python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
+python -m unittest tests.test_analyze_longrun  # 当前 130 OK（task-111）
+python -m unittest discover -s tests           # 当前 665 OK（0 红；0.7.28 装机放行条件）
 ```

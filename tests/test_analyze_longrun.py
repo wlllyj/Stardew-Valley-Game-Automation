@@ -2283,5 +2283,129 @@ class TestBagSpaceDeadlock(unittest.TestCase):
         self.assertIn("modal_dismiss_failed 1 次", mod.render_text(rep, 50))
 
 
+class TestLlmReviewAndLessons(unittest.TestCase):
+    """task-111（Lead m05325）：LLM 收工复盘（task-59）+ 跨日教训库（task-58/82）。
+
+    口径：**"模型没学到东西"不是失败**（空 notes / 空库 / 0 新增 / 复盘失败 / 写失败都只记信息）；
+    只有三条完整性红 —— ①`review_llm` 声称成功却 0 条 notes ②教训库条数超上限
+    ③教训库读不了/文件损坏。旧账本没有这些事件 ⇒ 头部 `<缺失>` + 【无法判定】（缺失 ≠ 0）。
+    """
+
+    REVIEW = {"event": "review_llm", "t": 8.0, "day_key": [1, "summer", 5],
+              "notes": ["先清枯死苗再浇水", "别在下雨前买种子"],
+              "text": "{\"notes\": [...]}", "usage": {"total_tokens": 123},
+              "duration_ms": 900, "model": "deepseek-flash", "rejected": [], "truncated": False,
+              "note": "只写 journal 与次日 recent_notes；不参与任何判定"}
+    LESSONS = {"event": "lessons", "t": 8.1, "day_key": [1, "summer", 5],
+               "added": ["no_inventory_space|buy", "stage_incomplete|till_area"],
+               "total": 5, "dropped": 0, "path": "<journal>-lessons.json",
+               "note": "只有客观账本事实"}
+
+    def _day(self, day, *, extra=()):
+        nxt = [day[0], day[1], day[2] + 1]
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": True,
+                  "watered_outdoor": True}
+        end = {"event": "day_end", "t": 9.0, "day": day, "day_text": "", "ended_by": "sleep",
+               "ended_reason": "night", "verified": True, "checks": checks,
+               "stages": [{"stage": "water_area", "ok": 5, "skipped": 0, "failed": 0,
+                           "env_block": 0, "inconclusive": 0, "stopped": None, "leftover": 0}],
+               "outcomes": [], "ok_steps": 5, "skipped_steps": 0, "failed_steps": 0,
+               "notes": [], "final": final(nxt),
+               "final_water": {"t": 9.0, "location": "Farm", "tiles": 84, "crops": 31,
+                               "dry": 0, "scope": "farm"}}
+        return [day_start(day), *extra, end]
+
+    def _report(self, events, name, *, days=1):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = write_ledger(tmp.name, name, events)
+        self._tmp = tmp
+        self._journal_path = path
+        rep = report_for(path, days=days, top=50)
+        return rep
+
+    def test_five_events_have_buckets_and_are_not_unmapped(self):
+        for name in ("review_llm", "review_llm_failed", "lessons", "lessons_load_failed",
+                     "lessons_save_failed"):
+            self.assertIn(name, mod.EVENT_BUCKETS, f"{name} 必须有桶，否则 run9 复核数不到")
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.REVIEW),
+                                                              dict(self.LESSONS)]),
+                           "llm_bucket.jsonl")
+        self.assertEqual(rep["unmapped_events"], {})
+        for name in ("review_llm", "lessons"):
+            self.assertEqual(rep["events"][name], 1, f"{name} 要能被数到")
+
+    def test_review_with_notes_is_info_and_visible(self):
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.REVIEW),
+                                                              dict(self.LESSONS)]),
+                           "llm_ok.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "有 notes 的正常复盘 ⇒ 不判红")
+        self.assertEqual(rep["llm_review"]["notes_count"], 2)
+        self.assertEqual(rep["llm_review"]["lessons_total"], 5)
+        text = mod.render_text(rep, 50)
+        self.assertIn("LLM 复盘/教训库:", text)
+        self.assertIn("notes 2 条", text)
+        self.assertIn("教训库 total 5 条", text)
+
+    def test_review_claims_success_without_notes_is_red(self):
+        no_notes = dict(self.REVIEW, notes=[])
+        rep = self._report(self._day([1, "summer", 5], extra=[no_notes]), "llm_nonotes.jsonl")
+        self.assertIn("missed:review_llm_without_notes", rep["red"]["subjects"])
+        self.assertGreaterEqual(rep["red"]["total"], 1)
+        text = mod.render_text(rep, 50)
+        self.assertIn("复盘声称成功却 0 条 notes", text)
+        self.assertIn("LLM 复盘/教训库（task-111）",
+                      " ".join(a["text"] for a in rep["advice"]))
+
+    def test_lessons_over_limit_is_red(self):
+        over = dict(self.LESSONS, total=21, added=["x|y"])
+        rep = self._report(self._day([1, "summer", 5], extra=[over]), "llm_over.jsonl")
+        self.assertIn("missed:lessons_over_limit", rep["red"]["subjects"])
+        self.assertIn("教训库超上限", mod.render_text(rep, 50))
+
+    def test_corrupt_lessons_file_is_red(self):
+        self._report(self._day([1, "summer", 5], extra=[dict(self.LESSONS)]), "llm_corrupt.jsonl")
+        # 与 brain `_derive_lessons_path` 同约定：`X.jsonl` ⇒ `X-lessons.json`
+        lp = str(self._journal_path)[:-len(".jsonl")] + "-lessons.json"
+        with open(lp, "w", encoding="utf-8") as fh:
+            fh.write("{ this is not json")
+        rep = report_for(self._journal_path, days=1, top=50)
+        self.assertEqual(rep["llm_review"]["file_status"], "corrupt")
+        self.assertIn("missed:lessons_load_failed", rep["red"]["subjects"])
+        self.assertIn("教训库文件损坏", mod.render_text(rep, 50))
+
+    def test_lessons_load_failed_event_is_red(self):
+        ev = {"event": "lessons_load_failed", "t": 8.2,
+              "path": "<journal>-lessons.json", "error": "read_failed:JSONDecodeError: bad",
+              "note": "教训库读不了 ⇒ 本次当作没有教训"}
+        rep = self._report(self._day([1, "summer", 5], extra=[ev]), "llm_loadfail.jsonl")
+        self.assertIn("missed:lessons_load_failed", rep["red"]["subjects"])
+        self.assertIn("教训库读不了", mod.render_text(rep, 50))
+
+    def test_review_failed_and_save_failed_are_info_not_red(self):
+        failed = {"event": "review_llm_failed", "t": 8.3, "day_key": [1, "summer", 5],
+                  "reason": "llm_timeout", "called": True, "rejected": [],
+                  "note": "复盘失败无害：睡觉与跨日照常"}
+        save_failed = {"event": "lessons_save_failed", "t": 8.4, "path": "<journal>-lessons.json",
+                       "error": "write_failed:PermissionError", "note": "写不进去 ⇒ 跑批照常"}
+        rep = self._report(self._day([1, "summer", 5], extra=[failed, save_failed]),
+                           "llm_failinfo.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "复盘失败/写失败都是'失败无害' ⇒ 不判红")
+        self.assertEqual(rep["llm_review"]["failed_events"], 1)
+        self.assertEqual(rep["llm_review"]["save_failed"], 1)
+        text = mod.render_text(rep, 50)
+        self.assertIn("复盘失败 1 次", text)
+        self.assertIn("读写失败 load 0 / save 1", text)
+
+    def test_old_ledger_is_undecidable_not_pass(self):
+        rep = self._report(self._day([1, "summer", 5]), "llm_missing.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "缺证据既不算通过也不算失败 ⇒ 不许判红")
+        text = mod.render_text(rep, 50)
+        self.assertIn("LLM 复盘/教训库: <缺失>", text)
+        self.assertIn("复盘/教训库", str(rep["undecidable"]),
+                      "旧账本要进【无法判定】（缺失 ≠ 0）")
+
+
 if __name__ == "__main__":
     unittest.main()
