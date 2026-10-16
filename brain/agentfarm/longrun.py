@@ -130,6 +130,15 @@ FAR_DRY_MAX_TRIES = 2
 #: 免得在"补水点走不到"时把整天耗在这一格上。
 FAR_DRY_REFILL_MAX = 2
 
+#: 【task-144】**一个阶段里**最多为"壶空"补几次水。
+#:
+#: run9c 现场：`water_area` 一次分下去 70 格，而壶只有 40 容量 ⇒ 阶段中途 `need_refill`。
+#: 补水是**前置条件**（补完要把这一批原样接着浇），但也要有界：取 2 —— 一次补水通常
+#: 能把剩下的做完（`StageResult` 每轮 `max_steps` 有限）；补到第 3 次还空说明这一轮的
+#: 目标量本身超出一天的水量，应当如实 `stopped="need_refill"`（`assigned_undone` 计入 unmet），
+#: 而不是在补水上把整天烧完。日级另有 `max_refills_per_day` 兜底。
+STAGE_REFILL_MAX = 2
+
 #: 【task-102】一天最多发起几次 `buy`（含探测与照清单复购）。
 #:
 #: run8 day 12/13：`buy` 一共 26 次、成交 0 —— 背包 0 空格，每次都 `no_inventory_space`，
@@ -3426,6 +3435,25 @@ class LongRun:
                 return False
         return False
 
+    @staticmethod
+    def _stage_undone_cause(steps: list[StepResult], undone: list[tuple[int, int]]) -> str:
+        """【task-144】把"分配了却没成事"的格子归一类，作为阶段 `stopped` 的**如实**原因。
+
+        返回 `need_refill`（壶空/补水不成）、`unreachable`（寻路走不到）、`no_seed`（没种子/
+        播种失败）或兜底的 `incomplete`（原因不单一，比如"下一轮窗口里看不见这些格"）。
+        只做归类，不改任何判定：这些原因都**不在**诚实上限白名单里，undone 照旧计入 unmet。
+        """
+        want = {tuple(t) for t in undone}
+        reached = [s for s in steps if s.tile and tuple(s.tile) in want]
+        codes = {str(getattr(s, "code", "") or "") for s in reached}
+        if "need_refill" in codes:
+            return "need_refill"
+        if any(getattr(s, "unreachable", False) for s in reached):
+            return "unreachable"
+        if "no_seed" in codes or "sow_failed" in codes:
+            return "no_seed"
+        return "incomplete"
+
     def _step_stage(self, task: str, obs: dict[str, Any], plot: dict[str, Any],
                     rep: DayReport) -> TaskOutcome:
         assert self.worker is not None
@@ -3477,6 +3505,11 @@ class LongRun:
         # 这一批格子（而不是重算 `_stage_tiles` —— 那会在环境抖动时换一批、把"重试"变成"扩大"）。
         env_retries = 0
         forced: list[tuple[int, int]] | None = None
+        # 【task-144】只有"补水后原样重跑"这一种 `forced` 需要在重跑完成后继续正常循环
+        # （把窗口里剩下的目标也做完）；环境挡路的 `forced` 不做这件事（那会白跑更多轮）。
+        refill_resume = False
+        # 本阶段已经为"壶空"补过几次水（上界 `STAGE_REFILL_MAX`；日级另有 `max_refills_per_day` 兜底）。
+        stage_refills = 0
         while True:
             if forced is None:
                 attempts += 1
@@ -3541,17 +3574,40 @@ class LongRun:
                     break
                 forced = tiles
                 continue
-            if res.stopped == "need_refill" and attempts <= 2 and self.refills_today < self.max_refills_per_day:
+            if res.stopped == "need_refill" and stage_refills < STAGE_REFILL_MAX \
+                    and self.refills_today < self.max_refills_per_day:
+                stage_refills += 1
                 rf = self.worker.refill_can()
                 self.refills_today += 1
                 self._actions += 1
                 rep.notes.append(f"补水：{rf.reason}")
                 self._journal("refill", ok=rf.ok, reason=rf.reason, before=rf.before, after=rf.after)
+                # 【task-144】壶空**不是"这一格干不动"**：补水成功后必须把"这一轮没成事的
+                # 已分配格"原样再跑一遍（`forced`），而不是下一轮重算 `_stage_tiles` ——
+                # 重算以玩家为中心重新取窗口，run9c 里那 3 格因此从目标里消失、既没浇上
+                # 也不再被重试，`stopped` 还停在 ""（"分配过却没成事"与"自然结束"共存的洞）。
+                done_round = {tuple(s.tile) for s in res.steps if s.tile and (s.ok or s.skipped)}
+                pending_round = [t for t in tiles if tuple(t) not in done_round]
+                self._journal("refill_retry", stage=task, zone=self.zone_name, ok=rf.ok,
+                              refills_today=self.refills_today, limit=self.max_refills_per_day,
+                              stage_refills=stage_refills, stage_limit=STAGE_REFILL_MAX,
+                              tiles=len(pending_round),
+                              targets=[list(t) for t in pending_round[:6]],
+                              note="壶空 ⇒ 先补水，再把这一轮没成事的格子**原样**重跑（同一批，"
+                                   "不重算窗口）；补水不成 ⇒ 保持 stopped=need_refill、undone 计入 unmet")
                 if rf.ok:
+                    # 补水成功 ⇒ 这一批没成事的格子**原样**重跑；重跑之后照旧继续正常循环
+                    # （重算窗口、把这片地剩下的目标也做完），否则阶段会提前收工。
+                    forced = pending_round or None
+                    refill_resume = True
                     continue
             if res.stopped == "budget" and attempts < self.max_stage_rounds:
                 # 撞到"每次只做 N 格"的上限：还有目标就接着跑完（真机 m01770：浇水只做 12 格、
                 # 剩下 19 格没浇就天黑了）。
+                continue
+            if refill_resume and not res.stopped and attempts < self.max_stage_rounds:
+                # 【task-144】"原样重跑"完成 ≠ 这一阶段做完：窗口重算一遍继续做（同上）。
+                refill_resume = False
                 continue
             stopped = res.stopped
             break
@@ -3565,6 +3621,22 @@ class LongRun:
         # 走不到/被拒/壶空这些另有两套独立计数与豁免，不在这里重复扣。
         assigned_done = {tuple(s.tile) for s in all_steps if s.tile and (s.ok or s.skipped)}
         assigned_undone = len(assigned - assigned_done)
+        # 【task-144】口径洞收口：`stopped==""` 表示"阶段自然走完"，但**分配过却没成事**的格子
+        # 不能与它共存（run9c 洞里那 3 格正是这样"没人浇上、也没人负责"）。只要还有 undone，
+        # 就补一个**如实的** stop 原因（壶空/够不着/没种子/其它 ⇒ `incomplete`），并留 journal。
+        # 注意：夜里收工的诚实上限判定同时接纳 `"incomplete"`（见日终 `honest`），所以
+        # 天黑收工不会被这条改名判成"没做完"。
+        if not stopped and assigned_undone > 0:
+            undone_tiles = sorted(assigned - assigned_done)
+            stopped = self._stage_undone_cause(all_steps, undone_tiles)
+            self._journal("stage_stop_named", stage=task, zone=self.zone_name, cause=stopped,
+                          assigned=len(assigned), assigned_undone=assigned_undone,
+                          tiles=[list(t) for t in undone_tiles[:8]],
+                          codes=sorted({str(getattr(s, "code", "") or "")
+                                        for s in all_steps
+                                        if s.tile and tuple(s.tile) in set(undone_tiles)}),
+                          note="阶段自然结束却仍有分配未成事的格 ⇒ 补一个如实 stop 原因"
+                               "（`stopped=\"\"` 与 `assigned_undone>0` 不再共存）")
         # "还可能再试"的剩余：既没被封格、也没到本日尝试上限。
         retryable = [t for t in leftover
                      if t not in self.blocked and self.tile_attempts.get(t, 0) < MAX_TILE_ATTEMPTS]
@@ -4720,7 +4792,9 @@ class LongRun:
             stopped = str(s.get("stopped") or "")
             honest = (stopped == "stamina"
                       or (stopped == "budget" and undone == 0)
-                      or (night_end and stopped == ""))
+                      # 【task-144】夜里收工留下的"分配没做完"是真收工（deferred），不是洗白；
+                      # `incomplete`/`need_refill`/`unreachable` 等如实原因**不在**这里 ⇒ 照旧 unmet。
+                      or (night_end and stopped in ("", "incomplete")))
             if honest:
                 deferred_tiles += int(s.get("leftover") or 0)
                 if int(s.get("leftover") or 0) > 0:

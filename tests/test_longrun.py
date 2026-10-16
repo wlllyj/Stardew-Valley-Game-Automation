@@ -6922,7 +6922,12 @@ class TestTask134AssignedVsPlotPending(unittest.TestCase):
         self.assertTrue(self._events(run, "deferred_tiles"), run.entries)
 
     def test_failed_assigned_tiles_without_honest_limit_stay_unmet(self):
-        """分配格没做完、`stopped` 为空（不是诚实上限）⇒ 照实 unmet、当天不 VERIFIED。"""
+        """分配格没做完、`stopped` 不是诚实上限 ⇒ 照实 unmet、当天不 VERIFIED。
+
+        【task-144】`stopped` 不再留空：有分配未成事的格子时，阶段必须给一个**如实**原因
+        （这里是"没拿到结论"⇒ 兜底码 `incomplete`）。`"incomplete"` **不在**诚实上限白名单，
+        所以 `no_unmet_stages` 照样 false —— 改的只是记录口径，不是判定。
+        """
         w = FakeWorld(weeds=0, seeds=0, money=0)
         for t in self._weeds(w, [(60, 10), (61, 10)]):
             w.fail_status[t] = "timeout"                # 没拿到结论：占配额、不封格
@@ -6934,11 +6939,12 @@ class TestTask134AssignedVsPlotPending(unittest.TestCase):
         stages = [s for s in rep.stages if s["stage"] == "clear_area"]
         self.assertTrue(stages, rep.stages)
         last = stages[-1]
-        self.assertEqual(last["stopped"], "", last)
+        self.assertEqual(last["stopped"], "incomplete", last)
         self.assertEqual(last["assigned_undone"], 2, last)
         self.assertEqual(rep.assigned_undone, 2, rep.stages)
         self.assertIs(rep.checks["no_unmet_stages"], False, rep.checks)
         self.assertFalse(rep.verified, rep.checks)
+        self.assertTrue(self._events(run, "stage_stop_named"), "缺 stage_stop_named 留痕")
 
     def test_plot_pending_is_the_legacy_raw_unmet(self):
         """`plot_pending` 必须与改判据前的 `raw_unmet`（last-by-stage `leftover` 求和）逐字相等。"""
@@ -7252,6 +7258,237 @@ class TestTask143PlantQuota(unittest.TestCase):
     @staticmethod
     def _seed_total(obs) -> int:
         return sum(n for _i, _nm, n in seed_items(FarmWorker.player_of(obs)))
+
+
+class _NoRefillWorker(FakeWorker):
+    """补水永远失败（模拟"补水点走不到 / 壶补不上"）。"""
+
+    def refill_can(self, *, timeout_ms=15000):
+        return StepResult("refill_can", code="failed", reason="补水点走不到（测试桩）")
+
+
+class _TinyRefillWorker(FakeWorker):
+    """补水只给 3 格水（模拟"补水点只补一点 / 一次补不满"）⇒ 阶段补水次数必须有界。"""
+
+    def __init__(self, world: FakeWorld) -> None:
+        super().__init__(world, log=lambda *_: None)
+        self.refill_calls = 0
+
+    def refill_can(self, *, timeout_ms=15000):
+        self.refill_calls += 1
+        self.w.water_left = 3
+        return StepResult("refill_can", ok=True, reason="补到 3（测试桩）")
+
+
+class _NightFailWorker(FakeWorker):
+    """一格"体面失败"（`code="failed"`、`stopped` 仍为空 ⇒ 复刻 run9c 的形态）+ 跑完就天黑。
+
+    `FakeWorker` 是"假执行层"，直接落到 `FakeWorld.clear()`，所以 `FakeWorld.fail_status`
+    （只在 `use_tool` 里生效）对它无效 —— 要造"分配了却没做成"必须在这里显式注入。
+    """
+
+    def __init__(self, world: FakeWorld, *, fail_tile) -> None:
+        super().__init__(world, log=lambda *_: None)
+        self.fail_tile = (int(fail_tile[0]), int(fail_tile[1]))
+
+    def run_stage(self, stage, tiles, *, min_stamina=12.0, max_steps=200):
+        action = STAGE_ACTION.get(stage, stage)
+        res = StageResult(stage=stage, tiles=list(tiles))
+        for i, tile in enumerate(tiles):
+            if i >= max_steps:
+                res.stopped, res.stopped_reason = "budget", f"达到格数上限 {max_steps}"
+                break
+            t = (int(tile[0]), int(tile[1]))
+            if t == self.fail_tile:
+                st = StepResult(action, t, code="failed", reason="这一格今天没做成（测试桩）")
+            else:
+                st = getattr(self.w, action)(t)
+            self.steps.append(st)
+            res.steps.append(st)
+            if st.code in ("no_seed", "need_refill"):
+                res.stopped, res.stopped_reason = st.code, st.reason
+                break
+        self.w.time_of_day = 2510               # ≥ 默认 sleep_at=2200
+        return res
+
+
+class TestTask144RefillRetryAndStopNaming(unittest.TestCase):
+    """task-144：阶段内壶空 ⇒ 先补水再把**这一批原样**重跑；且 `stopped==""` 与 `assigned_undone>0` 不再共存。
+
+    run9c 现场（`water_area assigned 21 / ok 18 / undone 3 / stopped ""`）：第 1 轮 `run_stage`
+    中途 `need_refill` ⇒ 补水成功 ⇒ `continue`（旧代码把剩下几格当"这一轮没成事"记进
+    `assigned_done` 的反面）；第 2/3 轮重算 `_stage_tiles` 时那 3 格已出以玩家为中心的窗口 ⇒
+    本轮 `tiles` 为空、`stopped` 仍是 `""` ⇒ 阶段看起来"自然走完"却留着 3 格真没浇。
+
+    两条修法：①补水成功后把这一轮"仍未成事"的格作为下一轮 `forced` **原样**重跑（同一批，
+    不重算窗口），重跑完成后继续正常循环；②`stopped==""` 而 `assigned_undone>0` 时补一个如实
+    的 stop 原因（`need_refill`/`unreachable`/`no_seed`/`incomplete`）并留 `stage_stop_named`。
+
+    变异实测（`scratch\\_t144_mutate2.py`，brain+tests 一起拷临时目录）：基线 6/6 绿；
+    **m144a**（`if rf.ok:` ⇒ `if False:`，补水后不原样重跑）红 2（`test_refill_lets_the_assigned_tiles_finish`、
+    `test_stage_refills_are_capped`）；**m144b**（去掉 `stage_stop_named` 收口）红 2
+    （`test_stopped_empty_and_undone_never_coexist`、`test_night_end_keeps_deferred_not_unmet`）；
+    **m144c**（去掉每阶段补水上限）红 1（`test_stage_refills_are_capped`）。
+    """
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list:
+        return [e for e in run.entries if e["event"] == name]
+
+    @staticmethod
+    def _run_with(w: FakeWorld, *, worker=None) -> LongRun:
+        client = _CountingClient(w)
+        worker = worker or FakeWorker(w, log=lambda *_: None)
+        run = make_run(w, target_days=1, max_days=1,
+                       client_factory=lambda: client, worker_factory=lambda c: worker)
+        run.worker = worker
+        run.client = client
+        run.plot_size = 5          # 让"分配额/片区 leftover"两个口径真的分得开
+        return run
+
+    @staticmethod
+    def _plot(*tiles) -> dict:
+        tiles = list(tiles) or [(60, 10)]
+        return {"zone": "", "label": "", "anchor": list(tiles[0]), "tiles": tiles, "note": ""}
+
+    @staticmethod
+    def _weeds(w: FakeWorld, tiles) -> list:
+        out = []
+        for t in tiles:
+            tt = (int(t[0]), int(t[1]))
+            w.blockers[tt] = "weed"
+            out.append(tt)
+        return out
+
+    @staticmethod
+    def _crops(w: FakeWorld, tiles, *, watered=False) -> list:
+        """放进观测窗口的未浇作物（必须同时在 `w.dirt` 里才会出现在 `tiles[]`）。"""
+        out = []
+        for t in tiles:
+            tt = (int(t[0]), int(t[1]))
+            w.dirt.add(tt)
+            w.crops[tt] = {"watered": watered, "ripe": False}
+            out.append(tt)
+        return out
+
+    def test_refill_lets_the_assigned_tiles_finish(self):
+        """壶只剩 5 格水、分了 10 格 ⇒ 补水后把这 10 格浇完，`assigned_undone` 归 0。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0, water_left=5)
+        self._crops(w, [(60, 10), (61, 10), (62, 10), (63, 10), (64, 10),
+                        (60, 11), (61, 11), (62, 11), (63, 11), (64, 11)])
+        run = self._run_with(w)
+
+        run.run()
+
+        rep = run.days[0]
+        stages = [s for s in rep.stages if s["stage"] == "water_area"]
+        self.assertTrue(stages, rep.stages)
+        self.assertTrue(all(s["assigned_undone"] == 0 for s in stages), stages)
+        # ⚠️ `FakeWorld.sleep()` 会把所有作物的 `watered` 清零（睡前事实只能看
+        # `unwatered_at_sleep`），所以别在收工后断言 `w.crops[*]["watered"]`。
+        self.assertEqual(w.unwatered_at_sleep[-1], 0, w.unwatered_at_sleep)
+        retries = self._events(run, "refill_retry")
+        self.assertTrue(retries, "缺 refill_retry 留痕")
+        self.assertIs(retries[0]["ok"], True, retries[0])
+        self.assertGreater(w.refills, 0, "补水没发生")
+        self.assertIs(rep.checks["no_unmet_stages"], True, rep.checks)
+
+    def test_refill_failure_stays_truthful(self):
+        """补水补不上 ⇒ 保持 `stopped="need_refill"`、undone 计入 unmet，且不算"诚实上限"。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0, water_left=2)
+        self._crops(w, [(60, 10), (61, 10), (62, 10), (63, 10), (64, 10)])
+        run = self._run_with(w, worker=_NoRefillWorker(w))
+
+        run.run()
+
+        rep = run.days[0]
+        stages = [s for s in rep.stages if s["stage"] == "water_area"]
+        self.assertTrue(stages, rep.stages)
+        last = stages[-1]
+        self.assertEqual(last["stopped"], "need_refill", last)
+        self.assertGreater(last["assigned_undone"], 0, last)
+        retries = self._events(run, "refill_retry")
+        self.assertTrue(retries, "缺 refill_retry 留痕")
+        self.assertIs(retries[0]["ok"], False, retries[0])
+        self.assertIs(rep.checks["no_unmet_stages"], False, rep.checks)
+        self.assertEqual(rep.deferred_tiles, 0, rep.as_dict())
+
+    def test_stopped_empty_and_undone_never_coexist(self):
+        """口径洞收口：任何阶段都不允许"自然走完（`stopped=\"\"`）却还有分配未成事的格"。"""
+        worlds = []
+        w1 = FakeWorld(weeds=0, seeds=0, money=0, water_left=2)
+        self._crops(w1, [(60, 10), (61, 10), (62, 10), (63, 10), (64, 10)])
+        worlds.append(self._run_with(w1, worker=_NoRefillWorker(w1)))
+
+        w2 = FakeWorld(weeds=0, seeds=0, money=0)
+        self._weeds(w2, [(60, 10), (61, 10), (62, 10)])
+        w2.fail_status[(60, 10)] = "timeout"
+        worlds.append(self._run_with(w2))
+
+        w3 = FakeWorld(weeds=0, seeds=0, money=0)
+        self._weeds(w3, [(60, 10), (61, 10)])
+        worlds.append(self._run_with(w3, worker=_NightFailWorker(w3, fail_tile=(60, 10))))
+
+        for run in worlds:
+            run.run()
+            for s in run.days[0].stages:
+                self.assertFalse(
+                    s["stopped"] == "" and s["assigned_undone"] > 0,
+                    f"阶段 {s['stage']} 自然走完却留 {s['assigned_undone']} 格没成事：{s}")
+
+    def test_stage_undone_cause_classifies(self):
+        """`_stage_undone_cause` 只归类、不改判定；四类都要认得。"""
+        tile = (60, 10)
+        cases = [
+            (StepResult("water", tile=tile, code="need_refill"), "need_refill"),
+            (StepResult("clear", tile=tile, code="unreachable"), "unreachable"),
+            (StepResult("sow", tile=tile, code="no_seed"), "no_seed"),
+            (StepResult("till", tile=tile, code="failed"), "incomplete"),
+        ]
+        for step, want in cases:
+            self.assertEqual(LongRun._stage_undone_cause([step], [tile]), want, step.code)
+        self.assertEqual(LongRun._stage_undone_cause([], [tile]), "incomplete")
+
+    def test_stage_refills_are_capped(self):
+        """补水每阶段 ≤ `STAGE_REFILL_MAX`：壶每次只补到 3 格 ⇒ 补两次就如实停在 need_refill。"""
+        grid = [(x, y) for y in (10, 11) for x in (60, 61, 62, 63, 64)]
+        w = FakeWorld(weeds=0, seeds=0, money=0, water_left=3)
+        self._crops(w, grid)
+        worker = _TinyRefillWorker(w)
+        run = self._run_with(w, worker=worker)
+        rep = DayReport(day_key=("spring", 1, 6), started_at=0.0)
+
+        run._step_stage("water_area", w.obs(), self._plot(*grid), rep)
+
+        self.assertEqual(worker.refill_calls, 2, worker.refill_calls)
+        stages = [s for s in rep.stages if s["stage"] == "water_area"]
+        self.assertTrue(stages, rep.stages)
+        last = stages[-1]
+        self.assertEqual(last["stopped"], "need_refill", last)
+        self.assertGreater(last["assigned_undone"], 0, last)
+        retries = self._events(run, "refill_retry")
+        self.assertEqual([e["stage_refills"] for e in retries], [1, 2], retries)
+        self.assertTrue(all(e["stage_limit"] == 2 for e in retries), retries)
+
+    def test_night_end_keeps_deferred_not_unmet(self):
+        """夜里收工留下的分配欠账仍记 `deferred_tiles`(info)：如实收尾，但不当"没做完"判红。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        self._weeds(w, [(60, 10), (61, 10)])
+        run = self._run_with(w, worker=_NightFailWorker(w, fail_tile=(60, 10)))
+
+        run.run()
+
+        rep = run.days[0]
+        stages = [s for s in rep.stages if s["stage"] == "clear_area"]
+        self.assertTrue(stages, rep.stages)
+        last = stages[-1]
+        self.assertEqual(last["stopped"], "incomplete", last)
+        self.assertGreater(last["assigned_undone"], 0, last)
+        self.assertTrue(str(rep.ended_reason).startswith("night"), rep.ended_reason)
+        self.assertGreater(rep.deferred_tiles, 0, rep.as_dict())
+        self.assertEqual(rep.assigned_undone, 0, rep.as_dict())
+        self.assertIs(rep.checks["no_unmet_stages"], True, rep.checks)
+        self.assertTrue(self._events(run, "stage_stop_named"), "缺 stage_stop_named 留痕")
 
 
 if __name__ == "__main__":  # pragma: no cover
