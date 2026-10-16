@@ -64,7 +64,7 @@
 1. 两侧工具同向：`tools\verify-run3.py`（尾部窗口 + `verdict`/`strict_verdict` 两行都抄）与 `tools\analyze-longrun.py --window 3`；
 2. 外部证据：存档 size/mtime、SMAPI 窗口冻结（四联/五联计数）、起止快照；**缺失字段一律【无法判定】，缺失 ≠ 通过**；
 3. 每次跨日必须落盘（`NewDay` 次数 == `SaveGame.Save() called.` 次数）；
-4. **世界差分必须用独立 `observe?detail=full` 差分**（每日 ≥1 份 + 逐日差分表），只有账本自述不算；
+4. **世界差分必须用独立 `observe?detail=full` 差分**（**每日 ≥2 份：晨间端点 A + 收尾端点 B**，同名不覆盖；逐日差分表），只有账本自述不算；**只有 1 份端点的日子，tile kind 迁移一律记【无法判定】**（run9c 的 summer 18/21 就是这个教训，summer 20 更是一份都没有 ⇒ 整日【无法判定·窗口错过】）；
 5. **新增**：任何阶段的 `assigned` 不得超过当时的可用资源（种子数 / 壶容），否则 `assigned_undone` 记的是资源缺口而不是 agent 没干完；
 6. **新增**：`stopped == ""` 与 `assigned_undone > 0` 不得同时出现；
 7. **新增**：`checks.no_unmet_stages=false` 必须能在 `day_end.stages[].assigned_undone` 上逐格解释（解释不了就是口径洞）。

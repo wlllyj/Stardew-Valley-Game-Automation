@@ -1,0 +1,24 @@
+v0.7.31（run9c 诊断后的分配额口径修复：播种不超手上种子数 + 浇水阶段壶空补水续做）
+
+本版两张卡 + 一张对抗验收（Mod 无源码改动，只 bump 版本号）：
+
+1. task-143（dev-coder）播种分配额 = 手上种子数：
+   - `_stage_tiles("plant_area")` 的上限改为 `limit = min(self.per_stage_tiles, seeds_total)`；
+   - run9c 实证：day1 两条 stage 记录 `assigned 12 / ok 11 / undone 1 / stopped "no_seed"` 与 `assigned 4 / ok 1 / undone 3 / stopped "no_seed"` —— 手上只有 11 粒却分了 16 格，多出来的格既做不成也不算"没活"⇒ `checks.no_unmet_stages=false`；
+   - **不许**把 `no_seed` 塞进"诚实上限"白名单（买不到种子 ≠ 今天该做的活做完了）。
+
+2. task-144（dev-coder）浇水阶段壶空必须补水续做：
+   - `water_area` 阶段内壶空（`water()` 返回 `need_refill`，或阶段开始前 `waterLeft == 0`）⇒ 先 `refill_can()`（每阶段/每天有界 ≤2 次）再继续浇，把分下去的格做完 ⇒ `assigned_undone` 归 0；
+   - 补水不可能（无补水点/失败/达上限）⇒ 保持诚实：`stopped="need_refill"` + `assigned_undone` 照旧计入 unmet（**不许**洗白）；
+   - 消除 `stopped == ""` 却 `assigned_undone > 0` 的形态（run9c：`assigned 21 / undone 3 / stopped ""`）——正常结束不许有格没做且不解释；
+   - run9c 实证：`water_area assigned 70 / undone 27 / stopped "need_refill"`（壶容 40），而补水链本身可用（当天有 `refill 0→40`）。
+
+3. task-145（deputy-lead，对抗验收）0.7.31 批次：A 段范围/读数；B 段复现 run9c 两条形态 FAIL→PASS；C 段 ≥6 组对抗（重点打"新洗白通道"：壶空被写成够不着/诚实上限、分配额上限被用来掩盖真未完成、`stopped==""` 与 `assigned_undone>0` 并存、补水自旋、买不到种子被当成收工理由）。
+
+判据（run9d = run A，0.7.31 上重跑；run9c 只作诊断）：
+- 尾部连续 3 天 `verified=true`（两侧工具同向 + `verdict`/`strict_verdict` 并列）；
+- 每次跨日落盘六串配对齐全（`NewDay / before save / SaveGame.Save() called. / Saving without compression / completed / after save`）；
+- **每个游戏日 ≥2 份独立 `observe?detail=full` 端点**（晨间 A + 收尾 B，同名不覆盖）并出逐日世界差分表；只有 1 份端点 ⇒ 该日 tile 迁移记【无法判定】，整日无观测 ⇒ 记【无法判定·窗口错过】；
+- 无 `unreachable_within_bound=false`/`refused_within_bound=false`/`slept_without_work`/`gave_up_dry`；
+- `lessons.total >= 1` 且零矛盾 lesson（L0）；
+- 经济四步真机留痕（卖→次日到账→买→种），死苗字段缺失一律【无法判定】。
