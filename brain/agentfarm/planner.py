@@ -442,6 +442,10 @@ LESSON_SEVERITY: dict[str, int] = {
     "far_dry_given_up": 2,
     "no_inventory_space": 2,
     "slept_without_work": 2,
+    # 【task-122】"一天以 `stuck` 收尾、还有 leftover"是最典型的退化形态（run9 第一天就是它，
+    # 而当时 8 种 kind 一条都生成不出来 ⇒ run A 攒不到教训）；"换了很多片地都找不到活"同理。
+    "stuck_with_leftover": 2,
+    "plot_exhausted": 2,
     "stage_incomplete": 1,
 }
 LESSON_SEVERITY_DEFAULT = 1

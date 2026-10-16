@@ -717,6 +717,11 @@ class LongRun:
         #: 【task-114 NIT-1】撞上 `no_inventory_space` 那一刻的**真实观测**（空格/种子/钱），
         #: 供当晚教训的 `evidence` 引用 —— 教训里绝不许写死"空格=0"这类常量。
         self.buy_no_space_facts: dict[str, Any] = {}
+        #: 【task-122】当天的两种"退化形态"计数（每日重置），供教训库生成
+        #: `plot_exhausted` / `stuck_with_leftover`：run9 第一天正是"以 stuck 收尾、
+        #: 还有 leftover、failed=0"，当时 8 种 kind 一条都生成不了 ⇒ run A 攒不到教训。
+        self.plot_exhausted_today = 0
+        self.midway_leftover_today = 0
 
     # ------------------------------------------------------------------ 小工具
 
@@ -1700,6 +1705,13 @@ class LongRun:
         seq = len(self.days) + 1
         hints = [h for h in self.lessons_hints if str(h).strip()]
         hint = str(hints[0]) if hints else ""
+        # 【task-122】"一天以 stuck 收尾"的三种客观形态（任一成立即算）：①`ended_by` 以 stuck 开头；
+        # ②当天出现过 `stage_midway_leftover`（同一阶段更早一轮还剩格子）；③日级账本
+        # `no_unmet_stages=false`。run9 第一天正是"stuck + leftover + failed=0"，当时 8 种 kind
+        # 一条都生成不出来 ⇒ run A 攒不到教训、run10 的 L1 没有素材。
+        ended = str(rep.ended_by or "")
+        stuck_day = (ended.startswith("stuck") or self.midway_leftover_today > 0
+                     or rep.checks.get("no_unmet_stages", True) is False)
         for stage in rep.stages:
             task = str(stage.get("stage") or "")
             if not task:
@@ -1729,6 +1741,20 @@ class LongRun:
                                        day_seq=seq, hint=hint,
                                        symptom=f"{task} 有 {failed} 格没做成，还剩 {leftover} 格",
                                        evidence=f"failed={failed} leftover={leftover}"))
+            # 【task-122】和 `stage_incomplete` **并存**（后者要 failed>0，这条正是 failed=0 时的
+            # 唯一痕迹）：只要当天以 stuck 收尾且这一阶段还剩格子，就如实记一条。
+            if stuck_day and leftover > 0:
+                stopped = str(stage.get("stopped") or "")
+                out.append(make_lesson(kind="stuck_with_leftover", scope=task, day_key=rep.day_key,
+                                       day_seq=seq, hint=hint,
+                                       symptom=f"{task} 收尾时还剩 {leftover} 格没做成、当天以 stuck 结束",
+                                       evidence=f"leftover={leftover} failed={failed} stopped={stopped}"))
+        # 【task-122】"换片地也找不到活"：≥2 次才算形态（1 次是正常的换片）。
+        if self.plot_exhausted_today >= 2:
+            out.append(make_lesson(kind="plot_exhausted", scope="plot", day_key=rep.day_key,
+                                   day_seq=seq, hint=hint,
+                                   symptom=f"换了 {self.plot_exhausted_today} 片地都找不到可干的活",
+                                   evidence=f"plot_exhausted={self.plot_exhausted_today}"))
         if int(getattr(rep, "dry_dead", 0) or 0) > 0 and not rep.verified:
             out.append(make_lesson(kind="dead_crops_blocking", scope="farm", day_key=rep.day_key,
                                    day_seq=seq, hint=hint,
@@ -3582,6 +3608,9 @@ class LongRun:
         self.slot_sold_today = False
         self.farm_actions_today = 0
         self.buy_no_space_facts = {}
+        # 【task-122】两种退化形态的当日计数，每天清零（只喂教训库，不参与判定）。
+        self.plot_exhausted_today = 0
+        self.midway_leftover_today = 0
         self.dead_scope_noted = set()
         # 【task-59】复盘每天最多一次（`recent_notes` **不**在这里清：它是"昨晚留给今天"的，
         # 由 `_review_before_sleep` 在夜里覆盖）。
@@ -3814,6 +3843,7 @@ class LongRun:
                                 self.idle_rounds = 0
                                 continue
                     recovered += 1
+                    self.plot_exhausted_today += 1     # 【task-122】当日计数（喂当晚教训）
                     self._journal("plot_exhausted", recovered=recovered, zone=self.zone_name,
                                   note=f"这一片没目标了，但守卫仍要求干活（{text}）⇒ 换一片地")
                     if recovered > self.max_plots_per_day:
@@ -4024,6 +4054,7 @@ class LongRun:
             last = last_by_stage.get(name)
             if last is None or int(last.get("leftover") or 0) != 0:
                 continue
+            self.midway_leftover_today += 1        # 【task-122】当日计数（喂当晚教训）
             self._journal("stage_midway_leftover", **mid,
                           note=("同一阶段种类当天更早一轮还剩格子、最后一轮 leftover==0 ⇒ 日级判定取"
                                 "最后一轮；若那批格子属于另一片地则存在遮蔽，请人工复核 `stage_exhausted`"))

@@ -5706,6 +5706,10 @@ class TestTask82Lessons(unittest.TestCase):
                 chat = _ReviewChat()
                 run = make_run(w, target_days=2, max_days=3, llm_enabled=True, llm_chat=chat,
                                journal_path=str(journal))
+                # 【task-122】本用例只比较"预置教训库"的注入效果 ⇒ 两个分支都不生成当天教训，
+                # 否则 plain 分支自己也会攒出 `lessons（` 一节。当天生成由
+                # `TestTask122LessonsCoverage` 单独覆盖。
+                run._lessons_from_day = lambda rep: []
                 self.assertEqual(run.run(), 0, run.logs)
                 prompts = []
                 trace = Path(str(journal)[:-6] + "-llm.jsonl")
@@ -5997,6 +6001,128 @@ class TestTask118UntrustedLessons(unittest.TestCase):
         for shape in ("good", "tampered_legal", "tampered_illegal", "bad_json", "review_fail"):
             with self.subTest(shape=shape):
                 self.assertEqual(once(shape), baseline, f"{shape} 不许改变任何判定")
+
+
+class TestTask122LessonsCoverage(unittest.TestCase):
+    """【task-122】教训库要覆盖"一天以 `stuck` 收尾、还有 leftover 但 failed=0"。
+
+    run9（run A）第一天真机账本 = `ended_by:"stuck"`、`failed_steps:0`、`no_unmet_stages:false`
+    （还剩 2 格）、`stage_midway_leftover 1`、`stuck_flush 1` —— 当时 8 种 kind **一条都没生成**，
+    `lessons {"added":[],"total":0}` ⇒ run A 攒不到教训、run10 的 L1（教训注入）没有素材。
+    两条新 kind：`stuck_with_leftover`（每条相关 stage 一条）与 `plot_exhausted`（≥2 次换片）。
+
+    变异自检（`scratch/_t122_mutate.py`：复制 brain+tests 到临时目录做文本替换，跑完即删）：
+    基线 6/6 绿；`m122a_stuck_day_off`（`if stuck_day and leftover > 0:` → `if False and …`）
+    红 3；`m122b_plot_threshold_1`（阈值 `>= 2` → `>= 1`）红 1。
+    离线重放 run9 账本（`scratch/_t122_replay.py`，只读 `logs/`）：旧代码 **0 条** ⇒
+    新代码 **12 条**（9 条 `stuck_with_leftover` + 3 条 `plot_exhausted`，三天全覆盖）。
+    """
+
+    def _run(self):
+        return make_run(FakeWorld(weeds=0, seeds=0, money=0), llm_enabled=False)
+
+    def _report(self, **over):
+        base = dict(day_key=(1, "summer", 13), started_at=0.0)
+        base.update(over)
+        return DayReport(**base)
+
+    def _stuck_report(self, **stage_over):
+        stage = {"stage": "clear_dead", "tiles": 4, "leftover": 2, "failed": 0,
+                 "stopped": "budget", "unreachable": 0, "refused": 0, "encircled": 0}
+        stage.update(stage_over)
+        return self._report(ended_by="stuck", ended_reason="stuck:连续 3 轮世界没有任何变化",
+                            stages=[stage], checks={"no_unmet_stages": False})
+
+    def test_stuck_day_with_leftover_and_zero_failures_makes_a_lesson(self):
+        run = self._run()
+        run.days = [object(), object()]                 # seq = 3
+        lessons = run._lessons_from_day(self._stuck_report())
+        kinds = [les["kind"] for les in lessons]
+        self.assertIn("stuck_with_leftover", kinds)
+        lesson = next(les for les in lessons if les["kind"] == "stuck_with_leftover")
+        self.assertEqual(lesson["scope"], "clear_dead")
+        self.assertIn("还剩 2 格", lesson["symptom"])
+        self.assertIn("stuck", lesson["symptom"])
+        self.assertEqual(lesson["evidence"], "leftover=2 failed=0 stopped=budget")
+        # 落盘：`_lessons_flush` 之后这条教训必须真的在文件里
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / "run-t122.jsonl"
+            run2 = make_run(FakeWorld(weeds=0, seeds=0, money=0), llm_enabled=False,
+                            journal_path=str(journal))
+            run2.days = [object(), object()]
+            rep = self._stuck_report()
+            run2._lessons_flush(rep)
+            data = json.loads((Path(tmp) / "run-t122-lessons.json").read_text(encoding="utf-8"))
+            self.assertIn("stuck_with_leftover", {les["kind"] for les in data["lessons"]})
+            self.assertTrue(self._events(run2, "lessons"))
+
+    def _events(self, run, name):
+        return [e for e in run.entries if e["event"] == name]
+
+    def test_failed_day_gets_both_kinds_without_double_counting(self):
+        run = self._run()
+        lessons = run._lessons_from_day(self._stuck_report(failed=2, leftover=3, tiles=5))
+        kinds = [les["kind"] for les in lessons]
+        self.assertEqual(kinds.count("stage_incomplete"), 1, kinds)
+        self.assertEqual(kinds.count("stuck_with_leftover"), 1, kinds)
+        stuck = next(les for les in lessons if les["kind"] == "stuck_with_leftover")
+        self.assertEqual(stuck["evidence"], "leftover=3 failed=2 stopped=budget")
+
+    def test_repeated_plot_exhausted_makes_one_lesson(self):
+        run = self._run()
+        run.plot_exhausted_today = 12
+        lessons = run._lessons_from_day(self._report(ended_by="sleep", ended_reason="no_work:没活"))
+        plots = [les for les in lessons if les["kind"] == "plot_exhausted"]
+        self.assertEqual(len(plots), 1, lessons)
+        self.assertEqual(plots[0]["scope"], "plot")
+        self.assertIn("12 片地", plots[0]["symptom"])
+        self.assertEqual(plots[0]["evidence"], "plot_exhausted=12")
+        # 只换 1 片地是正常行为，不算教训
+        run.plot_exhausted_today = 1
+        self.assertEqual([les for les in run._lessons_from_day(
+            self._report(ended_by="sleep")) if les["kind"] == "plot_exhausted"], [])
+
+    def test_a_clean_verified_day_makes_no_lessons(self):
+        run = self._run()
+        run.plot_exhausted_today = 0
+        clean = self._report(ended_by="sleep", ended_reason="night:天黑了",
+                             stages=[{"stage": "water_area", "tiles": 12, "leftover": 0, "failed": 0,
+                                      "stopped": "done", "unreachable": 0, "refused": 0,
+                                      "encircled": 0}],
+                             checks={"no_unmet_stages": True, "no_hard_failures": True})
+        clean.verified = True
+        self.assertEqual(run._lessons_from_day(clean), [], "好日子不许被写成教训")
+
+    def test_hint_still_only_comes_from_the_night_review(self):
+        run = self._run()
+        run.lessons_hints = ["明早先把体力补回来"]
+        lessons = run._lessons_from_day(self._stuck_report())
+        self.assertTrue(lessons)
+        self.assertTrue(all(les["hint"] == "明早先把体力补回来" for les in lessons))
+        run.lessons_hints = []
+        self.assertTrue(all(les["hint"] == "" for les in run._lessons_from_day(self._stuck_report())),
+                        "没有复盘笔记 ⇒ hint 空串，绝不自己编")
+
+    def test_new_kinds_never_change_a_verdict(self):
+        """同一个假世界跑两天：只切换"是否生成教训"，判决必须逐字相同。"""
+
+        def once(with_lessons: bool):
+            w = FakeWorld(weeds=4, seeds=10, money=500)
+            run = make_run(w, target_days=1, max_days=2, llm_enabled=False)
+            if not with_lessons:
+                run._lessons_from_day = lambda rep: []
+            run.run()
+            out = []
+            for day in run.days:
+                water = dict(day.final_water)
+                water.pop("t", None)
+                out.append({"verified": day.verified, "ended_by": day.ended_by,
+                            "ended_reason": day.ended_reason, "checks": dict(day.checks),
+                            "final_water": water, "final": dict(day.final),
+                            "stages": [dict(s) for s in day.stages]})
+            return out
+
+        self.assertEqual(once(True), once(False), "教训只喂提示词，判决必须逐字相同")
 
 
 if __name__ == "__main__":  # pragma: no cover
