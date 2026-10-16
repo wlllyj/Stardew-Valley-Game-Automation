@@ -2212,6 +2212,16 @@ class LongRun:
             _seeds, _money, can_plant = self._seed_outlook(obs)
             if not can_plant:
                 pool = []
+            elif task == "plant_area":
+                # 【task-143】分配额**不得超过手上种子数**（`_seed_outlook` 第一个返回值 =
+                # 背包里所有种子叠的总数）。run9c day1 实证：只剩 11 粒却分配 12 格、只剩
+                # 1 粒却分配 4 格 ⇒ 阶段以 `no_seed` 停在半路，`assigned_undone` 进了
+                # `no_unmet_stages` 的基数（task-134 B）⇒ 干得一格不差的一天被判不达标。
+                # 这是"分配额超过资源"的口径错，不是"没干完"。
+                # ⚠️ 反方向绝不许做：**不能**把 `no_seed` 塞进"诚实上限"白名单来掩盖
+                # 真没做完（那是 task-135 F1/F2 打过的洗白通道）；分配额 ≤ 种子数却仍没种完 ⇒
+                # 照旧 `assigned_undone>0`、照旧判 unmet。
+                limit = min(limit, max(0, int(_seeds or 0)))
         if task in ("clear_area", "clear_dead", "till_area", "plant_area"):
             # 今天已经证明"动了没用"的格子不再碰（一格最多白试一次）；
             # 再叠一道"同一格一天最多发起 MAX_TILE_ATTEMPTS 次"的兜底不变量。
@@ -2873,8 +2883,34 @@ class LongRun:
                           reason=bad[0].reason, code=bad[0].code)
         return bool(good)
 
-    def _preconditions(self, obs: dict[str, Any], rep: DayReport) -> None:
+    def _preconditions(self, obs: dict[str, Any], rep: DayReport) -> dict[str, Any]:
+        """把"种子/钱/背包空格"在本轮动手之前摆正，并返回**改动之后的观测**。
+
+        【task-143】为什么必须返回观测：这个函数会**真的买种子**（`buy`）。调用方
+        `_run_day` 原先继续拿**买入之前**的快照去 `_ensure_plot`/`decide`/`_verify_intents`，
+        于是刚到手的那 10 粒种子在校验关口看不见 —— 配上 task-143 的
+        "`plant_area` 分配额 ≤ 手上种子数"上限，`_stage_tiles("plant_area")` 被算成 0 格
+        ⇒ `intent_verdict cancel`（「看得见却没有一格可动目标」）⇒ `plant_area` 当天被封
+        ⇒ `plot_exhausted` ⇒ 以 `stuck:` 收场（`TestTask32PlotsCap` 从"1 天做完"退化成
+        "3 天"的那个回归）。旧口径之所以没露馅，是因为 `can_plant`（钱够）时它照样返回
+        空地池 —— 那是错的，只是看起来"有目标"。
+
+        判据是**"校验用的观测必须看得到刚发生的变化"**，不是猜：只有 `_preconditions_apply`
+        报告"真动过世界"（`buy`/`sell` 成功）才重新取快照，没动过就把原快照原样还回去。
+        """
+        if self._preconditions_apply(obs, rep):
+            try:
+                fresh = self._snap()
+            except Exception:                       # 重新取快照失败绝不让本轮崩掉
+                return obs
+            if fresh:
+                return fresh
+        return obs
+
+    def _preconditions_apply(self, obs: dict[str, Any], rep: DayReport) -> bool:
         """种子没了就买**当季能买到的**种子。买不成如实记账，不让后面每一格去撞同一堵墙。
+
+        返回值 = **有没有真的改动世界**（买/卖成功）—— 调用方据此决定要不要重取快照。
 
         【task-67】选品顺序（每一层都比上一层信息新）：
 
@@ -2884,10 +2920,11 @@ class LongRun:
         3. 没有清单 ⇒ 用配置的 `buy_item` **探一次**（旧 Mod 没有清单字段时的唯一办法）；
         4. 探测带回清单 ⇒ 按清单**重挑一次**（换一个 id）；仍不成 ⇒ 置 `seed_dead_today`。
         """
+        changed = False
         player = FarmWorker.player_of(obs)
         seeds_total = sum(n for _i, _nm, n in seed_items(player))
         if seeds_total > 0:
-            return
+            return False
         assert self.worker is not None
         money = FarmWorker.money(obs)
         # 【task-102】空格死锁（run8 day 12/13 的主因）：钱够、没种子，但背包**放不下**买来的种子
@@ -2896,30 +2933,32 @@ class LongRun:
         free_slots, fs_status = player_free_slots(player)
         if (seeds_total == 0 and money >= self.seed_price and fs_status == "ok"
                 and free_slots < 1 and not self.slot_sold_today):
-            self._sell_surplus_for_slot(obs, rep)
+            if self._sell_surplus_for_slot(obs, rep):
+                changed = True
         # 【task-55】钱不够买种子时，先把"超出保留线的盈余材料"换成钱（钱要等下一次 NewDay
         # 才到账）—— 这是 run7 缺的那条腿：脑从没自己挣过钱、也没自己买过种子。
         # 门闸与"卖哪几叠"都由 `farmwork.surplus_sell_plan()` 判（每 id 留 K 件、只卖整叠）。
-        self._sell_surplus_for_seeds(obs, rep)
+        if self._sell_surplus_for_seeds(obs, rep):
+            changed = True
         if not self.allow_buy:
             rep.notes.append("没种子（本轮禁止买种子）")
-            return
+            return changed
         if self.buy_no_space_today:
             # 今天已经撞过"背包没空格"：再买还是同一堵墙（run8 一天撞 13 次）。
             if not self.buy_no_space_noted:
                 self.buy_no_space_noted = True
                 rep.notes.append("今天背包没有空格、种子买不进来（no_inventory_space）⇒ 当天不再试 buy；"
                                  "腾格要等同一天卖出/次日结算（见 buy_no_space / surplus_sell journal）")
-            return
+            return changed
         if self.buy_attempts_today >= MAX_BUY_TRIES_PER_DAY:
             rep.notes.append(f"今天已经发过 {self.buy_attempts_today} 次 buy（上限 "
                              f"{MAX_BUY_TRIES_PER_DAY}）⇒ 不再试")
-            return
+            return changed
         if self.seed_dead_today:
             if not self.seed_dead_noted:
                 self.seed_dead_noted = True
                 rep.notes.append(f"今天已确认买不到合适种子（{self.seed_dead_today}），不再试")
-            return
+            return changed
         # 【task-102】买之前先把残留菜单关掉（run8：前一次 `buy` 留下的 `ShopMenu` 会让
         # 下一次技能被 `ui_modal` 拒掉、也会挡住 `goto_farm`），并顺手刷新观测。
         obs = self._dismiss_stray_menu(obs, rep, where="before_buy")
@@ -2930,10 +2969,10 @@ class LongRun:
             pick, code = pick_seed_offer(self.shop_offers, money)
             if pick is None:
                 self._seed_dead(code, rep, money=money, offers=self.shop_offers)
-                return
-            self._buy_seed(str(pick.get("id") or ""), money, "shelf", rep,
-                           price=int(pick.get("price") or 0))
-            return
+                return changed
+            st = self._buy_seed(str(pick.get("id") or ""), money, "shelf", rep,
+                                price=int(pick.get("price") or 0))
+            return changed or bool(st is not None and st.ok)
         # 没有清单（旧 Mod / 首次）：拿配置项探**一次**。
         # ⚠️ 探测**成功**时绝不能下"买不到"的结论 —— 上面那次 `no_seed_for_sale` 的误判
         # （探到了种子还说商店没有）会把 `seed_dead_today` 置上，当天后半程直接瘫掉。
@@ -2956,21 +2995,22 @@ class LongRun:
                           "⇒ 今天不买（没钱，不是失败）")
             rep.notes.append(f"没种子且钱不够（{money}g < {price_now}g，差 {short}g），"
                              "只能干等/清障开垦")
-            return
+            return changed
         st = self._buy_seed(self.buy_item, money, "probe", rep)
         if st is not None and st.ok:
-            return
+            return True
         # 【task-102】`no_space` 是"背包放不下"，跟"这个 id 不在售"无关 ⇒ 换 id 也白搭，
         # 当天到此为止（run8 一天 13 次就是这么白撞出来的）。
         if st is not None and st.code == "no_space":
-            return
+            return changed
         # 探测失败：若回执带了货架清单，就照它重挑一次（换 id）；仍不成才下结论。
         pick, code = pick_seed_offer(self.shop_offers, money)
         if pick is not None:
-            self._buy_seed(str(pick.get("id") or ""), money, "shelf", rep,
-                           price=int(pick.get("price") or 0))
-            return
+            st2 = self._buy_seed(str(pick.get("id") or ""), money, "shelf", rep,
+                                 price=int(pick.get("price") or 0))
+            return changed or bool(st2 is not None and st2.ok)
         self._seed_dead(code, rep, money=money, offers=self.shop_offers)
+        return changed
 
     def _buy_seed(self, item: str, money: int, source: str, rep: DayReport,
                   *, price: int = 0) -> StepResult | None:
@@ -3632,6 +3672,10 @@ class LongRun:
                           leftover=len(leftover),
                           note="【task-134 B】阶段分下去的格没做完（未按规跳过）⇒ 除非是诚实上限"
                                "（体力/夜里收工/做完后撞 budget），当天判 unmet；"
+                               f"本阶段 stopped={stopped or '（自然走完）'}"
+                               "（task-143：`plant_area` 的分配额已按手上种子数收窄，"
+                               "所以 stopped=no_seed 时 undone 必须为 0；再出现 undone>0 + no_seed "
+                               "就是分配额超资源的口径 bug，不是'没干完'）；"
                                "片区还剩几格是 `plot_pending` 口径，两者刻意分开")
         if unreach_steps:
             self._journal("unreachable_stage", stage=task, zone=self.zone_name,
@@ -4289,7 +4333,10 @@ class LongRun:
                 rep.ended_by, rep.ended_reason = self._do_sleep(obs, rep, f"{code}:{text}")
                 break
 
-            self._preconditions(obs, rep)
+            # 【task-143】`_preconditions` 会真的买种子 ⇒ 必须用它还回来的**改动后**观测继续
+            # 本轮（`_ensure_plot`/`decide`/`_verify_intents` 都要看得见刚到手的那批种子，
+            # 否则 `plant_area` 会被算成"没有可动目标"而当天封格）。
+            obs = self._preconditions(obs, rep)
             # 【task-50】窗口外那 1 格干作物（run5 三天 `farm.dryCrops` 恒剩 1 的病灶）：
             # Mod 的 `farm.dryTiles` 给了坐标 ⇒ **走过去浇**，别因为它不在窗口里就判 `no_work`。
             # 每格每天最多 `FAR_DRY_MAX_TRIES` 次；两次都不成会进"认输"集合，之后

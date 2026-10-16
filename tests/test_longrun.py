@@ -6645,8 +6645,11 @@ class TestTask124ReviewOnlyFallback(unittest.TestCase):
         base_pre = run._preconditions
 
         def pre(obs, rep):
-            base_pre(obs, rep)
+            # 【task-143】`_preconditions` 现在必须**把校验要用的观测还回来**（它可能买过种子）；
+            # 注入动作照旧（这就是本用例要的"跨片地遗留"来路）。
+            out = base_pre(obs, rep)
             run.leftover_targets.add((70, 20))
+            return out
 
         run._preconditions = pre
 
@@ -7126,6 +7129,129 @@ class TestTask136ReviewMaterialWiring(unittest.TestCase):
             on.pop(key)
             off.pop(key)
         self.assertEqual(on, off, "复盘只许影响提示词文本，判决必须逐字相同")
+
+
+class TestTask143PlantQuota(unittest.TestCase):
+    """【task-143】`plant_area` 的分配额**不得超过手上种子数**。
+
+    run9c（0.7.30 run A）day1 summer 18：整天 `ok_steps=116 / failed=0`、九项 checks 只挂
+    `no_unmet_stages=false` —— `day_end.stages[]` 里两条 plant 记录
+    `assigned 12 ok 11 undone 1 stopped 'no_seed'` / `assigned 4 ok 1 undone 3 stopped 'no_seed'`：
+    分配额按"作业区空地数"给、没按种子数收窄 ⇒ 阶段以 `no_seed` 停在半路，
+    `assigned_undone` 进了 `no_unmet_stages` 的基数（task-134 B）⇒ 干得一格不差的一天被判不达标。
+    这是**分配额超过资源**的口径错，不是"没干完"。
+
+    反向红线（task-135 F1/F2）：**不许**把 `no_seed` 塞进"诚实上限"白名单来掩盖真没做完；
+    分配额 ≤ 种子数却仍没种完 ⇒ 照旧 `assigned_undone>0`、照旧判 unmet（本类第 1 条的对照半边）。
+
+    变异自检（**实测**，脚本 `scratch/_t143_mutate.py`，跑完即删；基线本类 5 条全绿）：
+    * `m143a_no_cap`（删掉 `limit = min(limit, seeds)`）⇒ **红 3**（第 1、4、5 条）；
+    * `m143b_hardcoded`（上限退回 `self.per_stage_tiles`，即改前行为）⇒ **红 3**（同三条）。
+    第 5 条（`test_same_round_buy_is_visible_to_the_intent_verifier`）是 Lead m12741 要的
+    "同一轮买到种子 ⇒ 该轮 `plant_area` 不许被 cancel"链路：上限一去掉/退化，它也会红。
+    """
+
+    PLOT_T = [(60, 10), (61, 10), (62, 10), (63, 10), (64, 10),
+              (60, 11), (61, 11), (62, 11), (63, 11), (64, 11),
+              (60, 12), (61, 12), (62, 12), (63, 12), (64, 12),
+              (60, 13), (61, 13), (62, 13), (63, 13), (64, 13)]
+
+    def _plot(self, tiles=None):
+        tiles = list(tiles or self.PLOT_T)
+        return {"anchor": list(tiles[0]), "tiles": [list(t) for t in tiles], "zone": "", "label": ""}
+
+    def _two_stack_world(self, *, first=3, second=4):
+        """两个不同种子 id 的叠（上限必须 = 两叠之和）。"""
+        w = FakeWorld(seeds=0, money=0, weeds=0)
+        w.inventory = [it for it in w.inventory if it.get("slot") != 5]
+        w.inventory.append({"slot": 5, "id": "472", "qualifiedId": "(O)472",
+                            "name": "Parsnip Seeds", "stack": first, "isTool": False})
+        w.inventory.append({"slot": 6, "id": "483", "qualifiedId": "(O)483",
+                            "name": "Wheat Seeds", "stack": second, "isTool": False})
+        return w
+
+    def test_quota_never_exceeds_the_seeds_in_hand(self):
+        w = FakeWorld(seeds=11, money=0, weeds=0)
+        w.dirt = set(self.PLOT_T)
+        run = make_run(w, target_days=1, max_days=1)
+        tiles = run._stage_tiles("plant_area", w.obs(), self._plot())
+        self.assertEqual(len(tiles), 11, "只剩 11 粒 ⇒ 最多分配 11 格（改前会分 12 格）")
+        self.assertEqual(run.run(), 0, run.logs)
+        day = run.days[0]
+        plants = [s for s in day.stages if s["stage"] == "plant_area"]
+        self.assertTrue(plants, day.stages)
+        self.assertEqual(sum(int(s["ok"]) for s in plants), 11, "11 粒就该种下 11 格")
+        for s in plants:
+            self.assertEqual(int(s["assigned_undone"]), 0, s)
+        self.assertIs(day.checks["no_unmet_stages"], True, day.checks)
+
+    def test_no_seeds_means_no_plant_targets_at_all(self):
+        w = FakeWorld(seeds=0, money=0, weeds=0)
+        w.dirt = set(self.PLOT_T)
+        run = make_run(w, target_days=1, max_days=1)
+        self.assertEqual(run._stage_tiles("plant_area", w.obs(), self._plot()), [],
+                         "一粒种子都没有 ⇒ 一格都不许分配")
+        self.assertEqual(run.run(), 0, run.logs)
+        self.assertEqual(w.crops, {}, "没种子还去播种 = 白跑一趟")
+        self.assertIs(run.days[0].checks["no_unmet_stages"], True, run.days[0].checks)
+
+    def test_quota_is_capped_by_the_empty_tiles_when_seeds_are_plentiful(self):
+        few = self.PLOT_T[:7]
+        w = FakeWorld(seeds=50, money=0, weeds=0)
+        w.dirt = set(few)
+        run = make_run(w, target_days=1, max_days=1)
+        self.assertEqual(len(run._stage_tiles("plant_area", w.obs(), self._plot(few))), 7,
+                         "种子多过空地 ⇒ 上限 = 空地数（绝不能超过真实目标）")
+
+    def test_two_seed_stacks_add_up_for_the_quota(self):
+        w = self._two_stack_world(first=3, second=4)
+        w.dirt = set(self.PLOT_T)
+        run = make_run(w, target_days=1, max_days=1)
+        self.assertEqual(run._seed_outlook(w.obs())[0], 7, "两叠种子要相加")
+        self.assertEqual(len(run._stage_tiles("plant_area", w.obs(), self._plot())), 7)
+
+
+    def test_same_round_buy_is_visible_to_the_intent_verifier(self):
+        """【Lead m12741 硬要求 3】同一轮里 `_preconditions` 买到种子 ⇒ `plant_area` 不许被 `cancel`。
+
+        病根：`_run_day` 曾拿**买入之前**的快照去 `_verify_intents` —— 配上 task-143 的
+        "分配额 ≤ 手上种子数"上限，`_stage_tiles("plant_area")` 被算成 0 格 ⇒ `intent_verdict
+        cancel`（「看得见却没有一格可动目标」）⇒ `plant_area` 当天被封（`no_target`）⇒
+        `plot_exhausted` ⇒ 以 `stuck:` 收场（`TestTask32PlotsCap` 从"1 天做完"退化成"3 天"
+        的那个回归）。修法 = `_preconditions` 返回**改动之后的观测**。
+        """
+        w = FakeWorld(seeds=0, money=500, weeds=0)
+        w.dirt = set(self.PLOT_T[:5])       # 5 格空地等着播种（就在玩家窗口里）
+        run = make_run(w, target_days=1, max_days=1)
+        run.worker = FakeWorker(w)          # `make_run` 不自动装 worker（本仓库既有约定）
+        plot = self._plot(self.PLOT_T[:5])
+        run.plot = plot
+        rep = DayReport(day_key=("spring", 1, 6), started_at=0.0)
+        stale = w.obs()
+        fresh = run._preconditions(stale, rep)
+        self.assertTrue(w.buy_calls, "钱够、没种子 ⇒ 本轮必须真的买一次种子")
+        self.assertEqual(self._seed_total(stale), 0, "旧快照看不见刚买到的种子（这就是病根）")
+        self.assertGreater(self._seed_total(fresh), 0, "还回来的快照必须看得见新种子")
+        self.assertEqual(run._stage_tiles("plant_area", fresh, plot),
+                         run._stage_tiles("plant_area", w.obs(), plot),
+                         "返回的观测必须就是世界真值（不是拼出来的）")
+        self.assertTrue(run._stage_tiles("plant_area", fresh, plot), "买完种子就该有可播种目标")
+        kept, verdicts = run._verify_intents([TaskIntent("plant_area", "", "", ())], fresh, plot)
+        self.assertEqual([i.task for i in kept], ["plant_area"])
+        self.assertEqual(verdicts[0]["verdict"], "keep", verdicts)
+        self.assertNotIn("plant_area", run.no_target, "有目标就不许封格")
+        # 反面（把**买之前**的快照喂给校验 = 原来的 bug 形态）：手上 0 粒 ⇒ 0 格目标 ⇒ cancel
+        # （`_run_day` 随后就会 `_mark_no_target("plant_area")` 把它当天封掉 —— 封格的是调用方）。
+        w2 = FakeWorld(seeds=0, money=500, weeds=0)
+        w2.dirt = set(self.PLOT_T[:5])
+        run2 = make_run(w2, target_days=1, max_days=1)
+        run2.plot = plot
+        _k2, v2 = run2._verify_intents([TaskIntent("plant_area", "", "", ())], w2.obs(), plot)
+        self.assertEqual([v["verdict"] for v in v2], ["cancel"], v2)
+
+    @staticmethod
+    def _seed_total(obs) -> int:
+        return sum(n for _i, _nm, n in seed_items(FarmWorker.player_of(obs)))
 
 
 if __name__ == "__main__":  # pragma: no cover
