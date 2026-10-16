@@ -25,6 +25,7 @@
 | **task-142** | dev-coder | 141 | 铁匠铺升级链：`upgrade_tool` 技能（`TryOpenShopMenu("ClintUpgrade")` + 反射 `tryToPurchaseItem(item,null,1,0,0)`，**先判 `toolBeingUpgraded == null`**）+ 主动升级闭环（钱够 + 有对应金属锭 + 该工具是当前瓶颈）；判据=观测差分（钱差==Price、锭 -5、`toolBeingUpgraded!=null`、`daysLeft==2`、次日 -1、取回 `UpgradeLevel+1`） | pending |
 | **task-151** | dev-coder | 142 | **全场清理收敛**：以 `farm` 清障计数为进度、按田区推进直到可清障碍为 0；journal `farm_progress`/`farm_cleared` + `day_end.farm_cleared`；缺字段/`complete=false` fail-closed；≥6 单测；验收=**一次完整清理**且外部 `observe?detail=full` 差分可核 | pending |
 | **task-152** | dev-coder | 142 | **钱的三分配**：种子再投资 / 工具升级储备 / 缓冲；LLM 给分配意图（journal `money_plan{reserve_for_upgrade,spend_on_seeds,reason}`），代码算数字与兜底硬约束（**先留住下一件关键升级的钱 > 至少留 1 份种子钱 > 其余才买种子/囤货**）；缺字段保守；禁 `Money +=` | pending |
+| **task-157** | dev-coder | — | **`water_far` 够不着时先有界开路再试**（run9d 实证：`[12,30]` 活苗干作物 `code=unreachable`，雨天掩盖、非雨天必破尾链）；仍走不到 ⇒ `water_far_blocked{tile,cause,attempts,cleared_tiles}` + 当天如实 `gave_up_dry`（**不许把开路当浇水**）；原因 `unreachable/no_route/need_refill/no_evidence/truncated` 显式分离；≥6 单测 + ≥2 变异 |
 | **task-154** | dev-coder | — | 种子识别不许只靠名字：结构性识别（`Crop` 数据/`Data/Shops` 交叉）+ `seed_source` + `seed_unknown` fail-closed（来源 task-145 INFO-1） | pending |
 | **task-110** | dev-coder | — | **桥异常绝不许穿出 `run()`**：`ensure_location`/`snap`/`sleep` 三处 + 顶层兜底，任何 `BridgeError` 都要落 `finish` 并如实记因（来源 task-108 NIT-2 / task-145 NIT-1） | pending |
 | task-109 / task-101 / task-107 / task-117 | dev-coder | — | 顺延 NIT：卖货如实性（卖最大叠 vs 文档说最小、卖后刷新 obs）、`_farm_totals` 类型校验、Mod `dryTiles`/`dryCrops` 同源、教训内容模板校验 | pending |
@@ -55,6 +56,7 @@
 4. 工具等级不足**不许发请求空挥**（task-20 口径）；`clumpTarget` 缺失 ⇒ `precondition_failed` + 理由，不许默认斧头。
 5. 升级发起前必须 `toolBeingUpgraded == null`（否则白扣钱 —— task-153 §7 已证陷阱）。
 6. 口径变更（含 `checks` 新键、`TASK_KINDS` 新档）必须过一轮**独立对抗验收**才能拿去判真机账本。
+7. **够不着的活苗干作物不许洗白**：`watered_outdoor` 只认逐格证据（该格 `watered=true` 或该格不在新鲜 `farm.dryTiles`）；走不到的格如实 `gave_up_dry` + 当天不 VERIFIED。run9d 的 `[12,30]` 就是这一类（雨天掩盖），修法是 task-157 的"先开路再试"，**不是**放宽判据。
 
 ## §5 待写（跑完后填）
 
