@@ -41,7 +41,8 @@ from agentfarm.longrun import (  # noqa: E402
     JUSTIFIED_END_REASONS, MAX_BUY_TRIES_PER_DAY, MAX_ENV_ATTEMPTS, MAX_STUCK_FLUSH,
     MAX_TILE_ATTEMPTS, DayReport, LongRun, _till_blocked_by, is_justified_end, plot_observe,
 )
-from agentfarm.planner import BoundaryPlanner, Brief, TaskIntent, deterministic_plan  # noqa: E402
+from agentfarm.planner import (DECISION_LINE_MAX_CHARS, DECISIONS_KEPT, BoundaryPlanner, Brief,
+                               TaskIntent, deterministic_plan, find_coordinate_like)  # noqa: E402
 
 SEED_ID = "472"
 SEED_NAME = "Parsnip Seeds"
@@ -5284,6 +5285,97 @@ class TestTask104FarDryNotOnFarm(unittest.TestCase):
         self.assertTrue(ev[0]["ok"])
         self.assertEqual(ev[0]["dry_before"], 1)
         self.assertEqual(ev[0]["dry_after"], 0)
+
+
+class TestTask58DecisionMemory(unittest.TestCase):
+    """【task-58】决策史（会话内记忆）接进长跑：真实边界决策 + 当天结局 ⇒ 下一轮提示词。
+
+    诚实边界：这只是「会话内记忆 + 提示词反馈」，**不是**权重更新；因此本类最重要的一条
+    是「带记忆 / 不带记忆跑同一个假世界，判定必须逐字相同」（只有提示词文本不同）。
+    """
+
+    def _run_with_llm(self, w, **kw):
+        """LLM 打开的 run：用**抛 `LlmError` 的假 seam**（真调了一次、绝不联网）。"""
+        chat = _BoomChat()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        journal = Path(tmp.name) / "run-t58.jsonl"
+        run = make_run(w, target_days=1, max_days=1, llm_enabled=True, journal_path=str(journal),
+                       planner=BoundaryPlanner(llm_chat=chat, llm_enabled=True,
+                                               max_llm_attempts=1), **kw)
+        # 钉住边界：上一次 task 种类与本次确定性首选不同 ⇒ 必然问一次 LLM
+        run.state.last_task_kind = "review"
+        return run, chat
+
+    def test_boundary_decision_is_remembered_with_the_day_outcome(self):
+        w = FakeWorld(weeds=4, seeds=10, money=500)
+        run, chat = self._run_with_llm(w)
+
+        run.run()
+
+        decisions = [e for e in run.entries
+                     if e["event"] == "decision" and e.get("llm_trace")]
+        self.assertTrue(decisions, "这一天必须发生过真实边界决策")
+        self.assertEqual(len(run.decision_memory), min(len(decisions), DECISIONS_KEPT),
+                         "每条真实边界决策记一条记忆（超出 DECISIONS_KEPT 的丢最旧的）")
+        outcome = "VERIFIED" if run.days[0].verified else "needs_review"
+        for line in run.decision_memory:
+            self.assertLessEqual(len(line), DECISION_LINE_MAX_CHARS, line)
+            self.assertIn(f"outcome={outcome}", line)
+            self.assertIsNone(find_coordinate_like(line), line)
+        self.assertGreaterEqual(chat.calls, 1)
+
+    def test_memory_is_capped_and_survives_days(self):
+        w = FakeWorld(weeds=4, seeds=10, money=500)
+        run, _chat = self._run_with_llm(w)
+        run.decision_memory = [f"old{i} outcome=VERIFIED" for i in range(20)]
+
+        run.run()
+
+        self.assertLessEqual(len(run.decision_memory), DECISIONS_KEPT,
+                             "会话内记忆按 DECISIONS_KEPT 截断（保留最近的）")
+        self.assertNotIn("old0", " ".join(run.decision_memory))
+
+    def test_memory_stays_empty_when_the_llm_is_off(self):
+        """LLM 关着（默认单测路径）⇒ 一条记忆都不该有，提示词里也就不出现这一节。"""
+        w = FakeWorld(weeds=4, seeds=10, money=500)
+        run = make_run(w, target_days=1, max_days=1)
+
+        run.run()
+
+        self.assertEqual(run.decision_memory, [])
+        brief = Brief.from_observe(w.obs())
+        self.assertEqual(brief.recent_decisions, ())
+        self.assertNotIn("recent_decisions", brief.situation_text())
+
+    def test_memory_only_changes_the_prompt_not_any_verdict(self):
+        """**零判定影响**（对抗验收 task-112 的最高优先级）：带/不带记忆结论逐字相同。"""
+
+        def once(seed_memory: list[str]):
+            w = FakeWorld(weeds=4, seeds=10, money=500)
+            run = make_run(w, target_days=1, max_days=1)
+            run.decision_memory = list(seed_memory)
+            run.run()
+            day = run.days[0]
+            water = dict(day.final_water)
+            # `t` 是墙钟时间戳，不是判定（两次跑必然不同）⇒ 对照时剔掉
+            water.pop("t", None)
+            return {
+                "verified": day.verified,
+                "ended_by": day.ended_by,
+                "ended_reason": day.ended_reason,
+                "checks": dict(day.checks),
+                "final_water": water,
+                "final": dict(day.final),
+                "stages": [dict(s) for s in day.stages],
+                "intents": [e["intents"] for e in run.entries if e["event"] == "decision"],
+            }
+
+        plain = once([])
+        seeded = once([f"summer {10 + i} new_day intents=[water_area@player] "
+                       f"outcome=needs_review ended_by=stuck" for i in range(5)])
+
+        self.assertEqual(plain, seeded, "决策史只许影响提示词文本，判决必须逐字相同")
 
 
 if __name__ == "__main__":  # pragma: no cover

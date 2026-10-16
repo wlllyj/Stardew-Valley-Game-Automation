@@ -938,5 +938,73 @@ class LlmTraceTests(unittest.TestCase):
             self.assertFalse(path.exists())
 
 
+class DecisionMemoryTests(unittest.TestCase):
+    """【task-58】决策史喂回提示词（会话内记忆，不是权重更新）。
+
+    四条硬要求各自一条用例：①有决策史 ⇒ 出现在简报里且整节 ≤300；②为空 ⇒ **不出现空节**；
+    ③超上限 ⇒ 决策史**最先被裁**（原简报字段一个都不许被它挤掉）；④决策史行紧凑、**无坐标**
+    （`ended_reason` 里点名坐标的诚实文案也要洗掉）。
+    """
+
+    def _brief(self, decisions=(), **over):
+        base = dict(location="Farm", is_farm=True, has_save=True, day_key=(1, "summer", 11),
+                    stamina=180.0, max_stamina=270.0, counts={"crops": 6, "dirt": 4},
+                    tiles_present=True, money=188, time_of_day=640,
+                    recent_decisions=tuple(decisions))
+        base.update(over)
+        return P.Brief(**base)
+
+    def test_decision_line_is_compact_and_scrubs_coordinates(self):
+        intent = P.TaskIntent("water_area", "player", "把干作物浇了", "unwatered_crops 下降")
+        line = P.decision_line(day_key=(1, "summer", 11), boundary=P.BOUNDARY_TASK_CHANGE,
+                               intents=[intent], verdict_counts={"keep": 1, "cancel": 2},
+                               outcome="needs_review", ended_by="stuck",
+                               ended_reason="stuck:[12, 30] 浇不到（连续 3 轮世界没变）")
+        self.assertLessEqual(len(line), P.DECISION_LINE_MAX_CHARS)
+        self.assertIn("summer 11", line)
+        self.assertIn("water_area@player", line)
+        self.assertIn("verdicts=keep1/cancel2", line)
+        self.assertIn("outcome=needs_review", line)
+        self.assertIn("why=", line)
+        self.assertIn("某格", line)                      # 坐标被洗成占位
+        self.assertIsNone(P.find_coordinate_like(line), line)
+
+    def test_decisions_section_appears_and_is_bounded(self):
+        brief = self._brief([f"summer {d} new_day outcome=VERIFIED ended_by=sleep" for d in (11, 12, 13)])
+        text = brief.situation_text()
+        self.assertIn("recent_decisions", text)
+        self.assertIn("summer 13", text)
+        self.assertLessEqual(len(brief.decisions_text()), P.DECISIONS_MAX_CHARS)
+        self.assertLessEqual(len(text), P.PROMPT_BRIEF_MAX_CHARS)
+
+    def test_empty_decisions_do_not_render_an_empty_section(self):
+        brief = self._brief()
+        self.assertEqual(brief.decisions_text(), "")
+        self.assertNotIn("recent_decisions", brief.situation_text())
+
+    def test_decisions_are_trimmed_first_when_the_brief_is_full(self):
+        """简报本体已吃满上限 ⇒ 决策史**整节丢掉**，原字段一个都不少。"""
+        fat = self._brief(last_failure="x" * (P.PROMPT_BRIEF_MAX_CHARS - 200),
+                          recent_decisions=("summer 11 new_day outcome=VERIFIED",))
+        text = fat.situation_text()
+        self.assertNotIn("recent_decisions", text)
+        self.assertIn("location=Farm", text)
+        self.assertIn("counts=", text)
+        self.assertLessEqual(len(text), P.PROMPT_BRIEF_MAX_CHARS)
+        # 挤得下时又要**优先保住最近的一条**（老的先丢）
+        roomy = self._brief(recent_decisions=tuple(f"old{i}" + "y" * 60 for i in range(5)))
+        section = roomy.decisions_text()
+        self.assertIn("old4", section)
+        self.assertLessEqual(len(section), P.DECISIONS_MAX_CHARS)
+
+    def test_build_messages_carries_decisions_and_respects_max_chars(self):
+        brief = self._brief(["summer 11 new_day outcome=VERIFIED ended_by=sleep"])
+        user = P.build_messages(brief, boundary=P.BOUNDARY_NEW_DAY)[1]["content"]
+        self.assertIn("recent_decisions", user)
+        tight = P.build_messages(brief, boundary=P.BOUNDARY_NEW_DAY, max_chars=80)[1]["content"]
+        self.assertLessEqual(len(tight.split("情境简报", 1)[1]), 200)
+        self.assertNotIn("recent_decisions", tight)      # 裁到最紧时先丢决策史
+
+
 if __name__ == "__main__":
     unittest.main()

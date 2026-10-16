@@ -70,6 +70,8 @@ __all__ = [
     # 策略与调用
     "deterministic_plan", "PROMPT_BRIEF_MAX_CHARS", "build_messages", "default_llm_chat",
     "LLM_TRACE_MAX_PROMPT_CHARS",
+    # 【task-58】决策史（会话内记忆；不是权重更新，见 `Brief.recent_decisions`）
+    "DECISIONS_KEPT", "DECISIONS_MAX_CHARS", "decision_line",
     "BoundaryPlanner", "PLAN_SCHEMA_EXAMPLE",
 ]
 
@@ -382,6 +384,76 @@ PROMPT_BRIEF_MAX_CHARS = 2048
 #: 留痕是给人事后复盘用的，一句 prompt 写进 JSONL 前必须有个硬上限（否则一行能到几百 KB）。
 LLM_TRACE_MAX_PROMPT_CHARS = 8000
 
+#: 【task-58】决策史保留的条数（卡面：最近 **3–5** 条边界决策）。
+DECISIONS_KEPT = 5
+#: 【task-58】决策史这一节在提示词里的硬上限（卡面：≤300 字符）。
+#: 超长时**从最旧的一条开始丢**；整节挤不下（简报本体已吃满 `PROMPT_BRIEF_MAX_CHARS`）
+#: 就整节丢掉 —— 决策史是**最先被裁**的东西（原有简报字段一个都不许被它挤掉）。
+DECISIONS_MAX_CHARS = 300
+#: 【task-58】单条决策史的上限（"结局 + 意图 + 校验 + 为什么"要紧凑，一行说完）。
+#: 120 ⇒ 一节 300 字符通常能放 2–3 条（**记忆**本身保留 `DECISIONS_KEPT=5` 条，
+#: 提示词里只呈现塞得下的那些 —— 卡面要求的是"条数 3–5"与"整节 ≤300"两条同时成立）。
+DECISION_LINE_MAX_CHARS = 140
+
+
+def decision_line(
+    *,
+    day_key: Any = None,
+    boundary: str = "",
+    intents: Iterable[Any] = (),
+    verdict_counts: Mapping[str, int] | None = None,
+    outcome: str = "",
+    ended_by: str = "",
+    ended_reason: str = "",
+    max_chars: int = DECISION_LINE_MAX_CHARS,
+) -> str:
+    """把一条边界决策拍成**一行、无坐标**的决策史（task-58）。
+
+    只搬运上层已经算好的东西：意图（`task` + 可选 `area_hint`）、校验关口的
+    `keep/unknown/cancel` 计数、当天的结局（`VERIFIED`/`needs_review`）与收尾原因。
+    **这里不观测、不判断、也不许出现坐标** —— 它是"给模型看的战绩摘要"，
+    不是新的真值来源。
+    """
+    tasks: list[str] = []
+    for it in intents or ():
+        task = str(getattr(it, "task", "") or "")
+        if not task:
+            continue
+        hint = str(getattr(it, "area_hint", "") or "")
+        tasks.append(f"{task}@{hint}" if hint else task)
+    counts = dict(verdict_counts or {})
+    vtxt = "/".join(f"{k}{int(counts.get(k) or 0)}"
+                    for k in ("keep", "unknown", "cancel") if int(counts.get(k) or 0))
+    day = ""
+    if day_key:
+        try:
+            day = f"{day_key[1]} {day_key[2]}"
+        except Exception:  # pragma: no cover - day_key 形态异常时退化成空
+            day = str(day_key)
+    parts = [
+        f"{day} {boundary}".strip(),
+        "intents=[" + ",".join(tasks) + "]" if tasks else "intents=[]",
+        f"verdicts={vtxt}" if vtxt else "",
+        f"outcome={outcome}" if outcome else "",
+    ]
+    reason = " ".join(str(ended_reason or "").split())
+    # 【task-58】`ended_reason` 来自执行层，某些诚实文案里**点名过坐标**（如"坐标都够不着
+    # （如 [12,30]）"）。决策史是要回填进提示词的 ⇒ 坐标一律洗成"某格"（prompt 契约：
+    # 坐标只由代码算，绝不进提示词；见 `Brief` 的模块文档与 `find_coordinate_like`）。
+    for _ in range(8):
+        hit = find_coordinate_like(reason)
+        if not hit:
+            break
+        reason = reason.replace(hit, "某格")
+    # 先给"为什么"留位置：它比 `ended_by` 信息量大，被末尾截断掉最不划算。
+    reason = reason[:40]
+    if ended_by:
+        parts.append(f"ended_by={ended_by}")
+    if reason:
+        parts.append(f"why={reason}")
+    return " ".join(p for p in parts if p)[: int(max_chars)]
+
+
 #: 需要清掉的障碍种类（`tiles[].kind`）
 OBSTACLE_KINDS: tuple[str, ...] = ("weed", "twig", "stone", "tree", "fruitTree", "clump", "grass", "bush")
 
@@ -438,6 +510,11 @@ class Brief:
     #: 白名单在 `FarmWorker.harvested` 里（"哪一件是我们自己收进背包的"只有执行层知道），
     #: 长跑控制器把它**注入**进来。所以这个数在直接调 `from_observe()` 的场合恒为 0。
     sellable: int = 0
+    #: 【task-58】最近几次边界决策的**一行式战绩**（`decision_line()` 造，**无坐标**）。
+    #: 由长跑控制器用**会话内记忆 + 当天账本**维护（重启后允许为空 ⇒ 这一节就不出现）。
+    #: ⚠️ 诚实边界：这是「会话内记忆 + 提示词反馈」，**不是**权重更新 / 在线训练 ——
+    #: 模型不会因此"学会"，只是这一次会话里能看见自己最近做了什么、结果如何。
+    recent_decisions: tuple[str, ...] = ()
 
     # ---- 派生量（确定性策略用） ----
     @property
@@ -458,7 +535,8 @@ class Brief:
         return self.seed_count > 0 or bool(self.seed_ids)
 
     # ---- 文本化（进 prompt，且必须 ≤2 KB） ----
-    def situation_text(self) -> str:
+    def base_lines(self) -> list[str]:
+        """简报本体（不含决策史）：这些字段**一个都不许被决策史挤掉**。"""
         lines = [
             f"location={self.location or 'unknown'} is_farm={self.is_farm}",
             f"has_save={self.has_save} day_key={self.day_key}",
@@ -473,8 +551,40 @@ class Brief:
             # 田区摘要放在中段：既让模型有"方向"可选，又不至于被末尾截断吃掉
             lines.append(f"areas={list(self.areas)}")
             lines.extend(f"- {line}" for line in self.area_lines)
-        text = "\n".join(lines)
-        return text[:PROMPT_BRIEF_MAX_CHARS]
+        return lines
+
+    def decisions_text(self) -> str:
+        """决策史一节（【task-58】，≤ `DECISIONS_MAX_CHARS`）；空 ⇒ 返回空串（不出现空节）。
+
+        从**最新**往回收，保证最近的那条一定在；塞不下的老条目先丢。
+        """
+        if not self.recent_decisions:
+            return ""
+        head = "recent_decisions（你自己最近的边界决策与结局）:"
+        text = head
+        for line in reversed(tuple(self.recent_decisions)):
+            item = f"\n- {line}"
+            if len(text) + len(item) > DECISIONS_MAX_CHARS:
+                break
+            text += item
+        # 连一条都放不下：宁可整节不出现，也不发一个只有标题的空节
+        return text if text != head else ""
+
+    def situation_text(self) -> str:
+        """简报全文（进 prompt）【task-58】裁切优先级：
+
+        1. 先保证本体（`base_lines()`）完整；
+        2. 决策史只在**本体之后**还有余量时追加，且自己 ≤ `DECISIONS_MAX_CHARS`；
+        3. 本体已吃满 `PROMPT_BRIEF_MAX_CHARS` ⇒ 决策史**整节丢掉**（它是最先被裁的）。
+        """
+        base = "\n".join(self.base_lines())
+        block = self.decisions_text()
+        if not block:
+            return base[:PROMPT_BRIEF_MAX_CHARS]
+        room = PROMPT_BRIEF_MAX_CHARS - len(base) - 1
+        if room <= 0:
+            return base[:PROMPT_BRIEF_MAX_CHARS]
+        return f"{base}\n{block[:room]}"[:PROMPT_BRIEF_MAX_CHARS]
 
     @classmethod
     def from_observe(

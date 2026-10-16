@@ -46,8 +46,8 @@ from .farmwork import (ENV_BLOCK_STATUSES, FRONTIER_KINDS, SEED_KEEP_FACTOR, STA
                        FarmWorker, StageResult, StepResult, farm_dead_crops,
                        farm_dry_dead_crops, farm_dry_tiles, pick_seed_offer, player_free_slots,
                        seed_items, surplus_sell_plan, till_blocked_by)
-from .planner import (BoundaryPlanner, Brief, PlannerState, TaskIntent, TaskOutcome,
-                      deterministic_plan)
+from .planner import (DECISIONS_KEPT, BoundaryPlanner, Brief, PlannerState, TaskIntent, TaskOutcome,
+                      decision_line, deterministic_plan)
 
 try:  # 田区规划是**可选**依赖：拿不到就退回"玩家周围窗口"，不让长跑起不来
     from . import fields as fields_mod
@@ -608,6 +608,12 @@ class LongRun:
         # **全场级**：`water_area`/`harvest` 看的是整个农场（一天要把所有作物伺候完），
         # 它们没目标就是真没目标 —— 换片地也不该再问。
         self.no_target_global: set[str] = set()
+        # 【task-58】会话内的**决策史**：每次真实的边界决策（`llm_called`）+ 当天结局，
+        # 由 `planner.decision_line()` 拍成一行无坐标的摘要，喂回下一次提示词。
+        # ⚠️ 诚实边界：这是「会话内记忆 + 提示词反馈」，**不是**权重更新 / 在线训练；
+        # 只影响提示词文本，**绝不**参与任何判定（`verified`/`ended_by`/`checks` 一字不变）。
+        # 重启后为空 —— 允许（没有持久层）。
+        self.decision_memory: list[str] = []
         # 【task-49】今天**已经见过、但还没做完**的格子（`_step_stage` 每轮的 `leftover`，排除已封格）。
         # 为什么必须记：观测是**以玩家为中心**的窗口（真机 `tiles[]` 上限 400、近处优先），
         # 人一换到别的片地，原来那片地的格子就"看不见"了 ⇒ `work_reasons`/`_plot_candidates`
@@ -1531,6 +1537,8 @@ class LongRun:
             # 【task-42】出货白名单件数来自执行层（`FarmWorker.harvested`），
             # 而它挂在 `full` 上 ⇒ 必须显式搬过来，否则 `ship` 意图永远不会出现。
             sellable=full.sellable,
+            # 【task-58】把会话内的决策史喂回提示词（空 ⇒ 提示词里不出现这一节）。
+            recent_decisions=tuple(self.decision_memory),
         )
 
     def _stage_tiles(self, task: str, obs: dict[str, Any], plot: dict[str, Any]) -> list[tuple[int, int]]:
@@ -3328,6 +3336,8 @@ class LongRun:
             except Exception:
                 pass
         recovered = 0            # 今天"换了一片地"的次数（本片拿不出目标时）
+        # 【task-58】今天的边界决策（只记**真实 LLM 调用**的那些），日终连同结局一起进决策史。
+        day_decisions: list[dict[str, Any]] = []
         # **一天的第一次决策必须是"跨日边界"**（用户 m01860：该由大模型先判断今天做什么）。
         # `detect_boundary` 判 new_day 的依据是"state 里的 day_key 与当前简报不同"，而且**两边都得
         # 非空**才比 —— 所以这里不能置 None，要放一个与真实日期必然不等的哨兵值。
@@ -3466,6 +3476,11 @@ class LongRun:
                 self._journal("llm_trace_failed", reason=trace_error,
                               path=getattr(decision, "llm_trace", "") or str(self.llm_trace_path or ""),
                               boundary=decision.boundary, zone=self.zone_name)
+            # 【task-58】这一刻的"边界决策"（只有真实 LLM 调用才算）先攒着，日终才配结局。
+            # 放在 `_apply_policy`/校验关口**之前**：这里记的才是模型自己交出来的意图。
+            llm_decision = (bool(getattr(decision, "llm_called", False)),
+                            str(getattr(decision, "boundary", "") or ""),
+                            list(decision.intents))
             decision, policy_note = self._apply_policy(decision, obs)
             if policy_note:
                 self._journal("policy", note=policy_note,
@@ -3474,6 +3489,14 @@ class LongRun:
             kept, verdicts = self._verify_intents(decision.intents, obs, plot)
             if verdicts:
                 self._journal("intent_verdict", zone=self.zone_name, verdicts=verdicts)
+            if llm_decision[0]:
+                counts = {"keep": 0, "unknown": 0, "cancel": 0}
+                for _v in verdicts:
+                    key = str(_v.get("verdict") or "")
+                    counts[key] = counts.get(key, 0) + 1
+                day_decisions.append({"boundary": llm_decision[1],
+                                      "intents": llm_decision[2],
+                                      "verdicts": counts})
             canceled = [v for v in verdicts if v["verdict"] == "cancel"]
             if canceled:
                 for v in canceled:
@@ -3839,6 +3862,20 @@ class LongRun:
                 self._last_day_key = tuple(FarmWorker.day_key(key_obs))
         except Exception:  # pragma: no cover
             self._last_day_key = None
+        # 【task-58】把今天的边界决策连同**真实结局**记进会话内记忆（只喂提示词，不参与判定）。
+        # 结局只写客观事实：`VERIFIED`/`needs_review` + 失败格数或收尾原因摘要；
+        # 空列表（今天没有 LLM 调用 / 开关关着）⇒ 什么都不加，提示词里也就不出现这一节。
+        if day_decisions:
+            outcome = "VERIFIED" if rep.verified else "needs_review"
+            reason = str(rep.ended_reason or "")
+            if not rep.verified:
+                reason = (f"{rep.failed_steps} 格没做成" if rep.failed_steps else reason)
+            for _d in day_decisions:
+                self.decision_memory.append(decision_line(
+                    day_key=rep.day_key, boundary=_d["boundary"], intents=_d["intents"],
+                    verdict_counts=_d["verdicts"], outcome=outcome,
+                    ended_by=rep.ended_by, ended_reason=reason))
+            del self.decision_memory[:-DECISIONS_KEPT]
         self._journal("day_end", **rep.as_dict())
         return rep
 
