@@ -396,11 +396,19 @@ def c_tool_forged_journal_shortfall() -> None:
     _, head = VR.report(forged, target_days=1)
     pre_tool = load_tool(REPO / "scratch" / "_t135_pre134" / "tools" / "verify-run3.py")
     _, pre = pre_tool.report(forged, target_days=1)
-    info("C-tool 伪造（账本 assigned_undone=0 + journal stage_shortfall{undone:5} + checks=True）",
-         f"head={head['verdict']} problems={head['problems']} || pre134={pre['verdict']} problems={pre['problems']}")
-    check("C-tool 伪造：工具必须能抓出「journal 说少做 5 格、账本说做净」",
-          bool(head["problems"]),
-          f"head={head['verdict']} problems={head['problems']}（pre134 口径={pre['verdict']}）")
+    # 变体 B：把日级落痕 `stage_shortfall_day`（真实脑侧会写的那一条）也留给工具 ⇒ F2 闸门该抓住。
+    forged_b = forged + [{"event": "stage_shortfall_day", "t": 15.1, "unmet": 5,
+                          "stages": [{"stage": "till_area", "stopped": "no_target", "undone": 5,
+                                      "assigned": 10, "leftover": 5}],
+                          "plot_pending": 5, "stopped_night": False, "note": "假：日级落痕"}]
+    _, fix_b = VR.report(forged_b, target_days=1)
+    info("C-tool 伪造 A（只留 stage 级 `stage_shortfall{undone:5}`、无日级落痕）",
+         f"verdict={head['verdict']} problems={head['problems']} || pre134={pre['verdict']} problems={pre['problems']}")
+    info("C-tool 伪造 B（stage 级 + 日级 `stage_shortfall_day{unmet:5}`）",
+         f"verdict={fix_b['verdict']} problems={fix_b['problems']}")
+    check("C-tool 伪造 B：日级落痕 unmet=5 > 账本 assigned_undone=0 ⇒ 必须报红",
+          bool(fix_b["problems"]),
+          f"verdict={fix_b['verdict']} problems={fix_b['problems']}")
 
 
 def c7_run9b_replay() -> None:
@@ -417,11 +425,46 @@ def c7_run9b_replay() -> None:
           f"days={days}")
 
 
+class UnreachableTillWorld(TL.FakeWorld):
+    """指定格的 `till` 一律回 unreachable（世界不动）⇒ 逼出真实 unreachable 计数。"""
+
+    def __init__(self, *a, unreachable=(), **kw):
+        super().__init__(*a, **kw)
+        self.unreachable = {tuple(t) for t in unreachable}
+
+    def till(self, tile):
+        t = tuple(tile)
+        if t in self.unreachable:
+            return StepResult("till", t, code="unreachable", reason="假：四邻都站不过去")
+        return super().till(tile)
+
+
+def c6_honest_but_over_bound() -> None:
+    """诚实上限（stamina 停）叠加 unreachable 越界 ⇒ 当天绝不许 verified（卡面 C6）。"""
+    un = [(60 + i, 14) for i in range(5)] + [(60 + i, 13) for i in range(5)]
+    w = UnreachableTillWorld(weeds=0, seeds=10, money=500, water_left=40, unreachable=un)
+    worker = StoppedWorker(w, "stamina")
+    planner = TL.FakePlanner(TL.TaskIntent("till_area", "anchor:current_location", "till_area"),
+                             TL.TaskIntent("sleep", "anchor:current_location", "sleep"))
+    run = TL.make_run(w, planner=planner, target_days=1, max_days=1, plot_size=8,
+                      worker_factory=lambda _c: worker)
+    code = run.run()
+    rep = run.days[-1] if run.days else None
+    checks = rep.checks or {}
+    check("C6 诚实上限 + unreachable 越界 ⇒ 当天不许 verified",
+          checks.get("unreachable_within_bound") is False and rep.verified is False,
+          f"unreachable={rep.unreachable}/{rep.unreachable_bound} deferred={getattr(rep, 'deferred_tiles', None)} "
+          f"no_unmet_stages={checks.get('no_unmet_stages')} within_bound={checks.get('unreachable_within_bound')} "
+          f"verified={rep.verified} ended_by={rep.ended_by!r} code={code} "
+          f"stages={[(s.get('tiles'), s.get('unreachable'), s.get('assigned_undone'), s.get('stopped')) for s in rep.stages]}")
+
+
 def main() -> int:
     print(f"=== task-135 探针 tree={TREE} root={ROOT} ===")
     for fn in (b1_refill_retry, b2_global_diff_is_not_evidence, b3_resume_bounded,
                c1_evidence_never_guessed, c2_refill_spin_bounded, c3_ok_givenup_mutex,
                c4_stopped_shortfall, c4b_night_empty_stopped, c5_honest_stamina_deferred,
+               c6_honest_but_over_bound,
                c_tool_reconcile, c_tool_forged_journal_shortfall, c7_run9b_replay):
         try:
             fn()

@@ -7,23 +7,33 @@
 
 ---
 
-## §0 判定：**FAIL**（1 必修 + 1 必答）
+## §0 判定：**PASS-WITH-NITS**（F1/F2 已由 Lead `5b070b4` 修好、我复验通过 ⇒ **0.7.30 可放行**）
 
-两提交的**脑侧**逻辑与卡面要求达标（B 段三处 FAIL→PASS 全部成立、C 段点名要堵的洗白方向都堵住），
-但**放行链上的工具侧与脑侧 `checks.no_unmet_stages` 不同向**，且工具侧掉了一条既有交叉核对：
+初判 FAIL 的两条（F1 工具把"诚实上限"日判红、F2 `assigned_undone` 纯自述）在 Lead 提交
+**`5b070b4`**（`tools/verify-run3.py` +60/−?、`tests/test_verify_run3.py` +42/−?，2 文件 +96/−6）后**全部关闭**：
+
+| # | 初判 | 修复 | 我的复验（快照 `scratch/_t135_fix` = `5b070b4`） |
+|---|---|---|---|
+| **F1** | 工具把诚实上限日判红 | 工具自算逐字镜像脑侧口径：honest（`stamina`／`budget 且 `undone==0`／夜里收尾且 `stopped==""`）阶段的 `assigned_undone` 不进基数，只累 `deferred_tiles` | 探针 `_t135_fix`：`C-tool 同向` 四组 **全 PASS**（旧树 `_t135_head` 同四组 3 红）。CLI 直跑原反例 `scratch/_t135_j/_t135_head_night+stamina_600.jsonl --days 1` ⇒ **rc=0 / VERIFIED / `finish.no_unmet_stages=True` / `unmet_days=[]`**、无 `与自算不一致`（只剩 info"VERIFIED 但只涉及一个阶段 ⇒ 供复核"）；对照 `_t135_head_no_target_600.jsonl --days 1` ⇒ **rc=1 / `no_unmet_stages=False` / `unmet_days=['1年 spring 6日']`**（真硬失败没被放过） |
+| **F2** | `assigned_undone` 纯自述 | 新增交叉闸门：`journal stage_shortfall_day.unmet > 账本自算 assigned_undone` ⇒ problem | 探针变体 B（账本 `assigned_undone=0` + 日级落痕 `stage_shortfall_day{unmet:5}` + `checks=True`）⇒ **needs_review**，原文 `[spring 11] 账本 assigned_undone=0 < journal stage_shortfall_day.unmet=5（阶段日记自报少做了这些格，账本却少记 ⇒ 可能被洗白）`；旧工具（`c6cc654`）同输入 **VERIFIED / problems=[]** ⇒ FAIL→PASS 成立 |
+
+**保留 NIT-2（不阻塞放行）**：伪造账本的**变体 A**（只留 **stage 级** `stage_shortfall{undone:5}`、不带日级 `stage_shortfall_day`）在修后**仍 VERIFIED**
+（`pre134` 旧口径反而 needs_review）——F2 闸门只认日级落痕。要一并堵住需再读 stage 级落痕，但"取最大值"会引入假红
+（同一阶段种类跨轮次：早轮 `stage_shortfall{undone:1}` 在末轮做净后仍留在 journal）⇒ 建议按 `(stage, zone)` 取**最后一条**再比，属 0.7.31 口径加固；
+真实脑侧两种落痕都会写，纯自述伪造才需要同时抹掉日级痕迹，故不影响本批放行。
+
+**其余打分（不变）**：task-133 = **PASS**（四条全过）；task-134 脑侧 = **PASS-WITH-NITS**（口径实现/有界性/历史不翻案达标，留 NIT-1）。
+
+**初判时的原文（留档）**：
 
 | # | 结论 | 事实 | 最小复现 |
 |---|---|---|---|
-| **F1（必修）** | 工具把"诚实上限"日判红 | 脑侧 task-134 口径：`stamina`/夜里收工留下的分配内未完成格记 `deferred_tiles`，**不算 unmet**；`tools/verify-run3.py:901` 读到了 `deferred_tiles` 却在 `:902` **只减** `unreach_exempt + refused_exempt` ⇒ 自算 `effective_unmet=1 > 0` ⇒ 报 `checks.no_unmet_stages=True 与自算不一致（分配内未完成 assigned_undone=1 格…期望 False）`，**同一份输出里还印着**"其中诚实上限延后 9 格 ⇒ 不计 unmet"（自相矛盾） | `scratch/_t135_probe.py::c_tool_reconcile` 的 `night+stamina` 组：`[FAIL] C-tool 同向：night+stamina（脑 no_unmet=True / 工具=needs_review / stage_undone=1 deferred=9）`，journal `scratch/_t135_j/_t135_head_nightstamina_600.jsonl` |
-| **F2（必答/建议同批修）** | 工具丢了"journal 少做 vs 账本做净"的交叉核对 | 伪造账本：`stages[].assigned_undone=0` + `checks.no_unmet_stages=true` + journal 里有 `stage_shortfall{undone:5}` ⇒ **新工具 VERIFIED / 旧（pre134）工具 needs_review**（旧口径用 `leftover=5` 抓出来了）。`unreachable`/`refused` 两路都有"自算 + 交叉核对"，只有新增的 `assigned_undone` 是**纯自述** | `scratch/_t135_probe.py::c_tool_forged_journal_shortfall`：`head=VERIFIED problems=[] || pre134=needs_review` |
+| **F1（必修）** | 工具把"诚实上限"日判红 | 脑侧 task-134 口径：`stamina`/夜里收工留下的分配内未完成格记 `deferred_tiles`，**不算 unmet**；`tools/verify-run3.py:901` 读到了 `deferred_tiles` 却在 `:902` **只减** `unreach_exempt + refused_exempt` ⇒ 自算 `effective_unmet=1 > 0` ⇒ 报 `checks.no_unmet_stages=True 与自算不一致（分配内未完成 assigned_undone=1 格…期望 False）`，**同一份输出里还印着**"其中诚实上限延后 9 格 ⇒ 不计 unmet"（自相矛盾） | `scratch/_t135_probe.py::c_tool_reconcile` 的 `night+stamina` 组：`[FAIL] C-tool 同向：night+stamina（脑 no_unmet=True / 工具=needs_review / stage_undone=1 deferred=9）`，journal `scratch/_t135_j/_t135_head_night+stamina_600.jsonl` |
+| **F2（必答/建议同批修）** | 工具丢了"journal 少做 vs 账本做净"的交叉核对 | 伪造账本：`stages[].assigned_undone=0` + `checks.no_unmet_stages=true` + journal 里有落痕 ⇒ **新工具 VERIFIED / 旧（pre134）工具 needs_review**（旧口径用 `leftover=5` 抓出来了）。`unreachable`/`refused` 两路都有"自算 + 交叉核对"，只有新增的 `assigned_undone` 是**纯自述** | `scratch/_t135_probe.py::c_tool_forged_journal_shortfall`：`head=VERIFIED problems=[] || pre134=needs_review` |
 
 F1 的影响面 = run 验收：任何**体力收工**（`stopped="stamina"`）或**夜里收工**、且该阶段有分配格没做成的日子，
 脑侧 `verified` 可能为真，工具一定判红 ⇒ run9b/run10 这种日子拿不到验收通过（正是 task-134 想消灭的假红）。
-F1 修法一行：`effective_unmet = max(0, assigned_undone - unreach_exempt - refused_exempt - deferred_tiles)`
-（或让脑侧把"诚实上限"阶段的 `stages[].assigned_undone` 直接写 0，两种取其一即可，但必须两侧同口径）。
-F2 修法建议：像 unreachable/refused 一样从 journal 自算 `assigned_undone` 并与账本比对（至少"journal 说少做 > 账本说少做"时报问题）。
-
-**其余打分：task-133 = PASS（四条全过）；task-134 脑侧 = PASS-WITH-NITS（口径实现/有界性达标，留 NIT-1）。**
+F1 修法（Lead 采用）：工具侧逐字镜像 honest 判定；F2 修法（Lead 采用）：`stage_shortfall_day.unmet` 交叉核对。
 
 ---
 
@@ -42,6 +52,7 @@ F2 修法建议：像 unreachable/refused 一样从 journal 自算 `assigned_und
   `tests.test_farmwork tests.test_longrun tests.test_planner` = **Ran 433 / OK**（与 Lead 一致）；
   全量：干净快照（补上 gitignored 夹具后）= **Ran 762 / OK（0 红）**；缺夹具的快照 = 756 ran/9 skipped + 4 条 `test_analyze_longrun` 伪红；
   真实工作树 = 762 ran/2 failures（他人 WIP，不是本对象）。757 vs 762 的差额 = `tests/test_verify_run3.py` 在 `903e6a4` 53 个用例、在 `c6cc654` 58 个（+5）。
+- **修后追加读数（`5b070b4`，Lead 的 F1/F2 修复）**：`git show --stat` = **2 文件 +96/−6**（`tools/verify-run3.py` +60、`tests/test_verify_run3.py` +42）；越界扫描只命中 `tools/verify-run3.py`（声明即如此，`mod/`、`logs/`、`manifest.json`、`bridge.py`、`00-开发日志` 均 0）；快照 `scratch/_t135_fix`（`git archive 5b070b4`），`tools/verify-run3.py` SHA256 前 16 = `A781DE2FD068C3B8`、`tests/test_verify_run3.py` = `262E7518E8992805`；`py_compile -W error::SyntaxWarning` **exit 0**；`tests.test_verify_run3` = **Ran 60 / OK**（Lead 报 60，逐字一致）；全量 = **Ran 776 / OK**（Lead 报 776，一致）；九账本 rc 与 Lead 报的一致（green 0 / run2 1 / run3 1 / run5 1 / run6 1 / run7 0 / run8 1 / run9 1 / run9b 1）。
 
 ---
 
@@ -79,7 +90,7 @@ F2 修法建议：像 unreachable/refused 一样从 journal 自算 `assigned_und
 | C5 `stamina` + 少做 | N/A | 红（leftover 口径） | **绿（`deferred_tiles=9`、`no_unmet_stages=True`）** | 卡面要求的口径变化，但**工具不认（F1）** |
 | C7 run9b 三天重放 | false/false/false | 同 | 同 | 历史判决未变 |
 
-探针纯文本读数：`scratch/_t135_head_out.txt`、`scratch/_t135__t135_pre133_out.txt`、`scratch/_t135__t135_pre134_out.txt`（head **13/17**、pre133 9/17、pre134 12/17；head 的 4 条 FAIL = F1 的 3 组 + F2 的 1 条；pre 侧的"FAIL"多是该特性尚不存在的 N/A 项，逐条解释见上表）。
+探针纯文本读数（定稿，含后补的 C6）：`scratch/_t135_head_out2.txt`、`scratch/_t135__t135_pre133_out2.txt`、`scratch/_t135__t135_pre134_out2.txt`（head **14/18**、pre133 **10/18**、pre134 **13/18**；head 的 4 条 FAIL = F1 的 3 组 + F2 的 1 条；pre 侧的"FAIL"多是该特性尚不存在的 N/A 项，逐条解释见上表）。
 run9b 单独重放：`& $py tools\verify-run3.py --journal logs\longrun-3day-llm-run9b.jsonl --days 3` ⇒ `结论：needs_review`（exit 1），`summer 13/14/15` 三天 `no_unmet_stages=false`。
 
 ---
@@ -95,10 +106,13 @@ run9b 单独重放：`& $py tools\verify-run3.py --journal logs\longrun-3day-llm
 | C3 | 同格 `ok` 与 `given_up` 互斥 | PASS：0 条违规 |
 | C4 ×3 | `no_target`/`world`/`sow_failed` + `assigned_undone>0` 伪装诚实上限 | PASS：`no_unmet_stages=False`（`assigned_unmet=1`） |
 | C4b | 夜里 + `stopped=""` + 少做 | **VERIFIED**（`deferred=9`）⇒ 记 NIT-1；生产不可用（见 §5） |
-| C5 | `stamina` + 少做 ⇒ `deferred_tiles>0` 且不计 unmet | PASS（脑侧）／工具 F1 判红 |
-| C-tool 同向 ×4 | 同一账本"工具自算"与"脑侧 checks"必须同向 | `no_target` PASS；`night+stopped=''`、`night+stamina`、`stamina` **FAIL（F1）** |
-| C-tool 伪造 | journal `stage_shortfall{undone:5}` vs 账本 `assigned_undone=0` | **FAIL（F2）**：head VERIFIED、pre134 needs_review |
+| C5 | `stamina` + 少做 ⇒ `deferred_tiles>0` 且不计 unmet | PASS（脑侧）／`_t135_fix` 起工具同向 PASS |
+| C6 | 诚实上限（`stamina`）+ `unreachable` 越界（6 格 > bound 5） | PASS：head `unreachable=6/5`、`within_bound=False`、`verified=False`、`ended_by=stuck`（`deferred_tiles=9` 仍只作 info）；pre134/pre133 同构造同样 `within_bound=False/verified=False`（该闸门早于本批次） |
+| C-tool 同向 ×4 | 同一账本"工具自算"与"脑侧 checks"必须同向 | `no_target` 全树 PASS；`night+stopped=''`、`night+stamina`、`stamina` 在 `_t135_head`(c6cc654) **FAIL（F1）** ⇒ 在 `_t135_fix`(5b070b4) **全 PASS** |
+| C-tool 伪造 A | 账本 `assigned_undone=0` + 只留 **stage 级** `stage_shortfall{undone:5}` | `_t135_fix` 仍 **VERIFIED**（pre134 needs_review）⇒ 记 **NIT-2**（残余、不阻塞） |
+| C-tool 伪造 B | 同上 + 日级 `stage_shortfall_day{unmet:5}` | `_t135_head` **FAIL（F2，VERIFIED）** ⇒ `_t135_fix` **PASS（needs_review）**，原文见 §0 |
 | C7 | run9b 三天口径 | PASS：三天仍 `False`，历史判决未变 |
+| C6-fix（CLI） | 我的 F1 反例直接喂修后工具 | `night+stamina_600.jsonl --days 1` ⇒ **rc=0 / VERIFIED / `no_unmet_stages=True` / `unmet_days=[]`**；`no_target_600.jsonl --days 1` ⇒ **rc=1 / `no_unmet_stages=False` / `unmet_days=['1年 spring 6日']`** |
 
 ---
 
@@ -111,8 +125,11 @@ run9b 单独重放：`& $py tools\verify-run3.py --journal logs\longrun-3day-llm
   循环正常跑完时每个分配格都会留下一条 step；`assigned_undone>0` 而 `stopped==""` 只能来自**某格硬失败**（`ok=False` 且非 `skipped`），
   而硬失败一定让 `checks.no_hard_failures=False` ⇒ 当天不可能 `verified`。我的探针用"整格不派活"制造出这种形态，属防御性构造。
   ⇒ 记 **NIT-1**（见 §6），不是通过的洗白通道。
-**工具侧：有两条方向相反的偏差（F1 过严、F2 过松）**，F2 不是"脑侧洗白"，而是"工具不再独立复核 `assigned_undone`"——
-`task-52/63` 那两路豁免都有"自算 + 与账本交叉核对"，新增的 `assigned_undone` 目前**只信账本自述**，与其"不信自述"的既有设计不一致。
+**工具侧**：初判时两条方向相反的偏差（F1 过严、F2 过松）**都已由 `5b070b4` 修掉**：
+- F1（过严）⇒ 工具自算逐字镜像脑侧 honest 判定，诚实上限日不再假红（§0 复验表）。
+- F2（过松）⇒ 接入 journal `stage_shortfall_day.unmet` 交叉核对，账本少报即 problem。
+- **残余 NIT-2**：闸门只认日级落痕，伪造账本若**只留 stage 级** `stage_shortfall`（不带日级事件）仍能 VERIFIED（§0、§6）；
+  建议 0.7.31 按 `(stage, zone)` 取最后一条 stage 级落痕再比（避免跨轮次假红）。真实脑侧两种落痕都会写。
 
 ---
 
@@ -120,23 +137,28 @@ run9b 单独重放：`& $py tools\verify-run3.py --journal logs\longrun-3day-llm
 
 | # | 现象 | 行号/证据 | 阻塞放行？ |
 |---|---|---|---|
-| F1 | 工具自算不减 `deferred_tiles` ⇒ 诚实上限日被工具判红（同时印着"延后 9 格 ⇒ 不计 unmet"） | `tools/verify-run3.py:901-902`；`scratch/_t135_probe.py::c_tool_reconcile` `night+stamina` | **是（必修）** |
-| F2 | 工具对 `assigned_undone` 无 journal 交叉核对 ⇒ 账本说做净、journal 说少做 5 格仍 VERIFIED | `tools/verify-run3.py:897-906`；`::c_tool_forged_journal_shortfall` | 建议同批（单项可留 0.7.31，但需 Lead 拍板） |
+| F1 | 工具自算不减 `deferred_tiles` ⇒ 诚实上限日被工具判红（同时印着"延后 9 格 ⇒ 不计 unmet"） | `tools/verify-run3.py:901-902`（修前）；`scratch/_t135_probe.py::c_tool_reconcile` `night+stamina` | **已修（`5b070b4`）**，复验 PASS |
+| F2 | 工具对 `assigned_undone` 无 journal 交叉核对 ⇒ 账本说做净、journal 说少做 5 格仍 VERIFIED | `tools/verify-run3.py:897-906`（修前）；`::c_tool_forged_journal_shortfall` 变体 B | **已修（`5b070b4`）**，复验 needs_review |
 | NIT-1 | 夜里 + `stopped=""` + `assigned_undone>0` 走 `honest` ⇒ 记 `deferred_tiles`；生产不可达（§5），但将来任何"忘了写 `stopped`"的新路径都会静默变成诚实延后 | `longrun.py:4600-4602` | 否（建议 0.7.31 顺手收紧：要求 `stopped in ("", "night")` 且 `assigned_undone==0` 才按 night 算 honest，或新路径一律显式写 `stopped`） |
-| NIT-2 | 我的探针在 `night` 组里出现"缺跨日证据"（夹具 `sleep` 后 `day_end.final` 仍是睡前快照）——纯夹具现象，不是产品问题 | `scratch/_t135_j/*.jsonl` | 否 |
+| NIT-2 | F2 闸门只认日级落痕：伪造账本只留 **stage 级** `stage_shortfall{undone:5}`（不带 `stage_shortfall_day`）仍 VERIFIED | `tools/verify-run3.py`（修后闸门）；`::c_tool_forged_journal_shortfall` 变体 A | 否（0.7.31 加固；真实脑侧两种落痕都写） |
+| NIT-3 | 我的探针在 `night` 组里出现"缺跨日证据"（夹具 `sleep` 后 `day_end.final` 仍是睡前快照）——纯夹具现象，不是产品问题 | `scratch/_t135_j/*.jsonl` | 否 |
 
 ---
 
-## §7 复跑命令（三树 + run9b）
+## §7 复跑命令（四树 + run9b + F1/F2 单跑）
 
 ```powershell
 $py = "C:\Users\admin\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
 $env:PYTHONUTF8="1"; $env:PYTHONDONTWRITEBYTECODE="1"
-foreach ($t in @("_t135_head","_t135_pre133","_t135_pre134")) {
+# 三棵开工时的树 + 修后树（`scratch\_t135_fix` = `git archive 5b070b4`；期望 18/18 PASS）
+foreach ($t in @("_t135_head","_t135_pre133","_t135_pre134","_t135_fix")) {
   $env:T135_ROOT = "D:\Deepseek Harness Workspace\星露谷游戏自动化\scratch\" + $t
   & $py -W error::SyntaxWarning "scratch\_t135_probe.py" 2>&1 | Out-File -Encoding utf8 ("scratch\_t135_" + $t + "_out.txt")
 }
-# 工具单跑（伪造账本/run9b 重放）已含在探针内；单独重放 run9b：
+# F1 反例：修后工具必须放行我原来的"夜里/体力收工"账本，且仍判红真硬失败日
+& $py "scratch\_t135_fix\tools\verify-run3.py" --journal "scratch\_t135_j\_t135_head_night+stamina_600.jsonl" --days 1   # rc=0
+& $py "scratch\_t135_fix\tools\verify-run3.py" --journal "scratch\_t135_j\_t135_head_no_target_600.jsonl"    --days 1   # rc=1
+# run9b 三天重放
 & $py "tools\verify-run3.py" --journal "logs\longrun-3day-llm-run9b.jsonl" --days 3
 ```
 
@@ -144,5 +166,6 @@ foreach ($t in @("_t135_head","_t135_pre133","_t135_pre134")) {
 
 - **task-133 = PASS**（四条全过，B 段 FAIL→PASS 有 pre 树原文）。
 - **task-134（脑侧）= PASS-WITH-NITS**（口径实现、有界性、历史不翻案都达标）。
-- **整体 FAIL / 0.7.30 暂不可放行**：F1 是"脑侧 verified 被工具否掉"的整链不同向，必须在放行前修（一行）；F2 同批修最省事。
-  放行判据（建议）：改完后用本报告 §7 的 head 探针复跑，`C-tool 同向` 四组全 PASS + `C-tool 伪造` 转为 needs_review，且 `no_target` 组仍红。
+- **放行链（工具侧）= 复验 PASS**：`5b070b4` 后 `_t135_fix` 探针 **18/18**，`C-tool 同向` 四组全 PASS、伪造变体 B 转 needs_review、
+  `no_target` 组仍红；`tests.test_verify_run3` **Ran 60 / OK**、全量 **Ran 776 / OK**、九账本 rc 与 Lead 报的一致。
+- **总结论：PASS-WITH-NITS ⇒ `0.7.30 可放行`**（残余 NIT-1/NIT-2 均不阻塞，建议 0.7.31 顺手收）。
