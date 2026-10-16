@@ -154,6 +154,30 @@ _SEASON_INDEX = {
     "冬": 3,
 }
 
+# 「在场证据」事件集（P3 ⑥ 附加不变量，Lead 2026-10-17）：这些事件只可能由"脑在户外农场上动手"
+# 产生。用于堵「雨日醒在室内 + 日初 goto_farm 被模态挡住 + 0 动作却 verified=true」的 fail-open
+# （run9c summer 20；deputy task-146 的 CAVEAT-1）。`goto_farm` 只在 ok=True 时才算（被挡住不算）。
+_FARM_SIGNAL_EVENTS = frozenset(
+    {
+        "plot",
+        "plot_exhausted",
+        "plot_exhausted_burst",
+        "work_spot",
+        "work_spot_resume",
+        "resume_walk",
+        "frontier_clear",
+        "clear_neighbor",
+        "water_far",
+        "water_far_skipped",
+        "water_far_refill",
+        "stage_shortfall",
+        "stage_stop_named",
+        "tool_refused",
+        "unreachable",
+        "encircled",
+    }
+)
+
 
 def _day_ordinal(day: Any) -> int | None:
     """把 [年, 季, 日] 折成绝对日序（28 天/季、4 季/年）；认不出返回 None。
@@ -216,11 +240,18 @@ def build_days(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "verified": None,
                 "checks": {},
                 "end": {},
+                # 在场证据（P3 ⑥ 附加不变量，Lead 2026-10-17，源自 deputy task-146 的 CAVEAT-1）：
+                # 只有能证明"脑当天确实在户外农场上动过手"的事件才算。室内窗口自述的 no_work 不算 ——
+                # run9c summer 20 就是雨日醒在室内、日初 goto_farm 被 ShippingMenu 挡住、
+                # 22.81 秒 0 动作却 verified=true 的形态（工具旧版只认 reason 前缀 no_work ⇒ 放过了）。
+                "farm_signals": 0,
             }
             days.append(cur)
             continue
         if cur is None:
             continue
+        if ev in _FARM_SIGNAL_EVENTS or (ev == "goto_farm" and row.get("ok") is True):
+            cur["farm_signals"] += 1
         if ev in ("no_intents", "plot_exhausted", "policy_fallback"):
             cur["excuse"] = True
         if ev == "sleep" and str(row.get("reason") or "").startswith(("no_work", "night", "stamina")):
@@ -858,8 +889,19 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         if d["verified"] is True and not stage_recs and not d["stages"]:
             reason = str(d.get("ended_reason") or "")
             excused = bool(d.get("excuse")) or reason.startswith(("no_work", "night", "stamina"))
-            if excused:
-                infos.append(f"[{name}] 当天 0 个阶段且自称 VERIFIED，但有\"无活可做\"证据（{reason or '事件'}）⇒ 接受")
+            _signals = int(d.get("farm_signals") or 0)
+            if excused and _signals > 0:
+                infos.append(
+                    f"[{name}] 当天 0 个阶段且自称 VERIFIED，但有\"无活可做\"证据（{reason or '事件'}）"
+                    f"且当天有 {_signals} 条在场证据 ⇒ 接受"
+                )
+            elif excused:
+                # 室内自述的 no_work 不算证据（run9c summer 20：雨日醒在 FarmHouse、日初 goto_farm 被
+                # ShippingMenu 挡住、22.81 秒 0 动作却 verified=true）。要达标必须有在场证据。
+                problems.append(
+                    f"[{name}] 当天 0 个阶段却自称 VERIFIED，且**没有任何户外农场的在场证据**"
+                    f"（只有室内自述的理由 {reason or '空'}；0 步 + 没上过农场不能换一天达标）"
+                )
             else:
                 problems.append(
                     f"[{name}] 当天 0 个阶段却自称 VERIFIED，且没有任何\"无活可做\"的证据"

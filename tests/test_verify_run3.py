@@ -140,6 +140,39 @@ class TestVerifyRun3(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(any("成功动作 0 步" in p for p in s["problems"]), s["problems"])
 
+    # ------------------------------------------- 在场证据（Lead 2026-10-17，task-146 CAVEAT-1）
+    def _zero_stage_day(self, *, with_farm_signal: bool):
+        """0 阶段 + 自称 VERIFIED + `no_work` 理由的一天（run9c summer 20 的形态）。"""
+        rows = [
+            day_start([1, "spring", 10], t=0.0, lineno=1),
+            sleep_ok(t=100.0, reason="no_work:确实找不到可做的活", lineno=2),
+        ]
+        if with_farm_signal:
+            rows.append({"event": "plot", "t": 50.0, "zone": "field_ne", "_lineno": 3})
+        rows.append(
+            day_end([1, "spring", 10], [1, "spring", 11], t=200.0, stages=[], ok_steps=0,
+                    ended_reason="no_work:确实找不到可做的活")
+        )
+        rows.append(finish(streak=1, days=1))
+        return rows
+
+    def test_zero_stage_day_without_farm_evidence_is_problem(self):
+        """run9c summer 20：雨日醒在室内、日初 goto_farm 被模态挡住、22.81 秒 0 动作却 VERIFIED。
+
+        旧的真空日闸门只认 `ended_reason` 前缀 `no_work` ⇒ 放过了这种"室内自述没活"的假达标。
+        现在必须有**户外农场的在场证据**（plot / work_spot / water_far / tool_refused … 或成功的
+        goto_farm）才算，否则判红。
+        """
+        ok, s = self.check(self._zero_stage_day(with_farm_signal=False), days=1)
+        self.assertFalse(ok, "0 阶段 + 无在场证据 + 自称 VERIFIED 必须判红")
+        self.assertTrue(any("在场证据" in p for p in s["problems"]), s["problems"])
+
+    def test_zero_stage_day_with_farm_evidence_is_accepted(self):
+        """正对照：确实上过农场（有 plot 证据）且理由是无活可做 ⇒ 允许 0 阶段 VERIFIED。"""
+        ok, s = self.check(self._zero_stage_day(with_farm_signal=True), days=1)
+        self.assertTrue(ok, f"有在场证据的真空日不该判红：{s['problems']}")
+        self.assertTrue(any("在场证据" in i for i in s["infos"]), s["infos"])
+
     def test_failed_underreport_is_problem(self):
         """洗账：stage 侧 2 格失败，日级 failed_steps=0，且无环境/无结论可解释。"""
         rows = tweak(green_rows(), "day_end", ok_steps=5, failed_steps=0,
