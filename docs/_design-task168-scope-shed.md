@@ -311,3 +311,193 @@ m168d  # _pending_work 不剔除认输格（= 走回去复发）
 **仍然开放（不属于本卡，属实现/验收链）**：
 - `harvest` 真能摘的取证与修复（Lead 已点名 task-169 为前置）——它决定"连续 5 天"是否可达；
 - `<journal>-scope.json` 的 schema 终稿（§4.1 提案）与是否需要 Lead 侧工具读取它（本轮只作 info）。
+
+---
+
+## 7. 附录 A：函数级实现蓝图（Lead m15542 要求：改哪几个函数、新签名、分支）
+
+> 行号基准 = HEAD `037e599`（撰写时的工作树）。**只写文档，未动任何代码。**
+> 落地时按 §7.4 的五步走，每步都要能独立跑绿。
+
+### 7.1 `brain/agentfarm/planner.py`（5 处）
+
+**P1 · `Brief`（`planner.py:1093`）新增 4 个字段**（全部带默认值，老构造点不受影响）：
+
+```python
+live_crops: int | None = None          # 全农场活苗（farm.crops 同口径）；None =【未观测到】
+water_capacity: int | None = None      # 一整管体力最多浇几格
+water_deficit: int | None = None       # max(0, live_crops - water_capacity)
+area_facts: tuple[tuple[str, int, int], ...] = ()   # (田区名, 未浇活苗格数, 该区格数)
+```
+
+- 前三个由控制器 `_plot_brief()`（`longrun.py:2275`）用 `replace(...)` 注入（与 `review_facts` 的注入点 `longrun.py:2384` 同款）；
+  `from_observe()`（`planner.py:1246`）**保持不算**（planner 不依赖 `farmwork` 常量）⇒ 直接调它的场合恒 `None`。
+- `area_facts` 的未浇格数直接来自 `fields.Zone.unwatered`（`fields.py:74`，观测口径），格数 = `bounds` 面积；
+  注入点同样在 `_plot_brief()`（那里已经调 `self._zones(obs)`）。
+
+**P2 · `base_lines()`（`planner.py:1165`）追加一行**（紧跟 `areas=`/`counts=` 之后，属**核心事实**，不受可选节裁剪影响）：
+
+```python
+if self.live_crops is None or self.water_capacity is None or self.water_deficit is None:
+    lines.append("water_budget: live_crops=未观测到 water_capacity=未观测到 water_deficit=未观测到")
+else:
+    lines.append(f"water_budget: live_crops={self.live_crops} "
+                 f"water_capacity={self.water_capacity} water_deficit={self.water_deficit}")
+```
+
+**P3 · `TASK_KINDS`（`planner.py:96`）**：在 `"harvest"` 之后、`"water_area"` 之前插入 `"reduce_scope"`。
+
+**P4 · `deterministic_plan()`（`planner.py:1557`）**：在 `harvest` 块（:1582）之后、`water_area` 块（:1603）之前插入：
+
+```python
+if (brief.water_deficit is not None and brief.water_deficit > 0
+        and len(brief.area_facts) >= 2):
+    name, dry, _tiles = max(brief.area_facts, key=lambda kv: (kv[1], -kv[2], kv[0]))
+    if dry > 0:
+        return (TaskIntent("reduce_scope", name,
+                           f"今天有 {brief.water_deficit} 格活苗浇不完（最多浇 {brief.water_capacity} 格）；"
+                           f"先保其余田区，{name} 今天主动不做",
+                           "该田区不再做目标、守卫不再为它报『还有活』；日终 scope_shed 如实留痕"),)
+```
+
+- 选的确定性代理：**未浇活苗最多** → 格数少 → 名字典序（同分可复现，不引入随机）。
+- `water_deficit is None` / `<= 0` / `area_facts` 少于 2 区 / 选中区 `dry == 0` ⇒ **不提议**。
+
+**P5 · 持久层两个函数**（对照 `load_lessons_file:904` / `save_lessons_file:966`，同样的信任边界与原子写）：
+
+```python
+SCOPE_SCHEMA = "agentfarm-scope/1"
+
+def load_scope_file(path: Any, *, report: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+    """读 `<journal>-scope.json`；schema 不符 / JSON 坏 / 条目字段类型错 ⇒ 整份丢弃并回填 report。"""
+
+def save_scope_file(path: Any, zones: Mapping[str, Mapping[str, Any]], *,
+                    journal_stem: str = "", report: dict[str, Any] | None = None) -> None:
+    """原子写：tmp = p.with_name(p.name + '.tmp') → write_text(json) → tmp.replace(p)。"""
+```
+
+### 7.2 `brain/agentfarm/longrun.py`（13 处）
+
+**L1 · 常量**（顶部，`JUSTIFIED_END_REASONS` `:317` 附近）：
+
+```python
+SCOPE_SHED_MAX_FRACTION = 0.34   # 全 run 累计认输格上限（× 农场可作业格数）
+SCOPE_SHED_MAX_PER_DAY = 1       # 一天最多认输 1 个田区
+SCOPE_SCHEMA = "agentfarm-scope/1"
+```
+
+**L2 · `LongRun.__init__` 状态**（紧跟 `self.capacity_capped_noted` 之后）：
+
+```python
+self.shed_zones: dict[str, dict[str, Any]] = {}            # zone -> {since_day, tiles, live_crops_at_shed, reason}
+self.shed_zone_tiles: dict[str, set[tuple[int, int]]] = {}  # zone -> 格集合（目标池/守卫排除用）
+self.scope_shed_today: dict[str, Any] | None = None
+self.scope_shed_tiles_today: int = 0
+self.scope_cap_refused_today: bool = False
+self._scope_path = self._derive_scope_path(self.journal_path)
+```
+
+`_run_day` 每日重置（与 `budget_today`/`capacity_capped_noted` 同一处）：`scope_shed_today=None`、`scope_shed_tiles_today=0`、`scope_cap_refused_today=False`。
+**不重置** `shed_zones`/`shed_zone_tiles`（跨日粘，见 L6 释放）。
+
+**L3 · `@staticmethod _derive_scope_path(journal_path: Path | None) -> Path | None`**（照抄 `_derive_lessons_path:944`）：
+`logs/run9.jsonl` → `logs/run9-scope.json`；`journal_path is None` ⇒ `None`。
+
+**L4 · `_scope_load(self) -> None`**（镜像 `_lessons_load:2507`，在 `__init__` 末尾/`_prepare` 调一次）：
+读 `load_scope_file`；成功 ⇒ 填 `shed_zones` + 逐区用 `_scope_tiles_for_zone` 重算 `shed_zone_tiles`，journal `scope_loaded{path, zones}`；
+损坏/被外部改写 ⇒ 全丢 + journal `scope_rejected{path, reason}`（**绝不让外部文件决定判定**）。
+
+**L5 · `_scope_tiles_for_zone(self, obs, zone) -> set[tuple[int,int]]`**：
+`zone.bounds`（闭区间）∩ 当天观测里的农场格（`location.tiles[]`/`tillable[]`/作物格）；取不到观测 ⇒ 退回整矩形。
+用途：目标池排除 + `work_reasons` 计数扣减 + 持久层的 `tiles` 数。
+
+**L6 · `_release_scope_if_converged(self, obs, rep) -> None`**（**日初**调用，位置：`_run_day` 里 `self.budget_today = self._stamina_budget(obs)` 之后）：
+
+```python
+budget = self.budget_today or {}
+if budget.get("basis") != "farm" or not self.shed_zones:
+    return
+cap, live = budget.get("water_capacity"), budget.get("live_crops")
+if isinstance(cap, int) and isinstance(live, int) and live <= cap:
+    for name in list(self.shed_zones):
+        self._release_zone(name, "no_deficit", rep)      # 全释放
+else:
+    for name in list(self.shed_zones):
+        if self._zone_live_crops(obs, name) == 0:
+            self._release_zone(name, "no_live_crops", rep)   # 逐区
+```
+
+`_release_zone(self, name, reason, rep) -> None`：`pop` 两个字典 + journal `scope_released{zone, reason, tiles}`；
+集合真变化时调 `_scope_flush()`。`_zone_live_crops(self, obs, name) -> int`：该区 bounds ∩ 观测里的作物格数。
+
+**L7 · `_shed_scope(self, obs, rep, zone_name) -> str`**（`reduce_scope` 的执行体；分支顺序**必须**如下）：
+
+1. `zones = self._zones(obs)`；按 `name` 匹配不到 ⇒ `scope_shed_refused{zone, reason:"unknown_zone"}` ⇒ `"refused"`。
+2. `budget = self.budget_today or self._stamina_budget(obs)`；`basis != "farm"` ⇒ `reason:"unknown_basis"`；`water_deficit` 不是 `int > 0` ⇒ `reason:"no_deficit"`；两者都 `"refused"`（**fail-closed**）。
+3. `scope_shed_today is not None` ⇒ `reason:"already_today"` ⇒ `"refused"`（一天 1 区）。
+4. **先收成熟**：`got = self._harvest_zone(obs, rep, zone)`（L8；收多收少都继续，入账）。
+5. `tiles = self._scope_tiles_for_zone(obs, zone)`；cap 检查
+   `self._shed_total_tiles() + len(tiles) > SCOPE_SHED_MAX_FRACTION * self._actionable_tiles(obs)`
+   ⇒ `scope_cap_refused_today=True` + `scope_shed_refused{reason:"cap", visited, cap, tiles}` ⇒ `"refused"`。
+6. 入账：`shed_zones[zone.name]={since_day: rep.day_key, tiles: len(tiles), live_crops_at_shed: budget["live_crops"], reason: ...}`；
+   `shed_zone_tiles[zone.name]=tiles`；`scope_shed_today={...}`；`scope_shed_tiles_today=len(tiles)`；`self._actions += 1`；
+   journal **`scope_shed{zone, tiles, live_crops, water_capacity, deficit, basis, reason, sticky:True}`**；
+   `rep.scope_shed = {...}` / `rep.scope_shed_tiles = len(tiles)`；`self._scope_flush()` ⇒ 返回 `"shed"`。
+
+**L8 · `_harvest_zone(self, obs, rep, zone) -> int`**（认输前的唯一"真减活"动作，**一轮有界**）：
+`plot = {"anchor": [x0, y0], "tiles": sorted(tiles), "zone": zone.name, "label": zone.label}`；
+`targets = self._stage_tiles("harvest", obs, plot)`；空 ⇒ `0`；
+否则 `res = self.worker.run_stage("harvest", targets[:self.per_stage_tiles], min_stamina=self.min_stamina, max_steps=self.per_stage_tiles)`，
+再走既有三条记账：`self._actions += len(res.steps)` → `self._count_attempts(res.steps)` → `self._mark_blocked(obs, self._snap(), res.steps, rep)`；
+返回 `sum(1 for s in res.steps if s.ok)`。**不追第二轮**（认输当天刻意不多烧体力）。
+
+**L9 · 排除点（全部用 `shed = self._shed_tile_set()`；`_shed_tile_set()` = 各区集合的并集）**：
+
+| 函数 | 行号 | 改法 |
+|---|---|---|
+| `_stage_tiles` | `:2671` | 四个池子（`clear_area`/`till_area`/`plant_area`/`water_area`）**都**过滤 `t not in shed` |
+| `_plot_has_work` | `:2137` | `tiles` 全在 `shed` ⇒ `return False` |
+| `_pending_work` | `:2932` | 过滤 `shed`（它是 `_resume_plot`/`_work_spot` 的输入，不剔除会被走回去） |
+| `work_reasons` | `:2819` | 窗口两条作物理由按 `not in shed` 重数；farm 口径两条减 `len(shed)`（`max(0, …)`） |
+| `sleep_guard` | `:3214` | `unwatered` 分支与 farm 口径分支同上扣减；**扣完没有任何理由且认输集合非空** ⇒ `return True, "scope_shed", "剩下的活都在已认输的田区（…，N 格）：今天主动不做、如实不 VERIFIED"` |
+| `_leftover` | `:2767` | **一个字不改**（认输格留在会计里 ⇒ `plot_pending`/`assigned_undone` 照旧） |
+| `_resume_plot` / `_work_spot_plot` | `:2249` / `:2221` | 跳过 `shed` 格（与 `_pending_work` 同源） |
+| `leftover_targets` 记账处 | `_step_stage` | 不把 `shed` 格记进去（否则当晚/次日被"复活"） |
+
+**L10 · `_verify_intents`（`:4519`）新增 `reduce_scope` 分支**：
+`zone` 名在**当轮** `self._zones(obs)` 里真实存在 且 `self.budget_today.get("water_deficit")` 是 `int > 0`
+且 `basis == "farm"` 且 `self.scope_shed_today is None` ⇒ `keep`；否则 `cancel` 并在 verdict 里写明是哪一条不满足。
+
+**L11 · `_execute`（`:4636`）新增分派**：`elif intent.task == "reduce_scope": self._shed_scope(obs, rep, intent.target)`（成功/拒绝都进 `rep.outcomes`，沿用既有记账）。
+
+**L12 · `DayReport`（`:389`）** 新增 `scope_shed: dict[str, Any] = field(default_factory=dict)` 与 `scope_shed_tiles: int = 0`，并进 `as_dict()`。
+**`checks`（`:5556`+）一个键都不加**（红线）。
+
+**L13 · 注入点**（`_plot_brief` `:2275`）：在既有 `replace(brief, counts=…)`/`sellable` 之外，把
+`live_crops`/`water_capacity`/`water_deficit`/`area_facts` 一起 `replace` 进去；
+`water_capacity = int((max_stamina - PATH_STAMINA_ALLOWANCE) // STAMINA_COST_WATER)`、
+`water_deficit = max(0, live_crops - water_capacity)`，**数值一律取自 `_stamina_budget()`**（只加两个派生量，别抄第二份公式）。
+
+### 7.3 事件 / 字段清单（与 §4.2 一致，落地后按此报 Lead 转 analyzer 桶卡）
+
+- 新增 journal 事件：`scope_shed`、`scope_shed_refused`、`scope_released`、`scope_saved`（可选 info）、`scope_save_failed`、`scope_rejected`、`scope_loaded`。
+- `day_end` 新增子字段（info）：`scope_shed`（dict）、`scope_shed_tiles`（int）。
+- `Brief` 新增字段（进提示词）：`live_crops`/`water_capacity`/`water_deficit`/`area_facts`。
+- 持久层：`<journal>-scope.json`（schema `agentfarm-scope/1`）。
+- **不改** `checks`、`JUSTIFIED_END_REASONS`、`unreachable_exempt`/`refused_exempt`/`bound_basis`、`_leftover` 语义。
+
+### 7.4 落地顺序（5 步，每步独立跑绿；同卡内顺序提交或一次提交皆可，但每步都要有对应用例）
+
+1. **P1/P2**（planner 字段 + `base_lines`）：只加字段与渲染，`from_observe` 恒 `None` ⇒ 老用例应全绿。
+2. **P5**（`load_scope_file`/`save_scope_file`）+ 单测：round-trip、坏 JSON/schema 拒收、原子写（tmp 不残留）。
+3. **P3/P4 + L13**（意图 + 触发 + 注入）：假 `Brief` 造 `water_deficit>0` ⇒ 确认 `deterministic_plan` 出 `reduce_scope`；`None`/`0`/单区 ⇒ 不出。
+4. **L1/L2/L3/L4/L5/L6/L9**（状态、路径、载入写盘、释放、排除点）：跑 §5.1 的"目标池/守卫/释放"用例。
+5. **L7/L8/L10/L11/L12**（执行体、收成熟、意图校验、分派、`DayReport`）：跑端到端 + 变异。
+
+### 7.5 风险与回退点
+
+- **释放必须发生在日初**（`budget_today` 刚算出来时），否则当天"守卫口径"与"预算口径"会不一致。
+- `_harvest_zone` 会经 `_mark_blocked` 把该区当天没收到成的格封格 —— 与"认输区不再产生理由"一致，但**不要**写进 `leftover_targets`。
+- `area_facts` 缺失（`_zones` 空、窗口看不到农场）⇒ **不认输**（与 `basis != "farm"` 同一条 fail-closed）。
+- `_shed_tile_set()` 每次调用做集合合并；区数是个位数 ⇒ 可接受；若要缓存，缓存键用 `shed_zone_tiles` 的版本计数，**不要**拿 `obs` 当键。
+- 若第 4 步发现"排除 `_stage_tiles` 后守卫仍抱怨"，先查 `work_reasons` 的 farm 口径两条是否漏扣 —— 这正是 task-124/163 的复发点。
