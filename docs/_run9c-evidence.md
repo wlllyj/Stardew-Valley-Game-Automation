@@ -124,7 +124,7 @@ python tools\start-detached-longrun.py --days 3 --size 5 --max-minutes 150 --max
 - LLM：`复盘 5 次、notes 15 条（403 字；被拒 0 条、截断 0 次）`；`教训库 total 4 条（上限 20；本日新增 6 / 淘汰 6）`；`决策: 52 次（decisions_llm=21，其中模型产出 decisions_llm_used=21，无兜底）`；边界 `(none)=31 / new_day=4 / task_kind_change=17`
 - 模态：`打断 2 次（信息项）`；`必须人工介入（红）0 条`；`退出码: 0；有红 0 条`
 
-### 4.3 `scratch\run9-lead-check.py`（两侧参数显式传入）⇒ **rc=1**
+### 4.3 `scratch\run9-lead-check.py`（两侧参数显式传入）⇒ 修正前 **rc=1** / 修正后 **rc=0**
 
 - `--journal logs\longrun-3day-llm-run9c.jsonl --snapshots scratch\run9c-external-snapshots.jsonl --smapi logs\run9c-smapi-window.txt --days 3`
 - [1] 跨日链：`合计 跨日 5 次，其中恰好 +1 的 5/5`（含 `(1,summer,22) → (1,summer,23) +1 ✅ ended_by=sleep`）
@@ -135,6 +135,7 @@ python tools\start-detached-longrun.py --days 3 --size 5 --max-minutes 150 --max
 - [6] `finish: code=0 streak=3 actions=513 minutes=28.03 no_unmet_stages=False`
 - `发现问题：❌ SMAPI 里 before save(5) != Save called(6)` / `❌ 有 save(6) 无 NewDay(5) —— 保存没有对应的跨日`
   ⇒ 两条都因 §3.3 的 **L16 假阳性**；修正后计数为 `5 / 5 / 5 / 5`，**无真实缺口**。
+- **修正后复跑（Lead 提交 `13fa690` 的版本，00:25 后）**：⇒ **rc=0**，`合计 跨日 5 次，其中恰好 +1 的 5/5`、`结论：达标 ✅`、**无任何 ❌**（落 `logs\run9c-lead-check.txt`，本文件上文保留的是修正前的原始输出，两条 ❌ 不删改）。
 
 ## §5 判据逐条对账
 
@@ -225,3 +226,5 @@ python tools\start-detached-longrun.py --days 3 --size 5 --max-minutes 150 --max
 9. 本跑未覆盖：成熟作物收获、死苗（`farm.deadCrops=0` 全程）、夜间剧情事件（`eventUp=0`）、`ShipSkill` 整叠限制（task-55 缺口）。
 10. 游戏**未退出**（收尾后游戏进程仍活着，PID 8856 / 桥 0.7.30），按纪律等 Lead 指令再 `tools\stop-game.py`。
 11. 本文件与 `logs\run9c-*`、`scratch\run9c-*` 的所有读数均为**观测/日志原文**；Mod 回执只作旁证（`final` 字段明确区分），未用回执当证据。
+12. **`save_called` 判别式与 Lead 侧口径已对齐**：Lead 在 `scratch\run9-lead-check.py` 里修掉了同一个假阳性（提交 **`13fa690`**），修正规则 = **有 `[HH:MM:SS LEVEL CHANNEL]` 前缀 且 不含 ` by AgentFarm ` / `| v0.`**（插件描述行标记）——与本文件 §3.3 的规则逐字一致；修后本跑复核器 **rc=0 / 无 ❌**，与 `verify-run3.py` 同向。§4.3 同时保留修正前 `rc=1` 的原始输出，**不删改**。
+13. **优雅退出（2026-10-17 00:27:52）**：`python tools\stop-game.py` ⇒ **exit 0**、`✅ 游戏已退出（原 pids=[8856]）`；四项核对：进程数 **0**、`bridge.json` **已删除**、17890 **无 LISTENING**（仅 2 条 TIME_WAIT）、存档四条**逐字未变**（`Wahaha_450799035` 3860602 B / `2026-10-17 00:16:44.786`、`SaveGameInfo` 28884 B / `00:16:44.788`、`_old` 3826574 B / `00:08:27.843`、`SaveGameInfo_old` 28709 B / `00:08:27.844`）；SMAPI 尾 `00:27:52 Disconnected: ClosedGame → Disposing... → 已删除发现文件 …\AgentFarm\bridge.json → Disposing the content coordinator`，无 Event 1000/1001。
