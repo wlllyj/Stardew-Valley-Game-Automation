@@ -36,7 +36,12 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.27"   # v0.7.27：经济闭环第一步（卖盈余材料换种子钱，K=10 保底 + 三闸门）
+MOD_VERSION_EXPECTED = "0.7.28"   # v0.7.28：run8 复盘两病灶（经济空格死锁 `no_space`/腾格 sell、
+                                 # 早晨 0 农场动作不许收工 `slept_without_work`）+ 场外浇水额度
+                                 # （`water_far_skipped{not_on_farm}` 不扣额度）+ LLM 决策演进
+                                 # （recent_decisions / review_llm notes / `<journal>-lessons.json`
+                                 # 跨日教训库：src 来源标记 + trusted 优先 + 防洗白 + 拒收留痕）。
+                                 # v0.7.27：经济闭环第一步（卖盈余材料换种子钱，K=10 保底 + 三闸门）
                                  # + 枯死作物不再浇水（Mod 把"干"拆成活苗 `dryCrops`/`dryTiles`
                                  # 与死苗 `dryDeadCrops`；脑侧 `water()` 遇死苗 `skipped`、
                                  # `clear_dead` 提到浇水之前、认输格不再当"有活"）。
