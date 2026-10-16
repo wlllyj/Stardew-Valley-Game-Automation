@@ -3,7 +3,21 @@
 > 本文是**收工快照**，只写"明天开工要用的东西"。`docs\_resume-prompt.md` 是 P2 时代的三步恢复法（仍然有效：单测 → `deploy-mod.py` → `run-plot.py`），但它的状态表已过期，以本文为准。
 > 目标不变：**P3 ⑥ —— 端到端自主完成「清障 → 开垦 → 播种 → 浇水」，连续 3 个游戏日无人工介入**（判据一律用 `observe?detail=full` 的 `tiles[]`/`inventory[]`/`money` 差分，回执不算证据）。
 
-## 0h. 2026-10-15 深夜 · **0.7.28 = 「run8 两病灶修复」+「LLM 决策复盘/演进」两批一起冻结**（最新，与下文冲突以本节为准）
+## 0i. 2026-10-16 晚 · **0.7.28 第二批（LLM 复盘/演进）已全部交付，只等两张验收卡**
+
+**已交付并 Lead 独立复核（代码级 PASS）**：**task-58** `ae88b72`（`Brief.recent_decisions` 骨架）→ **task-59** `fe01a29`（night 复盘一次独立调用，独立预算 512、失败无害、禁坐标）→ **task-82** `d2cc09b`（决策→结果 join + 跨日教训库 `<journal>-lessons.json`，路径由 `--journal` 推导、**无新命令行开关**）。我亲跑：`tests.test_planner tests.test_longrun` = **265 OK**；全量 = **`Ran 657 / failures=2`**，两条都是 analyzer 未收 `review_llm`/`review_llm_failed`/`lessons*`（⇒ task-111）。
+
+**Lead 的两条裁定**：①决策史里**只写具名田区 `where=field_ne`，不写失败格坐标**（我的 GO 覆盖卡面旧措辞），`DECISION_LINE_MAX_CHARS 140→200`；②run9→run10 的教训库交接 = **显式拷贝** `logs\longrun-3day-llm-run9-lessons.json` ⇒ `…-run10-lessons.json`（记 SHA256/时刻，写进 `_run10-evidence.md`），两次 run 的 journal 各自独立 —— 见 `docs/_release-0.7.28.md` §3。
+
+**在制（放行条件）**：**task-111**（log-analyst，analyzer 收本批事件/字段；**全量必须 0 红**）+ **task-112**（deputy-lead，对抗验收：**最高优先级 = 零判定影响**，另查只认客观证据/失败无害/有界性/坐标拒收）。两张都 PASS/PASS-WITH-NITS 后我才走冻结。
+
+**Lead 侧新工具（已提交）**：`tools/compare-runs.py` + `tests/test_compare_runs.py`（run A/run B 演进对照，N6；对"教训写了但根本没送进提示词"单独报警，**不**把它当成"未观察到演进"）；`tools/start-detached-longrun.py` 的 sidecar 现在记录子进程 `argv` 原文 + `boundary_llm=True`（用于证明 run9/run10 只差 journal 路径）。
+
+**当前读数**：HEAD 见 `git log -1`；全量 657（2 红，属 task-111）；**Mod 0.7.27 已装机、0.7.28 未 bump/未装机**；游戏未运行、桥不在；存档 `Wahaha_450799035` = **夏 13 日 06:00 / 钱 188g / 背包满 / 种子 `[]` / 作物 6 格**（run9 **不做操作员预置**）。
+
+**下一步顺序**：task-111 零红 → task-112 PASS → 冻结九步（§2，`tools/_note-0728.txt` 已补写两批）→ 装机/preflight → **task-105 起 run9**（run A）→ Lead 拷贝教训库 → **run10**（run B，N6 对照）。
+
+## 0h. 2026-10-15 深夜 · **0.7.28 = 「run8 两病灶修复」+「LLM 决策复盘/演进」两批一起冻结**（与下文冲突以 0i/本节为准）
 
 用户节奏：`User said (m12478)`：「准备停下来吧，明天再搞」；随后 `User said (m12538)` 问「大模型的决策复盘进化机制有了吗？」、`User said (m12553)`：「总之要让模型再玩这个游戏的时候具备决策演进的能力，你自己定吧」、`User said (m12569)`：「定好之后排上任务，不用开始，明天再做」。⇒ Lead 决定：**把演进机制并入 0.7.28**（run9 当"run A 积累"、run10 当"run B 注入 + 对照验收"）。**今晚不动手**：卡已排好、无 owner、无人在跑。goal 已 `paused`。
 
