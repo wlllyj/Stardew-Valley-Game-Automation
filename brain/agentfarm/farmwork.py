@@ -253,6 +253,9 @@ SCYTHE_HINTS = ("scythe", "镰刀")
 #: 【task-158】浇水优先的体力预算：**脑侧规划估计**（每格真机消耗以游戏为准；这里只回答
 #: "今天还能干多少"）。取值刻意偏保守 —— 宁可早停手，也不要把体力花光、留下没浇的作物
 #: （run9d summer 27/28、fall 1 的 `stamina:体力 0 < 12` + `dry 17/79/140` 就是这个病灶）。
+#: 【task-161】这些是**未标定估算**：先用真机 `stamina_calibration`（阶段级
+#: `stamina_before/after/spent` + `day_end.stamina_calibration`）标定，**替换前不许**直接改成
+#: "看着像真的"的数字（改常量必须单独一步并过对抗验收）。
 STAMINA_COST_WATER = 2.0        # 每格浇一次水
 STAMINA_COST_TILL = 5.0         # 每格锄一次
 STAMINA_COST_CLEAR = 2.0        # 每格清障/割草一次

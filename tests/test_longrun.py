@@ -7922,6 +7922,16 @@ class TestTask158StaminaBudget(unittest.TestCase):
       * m158a（`_budget_defer_reason` 恒返回 ""，即去掉预备线闸门）红 3；
       * m158b（去掉 `plant_area` 的"还有没浇活苗 ⇒ 不许播种"）红 1；
       * m158c（去掉 `capacity` 上限）红 1。
+
+    【Lead m13917 追加不变量】另三条（`scratch/_t158b_mutate.py`，基线 **10/10** 绿）：
+      * `harvest`/`clear_dead` **永不**被预算延后（超载时的唯一恢复路径是"收获 + 不再播种 +
+        clear_dead"让作物数单调下降；它们被延后 = 作物数永远降不下来 ⇒ bug）；
+      * 超载日（`reserve > max_stamina`）`capacity == 0` 且 `deferred_by_budget` 点名的
+        恰好是 clear/till/plant 三类；
+      * 预算取值跟 `farm` 块（窗口口径冲突时不用窗口的 0），farm 缺失/`complete != true`
+        ⇒ `basis="conservative"`。
+      变异：**m158d**（连 harvest/clear_dead 一起延后）红 2、**m158a** 红 4、
+      **m158e**（`crops` 恒取 0，等于用窗口口径）红 6。
     """
 
     @staticmethod
@@ -8029,6 +8039,70 @@ class TestTask158StaminaBudget(unittest.TestCase):
             self.assertIn(key, rep.stamina_budget)
         self.assertEqual(rep.stamina_budget["dry"], 3)
         self.assertEqual(rep.stamina_budget["live_crops"], 3)
+
+    # ---- Lead m13917 加钉的三条不变量 ----
+    def _overloaded_world(self, *, dead: bool = False) -> FakeWorld:
+        """超载日：`farm.crops` 150 格 × 2 体力 > 满体力 270 ⇒ `reserve > max_stamina`。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0, stamina=20.0)
+        w.dirt = {(60 + i, 10) for i in range(4)}
+        w.crops = {(60, 10): {"watered": True, "ripe": True},
+                   (61, 10): {"watered": False, "ripe": False},
+                   (62, 10): {"watered": True, "ripe": False, "dead": bool(dead)}}
+        w.farm = {"loaded": True, "complete": True, "crops": 150, "dryCrops": 150,
+                  "ripeCrops": 1, "deadCrops": 1 if dead else 0, "dryDeadCrops": 0,
+                  "dryTiles": [], "dryTilesTruncated": False, "unwateredCrops": 150,
+                  "hoeDirt": 200, "emptyDirt": 50}
+        return w
+
+    def test_harvest_and_clear_dead_are_never_deferred(self):
+        """恢复路径的不变量：预算闸门**只**拦 clear/till/plant —— 收获与清死苗永不被延后。
+
+        （Lead m13917 裁定：超载时唯一正确的恢复路径是"收获 + 不再播种 + clear_dead"
+        让作物数单调下降；若 `harvest`/`clear_dead` 也被延后，作物数就永远降不下来 ⇒ bug。）
+        """
+        w = self._overloaded_world(dead=True)
+        run = self._run_with(w)
+        run.budget_today = run._stamina_budget(w.obs())
+        self.assertGreater(run.budget_today["water_reserve"], w.max_stamina)   # 确实超载
+        for task in ("harvest", "clear_dead"):
+            self.assertEqual(run._budget_defer_reason(task, w.obs()), "",
+                             f"{task} 不该被预算延后")
+            self.assertTrue(run._stage_tiles(task, w.obs(), self._plot(*sorted(w.dirt))),
+                            f"{task} 在超载日仍必须有目标")
+
+    def test_overloaded_day_defers_clear_till_plant_only(self):
+        """超载日：`capacity == 0`，且 `deferred_by_budget` 点名的恰好是 clear/till/plant。"""
+        w = self._overloaded_world()
+        run = self._run_with(w)
+        run.budget_today = run._stamina_budget(w.obs())
+        plot = self._plot(*sorted(w.dirt))
+        self.assertEqual(run.budget_today["capacity"], 0)
+        for task in ("clear_area", "till_area", "plant_area"):
+            self.assertEqual(run._stage_tiles(task, w.obs(), plot), [], f"{task} 该被拦")
+        names = {e["task"] for e in self._events(run, "deferred_by_budget")}
+        self.assertEqual(names, {"clear_area", "till_area", "plant_area"})
+        self.assertTrue(run.budget_today["deferred_by_budget"])
+        self.assertEqual(sorted(run.budget_today["deferred"]),
+                         ["clear_area", "plant_area", "till_area"])
+
+    def test_budget_prefers_the_farm_block_over_the_window(self):
+        """`day_start` 的窗口口径与 `farm` 口径冲突 ⇒ 预算取值必须跟 `farm` 块。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0, stamina=200.0)     # 窗口里一格作物都没有
+        w.farm = {"loaded": True, "complete": True, "crops": 100, "dryCrops": 100,
+                  "ripeCrops": 0, "deadCrops": 0, "dryDeadCrops": 0, "dryTiles": [],
+                  "dryTilesTruncated": False, "unwateredCrops": 100,
+                  "hoeDirt": 120, "emptyDirt": 20}
+        run = self._run_with(w)
+        b = run._stamina_budget(w.obs())
+        self.assertEqual(b["basis"], "farm")
+        self.assertEqual(b["live_crops"], 100)          # 不是窗口的 0
+        self.assertEqual(b["dry"], 100)
+        self.assertEqual(b["water_reserve"], 100 * 2.0 + 12.0)
+        self.assertEqual(b["capacity"], int((270.0 - 212.0 - 5.0) // 2.0))
+        # farm 块缺失/`complete != true` ⇒ conservative（全留给浇水）
+        w2 = FakeWorld(weeds=0, seeds=0, money=0, stamina=200.0)
+        w2.farm = {"loaded": True, "complete": False}
+        self.assertEqual(self._run_with(w2)._stamina_budget(w2.obs())["basis"], "conservative")
 
 
 if __name__ == "__main__":  # pragma: no cover
