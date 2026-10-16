@@ -219,19 +219,27 @@ namespace AgentFarm.Bridge
                             }
                         }
 
-                        bool acted = false;
+                        bool handled = false;
                         string err = null;
+                        // 【task-176 必修 ③】`acted` **不许自述成功**：`checkAction` 的返回值只是
+                        // "这一格被认领了"，真没真做事必须以**本调用内可独立观测的变化**为准
+                        // （目标格状态前后对比）。task-173 真机事故：回执 `{acted:true, ok:true}`
+                        // 但 `worldSeq 51→51`、作物还在、背包 +0、存档逐字节未变。
+                        string sigBefore = TileSig(tx, ty);
                         try
                         {
-                            acted = Game1.currentLocation.checkAction(
+                            handled = Game1.currentLocation.checkAction(
                                 new xTile.Dimensions.Location(tx, ty), Game1.viewport, who);
                         }
                         catch (Exception ex) { err = ex.GetType().Name + ": " + ex.Message; }
+                        string sigAfter = TileSig(tx, ty);
 
-                        // 【task-170 回执诚实化】`checkAction` 的返回值就是"这一格有没有可执行的动作/门"。
-                        // 旧实现只看有没有抛异常（`Ok = err == null`）⇒ **游戏拒绝（false）也报 ok**，
-                        // `acted` 只躺在 reason 文本里（run A/B 的"回执谎报"第三次，`docs\_il-harvest-path.md`）。
-                        // 现在 `acted=false` ⇒ `ok=false` + `status="no_action"`，且 `acted` 是机器可读字段。
+                        bool observedChange = sigBefore != null && sigAfter != null
+                                              && !string.Equals(sigBefore, sigAfter, StringComparison.Ordinal);
+                        // 判据：必须**看到格子变了**才算 acted。`worldSeq` 前进但格没变 ⇒ 仍 false；
+                        // 拿不准（快照失败）⇒ false + no_action（宁可让人来核，也不许自述成功）。
+                        bool acted = err == null && observedChange;
+
                         return new ExecResponse
                         {
                             Ok = err == null && acted,
@@ -241,10 +249,13 @@ namespace AgentFarm.Bridge
                             Acted = acted,
                             Reason = err == null
                                 ? (acted
-                                    ? $"已在 ({tx},{ty}) 调游戏自己的 checkAction（返回 true：这一格有可执行的动作/门）。"
+                                    ? $"已在 ({tx},{ty}) 调游戏自己的 checkAction，且**观测到这一格变了**"
+                                      + $"（checkAction 返回 {handled}；前[{sigBefore}] → 后[{sigAfter}]）。"
                                       + "若这一格是门/建筑入口，传送由游戏自己发起（有淡出期，**以 observe 到的地点为准**）"
-                                    : $"({tx},{ty}) 上**没有**可执行的动作（checkAction 返回 false：这一格现在收不了/开不了）。"
-                                      + "回执如实回 failed，`acted=false`；请用 observe 复核这一格的真实状态。")
+                                    : $"({tx},{ty}) 这一格**没有任何可独立观测的变化**"
+                                      + $"（checkAction 返回 {handled}；前[{sigBefore ?? "快照失败"}] → 后[{sigAfter ?? "快照失败"}]）。"
+                                      + "`acted=false`、`status=\"no_action\"`、回执如实 failed；"
+                                      + "请用 observe 复核这一格的真实状态（镰刀类作物必须走 use_tool，不是 interact）。")
                                 : "checkAction 抛异常：" + err,
                             ElapsedMs = 0,
                             WorldSeqBefore = world.WorldSeq,
@@ -333,6 +344,62 @@ namespace AgentFarm.Bridge
                                + "dismiss_modal、load_save、quit_game、interact、use_tool、select_item、plant、sleep、buy、sell）",
                     };
             }
+        }
+
+        /// <summary>
+        /// 【task-176 必修 ③】目标格的**可观测签名**（`interact` 前后各取一次做对比）。
+        ///
+        /// 为什么要它：`checkAction` 的返回值只说明"这一格被认领了"，不能证明游戏真做了事。
+        /// task-173 真机事故 = 回执 `acted:true` 但 `worldSeq` 不动、作物还在、背包 +0、存档未变。
+        /// 所以 `acted` 必须以"本调用内这一格真的变了"为准。
+        ///
+        /// 签名覆盖：地面物体（`QualifiedItemId`+`Stack`）、地形特征类型、`HoeDirt` 的浇水态与
+        /// 作物（`indexOfHarvest`/`currentPhase`/`fullyGrown`/`dead`）、`Action` 属性、门。
+        /// **取不到 ⇒ null**（调用方据此判"拿不准"，不许当"没变"以外的任何结论）。
+        /// </summary>
+        private static string TileSig(int x, int y)
+        {
+            try
+            {
+                GameLocation loc = Game1.currentLocation;
+                if (loc == null) return null;
+                var v = new Vector2(x, y);
+                var sb = new System.Text.StringBuilder();
+
+                StardewValley.Object o;
+                if (loc.objects != null && loc.objects.TryGetValue(v, out o) && o != null)
+                    sb.Append("obj:").Append(o.QualifiedItemId ?? o.ItemId).Append('x').Append(o.Stack);
+
+                StardewValley.TerrainFeatures.TerrainFeature tf;
+                if (loc.terrainFeatures != null && loc.terrainFeatures.TryGetValue(v, out tf) && tf != null)
+                {
+                    sb.Append("|tf:").Append(tf.GetType().Name);
+                    var hd = tf as StardewValley.TerrainFeatures.HoeDirt;
+                    if (hd != null)
+                    {
+                        try { sb.Append(":watered=").Append(hd.state != null && hd.state.Value == 1); } catch { }
+                        var c = hd.crop;
+                        if (c != null)
+                        {
+                            try { sb.Append(":crop=").Append(c.indexOfHarvest != null ? c.indexOfHarvest.Value : -1); } catch { }
+                            try { sb.Append(":phase=").Append(c.currentPhase != null ? c.currentPhase.Value : -1); } catch { }
+                            try { sb.Append(":grown=").Append(c.fullyGrown != null && c.fullyGrown.Value); } catch { }
+                            try { sb.Append(":dead=").Append(c.dead != null && c.dead.Value); } catch { }
+                        }
+                    }
+                }
+
+                try
+                {
+                    if (loc.doesTileHaveProperty(x, y, "Action", "Back") != null) sb.Append("|action");
+                    if (loc.doesTileHaveProperty(x, y, "TouchAction", "Back") != null) sb.Append("|touch");
+                }
+                catch { }
+                try { if (loc.doors != null && loc.doors.ContainsKey(new Point(x, y))) sb.Append("|door"); } catch { }
+
+                return sb.ToString();
+            }
+            catch { return null; }
         }
 
         /// <summary>已知技能名（用于区分 unknown_skill 与 not_implemented）。</summary>

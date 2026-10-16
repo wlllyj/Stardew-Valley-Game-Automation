@@ -538,12 +538,36 @@ namespace AgentFarm.Bridge
         /// </summary>
         [JsonPropertyName("ready")] public bool? Ready { get; set; }
 
+        /// <summary>
+        /// 【task-176】**这个 `ready` 是谁给的**：`"game"` = 真的调用了游戏自己的
+        /// `HoeDirt.readyForHarvest()`；`"fields"` = 反射不可用、退回**与该方法 IL 逐条等价**的
+        /// 字段判据；`null` = 判不了（此时 `ready` 也是 null）。
+        ///
+        /// 为什么要落账：task-173 在真机上看到 `readyCrops == crops == 102`，但**分不清**
+        /// 那是"游戏真说全都能收"还是"我们的兜底判据把不能收的也判成能收" —— 没有来源标记，
+        /// 这条缺陷永远定不了案。**键必须总是输出**（null 也输出），所以显式关掉全局的
+        /// `WhenWritingNull`（见文件头 `DefaultIgnoreCondition`）。
+        /// </summary>
+        [JsonPropertyName("readySource")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+        public string ReadySource { get; set; }
+
         /// <summary>裸 `Crop.fullyGrown`（历史字段；**不要**拿它当"可收"判据）。</summary>
         [JsonPropertyName("fullyGrown")] public bool? FullyGrown { get; set; }
 
-        /// <summary>`Crop.HarvestMethod.ToString()`：`"Grab"` / `"Scythe"`；没有作物 ⇒ null。
-        /// `Scythe` ⇒ 只能走**工具路径**（`interact` 永远摘不到）。</summary>
-        [JsonPropertyName("harvestMethod")] public string HarvestMethod { get; set; }
+        /// <summary>
+        /// `Crop.GetHarvestMethod().ToString()`：`"Grab"` / `"Scythe"` / 其它；判不了 ⇒ **null**。
+        ///
+        /// 【task-176 必修 ①】入口是**公开方法 `Crop.GetHarvestMethod()`**（api-probe IL：
+        /// `GetData()` 为 null ⇒ `0`(Grab)，否则 `CropData.HarvestMethod`；调用者 =
+        /// `HoeDirt.performUseAction`/`performToolAction`）—— 旧实现按**字段名**读，1.6.15 上
+        /// 根本没这个字段 ⇒ 恒 null ⇒ `Scythe` 类作物被当成 `Grab` 走 `interact` ⇒ **永远摘不到**。
+        /// `Scythe` ⇒ 只能走**工具路径**（`interact` 永远摘不到）。
+        /// **键必须总是输出**（null 也输出，缺键 ≠ null —— 真机事故正是被"缺键"掩盖的）。
+        /// </summary>
+        [JsonPropertyName("harvestMethod")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+        public string HarvestMethod { get; set; }
 
         /// <summary>`Crop.currentPhase`（没有作物 / 读不到 ⇒ null）。</summary>
         [JsonPropertyName("currentPhase")] public int? CurrentPhase { get; set; }

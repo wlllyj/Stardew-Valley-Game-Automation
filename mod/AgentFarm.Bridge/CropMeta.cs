@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Reflection;
 using StardewValley;
+using StardewValley.GameData.Crops;
 using StardewValley.TerrainFeatures;
 
 namespace AgentFarm.Bridge
@@ -32,6 +33,13 @@ namespace AgentFarm.Bridge
     ///   2. 拿不到时退回**等价的字段判据**（上面那条 IL 原文），字段同样用反射读；
     ///   3. 任一判据缺项 ⇒ **null（判不了）**：绝不当 `false`（漏掉真能收的），更**绝不**当"可收"。
     ///
+    /// 【task-176 更正】
+    ///   * `harvestMethod` 的正确入口是**公开方法 `Crop.GetHarvestMethod()`**（不是字段 `HarvestMethod`）
+    ///     —— 旧写法恒 null，镰刀类作物因此永远走 `interact`、永远摘不到；
+    ///   * `Ready` 现在一并返回**来源**（`"game"` / `"fields"` / `null`），落进 `tiles[].readySource`：
+    ///     没有来源标记，就无法定案"到底是游戏说的、还是我们兜底猜的"（task-173 的 FAIL 正是这样被掩盖的）；
+    ///   * `"fields"` 只允许在**逐条等价**（上面 ①–④ + 全字段可读）时给出；否则 `(null, null)`。
+    ///
     /// 反射结果按"类型.成员名"缓存（`_memberCache`），每帧不重复查表。
     /// </summary>
     internal static class CropMeta
@@ -40,12 +48,41 @@ namespace AgentFarm.Bridge
         private static MethodInfo _readyMethod;
         private static bool _readyProbed;
 
-        /// <summary>`Crop.HarvestMethod`（枚举 `HarvestMethod`）的字符串形式：`"Grab"` / `"Scythe"`；
-        /// 没有作物 / 读不到 ⇒ null。</summary>
+        /// <summary>`Crop.GetHarvestMethod()`（枚举 `HarvestMethod`）的字符串形式：`"Grab"` / `"Scythe"`；
+        /// 没有作物 / 读不到 ⇒ **null**（判不了，绝不默认 `Grab`）。</summary>
+        ///
+        /// <remarks>
+        /// 【task-176 必修 ①】旧实现按**字段名** `HarvestMethod` 去读 ⇒ 1.6.15 上 `Crop` 根本没有这个
+        /// 字段/属性 ⇒ 恒 `null` ⇒ `harvest_tool()` 恒 `null` ⇒ 镰刀类作物永远走 `interact`，
+        /// 而 `HoeDirt.performUseAction` 的 grab 分支对 Scythe 类作物**永远摘不到**。
+        ///
+        /// 正确入口 = **公开方法 `Crop.GetHarvestMethod()`**（api-probe IL，`scratch\_t176_gethm.txt`）：
+        /// <code>
+        ///   CropData d = this.GetData();
+        ///   if (d == null) return 0;            // 0 = HarvestMethod.Grab
+        ///   return d.HarvestMethod;
+        /// </code>
+        /// `FIND|GetHarvestMethod` 的调用者正是 `HoeDirt.performUseAction` / `performToolAction`
+        /// （`scratch\_t176_find_gethm.txt`），与 `scratch\il-hv-4.txt` 的镰刀路径对得上。
+        /// 反射失败才退回 `GetData().HarvestMethod`；两条都不通 ⇒ null（键仍要输出，见 Contracts）。
+        /// </remarks>
         internal static string HarvestMethodOf(Crop crop)
         {
             if (crop == null) return null;
-            try { return ReadMember(crop, "HarvestMethod")?.ToString(); } catch { return null; }
+            try
+            {
+                // 【task-176 必修 ①】`Crop.GetHarvestMethod()` 是 **public 无参方法** ⇒ 直接调，
+                // 不反射（Lead 侧独立探针复核：`scratch\_lead_ghm.txt`，并确认
+                // `StardewValley.Crop.HarvestMethod` 字段/属性在 1.6.15 **根本不存在** ——
+                // 这才是旧实现恒 null 的原因，不是可见性问题）。
+                switch (crop.GetHarvestMethod())
+                {
+                    case HarvestMethod.Grab: return "Grab";      // 0
+                    case HarvestMethod.Scythe: return "Scythe";  // 1
+                    default: return ((int)crop.GetHarvestMethod()).ToString();  // 未知值照实写
+                }
+            }
+            catch { return null; }
         }
 
         /// <summary>`harvestMethod == Scythe` ⇒ 必须走**工具路径**（`HoeDirt.performToolAction`，
@@ -59,13 +96,21 @@ namespace AgentFarm.Bridge
             catch { return false; }
         }
 
-        /// <summary>作物是否**现在可收**（游戏口径）。`null` = 判不了（无作物 / 成员读不到）。</summary>
-        internal static bool? Ready(HoeDirt dirt, Crop crop)
+        /// <summary>作物是否**现在可收**（游戏口径），以及结论的来源。
+        /// `Value == null` = 判不了（无作物 / 成员读不到）；`Source` ∈ `"game"` / `"fields"` / `null`。</summary>
+        ///
+        /// <remarks>
+        /// 【task-176 必修 ②】来源必须落账：`"game"` = 真的调用了 `HoeDirt.readyForHarvest()`；
+        /// `"fields"` = 反射不可用、退回**与该方法 IL 逐条等价**的字段判据（见下方注释）；
+        /// `null` = 判不了。**绝不许**用"宽松"字段判据冒充实测 `true` —— 只有逐条等价才允许
+        /// 给 `"fields"` 结论，任一判据字段读不到就返回 `(null, null)`（fail-closed）。
+        /// </remarks>
+        internal static (bool? Value, string Source) Ready(HoeDirt dirt, Crop crop)
         {
-            if (dirt == null || crop == null) return null;
+            if (dirt == null || crop == null) return (null, null);
 
             bool? direct = InvokeReadyForHarvest(dirt);
-            if (direct != null) return direct;
+            if (direct != null) return (direct, "game");
 
             try
             {
@@ -77,16 +122,22 @@ namespace AgentFarm.Bridge
                 bool? forage = NetBoolOf(ReadMember(crop, "forageCrop"));
                 string which = NetValue(ReadMember(crop, "whichForageCrop")) as string;
 
-                if (fullyGrown == null || dayOfPhase == null || phase == null || phases == null || dead == null)
-                    return null;                                  // 判据缺项 ⇒ 判不了（绝不猜）
+                // 等价性依据：HoeDirt.readyForHarvest() 的 IL（`scratch\_t176_ready.txt`）
+                //   crop==null ⇒ false；fullyGrown && dayOfCurrentPhase>0 ⇒ false；
+                //   currentPhase < phaseDays.Count-1 ⇒ false；dead ⇒ false；
+                //   !forageCrop ⇒ true；否则 whichForageCrop != "2"
+                // 少任何一项就无法证明等价 ⇒ 判不了（不许给结论）。
+                if (fullyGrown == null || dayOfPhase == null || phase == null || phases == null
+                    || dead == null || forage == null)
+                    return (null, null);
 
-                if (fullyGrown.Value && dayOfPhase.Value > 0) return false;   // ① 复收冷却
-                if (phase.Value < phases.Value - 1) return false;             // ② 阶段没走完
-                if (dead.Value) return false;                                 // ③ 枯死
-                if (forage == true && which == "2") return false;             // ④ 采集作物形态 2
-                return true;
+                if (fullyGrown.Value && dayOfPhase.Value > 0) return (false, "fields");   // ① 复收冷却
+                if (phase.Value < phases.Value - 1) return (false, "fields");             // ② 阶段没走完
+                if (dead.Value) return (false, "fields");                                 // ③ 枯死
+                if (forage.Value && which == "2") return (false, "fields");               // ④ 采集形态 2
+                return (true, "fields");
             }
-            catch { return null; }
+            catch { return (null, null); }
         }
 
         /// <summary>把 TileView 上的作物形态字段一次填齐（读不到就留 null）。</summary>
@@ -124,7 +175,8 @@ namespace AgentFarm.Bridge
             return null;
         }
 
-        private static bool? InvokeBool(object obj, string method)
+        /// <summary>无参实例方法调用（public/non-public 都试）；拿不到返回值 ⇒ null。</summary>
+        private static object InvokeMethod(object obj, string method)
         {
             if (obj == null) return null;
             try
@@ -132,11 +184,15 @@ namespace AgentFarm.Bridge
                 MethodInfo mi = obj.GetType().GetMethod(
                     method, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
                     null, Type.EmptyTypes, null);
-                object v = mi?.Invoke(obj, null);
-                if (v is bool b) return b;
+                return mi?.Invoke(obj, null);
             }
-            catch { }
-            return null;
+            catch { return null; }
+        }
+
+        private static bool? InvokeBool(object obj, string method)
+        {
+            object v = InvokeMethod(obj, method);
+            return v is bool b ? (bool?)b : null;
         }
 
         private static object ReadMember(object obj, string name)

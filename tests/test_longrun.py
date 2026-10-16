@@ -34,8 +34,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "brain"))
 from agentfarm.bridge import MOD_VERSION_EXPECTED, BridgeError  # noqa: E402
 from agentfarm.llm import LlmError  # noqa: E402
 from agentfarm.farmwork import (  # noqa: E402
-    MAX_CLEAR_SWINGS, FarmWorker, STAGE_ACTION, StepResult, StageResult, player_free_slots,
-    seed_items,
+    MAX_CLEAR_SWINGS, FarmWorker, STAGE_ACTION, StepResult, StageResult, harvest_tool,
+    player_free_slots, seed_items, tile_ready,
 )
 from agentfarm.longrun import (  # noqa: E402
     DEFAULT_LLM_MAX_TOKENS, ENDED_BY_EVENT, ENDED_BY_MODAL, FAR_DRY_MAX_TRIES,
@@ -94,6 +94,9 @@ class FakeWorld:
         #: 【task-170】`True` ⇒ 观测里**不发** `tiles[].ready`（模拟 <0.7.32 的旧 Mod）：
         #: 用来逼出"缺新字段 ⇒ fail-closed（不摘、不生成 harvest 目标）"。
         self.drop_ready_fields = False
+        #: 【task-176】`True` ⇒ 观测里**不发** `tiles[].harvestMethod` 键（复刻 0.7.33 的实机缺陷：
+        #: 该键整键缺失而不是 null ⇒ 脑侧把镰刀类作物误当 Grab、走 interact 永远摘不到）。
+        self.drop_harvest_method = False
         self.player_tile = [62, 14]
         self.is_in_bed = True
         #: 当前地点名 —— `FarmWorker.ensure_location/sleep` 会读它（task-15 让真 `FarmWorker`
@@ -182,11 +185,20 @@ class FakeWorld:
                 # `{"ripe": True, "ready": False}`；`drop_ready_fields=True` 模拟旧 Mod（缺字段）。
                 tv.update({"crop": "24", "ripe": bool(c["ripe"]),
                            "ready": bool(c.get("ready", c.get("ripe"))),
-                           "harvestMethod": str(c.get("harvestMethod") or "Grab"),
+                           # 【task-176】`readySource` ∈ {"game","fields",null}：来源必须落账
+                           # （task-173 的 FAIL 正是被"分不清游戏口径还是我们兜底"掩盖的）。
+                           "readySource": c.get("readySource", "game"),
+                           # 【task-176】显式 `None` 要**保留成 null**（0.7.34 的"拿不到写 null"形态）；
+                           # 作物字典里**没有这个键**时才用默认 "Grab"（老用例语义）。
+                           "harvestMethod": (c["harvestMethod"] if "harvestMethod" in c else "Grab"),
                            "watered": bool(c["watered"]),
                            "dead": bool(c.get("dead")), "plantable": False})
                 if self.drop_ready_fields:
                     tv.pop("ready", None)
+                    tv.pop("readySource", None)
+                if self.drop_harvest_method:
+                    # 【task-176】0.7.33 实机缺陷：`harvestMethod` **整键缺失**（不是 null）。
+                    tv.pop("harvestMethod", None)
             else:
                 tv.update({"plantable": True, "watered": False})
             tiles.append(tv)
@@ -386,19 +398,23 @@ class FakeWorld:
                 and _c.get("ready", _c.get("ripe")):
             # 【task-170 ③】镰刀类作物只能走工具路径（真机 `HoeDirt.performToolAction` 的
             # scythe 分支；`interact` 永远摘不到）。
-            return self.harvest_now(t)
+            return self.harvest_now(t, via="scythe")
         if self.blockers.pop(t, None) is None:
             return {"ok": True, "status": "ok", "reason": "挥了，但这格本来就没东西"}
         self.spend("clear")
         return {"ok": True, "status": "ok", "reason": "清掉"}
 
-    def harvest_now(self, tile):
+    def harvest_now(self, tile, *, via="grab"):
         """【task-170】真 `FarmWorker.harvest()` 的假世界版：可收作物 ⇒ crop 消失（可选 +1 进背包）。
 
         （假执行层 `FakeWorker` 用的是上面那个 `harvest()`（返回 `StepResult`）；这里是
         **桥路径**：真 `FarmWorker` 走 `client.interact`/`client.use_tool`，回执必须是 dict。）
         回执口径与真 Mod 对齐：**没动手就必须说没动手**（`ok=false` 或 `acted=false`），
         这正是 run A/B "284 次尝试 0 成功还报 ok" 的第二层病根。
+
+        【task-176】再加游戏真规则：`harvestMethod == "Scythe"` 的作物，`interact`（grab 分支）
+        **永远摘不到**（只弹红字、世界不变）—— 必须走 `use_tool(tool="scythe")`。
+        这条规则让"镰刀类被误当 Grab"的缺陷在假世界里也复现得出来。
         """
         t = tuple(tile)
         c = self.crops.get(t)
@@ -407,6 +423,9 @@ class FakeWorld:
         if not c.get("ready", c.get("ripe")):
             return {"ok": True, "status": "no_action", "acted": False,
                     "reason": "游戏口径不可收（ready=false：复收冷却/阶段没走完/枯死）"}
+        if via == "grab" and str(c.get("harvestMethod") or "") == "Scythe":
+            return {"ok": True, "status": "no_action", "acted": False,
+                    "reason": "镰刀类作物（harvestMethod=Scythe）用 interact 摘不到，游戏只弹红字"}
         del self.crops[t]
         self.spend("harvest")
         if self.harvest_item is not None:
@@ -8775,6 +8794,157 @@ class TestTask170HarvestReady(unittest.TestCase):
                   "crops": 3, "hoeDirt": 1, "emptyDirt": 0}
         run = self._run(w)
         self.assertEqual(run._farm_scope_work(w.obs()), (0, 3))
+
+
+class TestTask176HarvestMethodSourceAndActed(unittest.TestCase):
+    """【task-176】0.7.33 三处 Mod 硬缺陷的护栏：`harvestMethod` 来源 / `readySource` / `acted` 诚实化。
+
+    真机事故（task-173 在 0.7.33 上对样本 `(60,29)` 定点 harvest）：
+    Mod 回执 `{acted:true, ok:true, status:"ok"}`，但 `worldSeq 51→51`、作物还在、背包 +0、
+    存档逐字节未变。取证结论（`scratch/_t176_*.txt` + Lead m15401）：
+
+      * **①** `Crop.HarvestMethod` 字段/属性在 1.6.15 **根本不存在** ⇒ 旧实现在**缺键**上恒 null
+        ⇒ 镰刀类作物被当成 `Grab` 走 `interact` ⇒ `HoeDirt.performUseAction` 对它只弹红字、
+        永远摘不到（正是 284 次 0 成功）。正解 = **public 方法 `Crop.GetHarvestMethod()`**。
+      * **②** `HoeDirt.readyForHarvest()` 的 IL 与我方字段判据**逐条等价** ⇒ "`fullyGrown=false`
+        却 `ready=true`"是**游戏自己的答案**（不是 fail-open）；但必须落 `readySource`
+        （`"game"`/`"fields"`/`null`），否则缺陷定不了案。
+      * **③** `acted` 必须由**本调用内可独立观测的变化**推导：`worldSeq` 前进而目标格没变 ⇒ 仍 `false`。
+
+    本类前 5 条是**源码契约**（直接读 `mod/AgentFarm.Bridge/*.cs`，让 C# 侧的三条必修在
+    Python 测试里也有护栏 —— 仓库没有 C# 测试工程），后 5 条是脑侧行为（假世界）。
+    变异（`scratch/_t176_mutate.py`，brain+tests 一起拷临时目录）：m176a 把 `HarvestMethodOf`
+    改回读字段 ⇒ 契约 + 镰刀用例红；m176b 让反射不可用时 `Ready` 返回 null ⇒ `fields` 用例红；
+    m176c 去掉 `JsonIgnoreCondition.Never` ⇒ 契约用例红；m176d `acted` 改回 `checkAction` 返回值
+    ⇒ 契约用例红。
+    """
+
+    CROP = (60, 10)
+    ROOT = Path(__file__).resolve().parents[1]
+    MOD = ROOT / "mod" / "AgentFarm.Bridge"
+
+    @classmethod
+    def _src(cls, name: str) -> str:
+        return (cls.MOD / name).read_text(encoding="utf-8")
+
+    # ---------------------------------------------------------------- 源码契约（必修 ①）
+    def test_cropmeta_uses_the_public_get_harvest_method(self):
+        src = self._src("CropMeta.cs")
+        self.assertIn("crop.GetHarvestMethod()", src)
+        self.assertIn("case HarvestMethod.Scythe", src)
+        # 旧缺陷：按**字段名**读（1.6.15 无此字段 ⇒ 恒 null ⇒ 镰刀类误当 Grab）
+        self.assertNotIn('ReadMember(crop, "HarvestMethod")', src)
+
+    def test_harvest_method_key_is_always_written(self):
+        src = self._src("Contracts.cs")
+        block = src.split('JsonPropertyName("harvestMethod")')[1][:400]
+        self.assertIn("JsonIgnoreCondition.Never", block,
+                      "harvestMethod 必须**无条件输出**（缺键 ≠ null，0.7.33 的缺陷正是被缺键掩盖的）")
+
+    # ---------------------------------------------------------------- 源码契约（必修 ②）
+    def test_ready_reports_its_source_and_keeps_the_equivalent_fields_path(self):
+        src = self._src("CropMeta.cs")
+        self.assertIn('return (direct, "game")', src)
+        self.assertIn('(false, "fields")', src)
+        self.assertIn('(true, "fields")', src)
+        self.assertIn("(null, null)", src)
+        # 反射失败 + 字段齐全 ⇒ 允许给 "fields" 结论（与游戏 IL 逐条等价）；
+        # 只有**字段缺项**才 null（fail-closed 过头会把整片可收作物变成不可收）。
+        fields = src.split("bool? direct = InvokeReadyForHarvest(dirt);")[1]
+        self.assertIn('return (true, "fields")', fields)
+
+    def test_ready_source_is_exposed_and_carried_into_the_snapshot(self):
+        contracts = self._src("Contracts.cs")
+        block = contracts.split('JsonPropertyName("readySource")')[1][:400]
+        self.assertIn("JsonIgnoreCondition.Never", block)
+        self.assertIn("t.ReadySource = readyInfo.Source", self._src("WorldSnapshot.cs"))
+
+    # ---------------------------------------------------------------- 源码契约（必修 ③）
+    def test_interact_acted_comes_from_an_independent_tile_comparison(self):
+        src = self._src("Skills.cs")
+        self.assertIn("TileSig(tx, ty)", src)
+        self.assertIn("observedChange", src)
+        self.assertIn("bool acted = err == null && observedChange;", src)
+        # 旧缺陷：只看 `checkAction` 的返回值 ⇒ 游戏"认领了但没做事"也报 acted
+        self.assertNotIn("Ok = err == null && handled", src)
+
+    # ---------------------------------------------------------------- 脑侧行为
+    @staticmethod
+    def _plot(*tiles) -> dict:
+        tiles = list(tiles) or [(60, 10)]
+        return {"zone": "", "label": "", "anchor": list(tiles[0]),
+                "tiles": [list(t) for t in tiles], "note": "task-176 用例的作业区"}
+
+    def _world(self, *, ready=True, method="Grab", ready_source="game", **kw) -> FakeWorld:
+        w = FakeWorld(weeds=0, seeds=0, money=0, water_left=40, **kw)
+        w.player_tile = [62, 14]
+        w.dirt.add(self.CROP)
+        w.crops[self.CROP] = {"watered": True, "ripe": True, "ready": ready,
+                              "harvestMethod": method, "readySource": ready_source}
+        w.farm = w.farm_scan()
+        return w
+
+    def _run(self, w: FakeWorld):
+        client = FakeClient(w)
+        worker = FarmWorker(client, log=lambda *_: None)
+        run = make_run(w, target_days=1, max_days=1,
+                       client_factory=lambda: client, worker_factory=lambda c: worker)
+        run.worker = worker
+        run.client = client
+        return run
+
+    @staticmethod
+    def _tile_view(w: FakeWorld, tile) -> dict:
+        return next(t for t in w.obs()["location"]["tiles"] if tuple(t["tile"]) == tile)
+
+    def test_scythe_crop_goes_through_use_tool_not_interact(self):
+        w = self._world(method="Scythe")
+        run = self._run(w)
+        self.assertEqual(run._stage_tiles("harvest", w.obs(), self._plot(self.CROP)), [self.CROP])
+        st = run.worker.harvest(self.CROP)
+        self.assertTrue(st.ok, st.reason)
+        self.assertEqual(w.interacted, [], "镰刀类作物走 interact 永远摘不到 ⇒ 绝不许走")
+        self.assertTrue(w.swings.get(self.CROP), "必须真的挥了镰刀（use_tool 工具路径）")
+        self.assertNotIn(self.CROP, w.crops)
+
+    def test_missing_harvest_method_key_is_unknown_not_grab(self):
+        # 世界真相 = 镰刀类（游戏对它的 grab 分支永远摘不到）；但 0.7.33 的观测里**整键缺失**
+        w = self._world(method="Scythe")
+        w.drop_harvest_method = True          # 复刻 0.7.33：整键缺失（不是 null）
+        run = self._run(w)
+        tv = self._tile_view(w, self.CROP)
+        self.assertNotIn("harvestMethod", tv)
+        self.assertIsNone(harvest_tool(tv), "缺键 ⇒ 判不了工法，**不许**默认 Grab")
+        self.assertTrue(tile_ready(tv))
+        st = run.worker.harvest(self.CROP)
+        self.assertEqual(w.interacted, [self.CROP], "判不了工法时只能试 interact")
+        self.assertFalse(st.ok, "interact 没造成可观测变化 ⇒ 必须如实失败（不许自述成功）")
+        self.assertIn(self.CROP, w.crops, "世界没变 ⇒ 作物还在（这就是 284 次 0 成功的形态）")
+
+    def test_explicit_null_harvest_method_is_also_unknown(self):
+        w = self._world(method=None)          # 键存在但为 null（0.7.34 的"拿不到写 null"形态）
+        tv = self._tile_view(w, self.CROP)
+        self.assertIn("harvestMethod", tv)
+        self.assertIsNone(tv["harvestMethod"])
+        self.assertIsNone(harvest_tool(tv))
+
+    def test_ready_source_fields_is_still_a_harvest_target(self):
+        w = self._world(ready_source="fields")
+        run = self._run(w)
+        self.assertEqual(self._tile_view(w, self.CROP)["readySource"], "fields")
+        self.assertEqual(run._stage_tiles("harvest", w.obs(), self._plot(self.CROP)), [self.CROP],
+                         "反射不可用但字段与游戏 IL 等价 ⇒ 仍是合法目标（不许 fail-closed 过头）")
+
+    def test_acted_false_receipt_is_a_failure_even_when_ok(self):
+        w = self._world(method="Grab")
+        run = self._run(w)
+        run.client.interact = lambda tile=None, timeout_ms=None: {
+            "ok": True, "status": "ok", "acted": False, "reason": "checkAction 返回 true",
+        }
+        st = run.worker.harvest(self.CROP)
+        self.assertFalse(st.ok)
+        self.assertIn("acted", st.reason)
+        self.assertIn(self.CROP, w.crops, "世界没变 ⇒ 作物必须还在（脑不许以为摘过了）")
 
 
 if __name__ == "__main__":  # pragma: no cover

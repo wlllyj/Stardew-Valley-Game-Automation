@@ -290,7 +290,7 @@ namespace AgentFarm.Bridge
                     // 就是拿它当"可收"判据的后果（`docs\_il-harvest-path.md`）。
                     try
                     {
-                        if (CropMeta.Ready(dirt, crop) == true) _acc.ReadyCrops++;
+                        if (CropMeta.Ready(dirt, crop).Value == true) _acc.ReadyCrops++;
                     }
                     catch { }
                     try
