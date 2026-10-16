@@ -95,6 +95,13 @@
     头部 `LLM 复盘/教训库` 行给可 grep 的 `教训库写入 N 条 / 跳过 M 条（不可信）/ 拒收 K 条（其中不可信 J 条）`；
     **全部不判红**（`skipped_untrusted>0` 是好事），只有 `skipped_untrusted>0 且 written==0` **连续 ≥2 天**
     给 `warn:lessons_all_untrusted` 可视行；缺字段 ⇒ 只进【无法判定】（缺失 ≠ 0，绝不当"没有不可信条目"通过）。
+  * 教训素材质量（task-136 C / task-139）：`lessons.hint_dropped` = 当天被"矛盾判据"
+    （`planner.hint_contradicts_evidence(symptom, evidence, hint)`）丢掉的 `hint` 条数（每日重置）
+    ⇒ **丢弃是设计行为、防污染生效的正面证据，不判红**（verify-run3.py 对该字段零命中）。
+    头部 `教训素材质量` 行给可 grep 的 `入库 N 条 / hint 丢弃 M 条 / 拒收 K 次（原因…） / 库大小 J` + 建议 0o；
+    只给三条可证伪形态的 ⚠（不进 rc）：字段缺失/非整数、某天丢弃数 > 当天新增条数（口径打架）、
+    库文件里有 `hint` 为空的条目却没有 `hint_dropped` 计数（疑字段被摘/没记账）；
+    缺事件/缺字段 ⇒ 头部 `<缺失>` +【无法判定】（缺失 ≠ 0，绝不当"没有矛盾 hint"通过）。
   * review 兜底与换片连发（task-124 / task-130）：`review_only_fallback`（review 独苗却有活 ⇒
     换成能落地的意图 `source=work_spot` / 把人带回跨片 leftover `source=pending_walk`）、
     `review_only_no_target`（兜底也拿不出目标 ⇒ 把守卫抱怨的 leftover 如实记为"今天放弃"，
@@ -397,6 +404,10 @@ FIELD_PROBES = [
      "『防洗白生效』的直接证据：跳过多说明库里有外部条目、而它们绝不会被重新盖戳写回 ⇒ "
      "只记信息、不判红；`skipped_untrusted>0 且 written==0` 连续 ≥2 天 ⇒ "
      "`warn:lessons_all_untrusted` 可视行（库被外部整版污染，只警告不进 rc）"),
+    ("event:lessons.hint_dropped", "lessons_hint_dropped",
+     "task-136 C（task-139）：当天被『矛盾判据』（`hint_contradicts_evidence(symptom, evidence, hint)`）"
+     "丢掉的 hint 条数（每日重置）⇒ **丢弃是设计行为、防污染生效的正面证据，不判红**；"
+     "缺失/非整数 ⇒ ⚠ +【无法判定】（缺失 ≠ 0，绝不当'没有矛盾 hint'通过）"),
     ("event:decision", "decision_memory",
      "决策史条数（task-58 的 `Brief.recent_decisions` 注入 = 账本里 `decision` 事件数；每条还补了 "
      "terminal/leftover/unreachable/refused/where 具名田区，**无坐标**）⇒ 头部`决策:`行已给总数；"
@@ -2297,6 +2308,18 @@ def build_advice(report, top=8):
         if (lri.get("warn_all_untrusted_run") or 0) >= 2:
             _lparts.append(f"教训库连续整版不可信 ×{lri.get('warn_all_untrusted_run')} 天"
                            "（warn:lessons_all_untrusted：written==0 且 skipped_untrusted>0，**不判红**）")
+        # task-136 C（task-139）：hint 丢弃的**可证伪**形态 —— 只 ⚠、不判红（丢弃本身是设计行为）
+        if lri.get("hint_dropped_bad_lines"):
+            _lparts.append(f"`lessons.hint_dropped` 缺失/非整数（行 "
+                           f"{lri.get('hint_dropped_bad_lines', [])[:4]}）⇒ 矛盾 hint 丢弃数只能记"
+                           "【无法判定】（缺失 ≠ 0）")
+        elif lri.get("hint_dropped_gt_added_lines"):
+            _lparts.append(f"hint 丢弃数 > 当天新增条数（行 "
+                           f"{lri.get('hint_dropped_gt_added_lines', [])[:4]}）⇒ 口径打架"
+                           "（丢掉的不可能多于当天拍出来的），只警告不判红")
+        if lri.get("warn_empty_hint_no_count"):
+            _lparts.append(f"库里有条目 `hint` 为空（丢弃已生效）却全账本没有 `hint_dropped` 计数"
+                           f"（{lri.get('file_path')}）⇒ 疑字段被摘/没记账，只警告不判红")
         advice.append({
             "text": "LLM 复盘/教训库（task-111）：" + "；".join(_lparts),
             "lines": (lri.get("without_notes_lines", []) + lri.get("over_limit_lines", [])
@@ -2792,6 +2815,10 @@ def build_undecidable(rows, sessions, prelude, report):
             out.append("`lessons` 缺 `written`/`skipped_untrusted` 字段：无法判定这次落盘"
                        "有没有被外部不可信条目污染、以及防洗白是否生效"
                        "（缺失 ≠ 0，绝不当'没有不可信条目'通过；task-118 A / task-120）")
+        if _lr.get("lessons_events") and _lr.get("hint_dropped_bad_lines"):
+            out.append("`lessons` 缺 `hint_dropped` 字段（或非整数）：无法判定 task-136 的"
+                       "『矛盾 hint 被丢弃』是否发生、丢了几条（缺失 ≠ 0，"
+                       "绝不当'没有矛盾 hint'通过；task-136 C / task-139）")
         if _lr.get("rejected_events") and not _lr.get("rejected_untrusted_lines"):
             out.append("`lessons_rejected` 没有 `untrusted` 字段（或恒 0）：无法判定这次载入"
                        "有没有不可信条目（缺失 ≠ 0；task-118 A / task-120）")
@@ -3353,6 +3380,11 @@ def build_report(rows, path, args, bad_lines):
         "lessons_written": None, "lessons_skipped_untrusted": None,
         "all_untrusted_by_day": {}, "warn_all_untrusted_run": 0, "warn_all_untrusted_days": [],
         "file_status": "unknown", "file_path": "", "file_count": None, "file_error": "",
+        # task-136 C（task-139）：教训素材质量 —— `lessons.hint_dropped` = 当天被"矛盾判据"丢掉的 hint 条数
+        # （每日重置）。丢弃是设计行为（防污染生效的正面证据）⇒ 不判红；只有可证伪形态给 ⚠（不进 rc）。
+        "hint_dropped_total": 0, "hint_dropped_days": [], "hint_dropped_lines": [],
+        "hint_dropped_bad_lines": [], "hint_dropped_gt_added_lines": [],
+        "file_empty_hint": None, "warn_empty_hint_no_count": [],
         "has_events": bool(_rev_events or _rev_failed or _ls_events or _ls_load_failed
                            or _ls_save_failed or _ls_rejected),
     }
@@ -3385,6 +3417,18 @@ def build_report(rows, path, args, bad_lines):
         if _di is not None and _lw == 0 and (_lsu or 0) > 0:
             llm_review["all_untrusted_by_day"][_di] = {
                 "label": _lab, "written": _lw, "skipped_untrusted": _lsu, "line": _ln}
+        # task-136 C（task-139）：`hint_dropped` —— 只累加/留痕，绝不判红
+        _hd = as_int(ev.get("hint_dropped"), None)
+        if _hd is None:
+            llm_review["hint_dropped_bad_lines"].append(_ln)
+        else:
+            llm_review["hint_dropped_total"] += _hd
+            if _hd > 0:
+                llm_review["hint_dropped_days"].append(_lab or "?")
+                llm_review["hint_dropped_lines"].append(_ln)
+            _added_hd = ev.get("added")
+            if isinstance(_added_hd, list) and _hd > len(_added_hd):
+                llm_review["hint_dropped_gt_added_lines"].append(_ln)
     if _ls_events:
         _ln, _last = _ls_events[-1]
         llm_review["lessons_total"] = as_int(_last.get("total"))
@@ -3468,6 +3512,15 @@ def build_report(rows, path, args, bad_lines):
                 else:
                     llm_review["file_status"] = "ok"
                     llm_review["file_count"] = len(_raw)
+                    # task-139：库侧交叉核 —— `hint` 为空的条目 = "矛盾 hint 已被丢掉"的落地形态
+                    _empty_hint = sum(1 for _it in _raw
+                                      if isinstance(_it, dict)
+                                      and not str(_it.get("hint") or "").strip())
+                    llm_review["file_empty_hint"] = _empty_hint
+                    if (_empty_hint > 0 and not llm_review.get("hint_dropped_bad_lines")
+                            and not (llm_review.get("hint_dropped_total") or 0)):
+                        # 只有"字段在位且计数恒 0"才算口径打架；字段整体缺失由 ⚠① 覆盖（老账本不重复报）
+                        llm_review["warn_empty_hint_no_count"].append(_lp)
                     if len(_raw) > LESSONS_MAX:
                         llm_review["over_limit_lines"].append(None)
             except Exception as exc:  # noqa: BLE001 - 损坏就判红，别把工具带崩
@@ -4390,6 +4443,17 @@ MAPPING_TEXT = [
      "`buy_partial`（量力而行必须留痕）；②同日既有 `buy_partial` 又有 `cannot_afford`（可能是不"
      "同货品单价差、也可能判据打架，只提示人工核对）。旧账本没有该事件/字段 ⇒ 头部 `<缺失>` + "
      "【无法判定】（缺失 ≠ 0，绝不当'没出现过买一半'通过）"),
+    ("lessons.hint_dropped（task-136 C、task-139 收录）",
+     "教训素材质量（信息项，**丢弃是设计行为、不判红** —— `tools\\verify-run3.py` 对该字段零命中 ⇒ "
+     "本工具不判红、不进 rc）：复盘给的 `hint` 若与 `symptom`/`evidence` 矛盾，brain 用 "
+     "`planner.hint_contradicts_evidence()` 把它丢掉（`hint` 置空），当天累计写进 `lessons.hint_dropped`"
+     "（每日重置）⇒ 它是**防污染生效的正面证据**。头部'教训素材质量'行给可 grep 的 "
+     "`入库 N 条 / hint 丢弃 M 条 / 拒收 K 次（原因…） / 库大小 J` + 建议 0o；"
+     "**只给三条可证伪形态的 ⚠ 警告**：①`hint_dropped` 缺失或非整数（⇒ 丢弃数只能记【无法判定】，"
+     "缺失 ≠ 0）；②某天 `hint_dropped > 当天 lessons.added 条数`（口径打架：丢掉的不可能多于拍出来的）；"
+     "③库文件里有条目 `hint` 为空（= 丢弃已生效）却全账本没有 `hint_dropped` 计数（疑字段被摘/没记账）。"
+     "旧账本没有 `lessons` 事件或没有该字段 ⇒ 头部 `<缺失>` +【无法判定】（缺失 ≠ 0，"
+     "绝不当'没有矛盾 hint'通过）"),
     ("encircled / encircled_stage / encircled_summary（task-68、task-76）",
      "5 环境挡路·可达性/开路（信息项，**无硬闸门 ⇒ 一律不判红**）：被不可清障物围住（四邻没有"
      "「可站+可清」的突破口）＝与 `unreachable`（物理走不到）**分开计数**、不封格、不进任何豁免分子；"
@@ -4720,6 +4784,25 @@ def render_text(report, top):
                "；只作警告、不判红 —— 库被外部整版污染，但不可信条目一条也没被写回）"
                if (lri.get("warn_all_untrusted_run") or 0) >= 2 else "")
             + "；口径：**没学到东西不是失败**（空 notes/空库只记信息）")
+    # task-136 C（task-139）：教训素材质量 —— 入库 / hint 丢弃 / 拒收 / 库大小（缺失 ⇒ <缺失>+【无法判定】）
+    if not lri.get("lessons_events"):
+        add("教训素材质量: <缺失>（本账本没有 `lessons` 事件 ⇒ 无法判定入库与 hint 丢弃；"
+            "缺失 ≠ 0，绝不当'没有矛盾 hint'通过）")
+    else:
+        _hd_bad = lri.get("hint_dropped_bad_lines") or []
+        _hd_tot = ("<缺失>" if _hd_bad else lri.get("hint_dropped_total"))
+        add(f"教训素材质量: 入库 {lri.get('lessons_added') if lri.get('lessons_added') is not None else '<缺失>'} 条"
+            f" / hint 丢弃 {_hd_tot} 条"
+            f" / 拒收 {lri.get('rejected_events', 0)} 次（原因 "
+            f"{'、'.join([str(x) for x in (lri.get('rejected_reasons') or ['—'])][:3])}）"
+            f" / 库大小 {lri.get('file_count') if lri.get('file_count') is not None else '<缺失>'}"
+            + (f"  ⚠ `lessons.hint_dropped` 缺失或非整数（行 {_hd_bad[:4]}）⇒ 丢弃数只能记【无法判定】"
+               if _hd_bad else "")
+            + ("  ⚠ hint 丢弃数 > 当天新增条数（口径打架，只警告不判红）"
+               if lri.get("hint_dropped_gt_added_lines") else "")
+            + ("  ⚠ 库里有条目 hint 为空（丢弃已生效）却全账本没有 hint_dropped 计数 ⇒ 疑字段被摘"
+               if lri.get("warn_empty_hint_no_count") else "")
+            + "；口径：hint 被丢是**设计行为**（防污染生效的正面证据），不判红")
     sleep_days = [d for d in report["days"] if d.get("ended_by") == "sleep"]
     if sleep_days:
         after_days = sum(1 for d in sleep_days if d.get("day_after"))

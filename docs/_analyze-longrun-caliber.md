@@ -694,6 +694,62 @@ python tools/analyze-longrun.py --journal logs/<run>.jsonl | rg "部分购买|�
 九账本 rc（本工具 / `verify-run3.py`）：green 0/0、run2 1(19)/1、run3 1(17)/1、run5 1(62)/1、run6 1(14)/1、
 run7 0/0、run8 1(29)/1、run9 1(84)/1、vacuum 1(3)/1 —— 一字未变（输出留档 `scratch\_t133_*.txt` / `scratch\_t133_v3_*.txt`）。
 
+## 3.22 教训素材质量（task-136 `7d4450f` C，task-139 收录）—— 丢弃矛盾 `hint` 是设计行为
+
+病灶（用户 m12553 的"决策演进"链）：夜里复盘给的 `hint` 若与 `symptom`/`evidence` 矛盾，就会把
+**未经证实的猜测**当"教训"喂回提示词 ⇒ 污染下一轮决策。task-136 C 的做法：`brain/agentfarm/planner.py`
+的 `hint_contradicts_evidence(symptom, evidence, hint)` 判矛盾 ⇒ `make_lesson()` 把 `hint` **置空**
+（`planner.py:696-701`），`brain/agentfarm/longrun.py` 的 `_lessons_flush()` 用"传进去的 hint 非空、
+出来是空"数当天丢了几条，写进**既有** `lessons` 事件的 **`hint_dropped`** 字段（`:689` 计数、
+`:2140` 累加、`:2158` 落账、`:4198` 每日重置）。
+
+> **注意**：task-136 **没有新增 journal 事件名**（还是 `lessons`），所以机械枚举的未映射数**不变**；
+> 本卡新增的可观测面只是 `lessons.hint_dropped` 这个字段。`<journal>-llm.jsonl` 那边新增的是行内
+> `kind="review"`（复盘调用留痕，字段 `prompt/raw/usage/finish_reason/duration_ms/attempts/rejected/
+> truncated/max_tokens/notes`），决策行只**新增** `kind="decision"`、旧字段名与读法一字未动 ⇒
+> **本工具不解析该文件**（只读 journal + `<journal>-lessons.json`），故无需按 `kind` 分流；
+> 将来若加 trace 判据，**无 `kind` 的行按决策处理**。
+
+### 口径：`hint_dropped` **本身一律不判红**（丢弃 = 防污染生效的正面证据）
+
+- `tools\verify-run3.py` 对 `hint_dropped` / `lesson_rejected` 等名字**零命中** ⇒ 本工具判红会两边反向。
+- `FIELD_PROBES` 新增 `event:lessons.hint_dropped`；头部新增可 grep 行
+  **`教训素材质量: 入库 N 条 / hint 丢弃 M 条 / 拒收 K 次（原因…） / 库大小 J`** + 建议 0o。
+- 只给三条**可证伪形态**的 ⚠（不进 `red`、不进 rc）：
+  ①`hint_dropped` **缺失或非整数**（⇒ 丢弃数只能记【无法判定】；旧账本 run9/run9b 正是这一形态）；
+  ②某天 `hint_dropped > 当天 lessons.added 条数`（口径打架：丢掉的不可能多于当天拍出来的）；
+  ③`<journal>-lessons.json` 里有条目 `hint` 为空（= 丢弃已生效）却全账本 `hint_dropped` 恒 0
+  （**字段在位**时才算，避免老账本重复报）⇒ 疑字段被摘/没记账。
+- 旧账本没有 `lessons` 事件或没有该字段 ⇒ 头部 `<缺失>` +【无法判定】（**缺失 ≠ 0**，
+  绝不当"没有矛盾 hint"通过）；`build_undecidable` 单列一条。
+
+### 单测（`tests/test_analyze_longrun.py::TestLessonQualityHintDrop`，7 条）
+
+`test_hint_dropped_is_info_not_red_and_visible`、`test_missing_hint_dropped_is_warning_and_undecidable`、
+`test_non_integer_hint_dropped_is_warning_not_red`、`test_dropped_more_than_added_is_warning`、
+`test_empty_hint_in_file_without_count_is_warning`、`test_empty_hint_with_count_is_not_warned`、
+`test_no_lessons_event_is_missing_not_zero`。
+
+### 读数（task-139，2026-10-16）
+
+`py_compile -W error::SyntaxWarning` exit 0；`tests.test_analyze_longrun` **171 OK**（+7）；
+`discover -s tests` **774 tests / OK（0 红）**；
+机械枚举改前/改后**都是 3 个未映射**（只有结构性白名单 `day_start`/`day_end`/`finish`）——
+task-136 确实没改名、没藏事件；
+**十账本** rc（本工具 / `verify-run3.py`）：green 0/0、run2 1(19)/1、run3 1(17)/1、run5 1(62)/1、run6 1(14)/1、
+run7 0/0、run8 1(29)/1、run9 1(84)/1、**run9b 1(45)/1**、vacuum 1(3)/1 —— 一字未变
+（输出留档 `scratch\_t139_*.txt` / `scratch\_t139_v3_*.txt`）。run9/run9b 的头部原文：
+`教训素材质量: 入库 1 条 / hint 丢弃 <缺失> 条 / 拒收 0 次（原因 —） / 库大小 1  ⚠ lessons.hint_dropped 缺失或非整数…`
+（这两本录于 task-136 之前 ⇒ 只命中 ⚠①，不重复报 ⚠③）。
+
+### grep 配方
+
+```
+git grep -n "hint_dropped" -- brain/agentfarm/
+rg -n '"event": ?"lessons"' logs/longrun-*.jsonl | rg "hint_dropped"
+python tools/analyze-longrun.py --journal logs/longrun-3day-llm-run9b.jsonl --days 7 | rg "教训素材质量|hint 丢弃"
+```
+
 ## 4. 复核命令
 
 ```
@@ -701,9 +757,10 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run5.jsonl   # �
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run6.jsonl   # run6：守卫死锁 + 同日重试
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run7.jsonl --days 7   # run7：窗口口径 ⇒ rc=0；死苗字段缺失 ⇒ <缺失> + 【无法判定】
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run8.jsonl   # run8：背包空格死锁 ⇒ rc=1（回执 no_inventory_space×25）
+python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run9b.jsonl --days 7  # run9b：教训素材质量（hint_dropped 缺失 ⇒ ⚠ + 【无法判定】）
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
 python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
-python -m unittest tests.test_analyze_longrun  # 当前 164 OK（task-133/134 收录）
-python -m unittest discover -s tests           # 当前 757 tests / 5 failures（全为 dev 在制 task-134 B）
+python -m unittest tests.test_analyze_longrun  # 当前 171 OK（task-139 收录）
+python -m unittest discover -s tests           # 当前 774 tests / OK（0 红）
 ```

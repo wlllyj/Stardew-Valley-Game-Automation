@@ -3122,5 +3122,110 @@ class TestStageShortfallAndDeferred(unittest.TestCase):
         self.assertIn("没有任何 task-134 B 分配额字段", " ".join(rep["undecidable"]))
 
 
+class TestLessonQualityHintDrop(unittest.TestCase):
+    """task-136 C / task-139：`lessons.hint_dropped`（与 evidence 矛盾的 hint 被丢弃）。
+
+    口径：**丢弃是设计行为**（防污染生效的正面证据）⇒ 一律不判红；只有三条可证伪形态给 ⚠（不进 rc）：
+    ①字段缺失/非整数；②某天丢弃数 > 当天 `added` 条数（口径打架）；③库文件里有 `hint` 为空的条目
+    却没有 `hint_dropped` 计数（疑字段被摘/没记账）。旧账本 ⇒ `<缺失>` +【无法判定】（缺失 ≠ 0）。
+    """
+
+    def _build(self, name, *, dropped=0, added=("L1", "L2"), with_lessons=True,
+               lessons_json=None, extra=()):
+        day = [1, "summer", 5]
+        nxt = [day[0], day[1], day[2] + 1]
+        ls = {"event": "lessons", "t": 9.0, "day_key": day, "added": list(added),
+              "total": 7, "dropped": 0, "written": len(added), "skipped_untrusted": 0,
+              "path": "", "note": ""}
+        if dropped is not None:
+            ls["hint_dropped"] = dropped
+        end = {"event": "day_end", "t": 10.0, "day": day, "day_text": "1年 summer 5日",
+               "ended_by": "sleep", "ended_reason": "night", "verified": True,
+               "checks": {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                          "crops_watered": True, "day_justified": True,
+                          "watered_outdoor": True, "no_unmet_stages": True},
+               "stages": [{"stage": "water_area", "tiles": 1, "ok": 1, "skipped": 0, "failed": 0}],
+               "outcomes": [], "ok_steps": 1, "skipped_steps": 0, "failed_steps": 0,
+               "notes": [], "final": final(nxt),
+               "final_water": {"t": 9.0, "location": "Farm", "tiles": 84, "crops": 1, "dry": 0,
+                               "scope": "farm"}}
+        events = [day_start(day)]
+        if with_lessons:
+            events.append(ls)
+        events.append(end)
+        events.extend(extra)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = write_ledger(tmp.name, name, events)
+        if lessons_json is not None:
+            lpath = os.path.join(tmp.name, os.path.splitext(name)[0] + "-lessons.json")
+            with open(lpath, "w", encoding="utf-8") as fh:
+                json.dump(lessons_json, fh, ensure_ascii=False)
+        return report_for(path, days=1)
+
+    def test_hint_dropped_is_info_not_red_and_visible(self):
+        rep = self._build("hq_ok.jsonl", dropped=2, added=("L1", "L2", "L3"))
+        self.assertEqual(rep["red"]["total"], 0, "hint 被丢是设计行为 ⇒ 绝不判红")
+        lr = rep["llm_review"]
+        self.assertEqual(lr["hint_dropped_total"], 2)
+        self.assertEqual(lr["hint_dropped_lines"], [2])
+        self.assertEqual(lr["hint_dropped_bad_lines"], [])
+        self.assertEqual(lr["hint_dropped_gt_added_lines"], [])
+        text = mod.render_text(rep, 50)
+        self.assertIn("教训素材质量: 入库 3 条 / hint 丢弃 2 条", text)
+        self.assertIn("不判红", text)
+
+    def test_missing_hint_dropped_is_warning_and_undecidable(self):
+        rep = self._build("hq_missing.jsonl", dropped=None)
+        self.assertEqual(rep["red"]["total"], 0, "缺失只给 ⚠ +【无法判定】，不判红")
+        lr = rep["llm_review"]
+        self.assertEqual(lr["hint_dropped_bad_lines"], [2])
+        text = mod.render_text(rep, 50)
+        self.assertIn("hint 丢弃 <缺失>", text)
+        self.assertIn("⚠ `lessons.hint_dropped` 缺失或非整数", text)
+        self.assertIn("`lessons` 缺 `hint_dropped` 字段", " ".join(rep["undecidable"]))
+        self.assertIn("绝不当'没有矛盾 hint'通过", " ".join(rep["undecidable"]))
+
+    def test_non_integer_hint_dropped_is_warning_not_red(self):
+        rep = self._build("hq_bad.jsonl", dropped="很多")
+        self.assertEqual(rep["red"]["total"], 0)
+        self.assertEqual(rep["llm_review"]["hint_dropped_bad_lines"], [2])
+        self.assertIn("⚠ `lessons.hint_dropped` 缺失或非整数", mod.render_text(rep, 50))
+
+    def test_dropped_more_than_added_is_warning(self):
+        rep = self._build("hq_gt.jsonl", dropped=5, added=("L1",))
+        self.assertEqual(rep["red"]["total"], 0, "口径打架只给 ⚠，不判红")
+        self.assertEqual(rep["llm_review"]["hint_dropped_gt_added_lines"], [2])
+        text = mod.render_text(rep, 50)
+        self.assertIn("⚠ hint 丢弃数 > 当天新增条数", text)
+        self.assertIn("只警告不判红", text)
+
+    def test_empty_hint_in_file_without_count_is_warning(self):
+        rep = self._build("hq_file.jsonl", dropped=0, added=("L1",),
+                          lessons_json=[{"id": "L1", "src": "agentfarm", "hint": "",
+                                         "symptom": "s", "evidence": "e"}])
+        self.assertEqual(rep["red"]["total"], 0)
+        lr = rep["llm_review"]
+        self.assertEqual(lr["file_empty_hint"], 1)
+        self.assertTrue(lr["warn_empty_hint_no_count"])
+        self.assertIn("⚠ 库里有条目 hint 为空", mod.render_text(rep, 50))
+
+    def test_empty_hint_with_count_is_not_warned(self):
+        rep = self._build("hq_file_ok.jsonl", dropped=1, added=("L1",),
+                          lessons_json=[{"id": "L1", "src": "agentfarm", "hint": "",
+                                         "symptom": "s", "evidence": "e"}])
+        self.assertEqual(rep["llm_review"]["file_empty_hint"], 1)
+        self.assertEqual(rep["llm_review"]["warn_empty_hint_no_count"], [])
+        self.assertNotIn("⚠ 库里有条目 hint 为空", mod.render_text(rep, 50))
+
+    def test_no_lessons_event_is_missing_not_zero(self):
+        rep = self._build("hq_none.jsonl", with_lessons=False)
+        self.assertEqual(rep["red"]["total"], 0)
+        self.assertFalse(rep["llm_review"]["has_events"])
+        text = mod.render_text(rep, 50)
+        self.assertIn("教训素材质量: <缺失>", text)
+        self.assertIn("绝不当'没有矛盾 hint'通过", text)
+
+
 if __name__ == "__main__":
     unittest.main()
