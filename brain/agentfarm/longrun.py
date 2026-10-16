@@ -637,6 +637,16 @@ class LongRun:
         # 【task-41 NIT-2】当天是否已经播报过 `farm_evidence_unavailable`（室内 + farm 证据不可用
         # ⇒ fail-closed，绝不放行 `no_work`）。一天只记一次，免得每轮刷同一条 journal。
         self.farm_evidence_noted = False
+        # 【task-149 C】当天是否**独立证明**过"确实没活可做"：只有 `sleep_guard` 在 farm 证据
+        # 齐备（`complete`/`dryCrops`/`hoeDirt`/`emptyDirt` 都能读）且 `work_reasons` 为空时
+        # 才置真。日终 checks 用它拦"0 动作却 VERIFIED"的假绿灯（run9c summer 20：22.81 秒、
+        # `ok_steps=0`、只有室内窗口读数，却 `verified=true`）。
+        self.no_work_evidence_ok = False
+        # 【task-149 B】当天开工时**没能**站到户外农场（晨间模态挡住 + 清框重试也不成）：
+        # 这一天玩家窗口是室内的，窗口读数不能当作"地里没活"的证据 ⇒ 守卫不许放行 `no_work`
+        # （run9c summer 20 就是这条缺失：06:10、体力 270、全天 0 动作，却自称 `no_work` 并
+        # `verified=true`）。
+        self.day_start_off_farm = False
         self.refills_today = 0
         self.idle_rounds = 0
         self.fail_streak = 0
@@ -899,12 +909,17 @@ class LongRun:
         self._actions += 1
         self._journal("goto_farm", ok=st.ok, code=st.code, reason=st.reason,
                       where="day_start", before=st.before, after=st.after, receipt=st.receipt)
-        if not st.ok and st.code in ENV_BLOCK_STATUSES:
+        if not st.ok and (is_env_blocked(st) or st.code in ENV_BLOCK_STATUSES):
             # 【task-102 B】晨间 `ShippingMenu`（上一夜 sleep 留下的）会把 `goto_farm` 挡成
             # `ui_modal`，而本方法**一天只调一次** ⇒ 玩家整天留在室内（run8 day 12 的形态：
             # 全天 0 农场动作、守卫说还有 6 格干作物、最后 8 秒后收工）。
             # 先清一次残留菜单、再试一次；仍不成才如实记失败（task-104 会接手"人不在农场
             # 就别去浇窗口外干作物"，本卡只保证"能回就回"）。
+            # 【task-149 B】判据必须是**环境挡路的属性**而不是 `st.code`：`_location_failed`
+            # 把 `code` 统一写成 `"failed"`、只把 Mod 的 status 留在 `env_block` 标记与 reason
+            # 里 ⇒ 旧写法 `st.code in ENV_BLOCK_STATUSES` 恒假，run9c summer 20 的晨间
+            # `ShippingMenu`（`code=failed`，reason 里才是 `ui_modal`）**整个重试块被跳过**，
+            # 账本里连一条 `day_start_retry` 都没有。
             fresh = self._dismiss_stray_menu(obs, rep, where="goto_farm")
             if not self._is_farm(fresh):
                 st2 = self.worker.ensure_location(self.farm)
@@ -916,21 +931,43 @@ class LongRun:
                 if st2.ok:
                     self._say(f"  · 清掉残留模态后回到 {self.farm}：{st2.reason}")
                     try:
-                        return self._snap()
+                        fresh2 = self._snap()
                     except BridgeError as exc:
                         rep.notes.append(f"回到 {self.farm} 之后观测失败：{exc}")
+                        self.day_start_off_farm = True
                         return fresh
+                    if not self._is_farm(fresh2):
+                        self.day_start_off_farm = True
+                    return fresh2
                 st = st2
         if not st.ok:
             rep.notes.append(f"回不去 {self.farm}：{st.reason}")
             self._say(f"  × 回 {self.farm} 失败：{st.reason}")
+            # 【task-149 B】今天开工没能回到户外农场 ⇒ 窗口读数不能当"地里没活"的证据。
+            self.day_start_off_farm = True
             return obs
         self._say(f"  · 回到 {self.farm}：{st.reason}")
         try:
-            return self._snap()
+            fresh = self._snap()
         except BridgeError as exc:
             rep.notes.append(f"回到 {self.farm} 之后观测失败：{exc}")
+            self.day_start_off_farm = True
             return obs
+        if not self._is_farm(fresh):
+            # 回执说"到了"但观测显示玩家不在户外农场 ⇒ 按"没回到农场"如实处理。
+            self.day_start_off_farm = True
+        return fresh
+
+    def _zero_action_evidenced(self, rep: DayReport) -> bool:
+        """【task-149 C】"0 动作日凭什么算过关"：要么今天真做成过动作，要么手里有
+        **独立的"无活可做"证据**（`sleep_guard` 在 farm 证据齐备且 `work_reasons` 为空时
+        置的 `no_work_evidence_ok`）。
+
+        run9c summer 20 的反面教材：22.81 秒、`ok_steps=0`、`decision=0`，唯一的"证据"是
+        室内窗口 + farm 的 `dry/ripe/dead=0`，地里却有 142 格空耕地、手上还有种子 ⇒
+        `verified=true` 是假绿灯。抽成方法是为了能直接单测（不必造一整天）。
+        """
+        return bool(rep.ok_steps) or self.no_work_evidence_ok
 
     def _farm_totals(self, obs: dict[str, Any]) -> tuple[int, int] | None:
         """`farm` 块的全农场读数 `(dryCrops, ripeCrops)`；`None` = 证据不可用。
@@ -985,6 +1022,30 @@ class LongRun:
         "干着的作物格数"**，`unwateredCrops` 数的是 `NeedsWatering`（run3 里整天 32→32）。
         """
         return self._farm_totals(obs)
+
+    def _farm_plot_work(self, obs: dict[str, Any]) -> tuple[int, int, int] | None:
+        """`farm` 块的**耕地**读数 `(hoeDirt, emptyDirt, seeds)`；`None` = 证据不可用。
+
+        【task-149 A】run9c summer 20（雨天）的 material fail-open：作物被雨浇好 ⇒ farm 级
+        `dry/ripe/dead` 全是 0；清晨 `goto_farm` 被晨间 `ShippingMenu` 挡成 `ui_modal` 之后
+        **全天 0 动作**（22.81 秒、`ok_steps=0`、`decision=0`）却 `verified=true`。而相邻观测
+        是 `hoeDirt=224 / emptyDirt=142`、手上有 2 粒 Wheat Seeds + 465g ⇒ "地里的活干完了"
+        根本不成立 —— 缺的就是这条 farm 级来源："还有耕地空着可种/该去种"。
+
+        判据只用 Mod 已经暴露的字段（`mod\\AgentFarm.Bridge\\Contracts.cs` 的 `FarmView`）：
+        `hoeDirt`（有耕地的格数）、`emptyDirt`（耕地里没作物的格数）、`complete`/`loaded`。
+        **缺失任何一个 ⇒ `None`（未知 ≠ 没有活）**，由 `work_reasons`/`sleep_guard` 走
+        fail-closed（task-96/99 的口径：证据不足宁可诚实 `stuck`，绝不许 `no_work`）。
+        """
+        farm = obs.get("farm") or {}
+        if farm.get("complete") is not True or farm.get("loaded") is False:
+            return None
+        hoe = farm.get("hoeDirt")
+        empty = farm.get("emptyDirt")
+        if hoe is None or empty is None:
+            return None
+        seeds, _money, _can_plant = self._seed_outlook(obs)
+        return (max(0, int(hoe)), max(0, int(empty)), max(0, int(seeds)))
 
     def _unfinished_work(self, obs: dict[str, Any]) -> bool:
         """今天是否还有"该干没干"的活 —— task-102 的 `_do_sleep` 拦截判据。
@@ -2314,12 +2375,15 @@ class LongRun:
         # 真值在 `farm` 块（`complete=true` 时 `dryCrops`/`ripeCrops` 是全农场口径）：
         # 有干作物/熟作物就是"还有活"，而且第一件事是**先回农场**（见 `_ensure_on_farm`）。
         farm_work = self._farm_scope_work(obs)
-        if farm_work is None:
+        plot_work = self._farm_plot_work(obs)
+        if farm_work is None or plot_work is None:
             # 【task-96 ②】证据不可用 ⇒ **人在室内和人在农场都要给理由**（fail-closed）。
             # 旧代码只在室内给理由 ⇒ 人站在农场、最后一张快照的 `farm` 证据不可用（`complete`
             # 不为 true / 旧 Mod 没有 `dryCrops`）时这里为空 ⇒ 守卫放行 `no_work`，同时
             # `_water_evidence` 退回窗口口径（`crops==0` ⇒ `dry==0` ⇒ true）⇒ **假 VERIFIED**。
             # deputy-lead task-92 的 C8b/C8c 正是这条：真·没浇的活苗在 400 格窗口之外。
+            # 【task-149 A】`hoeDirt`/`emptyDirt` 缺失同样算"证据不可用"：雨天里
+            # `dry/ripe/dead` 全 0 只说明"作物没事"，不说明"没有地可以种"。
             reasons.append(self._farm_evidence_reason(obs))
         elif not self._is_farm(obs):
             dry, ripe = farm_work
@@ -2327,6 +2391,15 @@ class LongRun:
                 reasons.append(f"人不在农场，但 farm 口径还有 {dry} 格干作物（先回去浇）")
             if ripe > 0:
                 reasons.append(f"人不在农场，但 farm 口径还有 {ripe} 格熟作物（先回去收）")
+        if plot_work is not None:
+            # 【task-149 A】农场级"还有耕地/空地"来源（与人在不在农场无关）：
+            # 雨天作物被浇好之后，run9c 只剩这一条能说明"地里还有活"。
+            _hoe_f, empty_f, seeds_f = plot_work
+            if empty_f > 0 and seeds_f > 0:
+                reasons.append(f"farm 口径还有 {empty_f} 格耕地空着（手上有 {seeds_f} 粒种子）⇒ 该去种")
+            elif empty_f > 0 and seeds <= 0 and can_plant and not self.seed_dead_today:
+                reasons.append(f"farm 口径还有 {empty_f} 格耕地空着、但没种子；"
+                               f"钱够（{money}g），该去买")
         # 【task-49】人在农场里时也要看全农场读数：窗口只有半径 ~14，农场另一头的干作物
         # 在窗口里根本不存在。run5 第 1 天 `farm.dryCrops=1` 就是这么被丢掉的。
         totals = self._farm_totals(obs)
@@ -2665,11 +2738,14 @@ class LongRun:
                 f"人在室内（{loc}）、farm 口径还有 {farm_work[0]} 格干作物 / "
                 f"{farm_work[1]} 格熟作物，先回农场再说"
             )
-        if farm_work is None:
+        plot_work = self._farm_plot_work(obs)
+        if farm_work is None or plot_work is None:
             # 【task-41 NIT-2 + task-96 ②】证据不可用 ⇒ fail-closed，**室内与农场一视同仁**：
             # 绝不退回窗口口径放行 `no_work`（run3 那 4 天连睡、task-92 的 C8b/C8c 假 VERIFIED
             # 都是这条缺失造成的）。理由与 `work_reasons` 共用一份实现，避免口径漂移。
             # 有界：守卫说"还有活"而本片拿不出目标 ⇒ 换片地上限 + `stuck:` 单次收尾，不空转。
+            # 【task-149 A】`hoeDirt`/`emptyDirt` 缺失也算证据不可用（雨天 `dry/ripe=0` 时
+            # 唯一能证明"还有地可以种"的来源就是它们）。
             return False, "keep_working", self._farm_evidence_reason(obs)
         # 【task-49】人在农场里、全农场读数说还有干/熟作物，而玩家窗口没盖到 ⇒ 必须继续干；
         # 有水（壶里 / 能走到补水点 / 无尽壶）就去浇；**确实打不到水**才允许睡，而且这里
@@ -2709,8 +2785,20 @@ class LongRun:
             return False, "keep_working", (
                 "钱够但背包没有空格、种子买不进来（no_inventory_space）⇒ 先卖一叠腾格/腾背包，"
                 "今天不能靠睡觉跳过这条活")
+        if self.day_start_off_farm and not self._is_farm(obs):
+            # 【task-149 B】当天开工没能回到户外农场（晨间模态挡住、清框重试也不成）：玩家窗口
+            # 是室内的，窗口读数（`crops=0`/`tillable=0`）根本不能当"地里没活"的证据 ⇒
+            # 绝不许 `no_work`。run9c summer 20 就是这一天：06:10、体力 270、0 动作、`verified=true`。
+            loc = str((obs.get("location") or {}).get("name") or "?")
+            return False, "keep_working", (
+                f"今天开工时没能回到户外农场（人在{loc}）⇒ 窗口是室内的、看不见地里有没有活，"
+                "不许判『没活可做』；先想办法回农场，回不去就按 stuck 如实收尾")
         reasons = self.work_reasons(obs)
         if not reasons:
+            # 【task-149 C】走到这里说明"没活"有**独立证据**：farm 证据齐备（否则上一段
+            # fail-closed 已经给了理由）、窗口与农场口径都没给出任何活。日终 checks 用
+            # `zero_action_evidenced` 拦住"0 动作却 VERIFIED"的假绿灯。
+            self.no_work_evidence_ok = True
             return True, "no_work", "确实找不到可做的活（地里的活干完了、也没法/没必要买种子）"
         return False, "keep_working", "；".join(reasons)
 
@@ -4282,6 +4370,10 @@ class LongRun:
         self.plots_today = 0
         self.plots_capped_noted = False
         self.farm_evidence_noted = False
+        # 【task-149 C】"确实没活"的独立证据每天清零：昨天证明过不等于今天也证明过。
+        self.no_work_evidence_ok = False
+        # 【task-149 B】"开工没回到农场"每天清零（同 `_ensure_on_farm` 的写入点）。
+        self.day_start_off_farm = False
         self.refills_today = 0
         self.idle_rounds = 0
         self.blocked = {}
@@ -4939,6 +5031,14 @@ class LongRun:
             # 【task-32】白名单里**没有** `no_plot`：作业区配额到顶是我们自己设的软上限，
             # 被它憋停不等于"没活可做"，不许据此判 VERIFIED（判据见 `is_justified_end`）。
             "day_justified": is_justified_end(rep.ended_by, rep.ended_reason),
+            # 【task-149 C】0 动作日**不许** VERIFIED —— 除非当天有真正独立的"无活可做"证据
+            # （`sleep_guard` 在 farm 证据齐备且 `work_reasons` 为空时置的
+            # `no_work_evidence_ok`）。run9c summer 20：22.81 秒、`ok_steps=0`、`decision=0`，
+            # 依据只有室内窗口（`tillable=0`）+ farm 的 `dry/ripe/dead=0` 就自称 `no_work` 并
+            # `verified=true`，而地里有 142 格空耕地、手上还有种子 ⇒ 假绿灯。
+            # 与 `no_work_evidence_ok` 配套：`day_start_off_farm` 时守卫压根不给 `no_work`，
+            # 所以这条不会把"诚实收尾"误判成不达标。
+            "zero_action_evidenced": self._zero_action_evidenced(rep),
         }
         rep.verified = all(rep.checks.values())
         self._say(

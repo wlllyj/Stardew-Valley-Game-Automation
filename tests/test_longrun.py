@@ -973,7 +973,7 @@ class TestOneDay(unittest.TestCase):
         # "空窗口"这一条证据，而空窗口已按 task-19 NIT-1 如实判 False ⇒ 会把"本来就没作物可浇"的
         # 合法零工作日误判成 needs_review。补一份真机口径的 farm 快照（0 作物 ⇒ dryCrops=0 ⇒ 浇水证据成立）。
         w.farm = {"loaded": True, "complete": True, "crops": 0, "dryCrops": 0,
-                  "unwateredCrops": 0, "hoeDirt": 0}
+                  "unwateredCrops": 0, "hoeDirt": 0, "emptyDirt": 0}
         run = make_run(w, target_days=1, allow_buy=False)
         code = run.run()
         self.assertEqual(code, 0, run.logs)
@@ -1053,7 +1053,7 @@ class TestTask38DayProgressAfterSleepRetry(unittest.TestCase):
         # 真机口径的 farm 快照（0 作物 ⇒ dryCrops=0）：本世界没有任何 tile，空窗口按 task-19
         # NIT-1 如实判 False，会把这天误伤成 needs_review —— 与 `test_no_buy_flag` 同一个坑。
         w.farm = {"loaded": True, "complete": True, "crops": 0, "dryCrops": 0,
-                  "unwateredCrops": 0, "hoeDirt": 0}
+                  "unwateredCrops": 0, "hoeDirt": 0, "emptyDirt": 0}
         run = make_run(w, target_days=1)
         code = run.run()
         self.assertEqual(code, 0, run.logs)
@@ -2170,7 +2170,7 @@ class TestTask19WaterEvidence(unittest.TestCase):
         run = self._run(w)
         obs = w.obs()
         obs["farm"] = {"loaded": True, "complete": False, "crops": 5, "dryCrops": 0,
-                       "unwateredCrops": 5, "hoeDirt": 5}
+                       "unwateredCrops": 5, "hoeDirt": 5, "emptyDirt": 0}
 
         ok, info = run._water_evidence(obs, outdoor_obs=w.obs(), outdoor_t=3.0, outdoor_name="Farm")
 
@@ -2178,7 +2178,7 @@ class TestTask19WaterEvidence(unittest.TestCase):
         self.assertEqual(info["scope"], "window", info)
         self.assertGreater(info["tiles"], 0, info)
         # 旧 Mod（没有 dryCrops 字段）同理
-        obs["farm"] = {"loaded": True, "complete": True, "crops": 5, "unwateredCrops": 5, "hoeDirt": 5}
+        obs["farm"] = {"loaded": True, "complete": True, "crops": 5, "unwateredCrops": 5, "hoeDirt": 5, "emptyDirt": 0}
         ok2, info2 = run._water_evidence(obs, outdoor_obs=w.obs(), outdoor_t=3.0, outdoor_name="Farm")
         self.assertFalse(ok2, info2)
         self.assertEqual(info2["scope"], "window", info2)
@@ -2199,7 +2199,7 @@ class TestTask19WaterEvidence(unittest.TestCase):
         w2 = self._with_crop(watered=False)
         run2 = self._run(w2)
         obs = w2.obs()
-        obs["farm"] = {"loaded": False, "complete": True, "crops": 0, "dryCrops": 0, "hoeDirt": 0}
+        obs["farm"] = {"loaded": False, "complete": True, "crops": 0, "dryCrops": 0, "hoeDirt": 0, "emptyDirt": 0}
         ok2, info2 = run2._water_evidence(obs, outdoor_obs=w2.obs(), outdoor_t=1.0, outdoor_name="Farm")
         self.assertFalse(ok2, "farm 没加载时的 0 不是证据")
         self.assertEqual(info2["scope"], "window", info2)
@@ -2212,7 +2212,7 @@ class TestTask19WaterEvidence(unittest.TestCase):
         obs = w.obs()
         obs["location"] = {"name": "Farm", "isOutdoorFarm": True, "tiles": [],
                            "tillable": [], "furniture": [], "doors": []}
-        obs["farm"] = {"loaded": True, "complete": False, "crops": 0, "hoeDirt": 0}
+        obs["farm"] = {"loaded": True, "complete": False, "crops": 0, "hoeDirt": 0, "emptyDirt": 0}
 
         ok, info = run._water_evidence(obs, outdoor_obs=obs, outdoor_t=9.0, outdoor_name="Farm")
 
@@ -2228,7 +2228,7 @@ class TestTask19WaterEvidence(unittest.TestCase):
         run = self._run(w)
         obs = w.obs()
         obs["farm"] = {"loaded": True, "complete": True, "crops": 5, "dryCrops": 3,
-                       "unwateredCrops": 5, "hoeDirt": 5}
+                       "unwateredCrops": 5, "hoeDirt": 5, "emptyDirt": 0}
 
         ok, info = run._water_evidence(obs, outdoor_obs=w.obs(), outdoor_t=5.0, outdoor_name="Farm")
 
@@ -2246,7 +2246,7 @@ class TestTask19WaterEvidence(unittest.TestCase):
         `tools\\verify-run3.py` 的闸门（farm 口径要 `tiles>0/crops>0/dry==0`）。"""
         w = FakeWorld(weeds=0, seeds=0, money=0)
         w.farm = {"loaded": True, "complete": True, "crops": 25, "dryCrops": 0,
-                  "unwateredCrops": 25, "hoeDirt": 25}
+                  "unwateredCrops": 25, "hoeDirt": 25, "emptyDirt": 0}
         client = _CountingClient(w)
         worker = FarmWorker(client, log=lambda *_: None)
         run = make_run(w, target_days=1, max_days=1,
@@ -2312,7 +2312,7 @@ class TestTask32PlotsCap(unittest.TestCase):
         # 不放这块的话本用例会因为"缺 farm 级浇水证据"被 task-19 的闸门判 needs_review，
         # 而这里要钉的是"触顶 + 没活 ⇒ 仍然正当收工"，与浇水无关。
         w.farm = {"loaded": True, "complete": True, "crops": 0, "dryCrops": 0,
-                  "unwateredCrops": 0, "hoeDirt": 0}
+                  "unwateredCrops": 0, "hoeDirt": 0, "emptyDirt": 0}
         run = make_run(w, target_days=1, max_plots_per_day=0)
         obs = w.obs()
         rep0 = DayReport(day_key=("spring", 1, 6), started_at=0.0)
@@ -2390,7 +2390,7 @@ class MorningIndoorWorld(FakeWorld):
         # `NeedsWatering`、**不是**干格数，所以只信 `dryCrops`/`ripeCrops`。
         self.farm = {"loaded": True, "complete": True, "crops": len(crops),
                      "dryCrops": dry, "ripeCrops": ripe,
-                     "unwateredCrops": dry, "hoeDirt": len(self.dirt)}
+                     "unwateredCrops": dry, "hoeDirt": len(self.dirt), "emptyDirt": len(self.dirt) - len(self.crops)}
         o = super().obs()
         if not self.is_outdoor_farm:
             o["location"]["tiles"] = []
@@ -2700,7 +2700,7 @@ class TestTask41CannotGoHome(unittest.TestCase):
         w = FlipIndoorWorld(weeds=4, seeds=10, money=500)
         # farm 证据可用（不是 NIT-2 那条路）：这里要测的是"回不去农场 + 干不动 ⇒ 如实 stuck"
         w.farm = {"loaded": True, "complete": True, "crops": 0, "dryCrops": 0,
-                  "ripeCrops": 0, "unwateredCrops": 0, "hoeDirt": 0}
+                  "ripeCrops": 0, "unwateredCrops": 0, "hoeDirt": 0, "emptyDirt": 0}
         run = make_run(w, target_days=1, max_days=1,
                        client_factory=lambda: FakeClient(w),
                        worker_factory=lambda c: _CannotGoHomeWorker(w))
@@ -2914,7 +2914,7 @@ class TestTask49CrossPlotNoWork(unittest.TestCase):
         """农场口径还有干作物：能补水就继续干；**确实没水**才允许睡，且必须写成 `no_water`。"""
         w = FakeWorld(weeds=0, seeds=0, money=0)
         w.farm = {"loaded": True, "complete": True, "crops": 37, "dryCrops": 1,
-                  "ripeCrops": 0, "unwateredCrops": 0, "hoeDirt": 30}
+                  "ripeCrops": 0, "unwateredCrops": 0, "hoeDirt": 30, "emptyDirt": 0}
         w.water_left = 0                                # 壶空，但观测里有补水点
         run, _worker, _client = self._run_for(w)
 
@@ -2948,7 +2948,7 @@ class TestTask49CrossPlotNoWork(unittest.TestCase):
         w.fail_status[(60, 10)] = "timeout"             # 每轮都拿不到结论
         w.player_tile = [60, 12]                        # 站在这片地旁边：观测看得见它（真机口径）
         w.farm = {"loaded": True, "complete": True, "crops": 0, "dryCrops": 0,
-                  "ripeCrops": 0, "unwateredCrops": 0, "hoeDirt": 0}
+                  "ripeCrops": 0, "unwateredCrops": 0, "hoeDirt": 0, "emptyDirt": 0}
         run, _worker, _client = self._run_for(w)
 
         code = run.run()
@@ -2986,7 +2986,7 @@ class DryTilesWorld(MyopicWorld):
         self.farm = {"loaded": True, "complete": True, "crops": len(self.crops),
                      "ripeCrops": sum(1 for c in self.crops.values() if c["ripe"]),
                      "dryCrops": len(dry), "unwateredCrops": len(dry),
-                     "hoeDirt": len(self.dirt)}
+                     "hoeDirt": len(self.dirt), "emptyDirt": len(self.dirt) - len(self.crops)}
         if self.with_dry_tiles:
             self.farm["dryTiles"] = [list(t) for t in dry[:64]]
             self.farm["dryTilesTruncated"] = bool(self.truncated)
@@ -4979,7 +4979,7 @@ class TestTask84DeadCropWatering(unittest.TestCase):
         """日账本：`dead_crops`/`dry_dead`/`gave_up_tiles` 进 `day_end`（带状态，供对账）。"""
         w = FakeWorld(weeds=0, seeds=0, money=0)
         w.farm = {"loaded": True, "complete": True, "crops": 5, "dryCrops": 0,
-                  "dryDeadCrops": 3, "deadCrops": 4, "unwateredCrops": 5, "hoeDirt": 5}
+                  "dryDeadCrops": 3, "deadCrops": 4, "unwateredCrops": 5, "hoeDirt": 5, "emptyDirt": 0}
         run = make_run(w, target_days=1, max_days=1)
 
         run.run()
@@ -4998,7 +4998,7 @@ class TestTask84DeadCropWatering(unittest.TestCase):
     def test_old_mod_without_the_field_is_unavailable_not_zero(self):
         """旧 Mod 没有 `deadCrops`/`dryDeadCrops` ⇒ 状态必须是 `unavailable`，不是"没有"。"""
         w = FakeWorld(weeds=0, seeds=0, money=0)
-        w.farm = {"loaded": True, "complete": True, "crops": 5, "dryCrops": 0, "hoeDirt": 5}
+        w.farm = {"loaded": True, "complete": True, "crops": 5, "dryCrops": 0, "hoeDirt": 5, "emptyDirt": 0}
         run = make_run(w, target_days=1, max_days=1)
 
         run.run()
@@ -5080,7 +5080,7 @@ class TestTask96EvidenceFailClosed(unittest.TestCase):
     def test_on_farm_complete_false_also_fails_closed(self):
         """C6c/C6d 的变体：`farm.complete=false`（扫没扫完）同样是"证据不可用"。"""
         w = FakeWorld(weeds=0, seeds=0, money=0)
-        w.farm = {"loaded": True, "complete": False, "crops": 3, "dryCrops": 0, "hoeDirt": 3}
+        w.farm = {"loaded": True, "complete": False, "crops": 3, "dryCrops": 0, "hoeDirt": 3, "emptyDirt": 0}
         run = make_run(w)
 
         allow, code, why = run.sleep_guard(w.obs())
@@ -5214,7 +5214,7 @@ class TestTask99DryCropsMissing(unittest.TestCase):
     def test_missing_dry_crops_positive_control_can_still_finish(self):
         """正对照：同一世界**补上** `dryCrops=0` ⇒ 证据齐、守卫不再因"证据不可用"否决。"""
         w = FakeWorld(weeds=0, seeds=0, money=0)
-        w.farm = {**self.LEGACY, "dryCrops": 0, "ripeCrops": 0, "crops": 0, "hoeDirt": 0}
+        w.farm = {**self.LEGACY, "dryCrops": 0, "ripeCrops": 0, "crops": 0, "hoeDirt": 0, "emptyDirt": 0}
         run = make_run(w)
 
         allow, code, why = run.sleep_guard(w.obs())
@@ -7489,6 +7489,199 @@ class TestTask144RefillRetryAndStopNaming(unittest.TestCase):
         self.assertEqual(rep.assigned_undone, 0, rep.as_dict())
         self.assertIs(rep.checks["no_unmet_stages"], True, rep.checks)
         self.assertTrue(self._events(run, "stage_stop_named"), "缺 stage_stop_named 留痕")
+
+
+# --------------------------------------------------------------------------- task-149
+#: 【task-149】用例的变异预期（脚本 `scratch/_t149_mutate.py`，跑完即删）：
+#:   * `m149a_no_plot_work`（删掉 `work_reasons` 里的 farm 耕地来源）⇒ 红 2。
+#:   * `m149b_no_zero_action_check`（`_zero_action_evidenced` 恒 True）⇒ 红 1。
+#:   * `m149c_env_by_code_only`（把 `_ensure_on_farm` 的判据改回 `st.code in ENV_BLOCK_STATUSES`）⇒
+#:     红 1（`test_day_start_modal_retry_really_retries`，复刻 run9c：`code=failed` + `env_block=True`）。
+#:   基线：本类 7/7 绿。
+
+
+class _EnvFailThenFarmWorker(FakeWorker):
+    """日初 `ensure_location` 先回**环境挡路**，清模态重试那次把人送回农场（run9c 形态）。"""
+
+    def __init__(self, world: FakeWorld):
+        super().__init__(world)
+        self.ensure_calls = 0
+
+    def ensure_location(self, name, *, tile=None, timeout_ms=30000):
+        self.ensure_calls += 1
+        r = StepResult("move_to_location", tile=tile)
+        if self.ensure_calls == 1:
+            # ⚠️ 关键：**不要**在第一次就把人挪到农场，否则 `_is_farm(fresh)` 为真 ⇒ 重试被跳过
+            # （这正是 run9c 账本里连一条 `day_start_retry` 都没有的另一半原因）。
+            r.code = "failed"
+            r.reason = f"去 {name} 失败：[ui_modal] 晨间 ShippingMenu 没关（run9c 形态）"
+            r.env_block = True
+            return r
+        self.w.location = "Farm"
+        self.w.is_outdoor_farm = True
+        self.w.player_tile = [62, 14]
+        r.ok = True
+        r.reason = f"已经在 {name}"
+        return r
+
+
+class _EnvFailWorker(FakeWorker):
+    """`ensure_location` 永远回环境挡路（人整天留在室内）。"""
+
+    def __init__(self, world: FakeWorld):
+        super().__init__(world)
+        self.ensure_calls = 0
+
+    def ensure_location(self, name, *, tile=None, timeout_ms=30000):
+        self.ensure_calls += 1
+        r = StepResult("move_to_location", tile=tile)
+        r.code = "failed"
+        r.reason = f"去 {name} 失败：[ui_modal] 模态挡路"
+        r.env_block = True
+        return r
+
+
+class TestTask149FarmPlotWorkAndOffFarm(unittest.TestCase):
+    """【task-149】雨天/室内的 material fail-open + 0 动作日假 VERIFIED。
+
+    run9c summer 20（deputy 的 task-146 抓的 CAVEAT-1/F1）：雨天清晨醒在 FarmHouse、
+    `goto_farm` 被晨间 `ShippingMenu` 挡成环境挡路，清框后**没有真重试**；06:10、体力
+    270/270、全天 22.81 秒 0 动作 0 决策，却凭"室内窗口 tillable=0 + farm 的
+    `dry/ripe/dead=0`"自称 `no_work` 并 `verified=true`；而隔壁观测是 `hoeDirt=224 /
+    emptyDirt=142`、手上有 2 粒种子 + 465g。
+    """
+
+    def _run(self, w: FakeWorld, worker: FakeWorker, *, target_days: int = 1):
+        # ⚠️ `run()` 会**重新**从工厂造 client/worker（`longrun.py:5192/5198`）⇒ 必须用工厂注入，
+        # 直接 `run.worker = ...` 会被覆盖（本卡调试踩过：整天跑的都是默认 `FakeWorker`）。
+        run = make_run(w, target_days=target_days,
+                       client_factory=lambda: FakeClient(w),
+                       worker_factory=lambda _c: worker)
+        run.plot_size = 5
+        return run
+
+    @staticmethod
+    def _summary(*, empty_dirt: int = 6, hoe_dirt: int = 1, crops: int = 1) -> dict:
+        return {
+            "loaded": True, "complete": True,
+            "crops": crops, "ripeCrops": 0, "deadCrops": 0,
+            "dryCrops": 0, "dryDeadCrops": 0,
+            "dryTiles": [], "dryTilesTruncated": False,
+            "unwateredCrops": 0, "hoeDirt": hoe_dirt, "emptyDirt": empty_dirt,
+        }
+
+    def _farm_world(self, *, seeds: int, money: int) -> FakeWorld:
+        w = FakeWorld(seeds=seeds, money=money, weeds=0)
+        w.dirt.add((60, 10))
+        w.crops[(60, 10)] = {"watered": True, "ripe": False}   # 雨天：作物已浇好
+        w.location = "Farm"
+        w.is_outdoor_farm = True
+        w.player_tile = [62, 14]
+        return w
+
+    def test_rain_day_empty_dirt_with_seeds_is_not_no_work(self):
+        """雨日 + 有种子 + 有空耕地 ⇒ 必须给出"该去种"的活，不许 `no_work`。"""
+        w = self._farm_world(seeds=5, money=100)
+        w.farm = self._summary()
+        run = make_run(w)
+        obs = w.obs()
+        reasons = run.work_reasons(obs)
+        self.assertTrue(any("耕地空着" in r for r in reasons), reasons)
+        allow, code, text = run.sleep_guard(obs)
+        self.assertFalse(allow, (code, text))
+        self.assertEqual(code, "keep_working")
+        self.assertIn("耕地空着", text)
+
+    def test_missing_empty_dirt_is_fail_closed(self):
+        """`emptyDirt` 缺失 ⇒ 证据不可用 ⇒ fail-closed（未知 ≠ 没活）。"""
+        w = self._farm_world(seeds=0, money=0)
+        w.farm = self._summary()
+        del w.farm["emptyDirt"]
+        run = make_run(w)
+        obs = w.obs()
+        self.assertIsNone(run._farm_plot_work(obs))
+        reasons = run.work_reasons(obs)
+        self.assertTrue(any("farm 证据不可用" in r for r in reasons), reasons)
+        allow, code, _text = run.sleep_guard(obs)
+        self.assertFalse(allow)
+        self.assertEqual(code, "keep_working")
+
+    def test_farm_plot_work_none_means_unknown(self):
+        run = make_run(FakeWorld())
+        good = self._summary()
+        self.assertEqual(run._farm_plot_work({"farm": good}), (1, 6, 0))
+        for bad in ({**good, "hoeDirt": None}, {**good, "emptyDirt": None},
+                    {**good, "complete": False}, {**good, "loaded": False}, {}):
+            self.assertIsNone(run._farm_plot_work({"farm": bad}), bad)
+
+    def test_day_start_modal_retry_really_retries(self):
+        """日初被环境挡路 ⇒ 清模态后**真的**再试一次（journal 两条 `goto_farm`）。
+
+        直接调 `_ensure_on_farm`（不走 `run()`）：`run()` 开头的 `_prepare` 自己也会
+        `ensure_location`，会把"第一次失败"吃掉、让断言测不到日初重试。
+        """
+        w = FakeWorld(seeds=0, money=0, weeds=0)
+        w.location = "FarmHouse"
+        w.is_outdoor_farm = False
+        w.farm = self._summary(empty_dirt=0, hoe_dirt=0, crops=0)
+        worker = _EnvFailThenFarmWorker(w)
+        run = make_run(w)
+        run.client = FakeClient(w)
+        run.worker = worker
+        rep = DayReport(day_key=("spring", 1, 20), started_at=0.0)
+        out = run._ensure_on_farm(w.obs(), rep)
+        where = [e.get("where") for e in run.entries if e.get("event") == "goto_farm"]
+        self.assertEqual(where, ["day_start", "day_start_retry"], where)
+        self.assertEqual(worker.ensure_calls, 2)
+        self.assertTrue((out.get("location") or {}).get("isOutdoorFarm"), out.get("location"))
+        self.assertIs(run.day_start_off_farm, False)
+
+    def test_off_farm_day_never_claims_no_work(self):
+        """回不去农场 ⇒ 不许 `no_work` 收尾（窗口是室内的，不算证据）。"""
+        w = FakeWorld(seeds=2, money=465, weeds=0)
+        w.location = "FarmHouse"
+        w.is_outdoor_farm = False
+        w.farm = self._summary(empty_dirt=142, hoe_dirt=224, crops=0)
+        run = make_run(w)
+        run.client = FakeClient(w)
+        run.worker = _EnvFailWorker(w)
+        rep = DayReport(day_key=("summer", 1, 20), started_at=0.0)
+        out = run._ensure_on_farm(w.obs(), rep)
+        self.assertTrue(run.day_start_off_farm)
+        allow, code, text = run.sleep_guard(out)
+        self.assertFalse(allow, (code, text))
+        self.assertEqual(code, "keep_working")
+        self.assertIn("没能回到户外农场", text)
+        # 【task-149 A】同一张室内观测里，farm 级的"还有空耕地"也必须给出活。
+        self.assertTrue(any("耕地空着" in r for r in run.work_reasons(out)), run.work_reasons(out))
+
+    def test_zero_action_needs_independent_evidence(self):
+        """`zero_action_evidenced`：0 动作 + 没有独立证据 ⇒ False；有证据/有动作 ⇒ True。"""
+        run = make_run(FakeWorld())
+        rep = DayReport(day_key=("spring", 1, 20), started_at=0.0)
+        self.assertIs(run._zero_action_evidenced(rep), False)
+        run.no_work_evidence_ok = True
+        self.assertIs(run._zero_action_evidenced(rep), True)
+        run.no_work_evidence_ok = False
+        rep.stages.append({"ok": 2})          # `ok_steps` 是只读属性（= 各阶段 ok 之和）
+        self.assertIs(run._zero_action_evidenced(rep), True)
+
+    def test_truly_empty_farm_can_still_rest(self):
+        """真·空农场（无作物、无空耕地、没种子没钱）仍要能 `no_work` 收工并 VERIFIED
+        —— 防"新工作理由变成永远睡不着"（task-150 的对抗重点）。"""
+        w = FakeWorld(seeds=0, money=0, weeds=0)
+        w.location = "Farm"
+        w.is_outdoor_farm = True
+        w.player_tile = [62, 14]
+        w.farm = self._summary(empty_dirt=0, hoe_dirt=0, crops=0)
+        run = self._run(w, FakeWorker(w))
+        code = run.run()
+        day = run.days[0]
+        self.assertEqual(code, 0, run.logs)
+        self.assertEqual(day.ended_by, "sleep")
+        self.assertTrue(str(day.ended_reason).startswith("no_work"), day.ended_reason)
+        self.assertIs(day.checks["zero_action_evidenced"], True)
+        self.assertIs(day.verified, True)
 
 
 if __name__ == "__main__":  # pragma: no cover
