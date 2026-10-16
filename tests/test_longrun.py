@@ -40,7 +40,8 @@ from agentfarm.farmwork import (  # noqa: E402
 from agentfarm.longrun import (  # noqa: E402
     DEFAULT_LLM_MAX_TOKENS, ENDED_BY_EVENT, ENDED_BY_MODAL, FRONTIER_CLEAR_MAX,
     JUSTIFIED_END_REASONS, MAX_BUY_TRIES_PER_DAY, MAX_ENV_ATTEMPTS, MAX_STUCK_FLUSH,
-    MAX_TILE_ATTEMPTS, DayReport, LongRun, _till_blocked_by, is_justified_end, plot_observe,
+    MAX_TILE_ATTEMPTS, PLOT_EXHAUSTED_BURST, DayReport, LongRun, _till_blocked_by,
+    is_justified_end, plot_observe,
 )
 from agentfarm.planner import (DECISION_LINE_MAX_CHARS, DECISIONS_KEPT, LESSONS_MAX, LESSON_SRC,
                                REVIEW_MAX_TOKENS, REVIEW_RETRY_MAX_TOKENS,
@@ -6123,6 +6124,189 @@ class TestTask122LessonsCoverage(unittest.TestCase):
             return out
 
         self.assertEqual(once(True), once(False), "教训只喂提示词，判决必须逐字相同")
+
+
+class TestTask124ReviewOnlyFallback(unittest.TestCase):
+    """【task-124】`review` 独苗不许白过一轮（Lead m11194 的机制定案）。
+
+    病灶（run9 第 1/2 天）：`deterministic_plan` 吃的是**当前片地**简报 ⇒ 本片没活就给
+    `review`；而 `work_reasons`/`sleep_guard` 用的是**跨片地当日 leftover**（"今天早些时候还有
+    14 格没做完"）。两边没有对账路径：`_verify_intents` 对非阶段意图直接放行、`review` 不置
+    `acted`、`_fallback_decision` 只在 kept 为空时才被调用 ⇒ 3 轮零变化 ⇒ `stuck`。
+    修法：review 独苗 + 守卫说有活 ⇒ 用**守卫据以抱怨的那份 leftover / 观测里看得见的收尾活**
+    换意图（`review_only_fallback`），换不出来就把那批 leftover 如实记为今天放弃
+    （`review_only_no_target`）并诚实收尾；`plot_exhausted` 同一秒连发要记一条
+    `plot_exhausted_burst` 并提前结束换片循环。
+
+    变异自检（`scratch/_t124_mutate.py`，跑完即删）：基线 8/8 绿；
+    m124a（`_review_only_fallback` 直接 `return None, False`）红 3；
+    m124b（`_is_review_only` 恒 False，等于完全不拦）红 2；
+    m124c（`_plot_exhausted_burst` 恒返回 0）红 1。
+    """
+
+    def _run(self, w, **kw):
+        client = FakeClient(w)
+        worker = FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+        run = make_run(w, client_factory=lambda: client, worker_factory=lambda c: worker,
+                       target_days=1, max_days=1, llm_enabled=False, **kw)
+        run.worker = worker
+        run.client = client
+        return run
+
+    @staticmethod
+    def _plot(tiles):
+        return {"zone": "", "label": "", "anchor": [tiles[0][0], tiles[0][1]],
+                "tiles": list(tiles), "note": ""}
+
+    @staticmethod
+    def _review_decision():
+        return SimpleNamespace(intents=[TaskIntent("review", "anchor:current_location", "复盘")])
+
+    @staticmethod
+    def _events(run, name):
+        return [e for e in run.entries if e["event"] == name]
+
+    @staticmethod
+    def _rep():
+        return DayReport(day_key=("spring", 1, 9), started_at=0.0)
+
+    def test_is_review_only_recognizes_only_review_intents(self):
+        """判据：**全是** `review` 才算独苗；空意图/混合意图都不算。"""
+        self.assertTrue(LongRun._is_review_only(self._review_decision()))
+        self.assertFalse(LongRun._is_review_only(SimpleNamespace(intents=[])))
+        mixed = SimpleNamespace(intents=[TaskIntent("review", "", ""),
+                                         TaskIntent("water_area", "location.tiles[]", "")])
+        self.assertFalse(LongRun._is_review_only(mixed))
+
+    def test_plot_exhausted_burst_counts_within_the_same_second(self):
+        """同一秒内计数累加，跨秒归零（run9 是 0.6 秒 12 次）。"""
+        run = self._run(FakeWorld(weeds=0, seeds=0, money=0))
+        ticks = iter([10.0, 10.1, 10.2, 11.5, 11.6])
+        run.now = lambda: next(ticks)
+        self.assertEqual([run._plot_exhausted_burst() for _ in range(5)], [1, 2, 3, 1, 2])
+
+    def test_work_spot_fallback_turns_a_review_only_round_into_real_intents(self):
+        """观测里看得见的干作物 ⇒ 用它的容器出意图（不是拿本片简报再算一次）。"""
+        w = FakeWorld(weeds=0, seeds=10, money=500)
+        w.tillable = set()                       # 本片没地可开 ⇒ 本片简报给 review
+        w.dirt.add((70, 20))
+        w.crops[(70, 20)] = {"ripe": False, "watered": False}
+        run = self._run(w)
+
+        forced, walked = run._review_only_fallback(w.obs(), self._rep())
+
+        self.assertFalse(walked)
+        self.assertIsNotNone(forced, "看得见的干作物必须能变成能落地的意图")
+        self.assertEqual([i.task for i in forced.intents], ["water_area"])
+        ev = self._events(run, "review_only_fallback")
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["source"], "work_spot")
+        self.assertEqual(ev[0]["intents"], ["water_area"])
+        self.assertEqual(run.plot["tiles"], [(70, 20)], "容器要换成活所在的那几格")
+
+    def test_pending_leftover_walks_back_instead_of_reviewing(self):
+        """只有跨片地 leftover（人看不见）⇒ 不做计划，直接走回去再看一眼。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.tillable = set()
+        run = self._run(w)
+        run.leftover_targets = {(70, 20)}
+        rep = self._rep()
+
+        forced, walked = run._review_only_fallback(w.obs(), rep)
+
+        self.assertTrue(walked, "跨片地 leftover 只能靠'回去看一眼'")
+        self.assertIsNone(forced)
+        ev = self._events(run, "review_only_fallback")
+        self.assertEqual(ev[-1]["source"], "pending_walk")
+        self.assertEqual(ev[-1]["attempt"], 1)
+        self.assertEqual(run.resume_walks, 1)
+        self.assertEqual(run.plot["tiles"], [(70, 20)])
+
+    def test_abandon_marks_leftover_given_up_and_journals(self):
+        """兜底拿不出目标 ⇒ 那批 leftover 如实记为今天放弃（次日重试），绝不静默。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = self._run(w)
+        run.leftover_targets = {(70, 20), (71, 20)}
+        rep = self._rep()
+
+        self.assertEqual(run._abandon_guard_leftover(w.obs(), rep), 2)
+
+        self.assertEqual(run.leftover_targets, set())
+        self.assertEqual(run._pending_work(), [])
+        ev = self._events(run, "review_only_no_target")
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["pending"], 2)
+        self.assertEqual(ev[0]["tiles"], [[70, 20], [71, 20]])
+        self.assertTrue(rep.notes, "要给当天留一句人话")
+
+    def test_review_only_decision_survives_when_the_guard_has_nothing_to_say(self):
+        """守卫**指不出具体格**时 `review` 语义一字不改（不拦、不换意图）。"""
+        w = FakeWorld(weeds=4, seeds=10, money=500)     # 守卫会抱怨，但抱怨不可定位
+        run = make_run(w, target_days=1, max_days=1,
+                       planner=FakePlanner(TaskIntent("review", "anchor:current_location", "复盘")))
+        client = FakeClient(w)
+        worker = FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+        run.worker = worker
+        run.client = client
+
+        run.run()
+
+        self.assertTrue(self._events(run, "review"), "指不出格时 review 仍要照常执行")
+        self.assertEqual(self._events(run, "review_only_fallback"), [],
+                         "守卫说不出具体格 ⇒ 不许多此一举")
+        self.assertEqual(self._events(run, "review_only_no_target"), [])
+
+    def test_review_only_round_is_intercepted_end_to_end(self):
+        """端到端：只有 review 却有跨片地 leftover ⇒ 必须出现兜底，且不许洗成 `no_work`。"""
+        w = FakeWorld(weeds=4, seeds=10, money=500)
+        run = make_run(w, target_days=1, max_days=1,
+                       planner=FakePlanner(TaskIntent("review", "anchor:current_location", "复盘")))
+        client = FakeClient(w)
+        worker = FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+        run.worker = worker
+        run.client = client
+        # `_run_day` 每天会把 `leftover_targets` 清零 ⇒ 在日内的 `_preconditions` 里注入
+        # （那正是"今天早些时候见过、还没做完、人在别的片地看不见"的真实来路）。
+        run._ensure_plot = lambda obs, rep: self._plot([(60, 10)])
+        base_pre = run._preconditions
+
+        def pre(obs, rep):
+            base_pre(obs, rep)
+            run.leftover_targets.add((70, 20))
+
+        run._preconditions = pre
+
+        run.run()
+
+        ev = self._events(run, "review_only_fallback")
+        self.assertTrue(ev, "review 独苗 + 守卫说有活 ⇒ 必须有对账动作")
+        self.assertIn(ev[0]["source"], ("pending_walk", "work_spot"))
+        rep = run.days[0]
+        self.assertNotEqual(rep.ended_by, "no_work", "守卫说还有活 ⇒ 绝不许按『没活』收工")
+        self.assertFalse(rep.verified)
+
+    def test_burst_journal_is_written_at_most_once_per_day(self):
+        """日级：同一秒连发换片时 `plot_exhausted_burst` 至多一条，且收尾仍诚实。"""
+        w = UnreachableWorld(unreachable=[(60, 10)], seeds=0, money=0)
+        w.blockers[(70, 10)] = "weed"
+        w.fail_status[(60, 10)] = "ui_modal"
+        client = _UnreachableClient(w, unreachable=w.unreachable)
+        worker = FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+        run = make_run(w, client_factory=lambda: client, worker_factory=lambda c: worker,
+                       target_days=1, max_days=1, llm_enabled=False)
+        run.worker = worker
+        run.client = client
+        run._ensure_plot = lambda obs, rep: self._plot([(60, 10)])
+
+        run.run()
+
+        bursts = self._events(run, "plot_exhausted_burst")
+        self.assertLessEqual(len(bursts), 1, f"burst 一天至多记一条：{bursts}")
+        self.assertNotEqual(run.days[0].ended_by, "no_work")
+        self.assertFalse(run.days[0].verified)
+        if bursts:
+            self.assertIn("连发", run.days[0].ended_reason)
+            self.assertGreaterEqual(bursts[0]["count"], PLOT_EXHAUSTED_BURST)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -92,6 +92,14 @@ MAX_ENV_ATTEMPTS = 2
 #: 上界 20/天：不封顶的话"目标全够不着"的日子会把整天耗在**无目的**的清障上。
 FRONTIER_CLEAR_MAX = 20
 
+#: 【task-124】同一秒内连续判"这一片没目标"的次数上界（0.7.29）。
+#:
+#: run9（run A）第二天：`plot_exhausted` 在 **0.6 秒**里连发 **12 次** —— 每轮换一片、每片都
+#: 拿不出目标，纯空转（`deterministic_plan` 吃的是**当前片地**简报，四条分支全不成立 ⇒ `review`；
+#: 而 `work_reasons`/`sleep_guard` 用的是**跨片地当日 leftover**）。同一秒 ≥ 本值 ⇒ 记一条
+#: `plot_exhausted_burst`，并按既有有界机制结束当天换片循环，不再把整天耗在无目的换片上。
+PLOT_EXHAUSTED_BURST = 5
+
 #: 【task-73】stuck 日"有界翻篇"的整轮上限（Lead m06814）。
 #:
 #: 为什么要翻篇：run6（0.7.25）两个 `day_end` 都是 `ended_by=stuck`，随后 `run()` 命中
@@ -722,6 +730,9 @@ class LongRun:
         #: 还有 leftover、failed=0"，当时 8 种 kind 一条都生成不了 ⇒ run A 攒不到教训。
         self.plot_exhausted_today = 0
         self.midway_leftover_today = 0
+        #: 【task-124】"同一秒连发换片"的窗口计数（`plot_exhausted` 空转的刹车）。
+        self._plot_exhausted_last: float | None = None
+        self._plot_exhausted_window = 0
 
     # ------------------------------------------------------------------ 小工具
 
@@ -2005,6 +2016,118 @@ class LongRun:
         needs_review，而不是洗成"没活"）。
         """
         return sorted(t for t in self.leftover_targets if t not in self.blocked)
+
+    # ------------------------------------------------ task-124：review 独苗的对账路径
+
+    @staticmethod
+    def _is_review_only(decision: Any) -> bool:
+        """这一轮的意图**全是** `review`（没有一条能落地）吗？（task-124）
+
+        run9（0.7.29）第 1 天：61 条 `['review']` 独苗决策，`source=deterministic`
+        —— 当前**片地**的简报四条分支都不成立 ⇒ `deterministic_plan` 给 `review`；而
+        `work_reasons`/`sleep_guard` 用的是**跨片地当日 leftover**（"今天早些时候还有 14 格
+        没做完"）。两边没有对账路径：`_verify_intents` 对非阶段意图直接放行、`review` 不置
+        `acted`、`_fallback_decision` 只在 kept 为空时才被调用 ⇒ 3 轮零变化 ⇒ `stuck`。
+        """
+        intents = list(getattr(decision, "intents", ()) or ())
+        return bool(intents) and all(str(getattr(i, "task", "")) == "review" for i in intents)
+
+    def _plot_exhausted_burst(self) -> int:
+        """同一秒内连续判"这一片没目标"的次数（task-124）。
+
+        真机形态：run9 第 2 天 `plot_exhausted` 在 0.6 秒里连发 12 次 —— 每轮换一片、每片都
+        拿不出目标，纯空转。同一秒 ≥ `PLOT_EXHAUSTED_BURST` 次就判定"本片真没目标"，记一条
+        `plot_exhausted_burst` 后按既有有界机制结束当天换片循环。
+        """
+        try:
+            stamp = float(self.now())
+        except Exception:                       # pragma: no cover - now 是注入的
+            stamp = 0.0
+        if self._plot_exhausted_last is None or stamp - self._plot_exhausted_last >= 1.0:
+            self._plot_exhausted_window = 0
+        self._plot_exhausted_last = stamp
+        self._plot_exhausted_window += 1
+        return self._plot_exhausted_window
+
+    def _review_only_fallback(self, obs: dict[str, Any],
+                              rep: DayReport) -> tuple[Any | None, bool]:
+        """review 独苗 + 守卫说还有活 ⇒ 换成能落地的意图，或把人带回那片地（task-124）。
+
+        为什么**不能**拿当前片地的简报再跑一次 `deterministic_plan`：那份简报正是"本片没活了"
+        的来源（run9 第 1 天四条分支全不成立 ⇒ `review`），再算一次只会再得一个 `review`
+        —— 原地死循环（Lead m11194）。所以按"守卫到底在抱怨什么"分两步：
+          ① 观测里**看得见**的收尾活（`_work_spot_plot`：没浇/熟了/枯死的作物格）⇒ 用它的容器
+             出简报再跑确定性策略（视窗内 ⇒ 计数不为 0，能挑出 `water_area`/`harvest`/`clear_dead`）；
+          ② 只剩**跨片地 leftover**（人看不见）⇒ 不做计划，直接把人带回那些格子旁边
+             （`_resume_plot` + `_walk_into_plot`），让下一轮观测重新看见它们。
+
+        返回 `(decision_or_None, walked)`；`walked=True` 时调用方 `continue` 跑下一轮。
+        """
+        blocked = self.no_target | self.no_target_global
+        reasons = self.work_reasons(obs)
+        spot = self._work_spot_plot(obs)
+        if spot is not None:
+            brief: Brief | None = None
+            try:
+                brief = self._plot_brief(obs, spot)
+            except Exception as exc:            # pragma: no cover - 防御性
+                self._journal("review_only_fallback_failed", source="work_spot",
+                              error=f"{type(exc).__name__}: {exc}"[:200])
+            if brief is not None:
+                intents = [i for i in deterministic_plan(brief)
+                           if i.task not in blocked and i.task != "review"]
+                if intents:
+                    self.plot = spot
+                    self.zone_name = str(spot.get("zone") or "")
+                    self.idle_rounds = 0
+                    self._journal("review_only_fallback", source="work_spot",
+                                  plot_tiles=len(spot.get("tiles") or []),
+                                  intents=[i.task for i in intents], reasons=reasons[:6],
+                                  note="只有 review 却有活 ⇒ 改按观测里看得见的收尾活出意图")
+                    rep.notes.append(
+                        f"只有 review 却有活（{'；'.join(reasons[:2]) or '守卫说有活'}）⇒ "
+                        f"改按 {len(spot.get('tiles') or [])} 格待浇/待收/待清的作物挑目标："
+                        f"{[i.task for i in intents]}")
+                    return SimpleNamespace(intents=intents), False
+        pending = self._pending_work()
+        if pending and self.resume_walks < self.max_plots_per_day:
+            resume = self._resume_plot(obs)
+            if resume is not None:
+                self.resume_walks += 1
+                walked = self._walk_into_plot(obs, resume)
+                self._journal("review_only_fallback", source="pending_walk",
+                              tiles=len(resume["tiles"]), walked=bool(walked),
+                              attempt=self.resume_walks, reasons=reasons[:6],
+                              note="只有 review 却说还有活 ⇒ 回到跨片地 leftover 旁边再看一次")
+                if walked:
+                    self._actions += 1
+                    rep.notes.append(
+                        f"只有 review 却有活（{'；'.join(reasons[:2]) or '守卫说有活'}）⇒ 回到 "
+                        f"{len(resume['tiles'])} 格没做完的地方再看一次"
+                        f"（review 兜底 {self.resume_walks}/{self.max_plots_per_day}）")
+                    self.plot = resume
+                    self.zone_name = ""
+                    self.idle_rounds = 0
+                    return None, True
+        return None, False
+
+    def _abandon_guard_leftover(self, obs: dict[str, Any], rep: DayReport) -> int:
+        """兜底也拿不出目标时，把守卫据以抱怨的那份 leftover 如实记为"今天放弃"（task-124）。
+
+        不这么做 ⇒ 守卫下一轮还拿同一批格抱怨 ⇒ 继续空转到 `stuck`（Lead m11194 点名的弯路）。
+        只动 `leftover_targets`（当天不再回头、也不再当"还有活"的证据），`_run_day` 每日重置
+        ⇒ 次日照旧重试；**不碰任何判定字段**。
+        """
+        pending = self._pending_work()
+        for tile in pending:
+            self.leftover_targets.discard(tile)
+        self._journal("review_only_no_target", pending=len(pending),
+                      tiles=[[t[0], t[1]] for t in sorted(pending)[:12]],
+                      reasons=self.work_reasons(obs)[:6],
+                      note="确定性计划也拿不出目标 ⇒ 这些格如实记为今天放弃（次日重试），不再空转")
+        if pending:
+            rep.notes.append(f"确定性计划也没有目标：{len(pending)} 格今天放弃（次日重试）")
+        return len(pending)
 
     def _frontier_clear(self, obs: dict[str, Any], rep: DayReport) -> bool:
         """【task-68】"一轮不许零动作"：世界没变化、但仍有**可达 + 可清障**的地 ⇒ 至少清一格。
@@ -3611,6 +3734,9 @@ class LongRun:
         # 【task-122】两种退化形态的当日计数，每天清零（只喂教训库，不参与判定）。
         self.plot_exhausted_today = 0
         self.midway_leftover_today = 0
+        # 【task-124】同一秒连发换片的窗口计数每天清零。
+        self._plot_exhausted_last = None
+        self._plot_exhausted_window = 0
         self.dead_scope_noted = set()
         # 【task-59】复盘每天最多一次（`recent_notes` **不**在这里清：它是"昨晚留给今天"的，
         # 由 `_review_before_sleep` 在夜里覆盖）。
@@ -3814,6 +3940,38 @@ class LongRun:
                 # ①**换任务**（用户 m02591 的"取消换别的任务"）：模型要的事一件都落不到地上时，
                 #   用简报上的确定性策略重新挑一件当天真能做的事，而不是原地空转或掉头睡觉。
                 decision = self._fallback_decision(brief, rep)
+            # 【task-124】`review` 独苗不许白过一轮（Lead m11194）：`_verify_intents` 对非阶段
+            # 意图直接放行、`review` 又不置 `acted` ⇒ 每轮零变化 ⇒ 3 轮 idle 判 stuck（run9
+            # 第 1/2 天）。守卫说还有活时，改用**守卫据以抱怨的那份 leftover / 观测里看得见的
+            # 收尾活**去挑目标；挑不出来就把那批 leftover 如实记为今天放弃（次日重试）。
+            # `work_reasons()` 为空时 `review` 语义一个字不改。
+            if (self._is_review_only(decision) and self.work_reasons(obs)
+                    and (self._work_spot_plot(obs) is not None or self._pending_work())):
+                forced, walked = self._review_only_fallback(obs, rep)
+                if walked:
+                    continue
+                if forced is not None:
+                    decision = forced
+                else:
+                    # ②兜底也拿不出目标 ⇒ 把那份 leftover 如实记为**今天放弃**（次日重试），
+                    #   并先走既有的"一轮不许零动作"（世界里还有可达的可清障格就至少清一格）；
+                    #   连它都没有才落回既有诚实收尾（`sleep_guard`/换片/`stuck`）。
+                    self._abandon_guard_leftover(obs, rep)
+                    if self._frontier_clear(obs, rep):
+                        rep.notes.append(
+                            f"只有 review 且兜底没目标 ⇒ 先清一格可达的可清障格"
+                            f"（frontier_clear {self.frontier_clears}/{FRONTIER_CLEAR_MAX}）")
+                        self.idle_rounds = 0
+                        continue
+                    # ③连"清一格"都没有 ⇒ 立刻如实收尾（不落回 `sleep_guard` 的 `no_work`，
+                    #   那会把"守卫说有活却指不出格"洗成"今天没活"）。`_do_sleep` 里
+                    #   `require_work` 会再挡一道：0 农场动作的日子连睡都不许睡。
+                    rep.notes.append("确定性计划也没有目标 ⇒ 按 stuck 诚实收尾（不走 3 轮 idle 弯路）")
+                    rep.ended_by, rep.ended_reason = self._do_sleep(
+                        obs, rep,
+                        "stuck:确定性计划也没有目标（守卫说还有活，但既换不出意图、也无可达的可清障格）"
+                        + self._not_on_farm_suffix())
+                    break
             if not decision.intents:
                 # ②确定性策略也挑不出事来。⚠️ 这**不等于"今天没活了"**（用户 m02532 当场抓到：
                 #   体力 204/270、才 19:40，却掉头回家准备睡觉）。能不能收工只有 `sleep_guard`
@@ -3846,6 +4004,20 @@ class LongRun:
                     self.plot_exhausted_today += 1     # 【task-122】当日计数（喂当晚教训）
                     self._journal("plot_exhausted", recovered=recovered, zone=self.zone_name,
                                   note=f"这一片没目标了，但守卫仍要求干活（{text}）⇒ 换一片地")
+                    # 【task-124】同一秒连发换片 = 纯空转（run9 第 2 天 0.6 秒 12 次）：
+                    # 到阈值就记一条 `plot_exhausted_burst`、按既有有界机制结束当天换片循环。
+                    burst = self._plot_exhausted_burst()
+                    if burst >= PLOT_EXHAUSTED_BURST:
+                        rep.notes.append(
+                            f"同一秒内连发 {burst} 次换片 ⇒ 判定「本片真没目标」，结束今天的换片循环")
+                        self._journal("plot_exhausted_burst", count=burst, zone=self.zone_name,
+                                      note="同一秒内连发换片（run9 形态：0.6 秒 12 次）⇒ 不再把"
+                                           "整天耗在无目的换片上，按既有有界机制收尾")
+                        rep.ended_by, rep.ended_reason = self._do_sleep(
+                            obs, rep,
+                            f"stuck:同一秒连发 {burst} 次换片都没有目标（守卫仍说还有活：{text}）"
+                            + self._not_on_farm_suffix())
+                        break
                     if recovered > self.max_plots_per_day:
                         rep.notes.append(f"换过 {recovered} 片地都拿不出目标")
                         # ⚠️ 守卫**说还有活**却找不到任何目标 ⇒ 这是 `stuck`，不是"今天没活"：
