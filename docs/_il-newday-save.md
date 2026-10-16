@@ -144,3 +144,14 @@ Select-String -Path "$env:APPDATA\StardewValley\ErrorLogs\SMAPI-latest.txt" -Pat
 python tools\_tmp_conv.py logs\run5-levelup-clear.log scratch\_levelup_clear_u8.txt
 Get-Item "$env:APPDATA\StardewValley\Saves\Wahaha_450799035\Wahaha_450799035","$env:APPDATA\StardewValley\Saves\Wahaha_450799035\Wahaha_450799035_old" | Select-Object Name,Length,LastWriteTime
 ```
+
+## 6. 姊妹篇与本篇 U3 的更新（task-126）
+
+`docs\_il-shipmenu-save.md`（2026-10-16，run9 落盘 0/4 的 P0 取证）把本篇 §2.5 反例的**根因**钉死了：
+
+- 出货日 `displayedShippedItems.Count > 0` ⇒ `showEndOfNightStuff` 先 `Push(new ShippingMenu(...))` ⇒ 本篇 §1 的"空栈才建 SaveGameMenu"走不到；
+  **出货日保存的唯一入口在 `ShippingMenu.update()` 内部**（私有字段 `saveGameMenu = new SaveGameMenu()`，只在 `okClicked()` 置 `outro=true` 之后被执行）。
+- 我们对 `ShippingMenu` 调 `exitThisMenu()`（`ModalDismiss.cs:106`）⇒ `outro` 永假 ⇒ 永不建 SaveGameMenu；
+  `Game1._update` 的日终结束分支（IL_120B）不检查 `newDaySync.hasSaved()` ⇒ 日推进、盘不落（run9 4 次 NewDay / 0 次 save）。
+- 因此**本篇 U3 更新为"已定到两个创建点"**：`<>c.<showEndOfNightStuff>b__802_0` IL_01D2 与 `ShippingMenu.update` IL_0241；
+  其余创建点仍未穷举（`FIND` 对 `.ctor` 无效），但两个点已足够解释 run7/8/9。
