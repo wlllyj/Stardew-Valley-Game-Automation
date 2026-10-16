@@ -70,8 +70,11 @@ def main() -> int:
     print(f"目标 {dst}\n    size={os.path.getsize(dst)} B  SHA256={dst_sha}")
     ok = dst_sha == src_sha
     print(f"[{'OK' if ok else 'x'}] 两侧 SHA256 {'一致' if ok else '不一致'}")
-    print("\n--- 供 docs\\_run10-evidence.md §1 直接粘贴 ---")
-    print(f"- 教训库拷贝：`{SRC_DEFAULT}` → `{DST_DEFAULT}`（**原样字节拷贝**）")
+    # 粘贴块用**实际传入的路径**（run9d→run10 只是默认值；runA-0732→runB-0732 之类的用法同样适用）
+    src_rel = args.src if not os.path.isabs(args.src) else os.path.relpath(src, ROOT).replace("\\", "/")
+    dst_rel = args.dst if not os.path.isabs(args.dst) else os.path.relpath(dst, ROOT).replace("\\", "/")
+    print("\n--- 供证据文档 §1 直接粘贴 ---")
+    print(f"- 教训库拷贝：`{src_rel}` → `{dst_rel}`（**原样字节拷贝**）")
     print(f"  - 拷贝时刻：`{now}`")
     print(f"  - 两侧 SHA256：`{src_sha}`（源 {src_size} B） / `{dst_sha}`（目标 {os.path.getsize(dst)} B）")
     return 0 if ok else 4
