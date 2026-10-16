@@ -1,6 +1,6 @@
 v0.7.32（run9d 诊断后的目标 2 解药：够不着的活苗开路再浇 + 单日体力预算与规模控制；并补 Mod 障碍物/工具等级观测）
 
-本版四张代码卡 + 两张对抗验收（Mod 侧只有 task-155 改代码；其余为脑侧/工具侧）：
+本版五张代码卡 + 四张验收/收桶卡（Mod 侧只有 task-155 改代码；其余为脑侧/工具侧）：
 
 1. task-157（dev-coder，`ef59f30`）water_far 够不着时先有界开路再试：
    - run9d 实证：`[12,30]` 活苗干作物 `water_far code=unreachable` ⇒ 当天 `gave_up_dry`、不 VERIFIED（run9d 尾链 0/5 的第一条病灶）；
@@ -25,7 +25,12 @@ v0.7.32（run9d 诊断后的目标 2 解药：够不着的活苗开路再浇 + �
 
 5. task-161（dev-coder）阶段体力实测留痕与标定（**只留痕、不改判据**）：stage 记录补 `stamina_before`/`stamina_after`/`stamina_spent` + `day_end.stamina_calibration`（按 stage 的 `actions`/`per_action`），用于下一轮把 `farmwork.py` 的估算常量换成实测值（**改常量必须单独一步并过对抗验收**）。
 
-6. 两张对抗验收：task-159（deputy-lead）对 task-157+158（重点打"少干活/开路当浇水"的洗白通道）；task-160（log-analyst）收 `water_far_open`/`water_far_blocked`/`stamina_budget`/`deferred_by_budget` 等新事件与字段 ⇒ **全量单测回 0 红**（0.7.32 放行条件）。
+6. task-163（dev-coder，`3762936`）预算延后不得变成"还有活"：
+   - 现象：`_stage_tiles()` 已被预算拦住不产出目标，但守卫/`_pending_work()`/`_leftover()` 仍把同一批格算"还有活" ⇒ 守卫拒绝收工、策略又拿不出目标 ⇒ `stuck:同一秒连发 5 次换片都没有目标`（有界不假绿，但白烧一天且当天不可能 VERIFIED ⇒ 目标 2 的"连续 5 天"不可达）；
+   - 改法：日初 `_note_budget_deferrals()` 一次记账（`budget_deferred_tiles{task:n}`）+ 守卫四处收口（延后任务的格不再产生"还有活"理由，改走显式延后）；容量命中记 `stage_capped_by_capacity` 与 `day_end.stamina_budget.capped_by_capacity`/`capacity_capped_tasks`；
+   - 红线：`harvest`/`clear_dead`/浇水**永不**延后；延后只在"体力 ≤ `water_reserve` **且** 有浇水债"时成立；延后格只进 info 留痕、**不参与任何判定扣减**；`checks` 一个键未加。
+
+7. 验收与收桶卡：task-159（deputy-lead）对 task-157+158 的独立对抗验收（重点打"少干活/开路当浇水"的洗白通道）；task-160/task-164/task-165（log-analyst）分别收 task-157/158、task-20、task-163 的新事件与字段 ⇒ **全量单测回 0 红**（0.7.32 放行条件）；task-166（deputy-lead）对 task-163 的独立 delta 对抗验收（重点打"延后口径是不是新洗白通道"）⇒ 结论必须回答"0.7.32 能不能据此冻结"。
 
 （Lead 侧工具，不属于 Mod 产物：`tools\verify-run3.py` 已有"0 阶段自称 VERIFIED 必须有在场证据"与"缺 finish ⇒ 判决为临时"两道闸门；`tools\compare-runs.py` 的 L0–L5 演进判据已就绪。）
 
