@@ -1,0 +1,62 @@
+# 0.7.29 发布计划（LLM 演进素材修复 + 0.7.28 遗留）
+
+> 冻结前置：本版卡片全部 completed + 独立对抗验收 PASS（口径变更/对照机制类卡片必须过验收）。
+> 上一版：`docs/_release-0.7.28.md`（run8 两病灶 + LLM 演进第一批；2026-10-16 已装机，run9 = run A 正在跑）。
+
+## 0. 为什么有这一版（run9 实证）
+run9（0.7.28）第一天就把「决策演进」的**素材链**堵点暴露了：
+1. `review_llm_failed {"t":217.45,"reason":"llm_error:truncated: 回答被 max_tokens 截断且内容为空（推理占用了约 512 个 token）…"}` ⇒ 复盘笔记永远为空 ⇒ 教训库 `hint` 永远空 ⇒ run B 无教训可注入（**L1 不可能成立**）。
+2. `lessons {"total":0,"added":[],"written":0}` ⇒ 落盘库就是 `{"lessons": []}`（现有 8 种 kind 覆盖不到「`stuck` 收尾 + leftover 而 `failed=0`」这种最典型退化形态）。
+3. `cannot_afford {"money":88,"seed_price":20,…}` 而当天更早已用 88g 买到 10 个 Wheat Seeds ⇒ 判据按「买满 `--buy-count`」算账，钱只够买一半时**当天一粒不买**。
+> 好消息（同一次真机取证）：经济闭环前四腿已跑通（`sell{need_slot}` 腾格 → 自动跳过春季 `472` → 买当季 `(O)483` → 播种 4→13；次日出货到账 88→415 → 再买 10 个），窗外干作物 `[12,30]`/`[60,29]` 也浇成 `ok`。
+
+## 1. 卡片
+| 卡 | 内容 | 归属 | 是否本版 |
+|---|---|---|---|
+| task-121 | `REVIEW_MAX_TOKENS` 512→4096 + 截断自愈重试 1 次（8192）+ 失败留 `max_tokens`/`attempts` | dev-coder | ✅ |
+| task-122 | 教训库新增 `stuck_with_leftover` / `plot_exhausted` 两类（含"干净日仍然 0 条"用例） | dev-coder | ✅ |
+| task-123 | 买种子量力而行（`n=min(buy_count, money//price)`，`n>=1` 则 `buy_partial`） | dev-coder | ✅ |
+| task-101 | `_farm_totals` 类型校验（`"abc"` 会让整天崩）、窗口全死苗 `watered_outdoor` 字段级收口 | dev-coder | 择机 |
+| task-107 | Mod `farm.dryTiles` 与 `farm.dryCrops` 同源 + `scanSeq` | dev-coder | 择机 |
+| task-109 | 卖货如实性（`need_slot` 分支不可达/卖了最大叠）+ 卖后刷新 obs | dev-coder | 择机 |
+| task-110 | `ensure_location` 无 try/except ⇒ `BridgeError` 穿出 `run()`（老洞，无 finish/day_end） | dev-coder | 择机 |
+| task-117 | 教训库合并后 `count` 重钳 + 同 id 合并不得掉出持久化库 | dev-coder | 择机 |
+
+## 2. 冻结与装机（九步，Lead 独占）
+1. 确认 §1 标记 ✅ 的卡片全部 completed，且 task-122（口径/素材类）过了独立对抗验收。
+2. `tools/_note-0729.txt`：首串必须是 `v0.7.29（…）`，逐条写本版内容。
+3. `python tools\_bump-mod-version.py 0.7.29 --note-file tools\_note-0729.txt` ⇒ `json.load` 核对 `manifest.json` 的 Version（脚本末句在 cp1252 下会 `UnicodeEncodeError`、退出码 1，**版本已写盘**）。
+4. `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.29"`（注释列本版内容）。
+5. `dotnet build .\mod\AgentFarm.Bridge\AgentFarm.Bridge.csproj -c Release --nologo --no-incremental` ⇒ 必须 0 警告 0 错误（本版若 **Mod 无源码改动**则只 bump 版本号）。
+6. `git add -A && git commit`（工作树必须干净，`check-release` 会把未跟踪 scratch 算脏）。
+7. `python tools\check-release.py --expect 0.7.29` ⇒ 六项全绿（manifest==brain==0.7.29、dll 不比源码旧、`py_compile`、全量单测 OK、树干净）。
+8. `python tools\deploy-mod.py --no-quit` ⇒ 看 `modVersion=0.7.29` + 自动读档成功。
+9. `python -m agentfarm goto Farm --no-focus` → `python tools\preflight.py --expect 0.7.29 --save-baseline logs\run9b-baseline.json` ⇒ 四项全绿。
+
+## 3. 真机跑法（本版的核心目的：把演进素材链跑通）
+1. **重跑 run A**（因为 0.7.28 的 run9 攒不到教训）：`logs\longrun-3day-llm-run9b.jsonl`，脱离式起跑器，**不做操作员预置**。
+   - 关注：`review_llm`（成功、有 `notes`）与 `lessons {"added":[…],"total":≥1,"written":≥1}` 必须出现；`review_llm_failed` 允许出现但**不许每天都失败**。
+2. **run B（run10）**：run A 收工后**同一存档线继续**跑 `logs\longrun-3day-llm-run10.jsonl`（唯一差异 = journal 路径 ⇒ 教训/笔记/决策史不同）。
+   - 判据见 `docs/_run10-criteria.md` 的 **L1–L5**；对照取证用 `python tools\compare-runs.py --run-a logs\longrun-3day-llm-run9b.jsonl --run-b logs\longrun-3day-llm-run10.jsonl`。
+3. 两次 run 都要：起跑前 `scratch\run8-snapshot.py --tag start`（显式传 `--pid-file`，脚本默认 PID 候选写死 run8！）、结束后 `--tag end` + 冻结 SMAPI 窗口 + `docs\_runN-evidence.md`（两侧工具原文 + 外部证据 + 本版关注项）。
+
+## 4. 本版判据
+- 硬：全量单测 0 红；`check-release` 六绿；装机 `modVersion` 一致。
+- 主目标（P3 ⑥）：尾部窗口连续 **3 个游戏日 VERIFIED** + 四腿（清障/开垦/播种/浇水）+ **经济闭环**（卖→到账→买→种 四步留痕）。
+- 演进：L1–L5（`docs/_run10-criteria.md`）；**L1–L3 任一不成立 ⇒ 写"不足以判定自我进化"**，不许含糊。
+- 不变量：`day_after` 推进 ∧ `ok_steps==0` ∧ `verified==true` 三者绝不同时（`_stuck_flush` 有界例外）。
+- 缺失字段一律【无法判定】，**缺失 ≠ 通过**。
+
+## 5. 与 run9 对比（填表）
+| 项 | run9（0.7.28，run A） | run9b（0.7.29，run A） | run10（run B） |
+|---|---|---|---|
+| `review_llm` 成功次数 | 0（全部 truncated） | | |
+| `lessons.total` / `written` | 0 / 0 | | |
+| 经济闭环四腿 | 卖✅ 到账✅ 买✅ 种✅（首日） | | |
+| 尾部 VERIFIED 天数 | 待 run9 收尾 | | |
+| `unreachable`/`stuck` 形态 | day1 stuck（剩 2 格） | | |
+
+## 6. 遗留
+- task-101 / 107 / 109 / 110 / 117（若本版未做，顺延到 0.7.30）。
+- task-14（逐帧 warp 活锁，run7/8 仍上千次 `Warping to Farm`）、task-18、task-53、task-83（田块规整）、task-98。
+- run9 现场若再现"真·够不着的活苗"，当天如实 `gave_up_dry`/不 VERIFIED（不许洗白）。
