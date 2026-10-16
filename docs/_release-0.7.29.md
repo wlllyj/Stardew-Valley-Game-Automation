@@ -70,3 +70,20 @@ run9（0.7.28）**已收尾，实测 0/5 VERIFIED**：`finish {"code":1,"verifie
 - task-101 / 107 / 109 / 110 / 117（若本版未做，顺延到 0.7.30）。
 - task-14（逐帧 warp 活锁，run7/8 仍上千次 `Warping to Farm`）、task-18、task-53、task-83（田块规整）、task-98。
 - run9 现场若再现"真·够不着的活苗"，当天如实 `gave_up_dry`/不 VERIFIED（不许洗白）。
+
+## 7. 冻结与装机执行记录（2026-10-16 晚，Lead 独占）
+
+### 7.1 冻结
+- **放行闸门**：task-121 `9a4da64` / task-122 `affa7c8` / task-123 `25e9931` / task-124 `08a2ae0` / task-129 `2618166`（P0 落盘）/ task-130 `884f3a8` / task-132 `65699a1` 全部 completed；独立对抗验收 task-125 `693e4d2`（121 PASS-WITH-NITS / 122 PASS / 123 当时**未交付** FAIL / 124 PASS-WITH-NITS）⇒ 123 交付后全量归零。
+- `tools/_note-0729.txt` 首串 `v0.7.29（run9 复盘：跨日落盘闸门 + review 空转兜底 + 教训素材链）`；`python tools\_bump-mod-version.py 0.7.29 --note-file tools\_note-0729.txt` ⇒ **manifest 0.7.28 → 0.7.29**（一律 `json.load` 核对）；`brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.29"`。
+- `dotnet build .\mod\AgentFarm.Bridge\AgentFarm.Bridge.csproj -c Release --nologo --no-incremental` ⇒ **0 警告 0 错误**；`AgentFarm.Bridge.dll` **177664 B @21:57:37**、`manifest.json` **26454 B**。
+- 冻结提交 **`06c4426`**；`tools\check-release.py --expect 0.7.29` ⇒ **六项全绿**（`manifest==brain==0.7.29`、dll 不比源码旧、`py_compile` 22 文件、**全量 `Ran 730 tests` OK**、工作树干净）。
+
+### 7.2 装机与基线
+- `python tools\deploy-mod.py --no-quit` ⇒ **0.7.28 → 0.7.29**（桥 `modVersion=0.7.29 port=17890`，自动读档 `Wahaha_450799035` → FarmHouse(9,9)）。
+- `python -m agentfarm goto Farm --no-focus` ⇒ ok **7595ms**（hop1 `source=[3,12] landing=[64,15]`）。
+- `python tools\preflight.py --expect 0.7.29 --save-baseline logs\run9b-baseline.json` ⇒ **✅ 可以起跑**：第1年 **夏13日 06:10 / lightning / Farm(64,15)** / 体力 270/270 / 血 100 / **钱 188g** / 农场[草393 石110 枝65 树427 耕地81 作物6] / `unwateredCrops 2` / `dryCrops 0` / `farmComplete true` / `waterLeft 32` / `tillableCount 142` / `tileCount 400` / `tilesTruncated true` / `activeMenu null` / `isModal false` / `worldAdvancing true`。**不做操作员预置**。
+
+### 7.3 起跑（run9b = run A）
+- machine-runner 用**脱离式**起跑器（`tools\start-detached-longrun.py`，`logs\longrun-3day-llm-run9b.*`）：起跑 **2026-10-16 21:59:55**，`--tag start` 快照已写；首日控制台已见经济闭环前两腿 —— `腾格子：卖了 1 叠共 1 个材料` → `补种子：没成交：472 item_not_sold`（夏季不在售）→ **`买到 10 个 (O)483（钱 188→88；货架 30 条）`** → 作业区 `field_ne` [55,20]（25 格）。
+- 硬判据见 §4：**落盘五串配对 + 存档 size/mtime 前进**（run9 就是死在这）、**L0 教训库非空**、尾部 3 日 VERIFIED、两侧工具同向、`strict_verdict` 并列。
