@@ -714,8 +714,12 @@ class LongRun:
         self.buy_no_space_noted = False
         self.slot_sold_today = False
         self.farm_actions_today = 0
+        #: 【task-114 NIT-1】撞上 `no_inventory_space` 那一刻的**真实观测**（空格/种子/钱），
+        #: 供当晚教训的 `evidence` 引用 —— 教训里绝不许写死"空格=0"这类常量。
+        self.buy_no_space_facts: dict[str, Any] = {}
 
     # ------------------------------------------------------------------ 小工具
+
     def _mark_no_target(self, task: str) -> None:
         """记下"这个任务今天一格目标都拿不出来"，按作用域分账（见 `WIDE_TASKS`）。"""
         if task in WIDE_TASKS:
@@ -1646,17 +1650,31 @@ class LongRun:
 
     # ------------------------------------------------------------------ 跨日教训库（task-82）
     def _lessons_load(self) -> None:
-        """懒加载教训库（一次）。读不了 ⇒ 记一笔 `lessons_load_failed`，当作"没有教训"继续跑。"""
+        """懒加载教训库（一次）。读不了 ⇒ 记一笔 `lessons_load_failed`，当作"没有教训"继续跑。
+
+        【task-114 F1】载入走 `planner.load_lessons_file` 的 schema 校验（只认自己写出去的
+        格式）；被丢掉的条目**必须留痕** ⇒ 记 `lessons_rejected`（`path`/`dropped`/`reasons`）。
+        信任边界：这个文件是我们自己写自己读的，但一旦被外部改过，里面的自由文本会原样进
+        提示词 ⇒ 一律按不可信处理（未知 kind、结构不符、超长、多行、抬高 severity 都会被洗掉）。
+        """
         if self.lessons_loaded:
             return
         self.lessons_loaded = True
         if self.lessons_path is None:
             return
-        lessons, err = load_lessons_file(self.lessons_path)
+        report: dict[str, Any] = {}
+        lessons, err = load_lessons_file(self.lessons_path, report=report)
         self.lessons = lessons
         if err:
             self._journal("lessons_load_failed", path=str(self.lessons_path), error=err,
                           note="教训库读不了 ⇒ 本次当作没有教训（绝不影响判定）")
+        dropped = int(report.get("dropped") or 0)
+        reasons = list(report.get("reasons") or [])
+        if dropped or reasons:
+            self._journal("lessons_rejected", path=str(self.lessons_path), dropped=dropped,
+                          reasons=reasons, kept=len(lessons),
+                          note="教训库只认自己写出去的 schema ⇒ 不合格条目被丢弃/截断；"
+                               "外部改过的内容一律不可信（task-114 F1）")
 
     def _lessons_from_day(self, rep: DayReport) -> list[dict[str, Any]]:
         """把今天的**客观账本**拍成教训（代码写事实；不写回执、不写坐标）。
@@ -1703,10 +1721,22 @@ class LongRun:
                                    evidence=f"dead_crops={int(getattr(rep, 'dead_crops', 0) or 0)} "
                                             f"dry_dead={int(rep.dry_dead or 0)}"))
         if self.buy_no_space_today:
+            # 【task-114 NIT-1】evidence 用**当次观测真值**（`buy_no_space_facts`），
+            # 观测不到的字段就写"未观测到" —— 绝不写死常量、也绝不伪造。
+            facts = dict(getattr(self, "buy_no_space_facts", {}) or {})
+            fs_status = str(facts.get("free_slots_status") or "unavailable")
+            free_txt = (f"{int(facts.get('free_slots') or 0)}/{fs_status}"
+                        if facts.get("free_slots_status") else "未观测到")
+            seeds_txt = (str(int(facts.get("seeds") or 0))
+                         if "seeds" in facts else "未观测到")
+            money_txt = (f"{int(facts.get('money') or 0)}g"
+                         if "money" in facts else "未观测到")
+            item_txt = str(facts.get("item") or "")
             out.append(make_lesson(kind="no_inventory_space", scope="buy", day_key=rep.day_key,
                                    day_seq=seq, hint=hint,
                                    symptom="钱够但背包没有空格，种子买不进来（要先卖一叠腾格）",
-                                   evidence="空格=0 且 seeds=0"))
+                                   evidence=f"free_slots={free_txt} seeds={seeds_txt} "
+                                            f"money={money_txt} item={item_txt or '未观测到'}"))
         if rep.slept_without_work:
             out.append(make_lesson(kind="slept_without_work", scope="day", day_key=rep.day_key,
                                    day_seq=seq, hint=hint,
@@ -2409,9 +2439,24 @@ class LongRun:
                       available=len(st.available))
         if st.code == "no_space":
             self.buy_no_space_today = True
-            _free, fs_status = player_free_slots(FarmWorker.player_of(self._snap()))
+            # 【task-114 NIT-1】把**当次观测真值**记下来：教训的 `evidence` 直接引用它，
+            # 不许再写死"空格=0 且 seeds=0"（deputy Z10 里真实 `free_slots=8`，
+            # 写死的串会让账本自相矛盾、也没法解释到底卡在哪）。
+            facts_obs = self._snap()
+            facts_player = FarmWorker.player_of(facts_obs)
+            free_now, fs_status = player_free_slots(facts_player)
+            seeds_now = sum(n for _i, _nm, n in seed_items(facts_player))
+            self.buy_no_space_facts = {
+                "free_slots": int(free_now),
+                "free_slots_status": fs_status,
+                "seeds": int(seeds_now),
+                "money": int(FarmWorker.money(facts_obs)),
+                "item": item,
+                "price": int(price),
+            }
             self._journal("buy_no_space", item=item, price=price, source=source,
                           attempt=self.buy_attempts_today, free_slots_status=fs_status,
+                          free_slots=int(free_now), seeds=int(seeds_now),
                           reason=st.reason,
                           note="背包没有空格 ⇒ 当天不再重试 buy（run8 一天 13 次同堵墙）；"
                                "腾格路径见 `surplus_sell{why=need_slot}`，或等次日结算后背包腾出来")
@@ -3514,6 +3559,7 @@ class LongRun:
         self.buy_no_space_noted = False
         self.slot_sold_today = False
         self.farm_actions_today = 0
+        self.buy_no_space_facts = {}
         self.dead_scope_noted = set()
         # 【task-59】复盘每天最多一次（`recent_notes` **不**在这里清：它是"昨晚留给今天"的，
         # 由 `_review_before_sleep` 在夜里覆盖）。

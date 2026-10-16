@@ -77,7 +77,8 @@ __all__ = [
     "REVIEW_SYSTEM_PROMPT", "parse_review_notes", "build_review_messages",
     # 【task-82】跨日教训库（客观事实由代码写、hint 只许 LLM 写；只喂提示词，不参与判定）
     "LESSONS_MAX", "LESSONS_INJECT_MAX", "LESSONS_INJECT_CHARS", "LESSONS_SECTION_MAX_CHARS",
-    "LESSON_SEVERITY", "make_lesson", "prune_lessons", "render_lessons",
+    "LESSON_SEVERITY", "LESSON_TEXT_MAX_CHARS", "LESSONS_REJECT_REASONS_MAX",
+    "make_lesson", "prune_lessons", "render_lessons",
     "load_lessons_file", "save_lessons_file",
     "BoundaryPlanner", "PLAN_SCHEMA_EXAMPLE",
 ]
@@ -435,6 +436,13 @@ LESSON_SEVERITY: dict[str, int] = {
     "stage_incomplete": 1,
 }
 LESSON_SEVERITY_DEFAULT = 1
+#: 【task-114 F1】从磁盘读回来的教训**只认自己写出去的 schema**：单条文本字段上限
+#: （载入时截断）与一次最多记几条拒收原因。
+#: 信任边界：`*-lessons.json` 是"自己写、自己读"的文件 —— 一旦被人（或别的进程）改过，
+#: 里面的自由文本会**原样进提示词**，所以载入按最坏情况处理：未知 kind、结构不符、
+#: 超长文本、多行注入、`severity` 被抬高、坐标样式，全部洗掉或整条丢弃。
+LESSON_TEXT_MAX_CHARS = 160
+LESSONS_REJECT_REASONS_MAX = 6
 
 #: 【task-59】复盘专用 system 提示词。和主决策提示词完全分开：它**不做决策**，
 #: 只让模型对着当天简报写 1–3 条给明天的短笔记（禁坐标、禁长篇行动计划）。
@@ -652,10 +660,94 @@ def render_lessons(
     return text if text != head else ""
 
 
-def load_lessons_file(path: Any) -> tuple[list[dict[str, Any]], str]:
+def _clean_lesson_text(value: Any, *, field: str, notes: list[str]) -> str | None:
+    """洗一个教训文本字段：单行、限长、无坐标。类型不对 ⇒ `None`（整条丢）。
+
+    **折叠换行是多行注入的第一道闸**：`render_lessons()` 把每条教训渲染成一行，
+    如果文本里带着换行，外部改过的文件就能伪造出"额外的教训行/系统指令行"。
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        notes.append(f"bad_text:{field}")
+        return None
+    text = _strip_coordinates(" ".join(value.split()))
+    if len(text) > LESSON_TEXT_MAX_CHARS:
+        text = text[:LESSON_TEXT_MAX_CHARS]
+        notes.append(f"truncated:{field}")
+    return text
+
+
+def _sanitize_lesson(raw: Any, *, notes: list[str]) -> dict[str, Any] | None:
+    """把**从磁盘读回**的一条教训校验成自己的 schema；不合格 ⇒ `None`（丢）。
+
+    【task-114 F1】信任边界见 `LESSON_TEXT_MAX_CHARS` 的注释。逐条要求：
+    `kind` 必须是已知 kind、`id` 必须等于 `f"{kind}|{scope}"`、`count`/`last_seq`
+    必须是真整数（`bool` 不算）、三个文本字段必须是字符串且限长 + 折叠换行 + 洗坐标、
+    `symptom` 不能为空，`severity` **一律由 kind 重算**（文件里那个数不可信 ⇒ 否则
+    外部能把任意一条抬到最高优先级、把真教训挤出 20 条上限）。
+    """
+    if not isinstance(raw, Mapping):
+        notes.append("not_a_mapping")
+        return None
+    kind = raw.get("kind")
+    if not isinstance(kind, str) or kind not in LESSON_SEVERITY:
+        notes.append("unknown_kind")
+        return None
+    scope = raw.get("scope")
+    if scope is None:
+        scope = ""
+    if not isinstance(scope, str):
+        notes.append("bad_scope")
+        return None
+    if str(raw.get("id") or "") != f"{kind}|{scope}":
+        notes.append("id_mismatch")
+        return None
+    symptom = _clean_lesson_text(raw.get("symptom"), field="symptom", notes=notes)
+    evidence = _clean_lesson_text(raw.get("evidence"), field="evidence", notes=notes)
+    hint = _clean_lesson_text(raw.get("hint"), field="hint", notes=notes)
+    if symptom is None or evidence is None or hint is None:
+        return None
+    if not symptom:
+        notes.append("empty_symptom")
+        return None
+    count = raw.get("count", 1)
+    last_seq = raw.get("last_seq", 0)
+    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+        notes.append("bad_count")
+        return None
+    if not isinstance(last_seq, int) or isinstance(last_seq, bool):
+        notes.append("bad_seq")
+        return None
+    first_day = _day_key_values(raw.get("first_day"))
+    last_day = _day_key_values(raw.get("last_day")) or list(first_day)
+    return {
+        "id": f"{kind}|{scope}",
+        "kind": kind,
+        "scope": scope,
+        "symptom": symptom,
+        "evidence": evidence,
+        "hint": hint,
+        "count": count,
+        "first_day": first_day,
+        "last_day": last_day,
+        "last_seq": last_seq,
+        "severity": int(LESSON_SEVERITY.get(kind, LESSON_SEVERITY_DEFAULT)),
+    }
+
+
+def load_lessons_file(path: Any,
+                      *, report: dict[str, Any] | None = None) -> tuple[list[dict[str, Any]], str]:
     """读跨日教训库（task-82）。**绝不抛**：成功 ⇒ `(lessons, "")`；缺文件 ⇒ `([], "")`；
     读不了/不是 JSON/结构不对 ⇒ `([], 原因串)`（调用方记一笔 journal 后照常跑）。
+
+    【task-114 F1】读回来的每条都过 `_sanitize_lesson()`（只认自己的 schema）。
+    传了 `report` 字典时回填 `{"dropped": 丢了几条, "reasons": [原因…]}`，调用方据此记
+    `lessons_rejected` —— **不静默**是这条修法的另一半：丢了多少、为什么丢，账本里要看得到。
     """
+    if report is not None:
+        report["dropped"] = 0
+        report["reasons"] = []
     try:
         p = Path(path)
     except Exception as exc:  # noqa: BLE001
@@ -670,7 +762,25 @@ def load_lessons_file(path: Any) -> tuple[list[dict[str, Any]], str]:
         raw = raw.get("lessons")
     if not isinstance(raw, list):
         return [], "not_a_list"
-    return prune_lessons([it for it in raw if isinstance(it, Mapping) and it.get("id")]), ""
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    reasons: list[str] = []
+    for item in raw:
+        notes: list[str] = []
+        clean = _sanitize_lesson(item, notes=notes)
+        if clean is None:
+            dropped += 1
+        else:
+            kept.append(clean)
+        for why in notes:
+            if why.startswith("truncated:") and clean is not None:
+                reasons.append(why)          # 截断不算丢条，只如实记一笔
+            elif clean is None:
+                reasons.append(why)
+    if report is not None:
+        report["dropped"] = dropped
+        report["reasons"] = reasons[:LESSONS_REJECT_REASONS_MAX]
+    return prune_lessons(kept), ""
 
 
 def save_lessons_file(path: Any, lessons: Iterable[Mapping[str, Any]] | None) -> str:
@@ -920,19 +1030,22 @@ class Brief:
         2. 可选节只在**本体之后**还有余量时追加，且各自有硬上限
            （教训 `LESSONS_SECTION_MAX_CHARS`、复盘笔记 `NOTES_SECTION_MAX_CHARS`、
            决策史 `DECISIONS_MAX_CHARS`）；
-        3. 余量为 0 ⇒ 该节**整节丢掉**。三节都塞不下时**先丢教训、再丢复盘笔记、
-           最后才丢决策史**（决策史带的是"我做过什么、结果如何"，最贴近判断依据；
-           三节都属于最先被裁的东西，原有简报字段一个都不许被挤掉）。
+        3. 【task-114 F2，Lead m10474 裁定】保护优先级 = **核心字段 > 教训库 > 决策史 > 复盘笔记**
+           （追加顺序即 `(lessons, decisions, notes)`）：余量不够时先丢复盘笔记、再丢决策史、
+           最后才丢教训库；核心字段一个都不许被挤掉（可选节**要么整节进、要么不进**：塞不满余量就丢它，并连同更低优先级的节一起丢，不切半节）。理由：教训是从多天账本攒出来的
+           （稀缺、跨日），决策史只覆盖最近几次边界决策，复盘笔记是当晚一次性的、丢了明天还能再写。
         """
         base = "\n".join(self.base_lines())
         tail = ""
-        for block in (self.lessons_section(), self.notes_text(), self.decisions_text()):
+        for block in (self.lessons_section(), self.decisions_text(), self.notes_text()):
             if not block:
                 continue
             room = PROMPT_BRIEF_MAX_CHARS - len(base) - len(tail) - 1
-            if room <= 0:
-                continue
-            tail += f"\n{block[:room]}"
+            if room < len(block):
+                # 【task-114 F2】高优先级的节**整节放不下** ⇒ 低优先级的一律不加
+                # （不切半节：半截的 `where=…` 行比没有更糟，也让"谁被丢了"一眼可查）。
+                break
+            tail += f"\n{block}"
         return f"{base}{tail}"[:PROMPT_BRIEF_MAX_CHARS]
 
     @classmethod
