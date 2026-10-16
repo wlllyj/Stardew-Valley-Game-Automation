@@ -863,6 +863,39 @@ python tools/analyze-longrun.py --journal logs/longrun-3day-llm-run9d.jsonl --da
 rg -n '"event": ?"blocked_by_tool' logs/longrun-*.jsonl
 ```
 
+## 3.26 预算延后与容量上限（task-163 `3762936`，task-165 收录）—— **延后 ≠ 免罚额度**
+
+### 事件与字段（brain：`brain/agentfarm/longrun.py`）
+
+| 事件 / 字段 | 字段 | 说明 |
+| --- | --- | --- |
+| `budget_deferred_tiles` | `task/count/total/targets(≤6)/note` | 日级/日初：某任务有 `count` 格被**体力预算**显式延后 ⇒ 守卫（`work_reasons`/`_pending_work`/`_leftover`）**不再**把这些格算作「还有活」（`longrun.py:1984-2018`）；`{task: n}` 汇总是 `day_end.stamina_budget.deferred_tiles`，**不在事件本体里** |
+| `stage_capped_by_capacity` | `task/limit/capacity/live_crops/dry/water_reserve/note` | stage 级：分配额被当天容量上限卡住 ⇒ 只分配 `capacity` 格（`longrun.py:2077-2095`），一天每类只发一条 |
+| `day_end.stamina_budget.deferred_tiles` | `{task: n}` | 每个任务当天被延后的格数（`longrun.py:2004`） |
+| `day_end.stamina_budget.capped_by_capacity` | `{task:{limit,capacity}}` | `longrun.py:2086-2089` |
+| `day_end.stamina_budget.capacity_capped_tasks` | int | `longrun.py:2090` |
+
+⚠️ **同名不同物**：`day_end.deferred_tiles`（int，task-134 B 的「诚实上限留下的片区待办」，`longrun.py:570`）与 `day_end.stamina_budget.deferred_tiles`（`{task: n}`，task-163 的预算延后）是**两个东西**，读账本或写判据时别混。
+
+### 口径
+- 两条事件都是**诚实留痕、不是失败、不判红、不进 rc**（`tools/verify-run3.py` 对这两名零命中 ⇒ 判红会两边反向）。延后的格**绝不**参与 `checks` / `assigned_undone` 扣减 —— **延后 ≠ 洗白**（`longrun.py:1987`）。
+- 唯一红线（task-163 的锚点）：延后只在「体力 ≤ `water_reserve` **且** 有浇水债」时生效（`_budget_deferred_tasks()` 的唯一写入点 `_note_budget_deferred()` 只在 `_budget_defer_reason()` 非空时被调用）。
+- 本工具两条可证伪 ⚠（**只警告、不进 rc**）：①当天有 `budget_deferred_tiles` 却自称「该做的都做了」（`ended_reason` 以 `no_work` 开头且 `verified=true`）⇒ 人工核对延后前提；②同日有延后但 `stamina_budget` 显示没有浇水债（`live_crops<=0` 或 `dry<=0`）⇒ 延后可能已经变成「免罚额度」。
+- 缺失行为：旧账本/旧日没有这些事件或子键 ⇒ 头部 `体力预算: <缺失>` 或行内 `预算延后事件 <缺失>` + 【无法判定】（**缺失 ≠ 0**，也绝不当作「今天没用预算」通过）。
+
+### 单测与读数
+- 单测：`tests/test_analyze_longrun.py::TestBudgetDeferralAndCapacity` 5 条 —— 两事件有桶且不落未映射 / 信息项可见且不判红（含日级子键与头部原文）/ 有延后却自称「该做的都做了」⇒ ⚠ 不判红 / 同日无浇水债 ⇒ ⚠ 不判红 / 旧账本 ⇒ `<缺失>` +【无法判定】。
+- 读数：`python -W error::SyntaxWarning -m py_compile` RC=0；`tests.test_analyze_longrun` **195 OK**（+5）；机械枚举未映射回到 **3 个结构性**（`day_start`/`day_end`/`finish`）；12 账本 rc 与 `verify-run3.py` 并排未变（`journal-green` 0/0、run2 1(19)/1、run3 1(17)/1、run5 1(62)/1、run6 1(14)/1、run7 0/0、run8 1(29)/1、run9 1(84)/1、run9b 1(45)/1、run9c 0/1 有意分歧、run9d 1(29)/1、vacuum 1(3)/1）。
+- 全量：`discover -s tests` **Ran 874 tests / OK（0 红）** ⇒ 0.7.32 的「全量 0 红」放行条件满足（task-157/158/20/163 四条漂移红全部清零）。
+
+### grep 配方
+
+```
+git grep -n "budget_deferred_tiles\|stage_capped_by_capacity" -- brain/agentfarm/
+python tools/analyze-longrun.py --journal logs/longrun-3day-llm-run9d.jsonl --days 7 | rg "体力预算|预算延后|容量上限"
+rg -n '"event": ?"budget_deferred_tiles"' logs/longrun-*.jsonl
+```
+
 ## 4. 复核命令
 
 ```
@@ -876,6 +909,6 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run9d.jsonl --da
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
 python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
-python -m unittest tests.test_analyze_longrun  # 当前 190 OK（task-164 + 工具门槛 5 条）
-python -m unittest discover -s tests           # 当前 861 条 / 1 红（dev 在制 task-161 的 TestTask161StaminaCalibration，非本工具）；task-157/158/20 的三条漂移红已随 task-160/164 清零
+python -m unittest tests.test_analyze_longrun  # 当前 195 OK（task-165 + 预算延后/容量 5 条）
+python -m unittest discover -s tests           # 当前 Ran 874 tests / OK（0 红；task-157/158/20/163 四条漂移红已随 task-160/164/165 清零）
 ```

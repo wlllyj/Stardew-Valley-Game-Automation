@@ -156,6 +156,16 @@
     `crops_watered=false`），只两条可证伪 ⚠：①说「只因预算延后」却当天自称浇完（dry=0）；
     ②日级 `deferred_by_budget>0` 却没有对应事件。旧账本没有这两个事件/字段 ⇒ `<缺失>` +
     【无法判定】（缺失 ≠ 0，绝不当作「今天没用预算」）。
+  * task-163（预算延后的活不再算「还有活」+ 容量命中可见）：`budget_deferred_tiles`（日级/日初，
+    某任务有 count 格被**体力预算**显式延后 ⇒ 守卫不再把它们算作"还有活"；`{task: n}` 语义在
+    `day_end.stamina_budget.deferred_tiles` 里）与 `stage_capped_by_capacity`（stage 级：分配额被
+    当天容量上限卡住 ⇒ 只分配 capacity 格）。日级子键还有 `capacity_capped_tasks` /
+    `capped_by_capacity{task:{limit,capacity}}`。两条都是**诚实留痕、不判红、不进 rc**
+    （`tools\verify-run3.py` 对这两名零命中）；只两条可证伪 ⚠（不进 rc）：①当天有
+    `budget_deferred_tiles` 却自称"该做的都做了"（`no_work` + `verified=true`）⇒ 人工核对
+    「延后是否真的只发生在体力 ≤ water_reserve **且** 有浇水债时」（task-163 的红线锚点）；
+    ②同日有延后但 `stamina_budget` 显示没有浇水债（`live_crops<=0` 或 `dry<=0`）⇒ 延后可能
+    已经变成"免罚额度"。缺失 ⇒ `<缺失>` +【无法判定】（缺失 ≠ 0）。
   * task-20 / task-164（clump 工具门槛）：`blocked_by_tool`（逐格：工具等级/种类不够、或 `toolOk`
     判不出 ⇒ fail-closed）与 `blocked_by_tool_summary`（日级汇总）只作**信息项** —— 它们是**动手
     之前**就拦下的诚实跳过（0 次 `use_tool`、不进 `unreachable`/`refused` 两套豁免、也不算"活"、
@@ -506,6 +516,18 @@ FIELD_PROBES = [
      "但同一批格当天仍被算成浇完 / 自称 crops_watered=true 而 dry>0 ⇒ 账本自相矛盾（⚠ 不进 rc）"),
     ("day_end.stamina_budget", "stamina_budget_day",
      "日级体力预算留痕（dict，task-158；缺字段 ⇒【无法判定】，绝不当作「今天没用预算」）"),
+    # task-163（预算延后的活不再算「还有活」+ 容量命中可见）：两个**诚实留痕**事件 + 日级子键。
+    # 都不判红、不进 rc；唯一要人工核对的红线是「延后只在体力 ≤ water_reserve **且** 有浇水债时生效」。
+    ("event:budget_deferred_tiles", "budget_deferred_tiles",
+     "日级/日初：某任务有 count 格被**体力预算**显式延后（task/count/total/targets）⇒ 守卫不再把它们"
+     "算作『还有活』；**不判红**，但当天自称 `no_work`+`verified=true` ⇒ ⚠ 人工核对延后前提"),
+    ("event:stage_capped_by_capacity", "stage_capped_by_capacity",
+     "stage 级：分配额被当天体力预算的容量上限卡住（task/limit/capacity/live_crops/dry/water_reserve）"
+     "⇒ 只分配 capacity 格；**不是失败、不判红**，一天每类只发一条"),
+    ("day_end.stamina_budget.deferred_tiles", "stamina_budget_deferred_tiles",
+     "日级 `{task: n}`：每个任务当天被预算延后的格数（缺 ⇒【无法判定】，缺失 ≠ 0）"),
+    ("day_end.stamina_budget.capacity_capped_tasks", "stamina_budget_capacity_capped_tasks",
+     "日级 int：当天有几类任务的分配额被容量上限卡住（配 `capped_by_capacity{task:{limit,capacity}}`）"),
     # task-144（dev-coder 在制）：壶空先补水、再把"这一轮没成事的已分配格"原样重跑；以及
     # `stopped==""` 与"分配过却没成事"不再共存（补如实 stop 原因）。两者都**不判红**。
     ("event:refill_retry", "refill_retry",
@@ -752,6 +774,12 @@ EVENT_BUCKETS = {
     "water_far_blocked": "water_far_blocks",
     "stamina_budget": "stamina_budgets",
     "deferred_by_budget": "deferred_by_budgets",
+    # task-163：预算延后的活不再算「还有活」（`budget_deferred_tiles`，日级/日初，`{task: n}` 语义）
+    # + 容量上限命中可见（`stage_capped_by_capacity`，stage 级）。都是**诚实留痕、不判红、不进 rc**
+    # （`tools/verify-run3.py` 对这两名零命中 ⇒ 判红会两边反向）；唯一 ⚠ 是「当天有延后却自称
+    # no_work+VERIFIED ⇒ 核对延后前提：体力 ≤ water_reserve **且** 有浇水债」。
+    "budget_deferred_tiles": "budget_deferred_tiles_events",
+    "stage_capped_by_capacity": "stage_capped_by_capacities",
     # task-20 / task-164（工具门槛）：clump 工具等级/种类不够（或判不出）⇒ 当天封格、0 次 use_tool。
     # 逐格 `blocked_by_tool` + 日级 `blocked_by_tool_summary`。**诚实跳过、不判红、不进 rc**
     # （`tools/verify-run3.py` 对这两名零命中 ⇒ 判红会两边反向），只提示人工核对。
@@ -830,6 +858,7 @@ NEW_EVENT_BUCKETS = (
     "water_far_opens", "water_far_blocks",
     # task-158：体力预算（每天一条 + 只因预算被延后；都不是失败，只解释"为什么今天不浇"）
     "stamina_budgets", "deferred_by_budgets",
+    "budget_deferred_tiles_events", "stage_capped_by_capacities",
     # task-20 / task-164：工具门槛封格（逐格 + 日级汇总；诚实跳过、不进守卫理由、不判红）
     "blocked_by_tools", "blocked_by_tool_summaries",
 )
@@ -2680,6 +2709,14 @@ def build_advice(report, top=8):
             f"（共 {sbv.get('deferred_total', 0)} 格"
             + ("；任务 " + "、".join(f"{k}×{v}" for k, v in list((sbv.get('defer_tasks') or {}).items())[:4])
                if sbv.get("defer_tasks") else "") + "）",
+            f"预算延后 budget_deferred_tiles {sbv.get('budget_defer_events', 0)} 条"
+            f"（{sbv.get('budget_defer_tiles', 0)} 格；任务 "
+            f"{'、'.join(f'{k}×{v}' for k, v in list((sbv.get('budget_defer_tasks') or {}).items())[:4]) or '<缺失>'}）",
+            (f"容量上限 stage_capped_by_capacity {sbv.get('capacity_events', 0)} 次"
+             f"（任务 {'、'.join(list((sbv.get('capacity_tasks') or {}).keys())[:4]) or '<缺失>'}"
+             f"；日级 capacity_capped_tasks {sbv.get('capacity_capped_tasks', 0)}）"
+             if (sbv.get("capacity_events") or sbv.get("capacity_capped_tasks"))
+             else "容量上限 stage_capped_by_capacity <缺失>（旧账本 / 当天未命中）"),
         ]
         if not sbv.get("has_day_field"):
             _bparts.append("日级 `day_end.stamina_budget` <缺失>（旧账本 ⇒ 只能看事件口径）")
@@ -2689,14 +2726,27 @@ def build_advice(report, top=8):
         if sbv.get("warn_defer_missing_lines"):
             _bparts.append(f"⚠ 日级 deferred_by_budget>0 却没有对应的 deferred_by_budget 事件：行 "
                            f"{sbv['warn_defer_missing_lines'][:6]}（留痕不一致，只警告）")
+        if sbv.get("warn_defer_tiles_but_no_work_lines"):
+            _bparts.append(f"⚠ 当天有预算延后（budget_deferred_tiles）却自称「该做的都做了」"
+                           f"（no_work + VERIFIED）⇒ 人工核对「延后是否只发生在体力 ≤ water_reserve"
+                           f" **且** 有浇水债时」：行 {sbv['warn_defer_tiles_but_no_work_lines'][:6]}（只警告）")
+        if sbv.get("warn_defer_without_debt_lines"):
+            _bparts.append(f"⚠ 当天有预算延后但 stamina_budget 显示没有浇水债（live_crops/dry ≤ 0）"
+                           f"⇒ 延后可能变成「免罚额度」：行 "
+                           f"{sbv['warn_defer_without_debt_lines'][:6]}（只警告）")
         advice.append({
             "text": "体力预算/只因预算而不做（信息项，**不是失败**）：" + "；".join(_bparts)
-                    + "。verify-run3.py 对 `stamina_budget` / `deferred_by_budget` 零命中 ⇒ "
+                    + "。verify-run3.py 对 `stamina_budget` / `deferred_by_budget` / "
+                      "`budget_deferred_tiles` / `stage_capped_by_capacity` 零命中 ⇒ "
                       "本工具不判红、不进 rc；当天达不达标由 `checks.watered_outdoor` / "
-                      "`checks.no_unmet_stages` 说话；旧账本没有这两个事件 ⇒【无法判定】（缺失 ≠ 0）",
+                      "`checks.no_unmet_stages` 说话；旧账本没有这些事件 ⇒【无法判定】（缺失 ≠ 0）",
             "lines": sorted(set((sbv.get("lines") or []) + (sbv.get("defer_lines") or [])
+                                + (sbv.get("budget_defer_lines") or [])
+                                + (sbv.get("capacity_lines") or [])
                                 + (sbv.get("warn_deferred_but_watered_lines") or [])
-                                + (sbv.get("warn_defer_missing_lines") or []))),
+                                + (sbv.get("warn_defer_missing_lines") or [])
+                                + (sbv.get("warn_defer_tiles_but_no_work_lines") or [])
+                                + (sbv.get("warn_defer_without_debt_lines") or []))),
         })
     # 0v) task-20 / task-164：工具门槛封格（clump 工具等级/种类不够）—— **诚实跳过**（0 次 use_tool）、
     #     **不判红、不进 rc**；只一条可证伪 ⚠（自称 no_work 却存在工具门槛封格 ⇒ 人工核对）。
@@ -3128,12 +3178,20 @@ def build_undecidable(rows, sessions, prelude, report):
         out.append("task-157 事件存在但没进聚合（工具 bug 迹象）：无法判定开路/够不着计数")
     _t158_ev = [ev for _ln, ev in rows if ev.get("event") == "stamina_budget"]
     _t158_def = [ev for _ln, ev in rows if ev.get("event") == "deferred_by_budget"]
-    if not _t158_ev and not _t158_def and not (report.get("stamina_budget") or {}).get("has_day_field"):
-        out.append("本账本没有任何 task-158 的 `stamina_budget` / `deferred_by_budget` 事件、"
+    _t163_ev = [ev for _ln, ev in rows
+                if ev.get("event") in ("budget_deferred_tiles", "stage_capped_by_capacity")]
+    if not _t158_ev and not _t158_def and not _t163_ev and not (report.get("stamina_budget") or {}).get("has_day_field"):
+        out.append("本账本没有任何 task-158/163 的 `stamina_budget` / `deferred_by_budget` / "
+                   "`budget_deferred_tiles` / `stage_capped_by_capacity` 事件、"
                    "day_end 也没有 `stamina_budget` 字段 ⇒ 无法判定「今天不浇是不是因为体力预算」"
-                   "—— **缺失 ≠ 0，绝不当'今天没用预算'通过**（task-158）")
-    elif (_t158_ev or _t158_def) and not (report.get("stamina_budget") or {}).get("has_events"):
-        out.append("task-158 事件存在但没进聚合（工具 bug 迹象）：无法判定体力预算计数")
+                   "—— **缺失 ≠ 0，绝不当'今天没用预算'通过**（task-158/163）")
+    elif (_t158_ev or _t158_def or _t163_ev) and not (report.get("stamina_budget") or {}).get("has_events"):
+        out.append("task-158/163 事件存在但没进聚合（工具 bug 迹象）：无法判定体力预算/延后/容量计数")
+    _t163_day = (report.get("stamina_budget") or {}).get("has_defer_tiles_field")
+    if _t163_ev and not _t163_day:
+        out.append("有 `budget_deferred_tiles` / `stage_capped_by_capacity` 事件，但 day_end 的 "
+                   "`stamina_budget.deferred_tiles` / `capacity_capped_tasks` 都没读到 ⇒ "
+                   "无法判定日级延后格数（缺失 ≠ 0，绝不当 0 通过；task-163）")
     # task-20 / task-164：工具门槛封格（clump 工具等级/种类不够 ⇒ 动手前拦下、0 次 use_tool）。
     _t164_ev = [ev for _ln, ev in rows if ev.get("event") == "blocked_by_tool"]
     _t164_sum = [ev for _ln, ev in rows if ev.get("event") == "blocked_by_tool_summary"]
@@ -4038,6 +4096,75 @@ def build_report(rows, path, args, bad_lines):
     # 口径：**诚实跳过、不判红、不进 rc**（不进 unreachable/refused 两套豁免、也不算"活"）；
     # 唯一可证伪 ⚠：当天自称 `no_work`（`ended_reason` 以 no_work 开头）却存在工具门槛封格 ⇒
     # 提示人工核对「是真敲不动，还是工具够却判不出」（brain 有意不让它进守卫理由，见 longrun.py:2625-2627）。
+    # task-163（`budget_deferred_tiles` / `stage_capped_by_capacity`）：体力预算的两条**诚实留痕**
+    # （task-158 的延伸）。口径不变：**不判红、不进 rc**（当天达不达标由 checks 说话）；两条可证伪 ⚠：
+    #   ① 当天有 `budget_deferred_tiles` 却自称「该做的都做了」（`no_work` + `verified=true`）
+    #      ⇒ 人工核对「延后是否真的只发生在有浇水债时」（task-163 的红线锚点）；
+    #   ② 同一天有 `budget_deferred_tiles`，但 `day_end.stamina_budget` 显示 `live_crops<=0`
+    #      或 `dry<=0`（没有浇水债）⇒ 延后可能已经变成「免罚额度」，同样只警告。
+    #   缺字段 ⇒【无法判定】（缺失 ≠ 0）。
+    _bdt_events = [(ln, ev) for ln, ev in rows if ev.get("event") == "budget_deferred_tiles"]
+    _cap_events = [(ln, ev) for ln, ev in rows if ev.get("event") == "stage_capped_by_capacity"]
+    stamina_budget["warn_defer_tiles_but_no_work_lines"] = []
+    stamina_budget["warn_defer_without_debt_lines"] = []
+    _bdt_tasks: dict[str, int] = {}
+    _bdt_count = 0
+    for _ln, ev in _bdt_events:
+        _task = str(ev.get("task") or "?")
+        _cnt = as_int(ev.get("count"), 0) or 0
+        _bdt_count += int(_cnt)
+        _tot = as_int(ev.get("total"), None)
+        _bdt_tasks[_task] = max(_bdt_tasks.get(_task, 0), int(_cnt if _tot is None else _tot))
+    _cap_tasks: dict[str, dict] = {}
+    for _ln, ev in _cap_events:
+        _task = str(ev.get("task") or "?")
+        if _task not in _cap_tasks:
+            _cap_tasks[_task] = {"limit": as_int(ev.get("limit"), None),
+                                 "capacity": as_int(ev.get("capacity"), None)}
+    _day_bdt: dict[str, dict] = {}
+    _day_cap: dict[str, dict] = {}
+    _day_cap_n = 0
+    for _d in days:
+        _dbs = as_dict(_d.get("stamina_budget"))
+        _dt = as_dict(_dbs.get("deferred_tiles"))
+        if _dt:
+            _day_bdt[str(_d.get("label"))] = {str(k): (as_int(v, 0) or 0) for k, v in _dt.items()}
+        _cb = as_dict(_dbs.get("capped_by_capacity"))
+        if _cb:
+            _day_cap[str(_d.get("label"))] = _cb
+        _cc = as_int(_dbs.get("capacity_capped_tasks"), None)
+        if _cc:
+            _day_cap_n += int(_cc)
+    _bdt_days: dict[int, list[int]] = {}
+    for _ln, _ev in _bdt_events:
+        _lab, _di = _lr_day_of(_ln)
+        _bdt_days.setdefault(_di, []).append(_ln)
+    for _di, _lns in _bdt_days.items():
+        if _di >= len(days):
+            continue
+        _d = days[_di]
+        _dl = as_list(_d.get("day_end_lines"))
+        _anchor_line = _dl[0] if _dl else _lns[0]
+        if str(_d.get("ended_reason") or "").startswith("no_work") and _d.get("verified") is True:
+            stamina_budget["warn_defer_tiles_but_no_work_lines"].append(_anchor_line)
+        _dbs = as_dict(_d.get("stamina_budget"))
+        _live = as_int(_dbs.get("live_crops"), None)
+        _dry = as_int(_dbs.get("dry"), None)
+        if (_live is not None and _live <= 0) or (_dry is not None and _dry <= 0):
+            stamina_budget["warn_defer_without_debt_lines"].append(_anchor_line)
+    stamina_budget["budget_defer_events"] = len(_bdt_events)
+    stamina_budget["budget_defer_lines"] = [ln for ln, _ in _bdt_events]
+    stamina_budget["budget_defer_tasks"] = _bdt_tasks
+    stamina_budget["budget_defer_tiles"] = _bdt_count
+    stamina_budget["capacity_events"] = len(_cap_events)
+    stamina_budget["capacity_lines"] = [ln for ln, _ in _cap_events]
+    stamina_budget["capacity_tasks"] = _cap_tasks
+    stamina_budget["capacity_capped_tasks"] = _day_cap_n
+    stamina_budget["day_deferred_tiles"] = _day_bdt
+    stamina_budget["day_capped_by_capacity"] = _day_cap
+    stamina_budget["has_defer_tiles_field"] = bool(_day_bdt or _day_cap)
+    stamina_budget["has_events"] = bool(stamina_budget["has_events"] or _bdt_events or _cap_events
+                                        or _day_bdt or _day_cap)
     _tt_events = [(ln, ev) for ln, ev in rows if ev.get("event") == "blocked_by_tool"]
     _tt_summaries = [(ln, ev) for ln, ev in rows if ev.get("event") == "blocked_by_tool_summary"]
     tool_gate = {
@@ -4910,6 +5037,17 @@ MAPPING_TEXT = [
      "最后仍在 dryTiles 里；②有格 blocked 而当天却自称户外浇水达标（dry=0）；③说「只因预算延后」"
      "却当天自称浇完；④日级 `deferred_by_budget>0` 却没有对应事件。"
      "旧账本没有这些事件/字段 ⇒ `<缺失>` +【无法判定】（缺失 ≠ 0）"),
+    ("event:budget_deferred_tiles / stage_capped_by_capacity + day_end.stamina_budget 子键 (task-163)",
+     "信息项：**诚实留痕、不是失败、不判红、不进 rc**（`verify-run3.py` 对这两名零命中）。"
+     "`budget_deferred_tiles` = 日级/日初：某任务有 count 格被**体力预算**显式延后"
+     "（task/count/total/targets；`{task: n}` 汇总在 `day_end.stamina_budget.deferred_tiles`）"
+     "⇒ 守卫不再把这些格算作『还有活』；`stage_capped_by_capacity` = stage 级：分配额被当天容量"
+     "上限卡住（task/limit/capacity/live_crops/dry/water_reserve ⇒ 只分配 capacity 格）；日级子键"
+     "`capacity_capped_tasks`（int）与 `capped_by_capacity{task:{limit,capacity}}`。"
+     "两条可证伪 ⚠（只警告、不进 rc）：①当天有延后却自称『该做的都做了』（`no_work` + "
+     "`verified=true`）⇒ 核对「延后是否只在体力 ≤ water_reserve **且** 有浇水债时生效」"
+     "（task-163 红线）；②同日有延后但 `stamina_budget` 没有浇水债（`live_crops<=0`/`dry<=0`）"
+     "⇒ 延后可能变成免罚额度。旧账本/旧日缺字段 ⇒ `<缺失>` +【无法判定】（缺失 ≠ 0）"),
     ("event:blocked_by_tool / blocked_by_tool_summary (task-20/task-164)",
      "信息项：**诚实跳过、不是失败、不判红、不进 rc** —— clump（树桩/大木头/巨石/陨石…）的工具"
      "等级或种类不够（或 `toolOk` 判不出 ⇒ fail-closed 不挥）时，**动手之前**就封格（0 次 "
@@ -5302,7 +5440,22 @@ def render_text(report, top):
                if sb.get("warn_deferred_but_watered_lines") else "")
             + (f"  ⚠ 日级 deferred_by_budget>0 却没有对应的 deferred_by_budget 事件：行 "
                f"{sb.get('warn_defer_missing_lines', [])[:6]}"
-               if sb.get("warn_defer_missing_lines") else ""))
+               if sb.get("warn_defer_missing_lines") else "")
+            + (f"；预算延后 budget_deferred_tiles {sb.get('budget_defer_events', 0)} 条"
+               f"（{sb.get('budget_defer_tiles', 0)} 格；任务 "
+               f"{'、'.join(f'{k}×{v}' for k, v in list((sb.get('budget_defer_tasks') or {}).items())[:4]) or '<缺失>'}）"
+               if sb.get("budget_defer_events") else "；预算延后事件 <缺失>")
+            + (f"；容量上限 stage_capped_by_capacity {sb.get('capacity_events', 0)} 次"
+               f"（任务 {'、'.join(list((sb.get('capacity_tasks') or {}).keys())[:4]) or '<缺失>'}"
+               f"；日级 capacity_capped_tasks {sb.get('capacity_capped_tasks', 0)}）"
+               if (sb.get("capacity_events") or sb.get("capacity_capped_tasks")) else "")
+            + (f"  ⚠ 当天有预算延后却自称「该做的都做了」（no_work + VERIFIED）⇒ 人工核对"
+               f"「延后是否只发生在有浇水债时」：行 "
+               f"{sb.get('warn_defer_tiles_but_no_work_lines', [])[:6]}"
+               if sb.get("warn_defer_tiles_but_no_work_lines") else "")
+            + (f"  ⚠ 当天有预算延后但 stamina_budget 显示没有浇水债（live_crops/dry ≤ 0）：行 "
+               f"{sb.get('warn_defer_without_debt_lines', [])[:6]}"
+               if sb.get("warn_defer_without_debt_lines") else ""))
     # task-20 / task-164：工具门槛（clump 工具等级/种类不够 ⇒ 动手前拦下、0 次 use_tool）。
     # **诚实跳过、不判红、不进 rc**（verify-run3.py 对这两名零命中）；旧账本 ⇒ `<缺失>` +【无法判定】。
     tg = report.get("tool_gate") or {}

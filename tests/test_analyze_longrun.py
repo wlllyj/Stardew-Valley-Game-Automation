@@ -3634,5 +3634,117 @@ class TestToolGateBlockedByTool(unittest.TestCase):
         self.assertEqual((rep["red"] or {}).get("total"), 0)
 
 
+class TestBudgetDeferralAndCapacity(unittest.TestCase):
+    """task-163：`budget_deferred_tiles`（日级/日初：某任务有 count 格被**体力预算**显式延后 ⇒
+    守卫不再把它们算作「还有活」）+ `stage_capped_by_capacity`（stage 级：分配额被当天容量上限卡住
+    ⇒ 只分配 capacity 格），以及 `day_end.stamina_budget` 的三个子键
+    （`deferred_tiles{task:n}` / `capped_by_capacity{task:{limit,capacity}}` / `capacity_capped_tasks`）。
+
+    口径：两条都是**诚实留痕、不是失败、不判红、不进 rc**（`tools\\verify-run3.py` 对这两名零命中）；
+    唯一要人工核对的红线是「延后只在体力 ≤ water_reserve **且** 有浇水债时生效」。两条可证伪 ⚠
+    （只警告、不进 rc）：①当天有延后却自称「该做的都做了」（`no_work` + `verified=true`）；
+    ②同日有延后但 `stamina_budget` 显示没有浇水债（`live_crops<=0` / `dry<=0`）。
+    旧账本/缺字段 ⇒ `<缺失>` +【无法判定】（缺失 ≠ 0，绝不当作「今天没用预算」通过）。
+    """
+
+    BDT = {"event": "budget_deferred_tiles", "t": 6.0, "task": "till_area", "count": 3, "total": 3,
+           "targets": [[60, 20], [61, 20]], "note": "这些格子今天被**体力预算**显式延后"}
+    CAP = {"event": "stage_capped_by_capacity", "t": 6.5, "task": "till_area", "limit": 6,
+           "capacity": 4, "live_crops": 8, "dry": 34, "water_reserve": 100,
+           "note": "分配额被当天体力预算的容量上限卡住"}
+    SB_DAY = {"max": 270, "stamina": 120, "live_crops": 8, "dry": 34, "water_reserve": 100,
+              "capacity": 4, "basis": "farm", "deferred_by_budget": True,
+              "deferred": ["till_area"], "deferred_tiles": {"till_area": 3},
+              "capped_by_capacity": {"till_area": {"limit": 6, "capacity": 4}},
+              "capacity_capped_tasks": 1}
+
+    def _day(self, day, *, extra=(), ended_reason="night", verified=True, budget=None):
+        nxt = [day[0], day[1], day[2] + 1]
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": True,
+                  "watered_outdoor": True}
+        end = {"event": "day_end", "t": 9.0, "day": day, "ended_by": "sleep",
+               "ended_reason": ended_reason, "verified": verified, "checks": checks,
+               "stages": [{"stage": "till_area", "ok": 5, "skipped": 0, "failed": 0,
+                           "env_block": 0, "inconclusive": 0, "stopped": None, "leftover": 0}],
+               "ok_steps": 5, "skipped_steps": 0, "failed_steps": 0, "notes": [],
+               "final": final(nxt),
+               "final_water": {"t": 9.0, "location": "Farm", "tiles": 84, "crops": 31,
+                               "dry": 0, "scope": "farm"}}
+        if budget is not None:
+            end["stamina_budget"] = budget
+        return [day_start(day), *extra, end]
+
+    def _report(self, events, name, *, days=1):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_ledger(tmp, name, events)
+            return report_for(path, days=days)
+
+    def test_events_have_buckets_and_are_not_unmapped(self):
+        for ev in ("budget_deferred_tiles", "stage_capped_by_capacity"):
+            self.assertIn(ev, mod.EVENT_BUCKETS)
+        rep = self._report(self._day([1, "fall", 3], extra=[self.BDT, self.CAP],
+                                     budget=self.SB_DAY), "t165_buckets.jsonl")
+        self.assertEqual(rep["unmapped_events"], {})
+        self.assertEqual(rep["events"].get("budget_deferred_tiles"), 1)
+        self.assertEqual(rep["events"].get("stage_capped_by_capacity"), 1)
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+
+    def test_budget_deferral_and_capacity_are_info_only_and_visible(self):
+        rep = self._report(self._day([1, "fall", 3], extra=[self.BDT, self.CAP],
+                                     budget=self.SB_DAY), "t165_visible.jsonl")
+        sb = rep["stamina_budget"]
+        self.assertEqual(sb["budget_defer_events"], 1)
+        self.assertEqual(sb["budget_defer_tiles"], 3)
+        self.assertEqual(sb["budget_defer_tasks"], {"till_area": 3})
+        self.assertEqual(sb["capacity_events"], 1)
+        self.assertEqual(sb["capacity_tasks"], {"till_area": {"limit": 6, "capacity": 4}})
+        self.assertEqual(sb["capacity_capped_tasks"], 1)
+        self.assertEqual(sb["day_deferred_tiles"],
+                         {rep["days"][-1]["label"]: {"till_area": 3}})
+        text = mod.render_text(rep, 50)
+        self.assertIn("预算延后 budget_deferred_tiles 1 条（3 格；任务 till_area×3）", text)
+        self.assertIn("容量上限 stage_capped_by_capacity 1 次（任务 till_area；"
+                      "日级 capacity_capped_tasks 1）", text)
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+
+    def test_defer_tiles_with_no_work_verified_is_warning_not_red(self):
+        rep = self._report(self._day([1, "fall", 3], extra=[self.BDT], ended_reason="no_work",
+                                     budget=self.SB_DAY), "t165_warn_nowork.jsonl")
+        sb = rep["stamina_budget"]
+        self.assertTrue(sb["warn_defer_tiles_but_no_work_lines"])
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+        self.assertNotIn("missed:", " ".join((rep["red"] or {}).get("subjects") or []))
+        text = mod.render_text(rep, 50)
+        self.assertIn("当天有预算延后却自称「该做的都做了」", text)
+        blob = " ".join(a.get("text", "") for a in rep.get("advice") or [])
+        self.assertIn("延后是否只发生在体力 ≤ water_reserve", blob)
+
+    def test_defer_tiles_without_water_debt_is_warning_not_red(self):
+        no_debt = dict(self.SB_DAY)
+        no_debt.update({"live_crops": 0, "dry": 0})
+        rep = self._report(self._day([1, "fall", 3], extra=[self.BDT], budget=no_debt),
+                           "t165_warn_nodebt.jsonl")
+        sb = rep["stamina_budget"]
+        self.assertTrue(sb["warn_defer_without_debt_lines"])
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+        text = mod.render_text(rep, 50)
+        self.assertIn("没有浇水债（live_crops/dry ≤ 0）", text)
+
+    def test_old_ledger_without_fields_is_undecidable_not_zero(self):
+        rep = self._report(self._day([1, "summer", 5]), "t165_old.jsonl")
+        sb = rep["stamina_budget"]
+        self.assertFalse(sb["has_events"])
+        self.assertEqual(sb["budget_defer_events"], 0)
+        self.assertEqual(sb["day_deferred_tiles"], {})
+        text = mod.render_text(rep, 50)
+        self.assertIn("体力预算: <缺失>", text)
+        self.assertIn("缺失 ≠ 0", text)
+        blob = " ".join(rep.get("undecidable") or [])
+        self.assertIn("task-158/163", blob)
+        self.assertIn("绝不当'今天没用预算'通过", blob)
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
