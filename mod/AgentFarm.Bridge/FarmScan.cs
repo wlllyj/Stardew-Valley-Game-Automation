@@ -338,11 +338,36 @@ namespace AgentFarm.Bridge
 
             if (tf is ResourceClump clump)
             {
-                // 无法稳定拿到 clumpType 的公开入口时，按“凡是 ResourceClump 都算巨石障碍”处理：
-                // 巨石(148/150/152) 与 树桩/大木头(600/602/604) 对清障规划都是障碍，
-                // 口径统一比细分更重要（细分留给 P2 的 affordance 层）。
-                _ = clump;
-                _acc.Stones++;
+                // 【task-155】按 `parentSheetIndex` 分流，**不再一律算 stones**。
+                // 旧口径把树桩(600)/大木头(602) 混进 `stones`，「清空农场」的分母就乱了；
+                // 而 `stones` 语义已收窄为"普通可敲石头"（见 Contracts.FarmView.Stones 的 doc）。
+                // 未知索引 ⇒ 只进 `ClumpsTotal` + `ClumpsUnclassified`（显式残差，绝不静默并进 stones）。
+                int? index = null;
+                try { index = clump.parentSheetIndex.Value; } catch { }
+
+                _acc.ClumpsTotal++;
+                switch (ClumpMeta.KindOf(index))
+                {
+                    case "stump":
+                        _acc.Stumps++;
+                        break;
+                    case "log":
+                        _acc.Logs++;
+                        break;
+                    case "boulder":
+                        _acc.Boulders++;
+                        break;
+                    case "rockPile":
+                        _acc.RockPiles++;
+                        break;
+                    case "greenRain":
+                        _acc.GreenRain++;
+                        break;
+                    default:
+                        _acc.ClumpsUnclassified++;
+                        ClumpMeta.NoteUnknown(index);
+                        break;
+                }
                 return;
             }
         }

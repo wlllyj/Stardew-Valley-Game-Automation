@@ -266,6 +266,19 @@ namespace AgentFarm.Bridge
             }
             catch { }
 
+            // 【task-155】大障碍前置门（真机 run9d 教训：对需要镐的巨石挥斧、6 刀全白费）：
+            // 工具/等级不对或目标未知 ⇒ **一次都不挥**，直接 `precondition_failed` 并写清要什么、
+            // 当前几级。判据来自 `ClumpMeta`（观测层同一张表），不在这里另抄一份。
+            try
+            {
+                string clumpWhy;
+                if (!this.ClumpGate(target, out clumpWhy))
+                {
+                    return this.Fail("precondition_failed", clumpWhy, 0);
+                }
+            }
+            catch { }
+
             string why;
             int slot = this.FindToolSlot(this._plan[0], out why);
             if (slot < 0)
@@ -407,6 +420,100 @@ namespace AgentFarm.Bridge
         /// 6 次挥动全部无效。所以：先按种类猜，再把其余工具依次垫在后面，
         /// 由 `Step()` 里"挥满 MaxSwings 就换下一件"来兜底。
         /// </summary>
+        /// <summary>【task-155】目标格上的 `ResourceClump`（不是大障碍/读不到 ⇒ `null`）。</summary>
+        private static StardewValley.TerrainFeatures.ResourceClump ClumpAt(Point tile)
+        {
+            try
+            {
+                var loc = Game1.currentLocation;
+                var v = new Vector2(tile.X, tile.Y);
+                StardewValley.TerrainFeatures.TerrainFeature tf = null;
+                if (loc?.terrainFeatures != null && loc.terrainFeatures.TryGetValue(v, out tf))
+                {
+                    return tf as StardewValley.TerrainFeatures.ResourceClump;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>【task-155】目标格大障碍的 `parentSheetIndex`（不是大障碍/读不到 ⇒ `null`）。</summary>
+        private static int? ClumpIndexAt(Point tile)
+        {
+            var clump = ClumpAt(tile);
+            if (clump == null) return null;
+            try { return clump.parentSheetIndex.Value; } catch { return null; }
+        }
+
+        /// <summary>
+        /// 【task-155】大障碍前置门：**动工具之前**就问清"这堆要什么、我够不够"，
+        /// 不满足 ⇒ 返回 `false` + 可操作理由（一次都不挥）。
+        ///
+        /// 三条判据（与 `ClumpMeta` / 观测层同一张表）：
+        /// 1. 未知索引 ⇒ 不猜工具（`clumpTarget` 为 null）⇒ 不挥；
+        /// 2. 背包里没有该类工具 ⇒ 不挥（**不把"没有工具"当成"够级"**）；
+        /// 3. 有工具但 `UpgradeLevel &lt; minLevel` ⇒ 不挥（`minLevel==0` 是"已证无门槛"，放行）。
+        /// 不是大障碍的格子 ⇒ 直接放行（本门只管 `clump`）。
+        /// </summary>
+        private bool ClumpGate(Point target, out string why)
+        {
+            why = null;
+            var clump = ClumpAt(target);
+            if (clump == null) return true;
+
+            int? index = null;
+            try { index = clump.parentSheetIndex.Value; } catch { }
+
+            ClumpTargetView want = ClumpMeta.TargetOf(index);
+            string where = $"（clumpIndex={(index.HasValue ? index.Value.ToString() : "读不到")})";
+            if (want == null)
+            {
+                why = "clump 目标工具未知" + where
+                    + " ⇒ 不猜工具、不挥。请先用 observe?detail=full 看该格的 `clumpKind`/`clumpTarget`"
+                    + "（未知索引一律 clumpTarget=null，这是刻意的：绝不默认斧头）。";
+                return false;
+            }
+
+            bool has = false;
+            int level = -1;
+            try
+            {
+                var items = Game1.player?.Items;
+                if (items != null)
+                {
+                    foreach (Item it in items)
+                    {
+                        if (it == null) continue;
+                        bool match = string.Equals(want.Tool, "axe", StringComparison.OrdinalIgnoreCase)
+                            ? it is Axe
+                            : (string.Equals(want.Tool, "pickaxe", StringComparison.OrdinalIgnoreCase) && it is Pickaxe);
+                        if (!match) continue;
+                        has = true;
+                        level = ((StardewValley.Tool)it).UpgradeLevel;
+                        break;
+                    }
+                }
+            }
+            catch { has = false; }
+
+            int minLevel = want.MinLevel ?? 0;
+            if (!has)
+            {
+                why = $"这一堆需要「{want.Tool}≥{minLevel}」，但背包里没有「{want.Tool}」" + where
+                    + " ⇒ 不挥（先取回工具，或去干别的活）。";
+                return false;
+            }
+
+            if (level < minLevel)
+            {
+                why = $"这一堆需要「{want.Tool}≥{minLevel}」，当前「{want.Tool}」是 {level} 级" + where
+                    + " ⇒ 不挥（升级工具/清障策略属 task-142/141；这一步只保证不白挥）。";
+                return false;
+            }
+
+            return true;
+        }
+
         private System.Collections.Generic.List<string> BuildPlan(Point target)
         {
             var plan = new System.Collections.Generic.List<string>();
@@ -429,7 +536,14 @@ namespace AgentFarm.Bridge
                 case "dirt": plan.Add(hasCrop ? "can" : "hoe"); break;
                 case "grass": plan.Add("scythe"); break;
                 case "tree":
-                case "clump": plan.Add("axe"); break;
+                    plan.Add("axe"); break;
+                case "clump":
+                    // 【task-155】clump **不再一律斧头**：按 `parentSheetIndex` 推导（600/602 要斧、
+                    // 672/148/622/752+ 要镐）。未知索引 ⇒ **不首选任何工具** —— `Begin()` 的
+                    // `ClumpGate` 会直接 `precondition_failed`，绝不空挥（旧代码挥 6 次白耗）。
+                    string clumpTool = ClumpMeta.ToolOf(ClumpIndexAt(target));
+                    if (clumpTool != null) plan.Add(clumpTool);
+                    break;
                 default: break;
             }
 

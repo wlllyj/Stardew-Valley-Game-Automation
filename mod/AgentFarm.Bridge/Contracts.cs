@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -187,6 +188,24 @@ namespace AgentFarm.Bridge
         /// 此前快照只有 `inventoryCount`，脑根本不知道手里有没有防风草种子（P3 步骤④的硬缺口）。
         /// </summary>
         [JsonPropertyName("inventory")] public ItemView[] Inventory { get; set; }
+
+        // ---- 【task-155】工具升级在途状态（升级链 task-142 的前置/判据）----
+
+        /// <summary>
+        /// `Farmer.toolBeingUpgraded.Value`（正在 Clint 那里升级的工具）。`null` = 没有在途。
+        /// IL 实证：`Netcode.NetRef`1[StardewValley.Tool]`（`scratch/il-155-upg2.txt`）；
+        /// 买下升级时被置为该工具的副本、`daysLeftForToolUpgrade = 2`，取回时清 null。
+        /// </summary>
+        [JsonPropertyName("toolBeingUpgraded")] public ToolItemView ToolBeingUpgraded { get; set; }
+
+        /// <summary>`Farmer.daysLeftForToolUpgrade.Value`（`NetInt`）。`null` = 读不到。</summary>
+        [JsonPropertyName("toolUpgradeDaysLeft")] public int? ToolUpgradeDaysLeft { get; set; }
+
+        /// <summary>
+        /// `Farmer.hasReceivedToolUpgradeMessageYet`（`bool` 公共字段）：工具升级好了的提示是否已弹过。
+        /// `null` = 读不到。
+        /// </summary>
+        [JsonPropertyName("toolUpgradeNotice")] public bool? ToolUpgradeNotice { get; set; }
     }
 
     /// <summary>
@@ -206,6 +225,39 @@ namespace AgentFarm.Bridge
         [JsonPropertyName("shouldTimePass")] public bool ShouldTimePass { get; set; }
     }
 
+    /// <summary>【task-155】`ResourceClump` 的目标工具与最低等级（`clumpTarget`）。</summary>
+    internal sealed class ClumpTargetView
+    {
+        /// <summary>`axe` 或 `pickaxe`。</summary>
+        [JsonPropertyName("tool")] public string Tool { get; set; }
+
+        /// <summary>最低 `UpgradeLevel`；`0` = 已证无门槛。</summary>
+        [JsonPropertyName("minLevel")] public int? MinLevel { get; set; }
+    }
+
+    /// <summary>
+    /// 【task-155】背包里的一件工具（`tools[]` 的元素）。用来回答"我手上这把是几级"。
+    /// 语义：字段缺失/`null` = 读不到（`upgradeLevel` 是 `int`，读不到时该件工具**不出现**在数组里）。
+    /// </summary>
+    internal sealed class ToolItemView
+    {
+        [JsonPropertyName("id")] public string Id { get; set; }
+
+        [JsonPropertyName("name")] public string Name { get; set; }
+
+        /// <summary>`axe` / `pickaxe` / `hoe` / `can` / `fishingRod` / `pan` / `other`。</summary>
+        [JsonPropertyName("kind")] public string Kind { get; set; }
+
+        /// <summary>`Tool.UpgradeLevel`（0 = 初始）。</summary>
+        [JsonPropertyName("upgradeLevel")] public int UpgradeLevel { get; set; }
+
+        [JsonPropertyName("indexOfMenuItemView")] public int? IndexOfMenuItemView { get; set; }
+
+        [JsonPropertyName("isEquipped")] public bool IsEquipped { get; set; }
+
+        [JsonPropertyName("stack")] public int Stack { get; set; }
+    }
+
     internal sealed class ToolsView
     {
         [JsonPropertyName("hoe")] public bool Hoe { get; set; }
@@ -214,6 +266,12 @@ namespace AgentFarm.Bridge
         [JsonPropertyName("wateringCan")] public bool WateringCan { get; set; }
         [JsonPropertyName("fishingRod")] public bool FishingRod { get; set; }
         [JsonPropertyName("weapon")] public bool Weapon { get; set; }
+
+        /// <summary>
+        /// 【task-155】背包里**每件工具**的明细（含 `upgradeLevel`）。原来的 6 个 bool 原样保留，
+        /// 只加不改 —— 老读法不破；"有没有这把工具"由"它在不在数组里"承担。
+        /// </summary>
+        [JsonPropertyName("tools")] public List<ToolItemView> Tools { get; set; } = new List<ToolItemView>();
     }
 
     internal sealed class LocationView
@@ -391,6 +449,42 @@ namespace AgentFarm.Bridge
 
         /// <summary>要清掉/处理这一格该用哪个工具：`scythe` / `axe` / `pickaxe` / `hoe` / `can` / `none`。</summary>
         [JsonPropertyName("tool")] public string Tool { get; set; }
+
+        // ---- 【task-155】ResourceClump（大障碍）结构化元数据（只有 `kind="clump"` 时才填）----
+
+        /// <summary>
+        /// `ResourceClump.parentSheetIndex.Value`（600 树桩 / 602 大木头 / 672 巨石 / 148、622 石堆 /
+        /// 752+ 绿雨那支）。读不到 ⇒ `null`（**不许写 0**）。
+        /// </summary>
+        [JsonPropertyName("clumpIndex")] public int? ClumpIndex { get; set; }
+
+        /// <summary>`ResourceClump.width.Value`（占几格宽）。读不到 ⇒ `null`。</summary>
+        [JsonPropertyName("clumpWidth")] public int? ClumpWidth { get; set; }
+
+        /// <summary>`ResourceClump.height.Value`（占几格高）。读不到 ⇒ `null`。</summary>
+        [JsonPropertyName("clumpHeight")] public int? ClumpHeight { get; set; }
+
+        /// <summary>`ResourceClump.health.Value`（当前血量，诊断/进度用）。读不到 ⇒ `null`。</summary>
+        [JsonPropertyName("clumpHealth")] public float? ClumpHealth { get; set; }
+
+        /// <summary>
+        /// 障碍种类：`stump` / `log` / `boulder` / `rockPile` / `greenRain` / `unknown`。
+        /// `unknown` **必须显式出现**（未知索引绝不许静默并进 `stones`）。
+        /// </summary>
+        [JsonPropertyName("clumpKind")] public string ClumpKind { get; set; }
+
+        /// <summary>
+        /// 清掉这一格需要什么工具与最低等级（由 `clumpIndex` 推导，见 `ClumpMeta`）。
+        /// `null` = 判不了（未知索引）⇒ 调用方**不许猜**（禁默认斧头/默认 0）。
+        /// `minLevel == 0` = 已证**无等级门槛**（与 `null` 语义不同）。
+        /// </summary>
+        [JsonPropertyName("clumpTarget")] public ClumpTargetView ClumpTarget { get; set; }
+
+        /// <summary>
+        /// 当前玩家手上这把工具的 `UpgradeLevel` 是否 ≥ `clumpTarget.minLevel`。
+        /// `null` = **判不了**（没有该工具 / 等级读不到 / `clumpTarget` 未知）；与 `false` 语义不同。
+        /// </summary>
+        [JsonPropertyName("toolOk")] public bool? ToolOk { get; set; }
 
         /// <summary>select_item 专用：要找的物品（ItemId / QualifiedItemId / 名字，大小写不敏感）。</summary>
         [JsonPropertyName("item")] public string Item { get; set; }
@@ -577,6 +671,14 @@ namespace AgentFarm.Bridge
         [JsonPropertyName("dryTilesTruncated")] public bool? DryTilesTruncated { get; set; }
 
         [JsonPropertyName("weeds")] public int Weeds { get; set; }
+
+        /// <summary>
+        /// 普通石头（`Object` 的 `IsBreakableStone()` / `StoneIds`）。
+        ///
+        /// 【task-155 语义收窄】**不再包含 `ResourceClump`**：树桩/大木头/巨石/石堆/绿雨那支
+        /// 以前被算进这里，导致"清空农场"的分母混淆。收窄后 `ResourceClump` 走下面分 kind 的计数。
+        /// ⚠️ 与旧账本对账时 `stones` 会**变小**（树桩/大木头被移走）；不留旧别名。
+        /// </summary>
         [JsonPropertyName("stones")] public int Stones { get; set; }
         [JsonPropertyName("twigs")] public int Twigs { get; set; }
         [JsonPropertyName("trees")] public int Trees { get; set; }
@@ -588,6 +690,32 @@ namespace AgentFarm.Bridge
 
         /// <summary>统计是否已经跑完一整轮（分帧累计）。summary 也带这个字段，方便“脑”判断数字新不新。</summary>
         [JsonPropertyName("complete")] public bool Complete { get; set; }
+
+        // ---- 【task-155】ResourceClump 按 kind 分流计数（与 `dryTiles` 同一次扫描、同一个 `scanSeq`）----
+
+        /// <summary>`ResourceClump.parentSheetIndex == 600`（树桩，斧 ≥1）。</summary>
+        [JsonPropertyName("stumps")] public int Stumps { get; set; }
+
+        /// <summary>`== 602`（大木头，斧 ≥2）。</summary>
+        [JsonPropertyName("logs")] public int Logs { get; set; }
+
+        /// <summary>`== 672`（巨石，镐 ≥2）。</summary>
+        [JsonPropertyName("boulders")] public int Boulders { get; set; }
+
+        /// <summary>`== 148 || == 622`（石堆，镐 ≥3）。</summary>
+        [JsonPropertyName("rockPiles")] public int RockPiles { get; set; }
+
+        /// <summary>`>= 752`（绿雨那支，无等级门槛；精确索引集合未定，见 task-155 设计 §7-U3）。</summary>
+        [JsonPropertyName("greenRain")] public int GreenRain { get; set; }
+
+        /// <summary>上面五类之和 + 未归类（`clumpsUnclassified`）。</summary>
+        [JsonPropertyName("clumpsTotal")] public int ClumpsTotal { get; set; }
+
+        /// <summary>
+        /// **显式"未归类"**：`ResourceClump` 存在但 `parentSheetIndex` 读不到或不在已知表里。
+        /// 绝不静默并进 <see cref="Stones"/> —— 这就是 task-151/156 要的那 2 个残差。
+        /// </summary>
+        [JsonPropertyName("clumpsUnclassified")] public int ClumpsUnclassified { get; set; }
 
         /// <summary>该轮统计开始时的 worldSeq。complete=false 时这些数字是上一轮的值。</summary>
         [JsonPropertyName("scanSeq")] public long ScanSeq { get; set; }

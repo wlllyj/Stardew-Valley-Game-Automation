@@ -264,8 +264,77 @@ namespace AgentFarm.Bridge
                 Tools = ReadTools(p),
                 WateringCan = ReadWateringCan(p),
                 Inventory = ReadInventory(p),
+
+                // 【task-155】工具升级在途状态（升级链 task-142 的前置/判据）。
+                // IL 实证：`toolBeingUpgraded` 是 `NetRef<Tool>`、`daysLeftForToolUpgrade` 是 `NetInt`
+                // （`scratch/il-155-upg2.txt`：Farmer.showToolUpgradeAvailability 里 ldfld）。
+                ToolBeingUpgraded = ReadToolBeingUpgraded(p),
+                ToolUpgradeDaysLeft = SafeIntOrNull(() => p.daysLeftForToolUpgrade.Value),
+                ToolUpgradeNotice = SafeBoolOrNull(() => p.hasReceivedToolUpgradeMessageYet),
             };
             return view;
+        }
+
+        /// <summary>
+        /// 【task-155】填 `ResourceClump` 的元数据（`clumpIndex/Width/Height/Health/Kind/Target/ToolOk`），
+        /// 并按 `clumpTarget.tool` 写 `t.Tool` —— **不再一律 `axe`**（148/622/672/752+ 实际要镐）。
+        ///
+        /// 【不许猜】索引读不到或不在表里 ⇒ `clumpKind="unknown"` + `clumpTarget=null` +
+        /// `t.Tool="none"` + 一条按索引去重的 warn（调用方看到 `clumpTarget=null` 就该停手）。
+        /// `toolOk`：`null` = 判不了（没有那把工具 / 等级读不到 / 目标未知），`false` = 明确不够级。
+        /// 依据：`docs/_design-task155-clump-tool-metadata.md` §3（推导表与 `minLevel:0` vs `null` 的语义）。
+        /// </summary>
+        private static void FillClumpMeta(TileView t, StardewValley.TerrainFeatures.ResourceClump clump)
+        {
+            int? index = SafeIntOrNull(() => clump.parentSheetIndex.Value);
+            t.ClumpIndex = index;
+            t.ClumpWidth = SafeIntOrNull(() => clump.width.Value);
+            t.ClumpHeight = SafeIntOrNull(() => clump.height.Value);
+            t.ClumpHealth = SafeFloatOrNull(() => clump.health.Value);
+            t.ClumpKind = ClumpMeta.KindOf(index);
+            t.ClumpTarget = ClumpMeta.TargetOf(index);
+
+            if (t.ClumpTarget == null)
+            {
+                t.Tool = "none";
+                ClumpMeta.NoteUnknown(index);
+            }
+            else
+            {
+                t.Tool = t.ClumpTarget.Tool;
+            }
+
+            t.ToolOk = ToolMeetsTarget(t.ClumpTarget);
+        }
+
+        /// <summary>
+        /// 【task-155】手上那把工具够不够级。`null` = 判不了（`target` 为空 / 背包里没有这类工具 /
+        /// 等级读不到）；`false` = 明确不够。**不把"没有工具"当成"不够级"**。
+        /// </summary>
+        private static bool? ToolMeetsTarget(ClumpTargetView target)
+        {
+            if (target == null || string.IsNullOrEmpty(target.Tool) || !target.MinLevel.HasValue)
+            {
+                return null;
+            }
+
+            try
+            {
+                Farmer p = Game1.player;
+                if (p?.Items == null) return null;
+                foreach (Item item in p.Items)
+                {
+                    if (item == null) continue;
+                    if (ToolKindOf(item) != target.Tool) continue;
+                    if (!(item is StardewValley.Tool tool)) return null;
+                    return tool.UpgradeLevel >= target.MinLevel.Value;
+                }
+                return null;   // 背包里没有这类工具 ⇒ 判不了（不是"不够级"）
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         /// <summary>
@@ -351,8 +420,16 @@ namespace AgentFarm.Bridge
             {
                 if (p.Items == null) return t;
 
-                foreach (Item item in p.Items)
+                for (int slot = 0; slot < p.Items.Count; slot++)
                 {
+                    Item item = p.Items[slot];
+                    if (item == null) continue;
+
+                    // 【task-155】每件工具的明细（含 upgradeLevel）：老 6 个 bool 只是"有没有"，
+                    // 回答不了"我手上这把斧头是几级" —— 而那正是清障/升级链的判据。
+                    ToolItemView tv = ToolItemOf(item, slot, p);
+                    if (tv != null) t.Tools.Add(tv);
+
                     if (item is StardewValley.Tools.Axe) t.Axe = true;
                     else if (item is StardewValley.Tools.Pickaxe) t.Pickaxe = true;
                     else if (item is StardewValley.Tools.Hoe) t.Hoe = true;
@@ -363,6 +440,65 @@ namespace AgentFarm.Bridge
             }
             catch { }
             return t;
+        }
+
+        /// <summary>
+        /// 【task-155】把一件**工具**打包成 `tools[]` 条目；不是工具 ⇒ `null`（不进数组）。
+        /// `kind` 取值固定为 `axe` / `pickaxe` / `hoe` / `can` / `fishingRod` / `pan` / `other`。
+        /// </summary>
+        private static ToolItemView ToolItemOf(Item item, int slot, Farmer p)
+        {
+            string kind = ToolKindOf(item);
+            if (kind == null) return null;
+
+            var tv = new ToolItemView { Kind = kind, Stack = SafeInt(() => item.Stack) };
+            try { tv.Id = item.ItemId; } catch { }
+            try { tv.Name = item.DisplayName; } catch { }
+            try { tv.UpgradeLevel = ((StardewValley.Tool)item).UpgradeLevel; } catch { }
+            tv.IndexOfMenuItemView = SafeIntOrNull(() => ((StardewValley.Tool)item).IndexOfMenuItemView);
+            tv.IsEquipped = SafeBool(() => ReferenceEquals(p.CurrentTool, item));
+            return tv;
+        }
+
+        /// <summary>【task-155】工具种类（非工具 ⇒ `null`）。`upgradeLevel` 只有工具才有意义。</summary>
+        private static string ToolKindOf(Item item)
+        {
+            if (item is StardewValley.Tools.Axe) return "axe";
+            if (item is StardewValley.Tools.Pickaxe) return "pickaxe";
+            if (item is StardewValley.Tools.Hoe) return "hoe";
+            if (item is StardewValley.Tools.WateringCan) return "can";
+            if (item is StardewValley.Tools.FishingRod) return "fishingRod";
+            if (item is StardewValley.Tools.Pan) return "pan";
+            if (item is StardewValley.Tools.MeleeWeapon) return "other";   // 镰刀等武器：kind 表里只有 other
+            if (item is StardewValley.Tool) return "other";
+            return null;
+        }
+
+        /// <summary>
+        /// 【task-155】正在 Clint 那里升级的那把工具（`Farmer.toolBeingUpgraded.Value`）。
+        /// `null` = 没有在途。注意：它在升级期间**不在背包里**（`tools[]` 与 `inventory` 都看不到）。
+        /// </summary>
+        private static ToolItemView ReadToolBeingUpgraded(Farmer p)
+        {
+            try
+            {
+                StardewValley.Tool tool = p?.toolBeingUpgraded?.Value;
+                if (tool == null) return null;
+                return new ToolItemView
+                {
+                    Id = SafeString(() => tool.ItemId),
+                    Name = SafeString(() => tool.DisplayName),
+                    Kind = ToolKindOf(tool) ?? "other",
+                    UpgradeLevel = SafeInt(() => tool.UpgradeLevel),
+                    IndexOfMenuItemView = SafeIntOrNull(() => tool.IndexOfMenuItemView),
+                    IsEquipped = false,
+                    Stack = 1,
+                };
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private static LocationView ReadLocation(string detail)
@@ -481,7 +617,7 @@ namespace AgentFarm.Bridge
                             if (tf is StardewValley.TerrainFeatures.Grass) { t.Kind = "grass"; t.Tool = "scythe"; }
                             else if (tf is StardewValley.TerrainFeatures.Tree) { t.Kind = "tree"; t.Tool = "axe"; }
                             else if (tf is StardewValley.TerrainFeatures.FruitTree) { t.Kind = "fruitTree"; t.Tool = "axe"; }
-                            else if (tf is StardewValley.TerrainFeatures.ResourceClump) { t.Kind = "clump"; t.Tool = "axe"; }
+                            else if (tf is StardewValley.TerrainFeatures.ResourceClump clump) { t.Kind = "clump"; FillClumpMeta(t, clump); }
                             else if (tf is StardewValley.TerrainFeatures.HoeDirt) { t.Kind = "dirt"; t.Tool = "hoe"; }
                             else if (tf is StardewValley.TerrainFeatures.Bush) { t.Kind = "bush"; t.Tool = "axe"; }
                         }
@@ -937,6 +1073,11 @@ namespace AgentFarm.Bridge
         private static int SafeInt(Func<int> f) { try { return f(); } catch { return 0; } }
         private static float SafeFloat(Func<float> f) { try { return f(); } catch { return 0f; } }
         private static bool SafeBool(Func<bool> f) { try { return f(); } catch { return false; } }
+
+        // ---- 【task-155】"读不到"必须是 null，不能是 0/false（0 与 false 都是**事实**）----
+        private static int? SafeIntOrNull(Func<int> f) { try { return f(); } catch { return null; } }
+        private static float? SafeFloatOrNull(Func<float> f) { try { return f(); } catch { return null; } }
+        private static bool? SafeBoolOrNull(Func<bool> f) { try { return f(); } catch { return null; } }
     }
 
     /// <summary>observe 的产出：DTO + 生成时刻的 worldSeq（两个必须是同一个值）。</summary>

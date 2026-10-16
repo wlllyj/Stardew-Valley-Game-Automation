@@ -59,6 +59,10 @@ namespace AgentFarm.Bridge
         {
             this._monitor = monitor;
 
+            // 【task-155】观测层（`WorldSnapshot`/`FarmScan`）是静态方法，拿不到实例 monitor；
+            // 未知 `ResourceClump` 索引需要一条按索引去重的 warn。这里把出口交进去，只设一次。
+            ClumpMeta.Warn = msg => this._monitor.Log(msg, LogLevel.Warn);
+
             // 版本号必须来自 manifest.json（ModEntry 传 this.ModManifest.Version），
             // 不再写死：写死会让日志 / bridge.json / health 三处与 manifest 悄悄脱节。
             this.ModVersion = string.IsNullOrWhiteSpace(modVersion) ? "unknown" : modVersion.Trim();
