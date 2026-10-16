@@ -62,6 +62,7 @@
 2. **窗外浇水逐格判据**（task-133）：`ok` 只认该格证据（不在 `farm.dryTiles` 或 `watered=true`）；不许用全局 `dryCrops` 差值顶替；`gave_up_dry` 的理由必须区分壶空/不可达/缺证据。
 3. **resume 有界**（task-134 A）：`work_spot`/`resume_walk` 连续无产出必须被 burst 计数拦住（≤5），当天以 `stuck:` 诚实收尾且 leftover 不许归零。
 4. **leftover 口径拆分**（task-134 B，口径变更）：`assigned_undone`（阶段分到的格少做了）非诚实上限 ⇒ unmet；诚实上限（`stamina`/夜里/`budget` 且作业量做完）留下的片区待做 ⇒ `deferred_tiles`(info) 且不进 unmet；`plot_pending` 字段保留且数值不得变（守卫行为不许变）；`unreachable`/`refused` 越界仍判 false。
+5. **世界差分（原始目标口径：判据 = `observe?detail=full` 差分，不信回执）**：run9c 每个游戏日至少要有一份**独立**的 `observe?detail=full` 原文（`scratch/run9c-observe-<day>.json`），证据文档里给出"当日 `day_start` 观测 → 当日收尾观测"的**逐格/计数差分表**（至少：`location.tiles[]` 的 `kind` 迁移数、`farm.crops/unwatered(needsWatering)/dryCrops/deadCrops`、`player.stamina/money`、`inventory` 种子叠），并写明"哪一格从什么变成什么"。**只有账本自述没有独立观测差分的天，不算世界差分证据**（自述只能作旁证）。
 
 ## §5 与 run9b 对比（跑完填）
 
