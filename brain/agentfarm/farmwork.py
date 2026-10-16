@@ -41,10 +41,15 @@ __all__ = [
     "KIND_TOOL",
     "MAX_CLEAR_SWINGS",
     "MAX_DEAD_SWINGS",
+    "PATH_STAMINA_ALLOWANCE",
     "SEED_KEEP_FACTOR",
     "SEED_NAME_HINTS",
     "SKIP_KINDS",
     "STAGE_ACTION",
+    "STAMINA_COST_CLEAR",
+    "STAMINA_COST_SOW",
+    "STAMINA_COST_TILL",
+    "STAMINA_COST_WATER",
     "SURPLUS_MATERIAL_IDS",
     "SURPLUS_MATERIAL_KEEP",
     "SURPLUS_MIN_UNIT_PRICE",
@@ -244,6 +249,17 @@ TOOL_IDS = {
 }
 SCYTHE_IDS = {"47", "53"}
 SCYTHE_HINTS = ("scythe", "镰刀")
+
+#: 【task-158】浇水优先的体力预算：**脑侧规划估计**（每格真机消耗以游戏为准；这里只回答
+#: "今天还能干多少"）。取值刻意偏保守 —— 宁可早停手，也不要把体力花光、留下没浇的作物
+#: （run9d summer 27/28、fall 1 的 `stamina:体力 0 < 12` + `dry 17/79/140` 就是这个病灶）。
+STAMINA_COST_WATER = 2.0        # 每格浇一次水
+STAMINA_COST_TILL = 5.0         # 每格锄一次
+STAMINA_COST_CLEAR = 2.0        # 每格清障/割草一次
+STAMINA_COST_SOW = 0.0          # 播种本身不吃体力（真正贵的是它今后每天要浇的水）
+#: 每阶段往返作业区/窗口外格子的**路程余量**：与 `min_stamina` 同量级，保证"留的体力够
+#: 走过去 + 浇完最后一格"。
+PATH_STAMINA_ALLOWANCE = 12.0
 
 
 def _norm_item_text(value: Any) -> str:

@@ -7910,5 +7910,126 @@ class TestTask157WaterFarOpenWay(unittest.TestCase):
         self.assertIs(day.verified, False)
 
 
+class TestTask158StaminaBudget(unittest.TestCase):
+    """【task-158】浇水优先的体力预算（run9d summer 27/28、fall 1 的 `stamina:体力 0 < 12`）。
+
+    病灶：体力烧在 clear/till/plant 上、浇水没做完 ⇒ `watered_outdoor=false`、当天不 VERIFIED。
+    口径：先把浇水的体力留出来（`water_reserve = 活苗 × 每格浇水 + 路程余量`），剩下的才给别的活；
+    播种再按 `capacity = (max − reserve − 锄一格) / (播种 + 浇一格)` 收上限。
+
+    变异实测（`scratch/_t158_mutate.py`，brain+tests 一起拷临时目录）：
+      * 基线 7/7 绿；
+      * m158a（`_budget_defer_reason` 恒返回 ""，即去掉预备线闸门）红 3；
+      * m158b（去掉 `plant_area` 的"还有没浇活苗 ⇒ 不许播种"）红 1；
+      * m158c（去掉 `capacity` 上限）红 1。
+    """
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list:
+        return [e for e in run.entries if e["event"] == name]
+
+    @staticmethod
+    def _plot(*tiles) -> dict:
+        tiles = list(tiles) or [(60, 10)]
+        return {"zone": "", "label": "", "anchor": list(tiles[0]), "tiles": tiles, "note": ""}
+
+    @staticmethod
+    def _run_with(w: FakeWorld, *, worker=None) -> LongRun:
+        client = _CountingClient(w)
+        worker = worker or FakeWorker(w, log=lambda *_: None)
+        run = make_run(w, target_days=1, max_days=1,
+                       client_factory=lambda: client, worker_factory=lambda c: worker)
+        run.worker = worker
+        run.client = client
+        run.plot_size = 5
+        return run
+
+    def _dry_world(self, *, dry: int, crops: int, seeds: int, stamina: float,
+                   empty: int, max_stam: float = 270.0) -> FakeWorld:
+        """未浇活苗 + farm 口径计数（`dry`/`crops`）的世界。"""
+        w = FakeWorld(weeds=0, seeds=seeds, money=0, stamina=stamina)
+        w.max_stamina = max_stam
+        w.dirt = {(60 + i, 10) for i in range(crops + empty)}
+        w.crops = {(60 + i, 10): {"watered": False, "ripe": False} for i in range(crops)}
+        w.farm = {"loaded": True, "complete": True, "crops": crops, "dryCrops": dry,
+                  "ripeCrops": 0, "deadCrops": 0, "dryDeadCrops": 0, "dryTiles": [],
+                  "dryTilesTruncated": False, "unwateredCrops": dry,
+                  "hoeDirt": crops + empty, "emptyDirt": empty}
+        return w
+
+    def test_dry_crops_block_planting_for_the_day(self):
+        """当天还有没浇的活苗 ⇒ `plant_area` 一格不给（先浇水），浇水阶段照旧有目标。"""
+        w = self._dry_world(dry=3, crops=3, seeds=5, stamina=200.0, empty=6)
+        run = self._run_with(w)
+        self.assertEqual(run._stage_tiles("plant_area", w.obs(), self._plot(*sorted(w.dirt))), [])
+        self.assertIn("先浇水", run._budget_defer_reason("plant_area", w.obs()))
+        self.assertTrue(run._stage_tiles("water_area", w.obs(), self._plot(*sorted(w.dirt))))
+
+    def test_capacity_limits_planting(self):
+        """`capacity` = `(max − 浇水预备 − 锄一格) / (播种 + 浇一格)` 真的收上限。"""
+        w = self._dry_world(dry=0, crops=10, seeds=20, stamina=270.0, empty=20, max_stam=60.0)
+        run = self._run_with(w)
+        run.budget_today = run._stamina_budget(w.obs())
+        self.assertEqual(run.budget_today["capacity"], 11)      # (60 − 32 − 5) // 2
+        tiles = run._stage_tiles("plant_area", w.obs(), self._plot(*sorted(w.dirt)))
+        self.assertEqual(len(tiles), 11)
+
+    def test_reserve_stops_non_water_work(self):
+        """体力掉到浇水预备线（3 格活苗 × 2 + 12 = 18）⇒ clear/till 停手并留痕。"""
+        w = self._dry_world(dry=3, crops=3, seeds=5, stamina=18.0, empty=6)
+        run = self._run_with(w)
+        run.budget_today = run._stamina_budget(w.obs())
+        plot = self._plot(*sorted(w.dirt))
+        self.assertEqual(run._stage_tiles("till_area", w.obs(), plot), [])
+        self.assertEqual(run._stage_tiles("clear_area", w.obs(), plot), [])
+        self.assertTrue(run.budget_today["deferred_by_budget"])
+        events = self._events(run, "deferred_by_budget")
+        self.assertEqual({e["task"] for e in events}, {"till_area", "clear_area"})
+        self.assertIn("留给浇水", events[0]["why"])
+
+    def test_missing_farm_counts_is_conservative(self):
+        """farm 计数不可用 ⇒ `basis="conservative"`、把现有体力全留给浇水（fail-closed）。"""
+        w = FakeWorld(weeds=0, seeds=5, money=0, stamina=200.0)
+        w.farm = {"loaded": True, "complete": False}
+        run = self._run_with(w)
+        b = run._stamina_budget(w.obs())
+        self.assertEqual(b["basis"], "conservative")
+        self.assertEqual(b["water_reserve"], 200.0)
+        self.assertNotEqual(run._budget_defer_reason("till_area", w.obs()), "")
+        self.assertEqual(run._budget_defer_reason("water_area", w.obs()), "")
+
+    def test_no_water_debt_means_no_deferral(self):
+        """没有浇水债 ⇒ 预算不拦别的活（否则会变成"永远不开工"）。"""
+        w = FakeWorld(weeds=0, seeds=5, money=0, stamina=200.0)
+        run = self._run_with(w)
+        run.budget_today = run._stamina_budget(w.obs())
+        self.assertEqual(run._budget_defer_reason("till_area", w.obs()), "")
+        self.assertTrue(run._stage_tiles("till_area", w.obs(), self._plot((60, 10))))
+
+    def test_budget_deferral_adds_no_washable_check(self):
+        """红线①：`checks` 不新增任何可洗白键；没浇完就是 `crops_watered=false`。"""
+        w = self._dry_world(dry=3, crops=3, seeds=0, stamina=200.0, empty=6)
+        run = self._run_with(w)
+        run.max_steps = 60
+        rep = run._run_day()
+        self.assertNotIn("deferred_by_budget", rep.checks)
+        self.assertNotIn("stamina_budget", rep.checks)
+        self.assertNotIn("budget", rep.checks)
+        self.assertIs(rep.checks.get("crops_watered"), False)
+
+    def test_budget_snapshot_lands_in_the_day_report(self):
+        """journal `stamina_budget` 一天一条，字段集与 `day_end.stamina_budget` 一致。"""
+        w = self._dry_world(dry=3, crops=3, seeds=0, stamina=200.0, empty=6)
+        run = self._run_with(w)
+        run.max_steps = 60
+        rep = run._run_day()
+        self.assertEqual(len(self._events(run, "stamina_budget")), 1)
+        for key in ("max", "water_reserve", "water_cost_est", "capacity", "basis",
+                    "deferred_by_budget", "deferred"):
+            self.assertIn(key, rep.stamina_budget)
+        self.assertEqual(rep.stamina_budget["dry"], 3)
+        self.assertEqual(rep.stamina_budget["live_crops"], 3)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

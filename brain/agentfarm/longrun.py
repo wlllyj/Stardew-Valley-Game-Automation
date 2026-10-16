@@ -42,10 +42,12 @@ from types import SimpleNamespace
 from typing import Any, Callable, Iterable
 
 from .bridge import MOD_VERSION_EXPECTED, BridgeClient, BridgeError
-from .farmwork import (ENV_BLOCK_STATUSES, FRONTIER_KINDS, SEED_KEEP_FACTOR, STAGE_ACTION,
-                       FarmWorker, StageResult, StepResult, buy_count_for, farm_dead_crops,
-                       farm_dry_dead_crops, farm_dry_tiles, is_seed_offer, pick_seed_offer,
-                       player_free_slots, seed_items, surplus_sell_plan, till_blocked_by)
+from .farmwork import (ENV_BLOCK_STATUSES, FRONTIER_KINDS, PATH_STAMINA_ALLOWANCE, SEED_KEEP_FACTOR,
+                       STAGE_ACTION, STAMINA_COST_CLEAR, STAMINA_COST_SOW, STAMINA_COST_TILL,
+                       STAMINA_COST_WATER, FarmWorker, StageResult, StepResult, buy_count_for,
+                       farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles, is_seed_offer,
+                       pick_seed_offer, player_free_slots, seed_items, surplus_sell_plan,
+                       till_blocked_by)
 from .planner import (DECISIONS_KEPT, LESSONS_INJECT_CHARS, LESSONS_INJECT_MAX, BoundaryPlanner, Brief,
                       PlannerState, TaskIntent, TaskOutcome, decision_line, deterministic_plan,
                       load_lessons_file, make_lesson, prune_lessons, render_lessons,
@@ -443,6 +445,13 @@ class DayReport:
     plot_pending: int = 0
     plot_pending_by_kind: dict[str, int] = field(default_factory=dict)
     deferred_tiles: int = 0
+    #: 【task-158】当天的**浇水优先体力预算**（`stamina_budget` journal 的同名快照）：
+    #: `{max, stamina, live_crops, dry, water_reserve, water_cost_est, path_allowance,
+    #:   capacity, basis, deferred_by_budget, deferred}`。
+    #: * `basis ∈ {"farm", "conservative"}`：`conservative` = farm 计数不可用 ⇒ 按 fail-closed
+    #:   把**现有体力全留**给浇水（宁可早停手）；
+    #: * `deferred_by_budget` **只**表示"因为预算而不做"（不是"没活"），**绝不**进 `checks`。
+    stamina_budget: dict[str, Any] = field(default_factory=dict)
 
     @property
     def failed_steps(self) -> int:
@@ -520,6 +529,7 @@ class DayReport:
             "plot_pending": self.plot_pending,
             "plot_pending_by_kind": dict(self.plot_pending_by_kind),
             "deferred_tiles": self.deferred_tiles,
+            "stamina_budget": dict(self.stamina_budget),
         }
 
 
@@ -665,6 +675,11 @@ class LongRun:
         # （run9c summer 20 就是这条缺失：06:10、体力 270、全天 0 动作，却自称 `no_work` 并
         # `verified=true`）。
         self.day_start_off_farm = False
+        # 【task-158】当天的**浇水优先体力预算**：`_stamina_budget()` 在每天第一次拿到观测后
+        # 算一次并缓存到这里（`_stage_tiles`/`_budget_gate` 都读它），日终落
+        # `day_end.stamina_budget`。`budget_noted` 保证 `stamina_budget` journal 一天只发一条。
+        self.budget_today: dict[str, Any] = {}
+        self.budget_noted = False
         self.refills_today = 0
         self.idle_rounds = 0
         self.fail_streak = 0
@@ -1788,6 +1803,115 @@ class LongRun:
             "note": f"没有田区信息：以玩家 {pt} 为中心的 {2 * radius + 1}×{2 * radius + 1} 窗口",
         }
 
+    # ---- 【task-158】浇水优先的体力预算 ----
+    def _stamina_budget(self, obs: dict[str, Any]) -> dict[str, Any]:
+        """按**当前观测**估算"今天还能干多少非浇水活"（纯估计，不改判定）。
+
+        为什么需要它（run9d 实证）：summer 27/28、fall 1 三天都以 `stamina:体力 0 < 12` 收尾，
+        而当天 `farm.dryCrops` 是 17/79/140 —— 体力烧在 clear/till/plant 上、浇水没做完 ⇒
+        `watered_outdoor=false`、当天不 VERIFIED（用户目标"把作物伺候完"直接落空）。
+        所以：**先把浇水的体力留出来**，剩下的才给别的活。
+
+        * `water_reserve` = 活苗格数 × `STAMINA_COST_WATER` + `PATH_STAMINA_ALLOWANCE`
+          （活苗数取 `farm.crops` 的**全农场**口径）；
+        * `capacity` = 今天最多再播几格（卡面公式）：
+          `(max_stamina − water_reserve − 锄一格) / (播种 + 浇一格)` ⇒ 只种今天还浇得过来的量；
+        * farm 计数不可用（`complete != true` 或 `crops`/`dryCrops` 缺失）⇒ **fail-closed**：
+          `basis="conservative"`、`water_reserve = 现有体力`（全留给浇水，非浇水活一律停手）。
+
+        返回字典同时是 `stamina_budget` journal 与 `day_end.stamina_budget` 的字段集合。
+        """
+        player = FarmWorker.player_of(obs) or {}
+        stam = float(FarmWorker.stamina(obs) or 0.0)
+        try:
+            max_stam = float(player.get("maxStamina") or 0.0)
+        except (TypeError, ValueError):
+            max_stam = 0.0
+        if max_stam <= 0.0:
+            max_stam = stam
+        farm = obs.get("farm") or {}
+        evidence = (bool(farm) and str(farm.get("loaded")) != "False"
+                    and farm.get("loaded") is not False and farm.get("complete") is True)
+        crops = farm.get("crops") if evidence else None
+        dry = farm.get("dryCrops") if evidence else None
+        if isinstance(crops, int) and isinstance(dry, int):
+            basis = "farm"
+            live = max(0, int(crops))
+            dry_now = max(0, int(dry))
+            reserve = max(0.0, live * STAMINA_COST_WATER + PATH_STAMINA_ALLOWANCE)
+        else:
+            basis = "conservative"
+            live = dry_now = 0
+            reserve = max(0.0, stam)
+        per_new = max(1e-6, STAMINA_COST_SOW + STAMINA_COST_WATER)
+        capacity = int(max(0.0, (max_stam - reserve - STAMINA_COST_TILL) // per_new))
+        budget: dict[str, Any] = {
+            "max": round(max_stam, 2),
+            "stamina": round(stam, 2),
+            "live_crops": live,
+            "dry": dry_now,
+            "water_reserve": round(reserve, 2),
+            "water_cost_est": round(dry_now * STAMINA_COST_WATER, 2),
+            "path_allowance": PATH_STAMINA_ALLOWANCE,
+            "capacity": capacity,
+            "basis": basis,
+            "deferred_by_budget": False,
+            "deferred": [],
+        }
+        prev = self.budget_today or {}
+        if prev.get("deferred_by_budget"):
+            # 当天已记过的"因预算推迟"要保留在快照里（日终读数如实）。
+            budget["deferred_by_budget"] = True
+            budget["deferred"] = list(prev.get("deferred") or [])
+        return budget
+
+    def _budget_defer_reason(self, task: str, obs: dict[str, Any]) -> str:
+        """预算是否**拒绝**这一阶段（只针对 clear/till/plant 三类非浇水活）；空串 = 允许。
+
+        两条**只关于预算**的判据（不是"没活"）：
+        * 体力已经掉到浇水预备线以下、而地里还有活苗要浇 ⇒ 停手保浇水；
+        * `plant_area` 且**当天还有没浇的活苗** ⇒ 先浇，不许再种（卡面第 2/3 条）。
+        """
+        if task not in ("clear_area", "till_area", "plant_area"):
+            return ""
+        b = self._stamina_budget(obs)
+        if task == "plant_area":
+            dry = int(b.get("dry") or 0)
+            if dry > 0:
+                return (f"今天还有 {dry} 格活苗没浇（farm.dryCrops）⇒ 先浇水，"
+                        f"预算不许再播种")
+        debt = (str(b.get("basis")) == "conservative"      # 证据不足 ⇒ 当作"可能有浇水债"
+                or int(b.get("dry") or 0) > 0 or int(b.get("live_crops") or 0) > 0)
+        if not debt:
+            return ""                      # 没有浇水债 ⇒ 预算不该拦别的活
+        stam = float(b.get("stamina") or 0.0)
+        reserve = float(b.get("water_reserve") or 0.0)
+        if stam > reserve:
+            return ""
+        return (f"体力 {stam:g} ≤ 浇水预备 {reserve:g}"
+                f"（{int(b.get('live_crops') or 0)} 格活苗 × {STAMINA_COST_WATER:g}"
+                f" + 路程 {PATH_STAMINA_ALLOWANCE:g}，basis={b.get('basis')}）"
+                f"⇒ 停手把体力留给浇水")
+
+    def _note_budget_deferred(self, task: str, why: str) -> None:
+        """把"因为预算而不做"记进当天预算快照 + journal（一天每类只记一次）。
+
+        ⚠️ 语义钉死：只记**因为预算**而不做的活（卡面红线②）——"确实没活"不算预算推迟，
+        否则守卫的 `work_reasons` 会被污染成"还有活"。
+        """
+        b = self.budget_today
+        if not b:
+            return
+        b["deferred_by_budget"] = True
+        deferred = b.setdefault("deferred", [])
+        if task not in deferred:
+            deferred.append(task)
+        self._journal("deferred_by_budget", task=task, why=why,
+                      stamina=b.get("stamina"), water_reserve=b.get("water_reserve"),
+                      dry=b.get("dry"), live_crops=b.get("live_crops"),
+                      basis=b.get("basis"),
+                      note="只因预算而不做（不是没活）；没浇完就是 crops_watered=false")
+
     def _seed_outlook(self, obs: dict[str, Any]) -> tuple[int, int, bool]:
         """(种子总数, 钱, 还能不能搞到种子)。
 
@@ -2353,6 +2477,13 @@ class LongRun:
         local = [tuple(t) for t in plot["tiles"]]
         pool: list[tuple[int, int]]
         limit = self.per_stage_tiles
+        # 【task-158】预算闸门（只拦 `clear_area`/`till_area`/`plant_area`，且在算目标之前）：
+        # 体力不够浇完剩下的活苗 ⇒ 今天不再开新活。返回空池是**如实**的（leftover 照旧由
+        # `_leftover` 报），日终 `crops_watered` 该 false 就 false —— 绝不新增可洗白键。
+        _budget_why = self._budget_defer_reason(task, obs)
+        if _budget_why:
+            self._note_budget_deferred(task, _budget_why)
+            return []
 
         if task == "water_area":
             # 【task-84】**枯死作物不浇水**（用户 m11003）：死苗格从目标池里剔掉。
@@ -2402,6 +2533,12 @@ class LongRun:
                 # 真没做完（那是 task-135 F1/F2 打过的洗白通道）；分配额 ≤ 种子数却仍没种完 ⇒
                 # 照旧 `assigned_undone>0`、照旧判 unmet。
                 limit = min(limit, max(0, int(_seeds or 0)))
+                # 【task-158 ②】再按体力预算收一层：`capacity` = 今天还浇得过来的新增格数
+                # （`(max − 浇水预备 − 锄一格) / (播种 + 浇一格)`）。`budget_today` 为空说明
+                # 还没算过预算（例如单测直接调 `_stage_tiles`）⇒ 不拦，保持旧行为。
+                _cap = int((self.budget_today or {}).get("capacity") or 0)
+                if self.budget_today:
+                    limit = min(limit, max(0, _cap))
         if task in ("clear_area", "clear_dead", "till_area", "plant_area"):
             # 今天已经证明"动了没用"的格子不再碰（一格最多白试一次）；
             # 再叠一道"同一格一天最多发起 MAX_TILE_ATTEMPTS 次"的兜底不变量。
@@ -4484,6 +4621,9 @@ class LongRun:
         self.no_work_evidence_ok = False
         # 【task-149 B】"开工没回到农场"每天清零（同 `_ensure_on_farm` 的写入点）。
         self.day_start_off_farm = False
+        # 【task-158】体力预算每天重算（当天活苗数/体力上限都会变）。
+        self.budget_today = {}
+        self.budget_noted = False
         self.refills_today = 0
         self.idle_rounds = 0
         self.blocked = {}
@@ -4567,6 +4707,14 @@ class LongRun:
         # `_ensure_plot` 全判"没活" ⇒ 连睡 4 天，`final_water` farm 口径还是 `dry=33/33`。
         # 所以每天第一张观测之后、进主循环之前必须先回农场；失败**不吞**（notes + journal）。
         obs = self._ensure_on_farm(obs, rep)
+        # 【task-158】回到农场后的第一张观测就是"今天有多少活苗要浇、体力上限多少"的基准：
+        # 算一次浇水优先预算并落 journal（`_stage_tiles` 的闸门会用**当轮**观测重算，
+        # 这里这份是当天快照，日终进 `day_end.stamina_budget`）。
+        self.budget_today = self._stamina_budget(obs)
+        rep.stamina_budget = dict(self.budget_today)
+        if not self.budget_noted:
+            self.budget_noted = True
+            self._journal("stamina_budget", **self.budget_today)
 
         last_obs = obs
         # task-19：当天**最后一个户外农场快照**（窗口口径浇水证据的来源）。日终再问必然是室内的
@@ -4953,6 +5101,10 @@ class LongRun:
         raw_unmet = sum(plot_pending_by_kind.values())
         rep.plot_pending = raw_unmet
         rep.plot_pending_by_kind = plot_pending_by_kind
+        # 【task-158】日终把预算快照落到 `day_end`（含当天"因预算推迟"的记录）：
+        # 它**只**用于解释"为什么有些没浇完/没种上"，绝不参与 `checks`。
+        if self.budget_today:
+            rep.stamina_budget = dict(self.budget_today)
         unreach_in_last = sum(int(s.get("unreachable_leftover") or 0) for s in last_by_stage.values()
                               if int(s.get("tiles") or 0) > 0)
         unreachable_exempt = min(unreachable_bound, unreach_in_last)
