@@ -84,3 +84,28 @@
 - **顺序**：`157 → 158`（目标 2 关键路径，已交付）+ `155 ✅ → 20 → 161 → 163`（Mod 元数据 → 脑侧消费 → 体力标定 → 预算延后口径）⇒ `task-159` 对抗验收 ✅ + `task-160`（analyzer 回 0 红）✅ ⇒ Lead 冻结装机 ⇒ **run A / run B（同一 0.7.32 构建）** ⇒ 结论。
 - **A→B 对照口径（`docs/_run10-criteria.md`，提交 `54f8d07`）**：run A 与 run B 必须是**同一份 0.7.32 构建**、同参数（`--days 5 --size 5 --max-minutes 240 --max-days 12`），**唯一差异 = 注入的教训/笔记/决策史**；run9/run9b/run9c/run9d 都**不参与** A→B（它们分别是旧构建/诊断跑）。A 的初始教训库允许继承 run9d 的（双账本记录：继承 vs 本轮新增），B 用 A 的库显式拷贝。
 - **附加说明**：`task-161`（阶段体力标定）是 0.7.32 的**最后一张脑侧卡**；若它能在冻结前落地，A/B 两次跑的口径必须一致（`stamina_calibration` 只留痕、不改判据 ⇒ 允许同版共存）。
+
+## §8 冻结与装机执行记录（2026-10-17，Lead 独占，全部亲跑）
+
+### §8.1 冻结
+- 放行闸门全满足：`task-155`（Mod 元数据）、`task-20`（脑侧消费）、`task-157`、`task-158`、`task-161`、`task-163` 全部交付；`task-159`/`task-166` 独立对抗验收 **PASS / PASS-WITH-NITS（无必修）**；`task-160`/`task-164`/`task-165` 收桶 ⇒ **全量 `Ran 874 tests / OK`（0 红）**。
+- `tools/_note-0732.txt` 首串 `v0.7.32`（五张代码卡 + 四张验收/收桶卡 + 判据）。
+- `python tools\_bump-mod-version.py 0.7.32 --note-file tools\_note-0732.txt` ⇒ manifest **0.7.31 → 0.7.32**（cp1252 末句可能报 `UnicodeEncodeError`、退出码 1，但版本已写盘 ⇒ 一律用 `json.load` 核对）。
+- `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.32"`（注释列本版四项）。
+- `dotnet build .\mod\AgentFarm.Bridge\AgentFarm.Bridge.csproj -c Release --nologo --no-incremental` ⇒ **0 警告 0 错误**；`AgentFarm.Bridge.dll` **188928 B @03:43:15**、`manifest.json` **41292 B @03:42:40**（本版 Mod 侧有 task-155 的实际改动）。
+- 冻结提交 **`300a01c`**。
+- `python tools\check-release.py --expect 0.7.32` ⇒ **六项全绿**（manifest==brain==0.7.32、dll 不比源码旧、`py_compile` 22 文件、**`Ran 874 tests` OK**、工作树干净）。
+
+### §8.2 装机与起跑基线
+- `python tools\deploy-mod.py --no-quit` ⇒ 0.7.31 → **0.7.32**（dll 188928 / manifest 41292；桥 `modVersion=0.7.32 port=17890`；自动读档 `Wahaha_450799035` → FarmHouse(9,9)）。
+- `python -m agentfarm goto Farm --no-focus` ⇒ FarmHouse(9,9) → Farm(64,15)，hop1 **7617ms**。
+- `python tools\preflight.py --expect 0.7.32 --save-baseline logs\runA-0732-baseline.json` ⇒ **✅ 可以起跑**。
+- **基线**：第 1 年 **秋 3 日 06:10** / `debris` / Farm(64,15) / 体力 **136/270** / 钱 **20g** / 农场[草 444 / 石 110 / 枝 71 / 树 632 / 耕地 165 / 作物 142] / `waterLeft 0` / tillable 85 / tileCount 400（truncated）/ 无模态 / worldAdvancing true。**不做操作员预置。**
+- run A 命令：`python tools\start-detached-longrun.py --days 5 --size 5 --max-minutes 240 --max-days 12 --journal logs\longrun-runA-0732.jsonl --expect-version 0.7.32`。
+- run B 前置：待 run A 结束，把 `logs\longrun-runA-0732-lessons.json` **原样拷贝**为 `logs\longrun-runB-0732-lessons.json`（记拷贝时刻 + 两侧 SHA256），再以同参、仅换 journal 起跑（`task-113`）。
+
+### §8.3 判据（与 §4 合并执行）
+- run A/run B 两侧工具同向（`verify-run3` 的 `verdict` + `strict_verdict` 两行都抄；`analyze-longrun --window 5` 同向）+ `scratch\run9-lead-check.py --snapshots/--smapi` 无硬问题。
+- **尾部连续 5 天 `verified=true`** + 每次跨日落盘六串配对 + **每日 ≥2 份独立 `observe?detail=full` 端点**（缺口如实标【无法判定】）。
+- 演进对照 L0–L5（`tools\compare-runs.py`）：L0 A 库非空、L1 教训进 B 提示词、L2 同形态下降、L3 只作旁证、L4 无回归、L5 任一不成立 ⇒ 如实写"不足以判定自我进化"。
+- 0.7.33 遗留（不阻塞本版）：`task-167`（工具核延后留痕 + 两个 `deferred_tiles` 改名）、`task-141/142/151/152`（目标 1 主体）、`task-110/154/137` 等。
