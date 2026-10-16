@@ -6822,5 +6822,214 @@ class TestTask129ShippingMenuSave(unittest.TestCase):
         self.assertEqual(client.dismiss_timeouts, [5000])
 
 
+class TestTask134AssignedVsPlotPending(unittest.TestCase):
+    """task-134 B：日级"没做完"看**分配额**（`assigned_undone`），片区 leftover 只记 `plot_pending`。
+
+    run9b 的假红：`till_area` 分到 12 格、做完 12 格，整片地还剩 12 格 ⇒ 旧口径（leftover 求和）
+    把这一天判 `no_unmet_stages=False`。新口径下三种"还剩"必须分开：
+
+    * 分配格没做完（非诚实上限：`stopped` 为空/`world`/`fading`/`no_target`/`sow_failed`）⇒ **仍 unmet**；
+    * 分配格做完、片区还有（换片/收尾的事）⇒ 只记 `plot_pending`（= 改判据前的 `raw_unmet`）；
+    * 诚实上限（体力用尽 / 夜里收工 / 做完后撞 `budget`）留下的片区待办 ⇒ `deferred_tiles`(info)。
+
+    变异实测（`scratch\\_t134_mutate.py`，brain+tests 一起拷临时目录）：基线 9/9 绿；
+    **m134a**（诚实上限判据恒 False）红 `test_stamina_limit_defers_plot_pending_as_info`；
+    **m134b**（`assigned_unmet` 退回 leftover 口径）红 `test_assigned_tiles_all_done_*`。
+    """
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list:
+        return [e for e in run.entries if e["event"] == name]
+
+    @staticmethod
+    def _run_with(w: FakeWorld, *, client=None, worker=None):
+        client = client or _CountingClient(w)
+        worker = worker or FarmWorker(client, log=lambda *_: None)
+        run = make_run(w, target_days=1, max_days=1,
+                       client_factory=lambda: client, worker_factory=lambda c: worker)
+        run.worker = worker
+        run.client = client
+        run.plot_size = 5          # 让"片区/分配额"两个口径真的能分开（默认假世界片很小）
+        return run, client
+
+    @staticmethod
+    def _plot(*tiles) -> dict:
+        tiles = list(tiles) or [(60, 10)]
+        return {"zone": "", "label": "", "anchor": list(tiles[0]), "tiles": tiles, "note": ""}
+
+    @staticmethod
+    def _weeds(w: FakeWorld, tiles) -> list:
+        """把清障目标**明确**放進观测窗口里（`FakeWorld(weeds=N)` 的默认落点不保证在窗口内）。"""
+        out = []
+        for t in tiles:
+            tt = (int(t[0]), int(t[1]))
+            w.blockers[tt] = "weed"
+            out.append(tt)
+        return out
+
+    def test_assigned_tiles_all_done_is_not_unmet_even_with_plot_pending(self):
+        """分配 12 格做完（3 格被游戏拒绝 ⇒ 按规跳过），片区还剩 3 格 ⇒ 不许判未完成。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        grid = [(x, y) for y in range(10, 15) for x in range(60, 65)]
+        tiles = self._weeds(w, [t for t in grid if t != (62, 12)])   # 24 格（一片 5×5 里）
+        for t in tiles[:12]:
+            w.fail_status[t] = "tool_ineffective"       # 游戏拒绝 ⇒ skipped + proven_inert
+        run, _client = self._run_with(w)
+
+        run.run()
+
+        rep = run.days[0]
+        stages = [s for s in rep.stages if s["stage"] == "clear_area"]
+        self.assertTrue(stages, rep.stages)
+        last = stages[-1]
+        self.assertEqual(last["assigned_undone"], 0, last)
+        self.assertGreaterEqual(last["assigned"], 1, last)
+        self.assertGreater(last["leftover"], 0, last)
+        self.assertEqual(rep.plot_pending, last["leftover"], rep.stages)
+        self.assertGreater(rep.plot_pending_by_kind.get("clear_area", 0), 0, rep.plot_pending_by_kind)
+        self.assertTrue(rep.checks["no_unmet_stages"],
+                        f"分配格做完了、只剩片区 leftover ⇒ 不该判未完成：{rep.checks} {last}")
+
+    def test_stamina_limit_defers_plot_pending_as_info(self):
+        """体力用尽（诚实上限）留在中途中 ⇒ 只记 `deferred_tiles`(info)，不进 unmet。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0, stamina=20.0)
+        grid = [(x, y) for y in range(10, 15) for x in range(60, 65)]
+        self._weeds(w, [t for t in grid if t != (62, 12)])
+        run, _client = self._run_with(w)
+        run.min_stamina = 12.0
+
+        run.run()
+
+        rep = run.days[0]
+        stages = [s for s in rep.stages if s["stage"] == "clear_area"]
+        self.assertTrue(stages, rep.stages)
+        last = stages[-1]
+        self.assertEqual(last["stopped"], "stamina", last)
+        self.assertGreater(last["assigned_undone"], 0, last)
+        self.assertEqual(rep.assigned_undone, 0, f"诚实上限留下的片区待办不算没做完：{rep.stages}")
+        self.assertGreater(rep.deferred_tiles, 0, f"{rep.plot_pending} {rep.stages}")
+        self.assertTrue(rep.checks["no_unmet_stages"], f"{rep.checks} {last}")
+        self.assertTrue(self._events(run, "deferred_tiles"), run.entries)
+
+    def test_failed_assigned_tiles_without_honest_limit_stay_unmet(self):
+        """分配格没做完、`stopped` 为空（不是诚实上限）⇒ 照实 unmet、当天不 VERIFIED。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        for t in self._weeds(w, [(60, 10), (61, 10)]):
+            w.fail_status[t] = "timeout"                # 没拿到结论：占配额、不封格
+        run, _client = self._run_with(w)
+
+        run.run()
+
+        rep = run.days[0]
+        stages = [s for s in rep.stages if s["stage"] == "clear_area"]
+        self.assertTrue(stages, rep.stages)
+        last = stages[-1]
+        self.assertEqual(last["stopped"], "", last)
+        self.assertEqual(last["assigned_undone"], 2, last)
+        self.assertEqual(rep.assigned_undone, 2, rep.stages)
+        self.assertIs(rep.checks["no_unmet_stages"], False, rep.checks)
+        self.assertFalse(rep.verified, rep.checks)
+
+    def test_plot_pending_is_the_legacy_raw_unmet(self):
+        """`plot_pending` 必须与改判据前的 `raw_unmet`（last-by-stage `leftover` 求和）逐字相等。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.fail_status[self._weeds(w, [(60, 10)])[0]] = "timeout"
+        run, _client = self._run_with(w)
+
+        run.run()
+
+        rep = run.days[0]
+        last_by_stage: dict[str, dict] = {}
+        for s in rep.stages:
+            last_by_stage[str(s.get("stage") or "")] = s
+        legacy = sum(int(s.get("leftover") or 0) for s in last_by_stage.values()
+                     if int(s.get("tiles") or 0) > 0)
+        self.assertEqual(rep.plot_pending, legacy, rep.stages)
+        self.assertEqual(rep.plot_pending_by_kind,
+                         {k: int(s.get("leftover") or 0) for k, s in last_by_stage.items()
+                          if int(s.get("tiles") or 0) > 0})
+
+    def test_day_report_exposes_the_new_fields(self):
+        """新字段必须总在 `day_end` 里（旧账本缺它们 ⇒ 工具侧只许当 info，不能当通过）。"""
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+
+        d = rep.as_dict()
+
+        for key in ("assigned_undone", "plot_pending", "plot_pending_by_kind", "deferred_tiles"):
+            self.assertIn(key, d, f"{key} 必须落进 day_end")
+        self.assertEqual((d["assigned_undone"], d["plot_pending"], d["deferred_tiles"]), (0, 0, 0))
+        self.assertEqual(d["plot_pending_by_kind"], {})
+
+    def test_stage_records_carry_assigned_and_undone(self):
+        """阶段账本要有 `assigned`（分下去几格）与 `assigned_undone`（其中几格没做成）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        self._weeds(w, [(60, 10), (61, 10)])
+        run, _client = self._run_with(w)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+
+        run._step_stage("clear_area", w.obs(), self._plot((60, 10), (61, 10)), rep)
+
+        stage = [s for s in rep.stages if s["stage"] == "clear_area"][-1]
+        self.assertEqual(stage["assigned"], 2, stage)
+        self.assertEqual(stage["assigned_undone"], 0, stage)
+        self.assertFalse(self._events(run, "stage_shortfall"), run.entries)
+
+    def test_resume_reevaluate_clears_task_no_target_only(self):
+        """A 段：`resume` 只清任务级 `no_target`；全局「没目标」不许被清（那才是真洗白）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run, _client = self._run_with(w)
+        run.no_target = {"till_area", "clear_area"}
+        run.no_target_global = {"water_area"}
+
+        cleared = run._resume_reevaluate(where="unit")
+
+        self.assertEqual(sorted(cleared), ["clear_area", "till_area"])
+        self.assertEqual(run.no_target, set())
+        self.assertEqual(run.no_target_global, {"water_area"})
+        ev = self._events(run, "resume_reevaluate")
+        self.assertEqual(len(ev), 1, run.entries)
+        self.assertEqual(ev[0]["where"], "unit")
+
+    def test_repeated_resume_without_output_is_bounded_and_ends_stuck(self):
+        """A 段：回片区连续拿不出目标 ⇒ 到 burst 上界**立刻**诚实收尾 `stuck:`，不熬 idle 3 轮。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run, _client = self._run_with(w)
+        run.leftover_targets = {(60, 10)}
+        run.no_target = {"till_area"}
+        run.no_progress_cycles = PLOT_EXHAUSTED_BURST - 1
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+
+        forced, walked = run._review_only_fallback(w.obs(), rep)
+
+        self.assertIsNone(forced)
+        self.assertFalse(walked)
+        self.assertTrue(str(rep.ended_reason or "").startswith("stuck:"), rep.ended_reason)
+        self.assertEqual(rep.ended_by, "stuck",
+                         "有界收尾必须如实记 stuck（不是 sleep/收工，更不许洗成 no_work）")
+        self.assertTrue(run.leftover_targets, "leftover 不许被清成空（不许洗白）")
+        bursts = self._events(run, "no_progress_burst")
+        self.assertEqual(len(bursts), 1, run.entries)
+        self.assertGreaterEqual(bursts[0]["count"], PLOT_EXHAUSTED_BURST)
+        self.assertFalse(rep.checks.get("day_justified", False), rep.checks)
+
+    def test_exemptions_do_not_wash_an_assigned_shortfall(self):
+        """豁免（走不到）不许把"分配格没做完"洗成达标：扣完仍 > 0 ⇒ unmet。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        for t in self._weeds(w, [(60, 10), (61, 10), (62, 10)]):
+            w.fail_status[t] = "timeout"
+        client = _UnreachableClient(w, unreachable=[(63, 10), (64, 10)])
+        worker = FarmWorker(client, log=lambda *_: None)
+        run, _client = self._run_with(w, client=client, worker=worker)
+
+        run.run()
+
+        rep = run.days[0]
+        stages = [s for s in rep.stages if s["stage"] == "clear_area"]
+        self.assertTrue(stages, rep.stages)
+        self.assertGreater(stages[-1]["assigned_undone"], 0, stages[-1])
+        self.assertIs(rep.checks["no_unmet_stages"], False,
+                      f"豁免扣完仍该 unmet：{rep.checks} {rep.stages}")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

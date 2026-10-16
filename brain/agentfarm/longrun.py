@@ -404,6 +404,18 @@ class DayReport:
     #: —— 这一天**如实算失败**，只是"游戏日往前走了一格"，让整轮能继续跑下一天，
     #: 而不是像 run6 那样 19 秒 `no_day_progress` 终止。
     stuck_flushed: bool = False
+    #: 【task-134 B】两个**刻意分开**的口径：
+    #: * `assigned_undone` = 当天"阶段分下去的格没做完（且不是诚实上限）"的合计 —— 这才是
+    #:   `checks["no_unmet_stages"]` 的基数（先扣 `unreachable_exempt`/`refused_exempt`）。
+    #: * `plot_pending` = **片区还剩多少格该做没做**（改判据前的 `raw_unmet`，`_leftover` 逐 kind
+    #:   求和；数值与改前逐字一致）+ `plot_pending_by_kind` 明细。供守卫/换片/resume 与工具侧对账，
+    #:   **不再**直接决定 `no_unmet_stages`（run9b 的假红：分配 12 格做完 12 格、片区还剩 12 格）。
+    #: * `deferred_tiles` = 诚实上限（体力/夜里收工/分配额做完后撞 `budget`）留下的片区待办 ——
+    #:   只作 info，不算"没做完"。
+    assigned_undone: int = 0
+    plot_pending: int = 0
+    plot_pending_by_kind: dict[str, int] = field(default_factory=dict)
+    deferred_tiles: int = 0
 
     @property
     def failed_steps(self) -> int:
@@ -474,6 +486,13 @@ class DayReport:
             "dry_dead": self.dry_dead,
             "dry_dead_status": self.dry_dead_status,
             "gave_up_tiles": [list(t) for t in self.gave_up_tiles],
+            # 【task-134 B】"阶段分下去的格没做完"（no_unmet_stages 的基数）与"片区还剩多少格"
+            # （改判据前的 raw_unmet 口径，逐字保留）**分开落账**；诚实上限留下的片区待办
+            # 只记 `deferred_tiles`(info)。
+            "assigned_undone": self.assigned_undone,
+            "plot_pending": self.plot_pending,
+            "plot_pending_by_kind": dict(self.plot_pending_by_kind),
+            "deferred_tiles": self.deferred_tiles,
         }
 
 
@@ -762,6 +781,10 @@ class LongRun:
         #: 【task-124】"同一秒连发换片"的窗口计数（`plot_exhausted` 空转的刹车）。
         self._plot_exhausted_last: float | None = None
         self._plot_exhausted_window = 0
+        #: 【task-134 A】"回片区/换作业区"**连续**没产出目标的计数（run9b 2.6 秒 10 次、
+        #: 一格动作都没做的刹车）。与上面按墙钟 1 秒归零的窗口不同：这是确定性上界 ——
+        #: 只要世界一直没变化就一直累加，一旦真有进展就清零。
+        self.no_progress_cycles = 0
 
     # ------------------------------------------------------------------ 小工具
 
@@ -2284,6 +2307,51 @@ class LongRun:
         self._plot_exhausted_window += 1
         return self._plot_exhausted_window
 
+    def _resume_reevaluate(self, *, where: str) -> list[str]:
+        """回跨片区 leftover 之前，清掉当日"已证明没目标"的**任务级**记账（task-134 A）。
+
+        run9b t=290.78–293.72：`work_spot{tiles:9}` 与 `resume_walk{walked:true}` 在 2.6 秒里
+        各 **10 次**交替出现、一格动作都没做 —— 因为 `clear_area`/`plant_area` 已被
+        `_mark_no_target` 记进 `self.no_target`，人走回去以后 `_review_only_fallback` 的意图
+        过滤（`blocked = no_target | no_target_global`）把意图**全滤空** ⇒ 0 动作轮 ⇒
+        走路 → 空转 → 再走路。换片地那条路早就 `self.no_target.clear()`（plot_exhausted 分支），
+        resume 路径漏了这一步。
+
+        只清**任务级** `no_target`（"这一片拿不出目标"的片区级记账）；`no_target_global`
+        （全农场口径证明过没目标的任务）**不动** —— 把它也清掉才是真洗白。
+        """
+        cleared = sorted(self.no_target)
+        self.no_target = set()
+        if cleared:
+            self._journal("resume_reevaluate", where=where, cleared=cleared,
+                          note="回到跨片区 leftover 之前清掉任务级 no_target，让这批格重新"
+                               "参与取目标（否则意图被滤空 ⇒ 走路→空转→再走路的死循环）")
+        return cleared
+
+    def _no_progress_stop(self, obs: dict[str, Any], rep: DayReport, *,
+                          source: str, tiles: int) -> tuple[str, str]:
+        """回片区/换作业区**连续**无产出触顶 ⇒ 按既有诚实口径收尾（task-134 A）。
+
+        与 `plot_exhausted_burst`（墙钟同一秒窗口）互补：这条是确定性上界，慢速空转也一样拦。
+        收尾理由必须是 `stuck:`（leftover 一个字不动、绝不洗成 `no_work`）。
+        """
+        reasons = self.work_reasons(obs)[:3]
+        self._journal("no_progress_burst", count=self.no_progress_cycles, source=source,
+                      tiles=tiles, reasons=reasons,
+                      note="回片区/换作业区连续无产出（run9b：2.6 秒 10 次、一格动作没做）"
+                           "⇒ 按既有有界机制诚实收尾，不再空转；leftover 如实保留")
+        rep.notes.append(f"{source} 连续 {self.no_progress_cycles} 次没产出目标 ⇒ 停止空转")
+        ended_by, ended_reason = self._do_sleep(
+            obs, rep,
+            f"stuck:{source} 连续 {self.no_progress_cycles} 次都拿不出目标"
+            f"（守卫仍说还有活：{'；'.join(reasons) or '（无）'}）" + self._not_on_farm_suffix())
+        if ended_by == "slept_without_work":
+            # 【task-102】守卫仍说有活 ⇒ `_do_sleep` 拦住了"0 动作就想睡"（本日不推进）。
+            # 这条路径要的终态是**如实的 `stuck`**（不是"收工"、更不是靠睡觉翻篇把空转洗掉）：
+            # 保持 ended_by=stuck + `stuck:` 理由，让总控/账本一眼看出这一天没做成事。
+            ended_by = "stuck"
+        return ended_by, ended_reason
+
     def _review_only_fallback(self, obs: dict[str, Any],
                               rep: DayReport) -> tuple[Any | None, bool]:
         """review 独苗 + 守卫说还有活 ⇒ 换成能落地的意图，或把人带回那片地（task-124）。
@@ -2326,9 +2394,16 @@ class LongRun:
                     return SimpleNamespace(intents=intents), False
         pending = self._pending_work()
         if pending and self.resume_walks < self.max_plots_per_day:
+            self._resume_reevaluate(where="review_only_fallback")     # 【task-134 A】
             resume = self._resume_plot(obs)
             if resume is not None:
                 self.resume_walks += 1
+                self.no_progress_cycles += 1                          # 【task-134 A】
+                if self.no_progress_cycles >= PLOT_EXHAUSTED_BURST:
+                    rep.ended_by, rep.ended_reason = self._no_progress_stop(
+                        obs, rep, source="review_only_fallback 回片区",
+                        tiles=len(resume["tiles"]))
+                    return None, False
                 walked = self._walk_into_plot(obs, resume)
                 self._journal("review_only_fallback", source="pending_walk",
                               tiles=len(resume["tiles"]), walked=bool(walked),
@@ -3245,6 +3320,10 @@ class LongRun:
         stopped = ""
         attempts = 0
         walked = False
+        # 【task-134 B】这一阶段**真的分下去**的格子（跨轮累计）。日级 `no_unmet_stages`
+        # 从 task-134 起看它：分到的格做完 ⇒ 不算没做完（哪怕整片地还剩别的格，
+        # 那是换片/收尾的事，记 `plot_pending`）。
+        assigned: set[tuple[int, int]] = set()
         # **没种子又买不起 ⇒ 今天不碰开垦/播种**（执行层的第三道同口径，见 `_stage_tiles`）。
         # 先在这里说一句人话 + 记 journal，再去跑（跑起来会"一格目标都没有"，但那是空转的表现，
         # 不是原因）。只播报一次，别每轮刷屏。
@@ -3294,6 +3373,11 @@ class LongRun:
                 forced = None
             else:
                 tiles = self._stage_tiles(task, snap, plot)
+            for _t in tiles:
+                try:
+                    assigned.add((int(_t[0]), int(_t[1])))
+                except (TypeError, ValueError, IndexError):
+                    continue
             if not tiles and not walked:
                 # 观测是**以玩家为中心**的：`tiles[]` 上限 400 且近处优先，`tillable[]` 同理。
                 # 站在别处问"这片地还有可锄的吗"，答案会是 0 —— 真机证据：浇完水站在田区另一头，
@@ -3363,6 +3447,11 @@ class LongRun:
         # `_mark_blocked` 已改为**每轮**在循环内调用（见上），这里不再补一次：
         # 循环外的 `obs` 是阶段开始时的快照，用它当"动手前"会把中间几轮的变化算错。
         leftover = self._leftover(task, fresh, plot)
+        # 【task-134 B】`assigned_undone` = 分下去的格里**没做成、也没按规跳过**的数量。
+        # 按规跳过（`code=skipped`：这格本来就不用干/干不动）不算"没做完"；
+        # 走不到/被拒/壶空这些另有两套独立计数与豁免，不在这里重复扣。
+        assigned_done = {tuple(s.tile) for s in all_steps if s.tile and (s.ok or s.skipped)}
+        assigned_undone = len(assigned - assigned_done)
         # "还可能再试"的剩余：既没被封格、也没到本日尝试上限。
         retryable = [t for t in leftover
                      if t not in self.blocked and self.tile_attempts.get(t, 0) < MAX_TILE_ATTEMPTS]
@@ -3459,7 +3548,18 @@ class LongRun:
             # 是 `bound_basis`）。
             "engaged": sum(1 for s in all_steps if s.attempted and s.stood),
             "stopped": stopped, "leftover": len(leftover),
+            # 【task-134 B】`assigned` = 这一阶段分下去的格数；`assigned_undone` = 其中没做成、
+            # 也没按规跳过的格数。日级 `no_unmet_stages` 从 task-134 起看 `assigned_undone`
+            # （`leftover` 仍是"片区还剩多少格"，作为 `plot_pending` 落账、供守卫/换片/resume 用）。
+            "assigned": len(assigned), "assigned_undone": assigned_undone,
         })
+        if assigned_undone:
+            self._journal("stage_shortfall", stage=task, zone=self.zone_name,
+                          assigned=len(assigned), undone=assigned_undone, stopped=stopped,
+                          leftover=len(leftover),
+                          note="【task-134 B】阶段分下去的格没做完（未按规跳过）⇒ 除非是诚实上限"
+                               "（体力/夜里收工/做完后撞 budget），当天判 unmet；"
+                               "片区还剩几格是 `plot_pending` 口径，两者刻意分开")
         if unreach_steps:
             self._journal("unreachable_stage", stage=task, zone=self.zone_name,
                           tiles=len(unreach_tiles), in_leftover=unreach_in_left,
@@ -4021,6 +4121,7 @@ class LongRun:
         # 【task-124】同一秒连发换片的窗口计数每天清零。
         self._plot_exhausted_last = None
         self._plot_exhausted_window = 0
+        self.no_progress_cycles = 0      # 【task-134 A】每日重置：连续无产出环路计数
         self.dead_scope_noted = set()
         # 【task-59】复盘每天最多一次（`recent_notes` **不**在这里清：它是"昨晚留给今天"的，
         # 由 `_review_before_sleep` 在夜里覆盖）。
@@ -4161,6 +4262,13 @@ class LongRun:
                 # （与"换片地"同一个量级）；走不动就落回正常判定，不空转。
                 if work_spot is None and picked is plot and self.resume_walks < self.max_plots_per_day:
                     self.resume_walks += 1
+                    self.no_progress_cycles += 1                       # 【task-134 A】
+                    self._resume_reevaluate(where="work_spot_resume")  # 【task-134 A】
+                    if self.no_progress_cycles >= PLOT_EXHAUSTED_BURST:
+                        rep.ended_by, rep.ended_reason = self._no_progress_stop(
+                            obs, rep, source="回片区（work_spot_resume）",
+                            tiles=len(plot["tiles"]))
+                        break
                     walked = self._walk_into_plot(obs, plot)
                     self._journal("resume_walk", zone=self.zone_name, tiles=len(plot["tiles"]),
                                   walked=bool(walked), attempt=self.resume_walks,
@@ -4235,6 +4343,9 @@ class LongRun:
             if (self._is_review_only(decision) and self.work_reasons(obs)
                     and (self._work_spot_plot(obs) is not None or self._pending_work())):
                 forced, walked = self._review_only_fallback(obs, rep)
+                if rep.ended_by:
+                    # 【task-134 A】里面已按"连续空转触顶"写好了诚实收尾（`stuck:`）
+                    break
                 if walked:
                     continue
                 if forced is not None:
@@ -4269,9 +4380,16 @@ class LongRun:
                     #   格子"（可能整片都在玩家窗口之外）回头看一眼，而不是直接换片地/攒 recovered。
                     #   run5 第 1 天：field_nw 还剩 9 格未开垦，人站在 field_se 就以为"没活"。
                     if self._pending_work() and self.resume_walks < self.max_plots_per_day:
+                        self._resume_reevaluate(where="guard_leftover")   # 【task-134 A】
                         resume = self._resume_plot(obs)
                         if resume is not None:
                             self.resume_walks += 1
+                            self.no_progress_cycles += 1                  # 【task-134 A】
+                            if self.no_progress_cycles >= PLOT_EXHAUSTED_BURST:
+                                rep.ended_by, rep.ended_reason = self._no_progress_stop(
+                                    obs, rep, source="回片区（guard_leftover）",
+                                    tiles=len(resume["tiles"]))
+                                break
                             walked = self._walk_into_plot(obs, resume)
                             self._journal("resume_walk", zone=self.zone_name,
                                           tiles=len(resume["tiles"]), walked=bool(walked),
@@ -4331,9 +4449,11 @@ class LongRun:
             obs = after
             if acted and changed:
                 self.idle_rounds = 0
+                self.no_progress_cycles = 0      # 【task-134 A】真有进展 ⇒ 空转计数清零
             elif changed:
                 # 意图没落地（比如被否决），但世界确实变了 —— 也算有进展
                 self.idle_rounds = 0
+                self.no_progress_cycles = 0      # 【task-134 A】
             else:
                 self.idle_rounds += 1
                 self._journal("idle", rounds=self.idle_rounds, zone=self.zone_name,
@@ -4427,8 +4547,16 @@ class LongRun:
         rep.unreachable = len(unreach_day)
         rep.unreachable_tiles = [list(t) for t in sorted(unreach_day)]
         rep.unreachable_bound = unreachable_bound
-        raw_unmet = sum(int(s.get("leftover") or 0) for s in last_by_stage.values()
-                        if int(s.get("tiles") or 0) > 0)
+        # 【task-134 B】`plot_pending` = 改判据**之前**的 `raw_unmet` 口径（`_leftover` 逐 kind 求和）：
+        # "片区里还剩多少格该做没做"。**数值必须逐字一致**（守卫/换片/resume 与工具侧都对它）。
+        # `no_unmet_stages` 从此不再由它直接决定（见下面的 `assigned_unmet`）——
+        # run9b 的假红就是"分配 12 格做完了 12 格、整片地还剩 12 格"被算成没做完。
+        plot_pending_by_kind = {str(name): int(s.get("leftover") or 0)
+                                for name, s in last_by_stage.items()
+                                if int(s.get("tiles") or 0) > 0}
+        raw_unmet = sum(plot_pending_by_kind.values())
+        rep.plot_pending = raw_unmet
+        rep.plot_pending_by_kind = plot_pending_by_kind
         unreach_in_last = sum(int(s.get("unreachable_leftover") or 0) for s in last_by_stage.values()
                               if int(s.get("tiles") or 0) > 0)
         unreachable_exempt = min(unreachable_bound, unreach_in_last)
@@ -4455,7 +4583,47 @@ class LongRun:
                               if int(s.get("tiles") or 0) > 0)
         refused_exempt = min(refused_bound, refused_in_last)
         rep.refused_exempt = refused_exempt
-        unmet_leftover = max(0, raw_unmet - unreachable_exempt - refused_exempt)
+        # 【task-134 B】日级"没做完"改看**分配额** `assigned_undone`（分配格 − 做成/按规跳过），
+        # 不再直接看片区 leftover。诚实上限（体力用尽 `stamina`、夜里收工、`budget` 且分配额
+        # 已做完）留下的片区待办只记 `deferred_tiles`(info)：那是"今天该收工了"，不是"没做完
+        # 还硬说达标"。**豁免结构与 `bound_basis` 分母一字未动**（下面只把基数换成 assigned_unmet）。
+        night_end = str(rep.ended_reason or "").startswith("night")
+        assigned_unmet = 0
+        deferred_tiles = 0
+        honest_stages: list[dict] = []
+        shortfall_stages: list[dict] = []
+        for name, s in last_by_stage.items():
+            if int(s.get("tiles") or 0) <= 0:
+                continue
+            undone = int(s.get("assigned_undone") or 0)
+            stopped = str(s.get("stopped") or "")
+            honest = (stopped == "stamina"
+                      or (stopped == "budget" and undone == 0)
+                      or (night_end and stopped == ""))
+            if honest:
+                deferred_tiles += int(s.get("leftover") or 0)
+                if int(s.get("leftover") or 0) > 0:
+                    honest_stages.append({"stage": name, "stopped": stopped,
+                                          "leftover": int(s.get("leftover") or 0),
+                                          "assigned_undone": undone})
+            elif undone > 0:
+                assigned_unmet += undone
+                shortfall_stages.append({"stage": name, "stopped": stopped, "undone": undone,
+                                         "assigned": int(s.get("assigned") or 0),
+                                         "leftover": int(s.get("leftover") or 0)})
+        unmet_leftover = max(0, assigned_unmet - unreachable_exempt - refused_exempt)
+        rep.assigned_undone = assigned_unmet
+        rep.deferred_tiles = deferred_tiles
+        if shortfall_stages:
+            self._journal("stage_shortfall_day", unmet=assigned_unmet, stages=shortfall_stages[:6],
+                          plot_pending=raw_unmet, stopped_night=bool(night_end),
+                          note="阶段分下去的格没做完（非诚实上限）⇒ 当天 needs_review；"
+                               "`plot_pending` 是片区还剩多少格，两个口径分开记")
+        if deferred_tiles:
+            self._journal("deferred_tiles", tiles=deferred_tiles, night=bool(night_end),
+                          by_kind=plot_pending_by_kind, stages=honest_stages[:6],
+                          note="诚实上限（体力/夜里收工/分配额做完后撞 budget）留下的片区待办："
+                               "只作 info，不进 no_unmet_stages")
         made_any_progress = rep.ok_steps > 0
         if refused_day:
             self._journal("refused_summary", count=len(refused_day), bound=refused_bound,
@@ -4582,7 +4750,9 @@ class LongRun:
             f"[day] {rep.day_text} 结束：{rep.ended_by}"
             + (f"（{rep.ended_reason}）" if rep.ended_reason else "")
             + f" 阶段 {rep.stages_seen or '无'} 做成 {rep.ok_steps} 跳过 {rep.skipped_steps} 失败 {rep.failed_steps}"
-            + f" 未完成阶段剩 {unmet_leftover} 格（no_unmet_stages={rep.checks.get('no_unmet_stages')}）"
+            + f" 阶段分下去的格少做 {unmet_leftover} 格（no_unmet_stages={rep.checks.get('no_unmet_stages')}）"
+            + f"；片区待做 {raw_unmet} 格"
+            + (f"（其中 {rep.deferred_tiles} 格是诚实上限留下的，只作 info）" if rep.deferred_tiles else "")
             + (f" 走不到 {rep.unreachable} 格（豁免界 {unreachable_bound}、实扣 {unreachable_exempt}）"
                if rep.unreachable else "")
             + (f" 游戏拒绝 {rep.refused} 格（豁免界 {refused_bound}、实扣 {refused_exempt}）"
