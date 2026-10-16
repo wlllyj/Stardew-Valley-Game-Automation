@@ -362,6 +362,22 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         if isinstance(tile, (list, tuple)) and len(tile) >= 2:
             refused_tiles_by_day.setdefault(_cur_key2, set()).add((tile[0], tile[1]))
 
+    # task-134（Lead 2026-10-16，deputy task-135 的 F2）：`assigned_undone` 是**纯自述**字段 ——
+    # 伪造 `day_end.assigned_undone=0` + `checks.no_unmet_stages=true`（同时 journal 里留着
+    # `stage_shortfall{undone:5}`）能骗过 3b 的新口径，而 pre134 的 leftover 口径反而抓得住。
+    # 这里用 journal `stage_shortfall_day.unmet`（脑侧同一份数字的**另一处落痕**）做独立交叉核对：
+    # 账本比 journal 少报 ⇒ problem（与 unreachable/refused 两路同法：自述必须被自算验过）。
+    shortfall_by_day: dict[tuple[str, Any], int] = {}
+    _cur_key3: tuple[str, Any] | None = None
+    for r in rows:
+        if r.get("event") == "day_start":
+            _cur_key3 = (day_key(r), r.get("_lineno"))
+            continue
+        if _cur_key3 is None or r.get("event") != "stage_shortfall_day":
+            continue
+        # 同一天可能重试多次 ⇒ 取最后一条（与 `last_by_stage` 的日级口径一致）。
+        shortfall_by_day[_cur_key3] = int(r.get("unmet") or 0)
+
     # task-68（Lead 2026-10-14）：dev-coder 把「被围住」从 run6 的 42 格里分出来，单独成类
     # `encircled`（四邻连落脚点都没有 ⇒ 不封格、不计入 unreachable、不进任何豁免分子），
     # 并新增 `frontier_clear`（所有指定目标都不可达时，至少清一格自己够得着的可清障格）
@@ -897,8 +913,28 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         _assigned_recs = [s for s in last_by_stage.values() if "assigned_undone" in s]
         _has_assigned = bool(_assigned_recs)
         if _has_assigned:
-            assigned_undone = sum(int(s.get("assigned_undone") or 0) for s in _assigned_recs)
-            deferred_tiles = int(end_stats.get("deferred_tiles") or 0)
+            # ⚠ 必须**逐字镜像** longrun 的口径（deputy task-135 F1 实测的假红）：
+            # honest = `stamina` / `budget 且 assigned_undone==0` / **夜里收尾且 stopped==""**；
+            # honest 阶段的分配未完成**不进** unmet，只把它的 `leftover` 记进 `deferred_tiles`。
+            # 旧写法把 honest 阶段的 `assigned_undone` 也加进基数 ⇒ 夜里/体力收尾的干净一天
+            # 会同时出现「与自算不一致」和「诚实上限延后 N 格」两条互相打脸的输出。
+            _night_end = str(d.get("ended_reason") or "").startswith("night")
+            assigned_undone = 0
+            deferred_tiles = 0
+            for s in _assigned_recs:
+                if _tile_count(s) <= 0:
+                    continue
+                _undone = int(s.get("assigned_undone") or 0)
+                _stopped = str(s.get("stopped") or "")
+                _honest = (
+                    _stopped == "stamina"
+                    or (_stopped == "budget" and _undone == 0)
+                    or (_night_end and _stopped == "")
+                )
+                if _honest:
+                    deferred_tiles += int(s.get("leftover") or 0)
+                elif _undone > 0:
+                    assigned_undone += _undone
             effective_unmet = max(0, assigned_undone - unreach_exempt - refused_exempt)
         else:
             assigned_undone = None
@@ -935,6 +971,21 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
                 f"[{name}] 当天有阶段遗留目标 unmet={effective_unmet}"
                 f"（阶段没做完；已扣不可达豁免 {unreach_exempt} + 锄不动豁免 {refused_exempt}）"
             )
+        # task-134 / deputy task-135 F2：`assigned_undone` 是纯自述 ⇒ 必须与 journal 的另一处落痕
+        # 交叉核对。伪造"少做 5 格"却在账本写 0（`stage_shortfall{undone:5}` 仍在 journal）时，
+        # 单看账本会 VERIFIED；这里把少报抓成 problem（缺失/无落痕只记信息，不当通过）。
+        _shortfall_self = shortfall_by_day.get(sess)
+        if _has_assigned:
+            if _shortfall_self is not None and int(assigned_undone or 0) < int(_shortfall_self):
+                problems.append(
+                    f"[{name}] 账本 assigned_undone={assigned_undone} < journal stage_shortfall_day.unmet="
+                    f"{_shortfall_self}（阶段日记自报少做了这些格，账本却少记 ⇒ 可能被洗白）"
+                )
+            elif _shortfall_self is None and int(assigned_undone or 0) > 0:
+                infos.append(
+                    f"[{name}] 账本 assigned_undone={assigned_undone} 但 journal 没有 stage_shortfall_day "
+                    "落痕 ⇒ 无法交叉核对（缺失 ≠ 通过）"
+                )
         # task-134：片区待办只作信息 —— 但必须可见，否则复核的人会以为"没做完就是没做完"。
         if _has_assigned and leftover_targeted:
             infos.append(
@@ -944,6 +995,11 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         elif _has_assigned is False and leftover_targeted:
             infos.append(
                 f"[{name}] 旧口径账本：片区 leftover={leftover_targeted} 格（按 leftover 判 unmet）"
+            )
+        _defer_field = end_stats.get("deferred_tiles")
+        if isinstance(_defer_field, (int, float)) and _has_assigned and int(_defer_field) != deferred_tiles:
+            infos.append(
+                f"[{name}] 账本 deferred_tiles={int(_defer_field)} 与按阶段自算 {deferred_tiles} 不一致（供复核）"
             )
         if leftover_zero_target:
             problems.append(

@@ -925,11 +925,11 @@ class TestVerifyRun3(unittest.TestCase):
         self.assertTrue(any("plot_pending" in i for i in s["infos"]), s["infos"])
 
     def test_assigned_undone_positive_matches_no_unmet_false(self):
-        """分配内真没做完 + 账本如实写 false ⇒ 不报 mismatch（但 false 本身仍是问题）。"""
+        """分配内真没做完（非诚实上限）+ 账本如实写 false ⇒ 不报 mismatch（但 false 本身仍是问题）。"""
         rows = green_rows()
         for r in rows:
             if r.get("event") == "day_end":
-                r["stages"] = [stage("till_area", tiles=12, ok=9, leftover=15,
+                r["stages"] = [stage("till_area", tiles=12, ok=9, leftover=15, stopped="no_target",
                                      assigned=12, assigned_undone=3)]
                 r["checks"]["no_unmet_stages"] = False
                 r["verified"] = False
@@ -938,15 +938,49 @@ class TestVerifyRun3(unittest.TestCase):
         self.assertTrue(any("no_unmet_stages=false" in p for p in s["problems"]), s["problems"])
 
     def test_assigned_undone_lying_true_is_still_caught(self):
-        """账本谎报 true 而分配内还有 3 格没做完 ⇒ mismatch 必须被 SelfCheck 抓住。"""
+        """账本谎报 true 而分配内还有 3 格没做完（非诚实上限）⇒ mismatch 必须被抓住。"""
         rows = green_rows()
         for r in rows:
             if r.get("event") == "day_end":
-                r["stages"] = [stage("till_area", tiles=12, ok=9, leftover=15,
+                r["stages"] = [stage("till_area", tiles=12, ok=9, leftover=15, stopped="no_target",
                                      assigned=12, assigned_undone=3)]
         ok, s = self.check(rows, days=0)
         self.assertTrue(any("assigned_undone=3" in p and "与自算不一致" in p for p in s["problems"]),
                         s["problems"])
+
+    def test_honest_limit_stage_is_not_an_unmet_mismatch(self):
+        """deputy task-135 F1 的假红形态：体力/夜里收尾的诚实上限阶段**不许**报 mismatch。
+
+        旧写法把 honest 阶段的 `assigned_undone` 也加进基数 ⇒ 同一份输出上既说"与自算不一致"
+        又说"其中诚实上限延后 N 格"，自相矛盾。
+        """
+        rows = green_rows()
+        for r in rows:
+            if r.get("event") == "day_end":
+                r["ended_reason"] = "stamina:体力 4 < 12"
+                r["stages"] = [stage("till_area", tiles=12, ok=11, skipped=0, leftover=9,
+                                     stopped="stamina", assigned=12, assigned_undone=1)]
+                r["deferred_tiles"] = 9
+        ok, s = self.check(rows)
+        self.assertTrue(ok, s.get("problems"))
+        self.assertFalse(any("与自算不一致" in p for p in s["problems"]), s["problems"])
+        self.assertTrue(any("诚实上限延后 9 格" in i for i in s["infos"]), s["infos"])
+
+    def test_forged_assigned_undone_is_caught_by_journal(self):
+        """deputy task-135 F2：`assigned_undone` 是纯自述 ⇒ 账本少报必须被 journal 落痕抓住。"""
+        # journal 里留着"阶段自报少做 5 格"的落痕（与账本的 0 打架）；插在第一天会话内。
+        rows = green_rows()
+        for r in rows:
+            if r.get("event") == "day_end":
+                r["stages"] = [stage("till_area", tiles=12, ok=12, leftover=0, stopped="no_target",
+                                     assigned=12, assigned_undone=0)]
+        rows.insert(1, {"event": "stage_shortfall_day", "unmet": 5, "stages": [], "t": 150.0,
+                        "plot_pending": 5, "stopped_night": False})
+        ok, s = self.check(rows, days=0)
+        self.assertTrue(
+            any("stage_shortfall_day.unmet=5" in p and "assigned_undone=0" in p for p in s["problems"]),
+            s["problems"],
+        )
 
     def test_deferred_tiles_is_reported_as_info(self):
         """诚实上限延后的片区待办：`deferred_tiles` 只作信息，不许变成 unmet。"""
