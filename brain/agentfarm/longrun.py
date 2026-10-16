@@ -614,6 +614,12 @@ class LongRun:
         # 只影响提示词文本，**绝不**参与任何判定（`verified`/`ended_by`/`checks` 一字不变）。
         # 重启后为空 —— 允许（没有持久层）。
         self.decision_memory: list[str] = []
+        # 【task-59】昨晚收工复盘留下的 1–3 条笔记（`BoundaryPlanner.review()` 产出，无坐标）。
+        # 夜里回填、次日注入 `Brief.recent_notes`；复盘失败 ⇒ 清空（不拿旧笔记冒充昨晚的复盘）。
+        # ⚠️ 与决策史同一条诚实边界：只影响提示词文本，**绝不**参与任何判定。
+        self.recent_notes: list[str] = []
+        # 【task-59】今天是否已经复盘过（每天**最多一次**独立调用）。
+        self.review_done_today = False
         # 【task-49】今天**已经见过、但还没做完**的格子（`_step_stage` 每轮的 `leftover`，排除已封格）。
         # 为什么必须记：观测是**以玩家为中心**的窗口（真机 `tiles[]` 上限 400、近处优先），
         # 人一换到别的片地，原来那片地的格子就"看不见"了 ⇒ `work_reasons`/`_plot_candidates`
@@ -1539,7 +1545,70 @@ class LongRun:
             sellable=full.sellable,
             # 【task-58】把会话内的决策史喂回提示词（空 ⇒ 提示词里不出现这一节）。
             recent_decisions=tuple(self.decision_memory),
+            # 【task-59】把昨晚的复盘笔记喂回提示词（空 ⇒ 不出现这一节）。
+            recent_notes=tuple(self.recent_notes),
         )
+
+    def _review_brief(self, obs: dict[str, Any]) -> Brief:
+        """【task-59】收工复盘用的简报：当天最后一张观测的**全场**口径（不掺作业区局部）。"""
+        sellable = 0
+        try:
+            if self.worker is not None:
+                sellable = len(self.worker.sellable_slots(obs))
+        except Exception:  # pragma: no cover - 复盘简报不该影响主流程
+            sellable = 0
+        return Brief.from_observe(obs, consecutive_failures=self.fail_streak,
+                                  last_failure=self.last_failure,
+                                  target_tiles=self.target_tiles_base, sellable=sellable)
+
+    def _review_before_sleep(self, obs: dict[str, Any], rep: DayReport) -> None:
+        """【task-59】收工前**一次独立**的 LLM 复盘：产出 1–3 条笔记，只落两处。
+
+        落点：①journal `review_llm`（失败 ⇒ `review_llm_failed`）；②`self.recent_notes`
+        ⇒ 次日 `Brief.recent_notes`。
+
+        为什么它影响不到当天的判定（卡面第 2 条）：
+        * 调用发生在**睡前**，此时 `rep.final`/`rep.checks` 都已经定稿，复盘只往 `rep.notes`
+          里追加一句人话，**不碰** `rep.verified`/`checks`/`ended_by`/`final_water`；
+        * `BoundaryPlanner.review()` 不读也不写 `PlannerState` ⇒ 边界状态机、下一次决策的
+          边界判定与它无关；
+        * 全程 `try/except` 包住：任何异常都在这里消化成 `review_llm_failed`，睡觉与跨日
+          照常（"失败无害"）。
+        """
+        if self.review_done_today:
+            return
+        planner = self.planner
+        if planner is None or not getattr(planner, "llm_enabled", False):
+            return
+        self.review_done_today = True
+        try:
+            res = planner.review(self._review_brief(obs))
+        except Exception as exc:  # noqa: BLE001 - 再兜一层：复盘绝不许把主循环带崩
+            res = {"ok": False, "called": False,
+                   "reason": f"review_exception:{type(exc).__name__}: {exc}"}
+        day_key: Any = None
+        try:
+            day_key = list(FarmWorker.day_key(obs))
+        except Exception:  # pragma: no cover
+            day_key = None
+        if res.get("ok"):
+            self.recent_notes = [str(n) for n in (res.get("notes") or [])][:3]
+            self._journal("review_llm", day_key=day_key, notes=list(self.recent_notes),
+                          text=str(res.get("text") or ""), usage=res.get("usage"),
+                          duration_ms=int(res.get("duration_ms") or 0),
+                          model=str(res.get("model") or ""),
+                          rejected=list(res.get("rejected") or []),
+                          truncated=bool(res.get("truncated")),
+                          note="只写 journal 与次日 recent_notes；不参与任何判定")
+            rep.notes.append(f"收工复盘：{len(self.recent_notes)} 条笔记（只影响次日简报，不参与判定）")
+            self._say(f"  · 收工复盘：{len(self.recent_notes)} 条笔记")
+        else:
+            self.recent_notes = []
+            self._journal("review_llm_failed", day_key=day_key,
+                          reason=str(res.get("reason") or "review_failed"),
+                          called=bool(res.get("called")), rejected=list(res.get("rejected") or []),
+                          note="复盘失败无害：睡觉与跨日照常，只是次日看不到笔记")
+            rep.notes.append(f"收工复盘失败（无害）：{res.get('reason')}")
 
     def _stage_tiles(self, task: str, obs: dict[str, Any], plot: dict[str, Any]) -> list[tuple[int, int]]:
         """这一阶段要动的格子（已排序、已限数）。
@@ -2266,6 +2335,9 @@ class LongRun:
         # 【task-102】睡前先把残留模态关掉一次：run8 day 13 的 `sleep` 就是被 `ShopMenu`
         # 卡成 `sleep_failed`（`ui.isModal` 为真时所有技能都会被 `ui_modal` 拒）。
         # 存档类模态（`SaveGameMenu`/`NewDaySavingMenu`）与 `eventUp` 一律不碰（task-11/task-41）。
+        # 【task-59】真正收工前先做一次独立复盘（禁坐标、只落 journal 与次日简报）；
+        # 放在 `rep.final` 定稿之前也无妨 —— 它不碰任何判定字段（只追加 `rep.notes` 一句）。
+        self._review_before_sleep(obs, rep)
         fresh = self._dismiss_stray_menu(obs, rep, where="before_sleep")
         if fresh is not obs:
             obs = fresh
@@ -3312,6 +3384,9 @@ class LongRun:
         self.slot_sold_today = False
         self.farm_actions_today = 0
         self.dead_scope_noted = set()
+        # 【task-59】复盘每天最多一次（`recent_notes` **不**在这里清：它是"昨晚留给今天"的，
+        # 由 `_review_before_sleep` 在夜里覆盖）。
+        self.review_done_today = False
         self.no_target = set()
         self.no_target_global = set()
         # 【task-49】跨片地的"今天还没做完"记账 + 回头看的次数上限，每天清零。

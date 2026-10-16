@@ -72,6 +72,9 @@ __all__ = [
     "LLM_TRACE_MAX_PROMPT_CHARS",
     # 【task-58】决策史（会话内记忆；不是权重更新，见 `Brief.recent_decisions`）
     "DECISIONS_KEPT", "DECISIONS_MAX_CHARS", "decision_line",
+    # 【task-59】收工复盘（night 边界一次独立调用；只落 journal + 次日 `recent_notes`）
+    "REVIEW_MAX_TOKENS", "REVIEW_NOTES_MAX", "REVIEW_NOTES_MAX_CHARS", "NOTES_SECTION_MAX_CHARS",
+    "REVIEW_SYSTEM_PROMPT", "parse_review_notes", "build_review_messages",
     "BoundaryPlanner", "PLAN_SCHEMA_EXAMPLE",
 ]
 
@@ -395,6 +398,97 @@ DECISIONS_MAX_CHARS = 300
 #: 提示词里只呈现塞得下的那些 —— 卡面要求的是"条数 3–5"与"整节 ≤300"两条同时成立）。
 DECISION_LINE_MAX_CHARS = 140
 
+#: 【task-59】收工复盘（night 边界）的**独立调用**预算：只写 1–3 条笔记，所以给它单独一个
+#: 小 `max_tokens`（卡面 ≤512）——**绝不挪用主决策的 16384**（那是给"长期推理 + 补问"留的）。
+REVIEW_MAX_TOKENS = 512
+#: 【task-59】复盘笔记条数上限（卡面 1–3 条；超出就截断并记 `truncated`）。
+REVIEW_NOTES_MAX = 3
+#: 【task-59】复盘笔记**合计**字符上限（卡面"合计 ≤200 token"的保守字符代理：中文≈1 token/字）。
+REVIEW_NOTES_MAX_CHARS = 200
+#: 【task-59】次日简报里 `recent_notes` 这一节的硬上限。与决策史同口径：**最先被裁**。
+NOTES_SECTION_MAX_CHARS = 200
+
+#: 【task-59】复盘专用 system 提示词。和主决策提示词完全分开：它**不做决策**，
+#: 只让模型对着当天简报写 1–3 条给明天的短笔记（禁坐标、禁长篇行动计划）。
+REVIEW_SYSTEM_PROMPT = (
+    "你是《星露谷物语》农场的收工复盘助手。只做一件事：看完当天情境简报，写 1–3 条"
+    "**给明天的自己**的短笔记。\n"
+    "铁律：\n"
+    "1. 只输出 JSON，格式必须是 {\"notes\": [\"…\", \"…\"]}，不要任何多余文字。\n"
+    "2. 每条 ≤60 个汉字，全部合计 ≤200 字符；最多 3 条。\n"
+    "3. **禁止出现坐标或数字化的格子位置**（不许写 (12,30)、不许写“第 12 列第 30 行”）；"
+    "要指地点就写方向或田区名（如 field_nw、西北那片地）。\n"
+    "4. 只依据简报里已有的事实，不要臆造；不要写行动计划清单，只写“明天要注意什么”。\n"
+)
+
+
+def parse_review_notes(
+    raw: Any,
+    *,
+    max_notes: int = REVIEW_NOTES_MAX,
+    max_chars: int = REVIEW_NOTES_MAX_CHARS,
+) -> tuple[list[str], list[str], bool]:
+    """【task-59】把复盘输出解析成 `(notes, rejected, truncated)` —— **绝不抛异常**。
+
+    * 只认 `{"notes": [...]}`（或裸数组 / 裸字符串）；解析不出来 ⇒ `rejected` 里记原因；
+    * 含坐标样式数字的条目**丢弃**并记 `rejected`（沿用 `find_coordinate_like`，
+      与决策侧同一套判据 —— 坐标只允许由代码算）；
+    * 超过 `max_notes` 条 ⇒ 只留前 `max_notes` 条；
+    * 合计超过 `max_chars` ⇒ 截断最后一条能放下的部分（放不下一整条就整条丢），记 `truncated`。
+    """
+    rejected: list[str] = []
+    try:
+        data = extract_json(raw)
+    except Exception:  # noqa: BLE001 - 复盘输出什么样都可能，绝不能把主循环炸掉
+        return [], [f"review_not_json:{str(raw)[:120]}"], False
+    if isinstance(data, Mapping):
+        data = data.get("notes")
+    if isinstance(data, str):
+        data = [data]
+    if not isinstance(data, (list, tuple)):
+        return [], [f"review_schema:{type(data).__name__}"], False
+
+    truncated = False
+    kept_raw: list[str] = []
+    for item in data:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        if find_coordinate_like(text):
+            rejected.append(f"review_coordinates:{text[:80]}")
+            continue
+        kept_raw.append(text)
+    if len(kept_raw) > int(max_notes):
+        kept_raw = kept_raw[: int(max_notes)]
+        truncated = True
+
+    notes: list[str] = []
+    total = 0
+    for text in kept_raw:
+        if total + len(text) <= int(max_chars):
+            notes.append(text)
+            total += len(text)
+            continue
+        room = int(max_chars) - total
+        if room > 0:
+            notes.append(text[:room])
+        truncated = True
+        break
+    return notes, rejected, truncated
+
+
+def build_review_messages(
+    brief: "Brief",
+    *,
+    max_chars: int = PROMPT_BRIEF_MAX_CHARS,
+) -> list[dict[str, str]]:
+    """【task-59】复盘这一次调用的消息：system = `REVIEW_SYSTEM_PROMPT`，user = 当天简报。"""
+    return [
+        {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
+        {"role": "user", "content": "今天的情境简报（仅含已观测真值）：\n"
+                                    + brief.situation_text()[: int(max_chars) or PROMPT_BRIEF_MAX_CHARS]},
+    ]
+
 
 def decision_line(
     *,
@@ -515,6 +609,10 @@ class Brief:
     #: ⚠️ 诚实边界：这是「会话内记忆 + 提示词反馈」，**不是**权重更新 / 在线训练 ——
     #: 模型不会因此"学会"，只是这一次会话里能看见自己最近做了什么、结果如何。
     recent_decisions: tuple[str, ...] = ()
+    #: 【task-59】昨晚收工复盘留给今天的 1–3 条短笔记（`BoundaryPlanner.review()` 产出，
+    #: **无坐标**）。由长跑控制器在夜里回填、次日注入；复盘失败 ⇒ 空（不拿旧笔记冒充昨晚的）。
+    #: ⚠️ 与决策史同一条诚实边界：只影响**提示词文本**，绝不参与任何判定。
+    recent_notes: tuple[str, ...] = ()
 
     # ---- 派生量（确定性策略用） ----
     @property
@@ -570,21 +668,39 @@ class Brief:
         # 连一条都放不下：宁可整节不出现，也不发一个只有标题的空节
         return text if text != head else ""
 
+    def notes_text(self) -> str:
+        """【task-59】复盘笔记一节（≤ `NOTES_SECTION_MAX_CHARS`）；空 ⇒ 空串（不出现空节）。"""
+        if not self.recent_notes:
+            return ""
+        head = "recent_notes（你自己昨晚收工时的复盘笔记）:"
+        text = head
+        for note in tuple(self.recent_notes):
+            item = f"\n- {note}"
+            if len(text) + len(item) > NOTES_SECTION_MAX_CHARS:
+                break
+            text += item
+        return text if text != head else ""
+
     def situation_text(self) -> str:
-        """简报全文（进 prompt）【task-58】裁切优先级：
+        """简报全文（进 prompt）【task-58/59】裁切优先级：
 
         1. 先保证本体（`base_lines()`）完整；
-        2. 决策史只在**本体之后**还有余量时追加，且自己 ≤ `DECISIONS_MAX_CHARS`；
-        3. 本体已吃满 `PROMPT_BRIEF_MAX_CHARS` ⇒ 决策史**整节丢掉**（它是最先被裁的）。
+        2. 可选节只在**本体之后**还有余量时追加，且各自有硬上限
+           （复盘笔记 `NOTES_SECTION_MAX_CHARS`、决策史 `DECISIONS_MAX_CHARS`）；
+        3. 余量为 0 ⇒ 该节**整节丢掉**。两节都塞不下时**先丢复盘笔记、再丢决策史**
+           （决策史带的是"我做过什么、结果如何"，比笔记更贴近判断依据；两节都属于
+           最先被裁的东西，原有简报字段一个都不许被挤掉）。
         """
         base = "\n".join(self.base_lines())
-        block = self.decisions_text()
-        if not block:
-            return base[:PROMPT_BRIEF_MAX_CHARS]
-        room = PROMPT_BRIEF_MAX_CHARS - len(base) - 1
-        if room <= 0:
-            return base[:PROMPT_BRIEF_MAX_CHARS]
-        return f"{base}\n{block[:room]}"[:PROMPT_BRIEF_MAX_CHARS]
+        tail = ""
+        for block in (self.notes_text(), self.decisions_text()):
+            if not block:
+                continue
+            room = PROMPT_BRIEF_MAX_CHARS - len(base) - len(tail) - 1
+            if room <= 0:
+                continue
+            tail += f"\n{block[:room]}"
+        return f"{base}{tail}"[:PROMPT_BRIEF_MAX_CHARS]
 
     @classmethod
     def from_observe(
@@ -1123,6 +1239,9 @@ class BoundaryPlanner:
         temperature: float | None = 0.0,
         max_llm_attempts: int = DEFAULT_MAX_LLM_ATTEMPTS,
         brief_max_chars: int = PROMPT_BRIEF_MAX_CHARS,
+        # 【task-59】收工复盘的独立 token 预算（卡面 ≤512）。**刻意与 `max_tokens` 分开**：
+        # 复盘只写 1–3 条短笔记，挪用主决策的 16384 是纯浪费（也不利于把它的失败隔离掉）。
+        review_max_tokens: int = REVIEW_MAX_TOKENS,
         # 【task-56】决策留痕文件：**由控制器按 journal 路径推导后传进来**，planner 绝不自己
         # 猜路径（真机是 `<journal 去掉 .jsonl>-llm.jsonl`）。None = 不留痕（单测/`agentfarm plan`
         # 这类一次性调用不需要文件）。
@@ -1136,6 +1255,7 @@ class BoundaryPlanner:
         self.temperature = temperature
         self.max_llm_attempts = max(1, int(max_llm_attempts))
         self.brief_max_chars = int(brief_max_chars)
+        self.review_max_tokens = max(1, int(review_max_tokens))
         # 本次 decide 里真实发生的 seam 调用次数（进入 _ask 即 +1，抛异常也算"调了一次"）
         self._calls_seen = 0
         # 【task-56】留痕落点 + 上一次 `_ask` 的元数据（raw/usage/finish_reason/duration_ms）。
@@ -1146,6 +1266,60 @@ class BoundaryPlanner:
     def set_trace_path(self, path: str | Path | None) -> None:
         """【task-56】控制器在拿到 journal 路径后回填留痕文件（planner 不知道 journal 在哪）。"""
         self.llm_trace_path = Path(path) if path else None
+
+    # ---- 收工复盘（task-59） ----
+    def review(self, brief: Brief) -> dict[str, Any]:
+        """【task-59】夜里收工前**一次独立**的复盘调用：只产出 1–3 条次日可见的短笔记。
+
+        与 `decide()` 的关系：完全独立。它**不读也不写** `PlannerState`（不推进边界状态机、
+        不碰 `last_boundary`/`last_task_kind`/`day_key`/`llm_calls`），所以复盘发生与否、
+        成功与否，都不可能改变下一次决策的边界判定。返回值只被调用方写进 journal
+        `review_llm` 与次日 `Brief.recent_notes`。
+
+        失败**绝不外抛**（卡面第 3 条：失败无害）：禁用 ⇒ `ok=False, called=False,
+        reason="llm_disabled"`；超时/异常 ⇒ `reason` 是 `_describe_failure()` 的原文；
+        JSON 非法 ⇒ `reason="review_no_notes"`；成功但一条都没留下 ⇒ 同前。
+        返回字典：`{ok, called, reason, notes, text, rejected, truncated, usage, duration_ms, model}`。
+        """
+        empty = {"ok": False, "called": False, "reason": "llm_disabled", "notes": [], "text": "",
+                 "rejected": [], "truncated": False, "usage": {"prompt": None, "completion": None, "total": None},
+                 "duration_ms": 0, "model": str(self.model or "")}
+        if not self.llm_enabled:
+            return empty
+
+        messages = build_review_messages(brief, max_chars=self.brief_max_chars)
+        kwargs: dict[str, Any] = {"model": self.model, "max_tokens": int(self.review_max_tokens),
+                                  "temperature": self.temperature}
+        started = time.monotonic()
+        try:
+            result = self.llm_chat(messages, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 - 复盘任何失败都不许影响睡觉/跨日
+            return {"ok": False, "called": True, "reason": self._describe_failure(exc), "notes": [],
+                    "text": "", "rejected": [], "truncated": False,
+                    "usage": {"prompt": None, "completion": None, "total": None},
+                    "duration_ms": int((time.monotonic() - started) * 1000), "model": str(self.model or "")}
+        duration_ms = int((time.monotonic() - started) * 1000)
+        content = result if isinstance(result, str) else getattr(result, "content", None)
+        usage = _usage_dict(getattr(result, "usage", None))
+        model = str(getattr(result, "model", "") or self.model or "")
+        duration_ms = duration_ms or int(getattr(result, "elapsed_ms", 0) or 0)
+        if content is None:
+            return {"ok": False, "called": True, "reason": "llm_result_without_content", "notes": [],
+                    "text": "", "rejected": [], "truncated": False, "usage": usage,
+                    "duration_ms": duration_ms, "model": model}
+        notes, rejected, truncated = parse_review_notes(content)
+        return {
+            "ok": bool(notes),
+            "called": True,
+            "reason": "" if notes else "review_no_notes",
+            "notes": notes,
+            "text": "；".join(notes),
+            "rejected": rejected,
+            "truncated": truncated,
+            "usage": usage,
+            "duration_ms": duration_ms,
+            "model": model,
+        }
 
     # ---- 边界判定 ----
     def detect_boundary(self, state: PlannerState, brief: Brief) -> str | None:

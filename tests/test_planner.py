@@ -1006,5 +1006,78 @@ class DecisionMemoryTests(unittest.TestCase):
         self.assertNotIn("recent_decisions", tight)      # 裁到最紧时先丢决策史
 
 
+class ReviewNoteTests(unittest.TestCase):
+    """【task-59】收工复盘（night 边界一次独立调用）。
+
+    四条硬要求各有用例：①解析只认 `{"notes": [...]}` 且**丢弃带坐标的条目**；
+    ②超过 3 条 / 超过 200 字符 ⇒ 截断并记 `truncated`；③复盘走**独立 token 预算**（≤512，
+    绝不挪用主决策的 16384）且失败不抛；④`recent_notes` 一节进提示词、空则不出现空节、
+    与决策史同口径**最先被裁**。
+    """
+
+    def _brief(self, notes=(), **over):
+        base = dict(location="Farm", is_farm=True, has_save=True, day_key=(1, "summer", 12),
+                    stamina=180.0, max_stamina=270.0, counts={"crops": 6, "dirt": 4},
+                    tiles_present=True, money=188, time_of_day=640, recent_notes=tuple(notes))
+        base.update(over)
+        return P.Brief(**base)
+
+    def test_parse_review_notes_accepts_notes_and_rejects_coordinates(self):
+        notes, rejected, truncated = P.parse_review_notes(
+            '{"notes": ["活苗优先浇水", "去 (12,30) 那格看看", "水壶记得补水"]}')
+        self.assertEqual(notes, ["活苗优先浇水", "水壶记得补水"])
+        self.assertFalse(truncated)
+        self.assertTrue(any("review_coordinates" in r for r in rejected), rejected)
+
+    def test_parse_review_notes_truncates_to_three_and_budget(self):
+        notes, _, truncated = P.parse_review_notes(
+            json.dumps({"notes": ["a" * 50, "b" * 50, "c" * 50, "d" * 50]}))
+        self.assertEqual(len(notes), P.REVIEW_NOTES_MAX)
+        self.assertTrue(truncated)
+        total = sum(len(n) for n in notes)
+        self.assertLessEqual(total, P.REVIEW_NOTES_MAX_CHARS)
+        # 坏输出（不是 JSON / 结构不对）只记 rejected，**绝不抛**
+        bad, rejected, _ = P.parse_review_notes("今天还行")
+        self.assertEqual(bad, [])
+        self.assertTrue(rejected)
+        self.assertEqual(P.parse_review_notes(None)[0], [])
+
+    def test_notes_section_is_bounded_and_absent_when_empty(self):
+        self.assertEqual(self._brief().notes_text(), "")
+        self.assertNotIn("recent_notes", self._brief().situation_text())
+        brief = self._brief(["活苗优先", "水壶记得补水"])
+        text = brief.situation_text()
+        self.assertIn("recent_notes", text)
+        self.assertIn("水壶记得补水", text)
+        self.assertLessEqual(len(brief.notes_text()), P.NOTES_SECTION_MAX_CHARS)
+        self.assertLessEqual(len(text), P.PROMPT_BRIEF_MAX_CHARS)
+
+    def test_review_uses_its_own_token_budget_and_never_raises(self):
+        chat = FakeChat(json.dumps({"notes": ["明天先把水壶补满"]}, ensure_ascii=False))
+        planner = P.BoundaryPlanner(llm_chat=chat, llm_enabled=True, max_tokens=16384)
+        res = planner.review(self._brief())
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["notes"], ["明天先把水壶补满"])
+        self.assertEqual(chat.kwargs[0]["max_tokens"], P.REVIEW_MAX_TOKENS)
+        self.assertLess(P.REVIEW_MAX_TOKENS, 16384)
+        # 复盘提示词必须是**自己那一份**（不是决策提示词）
+        system = chat.calls[0][0]["content"]
+        self.assertIn("复盘", system)
+        self.assertNotIn("tasks", system)
+
+        boom = P.BoundaryPlanner(llm_chat=FakeChat(RuntimeError("网络炸了")), llm_enabled=True)
+        failed = boom.review(self._brief())          # 绝不抛
+        self.assertFalse(failed["ok"])
+        self.assertTrue(failed["called"])
+        self.assertIn("llm_exception", failed["reason"])
+        # 关掉 LLM ⇒ 一次都不调
+        off = FakeChat("x")
+        quiet = P.BoundaryPlanner(llm_chat=off, llm_enabled=False)
+        res_off = quiet.review(self._brief())
+        self.assertFalse(res_off["ok"])
+        self.assertEqual(off.call_count, 0)
+        self.assertEqual(res_off["reason"], "llm_disabled")
+
+
 if __name__ == "__main__":
     unittest.main()

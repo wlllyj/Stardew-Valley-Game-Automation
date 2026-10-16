@@ -41,8 +41,13 @@ from agentfarm.longrun import (  # noqa: E402
     JUSTIFIED_END_REASONS, MAX_BUY_TRIES_PER_DAY, MAX_ENV_ATTEMPTS, MAX_STUCK_FLUSH,
     MAX_TILE_ATTEMPTS, DayReport, LongRun, _till_blocked_by, is_justified_end, plot_observe,
 )
-from agentfarm.planner import (DECISION_LINE_MAX_CHARS, DECISIONS_KEPT, BoundaryPlanner, Brief,
+from agentfarm.planner import (DECISION_LINE_MAX_CHARS, DECISIONS_KEPT, REVIEW_MAX_TOKENS,
+                               BoundaryPlanner, Brief,
                                TaskIntent, deterministic_plan, find_coordinate_like)  # noqa: E402
+
+#: 【task-59】收工复盘与边界决策**共用同一个 LLM seam**，靠 system 提示词里的固定短语分辨
+#: （复盘提示词是 `REVIEW_SYSTEM_PROMPT`，开头写着"收工复盘助手"）。
+REVIEW_MARKER = "收工复盘助手"
 
 SEED_ID = "472"
 SEED_NAME = "Parsnip Seeds"
@@ -641,13 +646,20 @@ def make_run(world: FakeWorld | None = None, **kw) -> LongRun:
 
 
 class _BoomChat:
-    """【task-56】假 LLM seam：每次调用都抛 `LlmError`（**真的调了一次**，但绝不联网）。"""
+    """【task-56】假 LLM seam：每次调用都抛 `LlmError`（**真的调了一次**，但绝不联网）。
+
+    【task-59】分别计数"边界决策"与"收工复盘"两类调用（靠 system 提示词里的固定短语分辨），
+    留痕/决策相关的断言要的是**决策**那一类。
+    """
 
     def __init__(self) -> None:
         self.calls = 0
+        self.review_calls = 0
 
     def __call__(self, messages, **kwargs):
         self.calls += 1
+        if any(REVIEW_MARKER in str(m.get("content", "")) for m in messages):
+            self.review_calls += 1
         raise LlmError("单测假 seam：故意失败（不联网）", status="network")
 
 
@@ -876,7 +888,8 @@ class TestOneDay(unittest.TestCase):
         calls: list[str] = []
 
         def fake_chat(messages, **kwargs):
-            calls.append("".join(str(m.get("content", "")) for m in messages))
+            joined = "".join(str(m.get("content", "")) for m in messages)
+            calls.append({"text": joined, "review": REVIEW_MARKER in joined})
             return json.dumps({"tasks": [
                 {"task": "water_area", "area_hint": "tiles.unwatered_crops",
                  "reason": "作物要浇水", "expected_evidence": "unwatered_crops 数量下降"},
@@ -898,10 +911,14 @@ class TestOneDay(unittest.TestCase):
         self.assertEqual(decisions[0]["intents"][1]["area_hint"], "field_nw")
         self.assertTrue(all(not d["fallback"] for d in decisions),
                         [d["fallback"] for d in decisions if d["fallback"]])
-        # 联网次数 = 真调了 LLM 的决策数，且**远少于**决策总数（不是每步都问）
+        # 联网次数 = 真调了 LLM 的决策数，且**远少于**决策总数（不是每步都问）。
+        # 【task-59】睡前复盘也会走同一个 seam，但它**不是决策**（靠 system 提示词里的固定短语分辨）。
+        decision_calls = [c for c in calls if not c["review"]]
+        review_calls = [c for c in calls if c["review"]]
         llm_decisions = [d for d in decisions if d["llm"]]
-        self.assertEqual(len(calls), len(llm_decisions))
-        self.assertLess(len(calls), len(decisions))
+        self.assertEqual(len(decision_calls), len(llm_decisions))
+        self.assertEqual(len(review_calls), len(run.days), "每天收工复盘一次（task-59）")
+        self.assertLess(len(decision_calls), len(decisions))
         self.assertTrue(any(not d["llm"] for d in decisions), "常规区间必须一次都不联网")
         # 方向由模型给、坐标由代码落：被点名的田区排在尝试顺序第一位
         run.pending_zone_hint = "field_nw"
@@ -1203,8 +1220,13 @@ class TestLlmDefaultOn(unittest.TestCase):
         self.assertEqual(run2.run(), 0, run2.logs)
         self.assertTrue(any("大模型已开启" in line for line in run2.logs), run2.logs[:4])
         self.assertTrue(any(e["event"] == "llm_on" for e in run2.entries), run2.entries[:3])
-        # 播报里给的 token 上限就是真正发出去的那个
-        self.assertTrue(all(c["max_tokens"] == DEFAULT_LLM_MAX_TOKENS for c in calls), calls)
+        # 播报里给的 token 上限就是**决策调用**真正发出去的那个；
+        # 【task-59】睡前复盘走独立预算（≤512），刻意不占主决策的 token。
+        decision_calls = [c for c in calls if c["max_tokens"] != REVIEW_MAX_TOKENS]
+        review_calls = [c for c in calls if c["max_tokens"] == REVIEW_MAX_TOKENS]
+        self.assertTrue(decision_calls)
+        self.assertTrue(all(c["max_tokens"] == DEFAULT_LLM_MAX_TOKENS for c in decision_calls), calls)
+        self.assertEqual(len(review_calls), 1, "睡前一次独立复盘，且用独立 token 预算（task-59）")
 
 
 class TestIntentBackstop(unittest.TestCase):
@@ -3180,8 +3202,9 @@ class TestTask56LlmTraceWiring(unittest.TestCase):
             hashes = {hashlib.sha256(ln.encode("utf-8")).hexdigest()[:12] for ln in lines}
             for called_row in called:
                 self.assertIn(called_row["llm_trace_hash"], hashes)
-            # 每行 trace 都是一次**真实**调用：行数 == 假 seam 被调次数（不多不少）
-            self.assertEqual(len(lines), chat.calls)
+            # 每行 trace 都是一次**真实**决策调用：行数 == seam 被调次数 **减去** 复盘那些次。
+            # 【task-59】睡前复盘共用同一个 seam，但它**不写** trace 文件（只落 journal `review_llm`）。
+            self.assertEqual(len(lines), chat.calls - chat.review_calls)
             recs = [json.loads(ln) for ln in lines]
             self.assertTrue(all(r["accepted"] == [] for r in recs))
             self.assertTrue(all(r["fallback"] for r in recs))    # 降级 ⇒ 可读原因串（真值）
@@ -5376,6 +5399,127 @@ class TestTask58DecisionMemory(unittest.TestCase):
                        f"outcome=needs_review ended_by=stuck" for i in range(5)])
 
         self.assertEqual(plain, seeded, "决策史只许影响提示词文本，判决必须逐字相同")
+
+
+class _ReviewChat:
+    """【task-59】决策回假 tasks JSON、复盘回指定 notes 的 seam（都不联网）。"""
+
+    def __init__(self, *, notes=("明天先把水壶补满", "活苗优先浇水"), fail_review=False, raw=None):
+        self.notes = list(notes)
+        self.fail_review = fail_review
+        self.raw = raw
+        self.calls = 0
+        self.review_calls = 0
+        self.review_prompts: list[str] = []
+        self.review_kwargs: list[dict] = []
+
+    def __call__(self, messages, **kwargs):
+        self.calls += 1
+        text = "".join(str(m.get("content", "")) for m in messages)
+        if REVIEW_MARKER in text:
+            self.review_calls += 1
+            self.review_prompts.append(text)
+            self.review_kwargs.append(dict(kwargs))
+            if self.fail_review:
+                raise LlmError("假复盘失败（不联网）", status="network")
+            payload = self.raw if self.raw is not None else {"notes": self.notes}
+            return json.dumps(payload, ensure_ascii=False)
+        return json.dumps({"tasks": [
+            {"task": "water_area", "area_hint": "tiles.unwatered_crops",
+             "reason": "作物要浇水", "expected_evidence": "unwatered_crops 数量下降"},
+            {"task": "clear_area", "area_hint": "field_nw",
+             "reason": "这片田区还有草", "expected_evidence": "blockers 数量下降"},
+        ]}, ensure_ascii=False)
+
+
+class TestTask59ReviewNotes(unittest.TestCase):
+    """【task-59】收工复盘：night 边界一次独立调用，只落 journal `review_llm` + 次日简报。
+
+    硬要求各一条用例：①成功 ⇒ journal 有 `review_llm`，且**次日**的决策提示词里真的能看到笔记；
+    ②抛 `LlmError` ⇒ 睡觉/跨日照常 + journal `review_llm_failed`（失败无害）；
+    ③笔记含坐标 ⇒ 该条被拒（沿用同一套坐标判据）；④超 3 条 ⇒ 截断；
+    ⑤复盘开/关对同一假世界的**判决逐字相同**（零判定影响）。
+    """
+
+    def _events(self, run, name):
+        return [e for e in run.entries if e["event"] == name]
+
+    def test_review_notes_are_journalled_and_injected_next_day(self):
+        w = FakeWorld(weeds=4, seeds=10, money=500)
+        chat = _ReviewChat()
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / "run-t59.jsonl"
+            run = make_run(w, target_days=2, max_days=3, llm_enabled=True, llm_chat=chat,
+                           journal_path=str(journal))
+            self.assertEqual(run.run(), 0, run.logs)
+            reviews = self._events(run, "review_llm")
+            self.assertEqual(len(reviews), len(run.days), "每天收工复盘恰好一次")
+            self.assertEqual(reviews[0]["notes"], chat.notes)
+            self.assertEqual(reviews[0]["duration_ms"] >= 0, True)
+            self.assertIn("usage", reviews[0])
+            self.assertEqual(run.recent_notes, chat.notes)
+            # 次日决策的提示词里必须能看到昨晚的笔记（这就是"只影响次日"的落点）
+            trace = Path(tmp) / "run-t59-llm.jsonl"
+            rows = [json.loads(ln) for ln in trace.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            self.assertTrue(rows)
+            self.assertTrue(any(chat.notes[0] in str(r.get("prompt") or "") for r in rows),
+                            "第二天的提示词里没有昨晚的复盘笔记")
+
+    def test_review_failure_is_harmless(self):
+        w = FakeWorld(weeds=4, seeds=10, money=500)
+        chat = _ReviewChat(fail_review=True)
+        run = make_run(w, target_days=2, max_days=3, llm_enabled=True, llm_chat=chat)
+        self.assertEqual(run.run(), 0, run.logs)
+        self.assertEqual([d.ended_by for d in run.days], ["sleep", "sleep"], "复盘失败不许影响睡觉/跨日")
+        self.assertTrue(all(d.verified for d in run.days))
+        failed = self._events(run, "review_llm_failed")
+        self.assertEqual(len(failed), len(run.days))
+        self.assertTrue(all(e["called"] for e in failed))
+        self.assertEqual(self._events(run, "review_llm"), [])
+        self.assertEqual(run.recent_notes, [], "复盘失败 ⇒ 次日没有笔记（不拿旧笔记冒充）")
+
+    def test_coordinate_notes_are_rejected_and_over_three_truncated(self):
+        w = FakeWorld(weeds=4, seeds=10, money=500)
+        chat = _ReviewChat(raw={"notes": ["活苗优先浇水", "水壶记得补水", "第四条", "第五条",
+                                          "去 (12,30) 那格看看"]})
+        run = make_run(w, target_days=1, max_days=1, llm_enabled=True, llm_chat=chat)
+        self.assertEqual(run.run(), 0, run.logs)
+        review = self._events(run, "review_llm")[0]
+        self.assertEqual(review["notes"], ["活苗优先浇水", "水壶记得补水", "第四条"])
+        self.assertTrue(review["truncated"], "有效条目超 3 条要被截断")
+        self.assertTrue(any("review_coordinates" in str(r) for r in review["rejected"]), review["rejected"])
+        self.assertNotIn("(12,30)", "".join(review["notes"]))
+        # 复盘走独立预算：≤512，绝不挪用主决策的 16384
+        self.assertTrue(all(k["max_tokens"] == REVIEW_MAX_TOKENS for k in chat.review_kwargs),
+                        chat.review_kwargs)
+
+    def test_review_never_changes_any_verdict(self):
+        """同一个假世界、同一套假决策：**只切换复盘**，判决必须逐字相同。"""
+
+        def once(with_review: bool):
+            w = FakeWorld(weeds=4, seeds=10, money=500)
+            chat = _ReviewChat()
+            run = make_run(w, target_days=2, max_days=3, llm_enabled=True, llm_chat=chat)
+            if not with_review:
+                run._review_before_sleep = lambda obs, rep: None      # 只关复盘，其余一字不改
+            self.assertEqual(run.run(), 0, run.logs)
+            out = []
+            for day in run.days:
+                water = dict(day.final_water)
+                water.pop("t", None)
+                out.append({
+                    "verified": day.verified,
+                    "ended_by": day.ended_by,
+                    "ended_reason": day.ended_reason,
+                    "checks": dict(day.checks),
+                    "final_water": water,
+                    "final": dict(day.final),
+                    "stages": [dict(s) for s in day.stages],
+                    "intents": [e["intents"] for e in run.entries if e["event"] == "decision"],
+                })
+            return out
+
+        self.assertEqual(once(True), once(False), "复盘只许影响提示词文本，判决必须逐字相同")
 
 
 if __name__ == "__main__":  # pragma: no cover
