@@ -255,12 +255,12 @@ def main(argv: list[str] | None = None) -> int:
                   args.label_a, args.label_b)
 
     print("\n[5] run A 教训库 → run B 提示词命中")
+    hits = 0
     if not lessons:
-        print(f"  ⚠ 读不到 run A 的教训库（期望 {sidecar(ja, '-lessons.json')}）"
+        print(f"  ⚠ 读不到 run A 的教训库（期望 {sidecar(ja, '-lessons.json')} 或 `-lessons.jsonl`）"
               " ⇒ 无法证明「带教训再玩」，按未观察到演进处理")
     else:
         print(f"  教训库 {lessons_path}：{len(lessons)} 条")
-        hits = 0
         for idx, entry in enumerate(lessons, 1):
             text = lesson_text(entry)
             key = norm(text)
@@ -270,15 +270,22 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {idx:>2}. [{mark}] {text[:96]}")
         print(f"  ⇒ {hits}/{len(lessons)} 条教训文本出现在 run B 的 {len(prompts_b)} 次 LLM 调用提示词里"
               "（子串比对；注入后被裁掉的部分算未见）")
+        if prompts_b and hits == 0:
+            print("  ❌ 注入口径警告：run A 有教训、run B 也有 LLM 调用，却一条教训都没进提示词")
+            print("     —— 这不是「未观察到演进」，而是「教训根本没送到」；先查文件发现路径/裁切顺序。")
     if not prompts_b:
         print(f"  ⚠ 读不到 run B 的 LLM 留痕（期望 {sidecar(jb, '-llm.jsonl')}）"
               " ⇒ 无法核对注入；若 run B 未开 --boundary-llm，此处属预期")
+    injection_effective = bool(lessons) and bool(prompts_b) and hits > 0
 
     verdict = {
         "run_a": {"journal": str(ja), "info": info_a},
         "run_b": {"journal": str(jb), "info": info_b},
         "lessons": [{"text": lesson_text(e), "in_b_prompt": bool(norm(lesson_text(e)))
                      and norm(lesson_text(e)) in joined_b_norm} for e in lessons],
+        "lessons_total": len(lessons),
+        "lessons_hits": hits,
+        "injection_effective": injection_effective,
         "b_prompt_calls": len(prompts_b),
     }
     if args.json_out:

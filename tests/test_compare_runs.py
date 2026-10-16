@@ -146,6 +146,28 @@ class LessonInjectionTests(unittest.TestCase):
             self.assertTrue(path.endswith("-lessons.jsonl"))
             self.assertEqual(cr.lesson_text(entries[0]), "别给够不着的格子派活")
 
+    def test_lessons_written_but_never_injected_is_flagged(self):
+        """有教训、有 LLM 调用、却一条都没进提示词 ⇒ 必须报「根本没送到」，不是「未观察到演进」。"""
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = pathlib.Path(raw)
+            code, text, report = self._run(
+                tmp, [{"lesson": "不要给够不着的格子反复派活"}],
+                prompts=["当前简报：\n请决定。"])
+            self.assertEqual(code, 0)
+            self.assertIn("注入口径警告", text)
+            self.assertFalse(report["injection_effective"])
+            self.assertEqual(report["lessons_hits"], 0)
+
+    def test_injection_effective_flag_when_lesson_is_present(self):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = pathlib.Path(raw)
+            code, _text, report = self._run(
+                tmp, [{"lesson": "先浇水再开新地"}],
+                prompts=["简报：教训=先浇水再开新地"])
+            self.assertEqual(code, 0)
+            self.assertTrue(report["injection_effective"])
+            self.assertEqual(report["lessons_hits"], 1)
+
 
 class CliTests(unittest.TestCase):
     def test_missing_journal_exits_two(self):
