@@ -368,6 +368,7 @@ summer 18  final FarmHouse t=600  体力=270   钱=205 作物=0  未浇=0 熟=0 
 8. **`eventUp` / 剧情事件本跑 0 次**；`modal_dismissed` 2 次（普通框，均成功）。若有 `eventUp`，按 task-41 纪律一律停手等人工，本条不适用（无样本）。
 9. **本跑没有可证伪的死苗样本**（`dead_crops=0`/`dry_dead=0` 6/6 天）⇒ 六问③ 判【无法判定】。
 10. **`save_called` 计数 6 vs 5 的工具坑**（§3）：插件描述行会被正则命中，两套独立工具（Lead 复核器）都踩了 ⇒ 后续自动化必须先过滤该行。
+    - **补充（2026-10-16 实测，`scratch/run9c-diff.py --smapi`）**：只按「有没有 `[HH:MM:SS` 前缀」过滤**不够** —— 假阳性行 **L16 本身就带前缀**（`[21:58:08 INFO  SMAPI]    AgentFarm Bridge 0.7.29 by AgentFarm | v0.7.29（…改动日志里写着 `SaveGame.Save() called.`…）`）。正确的判别式 = **有 `[HH:MM:SS LEVEL CHANNEL]` 前缀 且 不含 ` by AgentFarm ` / `| v0.`**（插件描述行标记）。按此规则对 run9b 冻结窗口自测：**原始 6 / 修正 5**，并把 L16 逐字点名（见 `logs/run9c-diff.txt` 的 `save_called` 段）。
 11. **`day_end.final` 在非 `sleep` 收尾分支上可能滞后**（机制由第 4 条定案；**task-137** 候选、0.7.31 修）—— `final` 是验收/分析工具读"当天收尾状态"的字段（`money`/`seeds`/`crops`/`dry` 都取自它）；run9b 的 summer 18 以 `slept_without_work` 收尾，`final.money=205` 却是**买之前**那张快照，同一秒 `buy` 花掉的 100g 没进 `final` ⇒ **同日"买→种"链条会被工具读成"没买"**。
    - **0.7.30 验收与 `final` 字段的注意点**：若某天以 `slept_without_work` / `gave_up_dry` / `blocked_modal` 收尾，`final` 的 `money`/`seeds` **不能单独作数**，必须以收尾现场 `observe` 复核。
 
