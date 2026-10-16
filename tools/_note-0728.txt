@@ -2,5 +2,9 @@ v0.7.28（run8 复盘：经济闭环"买"死锁 + 早晨 0 动作连睡 + 场外
 - task-102（dev-coder）：A 经济闭环空格死锁 —— `buy` 的 `no_inventory_space` 记为独立结果（`no_space`/`buy_no_space`），当天同物不再重试（每天 buy ≤3）；`seeds_total==0 && money>=seed_price && free_slots==0` ⇒ 主动整叠卖一叠盈余材料腾格（`surplus_sell{why:"need_slot"}`，白名单、绝不碰种子/工具/武器/建材、尽量保留 K=10）；`buy` 前先关残留模态（含 `ShopMenu`），`sleep` 前 `ui.isModal` 先清一次；`buy` 优先当季在售且买得起的作物种子。B 早睡防线 —— 钱够但买不到 / 农场有干作物时 `sleep_guard` 不许放行 `_do_sleep`；每天必须有农场动作，否则记 `slept_without_work` 且当天不 VERIFIED；`goto_farm` 遇模态先清一次再重试。
 - task-104（dev-coder）：`_water_far_dry` 只在**人在户外农场**时才逐格尝试；场外（如晨间被 `ShippingMenu` 挡在屋内）先回农场（清模态 + 重试一次），回不去则记 `water_far_skipped{reason:"not_on_farm"}`、**不扣当日额度、不进 `given_up`**，当天收尾 `stuck` 必须点名 `not_on_farm`。
 - task-106（log-analyst）：`tools/analyze-longrun.py` 收本版新事件/字段（`slept_without_work`/`buy_no_space`/`surplus_sell.why`），漂移红清零（`check-release` 要求全量单测 0 红）。
-- 验收：task-103（task-102 对抗验收）、task-108（task-104 对抗验收）—— 均由 deputy-lead 独立执行。
-- 真机验收：run9（task-89 家族），判据见 `docs/_run6-criteria.md` §3.4 的 N1–N5 与 `docs/_release-0.7.28.md` §4。
+- 第二批（LLM 决策复盘/演进，用户 m12553「让模型再玩这个游戏的时候具备决策演进的能力」）：
+  - task-58（dev-coder）：`Brief.recent_decisions` —— 最近 3–5 条边界决策（意图 + 结局摘要）喂回提示词，≤300 字符，预算紧张时决策史最先被裁。
+  - task-59（dev-coder）：`night` 边界**一次独立复盘调用**（`BoundaryPlanner.review()`，独立 `max_tokens≤512`）⇒ journal `review_llm` + 次日 `Brief.recent_notes`（≤3 条 / ≤200 字符 / **禁坐标**，违者拒收）；失败只记 `review_llm_failed`，睡觉与跨日照常。**零判定影响**（对照用例：复盘开/关 ⇒ `verified`/`ended_by`/`checks`/`final_water`/`stages`/`intents` 逐字相同）。
+  - task-82（dev-coder）：决策→结果 join + **跨日教训库** `<journal>-lessons.json`（路径由 `--journal` 自动推导，**不新增命令行参数** ⇒ run9/run10 只差 journal 路径）；客观事实由代码写、一句 `hint` 由 LLM 写；≤~20 条按 `last_seen` 淘汰；次日注入 ≤3 条；失败无害、禁坐标、只认客观证据。
+- 验收：task-103（task-102 对抗验收）、task-108（task-104 对抗验收）、task-111（analyzer 收本批新事件/字段 + 八本账本两侧 rc 同向）、task-112（LLM 批次独立对抗验收：最高优先级 = **零判定影响**）—— task-103/108/112 由 deputy-lead 执行。
+- 真机验收：run9 = **run A**（验收 P3 ⑥ 的 N1–N5 + 开始积累教训）⇒ run10 = **run B**（N6 演进对照：run A 被 cancel/失败的意图在 run B 提示词里以教训出现、且同形态不再出现）；判据见 `docs/_run6-criteria.md` §3.4 与 `docs/_release-0.7.28.md` §4，对照命令 = `tools/compare-runs.py`。**没有这条对照，不许写"自我进化已实现"。**
