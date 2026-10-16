@@ -174,6 +174,12 @@ def main(argv: list[str] | None = None) -> int:
                   "--days", str(args.days), "--size", str(args.size),
                   "--max-minutes", str(args.max_minutes), "--max-days", str(args.max_days),
                   "--journal", str(journal.relative_to(_ROOT)).replace("\\", "/")]
+    # run9(run A)/run10(run B) 的"演进对照"要能证明两次**只差 journal 路径**：
+    # 把子进程命令行原文写进 sidecar（判决不看它，只用于取证）。注意本起跑器**不传**
+    # `--boundary-llm`/`--no-boundary-llm` ⇒ 走 `tools/run-longrun.py` 的默认（LLM 开）；
+    # 想关掉必须显式改这里或直接调用 run-longrun.py（run9/run10 绝不许关）。
+    elements["argv"] = list(argv_child)
+    elements["boundary_llm"] = True  # run-longrun.py:50 的默认；本脚本不覆盖它
     # 子进程环境显式写死：PYTHONUTF8=1（账本/console 里全是中文）+ PYTHONPATH=<root>/brain，
     # 这样"起跑器被在哪个 shell、带不带 PYTHONPATH"调用都不影响长跑的 import 与编码。
     child_env = dict(os.environ)
