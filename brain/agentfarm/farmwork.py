@@ -53,6 +53,7 @@ __all__ = [
     "UNREACHABLE_CODE",
     "UNREACHABLE_HINTS",
     "UNREACHABLE_STATUSES",
+    "buy_count_for",
     "FarmWorker",
     "StageResult",
     "StepResult",
@@ -800,28 +801,56 @@ def pick_seed_offer(
     *,
     keep_factor: int = SEED_KEEP_FACTOR,
 ) -> tuple[dict[str, Any] | None, str]:
-    """在货架清单里挑"最便宜、且买得起"的种子。返回 `(选中项, 代码)`。
+    """在货架清单里挑"最便宜、且**量力而行买得起**"的种子。返回 `(选中项, 代码)`。
 
     代码三种（与 `longrun` 的 journal 同名）：
 
     * `"ok"` —— 选中了，`pick["id"]` 就是要下单的 `QualifiedItemId`；
     * `"no_seed_for_sale"` —— 货架上**一条种子都没有**（run6 的夏季：只有当季种子，
       而脑硬编码的春季 `472` 不在架上）；
-    * `"cannot_afford"` —— 有种子，但按"留够 `keep_factor` 包"的口径**买不起**
-      （`price > money / keep_factor`），或有种子的价格不可用（≤0）。
+    * `"cannot_afford"` —— 有种子，但**连一个都买不起**（`price > money`），
+      或有种子的价格不可用（≤0）。
 
-    为什么要"留够 K 包"而不是"买得起一个就买"：run6 那 956g 全砸进种子，
-    之后连应急的余地都没有；而锄地/浇水每格都要体力与时间，钱是唯一的缓冲。
+    【task-123：量力而行】买得起与否**只看"能不能至少买一个"**（`price <= money`），
+    买几个由 `buy_count_for(price, money, buy_count)` 决定。
+    之前的口径是"留够 `keep_factor` 包的钱才算买得起（`price <= money / keep_factor`）"，
+    run9 实证它会把"88g 够买 8 个 Wheat Seeds(10g)"的日子判成 `cannot_afford`、
+    当天一粒不买、白丢一天播种窗口 —— 所以这里改成按实际在售价。
+    `keep_factor` 参数**仅为兼容保留、不参与判定**（journal 里仍记它，供老账本对账）。
     """
     seeds = [o for o in (offers or []) if is_seed_offer(o)]
     if not seeds:
         return None, "no_seed_for_sale"
-    budget = int(money // int(keep_factor)) if int(keep_factor) > 0 else int(money)
-    afford = [o for o in seeds if 0 < int(o.get("price") or 0) <= budget]
+    try:
+        m = max(0, int(money))
+    except (TypeError, ValueError):
+        m = 0
+    afford = [o for o in seeds if 0 < int(o.get("price") or 0) <= m]
     if not afford:
         return None, "cannot_afford"
     pick = min(afford, key=lambda o: (int(o.get("price") or 0), str(o.get("id") or "")))
     return pick, "ok"
+
+
+def buy_count_for(price: int, money: int, wanted: int) -> int:
+    """一次买多少个：`n = min(wanted, money // price)`（task-123）。
+
+    返回 **0** 表示连一个都买不起 —— 调用方据此记 `cannot_afford` 且当天不再试；
+    返回 `1 <= n < wanted` 表示"钱只够买一半"，照样买（记 `buy_partial`，**不算失败**）。
+
+    run9 实证（账本 t=84.69）：`money=88`、最便宜的当季 Wheat Seeds 10g/个 ⇒
+    本应买 8 个；旧判据按"买满 `--buy-count`（10 个）才算买得起"（88 < 200）直接判
+    `cannot_afford`，当天一粒不买、白丢一天。价格不可用（≤0）或钱为负 ⇒ 0（**不猜**）。
+    """
+    try:
+        p = int(price)
+        m = max(0, int(money))
+        w = max(0, int(wanted))
+    except (TypeError, ValueError):
+        return 0
+    if p <= 0:
+        return 0
+    return max(0, min(w, m // p))
 
 
 # ======================================================================

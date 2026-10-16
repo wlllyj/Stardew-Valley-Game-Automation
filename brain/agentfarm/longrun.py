@@ -43,9 +43,9 @@ from typing import Any, Callable, Iterable
 
 from .bridge import MOD_VERSION_EXPECTED, BridgeClient, BridgeError
 from .farmwork import (ENV_BLOCK_STATUSES, FRONTIER_KINDS, SEED_KEEP_FACTOR, STAGE_ACTION,
-                       FarmWorker, StageResult, StepResult, farm_dead_crops,
-                       farm_dry_dead_crops, farm_dry_tiles, pick_seed_offer, player_free_slots,
-                       seed_items, surplus_sell_plan, till_blocked_by)
+                       FarmWorker, StageResult, StepResult, buy_count_for, farm_dead_crops,
+                       farm_dry_dead_crops, farm_dry_tiles, is_seed_offer, pick_seed_offer,
+                       player_free_slots, seed_items, surplus_sell_plan, till_blocked_by)
 from .planner import (DECISIONS_KEPT, LESSONS_INJECT_CHARS, LESSONS_INJECT_MAX, BoundaryPlanner, Brief,
                       PlannerState, TaskIntent, TaskOutcome, decision_line, deterministic_plan,
                       load_lessons_file, make_lesson, prune_lessons, render_lessons,
@@ -1383,13 +1383,31 @@ class LongRun:
 
         【task-67】"能不能搞到"必须把**今天已经确认买不到**算进去（`self.seed_dead_today`）：
         否则 run6 的死锁原样复现 —— 守卫每轮都看到"钱够 ⇒ 该去买"，而商店根本没有当季种子。
+
+        【task-123】"钱够"以**当季在售种子的实际价**为准（见 `_seed_price_now()`），
+        拿不到货架清单才退回 `--seed-price`。run9 的配置价与货架价是两回事，混用会把
+        "10g 的 Wheat Seeds 摆在眼前、手上 88g"判成买不起 ⇒ 当天一粒不买。
         """
         player = FarmWorker.player_of(obs)
         seeds = sum(n for _i, _nm, n in seed_items(player))
         money = FarmWorker.money(obs)
-        can = seeds > 0 or (self.allow_buy and money >= self.seed_price
+        can = seeds > 0 or (self.allow_buy and money >= self._seed_price_now()
                             and not self.seed_dead_today)
         return seeds, money, can
+
+    def _seed_price_shelf(self) -> int:
+        """货架上**最便宜的在售种子价**（没清单 / 没有种子 / 价格不可用 ⇒ **0**，不猜）。
+
+        只认 `is_seed_offer()` 认可的条目（名字带 seed/种子）且价格 > 0 —— 与
+        `pick_seed_offer()` 的挑法同源，避免"守卫说买得起、挑的时候说买不起"两边错配。
+        """
+        prices = [int(o.get("price") or 0) for o in self.shop_offers
+                  if is_seed_offer(o) and int(o.get("price") or 0) > 0]
+        return min(prices) if prices else 0
+
+    def _seed_price_now(self) -> int:
+        """当下"一个种子多少钱"：**货架实际价优先**，拿不到清单才退回 `--seed-price`（task-123）。"""
+        return self._seed_price_shelf() or int(self.seed_price)
 
     def _plot_has_work(self, obs: dict[str, Any], tiles: Iterable[tuple[int, int]]) -> bool:
         tmap = FarmWorker.tiles_of(obs)
@@ -2566,19 +2584,24 @@ class LongRun:
         # 没有清单（旧 Mod / 首次）：拿配置项探**一次**。
         # ⚠️ 探测**成功**时绝不能下"买不到"的结论 —— 上面那次 `no_seed_for_sale` 的误判
         # （探到了种子还说商店没有）会把 `seed_dead_today` 置上，当天后半程直接瘫掉。
-        if money < self.seed_price:
+        price_shelf = self._seed_price_shelf()      # 【task-123】货架实际价（0 = 拿不到清单）
+        price_now = price_shelf or int(self.seed_price)
+        if money < price_now:
             # 【task-55·留痕】"是没钱，不是任务失败"必须能在账本里一眼看出来
             # （run7：`buy` 0 条、`seed_gate {seeds:0, money:14}` 5 次，账本侧看不出因果）。
-            short = int(self.seed_price) - int(money)
+            # 【task-123】"没钱"按**当下这个价**判（货架价优先）；`price_shelf`/`price_cfg`
+            # 两个值都进 journal，免得日后对账分不清用的是谁的价格。
+            short = int(price_now) - int(money)
             if not self.cannot_afford_noted:
                 self.cannot_afford_noted = True
                 self._journal("cannot_afford", money=int(money), seed_price=int(self.seed_price),
+                              price_shelf=int(price_shelf), price_cfg=int(self.seed_price),
                               short=short, count=self.buy_count, shop=self.shop,
-                              note="钱不够买当季种子（连配置单价都不到）⇒ 今天不走 buy；"
+                              note="钱不够买当季种子（连一个都买不起）⇒ 今天不走 buy；"
                                    "这不是任务失败，是账上没钱（先卖盈余材料，钱要等下一次 NewDay）")
-                self._say(f"  · 没种子且钱不够（{money}g < {self.seed_price}g，差 {short}g）"
+                self._say(f"  · 没种子且钱不够（{money}g < {price_now}g，差 {short}g）"
                           "⇒ 今天不买（没钱，不是失败）")
-            rep.notes.append(f"没种子且钱不够（{money}g < {self.seed_price}g，差 {short}g），"
+            rep.notes.append(f"没种子且钱不够（{money}g < {price_now}g，差 {short}g），"
                              "只能干等/清障开垦")
             return
         st = self._buy_seed(self.buy_item, money, "probe", rep)
@@ -2604,6 +2627,13 @@ class LongRun:
         `MAX_BUY_TRIES_PER_DAY`）；回执是 `no_space`（`no_inventory_space`）时置
         `buy_no_space_today` 并记 `buy_no_space` —— 当天不再重试，守卫也不许再拿
         "没种子但钱够 ⇒ 该去买"当理由（run8 day 12/13 就是在这条上撞了 26 次）。
+
+        【task-123】下单数量**量力而行**：`n = min(buy_count, money // price)`，价格用
+        **货架实际价**（`price`）优先、拿不到才退回 `--seed-price`（两个值都进 journal：
+        `price_shelf`/`price_cfg`）。`n >= 1` 就买 —— `n < buy_count` 时另记
+        `buy_partial`，**不是失败**、不进 `failed`；`n == 0` 连一个都买不起 ⇒ 记
+        `cannot_afford` 且**一个请求都不发**（run9 t=84.69 的 88g 就是这么被旧判据
+        按"买满 10 个"判没钱的，而当天其实够买 8 个 Wheat Seeds）。
         """
         assert self.worker is not None
         if not item:
@@ -2612,18 +2642,37 @@ class LongRun:
             # 【task-102】上界要在**发请求之前**判：一次 `_preconditions` 里"探一次 + 照清单
             # 换 id 再买一次"是两次请求，只靠调用方入口判会让当天总量漂到 4 次。
             return None
+        price_shelf = int(price or 0)
+        price_cfg = int(self.seed_price)
+        price_used = price_shelf if price_shelf > 0 else price_cfg
+        want = int(self.buy_count)
+        n = buy_count_for(price_used, money, want)
+        if n < 1:
+            # 连一个都买不起：不浪费请求，交给 `_seed_dead` 记 `cannot_afford`（带两个价格）。
+            self._seed_dead("cannot_afford", rep, money=money, offers=self.shop_offers)
+            return None
         self.buy_attempts_today += 1
-        st = self.worker.buy(item, self.buy_count, shop=self.shop)
+        st = self.worker.buy(item, n, shop=self.shop)
         self._actions += 1
         if st.available:
             self.shop_offers = list(st.available)   # 跨天保留：下次直接挑，不发注定失败的请求
-        rep.notes.append(f"补种子（{source}{f' {price}g' if price else ''}）：{st.reason}")
+        rep.notes.append(f"补种子（{source} {n} 个 @ {price_used}g）：{st.reason}")
         self._say(f"  · 补种子：{st.reason}")
         self._journal("buy", ok=st.ok, code=st.code, reason=st.reason, item=item,
-                      count=self.buy_count, price=price, source=source,
+                      count=n, wanted=want, price=price_used, price_shelf=price_shelf,
+                      price_cfg=price_cfg, source=source,
                       attempt=self.buy_attempts_today, limit=MAX_BUY_TRIES_PER_DAY,
                       before=st.before, after=st.after, receipt=st.receipt,
                       available=len(st.available))
+        if st.ok and n < want:
+            # 【task-123】钱只够买一部分 ⇒ 如实留痕，但**不是失败**：当天照常去种/浇，
+            # 缺的种子等 NewDay 把钱结算到账后再补（`cannot_afford` 只留给"一个都买不起"）。
+            self._journal("buy_partial", item=item, bought=n, wanted=want, price=price_used,
+                          price_shelf=price_shelf, price_cfg=price_cfg, money=int(money),
+                          source=source, ok=st.ok, code=st.code,
+                          note=f"钱只够买 {n} 个（想买 {want} 个，单价 {price_used}g）⇒ "
+                               "量力而行，这不是失败；缺的种子明天钱结算后再补")
+            rep.notes.append(f"钱只够买 {n}/{want} 个种子（单价 {price_used}g）⇒ 先买这些")
         if st.code == "no_space":
             self.buy_no_space_today = True
             # 【task-114 NIT-1】把**当次观测真值**记下来：教训的 `evidence` 直接引用它，
@@ -2658,13 +2707,21 @@ class LongRun:
 
         为什么必须记：`work_reasons` 里"没种子但钱够 ⇒ 该去买"这条**当天必须失效**，
         否则守卫永远拒绝收工，而商店根本没有当季种子（run6 的死锁）。
+
+        【task-123】`cannot_afford` 必须能自证"按谁的价格判的"：`price_shelf` = 货架上
+        最便宜的种子价（拿不到清单就是 0）、`price_cfg` = `--seed-price`；
+        `keep_factor` 保留只为老账本对账（task-123 之后它**已不参与判定**）。
         """
         self.seed_dead_today = code or "no_seed_for_sale"
         self.seed_dead_noted = True
         top = "、".join(f"{o.get('name')}({o.get('price')}g)" for o in (offers or [])[:12])
+        shelf_prices = [int(o.get("price") or 0) for o in (offers or [])
+                        if is_seed_offer(o) and int(o.get("price") or 0) > 0]
         self._journal("no_seed_for_sale" if self.seed_dead_today == "no_seed_for_sale"
                       else "cannot_afford",
                       code=self.seed_dead_today, money=money, seed_price=self.seed_price,
+                      price_shelf=(min(shelf_prices) if shelf_prices else 0),
+                      price_cfg=int(self.seed_price),
                       keep_factor=SEED_KEEP_FACTOR, offers=top or "(没有货架清单)",
                       note="今天不再发起 buy（次日重试一次）")
         rep.notes.append(f"买不到合适种子（{self.seed_dead_today}）：{top or '没有货架清单'}"

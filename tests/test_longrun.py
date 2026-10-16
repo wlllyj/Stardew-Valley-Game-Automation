@@ -441,13 +441,16 @@ class FakeWorld:
                               available=offers)
         if offers:
             want = "".join(ch for ch in str(item) if ch.isdigit())
-            on_shelf = any(want and want == "".join(ch for ch in str(o.get("id") or "") if ch.isdigit())
-                           for o in offers)
-            if not on_shelf:
+            on = [o for o in offers
+                  if want and want == "".join(ch for ch in str(o.get("id") or "") if ch.isdigit())]
+            if not on:
                 # 真机在这里回 `item_not_sold` + 在售清单（脑必须照清单换一个 id 重挑）
                 return StepResult("buy", code="failed", status="item_not_sold",
                                   reason=f"商店「{shop}」里没有「{item}」",
                                   available=offers)
+            # 【task-123】货架条目的价才是真价（真机用 `info.Price`）；`buy_price` 只是
+            # 兜底价（没有清单 / 不在货架上的配置项）。混用会让"脑报 8 个、假世界只给 4 个"。
+            price = int(on[0].get("price") or 0) or price
         can = min(int(count), self.money // price)
         if can < 1:
             return StepResult("buy", code="failed", reason=f"钱不够（{self.money}g < {price}g）",
@@ -3711,14 +3714,22 @@ class TestTask67SeedChoice(unittest.TestCase):
         self.assertEqual(len(self._events(run, "no_seed_for_sale")), 1)
 
     def test_cannot_afford_does_not_buy(self):
-        """有种子但攒不够 10 包的钱 ⇒ `cannot_afford`，不买。"""
-        w = FakeWorld(weeds=0, seeds=0, money=100)     # 预算 10 < 最便宜的 40
+        """【task-123】连一个都买不起（钱 30 < 单价 40）才 `cannot_afford`，不买。
+
+        旧口径是"留够 10 包的钱"（钱 100 / 10 = 10 < 40 也判没钱）—— run9 的 88g 就是被它
+        判死的（其实够买 8 个 10g 的 Wheat Seeds）。现在只要买得起一个就不算 `cannot_afford`。
+        """
+        w = FakeWorld(weeds=0, seeds=0, money=30)
         w.buy_offers = [{"id": "(O)482", "name": "Pepper Seeds", "price": 40}]
         run = self._run(w)
         run._preconditions(w.obs(), DayReport(day_key=("spring", 1, 5), started_at=0.0))
         self.assertEqual([c["item"] for c in w.buy_calls], ["472"], "探了一次就够")
         self.assertEqual(run.seed_dead_today, "cannot_afford")
-        self.assertEqual(len(self._events(run, "cannot_afford")), 1)
+        ev = self._events(run, "cannot_afford")
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["price_shelf"], 40, "要记**货架实际价**（判据用的就是它）")
+        self.assertEqual(ev[0]["price_cfg"], run.seed_price, "配置价也记，账本上分得清谁是谁")
+        self.assertEqual(ev[0]["money"], 30)
 
     def test_seed_dead_today_disarms_the_reason(self):
         """run6 死锁的解药：确认买不到之后，"该去买种子"这条理由**当天失效**。"""
@@ -3757,6 +3768,123 @@ class TestTask67SeedChoice(unittest.TestCase):
                        if not i or "Seed" not in str(i.get("name") or "")]
         run._preconditions(w.obs(), rep)
         self.assertEqual(len(w.buy_calls), first + 1, "次日应该再试一次")
+
+
+class TestTask123BuyWhatYouCanAfford(unittest.TestCase):
+    """task-123：钱只够买一半时**照样买**（run9 t=84.69 的 88g 白丢一天）。
+
+    现场：`cannot_afford {"money":88,"seed_price":20,"keep_factor":10,…}`，而当天货架上有
+    10g 的 Wheat Seeds ⇒ 够买 8 个；判据却按"买满 `--buy-count`（10 个）= 200g"算 ⇒ 一粒不买。
+
+    新口径：`n = min(buy_count, money // price)`，价格**货架实际价优先**（拿不到才退回
+    `--seed-price`）；`n >= 1` 就买（`n < buy_count` 记 `buy_partial`，**不是失败**），
+    `n == 0` 才 `cannot_afford` 且当天不再试。task-102 的三条约束（每天 ≤3 次 buy、
+    `no_space` 当天不再试、腾格卖走白名单 + K=10）**一字未动**，本类补一条回归。
+
+    变异自检（`scratch\\_t123_mutate.py`，跑完即删；按 task-124 的教训把 brain/ 与 tests/
+    **一起**拷到临时目录再打补丁，否则 `test_longrun.py:32` 的 `sys.path.insert` 会让变异假绿）：
+
+    * 基线（临时目录）→ `Ran 329 / OK`；
+    * **m123a**（`_buy_seed` 恒发 `self.buy_count`，不量力而行）⇒ 红 **3**（failures 2 + errors 1）；
+    * **m123b**（`pick_seed_offer` 退回 `price <= money // keep_factor`）⇒ 红 **5**
+      （run9 的 88g 又被判 `cannot_afford`）；
+    * **m123c**（请求失败也记 `buy_partial`）⇒ 红 **2**（"买到"与"想买"混为一谈）。
+    """
+
+    SUMMER = [{"id": "(O)254", "name": "Melon Seeds", "price": 80},
+              {"id": "(O)483", "name": "Wheat Seeds", "price": 10}]
+
+    @staticmethod
+    def _run(w: FakeWorld, **kw) -> LongRun:
+        run = make_run(w, target_days=1, **kw)
+        run.worker = FakeWorker(w)
+        return run
+
+    @staticmethod
+    def _events(run: LongRun, event: str) -> list[dict]:
+        return [e for e in run.entries if e.get("event") == event]
+
+    def test_partial_afford_journals_buy_partial_with_both_prices(self):
+        """run9 现场：88g + 10g 的 Wheat Seeds ⇒ 买 **8** 个（不是 0 个），并留 `buy_partial`。"""
+        w = FakeWorld(weeds=0, seeds=0, money=88)
+        w.buy_offers = list(self.SUMMER)
+        run = self._run(w)
+        run._preconditions(w.obs(), DayReport(day_key=("summer", 1, 12), started_at=0.0))
+
+        # 先探配置项（被商店拒绝，量力而行的请求数 = 88 // 20 = 4），再照货架买 88 // 10 = 8
+        self.assertEqual([(c["item"], c["count"]) for c in w.buy_calls],
+                         [("472", 4), ("(O)483", 8)], "下单数量必须量力而行，不许再报 10")
+        self.assertEqual(w.buys, [8], "假世界真的收到 8 个")
+        buy = self._events(run, "buy")
+        self.assertEqual(buy[-1]["count"], 8)
+        self.assertEqual(buy[-1]["wanted"], 10)
+        self.assertEqual((buy[-1]["price"], buy[-1]["price_shelf"], buy[-1]["price_cfg"]),
+                         (10, 10, 20), "用的是货架价，两个价都留痕")
+        self.assertTrue(buy[-1]["ok"], "买到 8 个就是成交，不因少于 wanted 而记失败")
+        part = self._events(run, "buy_partial")
+        self.assertEqual(len(part), 1, run.entries)
+        self.assertEqual((part[0]["bought"], part[0]["wanted"], part[0]["price"]), (8, 10, 10))
+        self.assertEqual((part[0]["price_shelf"], part[0]["price_cfg"]), (10, 20))
+        self.assertEqual(part[0]["money"], 88)
+        self.assertEqual(self._events(run, "cannot_afford"), [], "买到一半绝不是 cannot_afford")
+
+    def test_partial_buy_leaves_usable_seeds_and_is_not_seed_dead(self):
+        """部分买到之后：种子进背包、当天照常能种（`seed_dead_today` 不许被置上）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=88)
+        w.buy_offers = list(self.SUMMER)
+        run = self._run(w)
+        run._preconditions(w.obs(), DayReport(day_key=("summer", 1, 12), started_at=0.0))
+
+        seeds, _money, can = run._seed_outlook(w.obs())
+        self.assertEqual(seeds, 8, "买到的 8 个必须真的在背包里")
+        self.assertTrue(can, "有种子 ⇒ 能种")
+        self.assertEqual(run.seed_dead_today, "", "部分买到不算买不到")
+        self.assertFalse(run.seed_dead_noted)
+
+    def test_nothing_affordable_records_cannot_afford_with_the_shelf_price(self):
+        """钱 30 + 货架 40g ⇒ 一个都买不起 ⇒ `cannot_afford`（带货架价 + 配置价）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=30)
+        w.buy_offers = [{"id": "(O)482", "name": "Pepper Seeds", "price": 40}]
+        run = self._run(w)
+        run._preconditions(w.obs(), DayReport(day_key=("summer", 1, 12), started_at=0.0))
+        ev = self._events(run, "cannot_afford")
+        self.assertEqual(len(ev), 1, run.entries)
+        self.assertEqual(ev[0]["price_shelf"], 40)
+        self.assertEqual(ev[0]["price_cfg"], run.seed_price)
+        # 同一天再问：不再发请求、也不再重复记账
+        run._preconditions(w.obs(), DayReport(day_key=("summer", 1, 12), started_at=0.0))
+        self.assertEqual([c["item"] for c in w.buy_calls], ["472"], "当天不再发起 buy")
+
+    def test_shelf_price_beats_an_unaffordable_config_price(self):
+        """货架 10g 而 `--seed-price` 是 200g ⇒ 也买得起（判据用货架价，不用配置价）。
+
+        run9 的配置价与货架价是两回事：混用会把"10g 的种子摆在眼前、手上 88g"判成没钱。
+        """
+        w = FakeWorld(weeds=0, seeds=0, money=88)
+        w.buy_offers = list(self.SUMMER)
+        run = self._run(w, seed_price=200)
+        run.shop_offers = list(self.SUMMER)          # 昨天已经拿到过清单
+        _seeds, _money, can = run._seed_outlook(w.obs())
+        self.assertTrue(can, "货架价 10g ⇒ 88g 买得起（配置价 200g 不该一票否决）")
+        run._preconditions(w.obs(), DayReport(day_key=("summer", 1, 12), started_at=0.0))
+        self.assertEqual([(c["item"], c["count"]) for c in w.buy_calls], [("(O)483", 8)],
+                         "有清单就直接挑，不再探配置项；数量仍是量力而行的 8")
+        self.assertEqual(self._events(run, "cannot_afford"), [])
+
+    def test_partial_buy_does_not_count_as_a_failed_stage_step(self):
+        """`buy_partial` 不进 `failed`：账本里唯一的 `ok=false` 只能是**探测被拒**那次。"""
+        w = FakeWorld(weeds=0, seeds=0, money=88)
+        w.buy_offers = list(self.SUMMER)
+        run = self._run(w)
+        run._preconditions(w.obs(), DayReport(day_key=("summer", 1, 12), started_at=0.0))
+        buy = self._events(run, "buy")
+        self.assertEqual(len(buy), 2, "探测一次 + 成交一次")
+        self.assertFalse(buy[0]["ok"], "探测被商店拒 ⇒ 如实记 ok=false")
+        self.assertTrue(buy[1]["ok"], "成交那次（8 < 10）必须 ok=true")
+        self.assertEqual([e for e in run.entries if e.get("event") == "buy_partial"][0]["ok"], True)
+        # 日级硬失败口径不受影响：`failed_steps` 只数阶段里的 `StepResult.failed`
+        rep = DayReport(day_key=("summer", 1, 12), started_at=0.0)
+        self.assertEqual(rep.failed_steps, 0)
 
 
 class EncircledWorld(FakeWorld):

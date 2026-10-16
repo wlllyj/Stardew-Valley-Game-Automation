@@ -24,11 +24,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "brain"))
 from agentfarm.bridge import BridgeError  # noqa: E402
 from agentfarm.farmwork import (  # noqa: E402
     NEIGHBORS, FarmWorker, KIND_TOOL, MAX_CLEAR_SWINGS, StepResult as SR, StageResult,
-    SURPLUS_MATERIAL_IDS, farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles,
+    SURPLUS_MATERIAL_IDS, buy_count_for, farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles,
     farm_empty_dirt, is_seed_offer,
     is_unreachable, pick_seed_offer, player_free_slots, seed_offers_from, surplus_sell_plan,
-    till_blocked_by,
-    tool_missing_reason, tool_presence,
+    till_blocked_by, tool_missing_reason, tool_presence,
 )
 
 DROP = object()          # "这一格的障碍没了"（观测里那条记录消失）
@@ -1710,7 +1709,12 @@ class TestSeedOffers(unittest.TestCase):
         self.assertFalse(is_seed_offer(None))
 
     def test_pick_three_codes(self):
-        """夏季货架（run6 现场）：认得出种子、挑最便宜的、春季硬编码那条路不再是唯一出路。"""
+        """夏季货架（run6 现场）：认得出种子、挑最便宜的、春季硬编码那条路不再是唯一出路。
+
+        【task-123】第三种代码的判据改成**量力而行**：只要"至少买得起一个"（`price <= money`）
+        就算 `ok`，买几个交给 `buy_count_for()` —— run9 t=84.69 的 88g 买得起 8 个 10g 的
+        Wheat Seeds，旧口径按"留够 10 包"（88 // 10 = 8 < 10）判 `cannot_afford` ⇒ 一粒不买。
+        """
         summer = [{"id": "(O)254", "name": "Melon Seeds", "price": 80},
                   {"id": "(O)483", "name": "Wheat Seeds", "price": 10},
                   {"id": "(O)24", "name": "Parsnip", "price": 20}]
@@ -1721,10 +1725,24 @@ class TestSeedOffers(unittest.TestCase):
         pick, code = pick_seed_offer([{"id": "(O)24", "name": "Parsnip", "price": 20}], 500)
         self.assertIsNone(pick)
         self.assertEqual(code, "no_seed_for_sale")
-        # 有种子但按"留够 10 包"的口径买不起 ⇒ cannot_afford（钱 100 ⇒ 预算 10 < 40）
+        # 买得起一个就算能买（量力而行）：100g 对 40g 的 Pepper Seeds ⇒ ok
         pick, code = pick_seed_offer([{"id": "(O)482", "name": "Pepper Seeds", "price": 40}], 100)
+        self.assertEqual(code, "ok")
+        self.assertEqual(pick["id"], "(O)482")
+        self.assertEqual(buy_count_for(40, 100, 10), 2, "量力而行：100g 只够 2 个")
+        # 连一个都买不起（钱 30 < 单价 40）⇒ cannot_afford，绝不下单
+        pick, code = pick_seed_offer([{"id": "(O)482", "name": "Pepper Seeds", "price": 40}], 30)
         self.assertIsNone(pick)
         self.assertEqual(code, "cannot_afford")
+
+    def test_buy_count_for_is_quantity_based(self):
+        """【task-123】`n = min(wanted, money // price)`；价格不可用 ⇒ 0（**不猜**）。"""
+        self.assertEqual(buy_count_for(10, 88, 10), 8, "run9 现场：88g / 10g = 8 个")
+        self.assertEqual(buy_count_for(10, 5, 10), 0, "连一个都买不起")
+        self.assertEqual(buy_count_for(10, 25, 3), 2, "wanted 是上界，不越界")
+        self.assertEqual(buy_count_for(0, 500, 10), 0, "价格不可用 ⇒ 0（不猜）")
+        self.assertEqual(buy_count_for(-5, 500, 10), 0, "负价 ⇒ 0")
+        self.assertEqual(buy_count_for(10, -100, 10), 0, "负钱 ⇒ 0")
 
 
 class TestTask67BuyAvailable(unittest.TestCase):
