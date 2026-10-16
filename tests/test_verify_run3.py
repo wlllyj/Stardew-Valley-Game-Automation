@@ -375,6 +375,38 @@ class TestVerifyRun3(unittest.TestCase):
             self.assertTrue(ok)
             self.assertFalse(any("留痕" in i for i in s["infos"]), s["infos"])
 
+    def test_review_rows_do_not_break_the_decision_line_count(self):
+        """task-136：复盘调用也写同一个留痕文件（`kind="review"`）⇒ 只对决策行数做比对，
+        复盘行单独说明，不许报"行数与引用数不符"的假问题。"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = pathlib.Path(td) / "run9c-llm.jsonl"
+            p.write_text('{"kind":"decision","a":1}\n{"kind":"decision","b":2}\n'
+                         '{"kind":"review","notes":["x"]}\n', encoding="utf-8")
+            rows = green_rows()
+            for i in (1, 2):
+                rows.insert(i, {"event": "decision", "llm": True, "source": "llm", "t": float(i),
+                                "_lineno": 10 + i, "llm_trace": str(p), "llm_trace_hash": "h"})
+            ok, s = self.check(rows)
+            self.assertTrue(ok, s.get("problems"))
+            self.assertFalse(any("不符" in i for i in s["infos"]), s["infos"])
+            self.assertTrue(any("复盘行 1 行" in i for i in s["infos"]), s["infos"])
+
+    def test_review_rows_do_not_mask_a_real_decision_mismatch(self):
+        """复盘行不能把真缺口洗白：决策行只有 1 行而账本引用 2 条 ⇒ 仍要报不符。"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = pathlib.Path(td) / "run9c-llm.jsonl"
+            p.write_text('{"kind":"decision","a":1}\n{"kind":"review","notes":["x"]}\n'
+                         '{"kind":"review","notes":["y"]}\n', encoding="utf-8")
+            rows = green_rows()
+            for i in (1, 2):
+                rows.insert(i, {"event": "decision", "llm": True, "source": "llm", "t": float(i),
+                                "_lineno": 10 + i, "llm_trace": str(p), "llm_trace_hash": "h"})
+            ok, s = self.check(rows)
+            self.assertTrue(ok)
+            self.assertTrue(any("决策行 1 行、账本引用 2 条" in i for i in s["infos"]), s["infos"])
+
 
     # ------------------------------------------------------------ no_water 诚实收尾（task-49 通道）
     def test_no_water_day_is_not_verified_and_only_info(self):

@@ -1171,14 +1171,38 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
             continue
         try:
             with open(p, "r", encoding="utf-8", errors="replace") as fh:
-                lines = sum(1 for line in fh if line.strip())
+                raw_lines = [line for line in fh if line.strip()]
         except OSError as exc:  # pragma: no cover - 只有权限/占用这类环境问题
             infos.append(f"留痕读不出：{p}（{exc}）")
             continue
-        if lines != claimed:
+        # task-136 起，同一个留痕文件里既有决策行（`kind="decision"`，旧行无该键）也有复盘行
+        # （`kind="review"`）⇒ “行数 = 引用数”的比对只对**决策行**成立，复盘行单独说明。
+        lines = len(raw_lines)
+        decision_lines = 0
+        review_lines = 0
+        unknown_lines = 0
+        for line in raw_lines:
+            try:
+                kind = json.loads(line).get("kind", "decision")
+            except (ValueError, AttributeError):
+                unknown_lines += 1
+                continue
+            if kind == "decision":
+                decision_lines += 1
+            elif kind == "review":
+                review_lines += 1
+            else:
+                unknown_lines += 1
+        if decision_lines != claimed:
             infos.append(
-                f"留痕行数与引用数不符：{p} 实际 {lines} 行、账本引用 {claimed} 条"
+                f"留痕行数与引用数不符：{p} 决策行 {decision_lines} 行、账本引用 {claimed} 条"
+                f"（另有复盘行 {review_lines} 行、无法判定行 {unknown_lines} 行）"
                 f"（多/少都说明留痕与决策不是一一对应）"
+            )
+        elif review_lines:
+            infos.append(
+                f"留痕含复盘行：{p} 决策行 {decision_lines} 行（与账本引用一致）、复盘行 {review_lines} 行"
+                f"（task-136：复盘调用也留痕，不参与决策行数比对）"
             )
 
     # finish 自述必须与本工具的结论同向（盲区 B1：K3 账本自称 code=1/streak=0 却全绿）
