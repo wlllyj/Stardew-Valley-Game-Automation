@@ -49,7 +49,7 @@ from .farmwork import (ENV_BLOCK_STATUSES, FRONTIER_KINDS, SEED_KEEP_FACTOR, STA
 from .planner import (DECISIONS_KEPT, LESSONS_INJECT_CHARS, LESSONS_INJECT_MAX, BoundaryPlanner, Brief,
                       PlannerState, TaskIntent, TaskOutcome, decision_line, deterministic_plan,
                       load_lessons_file, make_lesson, prune_lessons, render_lessons,
-                      save_lessons_file)
+                      render_review_facts, save_lessons_file)
 
 try:  # 田区规划是**可选**依赖：拿不到就退回"玩家周围窗口"，不让长跑起不来
     from . import fields as fields_mod
@@ -684,6 +684,9 @@ class LongRun:
         self.lessons_loaded = False
         # 今晚复盘产出的笔记 ⇒ 挂到今天新增的教训上当 `hint`（hint 只许 LLM 写）。
         self.lessons_hints: list[str] = []
+        # 【task-136 C】今天有几次"模型自述的 hint 因与证据矛盾被丢掉"（客观计数，随 `lessons`
+        # journal 落账；不参与任何判定）。
+        self.hint_dropped_today: int = 0
         # 【task-49】今天**已经见过、但还没做完**的格子（`_step_stage` 每轮的 `leftover`，排除已封格）。
         # 为什么必须记：观测是**以玩家为中心**的窗口（真机 `tiles[]` 上限 400、近处优先），
         # 人一换到别的片地，原来那片地的格子就"看不见"了 ⇒ `work_reasons`/`_plot_candidates`
@@ -1858,17 +1861,80 @@ class LongRun:
                                           max_chars=LESSONS_INJECT_CHARS),
         )
 
-    def _review_brief(self, obs: dict[str, Any]) -> Brief:
-        """【task-59】收工复盘用的简报：当天最后一张观测的**全场**口径（不掺作业区局部）。"""
+    def _review_brief(self, obs: dict[str, Any], rep: DayReport | None = None) -> Brief:
+        """【task-59】收工复盘用的简报：当天最后一张观测的**全场**口径（不掺作业区局部）。
+
+        【task-136 B】`rep` 非空时额外带一段「当天事实（账本）」（`Brief.review_facts`），
+        让复盘模型看到当天的**诚实事实**（怎么收的尾、有没有放弃的干作物、片区还剩多少），
+        而不是只看到乐观的派生摘要。
+        """
         sellable = 0
         try:
             if self.worker is not None:
                 sellable = len(self.worker.sellable_slots(obs))
         except Exception:  # pragma: no cover - 复盘简报不该影响主流程
             sellable = 0
-        return Brief.from_observe(obs, consecutive_failures=self.fail_streak,
-                                  last_failure=self.last_failure,
-                                  target_tiles=self.target_tiles_base, sellable=sellable)
+        brief = Brief.from_observe(obs, consecutive_failures=self.fail_streak,
+                                   last_failure=self.last_failure,
+                                   target_tiles=self.target_tiles_base, sellable=sellable)
+        if rep is not None:
+            try:
+                brief = replace(brief, review_facts=render_review_facts(self._review_facts(obs, rep)))
+            except Exception:  # pragma: no cover - 事实段渲染失败就退回旧行为
+                pass
+        return brief
+
+    def _review_facts(self, obs: dict[str, Any], rep: DayReport) -> dict[str, Any]:
+        """【task-136 B】当天事实（客观账本口径）—— 取不到的一律 `None`（渲染成「未观测到」）。
+
+        绝不用"猜一个 0"：`0` 与"没观测到"在复盘提示词里是两件事。
+        """
+        facts: dict[str, Any] = {
+            "day_key": list(rep.day_key) if rep.day_key else None,
+            "ended_by": rep.ended_by or None,
+            "ended_reason": rep.ended_reason or None,
+            "ok_steps": int(rep.ok_steps),
+            "failed_steps": int(rep.failed_steps),
+            "deferred_tiles": int(getattr(rep, "deferred_tiles", 0) or 0),
+            "plot_pending": int(getattr(rep, "plot_pending", 0) or 0),
+            "unreachable": int(getattr(rep, "unreachable", 0) or 0),
+            "refused": int(getattr(rep, "refused", 0) or 0),
+            "given_up": len(getattr(rep, "gave_up_tiles", []) or []),
+            "given_up_cause": (self._far_dry_give_up_cause_text()
+                               if len(getattr(rep, "gave_up_tiles", []) or []) else None),
+            "water_far_not_on_farm": bool(getattr(self, "water_far_not_on_farm", False)),
+            "refills_today": int(getattr(self, "far_dry_refills_today", 0) or 0),
+        }
+        # 浇水口径：优先用当天定稿的 `final_water`（它是 `_water_evidence` 的产物），
+        # 缺它就退回农场快照的 `farm.dryCrops`（仍然"取不到 ⇒ None"）。
+        final_water = getattr(rep, "final_water", None) or {}
+        if isinstance(final_water, dict) and final_water:
+            facts["dry"] = final_water.get("dry")
+            facts["dry_scope"] = final_water.get("scope")
+        farm = obs.get("farm") if isinstance(obs, dict) else None
+        farm = farm if isinstance(farm, dict) else {}
+        if facts.get("dry") is None and farm.get("dryCrops") is not None:
+            facts["dry"] = int(farm.get("dryCrops") or 0)
+            facts["dry_scope"] = "farm"
+        if farm.get("crops") is not None:
+            facts["crops"] = int(farm.get("crops") or 0)
+        if farm.get("ripeCrops") is not None:
+            facts["ripe"] = int(farm.get("ripeCrops") or 0)
+        final = getattr(rep, "final", None) or {}
+        if isinstance(final, dict):
+            if facts.get("crops") is None and final.get("crops") is not None:
+                facts["crops"] = int(final.get("crops") or 0)
+            if facts.get("ripe") is None and final.get("ripe") is not None:
+                facts["ripe"] = int(final.get("ripe") or 0)
+        try:
+            facts["money"] = FarmWorker.money(obs)
+        except Exception:  # pragma: no cover
+            facts["money"] = None
+        try:
+            facts["seeds"] = len(seed_items(FarmWorker.player_of(obs)))
+        except Exception:  # pragma: no cover
+            facts["seeds"] = None
+        return facts
 
     def _review_before_sleep(self, obs: dict[str, Any], rep: DayReport) -> None:
         """【task-59】收工前**一次独立**的 LLM 复盘：产出 1–3 条笔记，只落两处。
@@ -1891,7 +1957,7 @@ class LongRun:
             return
         self.review_done_today = True
         try:
-            res = planner.review(self._review_brief(obs))
+            res = planner.review(self._review_brief(obs, rep))
         except Exception as exc:  # noqa: BLE001 - 再兜一层：复盘绝不许把主循环带崩
             res = {"ok": False, "called": False,
                    "reason": f"review_exception:{type(exc).__name__}: {exc}",
@@ -2065,7 +2131,13 @@ class LongRun:
         失败无害：读不了/写不了都只记一笔 journal，跑批照常继续（不许崩、不许少一天）。
         """
         self._lessons_load()
+        # 【task-136 C】"模型自述被矛盾判据丢掉"的客观计数：本次生成里给了 hint、
+        # 但拍完教训后 hint 为空（= `hint_contradicts_evidence` 判定矛盾）的条数。
+        # 只计数、不进判定；随 `lessons` journal 落账，供人工对照。
+        hints_given = bool([h for h in self.lessons_hints if str(h).strip()])
         added = self._lessons_from_day(rep)
+        if hints_given:
+            self.hint_dropped_today += sum(1 for it in added if not str(it.get("hint") or ""))
         before = len(self.lessons)
         self.lessons = prune_lessons(list(self.lessons) + added)
         self.lessons_hints = []
@@ -2083,6 +2155,7 @@ class LongRun:
         self._journal("lessons", day_key=list(rep.day_key) if rep.day_key else None,
                       added=[str(it.get("id") or "") for it in added], total=len(self.lessons),
                       dropped=max(0, before + len(added) - len(self.lessons)),
+                      hint_dropped=int(self.hint_dropped_today),
                       written=written, skipped_untrusted=skipped_untrusted,
                       path=str(self.lessons_path) if self.lessons_path else "",
                       note="只有客观账本事实；hint 仅来自收工复盘的笔记；只喂提示词、不参与判定；"
@@ -4122,6 +4195,7 @@ class LongRun:
         self._plot_exhausted_last = None
         self._plot_exhausted_window = 0
         self.no_progress_cycles = 0      # 【task-134 A】每日重置：连续无产出环路计数
+        self.hint_dropped_today = 0     # 【task-136 C】每日重置：hint 被矛盾判据丢掉的条数
         self.dead_scope_noted = set()
         # 【task-59】复盘每天最多一次（`recent_notes` **不**在这里清：它是"昨晚留给今天"的，
         # 由 `_review_before_sleep` 在夜里覆盖）。

@@ -75,10 +75,13 @@ __all__ = [
     # 【task-59】收工复盘（night 边界一次独立调用；只落 journal + 次日 `recent_notes`）
     "REVIEW_MAX_TOKENS", "REVIEW_RETRY_MAX_TOKENS", "REVIEW_NOTES_MAX", "REVIEW_NOTES_MAX_CHARS",
     "NOTES_SECTION_MAX_CHARS", "REVIEW_SYSTEM_PROMPT", "parse_review_notes", "build_review_messages",
+    # 【task-136】复盘接地（当天诚实事实）+ 复盘调用留痕（`kind:"review"`）
+    "REVIEW_FACT_KEYS", "render_review_facts",
     # 【task-82】跨日教训库（客观事实由代码写、hint 只许 LLM 写；只喂提示词，不参与判定）
     "LESSONS_MAX", "LESSONS_INJECT_MAX", "LESSONS_INJECT_CHARS", "LESSONS_SECTION_MAX_CHARS",
     "LESSON_SEVERITY", "LESSON_TEXT_MAX_CHARS", "LESSONS_REJECT_REASONS_MAX",
     "LESSON_SRC", "LESSON_COUNT_MAX", "UNTRUSTED_LESSON_PREFIX",
+    "HINT_UNVERIFIED_PREFIX", "hint_contradicts_evidence",
     "make_lesson", "prune_lessons", "render_lessons",
     "load_lessons_file", "save_lessons_file",
     "BoundaryPlanner", "PLAN_SCHEMA_EXAMPLE",
@@ -541,12 +544,69 @@ def build_review_messages(
     *,
     max_chars: int = PROMPT_BRIEF_MAX_CHARS,
 ) -> list[dict[str, str]]:
-    """【task-59】复盘这一次调用的消息：system = `REVIEW_SYSTEM_PROMPT`，user = 当天简报。"""
+    """【task-59】复盘这一次调用的消息：system = `REVIEW_SYSTEM_PROMPT`，user = 当天简报。
+
+    【task-136 B】user 段在简报**之后**再接一段「当天事实（账本）」—— 那些是账本里
+    客观记下来的收尾事实（`ended_by`/`failed`/`deferred`/`given_up`/干作物…），缺失的
+    字段渲染成「未观测到」。为什么必须接：run9b 的复盘模型只看到乐观的派生摘要，于是
+    写出「作物全已浇水且无成熟」这种与账本（`gave_up=3`）直接矛盾的 hint。
+    """
+    user = "今天的情境简报（仅含已观测真值）：\n" \
+           + brief.situation_text()[: int(max_chars) or PROMPT_BRIEF_MAX_CHARS]
+    facts = str(getattr(brief, "review_facts", "") or "")
+    if facts:
+        user += "\n\n" + facts
     return [
         {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
-        {"role": "user", "content": "今天的情境简报（仅含已观测真值）：\n"
-                                    + brief.situation_text()[: int(max_chars) or PROMPT_BRIEF_MAX_CHARS]},
+        {"role": "user", "content": user},
     ]
+
+
+#: 【task-136 B】复盘提示词里「当天事实」的键与中文标签（顺序即渲染顺序）。
+#: 值取不到 ⇒ 渲染「未观测到」，**绝不当 0**（"没观测到"和"就是 0"是两件事）。
+REVIEW_FACT_KEYS: tuple[tuple[str, str], ...] = (
+    ("day_key", "日期"),
+    ("ended_by", "当天怎么收的尾"),
+    ("ended_reason", "收尾原因"),
+    ("ok_steps", "做成的步数"),
+    ("failed_steps", "失败的步数"),
+    ("deferred_tiles", "诚实上限留下的片区待办格数"),
+    ("plot_pending", "片区待做格数（含干不动/走不到的）"),
+    ("unreachable", "走不到的格数"),
+    ("refused", "被游戏拒绝的格数"),
+    ("given_up", "当天放弃的窗口外干作物格数"),
+    ("given_up_cause", "放弃原因"),
+    ("dry", "农场口径没浇的活作物格数"),
+    ("dry_scope", "上面这个数的口径"),
+    ("crops", "农场口径作物数"),
+    ("ripe", "成熟作物数"),
+    ("money", "钱"),
+    ("seeds", "背包里的种子数"),
+    ("water_far_not_on_farm", "窗口外浇水是否因人不在农场而没做"),
+    ("refills_today", "当天补水次数"),
+)
+
+
+def render_review_facts(facts: Mapping[str, Any] | None) -> str:
+    """【task-136 B】把当天事实拍成复盘提示词里的一段（**绝不抛**、缺失写「未观测到」）。
+
+    只渲染 `REVIEW_FACT_KEYS` 里列到的键；`None`/空串 ⇒ 「未观测到」。
+    数值 0 是**有效事实**（"确实一格都没剩"），照实写 `0`，不许被当成缺失。
+    """
+    data = facts if isinstance(facts, Mapping) else {}
+    lines = ["当天事实（账本，客观记录；缺失的写「未观测到」）:"]
+    for key, label in REVIEW_FACT_KEYS:
+        value = data.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            text = "未观测到"
+        elif isinstance(value, bool):
+            text = "是" if value else "否"
+        elif isinstance(value, (tuple, list)):
+            text = "[" + ", ".join(str(v) for v in value) + "]"
+        else:
+            text = str(value)
+        lines.append(f"- {label}（{key}）={text}")
+    return "\n".join(lines)
 
 
 def _strip_coordinates(text: Any) -> str:
@@ -558,6 +618,45 @@ def _strip_coordinates(text: Any) -> str:
             break
         out = out.replace(hit, "某格")
     return out
+
+
+#: 【task-136 C】`hint` 在提示词里必须带的标注：它是**模型自述**，不是账本事实。
+HINT_UNVERIFIED_PREFIX = "[模型自述·未验证] "
+
+#: 账本里代表"还有没做的事"的字段名（`evidence`/`symptom` 里形如 `leftover=9`）。
+_PROBLEM_FACT_KEYS: tuple[str, ...] = (
+    "leftover", "failed", "failed_steps", "deferred", "deferred_tiles", "plot_pending",
+    "gave_up", "dry", "dry_dead", "dead_crops", "unreachable", "refused", "plot_exhausted",
+)
+
+#: `hint` 里代表"没事了/全做完了"的措辞（与上面的正数事实同时出现 ⇒ 判定为矛盾）。
+_HINT_ALL_CLEAR_MARKERS: tuple[str, ...] = (
+    "全都", "全部", "全已", "都已", "都浇", "已浇", "浇过", "没有问题", "无问题",
+    "一切正常", "无事可做", "没有可做", "没有什么可做", "都没有", "不缺", "不需要",
+    "已完成", "已做完", "干净了",
+)
+
+
+def hint_contradicts_evidence(symptom: str, evidence: str, hint: str) -> bool:
+    """【task-136 C】`hint` 是否与账本事实**直接矛盾**（矛盾就必须丢弃，绝不许进提示词）。
+
+    判据刻意保守、只看两件事同时成立：
+      ① `symptom`/`evidence` 里出现某个"还有没做的事"的字段且值为**正数**
+         （`leftover=9`、`gave_up=3`、`dry=2`、`failed=1`、`deferred_tiles=4`…）；
+      ② `hint` 里出现"全都做完了/全浇过了/没有问题"这类措辞。
+    run9b 的实例：`evidence="gave_up=3 dry_dead=0"` + hint「作物全已浇水且无成熟」⇒ 丢弃。
+    宁可少留一句模型自述，也不许把"我干完了"写进下一轮/下一批的提示词。
+    """
+    text = f"{symptom or ''}\n{evidence or ''}"
+    positive = False
+    for key in _PROBLEM_FACT_KEYS:
+        if re.search(rf"{re.escape(key)}\s*[=:：]\s*[1-9]\d*", text):
+            positive = True
+            break
+    if not positive:
+        return False
+    claim = str(hint or "")
+    return any(marker in claim for marker in _HINT_ALL_CLEAR_MARKERS)
 
 
 def _day_key_values(day_key: Any) -> list[Any]:
@@ -591,16 +690,23 @@ def make_lesson(
 
     【task-118 A.1】写出去的每条都带 `src = LESSON_SRC`（`"agentfarm"`）—— 这是
     "本机制自产"的唯一凭据：载入侧据此区分可信/不可信，回写侧据此过滤。
+
+    【task-136 C】`hint` 与 `symptom`/`evidence` **矛盾**（账本说还有 leftover/gave_up/dry…，
+    hint 却说"全都做完了"）⇒ 该 `hint` 直接丢弃（留空），其余字段照旧保留。
+    调用方（长跑控制器）用"传进去的 hint 非空、出来是空"来数 `hint_dropped` 并记 journal。
     """
     scope_text = str(scope or "")
     day_values = _day_key_values(day_key)
+    hint_text = _strip_coordinates(hint)
+    if hint_text and hint_contradicts_evidence(symptom, evidence, hint_text):
+        hint_text = ""
     return {
         "id": f"{kind}|{scope_text}",
         "kind": str(kind),
         "scope": scope_text,
         "symptom": _strip_coordinates(symptom),
         "evidence": _strip_coordinates(evidence),
-        "hint": _strip_coordinates(hint),
+        "hint": hint_text,
         "count": 1,
         "first_day": list(day_values),
         "last_day": list(day_values),
@@ -699,7 +805,9 @@ def render_lessons(
             line += f"｜{evidence}"
         hint = str(it.get("hint") or "").strip()
         if hint:
-            line += f"｜{hint}"
+            # 【task-136 C】模型自述必须带标注（证据行在前、hint 在后），
+            # 否则下一轮/下一批会把它当成账本事实读。
+            line += f"｜{HINT_UNVERIFIED_PREFIX}{hint}"
         item = f"\n{_strip_coordinates(line)}"
         if len(text) + len(item) > max(0, int(max_chars)):
             break
@@ -1030,6 +1138,10 @@ class Brief:
     #: 由长跑控制器从 `<journal>-lessons.json` 读取后注入；空 ⇒ 这一节不出现。
     #: ⚠️ 与决策史/复盘笔记同一条诚实边界：只影响**提示词文本**，绝不参与任何判定。
     recent_lessons: str = ""
+    #: 【task-136 B】复盘提示词专用的「当天事实（账本）」文本（`render_review_facts()` 渲染）。
+    #: **只在 `build_review_messages()` 里用**：决策提示词不含它（决策看的是当下的简报）。
+    #: 空 ⇒ 复盘 user 段只有简报（旧行为，向后兼容）。
+    review_facts: str = ""
 
     # ---- 派生量（确定性策略用） ----
     @property
@@ -1709,6 +1821,11 @@ class BoundaryPlanner:
         （`llm.py` 这时抛 `LlmError(status="truncated")`）。收到这种失败时**用 2 倍预算
         重试一次**（上限 `REVIEW_RETRY_MAX_TOKENS`），仍失败才放弃 —— 保持"失败无害"。
 
+        【task-136 A】真实调用（`called=True`）也会写一行留痕到 `<journal>-llm.jsonl`，
+        带 `kind="review"`，字段与决策行同构（`prompt`/`raw`/`usage`/`finish_reason`/
+        `duration_ms`/`attempts`/`rejected`/`truncated`）。失败**绝不外抛**：留痕写不进去
+        只放到返回值的 `trace_error` 里。
+
         失败**绝不外抛**（卡面第 3 条：失败无害）：禁用 ⇒ `ok=False, called=False,
         reason="llm_disabled"`；超时/异常 ⇒ `reason` 是 `_describe_failure()` 的原文；
         JSON 非法 ⇒ `reason="review_no_notes"`；成功但一条都没留下 ⇒ 同前。
@@ -1716,14 +1833,57 @@ class BoundaryPlanner:
         model, attempts, max_tokens}`（`attempts` = 实际发了几次请求，`max_tokens` = 最后一次
         用的预算 —— 事后能一眼看出"是不是预算不够"）。
         """
+        res = self._review_call(brief)
+        if res.get("called"):
+            err = self._write_review_trace(res)
+            if err:
+                res["trace_error"] = err
+        return res
+
+    def _write_review_trace(self, res: Mapping[str, Any]) -> str:
+        """【task-136 A】把复盘那次真实调用写成一行 trace（`kind="review"`）。
+
+        返回 `""` 表示成功或"没有落点"；写盘失败返回原因串（**绝不影响复盘结果**）。
+        """
+        prompt = str(res.get("prompt") or "")
+        record: dict[str, Any] = {
+            "t": round(time.time(), 3),
+            "kind": "review",          # 与决策行的 `kind="decision"` 区分（缺省字段名不变）
+            "boundary": None,
+            "model": str(res.get("model") or self.model or ""),
+            "prompt_chars": len(prompt),
+            "prompt": prompt[:LLM_TRACE_MAX_PROMPT_CHARS],
+            "prompt_truncated": len(prompt) > LLM_TRACE_MAX_PROMPT_CHARS,
+            "raw": str(res.get("raw") or ""),
+            "usage": dict(res.get("usage") or {"prompt": None, "completion": None, "total": None}),
+            "finish_reason": str(res.get("finish_reason") or ""),
+            "duration_ms": int(res.get("duration_ms") or 0),
+            "attempts": int(res.get("attempts") or 0),
+            "rejected": [str(x) for x in (res.get("rejected") or [])],
+            "accepted": [],
+            "fallback": False,
+            "truncated": bool(res.get("truncated")),
+            "ok": bool(res.get("ok")),
+            "notes": [str(n) for n in (res.get("notes") or [])],
+            "max_tokens": int(res.get("max_tokens") or 0),
+        }
+        _path, _hash, error = self._write_traces([record])
+        return error
+
+    def _review_call(self, brief: Brief) -> dict[str, Any]:
+        prompt = ""
+        messages: list[dict[str, str]] = []
         empty = {"ok": False, "called": False, "reason": "llm_disabled", "notes": [], "text": "",
                  "rejected": [], "truncated": False, "usage": {"prompt": None, "completion": None, "total": None},
                  "duration_ms": 0, "model": str(self.model or ""), "attempts": 0,
-                 "max_tokens": int(self.review_max_tokens)}
+                 "max_tokens": int(self.review_max_tokens), "prompt": "", "raw": "",
+                 "finish_reason": ""}
         if not self.llm_enabled:
             return empty
 
         messages = build_review_messages(brief, max_chars=self.brief_max_chars)
+        # 【task-136 A】留痕要的是"模型当时看到的那段 user 文本"（system + 简报 + 当天事实）。
+        prompt = "\n\n".join(str(m.get("content") or "") for m in messages)
         # 【task-121】预算阶梯：首答被截断（推理吃光 token、正文为空）⇒ 加倍重试一次。
         budgets = [int(self.review_max_tokens)]
         retry_budget = min(max(1, budgets[0] * 2), int(REVIEW_RETRY_MAX_TOKENS))
@@ -1749,17 +1909,20 @@ class BoundaryPlanner:
                         "usage": {"prompt": None, "completion": None, "total": None},
                         "duration_ms": int((time.monotonic() - started_all) * 1000),
                         "model": str(self.model or ""), "attempts": attempts,
-                        "max_tokens": used_budget}
+                        "max_tokens": used_budget, "prompt": prompt, "raw": "",
+                        "finish_reason": "", "error_status": str(getattr(exc, "status", "") or "")}
             duration_ms = int((time.monotonic() - started) * 1000)
             content = result if isinstance(result, str) else getattr(result, "content", None)
             usage = _usage_dict(getattr(result, "usage", None))
             model = str(getattr(result, "model", "") or self.model or "")
+            finish_reason = str(getattr(result, "finish_reason", "") or "")
             duration_ms = duration_ms or int(getattr(result, "elapsed_ms", 0) or 0)
             if content is None:
                 return {"ok": False, "called": True, "reason": "llm_result_without_content", "notes": [],
                         "text": "", "rejected": [], "truncated": False, "usage": usage,
                         "duration_ms": duration_ms, "model": model, "attempts": attempts,
-                        "max_tokens": used_budget}
+                        "max_tokens": used_budget, "prompt": prompt, "raw": "",
+                        "finish_reason": finish_reason}
             notes, rejected, truncated = parse_review_notes(content)
             return {
                 "ok": bool(notes),
@@ -1774,9 +1937,12 @@ class BoundaryPlanner:
                 "model": model,
                 "attempts": attempts,
                 "max_tokens": used_budget,
+                "prompt": prompt,
+                "raw": str(content),
+                "finish_reason": finish_reason,
             }
         # 理论到不了这里（budgets 至少一个元素且每个分支都返回）；保险起见给失败态。
-        return dict(empty, called=True, attempts=attempts, max_tokens=used_budget)
+        return dict(empty, called=True, attempts=attempts, max_tokens=used_budget, prompt=prompt)
 
     # ---- 边界判定 ----
     def detect_boundary(self, state: PlannerState, brief: Brief) -> str | None:
@@ -1889,6 +2055,10 @@ class BoundaryPlanner:
         prompt = str(user_text or "")
         return {
             "t": round(time.time(), 3),
+            # 【task-136 A】同一份 trace 文件里现在有两种行：决策（decision）与收工复盘（review）。
+            # 新增字段，**不动**既有字段名 ⇒ 现有读法（compare-runs/analyze-longrun/测试）不破；
+            # 旧行没有 `kind`，按"决策"处理即可（向后兼容）。
+            "kind": "decision",
             "boundary": boundary,
             "model": str(meta.get("model") or self.model or ""),
             "prompt_chars": len(prompt),

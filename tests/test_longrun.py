@@ -47,7 +47,7 @@ from agentfarm.planner import (DECISION_LINE_MAX_CHARS, DECISIONS_KEPT, LESSONS_
                                REVIEW_MAX_TOKENS, REVIEW_RETRY_MAX_TOKENS,
                                BoundaryPlanner, Brief,
                                TaskIntent, deterministic_plan, find_coordinate_like,
-                               make_lesson, save_lessons_file)  # noqa: E402
+                               make_lesson, render_lessons, save_lessons_file)  # noqa: E402
 
 #: 【task-59】收工复盘与边界决策**共用同一个 LLM seam**，靠 system 提示词里的固定短语分辨
 #: （复盘提示词是 `REVIEW_SYSTEM_PROMPT`，开头写着"收工复盘助手"）。
@@ -3448,12 +3448,19 @@ class TestTask56LlmTraceWiring(unittest.TestCase):
             hashes = {hashlib.sha256(ln.encode("utf-8")).hexdigest()[:12] for ln in lines}
             for called_row in called:
                 self.assertIn(called_row["llm_trace_hash"], hashes)
-            # 每行 trace 都是一次**真实**决策调用：行数 == seam 被调次数 **减去** 复盘那些次。
-            # 【task-59】睡前复盘共用同一个 seam，但它**不写** trace 文件（只落 journal `review_llm`）。
-            self.assertEqual(len(lines), chat.calls - chat.review_calls)
+            # 每行 trace 都是一次**真实**调用：行数 == seam 被调次数（决策 + 复盘）。
+            # 【task-136 A】复盘那次调用现在也写一行（`kind="review"`）——以前它只落
+            # journal `review_llm`、trace 里查不到，本次按卡面补上；决策行仍是
+            # `calls - review_calls` 条，且**只有**它们带 `kind="decision"`。
+            self.assertEqual(len(lines), chat.calls)
             recs = [json.loads(ln) for ln in lines]
-            self.assertTrue(all(r["accepted"] == [] for r in recs))
-            self.assertTrue(all(r["fallback"] for r in recs))    # 降级 ⇒ 可读原因串（真值）
+            self.assertEqual(len([r for r in recs if r.get("kind") == "decision"]),
+                             chat.calls - chat.review_calls)
+            self.assertEqual(len([r for r in recs if r.get("kind") == "review"]),
+                             chat.review_calls)
+            decision_recs = [r for r in recs if r.get("kind") == "decision"]
+            self.assertTrue(all(r["accepted"] == [] for r in decision_recs))
+            self.assertTrue(all(r["fallback"] for r in decision_recs))    # 降级 ⇒ 可读原因串（真值）
 
     def test_llm_trace_failed_is_journalled_when_the_path_is_unusable(self):
         """写盘失败：决策照常跑完，journal 多一条 `llm_trace_failed`（用户才不会以为有留痕）。"""
@@ -7029,6 +7036,96 @@ class TestTask134AssignedVsPlotPending(unittest.TestCase):
         self.assertGreater(stages[-1]["assigned_undone"], 0, stages[-1])
         self.assertIs(rep.checks["no_unmet_stages"], False,
                       f"豁免扣完仍该 unmet：{rep.checks} {rep.stages}")
+
+
+class TestTask136ReviewMaterialWiring(unittest.TestCase):
+    """【task-136】长跑侧的复盘接地与 hint 防污染接线。
+
+    证据（run9b）：`far_dry_given_up|water_far` 的 hint「作物全已浇水且无成熟」与同行
+    `evidence="gave_up=3 dry_dead=0"` 自相矛盾；决策提示词里 hint 与证据裸拼。
+    本类验两件事：①这样的自述**进不了库、也进不了提示词**，且 `lessons` journal 如实计数；
+    ②复盘开/关只多出 trace 行与提示词文本，**任何一个判决都不许变**。
+    """
+
+    def _events(self, run, name):
+        return [e for e in run.entries if e["event"] == name]
+
+    def test_contradictory_hint_is_dropped_and_counted(self):
+        w = FakeWorld(weeds=4, seeds=10, money=500)
+        run = make_run(w, target_days=1, max_days=1)
+        # 昨晚复盘留下的自述（与今天账本直接矛盾）
+        run.lessons_hints = ["作物全已浇水且无成熟，明天先看成熟与缺水情况。"]
+        rep = DayReport(day_key=(1, "summer", 13), started_at=0.0)
+        rep.ended_by = "stuck"
+        rep.ended_reason = "stuck:换过 5 片地都没有目标"
+        rep.gave_up_tiles = [(12, 30), (13, 30)]
+        rep.stages = [{"stage": "clear_area", "tiles": 3, "ok": 3, "leftover": 2,
+                       "unreachable": 0, "refused": 0, "encircled": 0, "failed": 0,
+                       "stopped": "", "assigned": 3, "assigned_undone": 0}]
+        run._lessons_flush(rep)
+        events = self._events(run, "lessons")
+        self.assertEqual(len(events), 1, events)
+        # 两条教训（stuck_with_leftover + far_dry_given_up）都拿到了 hint、都被判矛盾丢掉
+        self.assertEqual(events[0]["hint_dropped"], 2, events[0])
+        self.assertTrue(events[0]["added"], "教训本身照记（只丢自述那一段）")
+        # 矛盾的自述一个字都不许留下：库里没有、渲染出来的提示词里也没有
+        self.assertTrue(all("全已浇水" not in str(it.get("hint") or "") for it in run.lessons))
+        self.assertNotIn("全已浇水", render_lessons(run.lessons, max_chars=4000))
+        # 不矛盾的自述照旧保留，并带上"模型自述·未验证"前缀
+        run2 = make_run(FakeWorld(weeds=0, seeds=10, money=500), target_days=1, max_days=1)
+        run2.lessons_hints = ["明天先补水再试那几格"]
+        rep2 = DayReport(day_key=(1, "summer", 14), started_at=0.0)
+        rep2.ended_by = "stuck"
+        rep2.ended_reason = "stuck:换过 4 片地都没有目标"
+        rep2.stages = [{"stage": "clear_area", "tiles": 3, "ok": 3, "leftover": 1,
+                        "unreachable": 0, "refused": 0, "encircled": 0, "failed": 0,
+                        "stopped": "", "assigned": 3, "assigned_undone": 0}]
+        run2._lessons_flush(rep2)
+        self.assertEqual(self._events(run2, "lessons")[0]["hint_dropped"], 0)
+        self.assertIn("模型自述·未验证", render_lessons(run2.lessons, max_chars=4000))
+
+    def test_review_trace_rows_appear_only_when_review_runs_and_verdicts_match(self):
+        """零判定影响：只切换复盘，判决逐字相同；trace 里多出的只有 `kind="review"` 行。"""
+
+        def once(with_review: bool):
+            w = FakeWorld(weeds=4, seeds=10, money=500)
+            chat = _ReviewChat()
+            with tempfile.TemporaryDirectory() as tmp:
+                journal = Path(tmp) / "run-t136.jsonl"
+                run = make_run(w, target_days=1, max_days=1, llm_enabled=True, llm_chat=chat,
+                               journal_path=str(journal))
+                if not with_review:
+                    run._review_before_sleep = lambda obs, rep: None
+                self.assertEqual(run.run(), 0, run.logs)
+                day = run.days[0]
+                water = dict(day.final_water)
+                water.pop("t", None)
+                trace = Path(tmp) / "run-t136-llm.jsonl"
+                rows = ([json.loads(ln) for ln in trace.read_text(encoding="utf-8").splitlines()
+                         if ln.strip()] if trace.exists() else [])
+                return {
+                    "verified": day.verified,
+                    "ended_by": day.ended_by,
+                    "ended_reason": day.ended_reason,
+                    "checks": dict(day.checks),
+                    "final_water": water,
+                    "final": dict(day.final),
+                    "stages": [dict(s) for s in day.stages],
+                    "intents": [e["intents"] for e in run.entries if e["event"] == "decision"],
+                    "kinds": sorted({str(r.get("kind") or "legacy") for r in rows}),
+                    "review_prompt_has_facts": any("当天事实（账本" in str(r.get("prompt") or "")
+                                                   and r.get("kind") == "review" for r in rows),
+                }
+
+        on = once(True)
+        off = once(False)
+        self.assertEqual(on["kinds"], ["decision", "review"], "复盘调用必须留痕（task-136 A）")
+        self.assertEqual(off["kinds"], ["decision"], "关掉复盘 ⇒ 一条 review 行都不许有")
+        self.assertTrue(on["review_prompt_has_facts"], "复盘提示词必须带当天事实（task-136 B）")
+        for key in ("kinds", "review_prompt_has_facts"):
+            on.pop(key)
+            off.pop(key)
+        self.assertEqual(on, off, "复盘只许影响提示词文本，判决必须逐字相同")
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -855,10 +855,13 @@ class LlmTraceTests(unittest.TestCase):
             rec = json.loads(lines[0])
             # 卡面点名的字段一个不少、一个不多（多出来的都是没被要求的臆造）
             self.assertEqual(set(rec), {
-                "t", "boundary", "model", "prompt_chars", "prompt", "prompt_truncated",
+                "t", "kind", "boundary", "model", "prompt_chars", "prompt", "prompt_truncated",
                 "raw", "usage", "finish_reason", "duration_ms", "attempts",
                 "rejected", "accepted", "fallback",
             })
+            # 【task-136 A】同一份 trace 文件里现在有两种行：决策行 `kind="decision"`、
+            # 复盘行 `kind="review"`。决策行的其余字段名一字未动。
+            self.assertEqual(rec["kind"], "decision")
             self.assertEqual(rec["boundary"], P.BOUNDARY_NEW_DAY)
             self.assertEqual(rec["model"], "deepseek-flash")
             self.assertEqual(rec["attempts"], 1)
@@ -1471,6 +1474,102 @@ class LessonQuotaTests(unittest.TestCase):
             self.assertEqual((report["written"], report["skipped"]), (1, 1))
             reloaded, _ = P.load_lessons_file(path)
             self.assertEqual({it["id"] for it in reloaded}, {"unreachable|g1"})
+
+
+class TestTask136ReviewMaterial(unittest.TestCase):
+    """【task-136】复盘留痕 + 提示词接地 + hint 防污染（三条一起验）。
+
+    证据（run9b）：`*-lessons.json` 里 `far_dry_given_up|water_far` 的 hint 说
+    「作物全已浇水且无成熟」，而同一行 `evidence="gave_up=3 dry_dead=0"` —— 自相矛盾；
+    且决策提示词里 hint 与证据裸拼、看不出哪句是模型自述；31 条 trace 全是决策调用，
+    复盘那次调用的输入/输出**查不到**。
+
+    变异自检（**实测**，脚本 `scratch/_t136_mutate.py`，跑完即删；基线 = 本类 3 + `TestTask136ReviewMaterialWiring` 2 = 5 条全绿）：
+    * `m136a_no_prefix`（`render_lessons` 不再加 `[模型自述·未验证] ` 前缀）⇒ **红 2**
+      （`test_contradictory_hint_is_dropped_and_labelled`、`..._wiring.test_contradictory_hint_is_dropped_and_counted`）；
+    * `m136b_no_drop`（`make_lesson` 不再因矛盾丢 hint）⇒ **红 2**（同上两条）。
+    """
+
+    def test_review_prompt_carries_the_honest_facts_and_never_guesses_zero(self):
+        facts = P.render_review_facts({
+            "day_key": [1, "summer", 13], "ended_by": "stuck",
+            "ended_reason": "stuck:换过 5 片地都没有目标", "ok_steps": 62, "failed_steps": 0,
+            "deferred_tiles": 0, "plot_pending": 9, "unreachable": 3, "refused": 0,
+            "given_up": 3, "given_up_cause": "壶里没水、补水也没成（当天补水 2/2 次）——**不是「够不着」**",
+            "dry": 6, "dry_scope": "farm", "crops": 6, "ripe": 0, "money": 188, "seeds": 0,
+            "water_far_not_on_farm": True, "refills_today": 2,
+        })
+        self.assertIn("（ended_by）=stuck", facts)
+        self.assertIn("（given_up）=3", facts)
+        self.assertIn("（plot_pending）=9", facts)
+        # 缺失 ⇒ 「未观测到」；**0 照实写 0**（"没观测到"与"确实是 0"是两件事）
+        missing = P.render_review_facts({"dry": None, "crops": 0})
+        self.assertIn("未观测到", missing)
+        self.assertIn("（crops）=0", missing)
+        self.assertNotIn("（crops）=未观测到", missing)
+        # 这段事实必须真的进 user 提示词（不是造了不用）
+        brief = P.Brief(location="Farm", is_farm=True, has_save=True,
+                        day_key=(1, "summer", 13), review_facts=facts)
+        messages = P.build_review_messages(brief)
+        user = messages[-1]["content"]
+        self.assertIn("（ended_reason）=stuck", user)
+        self.assertIn("（given_up）=3", user)
+
+    def test_review_call_writes_its_own_trace_row_with_kind_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run-llm.jsonl"
+            chat = FakeChat(LlmResult(content=json.dumps({"notes": ["明天先把水壶补满"]},
+                                                         ensure_ascii=False),
+                                      model="deepseek-flash", finish_reason="stop",
+                                      usage=Usage(prompt_tokens=11, completion_tokens=22),
+                                      elapsed_ms=7))
+            planner = P.BoundaryPlanner(llm_chat=chat, llm_enabled=True, llm_trace_path=path)
+            res = planner.review(P.Brief(location="Farm", is_farm=True, has_save=True,
+                                         day_key=(1, "summer", 13)))
+            self.assertTrue(res["ok"], res)
+            lines = path.read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(lines), 1, "复盘这次真实调用必须落一行 trace")
+            rec = json.loads(lines[0])
+            self.assertEqual(rec["kind"], "review")
+            self.assertIsNone(rec["boundary"])
+            self.assertEqual(rec["accepted"], [])
+            self.assertIs(rec["fallback"], False)
+            self.assertEqual(rec["attempts"], 1)
+            self.assertEqual(rec["max_tokens"], P.REVIEW_MAX_TOKENS)
+            self.assertEqual(rec["notes"], ["明天先把水壶补满"])
+            self.assertIn("复盘", rec["prompt"])          # 存的是模型当时看到的那份提示词
+            self.assertEqual(rec["usage"], {"prompt": 11, "completion": 22, "total": 33})
+            self.assertEqual(rec["finish_reason"], "stop")
+            self.assertFalse(rec["prompt_truncated"])
+
+    def test_contradictory_hint_is_dropped_and_labelled(self):
+        # 判据本身：证据里 "有格子在挨饿/还剩/失败" 而 hint 说"全都好了" ⇒ 矛盾
+        self.assertTrue(P.hint_contradicts_evidence(
+            "water_far 有 3 格窗口外干作物够不着（当天放弃）", "gave_up=3 dry_dead=0",
+            "作物全已浇水且无成熟，明天先看成熟与缺水情况。"))
+        self.assertTrue(P.hint_contradicts_evidence(
+            "till_area 有 2 格没做成，还剩 5 格", "failed=2 leftover=5", "地里没有问题"))
+        # 不矛盾的不要误杀（"都没做成/还剩" 这类悲观话是真话）
+        self.assertFalse(P.hint_contradicts_evidence(
+            "till_area 有 2 格没做成，还剩 5 格", "failed=2 leftover=5",
+            "明天先补种子再开垦这块地"))
+        self.assertFalse(P.hint_contradicts_evidence(
+            "water_far 有 3 格够不着", "gave_up=3 dry_dead=0", "先去买种子"))
+        dropped = P.make_lesson(kind="far_dry_given_up", scope="water_far",
+                                symptom="water_far 有 3 格窗口外干作物够不着（当天放弃）",
+                                evidence="gave_up=3 dry_dead=0",
+                                hint="作物全已浇水且无成熟")
+        self.assertEqual(dropped["hint"], "", "与自身证据矛盾的 hint 必须丢掉（不许原样喂回模型）")
+        kept = P.make_lesson(kind="far_dry_given_up", scope="water_far",
+                             symptom="water_far 有 3 格窗口外干作物够不着（当天放弃）",
+                             evidence="gave_up=3 dry_dead=0", hint="明天先补水再试这几格")
+        self.assertEqual(kept["hint"], "明天先补水再试这几格")
+        text = P.render_lessons([kept], max_chars=2000)
+        self.assertIn("[模型自述·未验证]", text)
+        self.assertIn("明天先补水再试这几格", text)
+        # 证据行在前、自述在后：渲染顺序不能反（否则模型会把自述当事实读）
+        self.assertLess(text.index("gave_up=3"), text.index("[模型自述·未验证]"))
+        self.assertNotIn("[模型自述·未验证]", P.render_lessons([dropped], max_chars=2000))
 
 
 if __name__ == "__main__":
