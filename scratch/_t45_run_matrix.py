@@ -19,7 +19,9 @@ SAVE_NAME = "Wahaha_450799035"
 CASES = [
     ("ok", 0),
     ("pos-E-save-one-day-behind", 0),
-    ("pos-G-one-day-no-save", 0),
+    # task-128 新口径（Lead commit `99eb8e0` + task-126：每次跨日都必须完成一次落盘）⇒
+    # 此例字面就是"有一天 NewDay 之后 180s 内没有 `SaveGame.Save() called.`" ⇒ 期望 0 → **1**。
+    ("pos-G-one-day-no-save", 1),
     # task-93（NIT-5 三态）后此例**故意**由 0 变 1：跑批进行中（无 `finish`）而存档已领先 1 天
     # ⇒ fail-closed 判 problem（Lead 口径：无 finish 的领先不许用「跑批窗口 < 游戏会话」解释）。
     # 若将来加「SMAPI 日志仍在写 ⇒ 视为跑批中」的例外，这里再改回 0。
