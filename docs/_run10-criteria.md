@@ -3,9 +3,11 @@
 > 用户裁定：`User said (m12553)`「总之要让模型再玩这个游戏的时候具备决策演进的能力」、`User said (m12569)`「定好之后排上任务，不用开始，明天再做」。
 > 诚实边界（**必须与结论一起写**）：本机制是「会话内记忆 + 提示词反馈」（每次调用留痕 + 夜间复盘 notes + 跨日教训库），**不是权重更新、不是在线训练**。没有下面的 A→B 对照证据，**不许**写"自我进化已实现"。
 
-## 0. 设定
-- **run A = 累积轮 = `logs\longrun-3day-llm-run9d.jsonl`**（**0.7.31**、**5 天**、`--days 5 --max-days 12`，卡 = **task-147**）：跑完把 `…-run9d-lessons.json` **原样拷**成 `…-run10-lessons.json`（记拷贝时刻 + 两侧 SHA256）。历史轮次：run9（`lessons.total=0`，病灶取证轮）、run9b（落盘 5/5、首个整天全绿，但 `buy` 死锁/空转未修）、run9c（尾部 3/3 但含 summer 20 的"0 动作自称 VERIFIED"假达标日 ⇒ 由 task-149/150 修掉）**都不参与 A→B 对照**。
-- **run B = 对照轮 = `logs\longrun-3day-llm-run10.jsonl`**（同 0.7.31、同 5 天、同存档线的下一段；卡 = **task-113**）：同一 Mod、同一 brain，**唯一差异 = 注入的教训/笔记/决策史**（路径由 `--journal` 自动推导，没有新增开关）；两份 sidecar 的 `argv` 必须逐字对齐（除 journal 路径）。
+## 0. 设定（**2026-10-17 修订：A/B 都改到 0.7.32 同一构建**）
+- **run A = 累积轮 = `logs\longrun-runA.jsonl`**（**0.7.32**、5 天、`--days 5 --max-minutes 240 --max-days 12`）：跑完后把 `…-runA-lessons.json` **原样拷**成 `…-runB-lessons.json`（记拷贝时刻 + 两侧 SHA256）。
+- **A 的初始教训库允许"继承历史"**（本轮裁定）：可以把 run9d（0.7.31）的 `logs\longrun-3day-llm-run9d-lessons.json`（3712 B / SHA256 `2C4BA15FB…`，以实际台账为准）**原样复制**为 A 的初始库，理由 = 教训库本来就是跨日/跨轮持久的知识；**代价与纪律**：①A 与 B 必须是**同一份 0.7.32 构建**（sidecar 四要素逐字对齐，只有 journal 路径不同）；②复制时刻 + 两侧 SHA256 双向记账并写进 `docs\_runB-evidence.md` §1；③报告里如实写"库里有几条来自 run9d、几条是 A 自己新产出的"；④若用户要求"从零积累"，则 A 必须自己在 0.7.32 上跑到库非空（L0 只认"库非空"，不区分来源，但来源必须公开）。
+- **run B = 对照轮 = `logs\longrun-runB.jsonl`**（同 0.7.32、同 5 天、同存档线的下一段）：同一 Mod、同一 brain，**唯一差异 = 注入的教训/笔记/决策史**（路径由 `--journal` 自动推导，没有新增开关）；两份 sidecar 的 `argv` 必须逐字对齐（除 journal 路径）。
+- **不参与 A→B 对照的历史轮**：run9（`lessons.total=0`）、run9b（落盘 5/5 但买死锁/空转未修）、run9c（含 summer 20 "0 动作自称 VERIFIED"假达标日）、**run9d（0.7.31；尾部 0/5，两条结构性病灶由 task-157/158 修）** —— 它们只作诊断/素材，**不得**当 run A 的对照臂。
 - run B 起跑前必须先从 run A 的账本+教训库导出「待验证教训清单」（`tools/compare-runs.py` 的 lessons 段 + `criteria` 段），**先写下预测再跑**（避免事后挑证据）。
 
 ## 1. 五条判定（全部要有原文读数）
