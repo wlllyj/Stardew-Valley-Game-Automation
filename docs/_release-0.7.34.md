@@ -30,7 +30,7 @@
 
 - 修复生效 = 下列任一：①`(60,29)` 的 `crop` 变空 / `ready` 转非 true ②背包 +N 或地面掉落可见 ③`farm.readyCrops` 减少 ④Mod 回执 `acted` 与 `worldSeq` 一致（且世界确有变化）。
 - 混杂排除 = 第 2 步腾格后 `inventoryCount < 12` 再摘；若腾格后仍摘不到且步骤 4 的镰刀路径成功 ⇒ 定案为镰刀类作物 + `harvestMethod` 修复生效。
-- 缺陷 B 验证 = `(60,28)` 这类"`fullyGrown=false` 却 `ready=true`"的格，修复后应为 `ready=false` 或 `null`，且**不再进收获目标池**。
+- ~~缺陷 B 验证 = `(60,28)` 这类"`fullyGrown=false` 却 `ready=true`"的格，修复后应为 `ready=false` 或 `null`，且**不再进收获目标池**。~~ **【已作废，2026-10-17 诊断更正】** IL 实证显示 `HoeDirt.readyForHarvest()` 与字段判据**逐条等价** ⇒ `ready=true` 是游戏口径的真相，**不是缺陷**。0.7.34 的正确要求是：这类格 `readySource="fields"`（等价路径）且**照常进目标池**；只有字段缺项才 `null`（`readySource=null`，不摘）。**若复测发现 `readySource` 把"游戏说可收"的格判成 `null`，那是 fail-closed 过头 ⇒ 直接判问题。**
 
 ## 4. 已知风险 / 未决
 
@@ -44,4 +44,23 @@
 
 ## 5. 执行记录（逐步追加）
 
-- 待填。
+### 5.1 验收链（全部完成，2026-10-17）
+| 环节 | 结果 | 证据 |
+|---|---|---|
+| task-176 交付（dev-coder） | `037e599`，7 文件 +480/−40 | 定向 519 OK、全量 904 OK、build 0 警 0 错、变异 4/4 |
+| task-179 交付（log-analyst） | `7176922`，3 文件 +296/−2 | 单文件 207 OK、**全量 911 OK（0 红）**、六本旧账本 rc 与计数一字未变 |
+| task-178 独立对抗验收（deputy-lead） | **PASS-WITH-NITS（无必修）⇒ 可冻结** | `b69ccb5` + `docs\_review-task176.md`；六条作弊通道 6/6、探针 23/23；GAP-1/2 + NIT-1/2 排 0.7.35 |
+| Lead 亲核 | `py_compile` exit 0、全量 **911 OK**、commit 范围干净 | 见上两行读数 |
+| 后续卡 | **task-180**（0.7.35 harvest 护栏加固，`blocked_by task-177`） | GAP-1 行为化回归 / NIT-1 一行修 / GAP-2 文档更正 / NIT-2 docstring |
+
+### 5.2 冻结与装机（Lead 执行）
+- note 首串 `v0.7.34` ✅ ⇒ `_bump-mod-version.py 0.7.34 --note-file tools\_note-0734.txt` ⇒ manifest `0.7.33 → 0.7.34`（Description 头部插入）。
+- `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.34"`（注释补 v0.7.34 三条：`GetHarvestMethod()` 出键 / `readySource` 三态 / `acted` 由 `TileSig` 差分）。
+- `dotnet build -c Release --no-incremental` ⇒ **0 警 0 错**（1.26 s）⇒ dll **196608 B** / manifest **48579 B**。
+- 冻结提交 **`f349f14`**；`check-release --expect 0.7.34` ⇒ **六项全绿**（含 `Ran 911 tests / OK`、工作树干净）。
+- `deploy-mod.py --no-quit` ⇒ `0.7.33 → 0.7.34`（桥 `modVersion=0.7.34 port=17890`，自动读档 `Wahaha_450799035`）。
+- `goto Farm` ok（`hop1 [3,12] → [64,15]` 7607ms）⇒ `preflight --expect 0.7.34 --save-baseline logs\run10b-baseline.json` ✅ = 第1年 **秋12日 06:10 rain**、Farm(64,15)、体力 247/270、钱 0g、作物 102、`waterLeft 27`、tillable 120、无模态。
+- 构建指纹（task-177 证据照抄）：`longrun 2C5DEAAA…`、`farmwork 494E84C8…`、`bridge FC830E2D…`、`dll AA266F85…`、`manifest 8480207A…`。
+
+### 5.3 task-177 同格复测
+- 待填（machine-runner）。**要求**：先腾一格（出货箱路径，只卖盈余材料）；记录 `(60,29)` 的新键存在性与 `readySource`；一次收获；四条判据照抄读数；收尾优雅退出（`m02833`）。
