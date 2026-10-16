@@ -151,7 +151,17 @@ python tools\start-detached-longrun.py --days 3 --size 5 --max-minutes 150 --max
 
 ---
 
-## §5 本版六个关注项逐条读数
+## §5 本版关注项逐条读数（卡面 N1–N5 + Lead 六项）
+
+**卡面 N1–N5 对照表**
+
+| 卡面问 | 结论 | 读数 |
+|---|---|---|
+| N1 每天都有农场动作？ | ✅ | summer 13–16 `ok_steps` 35/62/94/108 且都推进游戏日；summer 17 `ok=0` 但 `slept_without_work` **没推进游戏日**（`day_after=null`），"`day_after` 推进 ∧ `ok_steps==0` ∧ `verified==true` 三者不同时"成立 |
+| N2 经济闭环四步是否都留痕？ | ✅（四步各自成功，**跨日衔接**） | `sell` 5 成交 5 + `surplus_sell sold 289 件`；次日 `day_end.final.money` 88 → 115 → 17 → 27 → **407**；`buy` 9 成交 8（当季 `(O)483 Wheat Seeds` 10g）；`plant_area` ok **10/23/16/19 格** |
+| N3 同日 `buy` ≤3？`no_inventory_space` 后是否重试？有 `surplus_sell{why:need_slot}`？ | ✅ | 单日 `buy` 最多 2 次（`attempt 2 / limit 3`）；`buy_no_space` **0 次**；`surplus_sell{why:"need_slot"}` **4 次**（腾格子卖出生效） |
+| N4 `day_after` 恰 +1？落盘缺口能否用日终菜单链解释？ | 跨日 ✅ 4/4；落盘 **0/4** | 见 §4.3 `[1]`（4 次跨日全 +1，summer 17 未跨日不计）；落盘按 `docs/_il-newday-save.md` 记 **INFO**（日终菜单期保存可能被推迟，不判失败也不当通过），但存档 start==end ⇒ **本跑全部进度未持久化**，建议独立立项 |
+| N5 死苗判据有真机证据？ | **真空未验** | 5 天 `final.dead_crops=0`、`farm.dryDeadCrops=0`、`day_end.gave_up_tiles=[]` ⇒ 全程没有死苗 ⇒ **真空未验：不算通过、也不算失败**（按 `docs/_run6-criteria.md` 死苗口径必须明写） |
 
 **① 经济闭环四步（task-55/102 的唯一真机验收）——四步各自都成功过 ✅，但没有任何一天走完"同日全链"**
 - `sell` **5 次成交 5**（`strategy=surplus_materials`、`below_keep 5 叠`、`surplus_sell sold 289 件`）；其中 **4 次 `why=need_slot`**（腾格子）。例：`t=0.25` 出货 slot 8 `(O)771 Fiber`（`freeSlots 0 / slotsNeeded 1`）；`t=84.69` 出货 slot 6 `(O)390 Stone stack 163`。
