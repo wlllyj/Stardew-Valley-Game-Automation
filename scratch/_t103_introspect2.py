@@ -1,0 +1,22 @@
+﻿import re, sys, inspect
+sys.path.insert(0, r"D:\Deepseek Harness Workspace\星露谷游戏自动化\scratch")
+from _t92_adv import TL
+src = open(r"D:\Deepseek Harness Workspace\星露谷游戏自动化\brain\agentfarm\farmwork.py", encoding="utf-8").read()
+calls = sorted(set(re.findall(r"self\.c\.(\w+)\(", src)))
+print("FarmWorker -> self.c calls:", calls)
+fc = [m for m in dir(TL.FakeClient) if not m.startswith("_")]
+print("FakeClient has:", sorted(fc))
+print("missing:", [c for c in calls if c not in fc])
+print("--- FakeWorld.buy ---")
+print(inspect.getsource(TL.FakeWorld.buy))
+print("--- FakeWorld.__init__ ---")
+print(inspect.getsource(TL.FakeWorld.__init__))
+print("--- FakeWorld.obs ---")
+print(inspect.getsource(TL.FakeWorld.obs))
+print("--- FakeWorld.current_ui / dismiss / _seed_slot ---")
+print(inspect.getsource(TL.FakeWorld.current_ui))
+print(inspect.getsource(TL.FakeWorld._seed_slot))
+print("--- FakeClient.observe / sleep / dismiss_modal ---")
+print(inspect.getsource(TL.FakeClient.observe))
+print(inspect.getsource(TL.FakeClient.sleep))
+print(inspect.getsource(TL.FakeClient.dismiss_modal))
