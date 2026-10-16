@@ -65,6 +65,8 @@ python tools\start-detached-longrun.py --days 3 --size 5 --max-minutes 150 --max
 
 ## §3 SMAPI 窗口冻结与配对计数
 
+> ⚠️ **作废标注（task-127 追加，结论数字未改）**：**本跑落盘 0/4（4 NewDay / 0 save），按 task-126 与 `docs/_run6-criteria.md` §2 新口径（commit `99eb8e0`：每次跨日必须落盘，`NewDay` 次数 > `Save` 次数即硬问题），run9 不能作为验收依据或 run A 基线；其逐日读数仅作诊断素材。**
+
 - 冻结文件：`logs/run9-smapi-window.txt` = **360153 B / 4865 行 / mtime `2026-10-16 21:04:17.918` / SHA256 `FEE3DF3702BBBB641CC853D8D85AC1879417A47F63110BB153D2D6C474CCB2EC`**（`Copy-Item` 自 `%APPDATA%\StardewValley\ErrorLogs\SMAPI-latest.txt`）。
 - 窗口 `20:40:40–21:04:17` 内 **4447 行**。
 
@@ -218,6 +220,8 @@ python tools\start-detached-longrun.py --days 3 --size 5 --max-minutes 150 --max
 
 ## §7 保留物 · 不确定项 · 诚实声明
 
+> ⚠️ **作废标注（task-127 追加，结论数字未改）**：**本跑落盘 0/4（4 NewDay / 0 save），按 task-126 与 `docs/_run6-criteria.md` §2 新口径（commit `99eb8e0`：每次跨日必须落盘，`NewDay` 次数 > `Save` 次数即硬问题），run9 不能作为验收依据或 run A 基线；其逐日读数仅作诊断素材。**
+
 ### 7.1 保留物（未删改）
 `logs/run9-journal-extract.txt`、`logs/run9-smapi-window.txt`、`logs/run9-smapi-counts.txt`、`logs/run9-verify.txt`、`logs/run9-analyze.txt`、`logs/run9-lead-check.txt`、`logs/longrun-3day-llm-run9.jsonl`（988 行）、`.console.log`（310 行 / 41754 B）、`.console.err.log`（**0 B**）、`.version.json`、`-llm.jsonl`、`-lessons.json`、`logs/run9-baseline.json`、`logs/longrun-3day-llm-run9-baseline.json`、`scratch/run9-external-snapshots.jsonl`（2 行）、`scratch/run9-extract.py`、`logs/run9.pid` 不存在（真 PID 文件是 `logs/longrun-3day-llm-run9.pid`）。
 
@@ -233,3 +237,18 @@ python tools\start-detached-longrun.py --days 3 --size 5 --max-minutes 150 --max
 - 我只做**只读**取证与起止快照；**没有**改源码/Mod/tools/tests、**没有** deploy、**没有**替游戏做选择（`eventUp` 全程 0 命中、无 Dialog/LevelUp/ShopMenu 的选择动作）。
 - 一处**订正已如实记账**：end 快照初次被 `run8-snapshot.py` 的默认输出写进了 `scratch/run8-external-snapshots.jsonl`；已由 `scratch/run9-extract.py` 的 `fix_snapshots()` 把 run9 行搬回 `scratch/run9-external-snapshots.jsonl`，并把 run8 那份**原样恢复为 2 行**（内容未改，只去掉误入行）。
 - 结论口径：**FAIL（0/5 VERIFIED、尾部窗口 0/3、exit 1）**；两侧工具同向；所有"好消息"（经济闭环四步各自成功、守卫生效、不死锁）与"坏消息"（0 落盘、`day_justified` 5/5 未过、两天 `stuck`）都如实列出，未做取舍性叙述。
+
+---
+
+## §8 下次证据必须包含（run9b / run10 模板，task-127 追加）
+
+下一跑（run9b/run10）的 `docs/_runNN-evidence.md` **必须**含下列八项，缺哪项就在对应位置写【无法判定】——**缺失 ≠ 通过**。
+
+1. **四个 SMAPI 计数逐条配对**：`NewDay`（`Synchronizing 'NewDay' task`）↔ `before save`（`Context: before save.`）↔ `Save called`（`SaveGame.Save() called.`）↔ `completed`（`SaveGame.Save() completed without exceptions.`）。每个计数给**次数 + 行号/时间**，并**逐次**把同一晚跨日的四个计数配成一组；`NewDay` 次数 > `Save` 次数即硬问题（task-126 / `docs/_run6-criteria.md` §2，commit `99eb8e0`）。
+2. **两侧工具的 `verdict` 与 `strict_verdict` 两行都抄**：`python tools\verify-run3.py --journal <journal> --days 3`（尾部窗口 verdict）与 `python tools\analyze-longrun.py --journal <journal>`（严格整本 / exit code）；两者必须同向，不同向就列为未决并写清差异条目。
+3. **`python scratch\run9-lead-check.py` 原文**，且**必须显式传** `--snapshots <快照文件> --smapi <SMAPI 窗口文件>`（默认是空串，不传只会报"无法判定"）。
+4. **教训库原文 + SHA256**：`logs/<journal 词干>-lessons.json` 全文与 `Get-FileHash -Algorithm SHA256` 结果。
+5. **`<journal>.version.json` 的四要素**：`head`、`files{五文件 sha256 + mtime}`、`pid` + 起跑时刻、`git_status_short`/`worktree_clean`；另附外部判定"进程 `StartTime` 晚于被测文件 mtime"。
+6. **起止快照两行原文**：`python scratch\run9b-snapshot.py --tag start` 与 `--tag end`（PID 候选按 `--journal` 自动推导 `X.jsonl ⇒ X.pid`；`--tag end` 建议显式 `--pid-file <journal>.pid`）；`save_main` 起止 size+mtime 一致 ⇒ 落盘 0，必须点名。
+7. **存档四条读数**（`Wahaha_450799035` / `SaveGameInfo` / `_old` / `SaveGameInfo_old` 的 size+mtime）与逐日 `day_after` 链（必须恰 +1）。
+8. **每日读数表**：`ended_by`、`verified`、`checks` 全项、`ok/skip/fail`、`final_water`（farm 口径 dry/crops）+ 逐日 `day_start.money`。
