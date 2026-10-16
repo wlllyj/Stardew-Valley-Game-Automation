@@ -834,6 +834,35 @@ python tools/analyze-longrun.py --journal logs/longrun-3day-llm-run9d.jsonl --da
 rg -n '"event": ?"stamina_budget"' logs/longrun-*.jsonl | rg "water_reserve|deferred_by_budget"
 ```
 
+## 3.25 clump 工具门槛（task-20 `1a86192`，task-164 收录）—— **动手之前**就拦下，诚实跳过
+
+### 事件与字段（brain：`brain/agentfarm/longrun.py`）
+
+| 事件 | 字段 | 说明 |
+| --- | --- | --- |
+| `blocked_by_tool` | `tile/action/stage/zone/kind/need/min_level/reason/note` | 逐格：工具等级/种类不够（或 `toolOk` 判不出 ⇒ fail-closed）⇒ **0 次 `use_tool`**、当天封格（`self.blocked`）、次日工具升级后自动重试。`need` 是工具需求**文本**（**不是** `tool` 字段）；`min_level` 可能是 `null` ⇒【无法判定】等级 |
+| `blocked_by_tool_summary` | `count/tiles(≤6)/kinds(去重列表)/tools(去重列表)/note` | 每天只发一次：说明「农场还剩障碍、为什么却收了工」；这些格**不算活、不进守卫理由**（否则一块暂时敲不动的巨石会让 agent 永远收不了工） |
+
+### 口径
+- **诚实跳过、不是失败、不判红、不进 rc**：与 `refused`（挥了、游戏拒绝，真花了体力才拿到结论）明确区分；也不进 `unreachable`/`refused` 两套豁免、任何豁免都不互相掩护。
+- `tools/verify-run3.py` 对这两个名字**零命中** ⇒ 判红会两边反向；本工具只做呈现（头部 `工具门槛` 行 + 建议 0v）+ 一条可证伪 ⚠。
+- 唯一可证伪 ⚠（**只警告、不进 rc**）：当天自称 `no_work`（`ended_reason` 以 `no_work` 开头）却存在工具门槛封格 ⇒ 人工核对「真敲不动 vs 工具够却判不出」。
+- 缺失行为：旧账本没有这两事件 ⇒ 头部 `工具门槛: <缺失>` + 【无法判定】（**缺失 ≠ 0**）；`min_level` 缺失 ⇒【无法判定】等级，**绝不默认 0 级**；`kind` 判不出时账本写「未知」，本工具不许替观测断言树/桩/大石。
+- 与目标 1 的关系：这些格**仍是障碍**（不会被算成已清理），要等工具升级（铁匠铺链见 `docs/_il-tool-upgrade.md`）后自动重试。
+
+### 单测与读数
+- 单测：`TestToolGateBlockedByTool` 5 条 —— 两事件有桶且不落未映射 / 信息项可见且不判红（计数 + 头部 + 建议）/ 自称 `no_work` 却有封格 ⇒ ⚠ 不判红 / `min_level` 缺失 ⇒【无法判定】不默认 0 级 / 旧账本 ⇒ `<缺失>` +【无法判定】。
+- 读数：`python -W error::SyntaxWarning -m py_compile` RC=0；`tests.test_analyze_longrun` **190 OK**；机械枚举未映射回到 **3 个结构性**（`day_start`/`day_end`/`finish`）；12 账本 rc 与 `verify-run3.py` 并排未变（`journal-green` 0/0、run2 1(19)/1、run3 1(17)/1、run5 1(62)/1、run6 1(14)/1、run7 0/0、run8 1(29)/1、run9 1(84)/1、run9b 1(45)/1、run9c 0/1 有意分歧、run9d 1(29)/1、vacuum 1(3)/1）。
+- 全量：`discover -s tests` 861 条，剩 1 条红 = dev 在制的 `tests/test_longrun.py::TestTask161StaminaCalibration`（task-161，非本工具；它提交后应回 0 红）。
+
+### grep 配方
+
+```
+git grep -n "blocked_by_tool" -- brain/agentfarm/
+python tools/analyze-longrun.py --journal logs/longrun-3day-llm-run9d.jsonl --days 7 | rg "工具门槛"
+rg -n '"event": ?"blocked_by_tool' logs/longrun-*.jsonl
+```
+
 ## 4. 复核命令
 
 ```
@@ -847,6 +876,6 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run9d.jsonl --da
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
 python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
-python -m unittest tests.test_analyze_longrun  # 当前 185 OK（task-160 + 开路/体力预算 6 条）
-python -m unittest discover -s tests           # 当前 838 OK（0 红；task-157/158 的两条漂移红已随本卡清零）
+python -m unittest tests.test_analyze_longrun  # 当前 190 OK（task-164 + 工具门槛 5 条）
+python -m unittest discover -s tests           # 当前 861 条 / 1 红（dev 在制 task-161 的 TestTask161StaminaCalibration，非本工具）；task-157/158/20 的三条漂移红已随 task-160/164 清零
 ```

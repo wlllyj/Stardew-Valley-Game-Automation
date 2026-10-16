@@ -156,6 +156,13 @@
     `crops_watered=false`），只两条可证伪 ⚠：①说「只因预算延后」却当天自称浇完（dry=0）；
     ②日级 `deferred_by_budget>0` 却没有对应事件。旧账本没有这两个事件/字段 ⇒ `<缺失>` +
     【无法判定】（缺失 ≠ 0，绝不当作「今天没用预算」）。
+  * task-20 / task-164（clump 工具门槛）：`blocked_by_tool`（逐格：工具等级/种类不够、或 `toolOk`
+    判不出 ⇒ fail-closed）与 `blocked_by_tool_summary`（日级汇总）只作**信息项** —— 它们是**动手
+    之前**就拦下的诚实跳过（0 次 `use_tool`、不进 `unreachable`/`refused` 两套豁免、也不算"活"、
+    不进守卫理由），头部 `工具门槛` 行 + 建议 0v；**不判红、不进 rc**（`tools\verify-run3.py` 对
+    这两名零命中，判红会两边反向）；只一条可证伪 ⚠（不进 rc）：当天自称 `no_work` 却存在工具门槛
+    封格 ⇒ 人工核对「真敲不动 vs 工具够却判不出」。旧账本 ⇒ `<缺失>` +【无法判定】（缺失 ≠ 0）；
+    `min_level` 缺失 ⇒【无法判定】等级，绝不默认 0 级。
   * 事件映射不许漂移（Lead m02395）：brain 里 `_journal("<name>"` 的**每个**事件名都要在
     `EVENT_BUCKETS` 里有桶（结构性事件 `day_start`/`day_end`/`finish` 除外，见 `STRUCTURAL_EVENTS`）；
     账本里出现没桶的事件 ⇒ 报告头部逐条点名（名字×次数+行号）+ 建议 0a，**绝不静默丢弃**。
@@ -522,6 +529,21 @@ FIELD_PROBES = [
      "money/source/ok/code）⇒ **不是失败**，不进 failed；缺 `wanted` 字段的旧账本 ⇒【无法判定】"),
     ("event:buy_partial.bought", "buy_partial_bought",
      "实际买到的手数（task-123）；与 `wanted` 一起才能算出还缺多少（缺失 ≠ 0）"),
+    # task-20 / task-164（工具门槛）：clump 工具等级/种类不够（或观测判不出）⇒ **动手之前就拦下**
+    # （0 次 use_tool、不白烧体力）。逐格 `blocked_by_tool`（tile/action/stage/zone/kind/**need**/
+    # min_level/reason/note）+ 日级汇总 `blocked_by_tool_summary`（count/tiles/kinds/tools/note）。
+    ("event:blocked_by_tool", "blocked_by_tool",
+     "逐格：工具不够格（或 `toolOk` 判不出 ⇒ fail-closed 不挥）⇒ 当天封格、**0 次 use_tool**；"
+     "`need` 是「<tool>≥<等级>」文本（**不是** `tool` 字段，以账本实测为准）、`min_level` 可缺 ⇒ 只提示"),
+    ("event:blocked_by_tool.kind", "blocked_by_tool_kind",
+     "被封格的 kind（`clump` 一族；判不出时写「未知」⇒ 不许替观测断言树/桩/大石）"),
+    ("event:blocked_by_tool.need", "blocked_by_tool_need",
+     "所需工具与等级文本（形如 `pickaxe≥2`；缺字段 ⇒【无法判定】该格到底要什么工具）"),
+    ("event:blocked_by_tool.min_level", "blocked_by_tool_min_level",
+     "所需工具最低等级（int；缺 ⇒【无法判定】，绝不默认 0 级）"),
+    ("event:blocked_by_tool_summary", "blocked_by_tool_summary",
+     "日级汇总（count/tiles ≤6/kinds/tools/note）⇒ 这些格**不算活、不进守卫理由**（否则一块"
+     "暂时敲不动的巨石会让人永远收不了工）；本工具**不判红、不进 rc**"),
 ]
 OUTCOME_RE = re.compile(
     r"目标\s*(\d+)\s*步：做成\s*(\d+)、跳过\s*(\d+)、失败\s*(\d+)"
@@ -730,6 +752,11 @@ EVENT_BUCKETS = {
     "water_far_blocked": "water_far_blocks",
     "stamina_budget": "stamina_budgets",
     "deferred_by_budget": "deferred_by_budgets",
+    # task-20 / task-164（工具门槛）：clump 工具等级/种类不够（或判不出）⇒ 当天封格、0 次 use_tool。
+    # 逐格 `blocked_by_tool` + 日级 `blocked_by_tool_summary`。**诚实跳过、不判红、不进 rc**
+    # （`tools/verify-run3.py` 对这两名零命中 ⇒ 判红会两边反向），只提示人工核对。
+    "blocked_by_tool": "blocked_by_tools",
+    "blocked_by_tool_summary": "blocked_by_tool_summaries",
     # task-144（dev-coder 在制）：阶段内壶空 ⇒ 补水后把"这一轮没成事的已分配格"**原样**重跑
     # （`refill_retry`，不再重算窗口把那几格丢掉）；阶段自然走完（`stopped==""`）却仍有分配未成事的
     # 格 ⇒ 补一个**如实** stop 原因的留痕（`stage_stop_named`）。两者都是**修复生效的证据**、不是失败；
@@ -803,6 +830,8 @@ NEW_EVENT_BUCKETS = (
     "water_far_opens", "water_far_blocks",
     # task-158：体力预算（每天一条 + 只因预算被延后；都不是失败，只解释"为什么今天不浇"）
     "stamina_budgets", "deferred_by_budgets",
+    # task-20 / task-164：工具门槛封格（逐格 + 日级汇总；诚实跳过、不进守卫理由、不判红）
+    "blocked_by_tools", "blocked_by_tool_summaries",
 )
 
 
@@ -2669,6 +2698,31 @@ def build_advice(report, top=8):
                                 + (sbv.get("warn_deferred_but_watered_lines") or [])
                                 + (sbv.get("warn_defer_missing_lines") or []))),
         })
+    # 0v) task-20 / task-164：工具门槛封格（clump 工具等级/种类不够）—— **诚实跳过**（0 次 use_tool）、
+    #     **不判红、不进 rc**；只一条可证伪 ⚠（自称 no_work 却存在工具门槛封格 ⇒ 人工核对）。
+    tgv = report.get("tool_gate") or {}
+    if tgv.get("has_events"):
+        _tgparts = [
+            f"工具门槛封格 {tgv.get('events', 0)} 格（需要 "
+            f"{'、'.join(f'{k}×{v}' for k, v in list((tgv.get('needs') or {}).items())[:4]) or '<缺失>'}；"
+            f"kind {'、'.join(f'{k}×{v}' for k, v in list((tgv.get('kinds') or {}).items())[:4]) or '<缺失>'}）",
+            f"日级汇总 {tgv.get('summary_events', 0)} 次（count {(tgv.get('summary_counts') or [])[:4]}）",
+        ]
+        if tgv.get("min_level_missing"):
+            _tgparts.append(f"{tgv['min_level_missing']} 格没写 `min_level`（判不出等级 ⇒ 不许默认 0 级）")
+        if tgv.get("kind_unknown"):
+            _tgparts.append(f"{tgv['kind_unknown']} 格 kind 判不出（不许替观测断言树/桩/大石）")
+        if tgv.get("warn_no_work_with_gate_lines"):
+            _tgparts.append(f"⚠ 当天自称 no_work（没活）却存在工具门槛封格：行 "
+                            f"{tgv['warn_no_work_with_gate_lines'][:6]}（人工核对：真敲不动 vs 判不出）")
+        advice.append({
+            "text": "工具门槛封格（信息项，**诚实跳过、不是失败**）：" + "；".join(_tgparts)
+                    + "。0 次 `use_tool`、不算活、不进守卫理由；`tools/verify-run3.py` 对 "
+                      "`blocked_by_tool` / `blocked_by_tool_summary` 零命中 ⇒ 本工具不判红、不进 rc；"
+                      "旧账本没有这两个事件 ⇒【无法判定】（缺失 ≠ 0）",
+            "lines": sorted(set((tgv.get("lines") or []) + (tgv.get("summary_lines") or [])
+                                + (tgv.get("warn_no_work_with_gate_lines") or []))),
+        })
     # 0s) task-144：阶段内壶空 ⇒ 先补水再把"这一轮没成事的已分配格"**原样**重跑（refill_retry）；
     #     阶段自然走完（stopped==""）却仍有分配未成事的格 ⇒ 补**如实** stop 原因（stage_stop_named）
     #     —— 都是**修复生效的证据**，**不判红**；只有三条可证伪形态给 ⚠（不进 red / 不进 rc）。
@@ -3080,6 +3134,18 @@ def build_undecidable(rows, sessions, prelude, report):
                    "—— **缺失 ≠ 0，绝不当'今天没用预算'通过**（task-158）")
     elif (_t158_ev or _t158_def) and not (report.get("stamina_budget") or {}).get("has_events"):
         out.append("task-158 事件存在但没进聚合（工具 bug 迹象）：无法判定体力预算计数")
+    # task-20 / task-164：工具门槛封格（clump 工具等级/种类不够 ⇒ 动手前拦下、0 次 use_tool）。
+    _t164_ev = [ev for _ln, ev in rows if ev.get("event") == "blocked_by_tool"]
+    _t164_sum = [ev for _ln, ev in rows if ev.get("event") == "blocked_by_tool_summary"]
+    if not _t164_ev and not _t164_sum:
+        out.append("本账本没有任何 task-20 的 `blocked_by_tool` / `blocked_by_tool_summary` 事件 ⇒ "
+                   "无法判定「当天有没有格是因工具等级/种类不够而**动手前**被封的」（诚实跳过、0 次 "
+                   "use_tool）—— **缺失 ≠ 0，绝不当'没有工具门槛挡路'通过**（task-20/task-164）")
+    elif (_t164_ev or _t164_sum) and not (report.get("tool_gate") or {}).get("has_events"):
+        out.append("task-20 事件存在但没进聚合（工具 bug 迹象）：无法判定工具门槛封格计数")
+    elif (report.get("tool_gate") or {}).get("min_level_missing"):
+        out.append(f"{((report.get('tool_gate') or {}).get('min_level_missing'))} 格 `blocked_by_tool` "
+                   "没写 `min_level` ⇒ 无法判定那些格到底要几级工具（缺失 ≠ 0，绝不默认 0 级）")
     # task-36：自称浇过、却没有 final_water 可核对的那些天（verify-run3.py:414-418 同口径：只记信息项）
     no_fw = [
         lineno for lineno, ev in rows
@@ -3966,6 +4032,62 @@ def build_report(rows, path, args, bad_lines):
             _dl = as_list(_d.get("day_end_lines"))
             if _dl:
                 stamina_budget["warn_defer_missing_lines"].append(_dl[0])
+    # task-20 / task-164（工具门槛）：clump 工具等级/种类不够（或 `toolOk` 判不出）⇒ **动手之前就拦下**
+    # （0 次 use_tool、不白烧体力）。逐格 `blocked_by_tool`（tile/action/stage/zone/kind/need/
+    # min_level/reason/note）+ 日级 `blocked_by_tool_summary`（count/tiles/kinds/tools/note）。
+    # 口径：**诚实跳过、不判红、不进 rc**（不进 unreachable/refused 两套豁免、也不算"活"）；
+    # 唯一可证伪 ⚠：当天自称 `no_work`（`ended_reason` 以 no_work 开头）却存在工具门槛封格 ⇒
+    # 提示人工核对「是真敲不动，还是工具够却判不出」（brain 有意不让它进守卫理由，见 longrun.py:2625-2627）。
+    _tt_events = [(ln, ev) for ln, ev in rows if ev.get("event") == "blocked_by_tool"]
+    _tt_summaries = [(ln, ev) for ln, ev in rows if ev.get("event") == "blocked_by_tool_summary"]
+    tool_gate = {
+        "events": len(_tt_events), "lines": [ln for ln, _ in _tt_events],
+        "tiles": [], "actions": {}, "stages": {}, "kinds": {}, "needs": {}, "min_levels": {},
+        "kind_unknown": 0, "min_level_missing": 0,
+        "summary_events": len(_tt_summaries), "summary_lines": [ln for ln, _ in _tt_summaries],
+        "summary_counts": [], "summary_tools": {}, "summary_kinds": {},
+        "warn_no_work_with_gate_lines": [],
+        "has_events": bool(_tt_events or _tt_summaries),
+    }
+    for _ln, ev in _tt_events:
+        _t = ev.get("tile")
+        if isinstance(_t, list) and _t and _t not in tool_gate["tiles"]:
+            tool_gate["tiles"].append(_t)
+        _k = str(ev.get("kind") or "未知")
+        tool_gate["kinds"][_k] = tool_gate["kinds"].get(_k, 0) + 1
+        if _k in ("未知", "", "None"):
+            tool_gate["kind_unknown"] += 1
+        _need = str(ev.get("need") or "")
+        if _need:
+            tool_gate["needs"][_need] = tool_gate["needs"].get(_need, 0) + 1
+        _ml = as_int(ev.get("min_level"), None)
+        if _ml is None:
+            tool_gate["min_level_missing"] += 1
+        else:
+            tool_gate["min_levels"][str(_ml)] = tool_gate["min_levels"].get(str(_ml), 0) + 1
+        _act = str(ev.get("action") or "")
+        if _act:
+            tool_gate["actions"][_act] = tool_gate["actions"].get(_act, 0) + 1
+        _st = str(ev.get("stage") or "")
+        if _st:
+            tool_gate["stages"][_st] = tool_gate["stages"].get(_st, 0) + 1
+    for _ln, ev in _tt_summaries:
+        tool_gate["summary_counts"].append(as_int(ev.get("count"), None))
+        for _x in as_list(ev.get("tools")):
+            tool_gate["summary_tools"][str(_x)] = tool_gate["summary_tools"].get(str(_x), 0) + 1
+        for _x in as_list(ev.get("kinds")):
+            tool_gate["summary_kinds"][str(_x)] = tool_gate["summary_kinds"].get(str(_x), 0) + 1
+    _tt_days = set()
+    for _ln, _ev in _tt_events + _tt_summaries:
+        _lab, _di = _lr_day_of(_ln)
+        _tt_days.add(_di)
+    for _di in sorted(_tt_days):
+        if _di >= len(days):
+            continue
+        if str(days[_di].get("ended_reason") or "").startswith("no_work"):
+            _dl = as_list(days[_di].get("day_end_lines"))
+            if _dl:
+                tool_gate["warn_no_work_with_gate_lines"].append(_dl[0])
     # task-134 B（分配额口径）：`stage_shortfall`（阶段分下去的格没做完）/`stage_shortfall_day`
     # （日级 unmet=assigned_undone）/`deferred_tiles`（诚实上限留下的片区待办，**只作 info、
     # 不进 no_unmet_stages**）。三者本身都**不判红**（红由 `checks.no_unmet_stages=false` 说话）；
@@ -4303,6 +4425,7 @@ def build_report(rows, path, args, bad_lines):
         # task-133：窗口外浇水 + 壶空先补水（壶空=前置条件、**不是「够不着」**；两条可证伪 ⚠）
         "water_far": water_far,
         "stamina_budget": stamina_budget,
+        "tool_gate": tool_gate,
         # task-134 B：分配额口径（阶段没做完 / 日级 unmet / 诚实上限 deferred；均 info、不判红）
         "shortfall": shortfall,
         # task-144（dev-coder 在制）：壶空先补水再"原样重跑"（refill_retry）+ 阶段如实 stop 原因
@@ -4787,6 +4910,16 @@ MAPPING_TEXT = [
      "最后仍在 dryTiles 里；②有格 blocked 而当天却自称户外浇水达标（dry=0）；③说「只因预算延后」"
      "却当天自称浇完；④日级 `deferred_by_budget>0` 却没有对应事件。"
      "旧账本没有这些事件/字段 ⇒ `<缺失>` +【无法判定】（缺失 ≠ 0）"),
+    ("event:blocked_by_tool / blocked_by_tool_summary (task-20/task-164)",
+     "信息项：**诚实跳过、不是失败、不判红、不进 rc** —— clump（树桩/大木头/巨石/陨石…）的工具"
+     "等级或种类不够（或 `toolOk` 判不出 ⇒ fail-closed 不挥）时，**动手之前**就封格（0 次 "
+     "`use_tool`、不白烧体力），当天 `blocked`、次日工具升级后自动重试；这些格**不算活、不进守卫"
+     "理由**（否则一块暂时敲不动的巨石会让人永远收不了工）。逐格 `blocked_by_tool`（tile/action/"
+     "stage/zone/kind/**need**（「<tool>≥<等级>」文本，不是 `tool` 字段）/min_level/reason/note）+ "
+     "日级 `blocked_by_tool_summary`（count/tiles/kinds/tools）。`tools/verify-run3.py` 对这两名"
+     "零命中 ⇒ 判红会两边反向，故只给一条**可证伪 ⚠**（不进 rc）：当天自称 `no_work`（没活）却存在"
+     "工具门槛封格 ⇒ 提示人工核对「真敲不动 vs 工具够却判不出」。旧账本没有这两事件 ⇒ `<缺失>` +"
+     "【无法判定】（缺失 ≠ 0）；`min_level` 缺失 ⇒【无法判定】等级，绝不默认 0 级"),
     ("event:refill_retry / stage_stop_named (task-144)",
      "信息项：**修复生效的证据**、不是失败（`verify-run3.py` 对两名零命中 ⇒ 本工具不判红、不进 rc）。"
      "`refill_retry` = 阶段内壶空 ⇒ 补水后把这一轮没成事的已分配格**原样**重跑（不再重算窗口把格子丢掉）；"
@@ -5170,6 +5303,26 @@ def render_text(report, top):
             + (f"  ⚠ 日级 deferred_by_budget>0 却没有对应的 deferred_by_budget 事件：行 "
                f"{sb.get('warn_defer_missing_lines', [])[:6]}"
                if sb.get("warn_defer_missing_lines") else ""))
+    # task-20 / task-164：工具门槛（clump 工具等级/种类不够 ⇒ 动手前拦下、0 次 use_tool）。
+    # **诚实跳过、不判红、不进 rc**（verify-run3.py 对这两名零命中）；旧账本 ⇒ `<缺失>` +【无法判定】。
+    tg = report.get("tool_gate") or {}
+    if not tg.get("has_events"):
+        add("工具门槛: <缺失>（本账本没有 blocked_by_tool / blocked_by_tool_summary 事件 ⇒ 无法判定"
+            "当天有没有格是因工具不够格被封的；缺失 ≠ 0）")
+    else:
+        _tg_need = "、".join(f"{k}×{v}" for k, v in list((tg.get("needs") or {}).items())[:4]) or "<缺失>"
+        _tg_kind = "、".join(f"{k}×{v}" for k, v in list((tg.get("kinds") or {}).items())[:4]) or "<缺失>"
+        add(f"工具门槛: 当天因工具等级/种类不够封格 {tg.get('events', 0)} 格"
+            f"（需要 {_tg_need}；kind {_tg_kind}；tiles {(tg.get('tiles') or [])[:6]}）；"
+            f"日级汇总 blocked_by_tool_summary {tg.get('summary_events', 0)} 次"
+            f"（count {(tg.get('summary_counts') or [])[:4]}、tools "
+            f"{'、'.join(sorted((tg.get('summary_tools') or {}).keys())) or '<缺失>'}）"
+            "；口径：**诚实跳过**（0 次 use_tool、不算活、不进守卫理由 ⇒ 不判红、不进 rc；"
+            "次日工具升级后自动重试）"
+            + (f"  ⚠ 当天自称 no_work（没活）却存在工具门槛封格：行 "
+               f"{tg.get('warn_no_work_with_gate_lines', [])[:6]}"
+               "—— 提示人工核对「真敲不动 vs 工具够却判不出」（brain 有意不让它进守卫理由，只警告）"
+               if tg.get("warn_no_work_with_gate_lines") else ""))
     pc, ws = report["events"].get("plots_capped", 0), report["events"].get("work_spot", 0)
     add(f"软上限/收尾: plots_capped {pc} 次（作业区配额到顶，信息项）；work_spot {ws} 次（收尾作业区）")
     # task-124/task-130：review 兜底 / 弃权 / 换片连发 —— 修复生效的证据（不判红），

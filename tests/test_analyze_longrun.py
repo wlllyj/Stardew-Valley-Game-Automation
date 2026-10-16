@@ -3513,5 +3513,126 @@ class TestOpenPathAndStaminaBudget(unittest.TestCase):
         self.assertEqual((rep["red"] or {}).get("total"), 0)
 
 
+class TestToolGateBlockedByTool(unittest.TestCase):
+    """task-20 / task-164：clump 工具门槛 ⇒ `blocked_by_tool`（逐格）+ `blocked_by_tool_summary`（日级）。
+
+    口径：**诚实跳过、不是失败**（工具等级/种类不够或 `toolOk` 判不出 ⇒ 动手之前就封格、0 次
+    `use_tool`；当天 `blocked`、次日升级后自动重试），**不判红、不进 rc**（`tools/verify-run3.py`
+    对这两名零命中，判红会两边反向）；只一条可证伪 ⚠（不进 rc）：当天自称 `no_work` 却存在工具门槛
+    封格。旧账本没有这两事件 ⇒ `<缺失>` +【无法判定】（缺失 ≠ 0）；`min_level` 缺失 ⇒【无法判定】。
+    """
+
+    BLOCKED = {"event": "blocked_by_tool", "t": 3.0, "tile": [72, 35], "action": "clear",
+               "stage": "clear_area", "zone": "field_ne", "kind": "clump",
+               "need": "pickaxe≥2", "min_level": 2, "reason": "工具不够格，先不动",
+               "note": "0 次 use_tool"}
+    BLOCKED2 = {"event": "blocked_by_tool", "t": 3.2, "tile": [73, 35], "action": "clear",
+                "stage": "clear_area", "zone": "field_ne", "kind": "clump",
+                "need": "pickaxe≥2", "min_level": 2, "reason": "工具不够格，先不动",
+                "note": "0 次 use_tool"}
+    BLOCKED_NOLEVEL = {"event": "blocked_by_tool", "t": 3.4, "tile": [72, 36], "action": "clear",
+                       "stage": "clear_area", "zone": "field_ne", "kind": "clump",
+                       "need": "pickaxe≥2", "reason": "等级判不出", "note": "0 次 use_tool"}
+    SUMMARY = {"event": "blocked_by_tool_summary", "t": 8.0, "count": 2,
+               "tiles": [[72, 35], [73, 35]], "kinds": ["clump"],
+               "tools": ["pickaxe"], "note": "日级汇总"}
+
+    def _day(self, day, *, extra=(), ended_reason="night"):
+        nxt = [day[0], day[1], day[2] + 1]
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": True,
+                  "watered_outdoor": True}
+        end = {"event": "day_end", "t": 9.9, "day": day, "day_text": "", "ended_by": "sleep",
+               "ended_reason": ended_reason, "verified": True, "checks": checks,
+               "stages": [{"stage": "water_area", "ok": 5, "skipped": 0, "failed": 0,
+                           "env_block": 0, "inconclusive": 0, "stopped": None, "leftover": 0}],
+               "outcomes": [], "ok_steps": 5, "skipped_steps": 0, "failed_steps": 0,
+               "notes": [], "final": final(nxt),
+               "final_water": {"t": 9.9, "location": "Farm", "tiles": 84, "crops": 31,
+                               "dry": 0, "scope": "farm"}}
+        return [day_start(day), *extra, end]
+
+    def _report(self, events, name, *, days=1):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_ledger(tmp, name, events)
+            return report_for(path, days=days)
+
+    def test_new_events_have_buckets_and_are_not_unmapped(self):
+        for ev in ("blocked_by_tool", "blocked_by_tool_summary"):
+            self.assertIn(ev, mod.EVENT_BUCKETS, f"{ev} 必须有桶（不许改名/藏事件）")
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.BLOCKED),
+                                                             dict(self.BLOCKED2),
+                                                             dict(self.SUMMARY)]),
+                           "t164_buckets.jsonl")
+        self.assertEqual(rep["unmapped_events"], {}, "已入桶 ⇒ 不许再出现未映射")
+        self.assertEqual(rep["events"].get("blocked_by_tool"), 2)
+        self.assertEqual(rep["events"].get("blocked_by_tool_summary"), 1)
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+
+    def test_tool_gate_is_info_only_and_visible(self):
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.BLOCKED),
+                                                             dict(self.BLOCKED2),
+                                                             dict(self.SUMMARY)]),
+                           "t164_info.jsonl")
+        tg = rep["tool_gate"]
+        self.assertTrue(tg["has_events"])
+        self.assertEqual(tg["events"], 2)
+        self.assertEqual(tg["kinds"], {"clump": 2})
+        self.assertEqual(tg["needs"], {"pickaxe≥2": 2})
+        self.assertEqual(tg["min_levels"], {"2": 2})
+        self.assertEqual(tg["min_level_missing"], 0)
+        self.assertEqual(tg["tiles"], [[72, 35], [73, 35]])
+        self.assertEqual(tg["summary_events"], 1)
+        self.assertEqual(tg["summary_counts"], [2])
+        self.assertEqual(tg["summary_tools"], {"pickaxe": 1})
+        self.assertEqual(tg["summary_kinds"], {"clump": 1})
+        self.assertEqual(tg["warn_no_work_with_gate_lines"], [])
+        text = mod.render_text(rep, 50)
+        self.assertIn("工具门槛: 当天因工具等级/种类不够封格 2 格", text)
+        self.assertIn("需要 pickaxe≥2×2", text)
+        self.assertIn("kind clump×2", text)
+        self.assertIn("日级汇总 blocked_by_tool_summary 1 次", text)
+        self.assertIn("诚实跳过", text)
+        self.assertIn("不进守卫理由", text)
+        blob = " ".join(a["text"] for a in rep["advice"])
+        self.assertIn("工具门槛封格（信息项，**诚实跳过、不是失败**）", blob)
+        self.assertEqual((rep["red"] or {}).get("total"), 0, "工具门槛只作信息项 ⇒ 绝不判红")
+
+    def test_no_work_with_gate_is_warning_not_red(self):
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.BLOCKED), dict(self.SUMMARY)],
+                                     ended_reason="no_work:今天已经没有任何可做的目标"),
+                           "t164_nowork.jsonl")
+        tg = rep["tool_gate"]
+        self.assertEqual(len(tg["warn_no_work_with_gate_lines"]), 1)
+        self.assertEqual((rep["red"] or {}).get("total"), 0, "⚠ 警告不是红：不进 rc")
+        text = mod.render_text(rep, 50)
+        self.assertIn("⚠ 当天自称 no_work（没活）却存在工具门槛封格", text)
+        self.assertIn("真敲不动 vs 工具够却判不出", text)
+
+    def test_missing_min_level_is_undecidable_not_zero(self):
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.BLOCKED_NOLEVEL),
+                                                             dict(self.SUMMARY)]),
+                           "t164_nolevel.jsonl")
+        tg = rep["tool_gate"]
+        self.assertEqual(tg["min_level_missing"], 1)
+        self.assertEqual(tg["min_levels"], {})
+        blob = " ".join(rep.get("undecidable") or [])
+        self.assertIn("没写 `min_level`", blob)
+        self.assertIn("绝不默认 0 级", blob)
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+
+    def test_old_ledger_without_events_is_undecidable_not_zero(self):
+        rep = self._report(self._day([1, "summer", 5]), "t164_old.jsonl")
+        tg = rep["tool_gate"]
+        self.assertFalse(tg["has_events"])
+        text = mod.render_text(rep, 50)
+        self.assertIn("工具门槛: <缺失>", text)
+        self.assertIn("缺失 ≠ 0", text)
+        blob = " ".join(rep.get("undecidable") or [])
+        self.assertIn("task-20", blob)
+        self.assertIn("没有任何 task-20 的 `blocked_by_tool`", blob)
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
