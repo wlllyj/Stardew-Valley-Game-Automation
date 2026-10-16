@@ -98,3 +98,28 @@ python tools\start-detached-longrun.py ^
 - **task-117**（0.7.29）：教训**内容模板校验**（按 kind 固定句式、只允许数字可变）+ 提示词里显式区分「观测真值」与「模型自述（不是真值）」。task-114 只锁了结构，**合法 kind 的自由文本仍会进提示词**（dev-coder 主动报备、deputy task-115 §NIT 再判）。
 - task-14（逐帧 warp 活锁）、task-18（职业选择耕种优先）、task-53（农场级待清/待垦计数）、task-98（`Brief.from_observe` 无 tiles 时回退 farm 计数的耦合）。
 - Mod `ShipSkill` 只能整叠出货 ⇒ 每 id 保留 K=10 做不到（详见条目 053 待决②）。
+- **task-119/120 的两条 NIT**（deputy 2026-10-16）：①合并后 `count` 未重新钳位（`prune_lessons` 累加可越过 `LESSON_COUNT_MAX`，实测 2×10⁶；只在同信任级竞争、抢不到名额）；②可信条目与外部**同 id** 条目合并后 `src` 被摘掉 ⇒ 该 id 不再回写持久化库（有损、非洗白）。随 task-117 同批。
+
+## 7. 冻结与装机执行记录（2026-10-16）
+
+### 7.1 冻结（Lead 独占，全部亲跑）
+- 放行闸门全部满足：**task-58 / 59 / 82 / 102 / 103 / 104 / 106 / 108 / 111 / 114 / 116 / 118 / 119 已完成**；其中 task-112 = FAIL、task-115 = FAIL 均已由 task-114/118 修复并二次复验 PASS-WITH-NITS。
+- `tools/_note-0728.txt` 首串 `v0.7.28（run8 复盘：经济闭环"买"死锁 + 早晨 0 动作连睡 + 场外浇水额度）`，含第二批 LLM 演进与 task-114/116。
+- `python tools\_bump-mod-version.py 0.7.28 --note-file tools\_note-0728.txt` ⇒ `manifest.json` **Version 0.7.27 → 0.7.28**（用 `json.load` 核对；脚本末句在 cp1252 下 `UnicodeEncodeError`、退出码 1，**版本已写盘**）。
+- `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.28"`（注释列本版三项）。
+- `dotnet build .\mod\AgentFarm.Bridge\AgentFarm.Bridge.csproj -c Release --nologo --no-incremental` ⇒ **0 警告 0 错误**；`AgentFarm.Bridge.dll` **172032 B @20:38:02**、`manifest.json` **25246 B @20:37:20**（本版 **Mod 无源码改动**，只 bump 版本号）。
+- 冻结提交 **`8b10936`**。
+- `tools/check-release.py --expect 0.7.28` ⇒ **六项全绿**（manifest==brain==0.7.28、dll 不比源码旧、`py_compile` 22 文件、**`Ran 685 tests` OK**、工作树干净）。
+
+### 7.2 装机与基线（原文见 `logs/deploy-0.7.28.log`）
+1. `python tools\deploy-mod.py --no-quit` ⇒ 0.7.27 → **0.7.28**（已备份存档；dll 172032 / manifest 25246；桥 `modVersion=0.7.28 port=17890`；自动读档 `Wahaha_450799035` → FarmHouse(9,9)）。
+2. `python -m agentfarm goto Farm --no-focus` ⇒ FarmHouse(9,9) → Farm(64,15)，hop1 **7603ms** ok（`source=[3,12] landing=[64,15]`）。
+3. `python tools\preflight.py --expect 0.7.28 --save-baseline logs\run9-baseline.json` ⇒ **✅ 可以起跑**。基线：**第1年 夏13日 06:10 / 天气 lightning / Farm(64,15) / 体力 270 / 钱 188g / 种子 [] / farmingLevel 0 / 作物 6 / 未浇 2 / dryCrops 0 / waterLeft 32 / tillable 142 / 无模态 / worldAdvancing true**。
+4. **不做操作员预置**（故意让脑自己走 `sell → 次日到账 → buy 当季种子 → plant`；钱 188g + 背包满正是 task-102 的验收场景）。
+5. run9 由 machine-runner 用 `tools\start-detached-longrun.py --days 3 --size 5 --max-minutes 150 --max-days 9 --journal logs\longrun-3day-llm-run9.jsonl --expect-version 0.7.28` 脱离式起跑（起跑前 `scratch\run8-snapshot.py --tag start`，结束后 `--tag end` + 冻结 SMAPI 窗口）。
+
+### 7.3 判据（run9 验收口径）
+- 两侧工具必须**同向**：`tools/verify-run3.py`（尾部窗口 `verdict` + 严格整本 `strict_verdict` 两行都要抄）与 `tools/analyze-longrun.py`（`--window` 默认 3）。
+- 外部证据单独列：存档 size/mtime、SMAPI 窗口冻结（`NewDay` ↔ `before save` ↔ `SaveGame.Save() called.` 配对）、`scratch/run9-external-snapshots.jsonl` 的 start/end 两行。
+- **缺失字段一律【无法判定】，缺失 ≠ 通过**；日终菜单期的"存档未动"既不判失败也不判通过。
+- **run9 = run A（只积累）**；run10 = run B（对照：run A 被 cancel/失败的意图在 run B 提示词里以教训出现、且同形态不再出现）。没有这条对照**不许**写"自我进化已实现"。
