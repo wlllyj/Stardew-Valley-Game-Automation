@@ -8813,11 +8813,17 @@ class TestTask176HarvestMethodSourceAndActed(unittest.TestCase):
       * **③** `acted` 必须由**本调用内可独立观测的变化**推导：`worldSeq` 前进而目标格没变 ⇒ 仍 `false`。
 
     本类前 5 条是**源码契约**（直接读 `mod/AgentFarm.Bridge/*.cs`，让 C# 侧的三条必修在
-    Python 测试里也有护栏 —— 仓库没有 C# 测试工程），后 5 条是脑侧行为（假世界）。
-    变异（`scratch/_t176_mutate.py`，brain+tests 一起拷临时目录）：m176a 把 `HarvestMethodOf`
-    改回读字段 ⇒ 契约 + 镰刀用例红；m176b 让反射不可用时 `Ready` 返回 null ⇒ `fields` 用例红；
-    m176c 去掉 `JsonIgnoreCondition.Never` ⇒ 契约用例红；m176d `acted` 改回 `checkAction` 返回值
-    ⇒ 契约用例红。
+    Python 测试里也有护栏），后 5 条是脑侧行为（假世界）。
+
+    【GAP-2 更正（task-180）】这里原来写的是**推论**「m176a ⇒ 契约 + 镰刀用例红；m176b ⇒
+    `fields` 用例红；m176c ⇒ 契约用例红；m176d ⇒ 契约用例红」。实测（装置
+    `scratch/_t180_mutate.py`：`brain/` + `tests/` + `mod/` 一起拷临时目录，跑本类 +
+    `TestTask182ActedEvidenceAndRules` + `TestTask182ClumpRulesBehaviour`，基线 `Ran 16 / OK`）：
+    `m176a_field_read` 杀 **1**、`m176b_fields_path_null` 杀 **1**、`m176c_drop_never` 杀 **1**、
+    `m176d_acted_from_return_value` 杀 **1** —— 四条**各杀 1 条**，且杀点全部是本类的**文本契约**，
+    行为层当时没有任何用例能杀（task-178 的 `m178b` 因此逃逸）。
+    **自 task-182 起**行为化回归由零依赖 C# 自检工程 `mod/AgentFarm.Bridge.Tests` 承担
+    （见 `TestTask182ClumpRulesBehaviour`），`m178b` 现由行为断言杀死。
     """
 
     CROP = (60, 10)

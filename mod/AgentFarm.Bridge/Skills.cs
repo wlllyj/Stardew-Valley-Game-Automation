@@ -187,6 +187,14 @@ namespace AgentFarm.Bridge
                 // 【纪律】与 `dismiss_modal` 用 `answerDialogue`、不按确认键**同一条**：
                 // 调游戏自己的处理函数，**不合成键鼠事件**。所以这不是"伪造输入"。
                 // 目标格：`args.tile` 优先；省略时用"玩家当前面朝的那一格"（玩家走到门口朝上时就是门格）。
+                //
+                // 【NIT-2（task-180 记录在案的局限）】`acted` 的四路证据里，格子级那两路都建立在
+                // `TileSig`/`ready` 上；而 **门/入口类传送**（`checkAction` → `warp`/`doAction`）
+                // 只把玩家挪走，目标格本身的签名与 `ready` 都可能不变 ⇒ 这类动作可能落
+                // `acted=false` / `status="no_action"`（下面 reason 里"以 observe 到的地点为准"这句
+                // 因此对门格是不成立的）。**今天无害**：`interact` 目前唯一调用点是脑侧 `harvest()`，
+                // 它只对作物格用；将来若要拿 `interact` 开门/进建筑，必须先给门格补一路证据
+                // （例如玩家 tile/location 变化），否则会被误判成"没动手"。
                 case "interact":
                     return () =>
                     {

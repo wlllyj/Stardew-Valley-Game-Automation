@@ -117,3 +117,29 @@ crop.dead.Value                                     ⇒ false     // 枯死
    且真机应看到 **`farm.ripeCrops`/`readyCrops` 下降 + 背包 +1 + `worldSeq` 前进**；
 3. 若游戏仍不给收 ⇒ 回执必须是 `status="no_action"` / `acted=false`，**不许**再出现
    "回执 ok 但世界逐字节未变"。
+
+## 6. 【task-180 GAP-2 更正】"变异 ⇒ 用例"从推论改成实测读数
+
+task-176 交付说明与 `tests/test_longrun.py::TestTask176HarvestMethodSourceAndActed` 的 docstring 当时写的是
+**推论**：「m176a 把 `HarvestMethodOf` 改回读字段 ⇒ 契约 + 镰刀用例红；m176b 让反射不可用时 `Ready`
+返回 null ⇒ `fields` 用例红；m176c 去掉 `JsonIgnoreCondition.Never` ⇒ 契约用例红；m176d `acted` 改回
+`checkAction` 返回值 ⇒ 契约用例红」。
+
+**实测（task-180，装置 `scratch/_t180_mutate.py`：`brain/` + `tests/` + `mod/` 一起拷临时目录；
+装置跑 task-176 与 task-182 的三条用例类；基线 `Ran 16 / OK`）**：
+
+| 变异 | 意图 | 实测杀死 |
+| --- | --- | --- |
+| `m176a_field_read` | `HarvestMethodOf` 退回读 `HarvestMethod` 字段 | **1** |
+| `m176b_fields_path_null` | 反射不可用时直接判"判不了"（fail-closed 过头） | **1** |
+| `m176c_drop_never` | `harvestMethod` 不再无条件出键 | **1** |
+| `m176d_acted_from_return_value` | `acted` 退回只看调用返回值 | **1** |
+
+结论：四条**各杀 1 条**，而不是原文暗示的"契约 + 行为多条"；并且当时的杀点**全部来自源码文本契约**，
+行为层当时**没有任何用例**能杀（deputy 的 `m178b` 就是这样逃逸的）。
+
+**自 task-182 起**：判据外置为纯函数 `ClumpRules.Ready(...)`，行为化回归由零依赖 C# 自检工程
+`mod/AgentFarm.Bridge.Tests` 承担（`dotnet run` 退出码当红绿，18 条断言）；`m178b`（在游戏分支之后插
+`return (null, null);`）现在**由行为断言杀死**（task-182 实测杀 1）。
+
+上游旧读数**不删、只标注更正**：本文与测试 docstring 里保留原文，作为"当时写的是推论"的历史记录。
