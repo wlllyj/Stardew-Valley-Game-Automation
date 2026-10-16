@@ -1163,9 +1163,9 @@ class ReviewNoteTests(unittest.TestCase):
     """【task-59】收工复盘（night 边界一次独立调用）。
 
     四条硬要求各有用例：①解析只认 `{"notes": [...]}` 且**丢弃带坐标的条目**；
-    ②超过 3 条 / 超过 200 字符 ⇒ 截断并记 `truncated`；③复盘走**独立 token 预算**（≤512，
-    绝不挪用主决策的 16384）且失败不抛；④`recent_notes` 一节进提示词、空则不出现空节、
-    与决策史同口径**最先被裁**。
+    ②超过 3 条 / 超过 200 字符 ⇒ 截断并记 `truncated`；③复盘走**独立 token 预算**
+    （【task-121】4096，绝不挪用主决策的 16384）且失败不抛、**被截断时用 2 倍预算自愈重试一次**；
+    ④`recent_notes` 一节进提示词、空则不出现空节、与决策史同口径**最先被裁**。
     """
 
     def _brief(self, notes=(), **over):
@@ -1212,7 +1212,11 @@ class ReviewNoteTests(unittest.TestCase):
         self.assertTrue(res["ok"])
         self.assertEqual(res["notes"], ["明天先把水壶补满"])
         self.assertEqual(chat.kwargs[0]["max_tokens"], P.REVIEW_MAX_TOKENS)
+        # 【task-121】run9 实证 512 太小（推理吃光 token、正文为空）⇒ 提到 4096，仍远小于主决策
+        self.assertGreaterEqual(P.REVIEW_MAX_TOKENS, 4096)
         self.assertLess(P.REVIEW_MAX_TOKENS, 16384)
+        self.assertEqual(res["attempts"], 1, "没被截断就不许重试")
+        self.assertEqual(res["max_tokens"], P.REVIEW_MAX_TOKENS)
         # 复盘提示词必须是**自己那一份**（不是决策提示词）
         system = chat.calls[0][0]["content"]
         self.assertIn("复盘", system)
@@ -1230,6 +1234,37 @@ class ReviewNoteTests(unittest.TestCase):
         self.assertFalse(res_off["ok"])
         self.assertEqual(off.call_count, 0)
         self.assertEqual(res_off["reason"], "llm_disabled")
+
+    def test_truncated_review_retries_once_with_a_doubled_budget(self):
+        """【task-121】推理模型把 token 全花在思考上、`content` 为空 ⇒ 加倍预算自愈成功。"""
+        chat = FakeChat(LlmError("回答被 max_tokens 截断且内容为空", status="truncated"),
+                        json.dumps({"notes": ["明天先把水壶补满"]}, ensure_ascii=False))
+        planner = P.BoundaryPlanner(llm_chat=chat, llm_enabled=True)
+        res = planner.review(self._brief())
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["notes"], ["明天先把水壶补满"])
+        self.assertEqual(res["attempts"], 2)
+        self.assertEqual(res["max_tokens"], P.REVIEW_RETRY_MAX_TOKENS)
+        self.assertGreater(P.REVIEW_RETRY_MAX_TOKENS, P.REVIEW_MAX_TOKENS)
+        self.assertEqual(chat.kwargs[0]["max_tokens"], P.REVIEW_MAX_TOKENS)
+        self.assertEqual(chat.kwargs[1]["max_tokens"], P.REVIEW_RETRY_MAX_TOKENS)
+
+    def test_two_truncations_are_reported_with_budget_and_attempts(self):
+        """两次都被截断 ⇒ 如实记 `review_llm_failed`（带预算与次数），且**绝不抛**。"""
+        chat = FakeChat(LlmError("回答被 max_tokens 截断且内容为空", status="truncated"))
+        planner = P.BoundaryPlanner(llm_chat=chat, llm_enabled=True)
+        res = planner.review(self._brief())
+        self.assertFalse(res["ok"])
+        self.assertTrue(res["called"])
+        self.assertIn("llm_error:truncated", res["reason"])
+        self.assertEqual(res["attempts"], 2)
+        self.assertEqual(res["max_tokens"], P.REVIEW_RETRY_MAX_TOKENS)
+        self.assertEqual(chat.call_count, 2, "只自愈一次，不许无限重试")
+        # 非截断失败（网络等）**不**重试，别把无害失败放大成两次请求
+        net = FakeChat(LlmError("超时", status="network"))
+        res_net = P.BoundaryPlanner(llm_chat=net, llm_enabled=True).review(self._brief())
+        self.assertEqual(res_net["attempts"], 1)
+        self.assertEqual(net.call_count, 1)
 
 
 class LessonLibraryTests(unittest.TestCase):

@@ -73,8 +73,8 @@ __all__ = [
     # 【task-58】决策史（会话内记忆；不是权重更新，见 `Brief.recent_decisions`）
     "DECISIONS_KEPT", "DECISIONS_MAX_CHARS", "decision_line",
     # 【task-59】收工复盘（night 边界一次独立调用；只落 journal + 次日 `recent_notes`）
-    "REVIEW_MAX_TOKENS", "REVIEW_NOTES_MAX", "REVIEW_NOTES_MAX_CHARS", "NOTES_SECTION_MAX_CHARS",
-    "REVIEW_SYSTEM_PROMPT", "parse_review_notes", "build_review_messages",
+    "REVIEW_MAX_TOKENS", "REVIEW_RETRY_MAX_TOKENS", "REVIEW_NOTES_MAX", "REVIEW_NOTES_MAX_CHARS",
+    "NOTES_SECTION_MAX_CHARS", "REVIEW_SYSTEM_PROMPT", "parse_review_notes", "build_review_messages",
     # 【task-82】跨日教训库（客观事实由代码写、hint 只许 LLM 写；只喂提示词，不参与判定）
     "LESSONS_MAX", "LESSONS_INJECT_MAX", "LESSONS_INJECT_CHARS", "LESSONS_SECTION_MAX_CHARS",
     "LESSON_SEVERITY", "LESSON_TEXT_MAX_CHARS", "LESSONS_REJECT_REASONS_MAX",
@@ -408,8 +408,15 @@ DECISIONS_MAX_CHARS = 300
 DECISION_LINE_MAX_CHARS = 200
 
 #: 【task-59】收工复盘（night 边界）的**独立调用**预算：只写 1–3 条笔记，所以给它单独一个
-#: 小 `max_tokens`（卡面 ≤512）——**绝不挪用主决策的 16384**（那是给"长期推理 + 补问"留的）。
-REVIEW_MAX_TOKENS = 512
+#: 小 `max_tokens`——**绝不挪用主决策的 16384**（那是给"长期推理 + 补问"留的）。
+#: 【task-121】原值 512 实测太小：run9（真机）`review_llm_failed`
+#: `llm_error:truncated: 回答被 max_tokens 截断且内容为空（推理占用了约 512 个 token）`
+#: —— deepseek-flash 是推理模型，512 全被推理吃掉、正文为空 ⇒ 复盘**每次都失败**、
+#: `recent_notes` 永远空 ⇒ 教训库 `hint` 永远空 ⇒ 「决策演进」的 L1 不可能成立。
+#: 提到 4096（仍远小于主决策的 16384，够 1–3 条短笔记），并配一次"加倍自愈"重试。
+REVIEW_MAX_TOKENS = 4096
+#: 【task-121】被 `truncated` 截断时的**自愈重试**预算（2 倍），且整次复盘最多重试 1 次。
+REVIEW_RETRY_MAX_TOKENS = 8192
 #: 【task-59】复盘笔记条数上限（卡面 1–3 条；超出就截断并记 `truncated`）。
 REVIEW_NOTES_MAX = 3
 #: 【task-59】复盘笔记**合计**字符上限（卡面"合计 ≤200 token"的保守字符代理：中文≈1 token/字）。
@@ -1656,8 +1663,9 @@ class BoundaryPlanner:
         temperature: float | None = 0.0,
         max_llm_attempts: int = DEFAULT_MAX_LLM_ATTEMPTS,
         brief_max_chars: int = PROMPT_BRIEF_MAX_CHARS,
-        # 【task-59】收工复盘的独立 token 预算（卡面 ≤512）。**刻意与 `max_tokens` 分开**：
-        # 复盘只写 1–3 条短笔记，挪用主决策的 16384 是纯浪费（也不利于把它的失败隔离掉）。
+        # 【task-59】收工复盘的独立 token 预算（【task-121】4096，被截断时自愈重试到 8192）。
+        # **刻意与 `max_tokens` 分开**：复盘只写 1–3 条短笔记，挪用主决策的 16384 是纯浪费
+        # （也不利于把它的失败隔离掉）。
         review_max_tokens: int = REVIEW_MAX_TOKENS,
         # 【task-56】决策留痕文件：**由控制器按 journal 路径推导后传进来**，planner 绝不自己
         # 猜路径（真机是 `<journal 去掉 .jsonl>-llm.jsonl`）。None = 不留痕（单测/`agentfarm plan`
@@ -1693,50 +1701,78 @@ class BoundaryPlanner:
         成功与否，都不可能改变下一次决策的边界判定。返回值只被调用方写进 journal
         `review_llm` 与次日 `Brief.recent_notes`。
 
+        【task-121】截断自愈：推理模型的 token 可能全花在思考上、`content` 为空
+        （`llm.py` 这时抛 `LlmError(status="truncated")`）。收到这种失败时**用 2 倍预算
+        重试一次**（上限 `REVIEW_RETRY_MAX_TOKENS`），仍失败才放弃 —— 保持"失败无害"。
+
         失败**绝不外抛**（卡面第 3 条：失败无害）：禁用 ⇒ `ok=False, called=False,
         reason="llm_disabled"`；超时/异常 ⇒ `reason` 是 `_describe_failure()` 的原文；
         JSON 非法 ⇒ `reason="review_no_notes"`；成功但一条都没留下 ⇒ 同前。
-        返回字典：`{ok, called, reason, notes, text, rejected, truncated, usage, duration_ms, model}`。
+        返回字典：`{ok, called, reason, notes, text, rejected, truncated, usage, duration_ms,
+        model, attempts, max_tokens}`（`attempts` = 实际发了几次请求，`max_tokens` = 最后一次
+        用的预算 —— 事后能一眼看出"是不是预算不够"）。
         """
         empty = {"ok": False, "called": False, "reason": "llm_disabled", "notes": [], "text": "",
                  "rejected": [], "truncated": False, "usage": {"prompt": None, "completion": None, "total": None},
-                 "duration_ms": 0, "model": str(self.model or "")}
+                 "duration_ms": 0, "model": str(self.model or ""), "attempts": 0,
+                 "max_tokens": int(self.review_max_tokens)}
         if not self.llm_enabled:
             return empty
 
         messages = build_review_messages(brief, max_chars=self.brief_max_chars)
-        kwargs: dict[str, Any] = {"model": self.model, "max_tokens": int(self.review_max_tokens),
-                                  "temperature": self.temperature}
-        started = time.monotonic()
-        try:
-            result = self.llm_chat(messages, **kwargs)
-        except BaseException as exc:  # noqa: BLE001 - 复盘任何失败都不许影响睡觉/跨日
-            return {"ok": False, "called": True, "reason": self._describe_failure(exc), "notes": [],
-                    "text": "", "rejected": [], "truncated": False,
-                    "usage": {"prompt": None, "completion": None, "total": None},
-                    "duration_ms": int((time.monotonic() - started) * 1000), "model": str(self.model or "")}
-        duration_ms = int((time.monotonic() - started) * 1000)
-        content = result if isinstance(result, str) else getattr(result, "content", None)
-        usage = _usage_dict(getattr(result, "usage", None))
-        model = str(getattr(result, "model", "") or self.model or "")
-        duration_ms = duration_ms or int(getattr(result, "elapsed_ms", 0) or 0)
-        if content is None:
-            return {"ok": False, "called": True, "reason": "llm_result_without_content", "notes": [],
-                    "text": "", "rejected": [], "truncated": False, "usage": usage,
-                    "duration_ms": duration_ms, "model": model}
-        notes, rejected, truncated = parse_review_notes(content)
-        return {
-            "ok": bool(notes),
-            "called": True,
-            "reason": "" if notes else "review_no_notes",
-            "notes": notes,
-            "text": "；".join(notes),
-            "rejected": rejected,
-            "truncated": truncated,
-            "usage": usage,
-            "duration_ms": duration_ms,
-            "model": model,
-        }
+        # 【task-121】预算阶梯：首答被截断（推理吃光 token、正文为空）⇒ 加倍重试一次。
+        budgets = [int(self.review_max_tokens)]
+        retry_budget = min(max(1, budgets[0] * 2), int(REVIEW_RETRY_MAX_TOKENS))
+        if retry_budget > budgets[0]:
+            budgets.append(retry_budget)
+        started_all = time.monotonic()
+        attempts = 0
+        used_budget = budgets[0]
+        for budget in budgets:
+            attempts += 1
+            used_budget = budget
+            kwargs: dict[str, Any] = {"model": self.model, "max_tokens": budget,
+                                      "temperature": self.temperature}
+            started = time.monotonic()
+            try:
+                result = self.llm_chat(messages, **kwargs)
+            except BaseException as exc:  # noqa: BLE001 - 复盘任何失败都不许影响睡觉/跨日
+                reason = self._describe_failure(exc)
+                if getattr(exc, "status", "") == "truncated" and budget is not budgets[-1]:
+                    continue          # 预算被推理吃光 ⇒ 换更大预算再来一次
+                return {"ok": False, "called": True, "reason": reason, "notes": [],
+                        "text": "", "rejected": [], "truncated": False,
+                        "usage": {"prompt": None, "completion": None, "total": None},
+                        "duration_ms": int((time.monotonic() - started_all) * 1000),
+                        "model": str(self.model or ""), "attempts": attempts,
+                        "max_tokens": used_budget}
+            duration_ms = int((time.monotonic() - started) * 1000)
+            content = result if isinstance(result, str) else getattr(result, "content", None)
+            usage = _usage_dict(getattr(result, "usage", None))
+            model = str(getattr(result, "model", "") or self.model or "")
+            duration_ms = duration_ms or int(getattr(result, "elapsed_ms", 0) or 0)
+            if content is None:
+                return {"ok": False, "called": True, "reason": "llm_result_without_content", "notes": [],
+                        "text": "", "rejected": [], "truncated": False, "usage": usage,
+                        "duration_ms": duration_ms, "model": model, "attempts": attempts,
+                        "max_tokens": used_budget}
+            notes, rejected, truncated = parse_review_notes(content)
+            return {
+                "ok": bool(notes),
+                "called": True,
+                "reason": "" if notes else "review_no_notes",
+                "notes": notes,
+                "text": "；".join(notes),
+                "rejected": rejected,
+                "truncated": truncated,
+                "usage": usage,
+                "duration_ms": duration_ms,
+                "model": model,
+                "attempts": attempts,
+                "max_tokens": used_budget,
+            }
+        # 理论到不了这里（budgets 至少一个元素且每个分支都返回）；保险起见给失败态。
+        return dict(empty, called=True, attempts=attempts, max_tokens=used_budget)
 
     # ---- 边界判定 ----
     def detect_boundary(self, state: PlannerState, brief: Brief) -> str | None:

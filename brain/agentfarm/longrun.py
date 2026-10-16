@@ -1620,7 +1620,8 @@ class LongRun:
             res = planner.review(self._review_brief(obs))
         except Exception as exc:  # noqa: BLE001 - 再兜一层：复盘绝不许把主循环带崩
             res = {"ok": False, "called": False,
-                   "reason": f"review_exception:{type(exc).__name__}: {exc}"}
+                   "reason": f"review_exception:{type(exc).__name__}: {exc}",
+                   "attempts": 0, "max_tokens": 0}
         day_key: Any = None
         try:
             day_key = list(FarmWorker.day_key(obs))
@@ -1636,6 +1637,9 @@ class LongRun:
                           model=str(res.get("model") or ""),
                           rejected=list(res.get("rejected") or []),
                           truncated=bool(res.get("truncated")),
+                          # 【task-121】实际发了几次、最后一次用了多大预算（事后判断"是不是预算不够"）
+                          attempts=int(res.get("attempts") or 0),
+                          max_tokens=int(res.get("max_tokens") or 0),
                           note="只写 journal 与次日 recent_notes；不参与任何判定")
             rep.notes.append(f"收工复盘：{len(self.recent_notes)} 条笔记（只影响次日简报，不参与判定）")
             self._say(f"  · 收工复盘：{len(self.recent_notes)} 条笔记")
@@ -1645,6 +1649,10 @@ class LongRun:
             self._journal("review_llm_failed", day_key=day_key,
                           reason=str(res.get("reason") or "review_failed"),
                           called=bool(res.get("called")), rejected=list(res.get("rejected") or []),
+                          # 【task-121】run9 的 `llm_error:truncated` 就是这么看出来的：
+                          # `attempts=2` + `max_tokens=8192` ⇒ 预算给到 8192 仍被截断
+                          attempts=int(res.get("attempts") or 0),
+                          max_tokens=int(res.get("max_tokens") or 0),
                           note="复盘失败无害：睡觉与跨日照常，只是次日看不到笔记")
             rep.notes.append(f"收工复盘失败（无害）：{res.get('reason')}")
 

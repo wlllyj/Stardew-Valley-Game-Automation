@@ -43,7 +43,7 @@ from agentfarm.longrun import (  # noqa: E402
     MAX_TILE_ATTEMPTS, DayReport, LongRun, _till_blocked_by, is_justified_end, plot_observe,
 )
 from agentfarm.planner import (DECISION_LINE_MAX_CHARS, DECISIONS_KEPT, LESSONS_MAX, LESSON_SRC,
-                               REVIEW_MAX_TOKENS,
+                               REVIEW_MAX_TOKENS, REVIEW_RETRY_MAX_TOKENS,
                                BoundaryPlanner, Brief,
                                TaskIntent, deterministic_plan, find_coordinate_like,
                                make_lesson, save_lessons_file)  # noqa: E402
@@ -5433,10 +5433,14 @@ class TestTask58DecisionMemory(unittest.TestCase):
 class _ReviewChat:
     """【task-59】决策回假 tasks JSON、复盘回指定 notes 的 seam（都不联网）。"""
 
-    def __init__(self, *, notes=("明天先把水壶补满", "活苗优先浇水"), fail_review=False, raw=None):
+    def __init__(self, *, notes=("明天先把水壶补满", "活苗优先浇水"), fail_review=False, raw=None,
+                 truncate_first=False):
         self.notes = list(notes)
         self.fail_review = fail_review
         self.raw = raw
+        #: 【task-121】第一次复盘回 `LlmError(status="truncated")`（推理吃光 token、正文为空），
+        #: 之后照常回笔记 —— 用来验"加倍预算自愈重试"。
+        self.truncate_first = truncate_first
         self.calls = 0
         self.review_calls = 0
         self.review_prompts: list[str] = []
@@ -5451,6 +5455,9 @@ class _ReviewChat:
             self.review_kwargs.append(dict(kwargs))
             if self.fail_review:
                 raise LlmError("假复盘失败（不联网）", status="network")
+            if self.truncate_first and self.review_calls == 1:
+                raise LlmError("回答被 max_tokens 截断且内容为空（推理占用了约 512 个 token）",
+                               status="truncated")
             payload = self.raw if self.raw is not None else {"notes": self.notes}
             return json.dumps(payload, ensure_ascii=False)
         return json.dumps({"tasks": [
@@ -5518,9 +5525,44 @@ class TestTask59ReviewNotes(unittest.TestCase):
         self.assertTrue(review["truncated"], "有效条目超 3 条要被截断")
         self.assertTrue(any("review_coordinates" in str(r) for r in review["rejected"]), review["rejected"])
         self.assertNotIn("(12,30)", "".join(review["notes"]))
-        # 复盘走独立预算：≤512，绝不挪用主决策的 16384
+        # 复盘走独立预算：4096（task-121），绝不挪用主决策的 16384
         self.assertTrue(all(k["max_tokens"] == REVIEW_MAX_TOKENS for k in chat.review_kwargs),
                         chat.review_kwargs)
+        self.assertEqual(review["attempts"], 1)
+        self.assertLess(REVIEW_MAX_TOKENS, 16384)
+
+    def test_truncated_review_retries_once_and_still_changes_nothing(self):
+        """【task-121】首次复盘被截断 ⇒ 加倍预算自愈成功；且**判决逐字不变**。"""
+
+        def once(truncate_first: bool):
+            w = FakeWorld(weeds=4, seeds=10, money=500)
+            chat = _ReviewChat(truncate_first=truncate_first)
+            run = make_run(w, target_days=1, max_days=1, llm_enabled=True, llm_chat=chat)
+            self.assertEqual(run.run(), 0, run.logs)
+            review = self._events(run, "review_llm")[0]
+            day = run.days[0]
+            water = dict(day.final_water)
+            water.pop("t", None)
+            return chat, review, {
+                "verified": day.verified,
+                "ended_by": day.ended_by,
+                "ended_reason": day.ended_reason,
+                "checks": dict(day.checks),
+                "final_water": water,
+                "final": dict(day.final),
+                "stages": [dict(s) for s in day.stages],
+                "intents": [e["intents"] for e in run.entries if e["event"] == "decision"],
+            }
+
+        chat, review, retried = once(True)
+        self.assertEqual(review["notes"], chat.notes, "重试成功后照常有笔记")
+        self.assertEqual(review["attempts"], 2, "首答被截断 ⇒ 发第二次")
+        self.assertEqual(review["max_tokens"], REVIEW_RETRY_MAX_TOKENS)
+        self.assertEqual(chat.review_kwargs[0]["max_tokens"], REVIEW_MAX_TOKENS)
+        self.assertEqual(chat.review_kwargs[1]["max_tokens"], REVIEW_RETRY_MAX_TOKENS)
+        self.assertGreater(REVIEW_RETRY_MAX_TOKENS, REVIEW_MAX_TOKENS)
+        _, _, clean = once(False)
+        self.assertEqual(retried, clean, "自愈重试也不许改变任何一个判决")
 
     def test_review_never_changes_any_verdict(self):
         """同一个假世界、同一套假决策：**只切换复盘**，判决必须逐字相同。"""
