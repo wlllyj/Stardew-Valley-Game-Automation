@@ -29,8 +29,9 @@
 | **task-152** | dev-coder | 142 | **钱的三分配**：种子再投资 / 工具升级储备 / 缓冲；LLM 给分配意图（journal `money_plan{reserve_for_upgrade,spend_on_seeds,reason}`），代码算数字与兜底硬约束（**先留住下一件关键升级的钱 > 至少留 1 份种子钱 > 其余才买种子/囤货**）；缺字段保守；禁 `Money +=` | pending |
 | **task-157** | dev-coder | — | **`water_far` 够不着时先有界开路再试**（run9d 实证：`[12,30]` 活苗干作物 `code=unreachable`，雨天掩盖、非雨天必破尾链）；仍走不到 ⇒ `water_far_blocked{tile,cause,attempts,cleared_tiles}` + 当天如实 `gave_up_dry`（**不许把开路当浇水**）；原因 `unreachable/no_route/need_refill/no_evidence/truncated` 显式分离；≥6 单测 + ≥2 变异 | **已交付 `ef59f30`**（Lead 亲核：2 文件 +351/−14、定向 463 OK、全量 822 其中 2 红＝analyzer 缺桶 ⇒ task-160） |
 | **task-158** | dev-coder | 157 | **体力预算与规模控制**：`water_reserve = 活苗×2.0 + 12`、`capacity=(max−reserve−5)//2`、预算不足时 clear/till/plant 停手（journal `deferred_by_budget`）、`farm` 计数不可用 ⇒ `basis="conservative"`（全留给浇水）；常量集中在 `farmwork.py`（**未标定估算** ⇒ task-161） | **已交付 `cf7432a`**（Lead 亲核：3 文件 +293/−4、定向 470 OK、全量 829 其中 2 红同上）；两点裁定已发：超载时"只浇水"保持、不许加清障底（补 harvest/clear_dead 不被延后的测试）、预算必须取 `farm` 块 |
-| **task-159** | deputy-lead | 157,158 | 对 157+158 的**独立对抗验收**（少干活/开路当浇水的洗白通道；`docs/_review-task157-158.md`） | in_progress |
-| **task-160** | log-analyst | 158 | analyzer 收录 157/158 新事件与字段（`water_far_open`/`water_far_blocked`/`stamina_budget`…）⇒ **全量回 0 红**（0.7.32 放行条件） | in_progress |
+| **task-159** | deputy-lead | 157,158 | 对 157+158 的**独立对抗验收**（少干活/开路当浇水的洗白通道；`docs/_review-task157-158.md`） | **PASS**（`ad34bf6`）：task-157 PASS / task-158 PASS-WITH-NITS 无必修；B 段 22/31→35/35；正对照 SHA256 逐字相同；C 段 8 组全过 |
+| **task-160** | log-analyst | 158 | analyzer 收录 157/158 新事件与字段（`water_far_open`/`water_far_blocked`/`stamina_budget`/`deferred_by_budget`）⇒ **全量回 0 红** | **已交付 `694c7b0`**（3 文件 +461/−7；全量 **838 OK / 0 红**；12 账本 rc 与 `verify-run3` 并排一字未变） |
+| **task-163** | dev-coder | 161 | **预算延后不得变成"还有活"**（task-159 NIT-1/NIT-2）：延后任务的格子不再进守卫理由（改走显式延后 + 日级按任务留痕）、容量命中加可见 journal；验收目标 = 被预算卡住但该做的都做了的一天**必须能 `verified=true`**，且不许洗白 | pending（0.7.32 冻结前最后一张脑侧卡） |
 | **task-161** | dev-coder | 20 | **阶段体力实测留痕与标定**：stage 记录补 `stamina_before/after/spent` + `day_end.stamina_calibration`（按 stage 的 `actions/per_action`）；只留痕不改判据；用于把 `farmwork.py` 的估算常量换成实测值（改常量单独一步、须过对抗验收） | pending |
 | **task-154** | dev-coder | — | 种子识别不许只靠名字：结构性识别（`Crop` 数据/`Data/Shops` 交叉）+ `seed_source` + `seed_unknown` fail-closed（来源 task-145 INFO-1） | pending |
 | **task-110** | dev-coder | — | **桥异常绝不许穿出 `run()`**：`ensure_location`/`snap`/`sleep` 三处 + 顶层兜底，任何 `BridgeError` 都要落 `finish` 并如实记因（来源 task-108 NIT-2 / task-145 NIT-1） | pending |
@@ -76,6 +77,6 @@
 
 - **0.7.32（本版）** = `task-157`（`water_far` 够不着先有界开路）+ `task-158`（体力预算与规模控制）+ `task-155`（Mod 障碍物/工具等级元数据）+ `task-20`（脑侧消费，`blocked_by task-155`）+ `task-159`（对 157/158 的独立对抗验收）。
 - **移到 0.7.33**（目标 1 主体）：`task-141`（Brief 暴露 `tool_levels`/`obstacles_by_tool` + `tool_upgrade` 建议意图）、`task-142`（铁匠铺升级链 `upgrade_tool` + 主动升级闭环）、`task-151`（全场清理收敛 + `farm_cleared` 完成判定）、`task-152`（钱的三分配：种子/升级储备/缓冲）。
-- **顺序**：`157 → 158`（目标 2 关键路径，先交付）+ `155 → 20 → 161`（Mod 元数据 + 脑侧消费 + 体力标定）⇒ `task-159` 对抗验收 + `task-160`（analyzer 回 0 红）⇒ Lead 冻结装机 ⇒ **run A / run B（同一 0.7.32 构建）** ⇒ 结论。
+- **顺序**：`157 → 158`（目标 2 关键路径，已交付）+ `155 ✅ → 20 → 161 → 163`（Mod 元数据 → 脑侧消费 → 体力标定 → 预算延后口径）⇒ `task-159` 对抗验收 ✅ + `task-160`（analyzer 回 0 红）✅ ⇒ Lead 冻结装机 ⇒ **run A / run B（同一 0.7.32 构建）** ⇒ 结论。
 - **A→B 对照口径（`docs/_run10-criteria.md`，提交 `54f8d07`）**：run A 与 run B 必须是**同一份 0.7.32 构建**、同参数（`--days 5 --size 5 --max-minutes 240 --max-days 12`），**唯一差异 = 注入的教训/笔记/决策史**；run9/run9b/run9c/run9d 都**不参与** A→B（它们分别是旧构建/诊断跑）。A 的初始教训库允许继承 run9d 的（双账本记录：继承 vs 本轮新增），B 用 A 的库显式拷贝。
 - **附加说明**：`task-161`（阶段体力标定）是 0.7.32 的**最后一张脑侧卡**；若它能在冻结前落地，A/B 两次跑的口径必须一致（`stamina_calibration` 只留痕、不改判据 ⇒ 允许同版共存）。
