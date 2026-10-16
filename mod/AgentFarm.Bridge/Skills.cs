@@ -87,6 +87,10 @@ namespace AgentFarm.Bridge
                 // 长距离多跳（走几十步再进建筑）：30s 装不下，task-43 放宽到 60s
                 case "move_to_location":
                     return MoveToLocationSkill.ClampBudget(timeoutMs);
+                // 【task-129】出货日跨日：出货菜单 → 日切保存 → 换天，合法地要十几秒，
+                // 默认 8s 会把"游戏正在存档"判成超时（上限 120s）
+                case "dismiss_modal":
+                    return ShippingMenuDismissSkill.ClampBudget(timeoutMs);
                 default:
                     return ClampTimeout(timeoutMs);
             }
@@ -242,6 +246,15 @@ namespace AgentFarm.Bridge
                     };
 
                 case "dismiss_modal":
+                    // 【task-129】出货菜单 / 存档菜单**绝不能**单 tick `exitThisMenu()`：
+                    // 出货日的日切保存入口在 `ShippingMenu` 自己内部（点 OK 才建 SaveGameMenu），
+                    // 硬关会让 `outro` 永假 ⇒ 日推进、盘不落（run9 四天 0 次 save，整跑作废）。
+                    // 这两类改走跨 tick 的 wait-only 技能（反射 okClicked() / 点 okButton，然后只等）；
+                    // 其它模态仍走原来的单 tick `ModalDismiss.Dismiss()`。
+                    // ⇒ 同时必须把 "dismiss_modal" 加进 BridgeHost.IsLongTaskSkill。
+                    if (ShippingMenuDismissSkill.Applies())
+                        return new ShippingMenuDismissSkill(req, world, monitor).Step;
+
                     // 单 tick 完成的短任务：不返回 null，所以不会被当成跨 tick 长任务。
                     return () =>
                     {

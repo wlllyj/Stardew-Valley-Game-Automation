@@ -483,10 +483,16 @@ namespace AgentFarm.Bridge
         ///
         /// buy 也是：`Utility.TryOpenShopMenu` 之后要等 `Game1.activeClickableMenu` 变成 `ShopMenu`
         /// 才能买（菜单不是同 tick 就挂上的）。买完是同 tick 返回终态。
+        ///
+        /// 【task-129】dismiss_modal 也是：遇到 `ShippingMenu`/存档菜单时要跨 tick ——
+        /// 反射 `okClicked()`（或点 okButton）之后**什么都不做**，等游戏自己把
+        /// 「出货 → 日切保存 → 换天」走完（约十几秒）。普通模态仍是单 tick 返回终态，
+        /// 所以只是"这一类任务被允许跨 tick"，不会让短模态白占预算。
         /// </summary>
         private static bool IsLongTaskSkill(string skill)
             => skill == "move_to" || skill == "move_to_location" || skill == "load_save"
-            || skill == "use_tool" || skill == "plant" || skill == "sleep" || skill == "buy";
+            || skill == "use_tool" || skill == "plant" || skill == "sleep" || skill == "buy"
+            || skill == "dismiss_modal";
 
         private HttpResponse ServeExec(HttpRequest req)
         {

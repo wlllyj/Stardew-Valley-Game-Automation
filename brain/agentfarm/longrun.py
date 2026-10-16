@@ -138,6 +138,19 @@ MODAL_WAIT_TIMEOUT_S = 90.0
 #: 一次日循环里最多关几个模态：多个技能同时升级会**连出** `LevelUpMenu`（实测可连出多个）。
 MODAL_MAX_DISMISS = 10
 
+#: `dismiss_modal` 的默认时间预算（毫秒）——普通短模态。
+MODAL_DISMISS_DEFAULT_MS = 5000
+
+#: 按模态类型给出的 `dismiss_modal` 预算（毫秒）。
+#:
+#: 【task-129】`ShippingMenu` 是硬例外的**长活**：Mod 侧不能关它（关掉 = 日切保存永久丢失，
+#: run9 就这么丢了 4 天盘），只能反射它自己的 `okClicked()`（等价玩家点 OK）然后**等游戏自己**
+#: 走完「出货 → 建 SaveGameMenu → SaveGame.Save() → 换天」，合法地要十几秒。
+#: 客户端默认 5s 会把"游戏正在存档"误判成超时 ⇒ 这一类单独放宽到 20s（Mod 侧上限 120s）。
+MODAL_DISMISS_BUDGET_MS = {
+    "ShippingMenu": 20000,
+}
+
 #: 挡住当天、必须人来处理的模态（职业选择等不可逆操作）对应的 `ended_by`。
 #: 它同时让 `slept_by_us=false` ⇒ 当天**不判 VERIFIED**（宁可停下等人，也不静默丢档）。
 ENDED_BY_MODAL = "blocked_modal"
@@ -2413,13 +2426,16 @@ class LongRun:
             return obs
         assert self.client is not None
         try:
-            res = self.client.dismiss_modal(timeout_ms=5000)
+            res = self.client.dismiss_modal(
+                timeout_ms=MODAL_DISMISS_BUDGET_MS.get(menu, MODAL_DISMISS_DEFAULT_MS))
         except BridgeError as exc:
             self._journal("modal_dismiss_failed", where=where, menu=menu,
                           reason=str(exc)[:200], status=str(getattr(exc, "status", "") or ""))
             return obs
         self._journal("modal_dismissed", where=where, menu=menu,
-                      ok=bool((res or {}).get("ok")) if isinstance(res, dict) else True)
+                      ok=bool((res or {}).get("ok")) if isinstance(res, dict) else True,
+                      dismissPath=(res or {}).get("dismissPath") if isinstance(res, dict) else None,
+                      waitedMs=(res or {}).get("waitedMs") if isinstance(res, dict) else None)
         return self._snap()
 
     def _sell_surplus_for_slot(self, obs: dict[str, Any], rep: DayReport) -> bool:
@@ -3555,10 +3571,16 @@ class LongRun:
                 return obs, False, waited
 
     def _dismiss_modal_once(self, menu: str, ui: dict[str, Any], *, kind: str) -> dict[str, Any]:
-        """关一次模态并重新观测（回执原文进 journal；世界是否真变了解除由后续观测回答）。"""
+        """关一次模态并重新观测（回执原文进 journal；世界是否真变了解除由后续观测回答）。
+
+        【task-129】`ShippingMenu` 要走"出货 → 日切保存 → 换天"整条链（Mod 侧反射
+        `okClicked()` 后只等游戏自己走完），合法地要十几秒 ⇒ 必须显式给大预算
+        （客户端默认只有 5s，会把"游戏正在存档"判成超时）。其它模态仍是短活。
+        """
         assert self.client is not None
         menu_text = str(ui.get("activeMenuText") or "")
-        receipt = self.client.dismiss_modal()
+        budget = MODAL_DISMISS_BUDGET_MS.get(menu, MODAL_DISMISS_DEFAULT_MS)
+        receipt = self.client.dismiss_modal(timeout_ms=budget)
         self._actions += 1
         self._journal("modal_dismissed", kind=kind, menu=menu, menuText=menu_text,
                       receipt=receipt,

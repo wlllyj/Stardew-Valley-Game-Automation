@@ -1,4 +1,5 @@
 using System;
+using System.Reflection;
 using StardewModdingAPI;
 using StardewValley;
 using StardewValley.Menus;
@@ -36,7 +37,9 @@ namespace AgentFarm.Bridge
     /// 这个技能的存在目的是“解除阻塞”，不是“替人做决定”。因此：
     ///   * 只在 DialogueBox 且是提问时回答，且**只选否/取消/关闭**那一项；
     ///   * 找不到明确的“否”时，按星露谷惯例选**最后一项**，并在 reason 里如实说明；
-    ///   * 其余任何模态一律走游戏的 `exitThisMenu()`（等价于玩家按 Esc）。
+    ///   * 其余任何模态一律走游戏的 `exitThisMenu()`（等价于玩家按 Esc）——
+    ///     **但 `ShippingMenu`／`SaveGameMenu`／`NewDaySavingMenu` 是硬例外**（task-129）：
+    ///     这三类由 `ShippingMenuDismissSkill` 跨 tick 接管，本类**拒关**（见 `Dismiss()` 情况 2a）。
     ///
     /// ==================================================================
     /// 【事故记录（修复迭代 3）：禁止再用按键去“确认”选项】
@@ -99,6 +102,24 @@ namespace AgentFarm.Bridge
                 if (menu is DialogueBox box)
                 {
                     return DismissDialogue(box);
+                }
+
+                // ---- 情况 2a：出货菜单 / 存档菜单 → **绝不 exitThisMenu()**（task-129）----
+                //
+                // 【为什么必须拒】出货日的日切保存唯一入口在 `ShippingMenu.update()` 内部：
+                // 只有私有字段 `outro == true`（= 玩家点 OK ⇒ 私有 `okClicked()`）之后才会
+                // `new SaveGameMenu()` ⇒ `SaveGame.Save()`。这里一句 `exitThisMenu()` 会让
+                // `outro` 永远为 false ⇒ **永不出存档菜单**；而 `Game1._update` 只要求
+                // “夜菜单栈空 + 无活动菜单”就推进到早晨 ⇒ 日推进、盘不落、无人拦
+                // （run9 实测 4 NewDay / 0 save，整跑作废）。
+                // 所以这两类一律交给 `ShippingMenuDismissSkill`（跨 tick：反射 okClicked() 或
+                // 点 okButton，然后只等游戏自己关）。
+                if (menu is ShippingMenu || IsSaveMenu(menu))
+                {
+                    return Finish(false, "wait_only",
+                        $"拒绝关闭 {menu.GetType().Name}：出货菜单的日切保存入口在它自己内部"
+                        + "（只有点 OK 才会建 SaveGameMenu），存档菜单正把盘写出去 —— 这两类必须走"
+                        + " dismiss_modal 的跨 tick wait-only 路径（task-129）");
                 }
 
                 // ---- 情况 2：其它任何模态 → exitThisMenu()（等价按 Esc）----
@@ -383,6 +404,107 @@ namespace AgentFarm.Bridge
                 if (lower.Contains(token)) return true;
             }
             return false;
+        }
+
+        // ==================================================================
+        // 【task-129】出货/存档菜单的公共判据与“点 OK”两条路（供 ShippingMenuDismissSkill 用）
+        // ==================================================================
+
+        /// <summary>
+        /// 存档类菜单：正把盘写出去，**任何情况下都不许关**。
+        ///
+        /// `SaveGameMenu` 是 1.6.15 里保存的唯一载体（`docs\_il-shipmenu-save.md` §1 的两个创建点）。
+        /// `NewDaySavingMenu` 在 1.6.15 **已经不是类型名**（同一篇 §5 的核对），但脑侧的
+        /// `MODAL_WAIT_ONLY` 仍按名字列表在等它 —— 所以这里按**类型名**兜一遍，既可编译，
+        /// 也不丢掉"将来版本又出现这个名字"的防线。
+        /// </summary>
+        internal static bool IsSaveMenu(IClickableMenu menu)
+        {
+            if (menu is SaveGameMenu) return true;
+            try { return menu != null && menu.GetType().Name == "NewDaySavingMenu"; }
+            catch { return false; }
+        }
+
+        /// <summary>出货菜单：日切保存的唯一入口在它自己内部（点 OK 才建 SaveGameMenu）。</summary>
+        internal static bool IsShippingMenu(IClickableMenu menu) => menu is ShippingMenu;
+
+        /// <summary>当前活动菜单的类型名（读不到返回空串，绝不抛）。</summary>
+        internal static string SafeMenuName()
+        {
+            try { return Game1.activeClickableMenu?.GetType().Name ?? ""; } catch { return ""; }
+        }
+
+        /// <summary>
+        /// 反射调用 `ShippingMenu` 的私有 `okClicked()` —— 这是“玩家点了 OK”在代码里的**唯一正路**
+        /// （等价玩家点 OK，不是特权操作）。发出后调用方**什么都不该做**，等游戏自己把
+        /// outro→SaveGameMenu→存档→换天走完。
+        /// </summary>
+        internal static bool TryInvokeOkClicked(ShippingMenu ship, out string note)
+        {
+            note = "";
+            try
+            {
+                MethodInfo m = typeof(ShippingMenu).GetMethod(
+                    "okClicked", BindingFlags.Instance | BindingFlags.NonPublic)
+                    ?? typeof(ShippingMenu).GetMethod(
+                        "okClicked", BindingFlags.Instance | BindingFlags.Public);
+                if (m == null)
+                {
+                    note = "ShippingMenu 上找不到 okClicked（1.6.15 预期是私有实例方法）";
+                    return false;
+                }
+
+                m.Invoke(ship, null);
+                note = $"已反射调用 {m.DeclaringType?.Name}.okClicked()（等价玩家点 OK）";
+                return true;
+            }
+            catch (Exception ex)
+            {
+                note = "反射 okClicked 异常：" + ex.GetType().Name + ": " + ex.Message;
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 反射失败时的兜底：`currentPage == -1 && CanReceiveInput()` 时点 `okButton` 中心。
+        ///
+        /// `introTimer > 0` 期间 `receiveLeftClick` 会被**静默丢弃**（菜单还没做完进场动画），
+        /// 所以调用方必须**按间隔重试到菜单消失**，而不是点一次就算数。
+        /// </summary>
+        internal static bool TryClickOkButton(ShippingMenu ship, out string note)
+        {
+            note = "";
+            try
+            {
+                if (ship.currentPage != -1)
+                {
+                    note = $"currentPage={ship.currentPage}（还没走到最后一页）";
+                    return false;
+                }
+                if (!ship.CanReceiveInput())
+                {
+                    note = "CanReceiveInput()=false（introTimer 还没走完，这一下点击会被静默丢弃）";
+                    return false;
+                }
+
+                ClickableTextureComponent btn = ship.okButton;
+                if (btn == null)
+                {
+                    note = "okButton 为空";
+                    return false;
+                }
+
+                int x = btn.bounds.Center.X;
+                int y = btn.bounds.Center.Y;
+                ship.receiveLeftClick(x, y, true);
+                note = $"已点 okButton 中心 ({x},{y})";
+                return true;
+            }
+            catch (Exception ex)
+            {
+                note = "点 okButton 异常：" + ex.GetType().Name + ": " + ex.Message;
+                return false;
+            }
         }
 
         private static bool SafeBool(Func<bool> f) { try { return f(); } catch { return false; } }

@@ -132,6 +132,10 @@ class FakeWorld:
         self.dismiss_calls = 0
         self.dismissed: list[str] = []
         self.modal_polls = 0
+        #: 【task-129】`dismiss_modal` 回执里要带的字段（`dismissPath`/`waitedMs`/`menuGone`）。
+        #: 真桥在出货/存档菜单上跨 tick 干活，必须把"怎么推的、等了多久、菜单有没有消失"带回脑；
+        #: 假世界默认 `None`（旧口径：一次调用就关掉队首、只回 `ok`）。
+        self.dismiss_receipt: dict | None = None
         self.scythe = scythe
         self.inventory = [
             {"slot": 0, "id": "Axe", "qualifiedId": "(T)Axe", "name": "Axe", "stack": 1, "isTool": True},
@@ -272,7 +276,11 @@ class FakeWorld:
         return ui
 
     def dismiss(self) -> dict:
-        """`dismiss_modal` 的假世界版：关掉队首模态（露出下一个）并如实返回回执。"""
+        """`dismiss_modal` 的假世界版：关掉队首模态（露出下一个）并如实返回回执。
+
+        【task-129】`dismiss_receipt` 非空时把它并进回执（模拟真桥跨 tick 走
+        "反射 okClicked → 等游戏自己走完"这条路时带回的 `dismissPath`/`waitedMs`/`menuGone`）。
+        """
         self.dismiss_calls += 1
         name = ""
         if self.ui_script:
@@ -280,7 +288,10 @@ class FakeWorld:
             self.ui_script.pop(0)
         self.modal_polls = 0
         self.dismissed.append(name)
-        return {"ok": True, "status": "ok", "worldResumed": True, "worldSeq": self.seq}
+        out = {"ok": True, "status": "ok", "worldResumed": True, "worldSeq": self.seq}
+        if self.dismiss_receipt:
+            out.update(self.dismiss_receipt)
+        return out
 
     def clear(self, tile):
         kind = self.blockers.get(tile)
@@ -490,6 +501,8 @@ class FakeClient:
         self.w = world
         self.mod_version = mod_version
         self.details: list[str] = []
+        #: 【task-129】每次 `dismiss_modal` 用的时间预算（毫秒）——出货菜单必须是"长活"预算。
+        self.dismiss_timeouts: list[int] = []
 
     def health(self, *, timeout=None):
         return {"ok": True, "status": "ok", "modVersion": self.mod_version,
@@ -530,6 +543,7 @@ class FakeClient:
 
     # ---- task-11：模态守卫用 ----
     def dismiss_modal(self, *, timeout_ms=5000):
+        self.dismiss_timeouts.append(timeout_ms)
         return self.w.dismiss()
 
     # ---- 供**真** `FarmWorker.plant`/`sow` 驱动（task-22 的播种/浇水集成用例）----
@@ -6307,6 +6321,152 @@ class TestTask124ReviewOnlyFallback(unittest.TestCase):
         if bursts:
             self.assertIn("连发", run.days[0].ended_reason)
             self.assertGreaterEqual(bursts[0]["count"], PLOT_EXHAUSTED_BURST)
+
+
+class _ModalTraceClient(FakeClient):
+    """【task-129】把模态处理期间**动了什么**逐条记下来：等存档期间只许出现 `observe`。"""
+
+    def __init__(self, world: FakeWorld) -> None:
+        super().__init__(world)
+        self.calls: list[str] = []
+
+    def observe(self, detail="summary", *, timeout=None):
+        self.calls.append("observe")
+        return super().observe(detail, timeout=timeout)
+
+    def move_to(self, *a, **kw):
+        self.calls.append("move_to")
+        return super().move_to(*a, **kw)
+
+    def move_to_location(self, *a, **kw):
+        self.calls.append("move_to_location")
+        return super().move_to_location(*a, **kw)
+
+    def use_tool(self, *a, **kw):
+        self.calls.append("use_tool")
+        return super().use_tool(*a, **kw)
+
+    def dismiss_modal(self, *, timeout_ms=5000):
+        self.calls.append("dismiss_modal")
+        return super().dismiss_modal(timeout_ms=timeout_ms)
+
+
+class TestTask129ShippingMenuSave(unittest.TestCase):
+    """task-129（P0）：出货日的**日切保存必须真的发生** —— 对出货/存档菜单只推不关。
+
+    【事故】run9 四天 0 次落盘、整跑作废：出货日日切保存的唯一入口在
+    `ShippingMenu.update()` 内部（只有点 OK ⇒ 私有 `okClicked()` 才会 `new SaveGameMenu()`
+    ⇒ `SaveGame.Save()`），而旧代码对一切非对话模态一律 `exitThisMenu()`
+    ⇒ `outro` 永假 ⇒ 永不出存档菜单；`Game1._update` 又只要求"夜菜单栈空 + 无活动菜单"
+    就推进早晨 ⇒ 日推进、盘不落、无人拦。
+
+    所以脑侧现在必须：
+      * 给出货菜单**长活预算**（默认 5s 会把"游戏正在存档"误判成超时）；
+      * 让 Mod 走"反射 okClicked / 点 okButton，然后**只等**游戏自己关"这条路，
+        回执里的 `dismissPath`/`waitedMs`/`menuGone` 进 journal 便于事后对账；
+      * 存档菜单**只等不关**，等待期间**一次 move/exec 都不许发**（自旋会打断保存）。
+
+    【变异自检（`%TEMP%\\t129_mutate.py`，把 brain/ 与 tests/ 一起拷到临时目录再打补丁）】
+      基线 5/5 绿；
+      * `m129a`（`MODAL_DISMISS_BUDGET_MS["ShippingMenu"]` 改回 5000）⇒ 红 2
+        （`test_shipping_menu_gets_the_long_budget_and_the_receipt_is_journaled`、
+        `test_shipping_then_save_menu_waits_out_the_whole_chain`）；
+      * `m129b`（存档菜单不再 wait-only，复刻 run9 的"一律 dismiss"）⇒ 红 3
+        （`test_save_menu_is_never_dismissed`、`test_shipping_then_save_menu_waits_out_the_whole_chain`、
+        `test_waiting_for_the_save_never_moves_or_execs`）。
+
+    【本卡的另一半在 C# 里，没有单测可跑】仓库没有 C# 测试工程（已知局限，历次卡都如实上报），
+    Mod 侧的三条铁律（`ModalDismiss` 拒关、`ShippingMenuDismissSkill` 只推只等、
+    `dismiss_modal` 注册成跨 tick）只能靠 `dotnet build` 0 警 0 错 + 真机验收
+    （SMAPI 日志须出现 `Context: before save.` → `SaveGame.Save() called.` → `after save, starting <次日>`，
+    且存档 mtime/size 前进）。
+    """
+
+    def _run(self, w: FakeWorld) -> tuple[LongRun, _ModalTraceClient]:
+        client = _ModalTraceClient(w)
+        run = make_run(w, target_days=1)
+        run.worker = FakeWorker(w)
+        run.client = client
+        return run, client
+
+    @staticmethod
+    def _rep() -> DayReport:
+        return DayReport(day_key=("summer", 1, 13), started_at=0.0)
+
+    @staticmethod
+    def _events(run: LongRun, event: str) -> list[dict]:
+        return [e for e in run.entries if e["event"] == event]
+
+    def test_shipping_menu_gets_the_long_budget_and_the_receipt_is_journaled(self):
+        w = FakeWorld(weeds=0)
+        w.ui_script = [{"activeMenu": "ShippingMenu", "isModal": True}]
+        w.dismiss_receipt = {"dismissPath": "ok_clicked", "waitedMs": 8200, "menuGone": True}
+        run, client = self._run(w)
+
+        _, blocked = run._clear_modals(w.obs(), self._rep())
+
+        self.assertFalse(blocked)
+        self.assertEqual(w.dismissed, ["ShippingMenu"])
+        self.assertEqual(client.dismiss_timeouts, [20000],
+                         "出货菜单是长活：默认 5s 会把『游戏正在存档』判成超时")
+        dis = self._events(run, "modal_dismissed")
+        self.assertEqual(len(dis), 1, run.entries)
+        self.assertEqual(dis[0]["receipt"].get("dismissPath"), "ok_clicked")
+        self.assertEqual(dis[0]["receipt"].get("waitedMs"), 8200)
+        self.assertTrue(dis[0]["receipt"].get("menuGone"))
+
+    def test_save_menu_is_never_dismissed(self):
+        w = FakeWorld(weeds=0)
+        w.ui_script = [{"activeMenu": "SaveGameMenu", "activeMenuText": "SaveGameMenu",
+                        "_autoGoneAfterPolls": 2}]
+        run, _ = self._run(w)
+
+        _, blocked = run._clear_modals(w.obs(), self._rep())
+
+        self.assertFalse(blocked, run.entries)
+        self.assertEqual(w.dismiss_calls, 0, "存档菜单绝不许 dismiss（run9 就是这么丢盘的）")
+        gone = self._events(run, "modal_gone")
+        self.assertEqual(gone[0]["menu"], "SaveGameMenu")
+
+    def test_waiting_for_the_save_never_moves_or_execs(self):
+        w = FakeWorld(weeds=0)
+        w.ui_script = [{"activeMenu": "SaveGameMenu", "_autoGoneAfterPolls": 3}]
+        run, client = self._run(w)
+        before = list(w.player_tile)
+
+        run._clear_modals(w.obs(), self._rep())
+
+        self.assertEqual(w.player_tile, before, "等存档期间不许移动")
+        self.assertEqual(client.calls, [],
+                         f"等存档期间一次 exec 都不许发（只靠快照轮询等），实际：{client.calls}")
+        self.assertTrue(self._events(run, "modal_gone"), "存档模态应被等到自己消失")
+
+    def test_shipping_then_save_menu_waits_out_the_whole_chain(self):
+        w = FakeWorld(weeds=0)
+        w.ui_script = [
+            {"activeMenu": "ShippingMenu", "isModal": True},
+            {"activeMenu": "SaveGameMenu", "_autoGoneAfterPolls": 2},
+        ]
+        w.dismiss_receipt = {"dismissPath": "ok_clicked", "waitedMs": 8100, "menuGone": True}
+        run, client = self._run(w)
+
+        obs, blocked = run._clear_modals(w.obs(), self._rep())
+
+        self.assertFalse(blocked, run.entries)
+        self.assertEqual(w.dismissed, ["ShippingMenu"], "只推出货菜单；存档菜单只等")
+        self.assertEqual(client.dismiss_timeouts, [20000])
+        self.assertEqual(self._events(run, "modal_gone")[0]["menu"], "SaveGameMenu")
+        self.assertFalse(run._modal_info(obs)[0], "清完之后世界干净")
+
+    def test_ordinary_menus_keep_the_short_budget(self):
+        """回归：普通模态（`ShopMenu` 等）仍是 5s 短活预算 —— 新映射不许放宽它们。"""
+        w = FakeWorld(weeds=0)
+        w.ui_script = [{"activeMenu": "ShopMenu", "isModal": True}]
+        run, client = self._run(w)
+
+        run._clear_modals(w.obs(), self._rep())
+
+        self.assertEqual(client.dismiss_timeouts, [5000])
 
 
 if __name__ == "__main__":  # pragma: no cover

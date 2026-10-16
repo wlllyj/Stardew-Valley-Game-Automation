@@ -832,6 +832,34 @@ namespace AgentFarm.Bridge
         /// 【可选字段】null 时序列化省略 ⇒ 其它技能回执形状不变。
         /// </summary>
         [JsonPropertyName("availableItems")] public ShopItemView[] AvailableItems { get; set; }
+
+        // ------------------------------------------------------------------
+        //  0.7.29（task-129）新增：`dismiss_modal` 走"出货 → 日切保存 → 换天"链时的回执
+        //
+        //  run9 事故：对 `ShippingMenu` 用了 `exitThisMenu()` ⇒ `outro` 永假 ⇒ 永不建
+        //  `SaveGameMenu` ⇒ 日推进、盘不落（4 NewDay / 0 save，整跑作废）。
+        //  现在这两类菜单走跨 tick 的 wait-only 路径，下面三个字段把"怎么推的、等了多久、
+        //  菜单到底有没有消失"如实带回给脑（回执只是声明，判据仍是观测差分）。
+        // ------------------------------------------------------------------
+
+        /// <summary>
+        /// <c>dismiss_modal</c> 专用：实际走的路径 ——
+        /// <c>"ok_clicked"</c>（反射私有 `ShippingMenu.okClicked()`）、
+        /// <c>"click_ok_button"</c>（兜底点 `okButton` 中心）、
+        /// <c>"reflection_failed"</c>（两条路都没走通）、
+        /// <c>"wait_only"</c>（存档菜单只等不关）、<c>"(未动手)"</c>。
+        /// 【可选字段】null 时序列化省略 ⇒ 其它技能回执形状不变。
+        /// </summary>
+        [JsonPropertyName("dismissPath")] public string DismissPath { get; set; }
+
+        /// <summary><c>dismiss_modal</c> 专用：这一跳实际等了多久（毫秒）。【可选字段】</summary>
+        [JsonPropertyName("waitedMs")] public long? WaitedMs { get; set; }
+
+        /// <summary>
+        /// <c>dismiss_modal</c> 专用：收尾那一刻菜单**是否真的不在了**（观测事实，不是计划）。
+        /// 非终态（还在等）时不写。【可选字段】null 时序列化省略。
+        /// </summary>
+        [JsonPropertyName("menuGone")] public bool? MenuGone { get; set; }
     }
 
     /// <summary>
