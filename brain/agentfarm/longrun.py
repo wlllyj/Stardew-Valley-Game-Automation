@@ -39,15 +39,15 @@ import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from .bridge import MOD_VERSION_EXPECTED, BridgeClient, BridgeError
-from .farmwork import (ENV_BLOCK_STATUSES, FRONTIER_KINDS, PATH_STAMINA_ALLOWANCE, SEED_KEEP_FACTOR,
-                       STAGE_ACTION, STAMINA_COST_CLEAR, STAMINA_COST_SOW, STAMINA_COST_TILL,
-                       STAMINA_COST_WATER, FarmWorker, StageResult, StepResult, buy_count_for,
-                       farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles, is_seed_offer,
-                       pick_seed_offer, player_free_slots, seed_items, surplus_sell_plan,
-                       till_blocked_by)
+from .farmwork import (CLUMP_KINDS, ENV_BLOCK_STATUSES, FRONTIER_KINDS, PATH_STAMINA_ALLOWANCE,
+                       SEED_KEEP_FACTOR, STAGE_ACTION, STAMINA_COST_CLEAR, STAMINA_COST_SOW,
+                       STAMINA_COST_TILL, STAMINA_COST_WATER, FarmWorker, StageResult, StepResult,
+                       buy_count_for, farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles,
+                       is_seed_offer, pick_seed_offer, player_free_slots, seed_items,
+                       surplus_sell_plan, till_blocked_by)
 from .planner import (DECISIONS_KEPT, LESSONS_INJECT_CHARS, LESSONS_INJECT_MAX, BoundaryPlanner, Brief,
                       PlannerState, TaskIntent, TaskOutcome, decision_line, deterministic_plan,
                       load_lessons_file, make_lesson, prune_lessons, render_lessons,
@@ -70,6 +70,23 @@ __all__ = ["DayReport", "LongRun", "plot_observe"]
 #: 用锄头/镰刀**真的清得掉**的障碍。树/果树/资源堆/灌木不在里面：
 #: `farmwork.SKIP_KINDS` 会跳过它们（"先用斧头砍"），把它们算成"活"会让这一天永远做不完。
 ACTIONABLE_KINDS = ("weed", "twig", "stone", "grass")
+
+
+def _tool_blocked_tv(tv: Mapping[str, Any] | None) -> bool:
+    """【task-20】这一格是不是"工具不够格 / 判不了"（观测层面就能判，不需要动手）。
+
+    判据（单一权威实现，`_stage_tiles`/`work_reasons` 共用）：
+      * kind 属于 `farmwork.CLUMP_KINDS`（clump/stump/log/boulder/rockPile/greenRain）；
+      * 且 `toolOk` **不是** `True`（`false` = 明确不够格；`null`/缺字段 = 判不了 ⇒ fail-closed）。
+    ⇒ 这样的格子：不进"可清目标"、不产生"还有活"的守卫理由、当天封格次日重试。
+
+    其余 kind（weed/twig/stone/tree/fruitTree/grass/bush）**一律不受影响**（返回 False）。
+    """
+    if not tv:
+        return False
+    if str(tv.get("kind") or "") not in CLUMP_KINDS:
+        return False
+    return tv.get("toolOk") is not True
 
 #: 看**全场**目标的任务（浇水/收获要伺候所有作物）；其余阶段只看**作业区**。
 #: 这个区分决定"没目标"这笔账当天会不会因为换了一片地而作废。
@@ -665,6 +682,9 @@ class LongRun:
         # 【task-41 NIT-2】当天是否已经播报过 `farm_evidence_unavailable`（室内 + farm 证据不可用
         # ⇒ fail-closed，绝不放行 `no_work`）。一天只记一次，免得每轮刷同一条 journal。
         self.farm_evidence_noted = False
+        # 【task-20】`blocked_by_tool_summary` 每天只发一次：工具不够格的格子**不算活**，
+        # 但账本要能看出"农场还剩障碍、为什么却收了工"（逐格另有 `blocked_by_tool`）。
+        self.tool_blocked_noted = False
         # 【task-149 C】当天是否**独立证明**过"确实没活可做"：只有 `sleep_guard` 在 farm 证据
         # 齐备（`complete`/`dryCrops`/`hoeDirt`/`emptyDirt` 都能读）且 `work_reasons` 为空时
         # 才置真。日终 checks 用它拦"0 动作却 VERIFIED"的假绿灯（run9c summer 20：22.81 秒、
@@ -2503,7 +2523,12 @@ class LongRun:
             # Mod 只给计数（`farm.deadCrops`）⇒ 本卡清不到，由 `clear_dead_scope` journal 留痕。
             pool = [t for t, v in tmap.items() if v.get("crop") and v.get("dead")]
         elif task == "clear_area":
-            pool = [t for t in local if str((tmap.get(t) or {}).get("kind") or "") in ACTIONABLE_KINDS]
+            # 【task-20】防御性过滤：`toolOk == false`（明确不够格）或判不了的 clump 一族
+            # **不进"可清目标"**。当前 `ACTIONABLE_KINDS` 本来就不含 clump 一族（所以这层现在
+            # 是冗余的），但口径要显式钉住：只要哪天清障池扩到 clump，也不能把敲不动的格子选进来。
+            pool = [t for t in local
+                    if str((tmap.get(t) or {}).get("kind") or "") in ACTIONABLE_KINDS
+                    and not _tool_blocked_tv(tmap.get(t))]
         elif task == "till_area":
             # 以**观测**为准判"能不能锄"：Mod 的 `tillable[]` 会含"有未知特征"的假阳性格
             # （真机 (73,25) 一带，锄 16 下白烧 60+ 体力，用户 m01804）。
@@ -2597,6 +2622,21 @@ class LongRun:
         """"还有活可做"的理由（空 = 真的没活了）。"""
         reasons: list[str] = []
         tmap = FarmWorker.tiles_of(obs)
+        # 【task-20】工具不够格/判不了的 clump 一族：**只留痕、绝不算活**。
+        # 反例（不许发生）：农场里剩一块暂时敲不动的巨石 ⇒ 守卫永远说"还有活" ⇒ 永不收工。
+        # 所以这里既不 append 理由，也不让它们进 `_stage_tiles` 的池子（`_tool_blocked_tv`）。
+        tool_blocked = [t for t, v in tmap.items() if _tool_blocked_tv(v)]
+        if tool_blocked and not self.tool_blocked_noted:
+            self.tool_blocked_noted = True
+            self._journal("blocked_by_tool_summary",
+                          count=len(tool_blocked),
+                          tiles=[list(t) for t in tool_blocked[:6]],
+                          kinds=sorted({str((tmap.get(t) or {}).get("kind") or "未知")
+                                        for t in tool_blocked}),
+                          tools=sorted({str((tmap.get(t) or {}).get("tool") or "（未知工具）")
+                                        for t in tool_blocked}),
+                          note="这些格工具不够格或观测判不出 ⇒ 不算活、不进守卫理由；"
+                               "当天封格（逐格 journal blocked_by_tool），次日工具升级后自动重试")
         # 【task-84】"该浇水"只看**活苗**：枯死作物浇了也没用（用户 m11003）⇒ 死苗不算活，
         # 它的去处是 `clear_dead`（`_stage_tiles("clear_dead")` 单独管）。
         unwatered = [t for t, v in tmap.items()
@@ -3628,10 +3668,11 @@ class LongRun:
         unreach_marked = 0
         refused_marked = 0
         encircled_marked = 0
+        tool_blocked_marked = 0
         for s in steps:
             if not s.tile:
                 continue
-            if not s.unreachable and not s.encircled:
+            if not s.unreachable and not s.encircled and not s.blocked_by_tool:
                 # 旧口径不动：只有 `till`/`clear`/`sow` 这类**主观能动**的动作才记「动了没用」。
                 if not (s.failed or s.proven_inert) or s.action not in ("till", "clear", "sow"):
                     continue
@@ -3669,6 +3710,27 @@ class LongRun:
                               kind=str((s.after or {}).get("kind") or "未知"),
                               reason=s.reason[:200])
                 continue
+            if s.blocked_by_tool:
+                # 【task-20】工具等级/种类不够（或观测判不了）⇒ **一次都没挥**、不白烧体力。
+                # 与 `refused` 的区别：`refused` 是"挥了、游戏拒绝"（真花了体力才拿到结论），
+                # 这里是"**动手之前**观测就说不该挥"（`clumpTarget`/`toolOk` 判据）。
+                # 当天封格（次日自动重试：工具可能升完级）、逐格 journal 留 `need`/`min_level`；
+                # **不进** unreachable/refused 两套豁免（它不是世界约束、也不是硬失败），
+                # 且**不产生任何"还有活"的守卫理由**（否则一块敲不动的巨石会让人永远收不了工）。
+                self.blocked[key] = f"{s.action} 工具不够格：{s.reason[:80]}"
+                tool_blocked_marked += 1
+                self._journal("blocked_by_tool", tile=list(key), action=s.action, stage=stage,
+                              zone=self.zone_name,
+                              kind=str(((FarmWorker.tiles_of(after_obs) or {}).get(key)
+                                        or (FarmWorker.tiles_of(before_obs) or {}).get(key)
+                                        or {}).get("kind") or "未知"),
+                              need=str(getattr(s, "tool_need", "") or ""),
+                              min_level=getattr(s, "tool_min_level", None),
+                              reason=s.reason[:200],
+                              note="工具等级/种类不够（或观测判不出）⇒ 今天不再挥这格："
+                                   "0 次 use_tool、不算硬失败、不进 unreachable/refused 豁免；"
+                                   "次日自动重试（工具可能已升级）")
+                continue
             if s.encircled:
                 # 【task-68】被围住（四邻没有"可清 + 自己够得着"的突破口）。
                 # 【task-78 NIT-2】逐格 journal 照实带 `kinds`（四邻真实 kind，从 reason 里读不到就
@@ -3704,6 +3766,10 @@ class LongRun:
             rep.notes.append(
                 f"记下 {refused_marked} 格「游戏拒绝」的地，今天不再白试（次日重试；不算硬失败，"
                 f"但有界）")
+        if tool_blocked_marked:
+            rep.notes.append(
+                f"记下 {tool_blocked_marked} 格「工具不够格」的地，今天不再挥"
+                f"（0 次 use_tool、不算硬失败；次日重试）")
 
     def _count_attempts(self, steps: list[StepResult]) -> None:
         """统计"每格今天**白试**过几次"（`MAX_TILE_ATTEMPTS` 兜底不变量）。
@@ -4617,6 +4683,8 @@ class LongRun:
         self.plots_today = 0
         self.plots_capped_noted = False
         self.farm_evidence_noted = False
+        # 【task-20】工具不够格的留痕每天清零（次日工具可能已升级 ⇒ 要重新评估、重新留痕）。
+        self.tool_blocked_noted = False
         # 【task-149 C】"确实没活"的独立证据每天清零：昨天证明过不等于今天也证明过。
         self.no_work_evidence_ok = False
         # 【task-149 B】"开工没回到农场"每天清零（同 `_ensure_on_farm` 的写入点）。

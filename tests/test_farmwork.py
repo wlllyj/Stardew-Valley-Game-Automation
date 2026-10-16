@@ -2184,5 +2184,91 @@ class TestTask102BuyNoSpace(unittest.TestCase):
         self.assertEqual(r.status, "item_not_sold")
 
 
+class TestTask20ToolGatedClumps(unittest.TestCase):
+    """【task-20】工具等级不够的 clump 一族：**判据在动手之前**，一次 `use_tool` 都不许发。
+
+    用户原话（m01758/m01804）：「工具等级不够要判断一下，不要白白浪费很多体力」。
+    字段来自 task-155（Mod 侧）：`clumpKind` / `clumpTarget{tool,minLevel}` / 三态 `toolOk`
+    （`true` 够 / `false` 明确不够 / `null` 判不了）。脑侧只消费，**绝不猜工具、绝不默认 0 级**。
+
+    变异实测（`scratch\\_t20_mutate.py`，brain+tests 一起拷临时目录再打补丁）：
+    基线 5 条全绿；**m20a**（把 `if tool_ok is False:` 短路）杀 `test_tool_ok_false_never_swings`；
+    **m20c**（`if tool_ok is True:` 改成 `is not False` ⇒ 判不了当"够"）杀 `test_missing_target_is_fail_closed`。
+    """
+
+    TARGET = (60, 10)
+
+    @staticmethod
+    def _clump_rec(tile, *, kind="boulder", tool="pickaxe", min_level=2, tool_ok=False,
+                   index=672) -> dict:
+        return {"tile": list(tile), "kind": kind, "feature": "ResourceClump",
+                "clumpIndex": index, "clumpWidth": 2, "clumpHeight": 2, "clumpHealth": 10.0,
+                "clumpKind": kind, "clumpTarget": {"tool": tool, "minLevel": min_level},
+                "toolOk": tool_ok, "standable": False}
+
+    def _worker(self, records):
+        return make_worker(MiniWorld(records=records))
+
+    def test_tool_ok_false_never_swings(self):
+        """`toolOk=false` ⇒ `skipped` + `blocked_by_tool`，**0 次 use_tool**、不是 failed。"""
+        w = MiniWorld(records=[self._clump_rec(self.TARGET, tool="pickaxe", min_level=2,
+                                              tool_ok=False)])
+        r = make_worker(w).clear(self.TARGET)
+        self.assertEqual(r.code, "skipped")
+        self.assertIs(r.failed, False, "工具不够格不是硬失败")
+        self.assertIs(r.proven_inert, False,
+                      "不吃 proven_inert：那是「这格今天动不了」的口径，这里是「工具不够格」")
+        self.assertIs(r.blocked_by_tool, True)
+        self.assertEqual(w.calls, [], "一次 use_tool 都不许发")
+        self.assertIn("pickaxe≥2", r.reason)
+        self.assertIn("0 次 use_tool", r.reason)
+        self.assertIn("今天不再试这格", r.reason)
+        self.assertEqual(r.tool_need, "pickaxe≥2")
+        self.assertEqual(r.tool_min_level, 2)
+        self.assertIs(r.as_dict().get("blocked_by_tool"), True)
+
+    def test_axe_kind_is_not_guessed_as_pickaxe(self):
+        """树桩（`stump`，斧≥1）不够格时 reason/journəl 证据必须是 `axe≥1`，不许写镐。"""
+        w = MiniWorld(records=[self._clump_rec(self.TARGET, kind="stump", tool="axe",
+                                              min_level=1, tool_ok=False, index=600)])
+        r = make_worker(w).clear(self.TARGET)
+        self.assertEqual(r.tool_need, "axe≥1")
+        self.assertEqual(w.calls, [])
+        self.assertNotIn("pickaxe", r.reason)
+
+    def test_tool_ok_true_clump_is_still_skipped_and_inert(self):
+        """`toolOk=true` 的 clump 仍整类 `skipped` + `proven_inert`（不许用 `auto` 去撞）。"""
+        w = MiniWorld(records=[self._clump_rec(self.TARGET, tool_ok=True)])
+        r = make_worker(w).clear(self.TARGET)
+        self.assertEqual(r.code, "skipped")
+        self.assertIs(r.proven_inert, True, "工具够也不主动撞：用哪把由 Mod 挑")
+        self.assertIs(r.blocked_by_tool, False)
+        self.assertEqual(w.calls, [], "整类跳过 ⇒ 一次都不挥")
+        self.assertIn("R2", r.reason)
+        self.assertIn("auto", r.reason)
+
+    def test_missing_target_is_fail_closed(self):
+        """`clumpTarget` 缺失 / `toolOk` 缺失 ⇒ 【无法判定】+ 不挥（不许默认斧头、不许默认 0）。"""
+        rec = self._clump_rec(self.TARGET)
+        rec.pop("clumpTarget")
+        rec.pop("toolOk")
+        w = MiniWorld(records=[rec])
+        r = make_worker(w).clear(self.TARGET)
+        self.assertEqual(r.code, "skipped")
+        self.assertIs(r.blocked_by_tool, True)
+        self.assertEqual(w.calls, [], "判不了 ⇒ fail-closed 不挥")
+        self.assertIn("无法判定", r.reason)
+        self.assertIn("不许默认斧头", r.reason)
+        self.assertIsNone(r.tool_min_level)
+
+    def test_plain_debris_still_swings(self):
+        """反例（不许误伤）：`weed`/`stone`/`twig` 照旧正常挥 —— 没有任何 `toolOk` 逻辑。"""
+        w = MiniWorld(records=[weed_rec(self.TARGET)])
+        r = make_worker(w).clear(self.TARGET)
+        self.assertTrue(r.ok, r.reason)
+        self.assertNotEqual(w.calls, [], "普通杂草必须照旧挥")
+        self.assertIs(r.blocked_by_tool, False)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

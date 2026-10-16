@@ -86,6 +86,9 @@ class FakeWorld:
         self.blockers: dict[tuple[int, int], str] = {}
         for t in sorted(self.tillable)[:weeds]:
             self.blockers[t] = "weed"
+        #: 【task-20】clump 一族的**结构化元数据**（`task-155` 的 Mod 字段）：按格补进 `tiles[]`，
+        #: 形如 `{"clumpIndex":672,"clumpKind":"boulder","clumpTarget":{"tool","minLevel"},"toolOk":False}`。
+        self.clump_meta: dict[tuple[int, int], dict] = {}
         self.dirt: set[tuple[int, int]] = set()
         self.crops: dict[tuple[int, int], dict[str, bool]] = {}
         self.player_tile = [62, 14]
@@ -155,7 +158,11 @@ class FakeWorld:
     def obs(self) -> dict:
         tiles: list[dict] = []
         for t, kind in sorted(self.blockers.items()):
-            tiles.append({"tile": list(t), "kind": kind, "standable": True, "actionable": True})
+            rec = {"tile": list(t), "kind": kind, "standable": True, "actionable": True}
+            meta = self.clump_meta.get(t)
+            if meta:
+                rec.update(meta)
+            tiles.append(rec)
         for t in sorted(self.dirt):
             tv: dict = {"tile": list(t), "kind": "dirt", "feature": "HoeDirt",
                         "standable": True, "actionable": True}
@@ -8103,6 +8110,113 @@ class TestTask158StaminaBudget(unittest.TestCase):
         w2 = FakeWorld(weeds=0, seeds=0, money=0, stamina=200.0)
         w2.farm = {"loaded": True, "complete": False}
         self.assertEqual(self._run_with(w2)._stamina_budget(w2.obs())["basis"], "conservative")
+
+
+class TestTask20ToolGatedClumps(unittest.TestCase):
+    """【task-20】工具不够格的 clump 一族：**不算活**（否则永不收工）、不白挥、当天封格。
+
+    用户诉求（m01758/m01804）：「工具等级不够要判断一下，不要白白浪费很多体力」。
+    观测判据来自 task-155 的 Mod 字段（`clumpKind`/`clumpTarget`/三态 `toolOk`）。
+
+    变异实测（`scratch\\_t20_mutate.py`，brain+tests 一起拷临时目录再打补丁）：
+    基线 6 条全绿；**m20b**（`_tool_blocked_tv` 恒 `False`）杀
+    `test_tool_blocked_tiles_are_never_claimed_as_work`。
+    """
+
+    TARGET = (60, 10)
+
+    def _world(self, *, tool_ok=False, kind="boulder", tool="pickaxe", min_level=2,
+               drop=None) -> FakeWorld:
+        w = FakeWorld(seeds=0, money=0, weeds=0)
+        w.blockers[self.TARGET] = kind
+        meta: dict = {"clumpIndex": 672, "clumpKind": kind,
+                      "clumpTarget": {"tool": tool, "minLevel": min_level}}
+        if tool_ok is not None:
+            meta["toolOk"] = tool_ok
+        if drop:
+            meta.pop(drop, None)
+        w.clump_meta[self.TARGET] = meta
+        return w
+
+    @staticmethod
+    def _plot(w: FakeWorld) -> dict:
+        return {"zone": "", "label": "", "anchor": [60, 10],
+                "tiles": [list(t) for t in sorted(w.tillable)], "note": ""}
+
+    @staticmethod
+    def _events(run, name: str) -> list:
+        return [e for e in run.entries if e.get("event") == name]
+
+    def test_clear_area_never_targets_tool_blocked_tiles(self):
+        """`toolOk=false` 的巨石：不进清障池（哪怕清障池口径以后扩到 clump）。"""
+        w = self._world(tool_ok=False)
+        run = make_run(w)
+        self.assertEqual(run._stage_tiles("clear_area", w.obs(), self._plot(w)), [])
+
+    def test_tool_blocked_tiles_are_never_claimed_as_work(self):
+        """关键反例：还剩一块敲不动的巨石 ⇒ 守卫**不许**说"还有活"（否则永不收工）。"""
+        w = self._world(tool_ok=False)
+        run = make_run(w)
+        self.assertEqual(run.work_reasons(w.obs()), [])
+        self.assertEqual(len(self._events(run, "blocked_by_tool_summary")), 1)
+        run.work_reasons(w.obs())
+        self.assertEqual(len(self._events(run, "blocked_by_tool_summary")), 1,
+                         "一天只留痕一次，不许每轮刷")
+        ev = self._events(run, "blocked_by_tool_summary")[0]
+        self.assertEqual(ev["count"], 1)
+        self.assertEqual(ev["kinds"], ["boulder"])
+
+    def test_undecidable_clump_is_also_not_work(self):
+        """`toolOk` 缺失（判不了）⇒ 同样不算活、同样不进清障池（fail-closed）。"""
+        w = self._world(tool_ok=None)
+        run = make_run(w)
+        self.assertEqual(run._stage_tiles("clear_area", w.obs(), self._plot(w)), [])
+        self.assertEqual(run.work_reasons(w.obs()), [])
+
+    def test_farmworker_skip_is_marked_blocked_with_a_journal_row(self):
+        """真 `FarmWorker.clear()` 判下来的 `blocked_by_tool` ⇒ 当天封格 + 逐格 journal。"""
+        w = self._world(tool_ok=False)
+        worker = FarmWorker(FakeClient(w), log=lambda _s: None)
+        st = worker.clear(self.TARGET)
+        self.assertEqual(st.code, "skipped")
+        self.assertIs(st.blocked_by_tool, True)
+        self.assertEqual(getattr(w, "swings", {}), {}, "一次 use_tool 都不许发")
+        run = make_run(w)
+        rep = DayReport(day_key=("spring", 1, 6), started_at=0.0)
+        run._mark_blocked(w.obs(), w.obs(), [st], rep, stage="clear_area")
+        self.assertIn(self.TARGET, run.blocked, "工具不够格 ⇒ 当天不再选它")
+        self.assertNotIn(self.TARGET, run.unreachable_day, "不进「走不到」账本")
+        self.assertNotIn(self.TARGET, run.refused_day, "也不进「游戏拒绝」账本（一次都没挥）")
+        rows = self._events(run, "blocked_by_tool")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["tile"], list(self.TARGET))
+        self.assertEqual(rows[0]["need"], "pickaxe≥2")
+        self.assertEqual(rows[0]["min_level"], 2)
+        self.assertTrue(any("工具不够格" in n for n in rep.notes), rep.notes)
+
+    def test_pending_work_excludes_tool_blocked_tiles(self):
+        """封格之后，"今天还有活"的跨片地记账也不许把它们算进去。"""
+        w = self._world(tool_ok=False)
+        worker = FarmWorker(FakeClient(w), log=lambda _s: None)
+        st = worker.clear(self.TARGET)
+        run = make_run(w)
+        rep = DayReport(day_key=("spring", 1, 6), started_at=0.0)
+        run.leftover_targets.add(self.TARGET)
+        run._mark_blocked(w.obs(), w.obs(), [st], rep, stage="clear_area")
+        self.assertEqual(run._pending_work(), [])
+
+    def test_day_with_only_a_tool_blocked_clump_still_rests(self):
+        """端到端：农场只剩一块敲不动的巨石 ⇒ 当天照常 `no_work` 收工并 VERIFIED。
+
+        （这条是"永不收工"的回归闸：守卫若把工具不够格的格算成活，这里会 `stuck`/不达标。）
+        """
+        w = self._world(tool_ok=False)
+        run = make_run(w, target_days=1)
+        code = run.run()
+        self.assertEqual(code, 0, f"应当是干净的一天；ended={run.days[-1].ended_by}/"
+                                  f"{run.days[-1].ended_reason}")
+        self.assertIs(run.days[-1].verified, True)
+        self.assertEqual(run.days[-1].ended_reason.split(":", 1)[0], "no_work")
 
 
 if __name__ == "__main__":  # pragma: no cover

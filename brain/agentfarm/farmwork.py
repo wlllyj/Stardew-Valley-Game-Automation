@@ -34,6 +34,7 @@ from typing import Any, Callable
 from .bridge import BridgeClient, BridgeError
 
 __all__ = [
+    "CLUMP_KINDS",
     "DEAD_TOOL_CANDIDATES",
     "DEBRIS_KINDS",
     "ENV_BLOCK_STATUSES",
@@ -92,6 +93,12 @@ SKIP_KINDS = {
 
 #: 草：锄头锄不出耕地（真机实测跳过原因），但**该用镰刀割掉**——"清理农场障碍"包含它。
 GRASS_KIND = "grass"
+
+#: 【task-155/task-20】大障碍（`ResourceClump`）在观测里的 kind 取值（Mod 侧 `ClumpMeta.KindOf`：
+#: 600→stump、602→log、672→boulder、148|622→rockPile、752+→greenRain、未知→clump）。
+#: 这些格**都要先判"工具够不够"再决定挥不挥**：观测给了 `clumpTarget{tool,minLevel}` 与三态
+#: `toolOk`（`true` 够 / `false` 明确不够 / `null` 判不了）——见 `CLUMP_TOOL_OK_*` 与 `clear()`。
+CLUMP_KINDS = ("clump", "stump", "log", "boulder", "rockPile", "greenRain")
 
 #: `clear()` 一次最多连挥几刀。普通镰刀一刀只把 `Grass.numberOfWeeds` 减 1（金镰刀减 2），
 #: 而 `Grass.TryDropItemsOnCut` 只有在 `numberOfWeeds <= 0` 时才返回 true 并移除特征
@@ -436,6 +443,19 @@ class StepResult:
     #: 【task-78 NIT-2】判 `encircled` 时四邻的**真实 kind**（`["weed","未知","空地",…]`）。
     #: 进逐格 journal `encircled.kinds` —— 观测拿不到就写"未知"，**不许**替观测断言"树/桩/大石"。
     encircled_kinds: list[str] = field(default_factory=list)
+    #: 【task-20】被**工具等级/工具种类**挡住（`clumpKind` 一族 + `toolOk==false` 或判不了）：
+    #: - `skipped`（**一次 `use_tool` 都没发**，所以不是 `failed`、也不吃可达性配额）；
+    #: - **不置 `proven_inert`**：那条口径是"这一格今天动不了"（缺工具/观测说动不了），
+    #:   而这里是"我们的**工具不够格**"—— 工具升级完当天就可能变，语义不同、单独留痕；
+    #: - 但它同样是"今天别再选它"的结论 ⇒ `longrun._mark_blocked` 记进当天的 `blocked`
+    #:   并逐格 journal `blocked_by_tool`（次日自动重试），**不产生任何"还有活"的守卫理由**
+    #:   （否则农场里只要有一块暂时敲不动的巨石，就永远收不了工）。
+    blocked_by_tool: bool = False
+    #: 【task-20】被工具挡住时的**结构化证据**（进逐格 journal `blocked_by_tool`，供事后复核与
+    #: 工具侧对账）：`tool_need` 形如 `"pickaxe≥2"`（判不了时是 `"（未知工具）≥（未知等级）"`），
+    #: `tool_min_level` 是观测给的 `minLevel`（`null` 原样是 `None`，**不许**当 0）。
+    tool_need: str = ""
+    tool_min_level: int | None = None
 
     @property
     def skipped(self) -> bool:
@@ -497,6 +517,8 @@ class StepResult:
             d["tried_open"] = self.tried_open
         if self.refused:
             d["refused"] = True
+        if self.blocked_by_tool:
+            d["blocked_by_tool"] = True
         if self.available:
             d["available"] = self.available
         return d
@@ -1662,6 +1684,45 @@ class FarmWorker:
 
         if (tv or {}).get("crop"):
             r.code, r.reason = "skipped", "这一格有作物，清障会伤到它"
+            return r
+        if kind in CLUMP_KINDS:
+            # 【task-155/task-20】大障碍：观测**必须**先回答"我们够不够格动它"，够不着就一次都别挥。
+            # 用户 m01758/m01804 的原话是"工具等级不够要判断一下，不要白白浪费很多体力"。
+            # 三态 `toolOk`（Mod `ClumpMeta` 按 `parentSheetIndex` 推 `clumpTarget{tool,minLevel}`）：
+            #   true  ⇒ 工具够：仍整类跳过（R2：**不走 `auto` 去撞**，用哪把/挥几下由 Mod 挑），
+            #           但置 `proven_inert`（"这一格今天不指望清掉"⇒ 当天不再选中）；
+            #   false ⇒ **明确不够格**：`skipped` + `blocked_by_tool`，**0 次 `use_tool`**，
+            #           不置 `proven_inert`（那是"缺工具/观测说动不了"的口径），reason 写清
+            #           "需要 <tool>≥<minLevel>"；
+            #   null/缺字段 ⇒ **判不了**：fail-closed 不挥（**不许默认斧头、不许默认 0 级**），
+            #           同样 `blocked_by_tool` 留痕。
+            tgt = (tv or {}).get("clumpTarget")
+            tool_ok = (tv or {}).get("toolOk")
+            need_tool = str((tv or {}).get("tool") or "")
+            min_level: Any = None
+            if isinstance(tgt, dict):
+                need_tool = str(tgt.get("tool") or need_tool)
+                min_level = tgt.get("minLevel")
+            need = (f"{need_tool or '（未知工具）'}≥"
+                    f"{min_level if min_level is not None else '（未知等级）'}")
+            r.tool_need = need
+            r.tool_min_level = int(min_level) if isinstance(min_level, int) else None
+            if tool_ok is False:
+                r.code = "skipped"
+                r.blocked_by_tool = True
+                r.reason = (f"工具等级不够（需要 {need}；kind={kind}，clumpIndex="
+                            f"{(tv or {}).get('clumpIndex')}）⇒ 判据在动手之前就拦下："
+                            f"**0 次 use_tool**、不白烧体力；今天不再试这格")
+                return r
+            if tool_ok is True:
+                r.code, r.proven_inert = "skipped", True
+                r.reason = (f"{kind} 整类跳过（R2）：观测说工具够（{need}），但**不用 `auto` 去撞**"
+                            f"—— 用哪把、挥几下由 Mod 自己挑；这一格今天不指望清掉")
+                return r
+            r.code = "skipped"
+            r.blocked_by_tool = True
+            r.reason = (f"【无法判定】工具够不够（clumpTarget={tgt!r}、toolOk={tool_ok!r}）"
+                        f"⇒ fail-closed 不挥：不许默认斧头、不许默认 0 级；今天不再试这格")
             return r
         if kind in SKIP_KINDS:
             r.code, r.reason = "skipped", SKIP_KINDS[kind]
