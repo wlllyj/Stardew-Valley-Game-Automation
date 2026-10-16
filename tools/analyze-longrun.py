@@ -114,6 +114,16 @@
     `count < wanted` 且当天没有对应 `buy_partial`（量力而行必须留痕）；②同日既有 `buy_partial`
     又有 `cannot_afford`（可能是不同货品单价差、也可能判据打架，只提示人工核对）。
     旧账本没有该事件、`buy` 也没有 `wanted` 字段 ⇒ 头部 `<缺失>` + 【无法判定】（缺失 ≠ 0）。
+  * 窗口外浇水 + 壶空补水（task-133）：`water_far` 新增 `cause`（**`need_refill` = 壶空 ⇒
+    "不是够不着"**）/`evidence`/`refills`/`retried_after_refill`/`in_dry_tiles_before|after`/
+    `dry_tiles_status`；壶空时先记 `water_far_refill`（`tile`/`ok`/`code`/`water_before`/
+    `water_after`/`tries`/`limit`/`reason`/`receipt`，一天有界 ≤ `FAR_DRY_REFILL_MAX`=2），
+    补上后回浇同一格。头部 `窗口外浇水/补水` 行 + 建议 0q；口径 = **两个事件都不是失败**
+    （`tools\verify-run3.py` 对 `water_far_refill` 零命中 ⇒ 本工具不判红、不进 rc）。只给两条
+    **可证伪形态**的 ⚠：①补水没成（回执不 ok 且水位没涨）当天却把那格浇成了（回执/水位有一边
+    不可信）；②当天补水预算用尽（`tries >= limit`）⇒ 剩下的干格今天注定浇不上。
+    旧账本没有 `water_far_refill`、`water_far` 也没有 `cause` ⇒ 头部 `<缺失>` + 【无法判定】
+    （缺失 ≠ 0）。
   * 事件映射不许漂移（Lead m02395）：brain 里 `_journal("<name>"` 的**每个**事件名都要在
     `EVENT_BUCKETS` 里有桶（结构性事件 `day_start`/`day_end`/`finish` 除外，见 `STRUCTURAL_EVENTS`）；
     账本里出现没桶的事件 ⇒ 报告头部逐条点名（名字×次数+行号）+ 建议 0a，**绝不静默丢弃**。
@@ -323,6 +333,26 @@ FIELD_PROBES = [
     ("event:water_far_skipped", "water_far_skipped",
      "窗口外有干作物、但**人不在户外农场**（task-104：reason=not_on_farm/tiles/count/where/note）"
      "⇒ 不扣该格当日额度、不进 `given_up`，**不是失败**；先回农场再说（run8 day 12 形态）"),
+    # task-133：壶空是**前置条件**，不是「够不着」——动手前先补水（一天有界 ≤2 次），补水后回浇同一格。
+    # 这些事件都**不是失败**；只有"补不上水却浇成了""预算用尽"这两条可证伪形态才给 ⚠（不判红）。
+    ("event:water_far_refill", "water_far_refill",
+     "窗口外浇水前的一次补水（task-133：tile/ok/code/water_before/water_after/tries/limit/reason/"
+     "receipt）⇒ **不是失败**，是'壶空=前置条件'的直接证据；补水没成才是那格今天浇不上的因由"),
+    ("event:water_far_refill.water_after", "water_far_refill_water_after",
+     "补水后的壶内水量（`None` = 无尽壶/读不到）；`water_after > water_before` 即使回执不 ok 也算"
+     "补上了 —— brain 的判据同此（回执可能不准）"),
+    ("event:water_far.cause", "water_far_cause",
+     "窗口外干格没浇成的因由（task-133：`need_refill`=壶空 ⇒ **不是够不着**；`not_watered` 等）；"
+     "缺失 ⇒ `<缺失>`（旧账本形态，不当 0）"),
+    ("event:water_far.refills", "water_far_refills",
+     "该次尝试时当天已用掉的窗口外补水次数（task-133；与 `refill_limit` 一起看预算是否用尽）"),
+    ("event:water_far.retried_after_refill", "water_far_retried_after_refill",
+     "补水后是否回浇了同一格（task-133：true = 壶空→补水→回浇这条链真跑完，不是空转）"),
+    ("event:water_far.dry_tiles_status", "water_far_dry_tiles_status",
+     "`farm.dryTiles` 可信度（task-104/133：ok / unavailable）；unavailable ⇒ 判不了那格是否还干"),
+    ("event:water_far.in_dry_tiles_after", "water_far_in_dry_tiles_after",
+     "浇完后该格是否**仍在** dryTiles 里（判据 = 该格 watered=true 或已不在 dryTiles，"
+     "绝不用全局 dryCrops 差值）"),
     ("event:goto_farm.where", "goto_farm_where",
      "进农场/走位的原因（task-49/task-102：`day_start` = 日初入场；`day_start_retry` = 早晨被模态挡下"
      "后的重试入场 —— run8 day 12 的 goto_farm 就是被晨间 ShippingMenu 挡成 ui_modal）"),
@@ -387,6 +417,30 @@ FIELD_PROBES = [
     ("event:plot_exhausted_burst", "plot_exhausted_burst",
      "同一秒 ≥5 次换片（task-124：count/zone；brain PLOT_EXHAUSTED_BURST=5）⇒ 按既有有界机制"
      "收尾，不判红；burst 当天仍自称 VERIFIED ⇒ ⚠ 警告（连发=没目标的证据，与 VERIFIED 互斥）"),
+    # task-134 A（与 task-124/task-130 同族）：`resume_reevaluate` = 回跨片区 leftover 前清掉任务级
+    # `no_target`（走路→空转→再走路的死循环的解药；`verify-run3.py` 对该名零命中 ⇒ 不判红）；
+    # `no_progress_burst` = 回片区/换作业区连续无产出触顶 ⇒ 按既有有界机制**诚实收尾**（stuck、
+    # leftover 如实保留）⇒ 本身不是失败；只有"当天却自称 VERIFIED"这条可证伪形态给 ⚠。
+    ("event:resume_reevaluate", "resume_reevaluate",
+     "回跨片区 leftover 之前清掉**任务级** `no_target`（where/cleared；`no_target_global` 不动）"
+     "⇒ 死循环被解药的直接证据，**不判红**（缺失 ⇒【无法判定】）"),
+    ("event:no_progress_burst", "no_progress_burst",
+     "回片区/换作业区**连续**无产出触顶 ⇒ 有界机制诚实收尾（count/source/tiles/reasons；"
+     "收尾理由必为 `stuck:`，leftover 如实保留）⇒ **不判红**；当天却自称 VERIFIED ⇒ ⚠ 警告"),
+    # task-134 B（分配额口径）：阶段"分下去的格没做完" vs 片区 leftover vs 诚实上限留下的 deferred。
+    ("event:stage_shortfall", "stage_shortfall",
+     "阶段分下去的格**没做完**（stage/zone/assigned/undone/stopped/leftover）⇒ 本身不是失败事件，"
+     "当天的 unmet 由日级 `stage_shortfall_day` + `checks.no_unmet_stages` 说话"),
+    ("event:stage_shortfall_day", "stage_shortfall_day",
+     "日级：`unmet`=Σ assigned_undone（非诚实上限）、`stages`、`plot_pending`=片区还剩几格、"
+     "`stopped_night`（task-134 B）⇒ **分离两个口径**、本身不判红（红由 no_unmet_stages=false 说）"),
+    ("event:deferred_tiles", "deferred_tiles",
+     "诚实上限（体力用尽/夜里收工/分配额做完后撞 budget）留下的片区待办（tiles/night/by_kind/stages）"
+     "⇒ **只作 info、绝不当'没做完还硬说达标'**（brain 明确不进 no_unmet_stages）"),
+    ("day_end.assigned_undone", "assigned_undone",
+     "当天 Σ 阶段 assigned_undone（分下去没做完的格数，task-134 B；日级 `no_unmet_stages` 看它）"),
+    ("day_end.deferred_tiles", "deferred_tiles",
+     "当天诚实上限留下的片区待办格数（task-134 B；info、不进 no_unmet_stages）"),
     # task-132（task-123 在制）：量力而行买种子 —— 钱只够买 `bought < wanted` 时照样买，**不是失败**。
     # 只有"自称买满却 count<wanted 且没有对应 buy_partial"或"同日既有 buy_partial 又有 cannot_afford"
     # 这类**可证伪**形态才给 ⚠ 警告（verify-run3.py 对 `buy_partial` 零命中 ⇒ 判红会两边反向）。
@@ -478,6 +532,9 @@ EVENT_BUCKETS = {
     "resume_walk": "resume_walks",
     "water_far": "water_fars",
     "water_far_unavailable": "water_far_unavailable",
+    # task-133（run9b 的 need_refill 病）：窗口外浇水前壶空 ⇒ **先补水再浇**（一天有界），
+    # 壶空是前置条件、**不是「够不着」**。这条是"试过补水"的直接证据，本身不是失败。
+    "water_far_refill": "water_far_refills",
     "seed_gate": "seed_gates",
     "stage_midway_leftover": "stage_midway_leftover",
     "buy": "buys",
@@ -582,6 +639,16 @@ EVENT_BUCKETS = {
     "review_only_fallback_failed": "review_only_fallback_failures",
     "review_only_no_target": "review_only_no_targets",
     "plot_exhausted_burst": "plot_exhausted_bursts",
+    # task-134 A（同族）：`resume_reevaluate` = 回跨片 leftover 前清任务级 no_target（死循环解药）；
+    # `no_progress_burst` = 连续无产出触顶 ⇒ 有界机制诚实收尾（stuck）。两者都**不是失败**，
+    # `verify-run3.py` 对这两个名字零命中 ⇒ 本工具不判红，只给可证伪形态的 ⚠ 警告。
+    "resume_reevaluate": "resume_reevaluates",
+    "no_progress_burst": "no_progress_bursts",
+    # task-134 B（分配额口径）：阶段 assigned_undone / 日级 shortfall / 诚实上限 deferred_tiles。
+    # 三者都不是失败（红由 `checks.no_unmet_stages=false` 说话；deferred 明确不进该检查）。
+    "stage_shortfall": "stage_shortfalls",
+    "stage_shortfall_day": "stage_shortfall_days",
+    "deferred_tiles": "deferred_tiles",
     # task-132（task-123 在制）：量力而行买种子 —— 钱只够买一半照样买（`buy_partial`），
     # **不是失败**（不进 failed、不判红；`tools\verify-run3.py` 对该名零命中），只作信息项 +
     # 两条可证伪 ⚠ 警告（自称买满却买少且无留痕 / 同日 `buy_partial` 与 `cannot_afford` 同时出现）。
@@ -626,6 +693,12 @@ NEW_EVENT_BUCKETS = (
     "buy_no_spaces", "slept_without_works", "modal_dismiss_failures",
     # task-104：窗口外浇水被人不在农场挡下（不扣额度、不认输 ⇒ 不是失败）
     "water_far_skips",
+    # task-134 A：回跨片区 leftover 前清任务级 no_target（死循环解药）+ 连续无产出触顶诚实收尾
+    "resume_reevaluates", "no_progress_bursts",
+    # task-134 B：分配额口径（阶段没做完 / 日级 unmet / 诚实上限留下的 deferred，均 info）
+    "stage_shortfalls", "stage_shortfall_days", "deferred_tiles",
+    # task-133：窗口外浇水前补水（壶空=前置条件，不是够不着；补水没成才是那格浇不上的因由）
+    "water_far_refills",
     # task-111：LLM 复盘 / 教训库（本日 notes、复盘失败、教训库新增/淘汰、读写失败）
     "review_llms", "review_llm_failures", "lessons_events",
     "lessons_load_failures", "lessons_save_failures",
@@ -2329,14 +2402,64 @@ def build_advice(report, top=8):
                            "（弃权没生效；只警告）")
         if rfa.get("failed_events"):
             _rparts.append(f"⚠ 兜底抛异常 {rfa.get('failed_events')} 次（{rfa.get('failed_errors', [])[:2]}）")
+        if rfa.get("resume_events"):
+            _rparts.append(f"回跨片区重评 {rfa.get('resume_events')} 次"
+                           f"（清掉任务级 no_target：{'、'.join(list((rfa.get('resume_cleared') or {}).keys())[:4]) or '（无）'}）"
+                           "——走路→空转→再走路死循环的解药，不判红")
+        if rfa.get("no_progress_events"):
+            _rparts.append(f"连续无产出触顶 {rfa.get('no_progress_events')} 次（最多 count="
+                           f"{rfa.get('no_progress_max', 0)}、覆盖 {rfa.get('no_progress_tiles', 0)} 格；来源 "
+                           f"{'、'.join(f'{k}×{v}' for k, v in list((rfa.get('no_progress_sources') or {}).items())[:3]) or '<缺失>'}）"
+                           "——按有界机制诚实收尾（stuck、leftover 如实保留），不判红")
+        for _wl, _wd, _what in ((rfa.get("warn_no_progress_verified_lines") or [],
+                                 rfa.get("warn_no_progress_verified_days") or [],
+                                 "连续无产出触顶当天却自称 VERIFIED"),
+                                (rfa.get("warn_burst_verified_lines") or [],
+                                 rfa.get("warn_burst_verified_days") or [],
+                                 "burst 当天却自称 VERIFIED")):
+            if _wl:
+                _rparts.append(f"⚠ {_what}：{'、'.join(str(x) for x in _wd[:3])}"
+                               "（触顶/连发=没目标的证据，与 VERIFIED 互斥；只警告）")
+                break
         advice.append({
             "text": "review 兜底/换片连发（信息项，**不是失败**）：" + "；".join(_rparts)
-                    + "。这些事件是 task-124 修复生效的证据（review 独苗时改走能落地的意图 / "
-                      "把人带回跨片 leftover / 把换片空转按有界机制收尾）；verify-run3.py 对它们零命中 "
+                    + "。这些事件是 task-124/task-130 修复生效的证据（review 独苗时改走能落地的意图 / "
+                      "把人带回跨片 leftover / 把换片空转按有界机制收尾；task-134 A 另加：回跨片 leftover 前"
+                      "清任务级 no_target、连续无产出触顶按有界机制诚实收尾）；verify-run3.py 对它们零命中 "
                       "⇒ 本工具只给上面这几条可证伪形态的 ⚠ 警告，**不判红、不进 rc**；"
                       "旧账本没有这些事件 ⇒ 写【无法判定】（缺失 ≠ 0）",
             "lines": sorted(set((rfa.get("fallback_lines") or []) + (rfa.get("no_target_lines") or [])
-                                + (rfa.get("burst_lines") or []) + (rfa.get("failed_lines") or []))),
+                                + (rfa.get("burst_lines") or []) + (rfa.get("failed_lines") or [])
+                                + (rfa.get("resume_lines") or []) + (rfa.get("no_progress_lines") or []))),
+        })
+    # 0r) task-134 B：分配额口径（阶段 assigned_undone vs 片区 leftover vs 诚实上限 deferred）——
+    #     三者在报告里**只作信息项**（不判红）；红由 `checks.no_unmet_stages=false` 说话。
+    shfa = report.get("shortfall") or {}
+    if shfa.get("has_events") or shfa.get("has_day_fields"):
+        _sparts = []
+        if shfa.get("stage_events"):
+            _sparts.append(f"阶段没做完 {shfa.get('stage_events')} 次"
+                           f"（分下去 {shfa.get('assigned_total', 0)} 格 / 没做完 "
+                           f"{shfa.get('undone_total', 0)} 格；stopped "
+                           f"{'、'.join(f'{k}×{v}' for k, v in list((shfa.get('stopped_kinds') or {}).items())[:3]) or '<缺失>'}）")
+        if shfa.get("day_events"):
+            _sparts.append(f"日级 shortfall {shfa.get('day_events')} 次（unmet 最多 {shfa.get('unmet_max', 0)}、"
+                           f"片区 pending 最多 {shfa.get('plot_pending_max', 0)}）")
+        if shfa.get("deferred_events"):
+            _sparts.append(f"诚实上限留下 {shfa.get('deferred_tiles', 0)} 格"
+                           f"（night={shfa.get('deferred_night', 0)} 次）⇒ 只作 info、**不进 no_unmet_stages**")
+        if shfa.get("warn_stopped_night_mismatch_lines"):
+            _sparts.append(f"⚠ 口径打架：行 {shfa.get('warn_stopped_night_mismatch_lines')[:4]}"
+                           "（日级说 stopped_night=false 而当天 ended_reason 是 night，只警告、不判红）")
+        advice.append({
+            "text": "阶段分配额/诚实上限（信息项，**不判红**）：" + "；".join(_sparts)
+                    + "。task-134 B 起日级 `no_unmet_stages` 看**分配额** `assigned_undone`"
+                      "（分下去的格 − 做成/按规跳过），`plot_pending`（片区还剩几格）只供守卫/换片/resume；"
+                      "体力用尽/夜里收工/做完后撞 budget 留下的片区待办记 `deferred_tiles`，"
+                      "**绝不当'没做完还硬说达标'**；缺失 ⇒【无法判定】（缺失 ≠ 0）",
+            "lines": sorted(set((shfa.get("stage_lines") or []) + (shfa.get("day_lines") or [])
+                                + (shfa.get("deferred_lines") or [])
+                                + (shfa.get("warn_stopped_night_mismatch_lines") or []))),
         })
     # 0p-2) task-132（task-123 在制）：量力而行买种子 —— **买一半不是失败**；只列两条可证伪 ⚠。
     bpv = report.get("buy_partial") or {}
@@ -2362,6 +2485,32 @@ def build_advice(report, top=8):
                       "**不判红、不进 rc**；旧账本缺这些字段 ⇒【无法判定】（缺失 ≠ 0）",
             "lines": sorted(set((bpv.get("lines") or []) + (bpv.get("warn_missing_partial_lines") or [])
                                 + (bpv.get("cannot_afford_lines") or []))),
+        })
+    # 0q) task-133：窗口外浇水 + 壶空先补水 —— **不是失败**（壶空是前置条件，不是"够不着"）；
+    #     只列两条可证伪 ⚠（补水没成却浇成 / 当天补水预算用尽）。
+    wfv = report.get("water_far") or {}
+    if wfv.get("has_events"):
+        _wparts = [f"water_far {wfv.get('far_events', 0)} 次（浇成 {wfv.get('far_ok', 0)} / "
+                   f"没成 {wfv.get('far_failed', 0)}；因由 "
+                   f"{'、'.join(f'{k}×{v}' for k, v in list((wfv.get('far_causes') or {}).items())[:4]) or '<缺失>'}）",
+                   f"补水 water_far_refill {wfv.get('refill_events', 0)} 次（成功 "
+                   f"{wfv.get('refill_ok', 0)} / 没成 {wfv.get('refill_failed', 0)}）"]
+        if wfv.get("far_need_refill_lines"):
+            _wparts.append(f"其中因由=need_refill（壶空）的行 {wfv.get('far_need_refill_lines')[:6]}"
+                           "——壶空**不是够不着**：先补水再回浇；补水没成才是那格今天浇不上的因由")
+        if wfv.get("warn_refill_failed_but_watered_lines"):
+            _wparts.append(f"⚠ 补水没成却把那格浇成了：行 "
+                           f"{wfv.get('warn_refill_failed_but_watered_lines')[:6]}（只警告）")
+        if wfv.get("warn_budget_exhausted_lines"):
+            _wparts.append(f"⚠ 当天补水预算用尽（tries ≥ limit）：行 "
+                           f"{wfv.get('warn_budget_exhausted_lines')[:6]}"
+                           "——剩余干格今天注定浇不上（只警告）")
+        advice.append({
+            "text": "窗口外浇水/壶空补水（信息项，**不是失败**）：" + "；".join(_wparts)
+                    + "。verify-run3.py 对 `water_far_refill` 零命中 ⇒ 本工具不判红、不进 rc；"
+                      "旧账本没有该事件 ⇒【无法判定】（缺失 ≠ 0）",
+            "lines": sorted(set((wfv.get("far_lines") or []) + (wfv.get("refill_lines") or [])
+                                + (wfv.get("warn_refill_failed_but_watered_lines") or []))),
         })
     # 0c) 环境挡路 / 没拿到结论（task-22 记账）
     env = report.get("env_inconclusive") or {}
@@ -2650,15 +2799,16 @@ def build_undecidable(rows, sessions, prelude, report):
     # （缺失 ⇒【无法判定】；**缺失 ≠ 0 = 没发生过**，也绝不当"没有兜底/没连发"通过）
     _rf_ev = [ev for _ln, ev in rows
               if ev.get("event") in ("review_only_fallback", "review_only_fallback_failed",
-                                     "review_only_no_target", "plot_exhausted_burst")]
+                                     "review_only_no_target", "plot_exhausted_burst",
+                                     "resume_reevaluate", "no_progress_burst")]
     _rf = report.get("review_fallback") or {}
     if rows and not _rf_ev:
-        out.append("本账本没有任何 task-124 的兜底/弃权/连发事件（`review_only_fallback`/"
-                   "`review_only_fallback_failed`/`review_only_no_target`/`plot_exhausted_burst`）："
-                   "无法判定当天是否出现过 review 兜底与换片连发 —— **缺失 ≠ 0，绝不当'没发生'通过**"
-                   "（task-124/130）")
+        out.append("本账本没有任何 review 兜底/弃权/连发/无产出触顶事件（`review_only_fallback`/"
+                   "`review_only_fallback_failed`/`review_only_no_target`/`plot_exhausted_burst`/"
+                   "`resume_reevaluate`/`no_progress_burst`）：无法判定当天是否出现过这些机制"
+                   " —— **缺失 ≠ 0，绝不当'没发生'通过**（task-124/130/134）")
     elif _rf_ev and not _rf.get("has_events"):
-        out.append("task-124 事件存在但没进聚合（工具 bug 迹象）：无法判定兜底/弃权/连发计数")
+        out.append("task-124/134 事件存在但没进聚合（工具 bug 迹象）：无法判定兜底/弃权/连发/触顶计数")
     # task-132（task-123 在制）：量力而行买种子的证据是否存在（旧账本没有 `buy_partial`、`buy` 也
     # 没有 `wanted` 字段）—— **缺失 ≠ 0，绝不当"没出现过买一半"通过**。
     _bp_ev = [ev for _ln, ev in rows if ev.get("event") == "buy_partial"]
@@ -2668,6 +2818,37 @@ def build_undecidable(rows, sessions, prelude, report):
                    "无法判定是否出现过「钱只够买一半」—— **缺失 ≠ 0，绝不当'没发生'通过**（task-132）")
     elif _bp_ev and not _bpv.get("has_events"):
         out.append("task-123 事件存在但没进聚合（工具 bug 迹象）：无法判定部分购买计数")
+    # task-133：窗口外浇水的**补水证据**是否存在（旧账本没有 `water_far_refill`、`water_far` 也没有
+    # `cause`/`retried_after_refill`）—— **缺失 ≠ 0，绝不当"没试过补水 / 不是壶空"通过**。
+    _wf_ev = [ev for _ln, ev in rows if ev.get("event") == "water_far_refill"]
+    _wfv = report.get("water_far") or {}
+    if not _wf_ev and not _wfv.get("far_events"):
+        out.append("本账本没有 `water_far` / `water_far_refill` 事件（task-133 之前的形态）："
+                   "无法判定是否出现过「壶空 ⇒ 先补水再回浇」—— **缺失 ≠ 0，绝不当'没发生'通过**"
+                   "（task-133）")
+    else:
+        _wf_missing = []
+        if not _wf_ev and _wfv.get("far_events"):
+            _wf_missing.append("没有任何 `water_far_refill` ⇒ 无法判定壶空时到底补没补"
+                               "（task-133 之前的账本形态）")
+        if _wfv.get("far_cause_missing"):
+            _wf_missing.append(f"{_wfv.get('far_cause_missing')} 条 `water_far` 没有 `cause` 字段"
+                               "⇒ 无法判定没浇成是壶空还是别的因由")
+        if _wf_missing:
+            out.append("窗口外浇水的补水证据不全：" + "；".join(_wf_missing)
+                       + " —— **缺失 ≠ 0，绝不当'不是壶空'通过**（task-133）")
+    # task-134 B：分配额口径的证据是否存在（旧账本没有 stage_shortfall(_day)/deferred_tiles 事件，
+    # `day_end` 也没有 assigned_undone/deferred_tiles 字段）—— **缺失 ≠ 0，绝不当"没发生"通过**。
+    _sf_ev = [ev for _ln, ev in rows
+              if ev.get("event") in ("stage_shortfall", "stage_shortfall_day", "deferred_tiles")]
+    _shf = report.get("shortfall") or {}
+    if not _sf_ev and not _shf.get("has_day_fields"):
+        out.append("本账本没有任何 task-134 B 分配额字段（`stage_shortfall`/`stage_shortfall_day`/"
+                   "`deferred_tiles` 事件与 `day_end.assigned_undone`/`day_end.deferred_tiles` 都没有）："
+                   "无法判定「分下去的格做完了没」与「诚实上限留下多少」—— "
+                   "**缺失 ≠ 0，绝不当'都做完了'通过**（task-134 B）")
+    elif _sf_ev and not _shf.get("has_events"):
+        out.append("task-134 B 事件存在但没进聚合（工具 bug 迹象）：无法判定分配额/诚实上限计数")
     # task-36：自称浇过、却没有 final_water 可核对的那些天（verify-run3.py:414-418 同口径：只记信息项）
     no_fw = [
         lineno for lineno, ev in rows
@@ -3302,6 +3483,12 @@ def build_report(rows, path, args, bad_lines):
     _rv_fbf = [(ln, ev) for ln, ev in rows if ev.get("event") == "review_only_fallback_failed"]
     _rv_nt = [(ln, ev) for ln, ev in rows if ev.get("event") == "review_only_no_target"]
     _rv_burst = [(ln, ev) for ln, ev in rows if ev.get("event") == "plot_exhausted_burst"]
+    # task-134 A（与 task-124/task-130 同族）：①`resume_reevaluate` = 回跨片区 leftover 前清掉
+    # 任务级 `no_target`（走路→空转→再走路的死循环的**解药**，是修复生效的证据）；
+    # ②`no_progress_burst` = 回片区/换作业区连续无产出触顶 ⇒ 按既有有界机制**诚实收尾**（stuck，
+    # leftover 如实保留）。两者都**不是失败**，只有"当天却自称 VERIFIED"这类可证伪形态给 ⚠。
+    _rv_resume = [(ln, ev) for ln, ev in rows if ev.get("event") == "resume_reevaluate"]
+    _rv_np = [(ln, ev) for ln, ev in rows if ev.get("event") == "no_progress_burst"]
     review_fallback = {
         "fallback_events": len(_rv_fb), "fallback_lines": [ln for ln, _ in _rv_fb],
         "fallback_work_spot": 0, "fallback_pending_walk": 0, "fallback_walked": 0,
@@ -3312,9 +3499,14 @@ def build_report(rows, path, args, bad_lines):
         "no_target_pending": 0, "no_target_tiles": [],
         "burst_events": len(_rv_burst), "burst_lines": [ln for ln, _ in _rv_burst],
         "burst_max": 0, "burst_zones": [],
+        "resume_events": len(_rv_resume), "resume_lines": [ln for ln, _ in _rv_resume],
+        "resume_cleared": {},
+        "no_progress_events": len(_rv_np), "no_progress_lines": [ln for ln, _ in _rv_np],
+        "no_progress_max": 0, "no_progress_tiles": 0, "no_progress_sources": {},
+        "warn_no_progress_verified_days": [], "warn_no_progress_verified_lines": [],
         "warn_burst_verified_days": [], "warn_burst_verified_lines": [],
         "warn_no_target_still_guarded_days": [], "warn_no_target_still_guarded_lines": [],
-        "has_events": bool(_rv_fb or _rv_fbf or _rv_nt or _rv_burst),
+        "has_events": bool(_rv_fb or _rv_fbf or _rv_nt or _rv_burst or _rv_resume or _rv_np),
     }
     for _ln, ev in _rv_fb:
         _src = str(ev.get("source") or "")
@@ -3358,6 +3550,25 @@ def build_report(rows, path, args, bad_lines):
             review_fallback["warn_no_target_still_guarded_lines"].append(_ln)
             if _lab not in review_fallback["warn_no_target_still_guarded_days"]:
                 review_fallback["warn_no_target_still_guarded_days"].append(_lab)
+    # task-134 A：①`resume_reevaluate` 清了哪些任务级 no_target（次数 = 死循环被解药的证据）；
+    # ②`no_progress_burst` 的连发次数/格数/来源，以及"当天却自称 VERIFIED"这条可证伪 ⚠。
+    for _ln, ev in _rv_resume:
+        for _tk in (ev.get("cleared") or []):
+            _tks = str(_tk)
+            review_fallback["resume_cleared"][_tks] = \
+                review_fallback["resume_cleared"].get(_tks, 0) + 1
+    for _ln, ev in _rv_np:
+        review_fallback["no_progress_max"] = max(review_fallback["no_progress_max"],
+                                                 as_int(ev.get("count")) or 0)
+        review_fallback["no_progress_tiles"] += as_int(ev.get("tiles")) or 0
+        _src = str(ev.get("source") or "?")
+        review_fallback["no_progress_sources"][_src] = \
+            review_fallback["no_progress_sources"].get(_src, 0) + 1
+        _lab, _di = _lr_day_of(_ln)
+        if _di is not None and _di < len(days) and days[_di].get("verified") is True:
+            review_fallback["warn_no_progress_verified_lines"].append(_ln)
+            if _lab not in review_fallback["warn_no_progress_verified_days"]:
+                review_fallback["warn_no_progress_verified_days"].append(_lab)
     # task-132（task-123 在制 `buy_partial`）：**买一半不是失败** —— `n = min(buy_count, money//price)`，
     # `n >= 1` 就买下，`n < wanted` 时另记 `buy_partial`（**不进** `failed`、不判红）。旧账本没有该事件、
     # `buy` 也没有 `wanted` 字段 ⇒【无法判定】（缺失 ≠ 0 ≠ "没发生"）。两条**可证伪** ⚠ 警告（不判红：
@@ -3440,6 +3651,116 @@ def build_report(rows, path, args, bad_lines):
             buy_partial["buy_ok_missing_wanted"] += 1
         elif _c is not None and _c >= _w:
             buy_partial["buy_ok_full"] += 1
+    # task-134 B（分配额口径）：`stage_shortfall`（阶段分下去的格没做完）/`stage_shortfall_day`
+    # （日级 unmet=assigned_undone）/`deferred_tiles`（诚实上限留下的片区待办，**只作 info、
+    # 不进 no_unmet_stages**）。三者本身都**不判红**（红由 `checks.no_unmet_stages=false` 说话）；
+    # 只有"日级说 `stopped_night=false` 而当天 `ended_reason` 却是 night"这条可证伪形态给 ⚠。
+    _sf_stage = [(ln, ev) for ln, ev in rows if ev.get("event") == "stage_shortfall"]
+    _sf_day = [(ln, ev) for ln, ev in rows if ev.get("event") == "stage_shortfall_day"]
+    _sf_def = [(ln, ev) for ln, ev in rows if ev.get("event") == "deferred_tiles"]
+    shortfall = {
+        "stage_events": len(_sf_stage), "stage_lines": [ln for ln, _ in _sf_stage],
+        "assigned_total": 0, "undone_total": 0, "stopped_kinds": {}, "stage_zones": [],
+        "day_events": len(_sf_day), "day_lines": [ln for ln, _ in _sf_day],
+        "unmet_max": 0, "plot_pending_max": 0,
+        "deferred_events": len(_sf_def), "deferred_lines": [ln for ln, _ in _sf_def],
+        "deferred_tiles": 0, "deferred_night": 0,
+        "warn_stopped_night_mismatch_lines": [], "warn_stopped_night_mismatch_days": [],
+        "has_events": bool(_sf_stage or _sf_day or _sf_def),
+        "has_day_fields": any("assigned_undone" in _d or "deferred_tiles" in _d
+                              for _s in sessions for _e in (_s.get("day_ends") or [])
+                              for _d in [_e[1]]),
+    }
+    for _ln, _ev in _sf_stage:
+        shortfall["assigned_total"] += as_int(_ev.get("assigned")) or 0
+        shortfall["undone_total"] += as_int(_ev.get("undone")) or 0
+        _st = str(_ev.get("stopped") or "?")
+        shortfall["stopped_kinds"][_st] = shortfall["stopped_kinds"].get(_st, 0) + 1
+        _z = str(_ev.get("zone") or "")
+        if _z and _z not in shortfall["stage_zones"]:
+            shortfall["stage_zones"].append(_z)
+    for _ln, _ev in _sf_day:
+        shortfall["unmet_max"] = max(shortfall["unmet_max"], as_int(_ev.get("unmet")) or 0)
+        shortfall["plot_pending_max"] = max(shortfall["plot_pending_max"],
+                                            as_int(_ev.get("plot_pending")) or 0)
+        _lab, _di = _lr_day_of(_ln)
+        if _di is None or _di >= len(days):
+            continue
+        _der = str(days[_di].get("ended_reason") or "")
+        if _ev.get("stopped_night") is False and _der.startswith("night"):
+            shortfall["warn_stopped_night_mismatch_lines"].append(_ln)
+            if _lab not in shortfall["warn_stopped_night_mismatch_days"]:
+                shortfall["warn_stopped_night_mismatch_days"].append(_lab)
+    for _ln, _ev in _sf_def:
+        shortfall["deferred_tiles"] += as_int(_ev.get("tiles")) or 0
+        if _ev.get("night") is True:
+            shortfall["deferred_night"] += 1
+    # task-133（run9b 的 need_refill 病）：窗口外浇水 + 壶空先补水 —— 两个事件都**不是失败**，
+    # 但两条可证伪形态要点名（都只给 ⚠ 警告、不进 red / 不进 rc，`verify-run3.py` 对
+    # `water_far_refill` 零命中）：①补水没成（回执不 ok 且水位没涨）当天却把那格浇成了；
+    # ②当天补水预算用尽（`tries >= limit`）⇒ 剩下的干格今天注定浇不上。
+    _wf_refills = [(ln, ev) for ln, ev in rows if ev.get("event") == "water_far_refill"]
+    _wf_fars = [(ln, ev) for ln, ev in rows if ev.get("event") == "water_far"]
+    water_far = {
+        "refill_events": len(_wf_refills), "refill_lines": [ln for ln, _ in _wf_refills],
+        "refill_ok": sum(1 for _, ev in _wf_refills if ev.get("ok") is True),
+        "refill_failed": sum(1 for _, ev in _wf_refills if ev.get("ok") is not True),
+        "refill_codes": {}, "refill_failed_lines": [], "refill_tiles": [],
+        "water_before": [ev.get("water_before") for _, ev in _wf_refills],
+        "water_after": [ev.get("water_after") for _, ev in _wf_refills],
+        "refill_tries": [as_int(ev.get("tries"), None) for _, ev in _wf_refills],
+        "refill_limits": [as_int(ev.get("limit"), None) for _, ev in _wf_refills],
+        "budget_exhausted_lines": [],
+        "far_events": len(_wf_fars), "far_lines": [ln for ln, _ in _wf_fars],
+        "far_ok": sum(1 for _, ev in _wf_fars if ev.get("ok") is True),
+        "far_failed": sum(1 for _, ev in _wf_fars if ev.get("ok") is not True),
+        "far_causes": {}, "far_cause_missing": 0, "far_tiles": [], "far_need_refill_lines": [],
+        "far_retried_after_refill": sum(1 for _, ev in _wf_fars
+                                        if ev.get("retried_after_refill") is True),
+        "far_tiles_status": {},
+        "warn_refill_failed_but_watered_lines": [], "warn_budget_exhausted_lines": [],
+        "has_events": bool(_wf_refills or _wf_fars), "has_refill_events": bool(_wf_refills),
+    }
+    for _ln, _ev in _wf_refills:
+        _c = str(_ev.get("code") or "?")
+        water_far["refill_codes"][_c] = water_far["refill_codes"].get(_c, 0) + 1
+        _t = _ev.get("tile")
+        if isinstance(_t, list) and _t and _t not in water_far["refill_tiles"]:
+            water_far["refill_tiles"].append(_t)
+        if _ev.get("ok") is not True:
+            water_far["refill_failed_lines"].append(_ln)
+            _tr, _li = as_int(_ev.get("tries"), None), as_int(_ev.get("limit"), None)
+            if _tr is not None and _li is not None and _tr >= _li:
+                water_far["budget_exhausted_lines"].append(_ln)
+                water_far["warn_budget_exhausted_lines"].append(_ln)
+    _wf_ok_days = set()
+    for _ln, _ev in _wf_fars:
+        _lab, _di = _lr_day_of(_ln)
+        if _ev.get("ok") is True:
+            _wf_ok_days.add(_di)
+        _cause = str(_ev.get("cause") or "")
+        if _cause:
+            water_far["far_causes"][_cause] = water_far["far_causes"].get(_cause, 0) + 1
+            if _cause == "need_refill":
+                water_far["far_need_refill_lines"].append(_ln)
+        else:
+            water_far["far_cause_missing"] += 1
+        _st = str(_ev.get("dry_tiles_status") or "")
+        if _st:
+            water_far["far_tiles_status"][_st] = water_far["far_tiles_status"].get(_st, 0) + 1
+        _t = _ev.get("tile")
+        if isinstance(_t, list) and _t and _t not in water_far["far_tiles"]:
+            water_far["far_tiles"].append(_t)
+    # 可证伪 ⚠①：补水没成（回执不 ok、水位也没涨）当天却把那格浇成了 —— 回执/水位有一边不可信。
+    for _ln, _ev in _wf_refills:
+        if _ev.get("ok") is True:
+            continue
+        _wb, _wa = _ev.get("water_before"), _ev.get("water_after")
+        if isinstance(_wb, int) and isinstance(_wa, int) and _wa > _wb:
+            continue                       # 水确实变多 = 补上了（回执可能不准，brain 判据同此）
+        _lab, _di = _lr_day_of(_ln)
+        if _di in _wf_ok_days:
+            water_far["warn_refill_failed_but_watered_lines"].append(_ln)
     sleep_ok = sum(1 for _, ev in rows if ev.get("event") == "sleep" and ev.get("ok"))
     sleep_failed = sum(1 for _, ev in rows if ev.get("event") == "sleep" and not ev.get("ok"))
     blocked_by_action = {}
@@ -3519,6 +3840,10 @@ def build_report(rows, path, args, bad_lines):
         "bag_space": bag_space,
         # task-132（task-123 在制）：量力而行买种子 —— 买一半**不是失败**；两条可证伪 ⚠ 警告
         "buy_partial": buy_partial,
+        # task-133：窗口外浇水 + 壶空先补水（壶空=前置条件、**不是「够不着」**；两条可证伪 ⚠）
+        "water_far": water_far,
+        # task-134 B：分配额口径（阶段没做完 / 日级 unmet / 诚实上限 deferred；均 info、不判红）
+        "shortfall": shortfall,
         # task-111：LLM 收工复盘 / 跨日教训库（task-58/59/82；只有三条完整性红，其余信息项）
         "llm_review": llm_review,
         # task-124/task-130：review 兜底（work_spot/pending_walk）/ 弃权 / 换片连发
@@ -3971,8 +4296,21 @@ MAPPING_TEXT = [
      "信息项：出货（sell_failed = 有货没卖成，run6 要单独看）"),
     ("event:goto_farm / plot_walk / resume_walk (task-49)",
      "信息项：进农场/走田区/续走 —— 路径层证据，配合 reason 看"),
-    ("event:water_far / water_far_unavailable (task-50)",
-     "信息项：窗口外远距浇水；`ok=false` + `given_up=true` = '窗口外干格够不着'的直接证据"),
+    ("event:water_far / water_far_unavailable (task-50 / task-133)",
+     "信息项：窗口外远距浇水；`ok=false` + `given_up=true` = '窗口外干格够不着'的直接证据。"
+     "task-133 的新字段：`cause`（**`need_refill` = 壶空 ⇒ 不是够不着**）/`refills`/`refill_limit`/"
+     "`retried_after_refill`/`in_dry_tiles_before|after`/`dry_tiles_status`；"
+     "旧账本没有这些字段 ⇒ `<缺失>`（缺失 ≠ 0）"),
+    ("event:water_far_refill (task-133)",
+     "信息项：窗口外浇水**前**的一次补水（壶空=前置条件，一天有界 `tries/limit`；"
+     "`water_after > water_before` 即算补上、回执可能不准）**不是失败**；"
+     "只两条可证伪 ⚠（补水没成却浇成 / 当天补水预算用尽），本工具不判红、不进 rc"),
+    ("event:stage_shortfall / stage_shortfall_day / deferred_tiles (task-134 B)",
+     "信息项：分配额口径 —— 阶段 `assigned_undone>0`（非诚实上限）⇒ 当天 unmet（红由 "
+     "`checks.no_unmet_stages=false` 说话，本工具不重复判）；`plot_pending` = 片区还剩几格"
+     "（只供守卫/换片/resume）；`deferred_tiles` = 体力/夜里收工/撞 budget 留下的片区待办，"
+     "**只作 info、绝不进 no_unmet_stages**；唯一可证伪 ⚠ = 日级 `stopped_night=false` 而当天 "
+     "`ended_reason` 是 night（口径打架，只警告）"),
     ("event:seed_gate / stage_midway_leftover (task-15)",
      "信息项：种子闸门（种子/钱不够 ⇒ till/plant 被跳过，不算硬失败）+ 阶段中途遗留"),
     ("event:no_seed_for_sale / cannot_afford / seed_unavailable_today (task-67)",
@@ -4268,14 +4606,41 @@ def render_text(report, top):
                f"（行 {bp.get('warn_cannot_afford_same_day_lines', [])[:6]}）"
                "——可能是不同货品单价差、也可能判据打架，只提示人工核对（不判红）"
                if bp.get("warn_cannot_afford_same_day_lines") else ""))
+    # task-133：窗口外浇水 + 壶空先补水 —— 两个事件都**不是失败**（verify-run3.py 对
+    # `water_far_refill` 零命中）；只有两条可证伪形态给 ⚠ 警告，旧账本一律 `<缺失>`（缺失 ≠ 0）。
+    wf = report.get("water_far") or {}
+    if not wf.get("has_events"):
+        add("窗口外浇水/补水: <缺失>（本账本没有 water_far / water_far_refill 事件 ⇒ 无法判定"
+            "是否出现过；缺失 ≠ 0）")
+    else:
+        _wf_b = "、".join(str(x) for x in (wf.get("water_before") or [])[:4]) or "<缺失>"
+        _wf_a = "、".join(str(x) for x in (wf.get("water_after") or [])[:4]) or "<缺失>"
+        _wf_c = "、".join(f"{k}×{v}" for k, v in list((wf.get("far_causes") or {}).items())[:4])
+        add(f"窗口外浇水/补水: water_far {wf.get('far_events', 0)} 次（浇成 {wf.get('far_ok', 0)} / "
+            f"没成 {wf.get('far_failed', 0)}；因由 {_wf_c or '<缺失>'}；补水后回浇 "
+            f"{wf.get('far_retried_after_refill', 0)} 次）；补水 water_far_refill "
+            f"{wf.get('refill_events', 0)} 次（成功 {wf.get('refill_ok', 0)} / 没成 "
+            f"{wf.get('refill_failed', 0)}；水位 {_wf_b} → {_wf_a}；回执 "
+            f"{wf.get('refill_codes') or '<缺失>'}）"
+            "；口径：**壶空是前置条件、不是「够不着」**（先补水再回浇同一格；补水与窗口外浇水"
+            "都不判红）"
+            + (f"  ⚠ 补水没成却把那格浇成了：行 "
+               f"{wf.get('warn_refill_failed_but_watered_lines', [])[:6]}"
+               "（回执/水位读数有一边可信度存疑，只警告、不判红）"
+               if wf.get("warn_refill_failed_but_watered_lines") else "")
+            + (f"  ⚠ 当天补水预算用尽（tries ≥ limit，行 {wf.get('budget_exhausted_lines', [])[:6]}）"
+               "⇒ 剩下的干格今天注定浇不上（提示换补水点或提高上限，不判红）"
+               if wf.get("budget_exhausted_lines") else "")
+            + (f"  ⚠ {wf.get('far_cause_missing')} 条 water_far 没有 cause 字段（旧账本形态）"
+               if wf.get("far_cause_missing") else ""))
     pc, ws = report["events"].get("plots_capped", 0), report["events"].get("work_spot", 0)
     add(f"软上限/收尾: plots_capped {pc} 次（作业区配额到顶，信息项）；work_spot {ws} 次（收尾作业区）")
     # task-124/task-130：review 兜底 / 弃权 / 换片连发 —— 修复生效的证据（不判红），
     # 只给可证伪形态的 ⚠ 警告；旧账本没有这些事件 ⇒ `<缺失>`（缺失 ≠ 0 = 没发生过）。
     rf = report.get("review_fallback") or {}
     if not rf.get("has_events"):
-        add("review 兜底/换片连发: <缺失>（本账本没有 review_only_* / plot_exhausted_burst 事件 ⇒ "
-            "无法判定是否出现过；缺失 ≠ 0）")
+        add("review 兜底/换片连发: <缺失>（本账本没有 review_only_* / plot_exhausted_burst / "
+            "resume_reevaluate / no_progress_burst 事件 ⇒ 无法判定是否出现过；缺失 ≠ 0）")
     else:
         _itxt = "、".join(f"{k}×{v}" for k, v in list((rf.get("fallback_intents") or {}).items())[:4])
         add(f"review 兜底/换片连发: 兜底 {rf.get('fallback_events', 0)} 次"
@@ -4296,6 +4661,24 @@ def render_text(report, top):
                if rf.get("failed_events") else "")
             + "；口径：这些事件**不是失败**（是 task-124 修复生效的证据）"
               "，verify-run3.py 对它们零命中 ⇒ 本工具只警告不判红")
+    # task-134 B：分配额口径（阶段 assigned_undone vs 片区 leftover vs 诚实上限 deferred）——
+    # 三者都不是失败（红由 `checks.no_unmet_stages=false` 说话；deferred 明确不进该检查）。
+    shf = report.get("shortfall") or {}
+    if not shf.get("has_events") and not shf.get("has_day_fields"):
+        add("阶段分配额/诚实上限: <缺失>（本账本没有 stage_shortfall / stage_shortfall_day / "
+            "deferred_tiles 事件，day_end 也没有 assigned_undone/deferred_tiles 字段 ⇒ "
+            "无法判定「分下去的格做完了没」与「诚实上限留下多少」；缺失 ≠ 0）")
+    else:
+        add(f"阶段分配额/诚实上限: 阶段没做完 {shf.get('stage_events', 0)} 次"
+            f"（分下去 {shf.get('assigned_total', 0)} 格 / 没做完 {shf.get('undone_total', 0)} 格；"
+            f"stopped {'、'.join(f'{k}×{v}' for k, v in list((shf.get('stopped_kinds') or {}).items())[:4]) or '<缺失>'}）；"
+            f"日级 shortfall {shf.get('day_events', 0)} 次（unmet 最多 {shf.get('unmet_max', 0)}、"
+            f"片区 pending 最多 {shf.get('plot_pending_max', 0)}）；"
+            f"诚实上限留下 {shf.get('deferred_events', 0)} 次 / {shf.get('deferred_tiles', 0)} 格"
+            "（只作 info、**不进** no_unmet_stages）"
+            + (f"  ⚠ 日级说 stopped_night=false 但当天 ended_reason 是 night（行 "
+               f"{shf.get('warn_stopped_night_mismatch_lines', [])[:4]}）——两个口径打架，只警告、不判红"
+               if shf.get("warn_stopped_night_mismatch_lines") else ""))
     # task-111：LLM 收工复盘 / 跨日教训库（task-58/59/82）—— "模型没学到东西"不是失败，只呈现
     lri = report.get("llm_review") or {}
     if not lri.get("has_events"):

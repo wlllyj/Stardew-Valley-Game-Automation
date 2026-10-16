@@ -2670,7 +2670,7 @@ class TestReviewFallbackAndBurst(unittest.TestCase):
         self.assertIn("review 兜底/换片连发: 兜底 2 次", text)
         self.assertIn("弃权 1 次（6 格当日放弃、次日重试）", text)
         self.assertIn("换片连发 1 次（最多一次 count=12、zone=['field_ne']）", text)
-        self.assertIn("task-124 修复生效的证据", " ".join(a["text"] for a in rep["advice"]))
+        self.assertIn("task-124/task-130 修复生效的证据", " ".join(a["text"] for a in rep["advice"]))
 
     def test_burst_with_verified_is_warning_not_red(self):
         rep = self._report(self._day([1, "summer", 5], extra=[dict(self.BURST)]),
@@ -2715,7 +2715,8 @@ class TestReviewFallbackAndBurst(unittest.TestCase):
         text = mod.render_text(rep, 50)
         self.assertIn("review 兜底/换片连发: <缺失>", text)
         self.assertIn("缺失 ≠ 0", text)
-        self.assertIn("没有任何 task-124 的兜底/弃权/连发事件", " ".join(rep["undecidable"]))
+        self.assertIn("没有任何 review 兜底/弃权/连发/无产出触顶事件",
+                      " ".join(rep["undecidable"]))
 
 
 class TestBuyPartialAccounting(unittest.TestCase):
@@ -2853,6 +2854,272 @@ class TestBuyPartialAccounting(unittest.TestCase):
         self.assertIn("部分购买: <缺失>", text)
         self.assertIn("缺失 ≠ 0", text)
         self.assertIn("没有 `buy_partial` 事件", " ".join(rep["undecidable"]))
+
+
+class TestWaterFarRefillAccounting(unittest.TestCase):
+    """task-133：窗口外浇水（`water_far`）遇到壶空 ⇒ **先补水再回浇同一格**（`water_far_refill`）。
+
+    口径：壶空是**前置条件**、**不是「够不着」**；两个事件都**不是失败**，
+    `tools\\verify-run3.py` 对 `water_far_refill` 零命中 ⇒ 本工具**不判红、不进 rc**，只给两条
+    可证伪形态的 ⚠ 警告（补水没成却把那格浇成了 / 当天补水预算用尽）；旧账本没有
+    `water_far_refill`、`water_far` 也没有 `cause` ⇒ 头部 `<缺失>` + 【无法判定】（缺失 ≠ 0 ≠ 没发生）。
+    """
+
+    REFILL_OK = {"event": "water_far_refill", "t": 3.0, "tile": [12, 30], "ok": True,
+                 "code": "ok", "water_before": 0, "water_after": 40, "tries": 1, "limit": 2,
+                 "reason": "补水成功（waterLeft 0 → 40）", "receipt": "refilled: [ok] (HTTP 200)",
+                 "note": "壶空是前置条件，不是够不着"}
+    REFILL_FAIL = {"event": "water_far_refill", "t": 3.0, "tile": [12, 30], "ok": False,
+                   "code": "failed", "water_before": 0, "water_after": 0, "tries": 2, "limit": 2,
+                   "reason": "补水失败", "receipt": "failed: [failed] (HTTP 200)", "note": ""}
+    FAR_OK = {"event": "water_far", "t": 4.0, "tile": [12, 30], "ok": True, "code": "ok",
+              "cause": "need_refill", "refills": 1, "retried_after_refill": True,
+              "dry_tiles_status": "ok", "in_dry_tiles_after": False, "walked": True,
+              "watered": True, "receipt_ok": True, "reason": "已浇（水 4→3）"}
+    FAR_NEED = {"event": "water_far", "t": 4.0, "tile": [12, 30], "ok": False,
+                "code": "need_refill", "cause": "need_refill", "refills": 2,
+                "retried_after_refill": False, "dry_tiles_status": "ok",
+                "in_dry_tiles_after": True, "walked": True, "watered": False,
+                "reason": "壶空且补不上"}
+    FAR_OLD = {"event": "water_far", "t": 4.0, "tile": [12, 30], "ok": False, "code": "timeout",
+               "walked": True, "watered": False, "receipt_ok": False, "reason": "够不着"}
+    # task-134 A（与 task-124/130 同族）：回跨片区重评 + 连续无产出触顶 —— 都不是失败
+    RESUME = {"event": "resume_reevaluate", "t": 5.0, "where": "resume_walk_leftover",
+              "cleared": ["clear_area", "plant_area"],
+              "note": "回到跨片区 leftover 之前清掉任务级 no_target"}
+    NO_PROGRESS = {"event": "no_progress_burst", "t": 6.0, "count": 10,
+                   "source": "resume_walk", "tiles": 9,
+                   "reasons": ["field_ne还有地要清/开/种"],
+                   "note": "回片区/换作业区连续无产出 ⇒ 诚实收尾"}
+
+    def _day(self, day, *, extra=(), ended_reason="night"):
+        nxt = [day[0], day[1], day[2] + 1]
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": True,
+                  "watered_outdoor": True}
+        end = {"event": "day_end", "t": 9.0, "day": day, "day_text": "", "ended_by": "sleep",
+               "ended_reason": ended_reason, "verified": True, "checks": checks,
+               "stages": [{"stage": "water_area", "ok": 5, "skipped": 0, "failed": 0,
+                           "env_block": 0, "inconclusive": 0, "stopped": None, "leftover": 0}],
+               "outcomes": [], "ok_steps": 5, "skipped_steps": 0, "failed_steps": 0,
+               "notes": [], "final": final(nxt),
+               "final_water": {"t": 9.0, "location": "Farm", "tiles": 84, "crops": 31,
+                               "dry": 0, "scope": "farm"}}
+        return [day_start(day), *extra, end]
+
+    def _report(self, events, name, *, days=1):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = write_ledger(tmp.name, name, events)
+        self._tmp = tmp
+        return report_for(path, days=days, top=50)
+
+    def test_water_far_refill_has_bucket_and_is_not_unmapped(self):
+        self.assertIn("water_far_refill", mod.EVENT_BUCKETS,
+                      "water_far_refill 必须有桶（不许改名/藏事件）")
+        rep = self._report(self._day([1, "summer", 5],
+                                     extra=[dict(self.REFILL_OK), dict(self.FAR_OK)]),
+                           "wf_bucket.jsonl")
+        self.assertEqual(rep["unmapped_events"], {}, "已入桶 ⇒ 不许再出现未映射")
+        self.assertIn("water_far", rep)
+
+    def test_refill_and_far_are_info_only_and_visible(self):
+        rep = self._report(self._day([1, "summer", 5],
+                                     extra=[dict(self.REFILL_OK), dict(self.FAR_OK)]),
+                           "wf_info.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "补水和窗口外浇水都不是失败 ⇒ 绝不判红")
+        wf = rep["water_far"]
+        self.assertTrue(wf["has_events"])
+        self.assertEqual(wf["refill_events"], 1)
+        self.assertEqual(wf["refill_ok"], 1)
+        self.assertEqual(wf["far_events"], 1)
+        self.assertEqual(wf["far_ok"], 1)
+        self.assertEqual(wf["far_causes"], {"need_refill": 1})
+        self.assertEqual(wf["far_retried_after_refill"], 1)
+        self.assertEqual(wf["warn_refill_failed_but_watered_lines"], [])
+        text = mod.render_text(rep, 50)
+        self.assertIn("窗口外浇水/补水: water_far 1 次（浇成 1 / 没成 0", text)
+        self.assertIn("补水 water_far_refill 1 次（成功 1 / 没成 0", text)
+        self.assertIn("壶空是前置条件、不是「够不着」", text)
+        self.assertIn("壶空", " ".join(a["text"] for a in rep["advice"]))
+
+    def test_refill_failed_but_watered_same_day_is_warning(self):
+        rep = self._report(self._day([1, "summer", 5],
+                                     extra=[dict(self.REFILL_FAIL), dict(self.FAR_OK)]),
+                           "wf_warn.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "警告不是红：不进 rc")
+        wf = rep["water_far"]
+        self.assertEqual(wf["warn_refill_failed_but_watered_lines"], [2])
+        self.assertEqual(wf["budget_exhausted_lines"], [2])
+        text = mod.render_text(rep, 50)
+        self.assertIn("⚠ 补水没成却把那格浇成了：行 [2]", text)
+        self.assertIn("只警告、不判红", text)
+        self.assertIn("⚠ 当天补水预算用尽", text)
+
+    def test_budget_exhausted_alone_is_warning_not_red(self):
+        rep = self._report(self._day([1, "summer", 5],
+                                     extra=[dict(self.REFILL_FAIL), dict(self.FAR_NEED)]),
+                           "wf_budget.jsonl")
+        self.assertEqual(rep["red"]["total"], 0)
+        wf = rep["water_far"]
+        self.assertEqual(wf["warn_refill_failed_but_watered_lines"], [], "当天没有浇成的格 ⇒ 不报这条")
+        self.assertEqual(wf["warn_budget_exhausted_lines"], [2])
+        text = mod.render_text(rep, 50)
+        self.assertIn("当天补水预算用尽（tries ≥ limit，行 [2]）", text)
+
+    def test_need_refill_cause_is_named_and_not_red(self):
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.FAR_NEED)]),
+                           "wf_need.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "壶空不是够不着 ⇒ 不判红")
+        wf = rep["water_far"]
+        self.assertEqual(wf["far_need_refill_lines"], [2])
+        self.assertEqual(wf["far_causes"], {"need_refill": 1})
+        advice = " ".join(a["text"] for a in rep["advice"])
+        self.assertIn("need_refill", advice)
+        self.assertIn("壶空**不是够不着**", advice)
+        self.assertIn("verify-run3.py 对 `water_far_refill` 零命中", advice)
+
+    def test_old_ledger_without_refill_event_is_undecidable_not_zero(self):
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.FAR_OLD)]),
+                           "wf_old.jsonl")
+        self.assertEqual(rep["red"]["total"], 0)
+        wf = rep["water_far"]
+        self.assertEqual(wf["far_cause_missing"], 1, "旧账本没有 cause 字段 ⇒ 如实计数")
+        self.assertEqual(wf["refill_events"], 0)
+        und = " ".join(rep["undecidable"])
+        self.assertIn("没有任何 `water_far_refill`", und)
+        self.assertIn("1 条 `water_far` 没有 `cause` 字段", und)
+        self.assertIn("缺失 ≠ 0", und)
+        text = mod.render_text(rep, 50)
+        self.assertIn("1 条 water_far 没有 cause 字段（旧账本形态）", text)
+
+    def test_task134_events_have_buckets_and_are_visible(self):
+        self.assertIn("resume_reevaluate", mod.EVENT_BUCKETS)
+        self.assertIn("no_progress_burst", mod.EVENT_BUCKETS)
+        rep = self._report(self._day([1, "summer", 5],
+                                     extra=[dict(self.RESUME), dict(self.NO_PROGRESS)]),
+                           "np_info.jsonl")
+        self.assertEqual(rep["unmapped_events"], {}, "task-134 的两个事件已入桶 ⇒ 不许未映射")
+        self.assertEqual(rep["red"]["total"], 0, "死循环解药/有界收尾都不是失败 ⇒ 不判红")
+        rf = rep["review_fallback"]
+        self.assertTrue(rf["has_events"])
+        self.assertEqual(rf["resume_events"], 1)
+        self.assertEqual(rf["resume_cleared"], {"clear_area": 1, "plant_area": 1})
+        self.assertEqual(rf["no_progress_events"], 1)
+        self.assertEqual(rf["no_progress_max"], 10)
+        self.assertEqual(rf["no_progress_tiles"], 9)
+        text = mod.render_text(rep, 50)
+        self.assertIn("回跨片区重评 1 次", text)
+        self.assertIn("连续无产出触顶 1 次（最多 count=10", text)
+
+    def test_no_progress_verified_is_warning_not_red(self):
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.NO_PROGRESS)]),
+                           "np_warn.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "⚠ 警告不是红：不进 rc")
+        rf = rep["review_fallback"]
+        self.assertEqual(rf["warn_no_progress_verified_lines"], [2])
+        self.assertEqual(rf["warn_no_progress_verified_days"], [rep["days"][-1]["label"]])
+        text = mod.render_text(rep, 50)
+        self.assertIn("⚠ 连续无产出触顶当天却自称 VERIFIED", text)
+        self.assertIn("与 VERIFIED 互斥", text)
+
+
+class TestStageShortfallAndDeferred(unittest.TestCase):
+    """task-134 B：分配额口径 —— `stage_shortfall`（阶段分下去的格没做完）/`stage_shortfall_day`
+    （日级 unmet=assigned_undone）/`deferred_tiles`（诚实上限留下的片区待办）。
+
+    口径：三者都不是失败事件（红由 `checks.no_unmet_stages=false` 说话；`deferred_tiles` 明确不进
+    该检查）⇒ 本工具只作信息项；只有"日级说 `stopped_night=false` 而当天 `ended_reason` 是 night"
+    这条可证伪形态给 ⚠（不判红）；旧账本没有这些事件与字段 ⇒【无法判定】（缺失 ≠ 0）。
+    """
+
+    STAGE_SHORTFALL = {"event": "stage_shortfall", "t": 5.0, "stage": "till_area",
+                       "zone": "field_ne", "assigned": 12, "undone": 3, "stopped": "",
+                       "leftover": 7, "note": "阶段分下去的格没做完"}
+    SHORTFALL_DAY = {"event": "stage_shortfall_day", "t": 9.5, "unmet": 3,
+                     "stages": [{"stage": "till_area", "undone": 3, "assigned": 12,
+                                 "leftover": 7}],
+                     "plot_pending": 7, "stopped_night": True, "note": "日级 unmet"}
+    DEFERRED = {"event": "deferred_tiles", "t": 9.6, "tiles": 5, "night": True,
+                "by_kind": {"till": 5}, "stages": [], "note": "诚实上限留下的片区待办"}
+    SHORTFALL_DAY_MISMATCH = {"event": "stage_shortfall_day", "t": 9.5, "unmet": 2,
+                              "stages": [{"stage": "plant_area", "undone": 2}],
+                              "plot_pending": 2, "stopped_night": False,
+                              "note": "日级口径打架形态"}
+
+    def _day(self, day, *, extra=(), ended_reason="night"):
+        nxt = [day[0], day[1], day[2] + 1]
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": True,
+                  "watered_outdoor": True}
+        end = {"event": "day_end", "t": 9.9, "day": day, "day_text": "", "ended_by": "sleep",
+               "ended_reason": ended_reason, "verified": True, "checks": checks,
+               "stages": [{"stage": "water_area", "ok": 5, "skipped": 0, "failed": 0,
+                           "env_block": 0, "inconclusive": 0, "stopped": None, "leftover": 0}],
+               "outcomes": [], "ok_steps": 5, "skipped_steps": 0, "failed_steps": 0,
+               "notes": [], "final": final(nxt),
+               "final_water": {"t": 9.9, "location": "Farm", "tiles": 84, "crops": 31,
+                               "dry": 0, "scope": "farm"}}
+        return [day_start(day), *extra, end]
+
+    def _report(self, events, name, *, days=1):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = write_ledger(tmp.name, name, events)
+        self._tmp = tmp
+        return report_for(path, days=days, top=50)
+
+    def test_task134b_events_have_buckets_and_are_not_unmapped(self):
+        for _name in ("stage_shortfall", "stage_shortfall_day", "deferred_tiles"):
+            self.assertIn(_name, mod.EVENT_BUCKETS, f"{_name} 必须有桶（不许改名/藏事件）")
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.STAGE_SHORTFALL),
+                                                             dict(self.SHORTFALL_DAY),
+                                                             dict(self.DEFERRED)]),
+                           "sf_bucket.jsonl")
+        self.assertEqual(rep["unmapped_events"], {}, "已入桶 ⇒ 不许再出现未映射")
+        self.assertIn("shortfall", rep)
+
+    def test_shortfall_and_deferred_are_info_only_and_visible(self):
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.STAGE_SHORTFALL),
+                                                             dict(self.SHORTFALL_DAY),
+                                                             dict(self.DEFERRED)]),
+                           "sf_info.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "分配额/诚实上限都只作信息项 ⇒ 绝不判红")
+        sf = rep["shortfall"]
+        self.assertTrue(sf["has_events"])
+        self.assertEqual(sf["stage_events"], 1)
+        self.assertEqual(sf["assigned_total"], 12)
+        self.assertEqual(sf["undone_total"], 3)
+        self.assertEqual(sf["day_events"], 1)
+        self.assertEqual(sf["unmet_max"], 3)
+        self.assertEqual(sf["plot_pending_max"], 7)
+        self.assertEqual(sf["deferred_tiles"], 5)
+        self.assertEqual(sf["warn_stopped_night_mismatch_lines"], [])
+        text = mod.render_text(rep, 50)
+        self.assertIn("阶段分配额/诚实上限: 阶段没做完 1 次", text)
+        self.assertIn("诚实上限留下 1 次 / 5 格", text)
+        self.assertIn("只作 info、**不进** no_unmet_stages", text)
+        self.assertIn("分配额", " ".join(a["text"] for a in rep["advice"]))
+
+    def test_stopped_night_mismatch_is_warning_not_red(self):
+        rep = self._report(self._day([1, "summer", 5],
+                                     extra=[dict(self.SHORTFALL_DAY_MISMATCH)]),
+                           "sf_warn.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "⚠ 警告不是红：不进 rc")
+        sf = rep["shortfall"]
+        self.assertEqual(sf["warn_stopped_night_mismatch_lines"], [2])
+        self.assertEqual(sf["warn_stopped_night_mismatch_days"], [rep["days"][-1]["label"]])
+        text = mod.render_text(rep, 50)
+        self.assertIn("⚠ 日级说 stopped_night=false 但当天 ended_reason 是 night", text)
+        self.assertIn("只警告、不判红", text)
+
+    def test_old_ledger_without_fields_is_undecidable_not_zero(self):
+        rep = self._report(self._day([1, "summer", 5]), "sf_old.jsonl")
+        self.assertEqual(rep["red"]["total"], 0)
+        sf = rep["shortfall"]
+        self.assertFalse(sf["has_events"])
+        self.assertIn("阶段分配额/诚实上限: <缺失>", mod.render_text(rep, 50))
+        self.assertIn("没有任何 task-134 B 分配额字段", " ".join(rep["undecidable"]))
 
 
 if __name__ == "__main__":

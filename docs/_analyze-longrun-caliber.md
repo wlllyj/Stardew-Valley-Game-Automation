@@ -663,6 +663,37 @@ rg -n '"event": ?"buy_partial"' logs/longrun-*.jsonl
 python tools/analyze-longrun.py --journal logs/<run>.jsonl | rg "部分购买|买一半不是失败|自称成交却买少"
 ```
 
+## 3.21 task-133 / task-134（窗口外补水 + 分配额口径 + 卡死/重启重评估）
+
+**背景**：dev-coder 的 task-133（`57ef928`，窗口外浇水前补水）与 task-134（A：`no_progress_burst`/`resume_reevaluate`；B：`assigned_undone`/`stage_shortfall`/`stage_shortfall_day`/`deferred_tiles`）新增了 journal 事件与字段，分析器不收就会出现漂移红。**机械枚举以代码为准**（`scratch\_event_map_audit.py`）：brain 98 个 `_journal("…")` 名、桶 94 个，未映射只剩 3 个结构性白名单（`day_start`/`day_end`/`finish`）。
+
+| 事件 | 桶 | 归因 |
+| --- | --- | --- |
+| `water_far_refill` | `water_far_refills` | 窗口外浇水**前**的补水（壶空 = 前置条件，一天有界 `tries/limit`；`water_after > water_before` 即算补上）。**不是失败**；两条可证伪 ⚠ |
+| `no_progress_burst` | `no_progress_bursts` | 连续同因**卡死**（多轮零动作、不同任务、同因 `intent_vetoed`）⇒ 走 bounded resume + stuck flush。会打断循环，故可证伪形态给 ⚠（不是红） |
+| `resume_reevaluate` | `resume_reevaluates` | 重评估（stuck flush 后重新规划）已经做过 ⇒ **不是失败**，只作信息项 |
+| `stage_shortfall` / `stage_shortfall_day` | `stage_shortfalls` / `stage_shortfall_days` | **分配额口径**：`assigned` = 阶段分下去的格、`undone` = 没做完的（不含诚实上限）。红由当天 `checks.no_unmet_stages=false` 说话，本工具不重复判 |
+| `deferred_tiles` | `deferred_tiles_events` | 体力/夜里收工/撞 budget 留下的片区待办 —— **只作 info、绝不进 `no_unmet_stages`** |
+
+**字段**（`brain\agentfarm\longrun.py`）：`stage_shortfall{tile,action,stage,zone,assigned,undone,stopped,leftover,note}`（逐格）、`stage_shortfall_day{unmet,stages:[{stage,assigned,undone,leftover}],plot_pending,stopped_night,note}`、`deferred_tiles{tiles:[…≤12],count,night,by_kind,stages,plot_pending,note}`；`water_far_refill{tile,ok,code,water_before,water_after,tries,limit,reason,receipt,note}`（同一次尝试最多一条）；`water_far` 新增 `cause`（`"need_refill"`）/`evidence`/`refills`/`emergency_refills`/`retried_after_refill`/`in_dry_tiles_before|after`/`dry_tiles_status`；stage 记录新增 `assigned`/`undone`。
+
+**呈现**（可 grep）：
+- 头部「窗口外浇水/补水:」= `water_far` 次数/成/败、`cause` 计数、`need_refill` 行、补水次数与水位、`tries/limit`、几条 ⚠（补水没成却浇成 / 当天补水预算用尽）。
+- 头部「阶段分配额/诚实上限:」= 阶段没做完次数与 `assigned/undone`、日级 `unmet/plot_pending`、诚实上限 `deferred_tiles` 次数与格数、一条 ⚠（日级 `stopped_night=false` 而当天 `ended_reason` 是 night ⇒ 口径打架）；旧账本 `<缺失>`。
+- 头部「卡死/重启重评估:」= 连续同因卡死次数与原因、重评估次数；旧账本无 `no_progress_burst` ⇒ `<缺失>`。
+
+**缺失行为**：任一字段/事件缺失 ⇒【无法判定】（`<缺失>`，**绝不写 0、绝不当通过**）。`water_far` 存在但没有任何 `water_far_refill` ⇒ 单列一条【无法判定】。
+
+**同向性**：`tools\verify-run3.py` 对这六个名字 **零命中**（只白名单了 `water_far_unavailable`）⇒ 本工具一律不判红（只信息项/⚠），不会造出反向；若它将来收紧，以它为准。
+
+### 读数（task-133/134 收录）
+
+`py_compile -W error::SyntaxWarning` exit 0；`tests.test_analyze_longrun` **164 OK**；
+`discover -s tests` **757 tests / 5 failures**（全在 `tests\test_longrun.py::TestTask134AssignedVsPlotPending`，dev-coder 在制 task-134 B 的红；我的两个文件从不 import brain ⇒ 零接触）；
+机械枚举改前 **7 个未映射**（3 结构性 + `water_far_refill`、`no_progress_burst`、`resume_reevaluate`、`stage_shortfall*`/`deferred_tiles`）⇒ 改后只剩 3 个结构性。
+九账本 rc（本工具 / `verify-run3.py`）：green 0/0、run2 1(19)/1、run3 1(17)/1、run5 1(62)/1、run6 1(14)/1、
+run7 0/0、run8 1(29)/1、run9 1(84)/1、vacuum 1(3)/1 —— 一字未变（输出留档 `scratch\_t133_*.txt` / `scratch\_t133_v3_*.txt`）。
+
 ## 4. 复核命令
 
 ```
@@ -673,6 +704,6 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run8.jsonl   # r
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
 python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
-python -m unittest tests.test_analyze_longrun  # 当前 152 OK（task-132）
-python -m unittest discover -s tests           # 当前 730 tests / OK（0 红；task-123 `25e9931` 提交后）
+python -m unittest tests.test_analyze_longrun  # 当前 164 OK（task-133/134 收录）
+python -m unittest discover -s tests           # 当前 757 tests / 5 failures（全为 dev 在制 task-134 B）
 ```
