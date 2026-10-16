@@ -1,0 +1,16 @@
+v0.7.34（harvest 三处真相修正：字段必须输出、判不了就判不了、回执不许自述成功）
+
+本版一张代码卡（Mod + 脑侧同批）+ 一张真机复测卡 + 一张独立验收卡：
+
+1. task-176（dev-coder）harvest 三处真相修正（起因：task-173 在 0.7.33 上同格定点 harvest = FAIL）：
+   - 实证（`docs\_run10-harvest-verify.md`、`scratch\run10-tile6029-{before,after}.json`）：Mod 回执 `{acted:true, ok:true, status:"ok", skill:"interact", worldSeqBefore:51, worldSeqAfter:51}`，而 `farm.readyCrops 102→102`、`(60,29).crop "270"→"270"`、背包 +0、存档逐字节未变、SMAPI `NewDay 0→0 / save_called 0→0`。
+   - **修正 1（字段缺键）**：`TileView` JSON 里 `harvestMethod` **完全没有这个键**（不是 null）⇒ `CropMeta.HarvestMethodOf()` 恒 null ⇒ `harvest_tool()` 恒 None ⇒ 只能走 `interact`；而镰刀类作物（`HarvestMethod=Scythe`）用 `interact` 永远摘不到（`HoeDirt.performUseAction` 的 Scythe 分支要求 `player.CurrentTool.isScythe()`）。**要求：先 probe 求证 1.6.15 的正确来源（`CropData.HarvestMethod` 候选等），实现后必须输出键——拿不到写 null，缺键与 null 语义不同。**
+   - **修正 2（`ready` fail-open）**：`Ready()` 的反射 `HoeDirt.readyForHarvest()` 不可用时退回字段判据，而字段判据四条排除都不命中时 `return true` ⇒ `(60,28)/(61,29)/(60,30)` 三格 `fullyGrown=false`/`ripe=false` 却 `ready=true` ⇒ `readyCrops == crops == 102`，目标池完全没收窄。**要求：反射不可用 ⇒ 一律 `null`（判不了），不许宽松字段判据冒充实测 true；并新增来源标记 `readySource ∈ {"game","fields",null}`。**
+   - **修正 3（`acted` 自述）**：`acted` 必须由本调用内**可独立观测的变化**推导（目标格状态前后对比，或 `worldSeq` 前进且目标格变化），拿不准 ⇒ `acted=false` + `status="no_action"`；脑侧 `Ok = err==null && acted` 保持不变。
+   - 验证要求：单测 ≥8 条（覆盖 harvestMethod 三态键存在性 / `ready=null` 不摘 / `readySource` / "回执 ok 世界未变"时 `acted=false` / 镰刀类走 use_tool）+ 变异 ≥3（每个至少 1 红）+ `py_compile` exit 0 + 全量 0 红。
+
+2. task-177（machine-runner）在 0.7.34 上同格复测：字段核对 → 受制裁腾格（单独排除"背包 12/12 满"混杂）→ 同格 `harvest` 一次 → （必要时）`use_tool(...,"scythe")` 定案形态 → 对照格验证缺陷 2；交付 `docs\_run10b-harvest-verify.md`。
+
+3. task-178（deputy-lead）对 task-176 的独立对抗验收：≥6 条作弊通道（伪造 `readySource` / 缺键当 null / `worldSeq` 前进但格没变仍报 `acted=true` / `ready=null` 被当可收 / 镰刀类被 interact 摘走 / 变异自证）+ 自建变异 + 全量回归 + "0.7.34 能否据此冻结"的结论。
+
+（Lead 侧工具不属于 Mod 产物：task-174 补 `day_end.final.farm` 白名单的 `ripeCrops`/`readyCrops`、task-175 收紧 `harvest_gave_up` 窗口依赖，均**不在本版**，另排 0.7.35。）
