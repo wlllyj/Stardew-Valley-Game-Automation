@@ -36,7 +36,13 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.31"   # v0.7.31：run9c 诊断后的口径修复 —— ①播种分配额 = 手上种子数
+MOD_VERSION_EXPECTED = "0.7.32"   # v0.7.32：run9d 诊断后的目标 2 解药 —— ①`water_far` 够不着的活苗
+                                 # 先**有界开路**再回浇（清出的路 ≠ 浇过的水）；②单日**体力预算**
+                                 # （`water_reserve = 活苗×2+12`、`capacity`）与规模控制，预算不足
+                                 # 只延后 clear/till/plant 且延后格**不再算「还有活」**；
+                                 # ③Mod 障碍物/工具等级元数据（`clumpTarget{tool,minLevel}`/`toolOk`）
+                                 # + 脑侧工具不够格不空挥；阶段体力实测留痕（`stamina_calibration`）。
+                                 # v0.7.31：run9c 诊断后的口径修复 —— ①播种分配额 = 手上种子数
                                  # （`plant_area` 上限 `min(per_stage_tiles, seeds_total)`，
                                  #   买不到种子 **不算** 今天该做的活做完）；
                                  # ②浇水阶段壶空先补水再续做（阶段内 ≤2 次，把分下去的格做完；
