@@ -1,0 +1,66 @@
+# 0.7.32 发布计划 · **目标 1（把农场全部清理干净 + 钱在作物再投资与工具升级之间平衡）**
+
+> 用户 2026-10-17 `User said (m15155)` 把目标改成两个：**目标 1** 全场清理（钱要平衡"作物再投资"与"工具升级"，**只要求完成一次全部清理即标完成**）；**目标 2** 连续 5 个游戏日完全自主 + 策略生成/结果校验/据结果优化（由 0.7.31 + run9d/run10 承担）。
+> 本文件只管**目标 1**。目标 2 的构建见 `docs/_release-0.7.31.md`。
+> **排期纪律**：0.7.32 的任何代码改动都要等 **run9d(run A) 与 run10(run B) 全部跑完、证据冻结之后**才允许开始 —— 长跑器直接跑工作树里的 `brain/agentfarm/*.py`，两次 run 之间动代码就毁掉 A→B 的"同构建"前提。
+
+## §0 现状（2026-10-17 01:2x）
+
+- **已证**（task-153，`24ffe71`，`docs/_il-tool-upgrade.md`）：
+  - 升级入口 = 对话应答键 `Blacksmith_Upgrade` ⇒ `Utility.TryOpenShopMenu("ClintUpgrade","Clint",true)`；菜单是数据驱动 `ShopMenu`（`Data/Shops["ClintUpgrade"]`，条目 = `ToolUpgradeData{Condition,Price,RequireToolId,TradeItemId,TradeItemAmount}`）。
+  - 状态字段全 public：`Farmer.toolBeingUpgraded`、`Farmer.daysLeftForToolUpgrade`、`Tool.UpgradeLevel`。
+  - 价格：**2000+5 铜锭 / 5000+5 铁锭 / 10000+5 金锭 / 25000+5 铱锭**（按当前等级 0..3）；升级耗时 2 天。
+  - **陷阱**：`chargePlayer`/`ConsumeTradeItem` 排在 `actionWhenPurchased` **之前** ⇒ 已有工具在升级时**钱照扣、工具不升级** ⇒ 发起前必须先自己判 `toolBeingUpgraded == null`。
+  - 清障门槛：**600 树桩=斧≥1、602 大木头=斧≥2、672 巨石=镐≥2、148/622=镐≥3、752+（绿雨）无等级检查**；血量 10/20/10/20/8。
+  - 我们的三处错：`WorldSnapshot.cs:484` 全部 clump 写 `tool="axe"`；`FarmScan.cs:339-346` 把树桩/大木头算进 `stones`；`UseToolSkill.cs:432` clump 一律用斧。
+- 观测层现状：`ToolsView` 只有布尔 + `wateringCan.upgradeLevel`（`Contracts.cs:323-324`）⇒ 看不清"哪把工具能清哪种障碍"。
+- 经济现状：run9c 已真机跑通"卖盈余 → 次日到账 → 买当季种子 → 播种"（`sell` → money 5→545→465→365 → `buy` 6 成交 5 → 每日 `plant_area` 落格），但**没有任何"为升级存钱"的概念**。
+
+## §1 卡片表（本版）
+
+| 卡 | owner | 依赖 | 内容 | 状态 |
+|---|---|---|---|---|
+| **task-155** | dev-coder | task-153 ✅ | Mod 观测补：`clumpIndex`/`width`/`height`/`health` + 推导 `clumpTarget{tool,minLevel}`；`FarmScan` 按 clumpIndex 分流（树桩/大木头不再进 `stones`）；`ToolsView.tools[]` 带 `upgradeLevel`；`player.toolBeingUpgraded`/`toolUpgradeDaysLeft`；`UseToolSkill` 按 `clumpTarget` 选镐/斧、等级不够直接 `skipped` | pending |
+| **task-141** | dev-coder | 155 | Brief 暴露 `tool_levels` + `obstacles_by_tool`；`TASK_KINDS` 增 `tool_upgrade` 意图（**只建议不改世界**，journal `tool_advice`/`day_end.tool_advice`，不影响 `verified`/rc）；≥6 单测 | pending |
+| **task-142** | dev-coder | 141 | 铁匠铺升级链：`upgrade_tool` 技能（`TryOpenShopMenu("ClintUpgrade")` + 反射 `tryToPurchaseItem(item,null,1,0,0)`，**先判 `toolBeingUpgraded == null`**）+ 主动升级闭环（钱够 + 有对应金属锭 + 该工具是当前瓶颈）；判据=观测差分（钱差==Price、锭 -5、`toolBeingUpgraded!=null`、`daysLeft==2`、次日 -1、取回 `UpgradeLevel+1`） | pending |
+| **task-151** | dev-coder | 142 | **全场清理收敛**：以 `farm` 清障计数为进度、按田区推进直到可清障碍为 0；journal `farm_progress`/`farm_cleared` + `day_end.farm_cleared`；缺字段/`complete=false` fail-closed；≥6 单测；验收=**一次完整清理**且外部 `observe?detail=full` 差分可核 | pending |
+| **task-152** | dev-coder | 142 | **钱的三分配**：种子再投资 / 工具升级储备 / 缓冲；LLM 给分配意图（journal `money_plan{reserve_for_upgrade,spend_on_seeds,reason}`），代码算数字与兜底硬约束（**先留住下一件关键升级的钱 > 至少留 1 份种子钱 > 其余才买种子/囤货**）；缺字段保守；禁 `Money +=` | pending |
+| **task-154** | dev-coder | — | 种子识别不许只靠名字：结构性识别（`Crop` 数据/`Data/Shops` 交叉）+ `seed_source` + `seed_unknown` fail-closed（来源 task-145 INFO-1） | pending |
+| **task-110** | dev-coder | — | **桥异常绝不许穿出 `run()`**：`ensure_location`/`snap`/`sleep` 三处 + 顶层兜底，任何 `BridgeError` 都要落 `finish` 并如实记因（来源 task-108 NIT-2 / task-145 NIT-1） | pending |
+| task-109 / task-101 / task-107 / task-117 | dev-coder | — | 顺延 NIT：卖货如实性（卖最大叠 vs 文档说最小、卖后刷新 obs）、`_farm_totals` 类型校验、Mod `dryTiles`/`dryCrops` 同源、教训内容模板校验 | pending |
+
+## §2 冻结与装机九步（Lead 独占，同 0.7.25–0.7.31 流程）
+
+1. 确认本版所有卡 completed + 它们的对抗验收 PASS + **全量 `unittest discover -s tests` 0 红**；
+2. `tools\_note-0732.txt`（首串必须是 `v0.7.32`）写完；
+3. `python tools\_bump-mod-version.py 0.7.32 --note-file tools\_note-0732.txt` ⇒ 核对 `mod\AgentFarm.Bridge\manifest.json` 的 `Version`（cp1252 末句可能 `UnicodeEncodeError`、退出码 1，**版本已写盘**，一律用 `json.load` 核对）；
+4. `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.32"`；
+5. `dotnet build .\mod\AgentFarm.Bridge\AgentFarm.Bridge.csproj -c Release --nologo --no-incremental` ⇒ **0 警告 0 错误**；
+6. `git add -A` ⇒ 提交冻结（提交信息写清版本内容）；
+7. `python tools\check-release.py --expect 0.7.32` ⇒ 六项全绿；
+8. `python tools\deploy-mod.py --no-quit` ⇒ 桥 `modVersion=0.7.32`；
+9. `python -m agentfarm goto Farm --no-focus` → `tools\preflight.py --expect 0.7.32 --save-baseline logs\run10b-baseline.json`。
+
+## §3 起跑（目标 1 的真机验收跑）
+
+- 目标 1 不要求"连续 N 天"，只要求**完成一次全部清理**：起跑用 `tools\start-detached-longrun.py --days 5 --size 5 --max-minutes 300 --max-days 15 --journal logs\longrun-clear-run1.jsonl --expect-version 0.7.32`（天数取宽，允许跨多天清理）。
+- 每天 ≥2 份 `observe?detail=full` 端点（晨间 A + 收尾 B）⇒ 逐日世界差分表；清障进度以 `farm` 计数的 `complete=true` 快照为准（`FarmScanCache` 全农场口径，不受 400 格窗口影响）。
+- 完成判据（外部可核）：`farm_cleared=true` 且**外部观测**里可清障碍计数（`weeds/stones/twigs/trees/stumps/logs/boulders/bushes`）为 0；`day_end.farm_cleared` 与之一致；存档落盘六串齐全。
+
+## §4 判据
+
+1. 两侧工具同向（`tools\verify-run3.py` 的 `verdict` + `strict_verdict` 两行都要抄；`tools\analyze-longrun.py --window N` rc 同向）+ `scratch\run9-lead-check.py --snapshots/--smapi` 无硬问题。
+2. **缺失字段一律【无法判定】，缺失 ≠ 通过**；每个数字都要有外部证据（存档 size/mtime、SMAPI 行号、`observe` 端点）。
+3. 钱：全程 `git grep -n "Money *+=" -- brain mod` 只许命中注释；买入/升级的花费一律走游戏自己的 `chargePlayer` 路径，判据用观测差分。
+4. 工具等级不足**不许发请求空挥**（task-20 口径）；`clumpTarget` 缺失 ⇒ `precondition_failed` + 理由，不许默认斧头。
+5. 升级发起前必须 `toolBeingUpgraded == null`（否则白扣钱 —— task-153 §7 已证陷阱）。
+6. 口径变更（含 `checks` 新键、`TASK_KINDS` 新档）必须过一轮**独立对抗验收**才能拿去判真机账本。
+
+## §5 待写（跑完后填）
+
+- run 表（逐日 `ended_by`/`verified`/清障增量/钱/工具等级）、清障前后外部差分、升级链真机留痕、两侧工具原文、结论。
+
+## §6 遗留 / 顺延
+
+- task-14（逐帧 warp 活锁，run9 仍 1256 次）、task-83/task-94（田块规整）、task-17（world_stuck 自愈）、task-18（职业耕种优先）、task-53（农场级待清/待垦计数）、task-137（非 sleep 收尾分支 `final` 快照滞后）。
+- 不在目标 1 范围但影响体验：task-59 的复盘调用已在 0.7.31；`review` 类调用在留痕里的 `kind` 分流已在 0.7.31。

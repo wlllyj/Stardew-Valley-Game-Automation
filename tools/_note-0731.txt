@@ -23,7 +23,7 @@ v0.7.31（run9c 诊断后的口径修复：播种不超手上种子数 + 浇水�
 
 5. task-150（deputy-lead，对抗验收）task-149：A 段范围/读数；B 段复现 summer 20 FAIL→PASS；C 段 ≥6 组（重点：伪造"农场级无活"、缺字段当 0、`complete=false` 时假收工、模态重试自旋、0 动作日换皮成 `slept_without_work` 骗过检查）。
 
-（另：本版还包含 Lead 侧工具收紧，**不属于 Mod 产物**——`tools\verify-run3.py` 增加"0 阶段却自称 VERIFIED 必须有在场证据（当天成功 `goto_farm` 或农场动作事件）"闸门，run9c 因此从 rc=0 变为 rc=1；`tests\test_verify_run3.py` 64 OK。）
+（另：本版还包含 Lead 侧工具收紧，**不属于 Mod 产物**——`tools\verify-run3.py` 增加"0 阶段却自称 VERIFIED 必须有在场证据（当天成功 `goto_farm` 或农场动作事件）"闸门 + "没有 `finish` 的账本判决标注为临时"，run9c 因此从 rc=0 变为 rc=1；`tests\test_verify_run3.py` 65 OK。）
 
 判据（run9d = run A，0.7.31 上重跑；run9c 只作诊断）：
 - **尾部连续 5 天** `verified=true`（用户 2026-10-17 目标 2；两侧工具同向 + `verdict`/`strict_verdict` 并列）；
