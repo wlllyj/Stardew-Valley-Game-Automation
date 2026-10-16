@@ -67,6 +67,10 @@
 - 存档 `Wahaha_450799035` 的 **size 与 mtime 应前进**（对应 SMAPI `SaveGame.Save() called/completed`）。
   **口径按 task-47 定案（`docs/_il-newday-save.md`）更正**：落盘唯一通道是 `SaveGameMenu.update` 的 master 分支；`SaveGameMenu` 只在
   `Game1.showEndOfNightStuff()` 且 **`endOfNightMenus.Count == 0`** 时被创建 ⇒ **当天早晨有日终菜单（`ShippingMenu`＝有货要结算 / `LevelUpMenu` / `Billboard`）时，存档是被设计延后的**。
+  **口径收紧（Lead 2026-10-16，引 task-126；本节以下 2026-10-14 的"有期限豁免"即被推翻，只留档）**：**每次跨日都必须完成一次落盘**，`Synchronizing 'NewDay' task` 次数 > `SaveGame.Save() called.` 次数 ⇒ **硬问题**（不是 info）。
+  实测依据（run9，见 `docs/_run9-evidence.md` §3 与 task-126 卡面）：run9 每天出货（`sell` 5 次 + `surplus_sell` 4 次 `why=need_slot`）而 SMAPI **4 NewDay / 0 before save / 0 Save called / 0 completed**，存档 start==end（`3706657 B / 2026-10-15 22:22:57.011`）⇒ **5 个游戏日进度一次都没落盘**，run9 整条外部证据链作废；对照 run7 无出货 ⇒ 8/8 全配对、run8 有出货 ⇒ 2 NewDay / 1 save。
+  机制（待 task-126 用 IL 钉死）：有 `displayedShippedItems` ⇒ `showEndOfNightStuff()` 先压 `ShippingMenu` ⇒ 保存被设计推迟；而我们第二天早晨清模态把 `ShippingMenu` 关掉（账本每个日界后第一条正是 `modal_dismissed {"menu":"ShippingMenu"}`）⇒ **绕过菜单、掐断保存链**。
+  判据（新增，写进 evidence §3）：必须列 **NewDay / before save / Save called / completed 四个计数**且**逐条配对**；缺失任何一项 ⇒【无法判定】，**缺失 ≠ 通过**。Lead 复核器 `scratch/run9-lead-check.py` 已按此收紧（run9 ⇒ exit 1 硬问题；run7 ⇒ 无该问题）。
   因此：**跨日 ≠ 落盘**。豁免**有期限**（2026-10-14 采纳 log-analyst 建议，task-61）：①有日终菜单且**未观测到菜单被关掉** ⇒ 存档未动只记 **info**（设计性延后）；②**已观测到菜单被关掉**（`activeMenu` 变 null，或转 `SaveGameMenu` 后消失）**而其后 1–2 秒内仍无 `SaveGame.Save() called.`** ⇒ 转**待查/异常**（run5 的 25→26 出货那次正属此形态，见 `docs/_il-newday-save.md` §2.5/§4）；③**没有任何日终菜单却缺 `SaveGame.Save() called.` 且存档未动 = 异常**（原样）。
   以「跨日 +1 + 账本一致」为主判据（P3a 每次跨日必有 `Synchronizing 'NewDay' task`；P3b 有 Save 必有 NewDay；P3c NewDay 无 Save：**未观测到菜单被关**记 info，**已关仍无 Save** 记 problem/待查，连续 ≥2 次同样升 problem）。
 - SMAPI `Synchronizing 'NewDay'` 计数与账本跨日次数**同向**。

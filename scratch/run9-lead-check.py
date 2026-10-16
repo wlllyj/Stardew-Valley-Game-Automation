@@ -167,10 +167,13 @@ def main() -> int:
         if len(called) > len(newday):
             problems.append(f"有 save({len(called)}) 无 NewDay({len(newday)}) —— 保存没有对应的跨日")
         if len(newday) != len(before):
-            # 口径（docs/_il-newday-save.md + task-47）：日终菜单链没走完时保存会被设计推迟，
-            # "跨日没落盘"本身既不判失败也不判通过 ⇒ 只记 INFO，由存档链与 run 收尾共同解释。
-            print(f"    · INFO 有 NewDay({len(newday)}) 无 save({len(before)}) 的缺口："
-                  f"日终菜单期保存可能被推迟（不判失败，也不当通过）")
+            # 口径（2026-10-16 收紧，引 task-126）：run9 实测 4 NewDay / 0 save
+            # ⇒ 5 个游戏日一次都没落盘（存档 start==end），进度全丢。
+            # 既然主目标要求"真机连续 3 个游戏日"，就**必须**每次跨日配一次保存：
+            # 有出货时游戏会把保存推迟到 ShippingMenu 之后，而我们关菜单的方式会掐断它。
+            # 因此这不再是 INFO，而是**硬问题**（除非修好 task-126）。
+            problems.append(f"跨日未落盘：SMAPI 里 NewDay={len(newday)} 而 save={len(before)} "
+                            f"（每次跨日必须完成一次 SaveGame.Save()；见 task-126 与 docs/_run6-criteria.md §2）")
         print(f"    · NewDay 行号 {[i + 1 for i in newday][:12]}")
         print(f"    · before-save 行号 {[i + 1 for i in before][:12]}")
     else:
