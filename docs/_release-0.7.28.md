@@ -24,7 +24,8 @@
 | **task-58** | dev-coder | `Brief.recent_decisions` 骨架（最近 3–5 条边界决策 + 结局摘要喂回提示词，≤300 字符；超限时决策史最先被裁；≥4 单测） | pending（明天第一个开工） |
 | **task-82** | dev-coder | 决策→结果 join（`terminal`/`leftover`/`unreachable`/`refused`/`ended_by`/失败格坐标 ≤3）+ **跨日教训库** `<journal>-lessons.json`（客观事实代码写、一句 `hint` LLM 写；≤~20 条按 `last_seen` 淘汰；次日注入 ≤3 条 ≤200 字符；**只认客观证据**） | pending |
 | **task-59** | dev-coder | night 边界一次独立复盘调用（只写 `review_llm` + 次日 `recent_notes`；**失败无害**；`max_tokens ≤512`；notes 含坐标 ⇒ 拒收） | pending |
-| **task-111** | log-analyst | analyzer 收录本批新事件/字段（防漂移红）+ 八本账本两侧 rc 同向 | pending（`blocked_by 58/59/82`） |
+| **task-111** | log-analyst | analyzer 收录本批新事件/字段（防漂移红）+ 八本账本两侧 rc 同向 | **已交 `d10dc6b`**（5 个新事件入桶 + 三条完整性红 + 全量 665 OK / 0 红） |
+| **task-116** | log-analyst | analyzer 收 task-114 的新事件 `lessons_rejected` ⇒ **全量归零**（0.7.28 放行条件） | pending（0 红前不许冻结） |
 | **task-112** | deputy-lead | 独立对抗验收：**最高优先级 = 零判定影响**（开/关机制 `verified`/`checks`/`final_water` 逐字相同）+ 只认客观证据 + 失败无害 + 有界性 + ≥4 对抗 | pending（`blocked_by 58/59/82`） |
 
 > **诚实边界**（写进 evidence 与给用户的结论）：这是「会话内记忆 + 提示词反馈」，**不是**权重更新/在线训练。
@@ -32,9 +33,10 @@
 
 ## 2. 冻结与装机九步（Lead 独占，链式，不许并行）
 
-1. `team_task_get` 确认 **task-102 / task-104 / task-106 / task-58 / task-59 / task-82 / task-111 / task-114 已 completed**，且 **task-103 / task-108 / task-112 PASS 或 PASS-WITH-NITS（无必修）、task-115 PASS 或 PASS-WITH-NITS（无必修）**。
+1. `team_task_get` 确认 **task-102 / task-104 / task-106 / task-58 / task-59 / task-82 / task-111 / task-114 / task-116 已 completed**，且 **task-103 / task-108 PASS、task-112 FAIL→task-114 已修、task-115 PASS 或 PASS-WITH-NITS（无必修）**。
    - 其中 **task-112 = FAIL**（`docs/_review-llmfeedback.md`：F1 教训库来源可信性、F2 裁剪优先级）⇒ **task-114 修 → task-115 delta 复验**；两条都不阻塞 run9 判定正确性，但削弱演进机制，故列为本版必修。
    - task-111 已交 **`d10dc6b`**（5 个新事件入桶 + `review_llm_without_notes`/`lessons_over_limit`/`lessons_load_failed` 三条红；全量 **665 OK / 0 红**；八账本 rc 与 `verify-run3` 一字未变）。
+   - **task-114 已交 `c135edc`**（教训库 schema 信任边界 + 裁剪优先级 核心>教训>决策史>笔记 + `no_inventory_space.evidence` 用当次真值；丢条目记新事件 `lessons_rejected`）；**task-116 收该事件前全量有 2 条漂移红**（`Ran 672, failures=2`，均在 `tests/test_analyze_longrun.py`）⇒ **task-116 归零是本版放行硬条件**。
 2. 确认 `tools/_note-0728.txt` 存在且**首串是 `v0.7.28`**（列本版两批卡片：run8 两病灶 + LLM 复盘/教训库；LLM 两条等 task-82/task-59 落地后按实际内容补写）。
 3. `python tools/_bump-mod-version.py 0.7.28 --note-file tools\_note-0728.txt`（⚠️ cp1252 下末句 print 会 `UnicodeEncodeError` 且退出码 1，但**版本已写盘** ⇒ 一律用 `json.load` 核对 `manifest.json` 的 `Version`）。
 4. `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.28"`。
@@ -90,5 +92,8 @@ python tools\start-detached-longrun.py ^
 - **task-101**（0.7.29）：`_farm_totals` 类型校验（`dryCrops="abc"` 会抛 `ValueError` 穿出整天；`"0"` 与合法 0 不可区分；`-1` 状态自相矛盾）、窗口全死苗时 `watered_outdoor` 的字段级收口、夹具 `farm_scan()` 的死苗口径。
 - **task-107**（0.7.29，Mod）：`farm.dryTiles` 与 `farm.dryCrops` **同一次扫描 + 共用 `scanSeq`**（解释 run8 `[12,30]` 记 `ok` 但计数 `6→6`；dev-coder 已判定既非死苗也非一拍滞后 ⇒ 最可能同一次发布里不同源）。**脑侧 `_water_far_dry` 的 `ok` 判据不收紧**（计数若真滞后，收紧会造假失败）。
 - task-83 rev2（田块规整：坐标级留痕 `sow_step`/`till_step` + `plant_layout.tiles` 坐标 + 五指标）—— 需要 run9 的数据才有意义。
-- task-82/58/59（LLM 反馈/自省：决策→结果 join + `<journal>-lessons.json`）、task-14（逐帧 warp 活锁）、task-18（职业选择耕种优先）、task-53（农场级待清/待垦计数）、task-98（`Brief.from_observe` 无 tiles 时回退 farm 计数的耦合）。
+- **task-109**（0.7.29）：`farmwork.py:1006-1015` money 循环无条件先跑 ⇒ 腾格分支在"存在真盈余叠"时不可达（实卖最大叠而 docstring 说最小；只缺 1 格却每 id 各卖一叠）；`longrun.py:2040-2047` 卖后用过期 obs ⇒ 多一次 `empty_slot` 卖出。
+- **task-110**（0.7.29，老洞）：`longrun.py:974` `worker.ensure_location` 无 try/except，其内部 `snap()` 抛 `BridgeError` 会从 `run()` 穿出（无 `finish`/无 `day_end` 的静默死法）。
+- **task-117**（0.7.29）：教训**内容模板校验**（按 kind 固定句式、只允许数字可变）+ 提示词里显式区分「观测真值」与「模型自述（不是真值）」。task-114 只锁了结构，**合法 kind 的自由文本仍会进提示词**（dev-coder 主动报备、deputy task-115 §NIT 再判）。
+- task-14（逐帧 warp 活锁）、task-18（职业选择耕种优先）、task-53（农场级待清/待垦计数）、task-98（`Brief.from_observe` 无 tiles 时回退 farm 计数的耦合）。
 - Mod `ShipSkill` 只能整叠出货 ⇒ 每 id 保留 K=10 做不到（详见条目 053 待决②）。
