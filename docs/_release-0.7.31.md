@@ -34,7 +34,7 @@
 | **task-144** | `water_area` 阶段壶空 ⇒ 补水续做（有界 ≤2 次）；补水不可能才如实 `need_refill` + `assigned_undone>0`；消除 `stopped=="" ∧ assigned_undone>0` | 本版必修（blocked_by 143） |
 | **task-145** | 对 143+144 的独立对抗验收（重点打"新洗白通道"） | **PASS（`452dc02`）**：143 PASS / 144 PASS-WITH-NITS 无必修；B1/B2/B2b 三形态 FAIL→PASS；C 段六组未发现新洗白通道；NIT-1（桥异常穿出 `run()`）→ task-110、INFO-1（种子靠名字认）→ task-154 |
 | **task-149** | run9c 的 summer 20 真空日暴露的 F1：`work_reasons()` 缺“农场级还有活”的来源（hoeDirt/emptyDirt 有活却全天 0 动作仍被当 `no_work`）⇒ 农场级工作理由 + 缺失字段 fail-closed；日首 `goto_farm` 被模态挡住必须重试一次；0 动作日不许 VERIFIED | **已交付 `928d3d2`**（Lead 核：2 文件、越界零命中、三模块 456 OK、**全量 815 OK / 0 红**） |
-| **task-150** | 对 task-149 的独立对抗验收（重点：伪造“农场级无活”） | **本版最后一道门**（deputy 在制） |
+| **task-150** | 对 task-149 的独立对抗验收（重点：伪造“农场级无活”） | **PASS-WITH-NITS 无必修（`87da623`）**：pre 树 5/11 → `928d3d2` 上 **11/11**；B 段 6 项 FAIL→PASS；C 段六攻全过（有界 / 缺失 fail-closed / 字段说谎不构成通道 / 重试只 1 次 / 与诚实上限和 task-102 不打架）；INFO-1：0 动作 + 体力耗尽的日子改为 `no_day_progress` 中止（rc=1） |
 | task-137 | 非 `sleep` 收尾分支 `day_end.final` 可能是旧快照 | 顺延 |
 | task-101/107/109/110/117 | 类型校验 / dryTiles 同源 / 卖货如实性 / `ensure_location` 无 try / 教训内容模板 | 顺延 |
 | task-141/142 | 用户 2026-10-17 诉求：工具升级（LLM 能建议 + 真能升级）——**0.7.32**（目标 1 的前置） | 0.7.32 |
@@ -95,3 +95,17 @@
 - **决定**：run9c **只作诊断证据**（落盘/经济闭环/有界收尾的真机证明），**不作为 A/B 对照的 run A** —— 0.7.31 会改 `brain/`，两次 run 的世界不可比。run A 必须在 0.7.31 上重跑（run9d），教训库显式拷给 run10。
 - 遗留：task-137（`day_end.final` 滞后）、task-101/107/109/110/117。
 - 诚实边界：`lesson` 注入 + `compare-runs` 的 L1–L4 只能证"机制生效 + 同形态减少"；**"自我进化"的正式结论**必须并列两侧工具判决与 L3 的人工核对，L1–L3 任一不成立就写"不足以判定自我进化"（`docs/_run10-criteria.md`）。
+
+## §7 冻结与装机执行记录（2026-10-17 01:30，Lead 独占）
+
+1. **放行闸门全满足**：task-143 `da5f81b` / 144 `2438cae` / 149 `928d3d2` 均 completed；task-145 **PASS**（`452dc02`）、task-150 **PASS-WITH-NITS 无必修**（`87da623`）；`unittest discover -s tests` = **Ran 815 tests / OK（0 红）**。
+2. `tools\_note-0731.txt` 首串 `v0.7.31（run9c 诊断后的口径修复：播种不超手上种子数 + 浇水壶空补水续做 + 农场级工作理由与在场证据闸门）`（并注明工具侧收紧不属于 Mod 产物）。
+3. `python tools\_bump-mod-version.py 0.7.31 --note-file tools\_note-0731.txt` ⇒ manifest `0.7.30 → 0.7.31`（脚本末句在 cp1252 下 `UnicodeEncodeError`、退出码 1，**版本已写盘** ⇒ 用 `json.load` 核对）。
+4. `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.31"`（注释列本版三项）。
+5. `dotnet build .\mod\AgentFarm.Bridge\AgentFarm.Bridge.csproj -c Release --nologo --no-incremental` ⇒ **0 警告 0 错误**；`AgentFarm.Bridge.dll` **177664 B**、`manifest.json` **34606 B**（本版 Mod 无源码改动）。
+6. 冻结提交 **`24a8ce7`**；`python tools\check-release.py --expect 0.7.31` ⇒ **六项全绿**（manifest==brain==0.7.31、dll 不比源码旧、`py_compile` 22 文件、**Ran 815 tests** OK、树干净）。
+7. `python tools\deploy-mod.py --no-quit` ⇒ 0.7.30 → **0.7.31**（桥 `modVersion=0.7.31 port=17890`，自动读档 `Wahaha_450799035` → FarmHouse(9,9)）。
+8. `python -m agentfarm goto Farm --no-focus` ⇒ FarmHouse(9,9) → Farm(64,15)，hop1 **7617ms**（`source=[3,12] landing=[64,15]`）。
+9. `python tools\preflight.py --expect 0.7.31 --save-baseline logs\run9d-baseline.json` ⇒ **✅ 可以起跑**。基线：**第1年 夏23日 06:40 / sunny / Farm(64,15) / 体力 270 / 钱 265g / 背包 Wheat Seeds / 作物 103 / unwatered 24 / dryCrops 103 / waterLeft 18 / tillable 84 / tileCount 400（truncated）/ farmComplete true / 无模态 / worldAdvancing true**；**不做操作员预置**。
+10. **run9d（task-147，machine-runner）**已获 GO：`tools\start-detached-longrun.py --days 5 --size 5 --max-minutes 240 --max-days 12 --journal logs\longrun-3day-llm-run9d.jsonl --expect-version 0.7.31`；硬要求 = 每日 ≥2 份独立 `observe?detail=full` 端点、收工后显式 `--pid-file` 取 end 快照、教训库原样拷给 run10。
+11. **排期纪律（对 A→B 对照至关重要）**：run9d 与 run10 之间**不许改 `brain/`、`mod/`**（长跑器直接跑工作树代码）；0.7.32（目标 1）批次一律排在 run10 证据冻结之后。已向 dev-coder 发停手令。
