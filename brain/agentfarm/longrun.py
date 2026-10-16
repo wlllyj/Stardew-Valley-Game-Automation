@@ -723,6 +723,13 @@ class LongRun:
         # `day_end.stamina_budget`。`budget_noted` 保证 `stamina_budget` journal 一天只发一条。
         self.budget_today: dict[str, Any] = {}
         self.budget_noted = False
+        #: 【task-163】当天**因体力预算被显式延后**的任务 → 当时没做完的格子。
+        #: 用途只有两个：①守卫（`work_reasons`/`_pending_work`）不许再把它们算成"还有活"；
+        #: ②日终按任务分类留痕（`budget_deferred_tiles{task: n}`，info）。
+        #: **绝不**参与 `checks`/`assigned_undone` 的任何扣减（延后 ≠ 洗白，卡面红线②）。
+        self.budget_deferred_tiles: dict[str, list[tuple[int, int]]] = {}
+        #: 【task-163 NIT-2】容量上限已留痕的任务（一天每类只发一条 `stage_capped_by_capacity`）。
+        self.capacity_capped_noted: set[str] = set()
         self.refills_today = 0
         self.idle_rounds = 0
         self.fail_streak = 0
@@ -1967,24 +1974,125 @@ class LongRun:
                 f" + 路程 {PATH_STAMINA_ALLOWANCE:g}，basis={b.get('basis')}）"
                 f"⇒ 停手把体力留给浇水")
 
-    def _note_budget_deferred(self, task: str, why: str) -> None:
+    def _note_budget_deferred(self, task: str, why: str,
+                              tiles: Iterable[tuple[int, int]] = ()) -> None:
         """把"因为预算而不做"记进当天预算快照 + journal（一天每类只记一次）。
 
         ⚠️ 语义钉死：只记**因为预算**而不做的活（卡面红线②）——"确实没活"不算预算推迟，
         否则守卫的 `work_reasons` 会被污染成"还有活"。
+
+        【task-163】同时把"当时还没做完的格子"记进 `self.budget_deferred_tiles`：
+        守卫（`work_reasons`/`_pending_work`/`_leftover`）据此**不再**把这些格子算作
+        "还有活可做"，改走显式延后（日终按任务分类留痕 `budget_deferred_tiles{task: n}`）。
+        这些格子**绝不**参与 `checks`/`assigned_undone` 扣减（延后 ≠ 洗白）。
         """
         b = self.budget_today
         if not b:
             return
         b["deferred_by_budget"] = True
         deferred = b.setdefault("deferred", [])
-        if task not in deferred:
+        first = task not in deferred
+        if first:
             deferred.append(task)
+        pending = sorted({(int(t[0]), int(t[1])) for t in tiles})
+        new_tiles: list[tuple[int, int]] = []
+        if pending:
+            known = set(self.budget_deferred_tiles.get(task, []))
+            new_tiles = [t for t in pending if t not in known]
+            if new_tiles:
+                self.budget_deferred_tiles.setdefault(task, []).extend(new_tiles)
+                b.setdefault("deferred_tiles", {})[task] = len(self.budget_deferred_tiles[task])
+        if not first and not new_tiles:
+            return          # 一天每类只记一次（后来真发现了新的延后格才再记一笔）
         self._journal("deferred_by_budget", task=task, why=why,
                       stamina=b.get("stamina"), water_reserve=b.get("water_reserve"),
                       dry=b.get("dry"), live_crops=b.get("live_crops"),
-                      basis=b.get("basis"),
+                      basis=b.get("basis"), tiles=len(pending),
+                      targets=[list(t) for t in pending[:6]],
                       note="只因预算而不做（不是没活）；没浇完就是 crops_watered=false")
+        if pending:
+            self._journal("budget_deferred_tiles", task=task, count=len(pending),
+                          total=len(self.budget_deferred_tiles[task]),
+                          targets=[list(t) for t in pending[:6]],
+                          note="这些格子今天被**体力预算**显式延后：守卫不再把它们算作"
+                               "『还有活』，但也不参与任何判定扣减（延后≠洗白）")
+
+    def _budget_deferred_tasks(self) -> set[str]:
+        """【task-163】当天因**体力预算**被显式延后的任务集合（空集 = 没有延后）。
+
+        唯一写入点是 `_note_budget_deferred()`，而它只在 `_budget_defer_reason()` 非空
+        （体力 ≤ 浇水预备 **且** 有浇水债）时被调用 ⇒ 这个集合天然满足卡面红线②：
+        没有浇水债、或者体力还在预备线以上时，延后一律不生效。
+        """
+        b = self.budget_today or {}
+        if not b.get("deferred_by_budget"):
+            return set()
+        return {str(t) for t in (b.get("deferred") or [])}
+
+    def _budget_deferred_tile_set(self) -> set[tuple[int, int]]:
+        """所有被预算显式延后的格子（守卫据此把它们从"还有活"里剔除）。"""
+        out: set[tuple[int, int]] = set()
+        for tiles in self.budget_deferred_tiles.values():
+            out.update(tiles)
+        return out
+
+    def _deferred_scan(self, task: str, obs: dict[str, Any]) -> list[tuple[int, int]]:
+        """【task-163】还没挑作业区时，用观测直接扫出"这个任务今天有多少格没做完"。
+
+        只用于**留痕**（`budget_deferred_tiles{task: n}`）与守卫闭嘴，口径与 `_leftover`
+        的对应分支保持一致；拿不到就返回空列表（留痕为 0，不改任何判定）。
+        """
+        tmap = FarmWorker.tiles_of(obs)
+        tillable = FarmWorker.tillable_of(obs)
+        if task == "clear_area":
+            return sorted(t for t, v in tmap.items()
+                          if str(v.get("kind") or "") in ACTIONABLE_KINDS)
+        if task == "till_area":
+            if not self._seed_outlook(obs)[2]:
+                return []
+            return sorted(t for t in tillable if not _till_blocked_by(tmap.get(t)))
+        if task == "plant_area":
+            if not self._seed_outlook(obs)[2]:
+                return []
+            return sorted(t for t, v in tmap.items()
+                          if str(v.get("kind") or "") == "dirt" and not v.get("crop"))
+        return []
+
+    def _note_budget_deferrals(self, obs: dict[str, Any]) -> None:
+        """【task-163】日初把"今天因预算而不做"的三类活一次性记账（+ 延后格清单）。
+
+        为什么必须在日初做：延后要能**让守卫闭嘴**，而守卫（`work_reasons`/`_plot_has_work`/
+        `_pending_work`/`_leftover`）读的是 `budget_deferred_tiles`。若只在 `_stage_tiles`
+        被调用时才记，那么"策略给 `review`、守卫说还有活"的日子里延后永远记不上
+        （run9d day1 形态）⇒ 白烧一天。**只留痕、不改判定**。
+        """
+        if not self.budget_today:
+            return
+        for task in ("clear_area", "till_area", "plant_area"):
+            why = self._budget_defer_reason(task, obs)
+            if not why:
+                continue
+            self._note_budget_deferred(task, why, tiles=self._deferred_scan(task, obs))
+
+    def _note_capacity_capped(self, task: str, limit: int, capacity: int) -> None:
+        """【task-163 NIT-2】容量上限命中要**看得见**（旧行为静默生效、账本里查不到）。
+
+        一天每类只发一条 journal，并把汇总写进 `budget_today["capped_by_capacity"]`
+        （随 `day_end.stamina_budget` 落账）。**只留痕，不改判据**。
+        """
+        b = self.budget_today
+        if not b:
+            return
+        capped = b.setdefault("capped_by_capacity", {})
+        if task in capped:
+            return
+        capped[task] = {"limit": int(limit), "capacity": int(capacity)}
+        b["capacity_capped_tasks"] = len(capped)
+        self._journal("stage_capped_by_capacity", task=task, limit=int(limit),
+                      capacity=int(capacity), live_crops=b.get("live_crops"),
+                      dry=b.get("dry"), water_reserve=b.get("water_reserve"),
+                      note="分配额被当天体力预算的容量上限卡住 ⇒ 只分配 capacity 格；"
+                           "这不是『没活』，日终按预算延后口径解释")
 
     def _seed_outlook(self, obs: dict[str, Any]) -> tuple[int, int, bool]:
         """(种子总数, 钱, 还能不能搞到种子)。
@@ -2021,6 +2129,10 @@ class LongRun:
         tmap = FarmWorker.tiles_of(obs)
         tillable = FarmWorker.tillable_of(obs)
         _seeds, _money, can_plant = self._seed_outlook(obs)
+        # 【task-163】当天被体力预算**显式延后**的任务不再算"还有活"（否则守卫说还有活、
+        # 而 `_stage_tiles` 被预算拦住不产目标 ⇒ 白烧一天且当天不可能 VERIFIED）。
+        # 浇水/收获/清死苗**永不延后**，所以下面 crop 分支照旧。
+        deferred = self._budget_deferred_tasks()
         for t in tiles:
             if t in self.blocked:
                 continue  # 今天已经证明"动了没用"
@@ -2029,7 +2141,7 @@ class LongRun:
                 # 没动过的格子在 tiles[] 里根本不存在，只能靠 tillable[] 认。
                 # 但**没种子又买不起**时锄地是纯烧体力（`_plot_brief` 的 broken 分支就是这么判的）：
                 # 这里必须同口径，否则"守卫说还有活 / 策略说没事可做"会把一天耗成 stuck。
-                if t in tillable and can_plant:
+                if t in tillable and can_plant and "till_area" not in deferred:
                     return True
                 continue
             if tv.get("crop"):
@@ -2042,11 +2154,12 @@ class LongRun:
                     return True
                 continue
             kind = str(tv.get("kind") or "")
-            if kind in ACTIONABLE_KINDS:
+            if kind in ACTIONABLE_KINDS and "clear_area" not in deferred:
                 return True
-            if t in tillable and can_plant and not _till_blocked_by(tv):
+            if (t in tillable and can_plant and not _till_blocked_by(tv)
+                    and "till_area" not in deferred):
                 return True
-            if kind == "dirt" and can_plant:
+            if kind == "dirt" and can_plant and "plant_area" not in deferred:
                 return True
         return False
 
@@ -2556,7 +2669,11 @@ class LongRun:
         # `_leftover` 报），日终 `crops_watered` 该 false 就 false —— 绝不新增可洗白键。
         _budget_why = self._budget_defer_reason(task, obs)
         if _budget_why:
-            self._note_budget_deferred(task, _budget_why)
+            # 【task-163】把"当时还没做完的格子"一起记下来：守卫据此不再把这些格子算作
+            # "还有活"，日终按任务分类留痕。**不动判据**：`leftover` 仍是如实的，
+            # `budget_deferred_tiles` 只作 info，绝不参与 `checks`/`assigned_undone` 扣减。
+            self._note_budget_deferred(task, _budget_why,
+                                       tiles=self._leftover(task, obs, plot))
             return []
 
         if task == "water_area":
@@ -2616,8 +2733,10 @@ class LongRun:
                 # （`(max − 浇水预备 − 锄一格) / (播种 + 浇一格)`）。`budget_today` 为空说明
                 # 还没算过预算（例如单测直接调 `_stage_tiles`）⇒ 不拦，保持旧行为。
                 _cap = int((self.budget_today or {}).get("capacity") or 0)
-                if self.budget_today:
-                    limit = min(limit, max(0, _cap))
+                if self.budget_today and max(0, _cap) < limit:
+                    # 【task-163 NIT-2】容量命中要看得见（旧行为静默收窄、账本里查不到）。
+                    self._note_capacity_capped(task, limit, max(0, _cap))
+                    limit = max(0, _cap)
         if task in ("clear_area", "clear_dead", "till_area", "plant_area"):
             # 今天已经证明"动了没用"的格子不再碰（一格最多白试一次）；
             # 再叠一道"同一格一天最多发起 MAX_TILE_ATTEMPTS 次"的兜底不变量。
@@ -2635,7 +2754,14 @@ class LongRun:
         "动了没用"的格子会被从剩余集合里抹掉 ⇒ `met=true` ⇒ 硬失败被洗成 VERIFIED
         （真机 run2 第 1 天：`no_hard_failures=false`，阶段级却报 ok；task-3 §4 指出过同一处）。
         剩下的格子里哪些"已判定干不动"，由 `_step_stage` 在 reason 里**单独报数**，不混进判据。
+
+        【task-163】当天被**体力预算显式延后**的任务返回 `[]`：延后是"今天不做"而不是
+        "该做而没做"，否则守卫会一直说"还有活"、而 `_stage_tiles` 又拿不出目标 ⇒ 白烧一天
+        且当天不可能 VERIFIED。延后的格数记在 `budget_deferred_tiles{task: n}`（只作 info）；
+        **判定扣减一处不动**（`checks`/`assigned_undone` 都不看这个集合）。
         """
+        if task in self._budget_deferred_tasks():
+            return []
         tmap = FarmWorker.tiles_of(obs)
         tillable = FarmWorker.tillable_of(obs)
         local = [tuple(t) for t in plot["tiles"]]
@@ -2701,7 +2827,11 @@ class LongRun:
         if ripe:
             reasons.append(f"有 {len(ripe)} 格作物熟了")
         seeds, money, can_plant = self._seed_outlook(obs)
-        if seeds <= 0 and can_plant:
+        # 【task-163】当天被体力预算显式延后的任务不再算"还有活"：`clear_area`/`till_area`/
+        # `plant_area` 三类。`harvest`/`clear_dead`/浇水**永不延后**，所以下面各条照旧。
+        # 反例（不许发生）：预算把 plant_area 拦死、守卫却一直在说"该去买种子"⇒ 白烧一天。
+        deferred = self._budget_deferred_tasks()
+        if seeds <= 0 and can_plant and "plant_area" not in deferred:
             reasons.append(f"没种子但钱够（{money}g ≥ {self.seed_price}g），该去买")
         elif seeds <= 0 and self.seed_dead_today and not self.seed_unavail_noted:
             # 【task-67 ③b，run6 死锁的解药】今天已经确认"买不到合适种子" ⇒ "该去买"这条理由
@@ -2732,9 +2862,10 @@ class LongRun:
                 reasons.append(f"人不在农场，但 farm 口径还有 {dry} 格干作物（先回去浇）")
             if ripe > 0:
                 reasons.append(f"人不在农场，但 farm 口径还有 {ripe} 格熟作物（先回去收）")
-        if plot_work is not None:
+        if plot_work is not None and "plant_area" not in deferred:
             # 【task-149 A】农场级"还有耕地/空地"来源（与人在不在农场无关）：
             # 雨天作物被浇好之后，run9c 只剩这一条能说明"地里还有活"。
+            # 【task-163】`plant_area` 被体力预算延后时这条**也不算活**（今天不打算种）。
             _hoe_f, empty_f, seeds_f = plot_work
             if empty_f > 0 and seeds_f > 0:
                 reasons.append(f"farm 口径还有 {empty_f} 格耕地空着（手上有 {seeds_f} 粒种子）⇒ 该去种")
@@ -2778,8 +2909,13 @@ class LongRun:
         "判据证明这一格今天干不动"）。`tile_attempts` 到顶的格子仍然算 —— 它们是
         "今天试过但没做成"的真目标，允许守卫因此不判 `no_work`（当天会如实 `stuck`/
         needs_review，而不是洗成"没活"）。
+
+        【task-163】被**体力预算显式延后**的格子也不算：延后是"今天不做"，与"干不动"不同 ⇒
+        它们不该再让守卫说"还有活"（延后格数在 `budget_deferred_tiles{task: n}` 里如实记着）。
         """
-        return sorted(t for t in self.leftover_targets if t not in self.blocked)
+        defer = self._budget_deferred_tile_set()
+        return sorted(t for t in self.leftover_targets
+                      if t not in self.blocked and t not in defer)
 
     # ------------------------------------------------ task-124：review 独苗的对账路径
 
@@ -4761,6 +4897,9 @@ class LongRun:
         # 【task-158】体力预算每天重算（当天活苗数/体力上限都会变）。
         self.budget_today = {}
         self.budget_noted = False
+        # 【task-163】预算延后记账每天重来（`deferred` 只描述"今天"）。
+        self.budget_deferred_tiles = {}
+        self.capacity_capped_noted = set()
         self.refills_today = 0
         self.idle_rounds = 0
         self.blocked = {}
@@ -4852,6 +4991,11 @@ class LongRun:
         if not self.budget_noted:
             self.budget_noted = True
             self._journal("stamina_budget", **self.budget_today)
+        # 【task-163】预算延后**在日初就落痕**：不能等 `_stage_tiles` 被调用才记。
+        # run9d/day1 那种"策略给 `review`、守卫却一直说还有活"的日子里，
+        # `_stage_tiles` 可能一整天都不会被叫到，于是延后永远记不上、守卫永远不闭嘴
+        # ⇒ 3 轮零变化 ⇒ `stuck`（有界、不假绿，但白烧一天且当天不可能 VERIFIED）。
+        self._note_budget_deferrals(obs)
 
         last_obs = obs
         # task-19：当天**最后一个户外农场快照**（窗口口径浇水证据的来源）。日终再问必然是室内的

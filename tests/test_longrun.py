@@ -8356,5 +8356,202 @@ class TestTask161StaminaCalibration(unittest.TestCase):
         self.assertEqual(set(rep.checks), {"slept_by_us", "no_blocking_modal"})
 
 
+class TestTask163BudgetDeferralIsNotWork(unittest.TestCase):
+    """【task-163】当天被**体力预算**显式延后的任务，不许再被守卫算成"还有活"。
+
+    病灶（run9d 形态）：`_stage_tiles()` 被 `_budget_defer_reason()` 拦住不产出目标，
+    但 `work_reasons()`/`_pending_work()`/`_plot_has_work()` 仍把同一批格子算作"还有活"
+    ⇒ 守卫拒绝收工、策略又拿不出目标 ⇒ `stuck:同一秒连发 5 次换片都没有目标`
+    （有界、不假绿，但白烧一天，且当天**不可能** VERIFIED）。
+
+    口径（卡面红线，实现见 `brain/agentfarm/longrun.py`）：
+      * 延后只发生在"体力 ≤ 浇水预备 **且** 有浇水债"时（`_budget_defer_reason` 非空）；
+      * `harvest`/`clear_dead`/浇水**永不**延后；
+      * 延后格数只作 info（`budget_deferred_tiles{task: n}`），**绝不**参与
+        `checks`/`assigned_undone`/`plot_pending`/`day_end.deferred_tiles` 的任何扣减
+        —— 延后 ≠ 洗白；还剩真活（没浇完的活苗）时当天照样不 VERIFIED。
+
+    变异实测（`scratch/_t163_mutate.py`，brain+tests 一起拷到临时目录再打补丁）：
+      * 基线 8/8 绿；
+      * m163a（`_pending_work` 不过滤延后格）红 1：`test_pending_work_excludes_deferred_tiles`；
+      * m163b（`_leftover` 不为延后任务返回空）红 1：`test_leftover_is_empty_for_deferred_tasks_only`；
+      * m163c（`_plot_has_work` 忽略延后集合）红 4（含 `test_budget_blocked_day_can_still_verify`）；
+      * m163d（`work_reasons` 的 `plot_work` 理由忽略延后）红 4（同上四条）。
+    """
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list:
+        return [e for e in run.entries if e["event"] == name]
+
+    @staticmethod
+    def _plot(*tiles) -> dict:
+        tiles = list(tiles) or [(60, 10)]
+        return {"zone": "", "label": "", "anchor": list(tiles[0]), "tiles": tiles, "note": ""}
+
+    def _run_with(self, w: FakeWorld, *, worker=None) -> LongRun:
+        client = _CountingClient(w)
+        worker = worker or FakeWorker(w, log=lambda *_: None)
+        run = make_run(w, target_days=1, max_days=1,
+                       client_factory=lambda: client, worker_factory=lambda c: worker)
+        run.worker = worker
+        run.client = client
+        run.plot_size = 5
+        return run
+
+    def _overloaded_quiet_world(self) -> FakeWorld:
+        """超载但**没有浇水债**的农场：`crops=150`（150×2 + 12 > 270）而 `dryCrops=0`。
+
+        这正是卡面第④条要的目标形态：该浇的都浇完了、只剩被预算延后的清障/开垦/播种。
+        """
+        w = FakeWorld(weeds=0, seeds=5, money=0, stamina=270.0)
+        w.dirt = {(60 + i, 10) for i in range(6)}
+        w.farm = {"loaded": True, "complete": True, "crops": 150, "dryCrops": 0,
+                  "ripeCrops": 0, "deadCrops": 0, "dryDeadCrops": 0, "dryTiles": [],
+                  "dryTilesTruncated": False, "unwateredCrops": 0,
+                  "hoeDirt": 200, "emptyDirt": 6}
+        return w
+
+    def _defer_all_three(self, run: LongRun, w: FakeWorld) -> dict:
+        run.budget_today = run._stamina_budget(w.obs())
+        plot = self._plot(*sorted(w.dirt))
+        for task in ("clear_area", "till_area", "plant_area"):
+            self.assertEqual(run._stage_tiles(task, w.obs(), plot), [], f"{task} 该被预算拦")
+        return plot
+
+    def test_deferred_tasks_are_not_claimed_as_work(self):
+        """延后三类活之后，守卫**一条**"还有活"理由都不许有（卡面第①条）。"""
+        w = self._overloaded_quiet_world()
+        run = self._run_with(w)
+        self._defer_all_three(run, w)
+        self.assertEqual(run._budget_deferred_tasks(),
+                         {"clear_area", "till_area", "plant_area"})
+        reasons = run.work_reasons(w.obs())
+        joined = "；".join(reasons)
+        self.assertNotIn("还有地要清/开/种", joined)
+        self.assertNotIn("该去种", joined)
+        self.assertNotIn("没做完", joined)
+        self.assertEqual(reasons, [])
+
+    def test_pending_work_excludes_deferred_tiles(self):
+        """`_pending_work()`（task-49 的跨片地记账）也要剔掉延后格。"""
+        w = self._overloaded_quiet_world()
+        run = self._run_with(w)
+        self._defer_all_three(run, w)
+        run.leftover_targets = set(w.dirt)          # 假装这些格"今天早些时候见过"
+        self.assertEqual(run._pending_work(), [])
+        self.assertEqual(run.work_reasons(w.obs()), [])
+        # 反面对照：只清掉延后记账 ⇒ 同一批格子立刻又算"还有活"（证明过滤真在起作用）
+        run.budget_deferred_tiles = {}
+        self.assertEqual(len(run._pending_work()), len(w.dirt))
+
+    def test_leftover_is_empty_for_deferred_tasks_only(self):
+        """`_leftover` 对延后任务返回空（改走显式延后），对不延后的任务照旧如实报剩余。"""
+        w = self._overloaded_quiet_world()
+        run = self._run_with(w)
+        plot = self._plot(*sorted(w.dirt))
+        self.assertTrue(run._leftover("plant_area", w.obs(), plot))   # 延后之前：如实
+        self._defer_all_three(run, w)
+        self.assertEqual(run._leftover("plant_area", w.obs(), plot), [])
+        self.assertEqual(run._leftover("till_area", w.obs(), plot), [])
+        # 浇水/收获/清死苗永不延后 ⇒ 它们照旧报剩余（本世界没作物 ⇒ 本来就空，这里只验证不报错）
+        self.assertEqual(run._leftover("water_area", w.obs(), plot), [])
+
+    def test_no_water_debt_means_the_new_scope_does_not_apply(self):
+        """反向红线：没有浇水债 ⇒ 不延后，正常日子一字不改（守卫照旧说"该去种"）。"""
+        w = FakeWorld(weeds=0, seeds=5, money=0, stamina=270.0)
+        w.dirt = {(60 + i, 10) for i in range(3)}
+        w.farm = {"loaded": True, "complete": True, "crops": 0, "dryCrops": 0,
+                  "ripeCrops": 0, "deadCrops": 0, "dryDeadCrops": 0, "dryTiles": [],
+                  "dryTilesTruncated": False, "unwateredCrops": 0,
+                  "hoeDirt": 3, "emptyDirt": 3}
+        run = self._run_with(w)
+        run.budget_today = run._stamina_budget(w.obs())
+        self.assertEqual(run._budget_defer_reason("plant_area", w.obs()), "")
+        self.assertEqual(run._budget_deferred_tasks(), set())
+        plot = self._plot(*sorted(w.dirt))
+        self.assertTrue(run._stage_tiles("plant_area", w.obs(), plot))
+        self.assertTrue(run._plot_has_work(w.obs(), plot["tiles"]))
+        self.assertTrue(any("该去种" in r for r in run.work_reasons(w.obs())))
+
+    def test_budget_blocked_day_can_still_verify(self):
+        """卡面第④条：被预算卡住但该做的都做了（水浇完、无硬失败）⇒ 当天必须能 VERIFIED。"""
+        w = self._overloaded_quiet_world()
+        run = self._run_with(w)
+        self.assertEqual(run.run(), 0)
+        rep = run.days[-1]
+        self.assertTrue(run.budget_today["deferred_by_budget"])
+        self.assertEqual(sorted(run.budget_today["deferred"]),
+                         ["clear_area", "plant_area", "till_area"])
+        self.assertEqual(rep.ended_by, "sleep")
+        self.assertTrue(str(rep.ended_reason).startswith("no_work"))
+        self.assertIs(rep.checks["day_justified"], True)
+        self.assertIs(rep.verified, True)
+
+    def test_capacity_cap_is_journalled(self):
+        """卡面第③条（NIT-2）：容量上限命中要看得见（journal + `stamina_budget`），一天一条。"""
+        w = FakeWorld(weeds=0, seeds=50, money=0, stamina=270.0)
+        w.max_stamina = 60.0
+        w.dirt = {(60 + i, 10) for i in range(20)}
+        w.crops = {(60 + i, 10): {"watered": True, "ripe": False} for i in range(10)}
+        w.farm = {"loaded": True, "complete": True, "crops": 10, "dryCrops": 0,
+                  "ripeCrops": 0, "deadCrops": 0, "dryDeadCrops": 0, "dryTiles": [],
+                  "dryTilesTruncated": False, "unwateredCrops": 0,
+                  "hoeDirt": 20, "emptyDirt": 20}
+        run = self._run_with(w)
+        run.budget_today = run._stamina_budget(w.obs())
+        self.assertEqual(run.budget_today["capacity"], 11)          # (60 − 32 − 5) // 2
+        tiles = run._stage_tiles("plant_area", w.obs(), self._plot(*sorted(w.dirt)))
+        self.assertEqual(len(tiles), 10)                            # 空耕地只有 10 格 ⇒ 受池子限制
+        events = self._events(run, "stage_capped_by_capacity")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["task"], "plant_area")
+        self.assertEqual(events[0]["limit"], 12)                    # 收窄前的 `per_stage_tiles`
+        self.assertEqual(events[0]["capacity"], 11)
+        self.assertEqual(run.budget_today["capped_by_capacity"]["plant_area"],
+                         {"limit": 12, "capacity": 11})
+        self.assertEqual(run.budget_today["capacity_capped_tasks"], 1)
+        run._stage_tiles("plant_area", w.obs(), self._plot(*sorted(w.dirt)))
+        self.assertEqual(len(self._events(run, "stage_capped_by_capacity")), 1)   # 一天一条
+
+    def test_deferred_tiles_are_info_only(self):
+        """红线②：延后格数只作 info —— 不进 `checks`、不动 task-134 的日终口径。"""
+        w = self._overloaded_quiet_world()
+        run = self._run_with(w)
+        self.assertEqual(run.run(), 0)
+        rep = run.days[-1]
+        self.assertEqual(rep.stamina_budget["deferred_tiles"].get("plant_area"), 6)
+        self.assertEqual(rep.deferred_tiles, 0)          # 诚实上限口径：本世界没有阶段记录
+        self.assertEqual(rep.assigned_undone, 0)
+        self.assertEqual(rep.plot_pending, 0)
+        self.assertNotIn("deferred_tiles", rep.checks)
+        self.assertNotIn("budget_deferred_tiles", rep.checks)
+        self.assertGreaterEqual(len(self._events(run, "budget_deferred_tiles")), 1)
+        # 日初扫描能看到的延后格按任务落账：`plant_area` = 6 格空耕地、`till_area` = 观测里的
+        # 可锄格；本世界没有杂草 ⇒ `clear_area` 一格也没有（不产生 event，但仍在 `deferred` 名单里）。
+        self.assertEqual({e["task"] for e in self._events(run, "budget_deferred_tiles")},
+                         {"till_area", "plant_area"})
+        self.assertEqual(rep.stamina_budget["deferred_tiles"].get("till_area"), 20)
+        self.assertNotIn("clear_area", rep.stamina_budget["deferred_tiles"])
+        self.assertEqual(sorted(rep.stamina_budget["deferred"]),
+                         ["clear_area", "plant_area", "till_area"])
+
+    def test_real_unfinished_work_still_blocks_the_day(self):
+        """红线④反面：还剩**真活**（没浇完的活苗）⇒ 预算延后不许把当天洗成 VERIFIED。"""
+        w = self._overloaded_quiet_world()
+        w.dirt = {(60, 10)}
+        w.crops = {(60, 10): {"watered": False, "ripe": False}}
+        w.water_left = 0                                # 壶空 ⇒ 浇不成
+        w.farm["crops"] = 150
+        w.farm["dryCrops"] = 1
+        w.farm["unwateredCrops"] = 1
+        w.farm["hoeDirt"] = 1
+        w.farm["emptyDirt"] = 0
+        run = self._run_with(w)
+        run.max_steps = 40
+        rep = run._run_day()
+        self.assertIs(rep.verified, False)
+        self.assertIs(rep.checks.get("crops_watered"), False)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
