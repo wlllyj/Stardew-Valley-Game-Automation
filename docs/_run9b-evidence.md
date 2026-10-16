@@ -88,6 +88,19 @@ summer 17  final Farm      t=1530 体力=108.1 钱=5   作物=50 未浇=0 熟=0 
 summer 18  final FarmHouse t=600  体力=270   钱=205 作物=0  未浇=0 熟=0 可锄=0   种子=0
 ```
 
+`analyze-longrun.py` 的逐日原文（`logs/run9b-analyze.txt`，六行照抄）：
+
+```
+- 1年 summer 13日: ended_by=sleep verified=False ok/skip/fail=79/0/0 checks[slept_by_us=True,no_blocking_modal=True,no_hard_failures=True,unreachable_within_bound=True,refused_within_bound=True,no_unmet_stages=False,crops_watered=True,watered_outdoor=True,day_justified=False] 模态打断=0 | 浇水证据=farm/Farm dry=0/24 tiles=141 | 跨日=day_after 1/summer/14 L[101] | final Farm t=1440 体力=150 钱=8 作物=19 未浇=0 熟=0 可锄=200 种子=0
+- 1年 summer 14日: ended_by=sleep verified=False ok/skip/fail=107/3/0 checks[... no_unmet_stages=False ... day_justified=True] 模态打断=1 | 浇水证据=farm/Farm dry=0/24 tiles=227 | 跨日=day_after 1/summer/15 L[205] | final Farm t=1630 体力=4 钱=235 作物=7 未浇=0 熟=0 可锄=168 种子=1
+- 1年 summer 15日: ended_by=sleep verified=False ok/skip/fail=31/4/0 checks[... no_unmet_stages=False ... watered_outdoor=False ... day_justified=False] 模态打断=0 | 浇水证据=false（睡前还有没浇的作物） | 跨日=day_after 1/summer/16 L[244] | final Farm t=1140 体力=142 钱=235 作物=18 未浇=0 熟=0 可锄=200 种子=1
+- 1年 summer 16日: ended_by=sleep verified=False ok/skip/fail=16/0/0 checks[... no_unmet_stages=True ... watered_outdoor=False ... day_justified=False] 模态打断=0 | 浇水证据=false（睡前还有没浇的作物） | 跨日=day_after 1/summer/17 L[284] | final Farm t=1140 体力=206 钱=235 作物=28 未浇=0 熟=0 可锄=200 种子=1
+- 1年 summer 17日: ended_by=sleep verified=True ok/skip/fail=70/0/0 checks[slept_by_us=True,no_blocking_modal=True,no_hard_failures=True,unreachable_within_bound=True,refused_within_bound=True,no_unmet_stages=True,crops_watered=True,watered_outdoor=True,day_justified=True] 模态打断=0 | 浇水证据=farm/Farm dry=0/56 tiles=199 | 跨日=day_after 1/summer/18 L[348] | final Farm t=1530 体力=108.100006 钱=5 作物=50 未浇=0 熟=0 可锄=62 种子=0
+- 1年 summer 18日: ended_by=slept_without_work verified=False ok/skip/fail=0/0/0 checks[slept_by_us=False,no_blocking_modal=True,no_hard_failures=True,unreachable_within_bound=True,refused_within_bound=True,no_unmet_stages=True,crops_watered=True,watered_outdoor=True,day_justified=False] 模态打断=1 | 浇水证据=farm/Farm dry=0/56 tiles=200 L[355] | final FarmHouse t=600 体力=270 钱=205 作物=0 未浇=0 熟=0 可锄=0 种子=0
+```
+
+（上面六行里 `[...]` 是我为版面省略的重复项，**完整原文**见 `logs/run9b-analyze.txt`；六行中 `checks[...]` 内被省略的字段与左表一致：`no_unmet_stages` / `watered_outdoor` / `day_justified` / `slept_by_us`。）
+
 逐日 `day_after` 链（Lead 复核器原文）：`summer 13→14→15→16→17→18` 前 5 次 **5/5 恰好 +1**；summer 18 `day_after=None`（守卫拦住、当天不推进）。
 
 「睡前未浇」列 6 天全为 **0** —— 它取自 `day_end.final.counts_scope="window"`（人在 FarmHouse 时的窗口口径），**不能当浇水证据**；浇水一律看 `final_water`（farm 口径）与 `checks.watered_outdoor`。
@@ -109,6 +122,16 @@ summer 18  final FarmHouse t=600  体力=270   钱=205 作物=0  未浇=0 熟=0 
 - 计数：`NewDay 5 / before_save 5 / save_task 5 / completed 5 / after_save 5` ⇒ **逐次配对，无缺口**。
 - **⚠ 工具自身的坑：`SaveGame.Save() called.` 原始计数是 6，真实是 5。** 多出来的那一条是 **L16 插件描述文本**（`[21:58:08 INFO SMAPI] AgentFarm Bridge 0.7.29 …` 的版本说明里写着"run9 实测 4 NewDay / 0 Save called"），被正则 `SaveGame\.Save\(\) called\.` 命中。机制写清楚的原因：**Lead 的独立复核器 `scratch/run9-lead-check.py` 也踩了同一个坑**，它据此报了两条 ❌（"before save(5) != Save called(6)"、"有 save(6) 无 NewDay(5) —— 保存没有对应的跨日"）——**这两条是假阳性**，实际 5 次跨日各自都配齐了 `NewDay → before save → Save called → Saving → completed → after save`。后续判据若要自动化，**必须先排除插件描述行（`INFO  SMAPI]  AgentFarm Bridge`）再计数**。
 - 存档四条（收工时）：`Wahaha_450799035` **5766683** / `22:30:13.053`、`SaveGameInfo` **26933** / `22:30:13.055`、`Wahaha_450799035_old` 3843606 / `22:22:45.355`、`SaveGameInfo_old` 26891 / `22:22:45.356`。
+- 账本事件计数（`logs/run9b-verify.txt` 第 2 行原文）：
+```
+行数 357  坏行 0  事件 {'water_far': 73, 'decision': 44, 'outcome': 37, 'intent_verdict': 33, 'policy': 25, 'plot': 14, 'work_spot': 14, 'plot_exhausted': 11, 'resume_walk': 11, 'buy': 8, 'review': 7, 'tool_refused': 7, 'day_end': 6, 'day_start': 6, 'goto_farm': 6, 'lessons': 6, 'review_llm': 5, 'sleep': 5, 'refused_stage': 4, 'stage_midway_leftover': 4, 'idle': 3, 'refill': 3, 'sell': 3, 'surplus_sell': 3, 'buy_partial': 2, 'modal_dismissed': 2, 'plot_walk': 2, 'refused_summary': 2, 'review_only_fallback': 2, 'stage_exhausted': 2, 'stage_no_target': 2, 'finish': 1, 'intent_vetoed': 1, 'no_day_progress': 1, 'plot_exhausted_burst': 1, 'slept_without_work': 1}
+```
+- console（`logs/longrun-3day-llm-run9b.console.log` = **21251 B / 192 行**，stderr **0 B**）尾 3 行原文：
+```
+[run] 账本：logs\longrun-3day-llm-run9b.jsonl
+{"code": 1, "verified_streak": 0, "target_days": 3, "actions": 432, "minutes": 30.35}
+终态：needs_review（判据：observe?detail=full 的 tiles[]/clock 差分；回执一律不作证据）
+```
 
 ---
 
@@ -175,6 +198,118 @@ summer 18  final FarmHouse t=600  体力=270   钱=205 作物=0  未浇=0 熟=0 
 
 - 逐日 `day_end`：`dead_crops=0`、`dry_dead=0` **6/6 天**；`logs/longrun-3day-llm-run9b-lessons.json` 里 `far_dry_given_up|water_far` 的 `evidence="gave_up=3 dry_dead=0"`。
 - ⇒ 本跑**没有可证伪的死苗样本**（既非"通过"也非"失败"）：判定为【无法判定】——**缺失 ≠ 通过**。
+
+### ③-b L0 教训库原文（`logs/longrun-3day-llm-run9b-lessons.json`，3568 B，7 条，SHA256 `C2312F2D7FA3C9AAC3DBE3273E7DC9EBD220555AF5368A2F0AC8F342338486A0`）
+
+```json
+{
+ "lessons": [
+  {
+   "id": "slept_without_work|day",
+   "kind": "slept_without_work",
+   "scope": "day",
+   "symptom": "一天里一次农场动作都没做就想收工（被拦住、没推进游戏日）",
+   "evidence": "ended_by=slept_without_work 动作=0",
+   "hint": "",
+   "count": 1,
+   "first_day": [1, "summer", 18],
+   "last_day": [1, "summer", 18],
+   "last_seq": 7,
+   "severity": 2,
+   "src": "agentfarm"
+  },
+  {
+   "id": "stuck_with_leftover|till_area",
+   "kind": "stuck_with_leftover",
+   "scope": "till_area",
+   "symptom": "till_area 收尾时还剩 11 格没做成、当天以 stuck 结束",
+   "evidence": "leftover=11 failed=0 stopped=",
+   "hint": "资金只剩个位数，明天花钱要极省，别买不必要的东西。",
+   "count": 11,
+   "first_day": [1, "summer", 13],
+   "last_day": [1, "summer", 17],
+   "last_seq": 6,
+   "severity": 2,
+   "src": "agentfarm"
+  },
+  {
+   "id": "stuck_with_leftover|plant_area",
+   "kind": "stuck_with_leftover",
+   "scope": "plant_area",
+   "symptom": "plant_area 收尾时还剩 3 格没做成、当天以 stuck 结束",
+   "evidence": "leftover=3 failed=0 stopped=no_seed",
+   "hint": "资金只剩个位数，明天花钱要极省，别买不必要的东西。",
+   "count": 4,
+   "first_day": [1, "summer", 13],
+   "last_day": [1, "summer", 17],
+   "last_seq": 6,
+   "severity": 2,
+   "src": "agentfarm"
+  },
+  {
+   "id": "far_dry_given_up|water_far",
+   "kind": "far_dry_given_up",
+   "scope": "water_far",
+   "symptom": "有 3 格窗口外干作物够不着（当天放弃）",
+   "evidence": "gave_up=3 dry_dead=0",
+   "hint": "作物全已浇水且无成熟，明天先看成熟与缺水情况。",
+   "count": 2,
+   "first_day": [1, "summer", 15],
+   "last_day": [1, "summer", 16],
+   "last_seq": 5,
+   "severity": 2,
+   "src": "agentfarm"
+  },
+  {
+   "id": "tool_refused|till_area",
+   "kind": "tool_refused",
+   "scope": "till_area",
+   "symptom": "till_area 有 4 格被游戏拒绝（工具等级/前置不满足）",
+   "evidence": "refused=4 leftover=13",
+   "hint": "今天收工时体力只剩个位数，明天先恢复体力，别一早就猛干。",
+   "count": 4,
+   "first_day": [1, "summer", 14],
+   "last_day": [1, "summer", 15],
+   "last_seq": 4,
+   "severity": 3,
+   "src": "agentfarm"
+  },
+  {
+   "id": "stuck_with_leftover|water_area",
+   "kind": "stuck_with_leftover",
+   "scope": "water_area",
+   "symptom": "water_area 收尾时还剩 5 格没做成、当天以 stuck 结束",
+   "evidence": "leftover=5 failed=0 stopped=",
+   "hint": "作物全已浇水且无成熟，明天先看成熟与缺水情况。",
+   "count": 1,
+   "first_day": [1, "summer", 15],
+   "last_day": [1, "summer", 15],
+   "last_seq": 4,
+   "severity": 2,
+   "src": "agentfarm"
+  },
+  {
+   "id": "plot_exhausted|plot",
+   "kind": "plot_exhausted",
+   "scope": "plot",
+   "symptom": "换了 4 片地都找不到可干的活",
+   "evidence": "plot_exhausted=4",
+   "hint": "资金只剩个位数，明天花钱要极省，别买不必要的东西。",
+   "count": 2,
+   "first_day": [1, "summer", 13],
+   "last_day": [1, "summer", 14],
+   "last_seq": 3,
+   "severity": 2,
+   "src": "agentfarm"
+  }
+ ]
+}
+```
+
+- 值得点名的两条**自相矛盾/自证**（task-136 的输入）：
+  - `far_dry_given_up|water_far`：`symptom="有 3 格窗口外干作物够不着（当天放弃）"`、`evidence="gave_up=3 dry_dead=0"`，但 `hint="作物全已浇水且无成熟…"` —— **hint 与 evidence 矛盾**（当天并没有"全已浇水"，而是有 3 格放弃）。
+  - `slept_without_work|day`：`hint` 为空字符串（该 kind 没写提示），而它恰恰是最该被次日注入的一条（summer 18 的守卫事件）。
+- 拷贝（占位，**不得用于判决**）：`logs/longrun-3day-llm-run10-lessons.json`（同一 SHA256），重做规则见 §7.2。
 
 ### ④ `review_only_fallback` / `plot_exhausted_burst` 是否生效、有界
 
@@ -255,3 +390,25 @@ summer 18  final FarmHouse t=600  体力=270   钱=205 作物=0  未浇=0 熟=0 
 | `logs/run9b-baseline.json` | Lead 的起跑前基线 |
 
 **纪律声明**：本跑与本文档只写 `logs/`（新增）、`scratch/`、`docs/_run9b-evidence.md`；**未改动** `brain/`、`mod/`、`tests/`、`tools/`，未 bump/未装机，未在跑批中 `load_save`，未替游戏做选择（本跑无 `eventUp`）。
+
+---
+
+## §9 附录：起止快照原文（`scratch/run9b-external-snapshots.jsonl`，2 行，逐字）
+
+```json
+{"tag": "start", "at": "2026-10-16T21:59:31", "save_main": {"exists": true, "size": 3706657, "mtime": "2026-10-15T22:22:57.011"}, "save_info": {"exists": true, "size": 27913, "mtime": "2026-10-15T22:22:57.145"}, "smapi_lines": 417, "smapi_counts_filter": null, "smapi_newday": 0, "smapi_before_save": 0, "smapi_save_called": 1, "smapi_save_task": 0, "smapi_save_completed": 0, "smapi_save": 3, "smapi_total_lines": 417, "smapi_mtime": "2026-10-16T21:58:36.507", "journal_lines": null, "journal_last_event": null, "journal_finish": null, "journal_path": "logs\\longrun-3day-llm-run9b.jsonl", "pid_file": null, "pid_file_candidates": [{"path": "logs\\longrun-3day-llm-run9b.pid", "exists": false}], "pid": null, "pid_alive": null, "bridge_info": {"schema": "agentfarm-bridge/1", "port": 17890, "pid": 456, "modVersion": "0.7.29", "gameVersion": "1.6.15", "smapiVersion": "4.5.2", "startedAt": "2026-10-16T14:58:08+00:00", "mtime": "2026-10-16T21:59:10.259", "_keys": ["gameVersion", "modVersion", "pid", "port", "schema", "smapiVersion", "startedAt", "token"]}, "expected_mod_version": "0.7.29", "mod_version_matches": true, "version_sidecar": null, "console": null, "console_err": null, "written_at": "2026-10-16T21:59:31"}
+{"tag": "end", "at": "2026-10-16T22:30:27", "save_main": {"exists": true, "size": 5766683, "mtime": "2026-10-16T22:30:13.053"}, "save_info": {"exists": true, "size": 26933, "mtime": "2026-10-16T22:30:13.055"}, "smapi_lines": 4622, "smapi_counts_filter": null, "smapi_newday": 5, "smapi_before_save": 5, "smapi_save_called": 6, "smapi_save_task": 5, "smapi_save_completed": 5, "smapi_save": 13, "smapi_total_lines": 4622, "smapi_mtime": "2026-10-16T22:30:17.140", "journal_lines": 357, "journal_last_event": "finish", "journal_finish": {"event": "finish", "t": 1821.0, "code": 1, "verified_streak": 0, "actions": 432, "minutes": 30.35, "stages_seen": ["clear_area", "plant_area", "till_area", "water_area"], "no_unmet_stages": false, "unmet_days": ["1年 summer 13日", "1年 summer 14日", "1年 summer 15日"], "stuck_flushes": 0}, "journal_path": "logs\\longrun-3day-llm-run9b.jsonl", "pid_file": "logs\\longrun-3day-llm-run9b.pid", "pid_file_candidates": [{"path": "logs\\longrun-3day-llm-run9b.pid", "exists": true}], "pid": 12028, "pid_alive": false, "bridge_info": {"schema": "agentfarm-bridge/1", "port": 17890, "pid": 456, "modVersion": "0.7.29", "gameVersion": "1.6.15", "smapiVersion": "4.5.2", "startedAt": "2026-10-16T14:58:08+00:00", "mtime": "2026-10-16T22:30:11.026", "_keys": ["gameVersion", "modVersion", "pid", "port", "schema", "smapiVersion", "startedAt", "token"]}, "expected_mod_version": "0.7.29", "mod_version_matches": true, "version_sidecar": {"path": "logs\\longrun-3day-llm-run9b.version.json", "head": "06c4426fff406d9d51b50ac45baaee467b49d4d6", "pid": 12028, "started_at": "2026-10-16T21:59:55", "worktree_clean": false, "git_status_short": ["M docs/00-开发日志.md"], "files": {"brain/agentfarm/longrun.py": {"sha256": "6CE4EA267A37810782BEAEAD484CDAE5D3F8CA554FF97C143120445739436724", "mtime": "2026-10-16T21:50:37.018739"}, "brain/agentfarm/farmwork.py": {"sha256": "4A39BC11ABCA3413D1608CCD58CC1F070CEA9F85EAB4AA87E809ED5E686C2D80", "mtime": "2026-10-16T21:45:23.956930"}, "brain/agentfarm/bridge.py": {"sha256": "648E988912C85FCF7DFB403A276120BCF900FB8F1605A052795A14EAED7AA507", "mtime": "2026-10-16T21:57:24.901504"}, "mod/AgentFarm.Bridge/bin/Release/AgentFarm.Bridge.dll": {"sha256": "02755488A532BA3D163010BAF985029B35B31C682D5AC025A9AD2E68D86297C7", "mtime": "2026-10-16T21:57:37.867712"}, "mod/AgentFarm.Bridge/manifest.json": {"sha256": "8765A4735821B5B6ED6851731A0F076E01DA72A8E836334B6F68A77D3D76FB26", "mtime": "2026-10-16T21:57:34.089725"}}}, "console": {"path": "logs\\longrun-3day-llm-run9b.console.log", "bytes": 21251, "lines": 192, "tail": ["[run] 账本：logs\\longrun-3day-llm-run9b.jsonl", "{\"code\": 1, \"verified_streak\": 0, \"target_days\": 3, \"actions\": 432, \"minutes\": 30.35}", "终态：needs_review（判据：observe?detail=full 的 tiles[]/clock 差分；回执一律不作证据）"]}, "console_err": {"path": "logs\\longrun-3day-llm-run9b.console.err.log", "bytes": 0, "lines": 0, "tail": []}, "written_at": "2026-10-16T22:30:27"}
+```
+
+---
+
+## §10 判决一览（供 Lead 汇总进 `docs/_run10-criteria.md`）
+
+| 层级 | 结论 | 依据 |
+|---|---|---|
+| 落盘硬判据（本轮新增） | **通过 ✅** | §3：5 次跨日 × 6 串全部配对、存档逐次前进 |
+| 严格整本（`strict_verdict`） | `needs_review` | `verify-run3.py --json`：`problems=13`、`history_problems=0` |
+| 尾部窗口（`verdict`，权威） | `needs_review` / 尾部连续 VERIFIED **0/3** | `verify-run3.py` 文本版结论行 |
+| 独立复核（`analyze-longrun --window 3`） | `exit 1` / `VERIFIED 1/3` / 窗口内红 45 / 历史 0 | §4.2 |
+| Lead 复核器 | `rc=1` / 尾部窗口未达标 ❌（另 2 条 ❌ 为 L16 假阳性） | §4.3 |
+| **整跑判决** | **FAIL（0/3）** | 上述四条同向 |
