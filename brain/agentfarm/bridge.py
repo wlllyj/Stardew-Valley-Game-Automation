@@ -36,7 +36,16 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.30"   # v0.7.30：run9b 复盘四件事 —— ①water_far 壶空先补水再重试
+MOD_VERSION_EXPECTED = "0.7.31"   # v0.7.31：run9c 诊断后的口径修复 —— ①播种分配额 = 手上种子数
+                                 # （`plant_area` 上限 `min(per_stage_tiles, seeds_total)`，
+                                 #   买不到种子 **不算** 今天该做的活做完）；
+                                 # ②浇水阶段壶空先补水再续做（阶段内 ≤2 次，把分下去的格做完；
+                                 #   补水不可能才如实 `stopped="need_refill"`）；
+                                 # ③雨日 0 动作 fail-open 修法（农场级工作理由
+                                 #   `hoeDirt`/`emptyDirt` fail-closed + 日初 `goto_farm` 被
+                                 #   `ui_modal` 挡住后清模态**真重试一次** +
+                                 #   `checks.zero_action_evidenced`：0 动作日没有独立证据不许 VERIFIED）。
+                                 # v0.7.30：run9b 复盘四件事 —— ①water_far 壶空先补水再重试
                                  # （当天 ≤2 次）+ **逐格判据**（只看该格是否还在
                                  #   `farm.dryTiles`/`watered`，不许用别格浇水的全局差值顶替）；
                                  # ②resume 空转有界（`_resume_plot`/`review_only_fallback`
