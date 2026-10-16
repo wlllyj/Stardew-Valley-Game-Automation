@@ -36,7 +36,8 @@
 1. `team_task_get` 确认 **task-102 / task-104 / task-106 / task-58 / task-59 / task-82 / task-111 / task-114 / task-116 已 completed**，且 **task-103 / task-108 PASS、task-112 FAIL→task-114 已修、task-115 PASS 或 PASS-WITH-NITS（无必修）**。
    - 其中 **task-112 = FAIL**（`docs/_review-llmfeedback.md`：F1 教训库来源可信性、F2 裁剪优先级）⇒ **task-114 修 → task-115 delta 复验**；两条都不阻塞 run9 判定正确性，但削弱演进机制，故列为本版必修。
    - task-111 已交 **`d10dc6b`**（5 个新事件入桶 + `review_llm_without_notes`/`lessons_over_limit`/`lessons_load_failed` 三条红；全量 **665 OK / 0 红**；八账本 rc 与 `verify-run3` 一字未变）。
-   - **task-114 已交 `c135edc`**（教训库 schema 信任边界 + 裁剪优先级 核心>教训>决策史>笔记 + `no_inventory_space.evidence` 用当次真值；丢条目记新事件 `lessons_rejected`）；**task-116 收该事件前全量有 2 条漂移红**（`Ran 672, failures=2`，均在 `tests/test_analyze_longrun.py`）⇒ **task-116 归零是本版放行硬条件**。
+   - **task-114 已交 `c135edc`**（教训库 schema 信任边界 + 裁剪优先级 核心>教训>决策史>笔记 + `no_inventory_space.evidence` 用当次真值；丢条目记新事件 `lessons_rejected`）；**task-116 收该事件前全量有 2 条漂移红**（`Ran 672, failures=2`，均在 `tests/test_analyze_longrun.py`）⇒ **task-116 归零是本版放行硬条件**（已交 `370909c`、`Ran 677 OK`）。
+   - **task-115（delta 复验 task-114）= FAIL**（`docs/_review-task114.md`，`04ce4f9`）：卡面第 1 条③「伪造条目不许把真教训挤出 20 条上限」不成立 —— 合法 schema 的 `last_seq=999999`/`21`/`count=1e9` 能占注入列表首位并挤掉真教训（20 条真教训 ⇒ 存活 18/20；单喂 ⇒ 19/20）；根因 `_sanitize_lesson` 没钳 `last_seq`/`count` + `prune_lessons` 排序键 `(last_seq, severity, count)`（task-112 §5 NIT-3 只修了一半）。⇒ **task-118 修（src 标记 + trusted 优先 + 钳上界 + 防洗白 + NIT-2 最小版）→ task-119 二次 delta 复验**，两条同样列为本版必修（纯载入侧、无判定影响）。
 2. 确认 `tools/_note-0728.txt` 存在且**首串是 `v0.7.28`**（列本版两批卡片：run8 两病灶 + LLM 复盘/教训库；LLM 两条等 task-82/task-59 落地后按实际内容补写）。
 3. `python tools/_bump-mod-version.py 0.7.28 --note-file tools\_note-0728.txt`（⚠️ cp1252 下末句 print 会 `UnicodeEncodeError` 且退出码 1，但**版本已写盘** ⇒ 一律用 `json.load` 核对 `manifest.json` 的 `Version`）。
 4. `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.28"`。
