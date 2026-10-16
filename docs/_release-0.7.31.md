@@ -32,19 +32,22 @@
 |---|---|---|
 | **task-143** | `plant_area` 分配额不得超过手上种子数（`limit = min(per_stage_tiles, seeds)`）；不许把 `no_seed` 塞进诚实上限白名单 | 本版必修 |
 | **task-144** | `water_area` 阶段壶空 ⇒ 补水续做（有界 ≤2 次）；补水不可能才如实 `need_refill` + `assigned_undone>0`；消除 `stopped=="" ∧ assigned_undone>0` | 本版必修（blocked_by 143） |
-| **task-145** | 对 143+144 的独立对抗验收（重点打"新洗白通道"） | 本版验收（blocked_by 143,144） |
-| **task-149** | run9c 的 summer 20 真空日暴露的 F1：`work_reasons()` 缺“农场级还有活”的来源（hoeDirt/emptyDirt 有活却全天 0 动作仍被当 `no_work`）⇒ 农场级工作理由 + 缺失字段 fail-closed；日首 `goto_farm` 被模态挡住必须重试一次；0 动作日不许 VERIFIED | 本版必修（blocked_by 144） |
-| **task-150** | 对 task-149 的独立对抗验收（重点：伪造“农场级无活”） | 本版验收（blocked_by 149） |
+| **task-145** | 对 143+144 的独立对抗验收（重点打"新洗白通道"） | **PASS（`452dc02`）**：143 PASS / 144 PASS-WITH-NITS 无必修；B1/B2/B2b 三形态 FAIL→PASS；C 段六组未发现新洗白通道；NIT-1（桥异常穿出 `run()`）→ task-110、INFO-1（种子靠名字认）→ task-154 |
+| **task-149** | run9c 的 summer 20 真空日暴露的 F1：`work_reasons()` 缺“农场级还有活”的来源（hoeDirt/emptyDirt 有活却全天 0 动作仍被当 `no_work`）⇒ 农场级工作理由 + 缺失字段 fail-closed；日首 `goto_farm` 被模态挡住必须重试一次；0 动作日不许 VERIFIED | **已交付 `928d3d2`**（Lead 核：2 文件、越界零命中、三模块 456 OK、**全量 815 OK / 0 红**） |
+| **task-150** | 对 task-149 的独立对抗验收（重点：伪造“农场级无活”） | **本版最后一道门**（deputy 在制） |
 | task-137 | 非 `sleep` 收尾分支 `day_end.final` 可能是旧快照 | 顺延 |
 | task-101/107/109/110/117 | 类型校验 / dryTiles 同源 / 卖货如实性 / `ensure_location` 无 try / 教训内容模板 | 顺延 |
 | task-141/142 | 用户 2026-10-17 诉求：工具升级（LLM 能建议 + 真能升级）——**0.7.32**（目标 1 的前置） | 0.7.32 |
 | **task-151** | 全场清理收敛策略 + `farm_cleared` 完成判定（farm 计数同源 + 不许洗白）——**目标 1** | 0.7.32（blocked_by 142） |
 | **task-152** | 钱的三分配策略（种子再投资 / 升级储备 / 缓冲；LLM 给意图、代码算数字）——**目标 1 后半句** | 0.7.32（blocked_by 142） |
+| **task-153** | 铁匠铺升级链 IL/反射取证（喂 141/142；只读 `docs/`+`scratch/`） | 0.7.32（log-analyst 在制，与 141/142 并行） |
+| **task-110** | 桥异常绝不许穿出 `run()`（`ensure_location` / `refill_can.snap` / `_step_stage` refill 三处 + 顶层兜底要有 `finish`） | 0.7.32（与 task-109 同批） |
+| **task-154** | 种子识别不许只靠名字（结构性识别 + `seed_unknown` fail-closed） | 0.7.32 |
 | task-14/17/18/20/53/83/94 | warp 活锁 / world_stuck / 职业 / 工具等级 / 农场级计数 / 田块规整 | 长期 |
 
 ## §2 冻结与装机九步（Lead 独占，命令照抄）
 
-1. 确认 143/144 completed、145 PASS、全量单测 **0 红**；
+1. 确认 143/144/149 completed、145 PASS（`452dc02`：143 PASS / 144 PASS-WITH-NITS 无必修）、150 PASS、全量单测 **0 红**（当前读数 **Ran 815 / OK**，task-149 提交后）；
 2. `tools/_note-0731.txt` 首串必须是 `v0.7.31`（列 143/144）；
 3. `python tools\_bump-mod-version.py 0.7.31 --note-file tools\_note-0731.txt`（cp1252 末句会 `UnicodeEncodeError` 且退出码 1 —— **版本已写盘**，一律用 `json.load` 核对 manifest）；
 4. `brain/agentfarm/bridge.py` 的 `MOD_VERSION_EXPECTED = "0.7.31"`（注释写清本版两项）；
