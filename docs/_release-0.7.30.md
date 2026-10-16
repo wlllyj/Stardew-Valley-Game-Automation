@@ -21,7 +21,8 @@
 | task-133 | `_water_far_dry` 补水重试（≤2 次）+ **逐格判据**（`farm.dryTiles`/`watered`，禁止全局差值）+ 收尾分清因 | dev-coder **completed**（`57ef928`，Lead 已核） | ✅ |
 | task-134 | A：resume/work_spot 空转有界（burst 计数覆盖）+ resume 重评 `no_target`；B：**leftover 口径拆分**（`assigned_undone` vs `plot_pending`） | dev-coder **completed**（`903e6a4`，2 文件 +383/−4；Lead 亲核定向 433 OK / 全量 **757 OK**） | ✅ |
 | 工具侧对齐 | `tools/verify-run3.py` 3b 改按 `stages[].assigned_undone` 判 `no_unmet_stages`（`leftover`/`plot_pending` 只记录）+ 日级白名单补 `assigned_undone`/`plot_pending`/`plot_pending_by_kind`/`deferred_tiles` + 5 条新用例 | Lead **completed**（`c6cc654`；`tests.test_verify_run3` 58 OK、九账本 rc 并排不变） | ✅ |
-| task-135 | 独立对抗验收 task-133 + task-134（重点：口径变更是否引入新洗白通道） | deputy-lead 在制（已派，含工具侧对账） | ✅ |
+| task-135 | 独立对抗验收 task-133 + task-134（重点：口径变更是否引入新洗白通道） | deputy-lead 首轮 **FAIL**（`1726d2e`：task-133 PASS / task-134 脑侧 PASS-WITH-NITS / 工具侧 F1 必修）⇒ 复验在制 | ✅ |
+| task-135 修复 | 工具侧 **F1**（诚实上限阶段的分配内未完成格不许当 unmet ⇒ 消掉假红）+ **F2**（`assigned_undone` 不许纯自述：`stage_shortfall_day` 落痕 > 账本自算 ⇒ problem） | Lead **completed**（`5b070b4`；`tests.test_verify_run3` 60 OK、全量 **776 OK**、九账本 rc 逐字不变；deputy 的 F1 反例 `scratch/_t135_j/_t135_head_night+stamina_600.jsonl` 改前 needs_review ⇒ 改后 `--days 1` VERIFIED 无 mismatch） | ✅ |
 | task-136 | 决策演进链质量：复盘调用留痕 + 复盘提示词接地 + 教训 hint 防污染（`[模型自述·未验证]`） | dev-coder **completed**（`7d4450f`，4 文件 +463/−23；Lead 亲核定向 438 OK / 全量 **767 OK**） | ✅（run9c 前） |
 | task-139 | analyzer 收录 task-136 的 `lessons.hint_dropped` + 头部「教训素材质量」行 + 三条 ⚠（不进 rc） | log-analyst **completed**（`1e1d2cf`，3 文件 +247/−2；Lead 亲核 analyzer 171 OK / 全量 **774 OK**，十账本 rc 一字未变） | ✅（不阻塞冻结，run9c 判决前交） |
 | task-101 | `_farm_totals` 类型校验（`dryCrops="abc"` 会让整天崩）等 NIT | pending | 顺延 |
@@ -34,7 +35,7 @@
 
 ## §2 冻结与装机九步（Lead 独占）
 
-1. 确认 task-133/134/**136**/135 全 completed 且**全量单测 0 红**（`python -m unittest discover -s tests`）。本版**工具侧对齐已在冻结前完成**（`c6cc654`：3b 按 `assigned_undone` 判、日级白名单补四键、58 OK、九账本 rc 并排不变），冻结时只需再复跑一次确认。**task-139**（analyzer 收录 task-136 新事件）`blocked_by task-136`，**不阻塞冻结**，但必须在 run9c 判决前交（否则 `--window` 口径可能出现漂移红）。
+1. 确认 task-133/134/**136**/135 全 completed 且**全量单测 0 红**（`python -m unittest discover -s tests`）。本版**工具侧对齐已在冻结前完成**：`c6cc654`（3b 按 `assigned_undone` 判、日级白名单补四键）+ **`5b070b4`**（F1 诚实上限阶段假红、F2 `assigned_undone` 纯自述漏洞 —— deputy task-135 首轮 FAIL 的两条），冻结时只需再复跑一次确认（`tests.test_verify_run3` 60 OK / 全量 776 OK / 九账本 rc 并排不变）。**task-135 需 deputy 复验把 F1/F2 判 PASS-WITH-NITS 或 PASS**，否则不许冻结。**task-139**（analyzer 收录 task-136 新事件）已 completed（`1e1d2cf`）。
 2. 写 `tools/_note-0730.txt`，**首串必须是 `v0.7.30`**，逐条列 task-133/134/136（已于本夜写好，首串 `v0.7.30（run9b 复盘：water_far 补水与逐格判据 + resume 空转兜底 + 阶段口径账实相符 + 演进素材质量）`）。
 3. `python tools\_bump-mod-version.py 0.7.30 --note-file tools\_note-0730.txt`（末句在 cp1252 下会 `UnicodeEncodeError`、退出码 1，**版本已写盘** ⇒ 一律 `json.load` 核对 manifest）。
 4. `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.30"`（注释列本版两项）。
@@ -65,6 +66,8 @@
 3. **resume 有界**（task-134 A）：`work_spot`/`resume_walk` 连续无产出必须被 burst 计数拦住（≤5），当天以 `stuck:` 诚实收尾且 leftover 不许归零。
 4. **leftover 口径拆分**（task-134 B，口径变更）：`assigned_undone`（阶段分到的格少做了）非诚实上限 ⇒ unmet；诚实上限（`stamina`/夜里/`budget` 且作业量做完）留下的片区待做 ⇒ `deferred_tiles`(info) 且不进 unmet；`plot_pending` 字段保留且数值不得变（守卫行为不许变）；`unreachable`/`refused` 越界仍判 false。
 5. **世界差分（原始目标口径：判据 = `observe?detail=full` 差分，不信回执）**：run9c 每个游戏日至少要有一份**独立**的 `observe?detail=full` 原文（`scratch/run9c-observe-<day>.json`），证据文档里给出"当日 `day_start` 观测 → 当日收尾观测"的**逐格/计数差分表**（至少：`location.tiles[]` 的 `kind` 迁移数、`farm.crops/unwatered(needsWatering)/dryCrops/deadCrops`、`player.stamina/money`、`inventory` 种子叠），并写明"哪一格从什么变成什么"。**只有账本自述没有独立观测差分的天，不算世界差分证据**（自述只能作旁证）。
+6. **`assigned_undone` 不得纯自述**（task-135 F2，`5b070b4`）：该字段是脑侧自报；`tools/verify-run3.py` 新增交叉核对 —— `stage_shortfall_day`（非夜里收工的欠账落痕）`unmet > 账本自算 assigned_undone` ⇒ problem。伪造 `assigned_undone=0` + 落痕 `unmet=5` 的账本必须被判红。
+7. **诚实上限阶段不得制造假红**（task-135 F1，`5b070b4`）：体力/夜里/预算收尾且作业量做完的阶段，其分配内未完成格只进 `deferred_tiles`（info），自算 `no_unmet_stages` 时从基数里减掉；账本谎报 `true` 时仍报 mismatch。
 
 ## §5 与 run9b 对比（跑完填）
 
