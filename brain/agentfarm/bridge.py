@@ -36,15 +36,15 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.29"   # v0.7.29：run9 复盘四件事 —— ①【P0】出货日日切保存
-                                 # （ShippingMenu **只推不关**：反射私有 `okClicked()` 后
-                                 #   wait-only；`SaveGameMenu`/`NewDaySavingMenu` 一律拒关，
-                                 #   run9 实测 4 NewDay / 0 Save called、存档 start==end）；
-                                 # ②review-only 决策不许白过（用守卫据以抱怨的跨片地
-                                 #   leftover 兜底换真意图，`plot_exhausted` 连发有界）；
-                                 # ③复盘预算 512→4096 + 截断自愈重试 8192（`max_tokens`/`attempts` 留痕）；
-                                 # ④买种子量力而行（`n=min(buy_count, money//price)`，
-                                 #   `buy_partial`，货架价优先 `price_shelf`/`price_cfg`）。
+MOD_VERSION_EXPECTED = "0.7.30"   # v0.7.30：run9b 复盘四件事 —— ①water_far 壶空先补水再重试
+                                 # （当天 ≤2 次）+ **逐格判据**（只看该格是否还在
+                                 #   `farm.dryTiles`/`watered`，不许用别格浇水的全局差值顶替）；
+                                 # ②resume 空转有界（`_resume_plot`/`review_only_fallback`
+                                 #   回来时清任务级 `no_target`，work_spot/resume 计入 burst ≤5）；
+                                 # ③"今天没做完"账实相符（阶段级 `assigned_undone` vs 片区级
+                                 #   `plot_pending`，诚实上限留 `deferred_tiles` 不计 unmet）；
+                                 # ④演进素材质量（复盘调用进 trace `kind="review"`、复盘提示词
+                                 #   接地 19 字段、lesson 的 hint 与 evidence 矛盾 ⇒ `hint_dropped`）。
                                  # v0.7.27：经济闭环第一步（卖盈余材料换种子钱，K=10 保底 + 三闸门）
                                  # + 枯死作物不再浇水（Mod 把"干"拆成活苗 `dryCrops`/`dryTiles`
                                  # 与死苗 `dryDeadCrops`；脑侧 `water()` 遇死苗 `skipped`、
