@@ -1,0 +1,9 @@
+v0.7.29（run9 复盘：跨日落盘闸门 + review 空转兜底 + 教训素材链）
+
+- task-129（P0）：出货日跨日保存修活 —— ShippingMenu 禁 exitThisMenu，改反射 okClicked() 后 wait-only；SaveGameMenu / NewDaySavingMenu 一律 wait-only（run9 实测 4 NewDay / 0 Save called，存档 start==end）。
+- task-124：review-only 决策不许白过 —— 用守卫据以抱怨的那份 leftover 挑片地/挑格兜底；兜底仍无目标时诚实收尾并把 leftover 标 no_target_global / given_up；plot_exhausted 连发有界。
+- task-122：教训库新增 stuck_with_leftover / plot_exhausted 两类（含「干净日仍然 0 条」用例）。
+- task-121：复盘预算 512→4096，截断自愈重试一次（8192）；失败留 max_tokens / attempts。
+- task-123：买种子量力而行（n=min(buy_count, money//price)，n>=1 记 buy_partial；货架价优先）。
+- 判据收紧：每次跨日必须落盘 —— SMAPI NewDay 次数 > SaveGame.Save() called. 次数即硬问题（docs/_run6-criteria.md §2，commit 99eb8e0）。
+- run9 不能作为 run A 基线（落盘 0/4）；run9b = run A、run10 = run B（教训库显式拷贝 + compare-runs 对照）。
