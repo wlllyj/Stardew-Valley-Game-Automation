@@ -2977,7 +2977,8 @@ class TestWaterFarRefillAccounting(unittest.TestCase):
         advice = " ".join(a["text"] for a in rep["advice"])
         self.assertIn("need_refill", advice)
         self.assertIn("壶空**不是够不着**", advice)
-        self.assertIn("verify-run3.py 对 `water_far_refill` 零命中", advice)
+        self.assertIn("verify-run3.py 对 `water_far_refill` / `water_far_open` / `water_far_blocked` 零命中",
+                      advice)
 
     def test_old_ledger_without_refill_event_is_undecidable_not_zero(self):
         rep = self._report(self._day([1, "summer", 5], extra=[dict(self.FAR_OLD)]),
@@ -3382,6 +3383,134 @@ class TestStageRefillRetryAndStopNamed(unittest.TestCase):
         self.assertIn("阶段自愈/如实收工: <缺失>", text)
         self.assertIn("缺失 ≠ 0", text)
         self.assertIn("没有任何 task-144", " ".join(rep["undecidable"]))
+
+
+class TestOpenPathAndStaminaBudget(unittest.TestCase):
+    """task-157/158：够不着 ⇒ **有界开路**（`water_far_open`）后重试同一格；开路后仍站不到 ⇒
+    如实 `water_far_blocked`；体力预算 `stamina_budget` / 只因预算被延后 `deferred_by_budget`。
+
+    口径：四个事件都**不是失败**（`tools\\verify-run3.py` 对它们零命中 ⇒ 本工具**不判红、不进 rc**）；
+    当天达不达标一律由 `checks.watered_outdoor` / `checks.no_unmet_stages` 说话。只给四条可证伪
+    ⚠（只警告）：①开路成功但那格当天最后仍在 dryTiles 里；②有格 blocked 而当天却自称户外浇水达标；
+    ③说「只因预算延后」却当天自称浇完；④日级 `deferred_by_budget>0` 却没有对应事件。
+    旧账本没有这些事件/字段 ⇒ 头部 `<缺失>` +【无法判定】（缺失 ≠ 0 ≠ 没发生）。
+    """
+
+    OPEN_OK = {"event": "water_far_open", "t": 3.0, "tile": [12, 30], "code": "ok",
+               "attempt": 1, "limit": 2, "cleared_count": 2, "cleared": [[11, 30], [13, 30]],
+               "note": "开路后已站到目标旁（open_way 内部复核 stand_next_to 通过）"}
+    BLOCKED = {"event": "water_far_blocked", "t": 3.5, "tile": [40, 40], "cause": "no_route",
+               "attempts": 2, "limit": 2, "opens": 2, "cleared_count": 3, "cleared": [[39, 40]],
+               "note": "有界开路之后仍然站不到这一格 ⇒ 如实记 blocked"}
+    FAR_STILL_DRY = {"event": "water_far", "t": 4.0, "tile": [12, 30], "ok": False,
+                     "code": "timeout", "walked": True, "watered": False,
+                     "in_dry_tiles_after": True, "dry_tiles_status": "ok",
+                     "reason": "开路成功但那格仍在 dryTiles 里"}
+    BUDGET = {"event": "stamina_budget", "t": 5.0, "max": 270, "stamina": 120, "live_crops": 8,
+              "dry": 34, "water_reserve": 100, "water_cost_est": 96, "path_allowance": 25,
+              "capacity": 100, "basis": "farm", "deferred_by_budget": 4,
+              "deferred": ["water_area"]}
+    DEFER = {"event": "deferred_by_budget", "t": 5.5, "task": "till_area", "why": "budget",
+             "stamina": 120, "water_reserve": 100, "dry": 34, "live_crops": 8, "basis": "farm",
+             "note": "只因预算而不做（不是没活）"}
+
+    def _day(self, day, *, extra=(), checks_over=None, budget=None):
+        nxt = [day[0], day[1], day[2] + 1]
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": True,
+                  "watered_outdoor": True}
+        if checks_over:
+            checks.update(checks_over)
+        end = {"event": "day_end", "t": 9.0, "day": day, "ended_by": "sleep",
+               "ended_reason": "night", "verified": True, "checks": checks,
+               "stages": [{"stage": "water_area", "ok": 5, "skipped": 0, "failed": 0,
+                           "env_block": 0, "inconclusive": 0, "stopped": None, "leftover": 0}],
+               "ok_steps": 5, "skipped_steps": 0, "failed_steps": 0, "notes": [],
+               "final": final(nxt),
+               "final_water": {"t": 9.0, "location": "Farm", "tiles": 84, "crops": 31,
+                               "dry": 0, "scope": "farm"}}
+        if budget is not None:
+            end["stamina_budget"] = budget
+        return [day_start(day), *extra, end]
+
+    def _report(self, events, name, *, days=1):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_ledger(tmp, name, events)
+            return report_for(path, days=days)
+
+    def test_new_events_have_buckets_and_are_not_unmapped(self):
+        for ev in ("water_far_open", "water_far_blocked", "stamina_budget", "deferred_by_budget"):
+            self.assertIn(ev, mod.EVENT_BUCKETS)
+        rep = self._report(self._day([1, "fall", 3], extra=[self.OPEN_OK, self.BLOCKED,
+                                                            self.BUDGET, self.DEFER]),
+                           "t160_buckets.jsonl")
+        self.assertEqual(rep["unmapped_events"], {})
+        self.assertEqual(rep["events"].get("water_far_open"), 1)
+        self.assertEqual(rep["events"].get("water_far_blocked"), 1)
+        self.assertEqual(rep["events"].get("stamina_budget"), 1)
+        self.assertEqual(rep["events"].get("deferred_by_budget"), 1)
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+
+    def test_open_and_blocked_are_info_only_and_visible(self):
+        rep = self._report(self._day([1, "fall", 3], extra=[self.OPEN_OK, self.BLOCKED]),
+                           "t160_open.jsonl")
+        text = mod.render_text(rep, 50)
+        self.assertIn("开路/够不着: 开路 1 次", text)
+        self.assertIn("开路后仍站不到 1 格", text)
+        self.assertIn("no_route×1", text)
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+        self.assertEqual(rep["water_far"]["open_events"], 1)
+        self.assertEqual(rep["water_far"]["open_cleared_total"], 2)
+        self.assertEqual(rep["water_far"]["blocked_causes"], {"no_route": 1})
+
+    def test_open_ok_but_still_dry_is_warning_not_red(self):
+        rep = self._report(self._day([1, "fall", 3], extra=[self.OPEN_OK, self.FAR_STILL_DRY]),
+                           "t160_stilldry.jsonl")
+        wf = rep["water_far"]
+        self.assertEqual(len(wf["warn_open_but_still_dry_lines"]), 1)
+        advice = mod.render_text(rep, 50)
+        self.assertIn("⚠ 开路成功但那格当天最后仍在 dryTiles 里", advice)
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+
+    def test_stamina_budget_and_deferred_are_visible_not_red(self):
+        rep = self._report(self._day([1, "fall", 3], extra=[self.BUDGET, self.DEFER],
+                                     budget={"deferred_by_budget": 4, "water_reserve": 100,
+                                             "capacity": 100}),
+                           "t160_budget.jsonl")
+        sb = rep["stamina_budget"]
+        self.assertEqual(sb["events"], 1)
+        self.assertEqual(sb["defer_events"], 1)
+        self.assertEqual(sb["defer_tasks"], {"till_area": 1})
+        self.assertEqual(sb["basis"], {"farm": 1})
+        text = mod.render_text(rep, 50)
+        self.assertIn("体力预算: reserve 100 / capacity 100", text)
+        self.assertIn("by_budget 延后 1 条", text)
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+
+    def test_deferred_but_watered_and_missing_event_are_warnings(self):
+        day1 = self._day([1, "fall", 3], extra=[self.DEFER])
+        # 第 2 天：日级说 deferred_by_budget>0，却没有任何 deferred_by_budget 事件（留痕不一致）
+        day2 = self._day([1, "fall", 4], budget={"deferred_by_budget": 3, "water_reserve": 100,
+                                                 "capacity": 100})
+        rep = self._report(day1 + day2, "t160_defer.jsonl", days=2)
+        sb = rep["stamina_budget"]
+        self.assertEqual(len(sb["warn_deferred_but_watered_lines"]), 1)
+        self.assertEqual(len(sb["warn_defer_missing_lines"]), 1)
+        text = mod.render_text(rep, 50)
+        self.assertIn("⚠ 说「只因预算延后」但当天却自称户外浇水达标", text)
+        self.assertIn("⚠ 日级 deferred_by_budget>0 却没有对应的 deferred_by_budget 事件", text)
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+
+    def test_old_ledger_without_fields_is_undecidable_not_zero(self):
+        rep = self._report(self._day([1, "fall", 3]), "t160_old.jsonl")
+        text = mod.render_text(rep, 50)
+        self.assertIn("开路/够不着: <缺失>", text)
+        self.assertIn("体力预算: <缺失>", text)
+        blob = " ".join(rep.get("undecidable") or [])
+        self.assertIn("task-157", blob)
+        self.assertIn("task-158", blob)
+        self.assertIn("缺失 ≠ 0", blob)
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
 
 
 if __name__ == "__main__":

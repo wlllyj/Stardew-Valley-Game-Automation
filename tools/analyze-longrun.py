@@ -143,6 +143,19 @@
     `stage_refills`（该阶段已补水几次）/`stage_limit`（= `STAGE_REFILL_MAX`，brain 现值 2），头部
     「阶段补水 <stage> N/M 次」呈现；`stage_refills > stage_limit` ⇒ 第四条 ⚠（同样不进 rc）。
     旧账本没有这两个事件 ⇒ 头部 `<缺失>` +【无法判定】（缺失 ≠ 0）。
+  * task-157（够不着 ⇒ **有界开路**再重试）：`water_far_open`（为够不着的干格清掉挡路邻格；
+    **开路成功 ≠ 浇上水**）与 `water_far_blocked`（开路后仍站不到 ⇒ **如实**记没浇上，cause ∈
+    no_route/unreachable/need_refill/truncated/no_evidence/not_watered）；`water_far` 另带
+    `opens`/`opened_count`。头部 `开路/够不着` 行；**都不是失败**（`verify-run3.py` 对两名零命中
+    ⇒ 不判红、不进 rc；当天达不达标由 `checks.watered_outdoor` 说话），只两条可证伪 ⚠：
+    ①开路成功但那格当天最后仍在 dryTiles 里；②有格 blocked 而当天却自称户外浇水达标（dry=0）。
+  * task-158（体力预算）：`stamina_budget`（每天一条：max/stamina/live_crops/dry/water_reserve/
+    water_cost_est/path_allowance/capacity/basis/deferred_by_budget/deferred[]，basis ∈
+    farm/conservative，证据不足 fail-closed）与 `deferred_by_budget`（某任务**只因预算**被延后），
+    日级另有 `day_end.stamina_budget`。头部 `体力预算` 行 + 建议 0u；同样**不判红**（没浇完就是
+    `crops_watered=false`），只两条可证伪 ⚠：①说「只因预算延后」却当天自称浇完（dry=0）；
+    ②日级 `deferred_by_budget>0` 却没有对应事件。旧账本没有这两个事件/字段 ⇒ `<缺失>` +
+    【无法判定】（缺失 ≠ 0，绝不当作「今天没用预算」）。
   * 事件映射不许漂移（Lead m02395）：brain 里 `_journal("<name>"` 的**每个**事件名都要在
     `EVENT_BUCKETS` 里有桶（结构性事件 `day_start`/`day_end`/`finish` 除外，见 `STRUCTURAL_EVENTS`）；
     账本里出现没桶的事件 ⇒ 报告头部逐条点名（名字×次数+行号）+ 建议 0a，**绝不静默丢弃**。
@@ -464,6 +477,28 @@ FIELD_PROBES = [
      "当天 Σ 阶段 assigned_undone（分下去没做完的格数，task-134 B；日级 `no_unmet_stages` 看它）"),
     ("day_end.deferred_tiles", "deferred_tiles",
      "当天诚实上限留下的片区待办格数（task-134 B；info、不进 no_unmet_stages）"),
+    # task-157（够不着 ⇒ 有界开路，再重试同一格）。两者都**不是失败**：
+    # 当天「户外的活有没有干完」由 `checks.watered_outdoor` / `no_unmet_stages` 说话，本工具不重复判。
+    ("event:water_far_open", "water_far_open",
+     "有界开路：把够不着的干格旁边的挡路格清掉再重试同一格（tile/code/attempt/limit/"
+     "cleared_count/cleared ≤8）⇒ **不判红**；开路成功（code=ok）也**不等于**浇上了水"),
+    ("event:water_far_blocked", "water_far_blocked",
+     "有界开路之后**仍然站不到**这一格 ⇒ 如实记 blocked（tile/cause/attempts/limit/opens/"
+     "cleared_count；cause ∈ no_route/unreachable/need_refill/truncated/no_evidence/not_watered）"
+     "⇒ **不判红**（如实承认没浇上）"),
+    ("event:water_far.opens", "water_far_opens",
+     "该格当天开过几次路（task-157 新增字段，与 opened_count 配套 ⇒ 可看出「一直在开路却从没浇上」）"),
+    # task-158（体力预算）：不浇水是**因为体力**而不是没活 ⇒ 只做呈现 + 可证伪 ⚠，绝不判红。
+    ("event:stamina_budget", "stamina_budget",
+     "每天一条体力预算（max/stamina/live_crops/dry/water_reserve/water_cost_est/path_allowance/"
+     "capacity/basis/deferred_by_budget/deferred[]）⇒ 解释「为什么今天不浇」"),
+    ("event:stamina_budget.basis", "stamina_budget_basis",
+     "预算依据：`farm` = 有完整户外农场证据；`conservative` = 证据不足时的保守下界（fail-closed）"),
+    ("event:deferred_by_budget", "deferred_by_budget",
+     "某任务**只因预算**被延后（task/why/stamina/water_reserve/dry/live_crops/basis）⇒ **不判红**；"
+     "但同一批格当天仍被算成浇完 / 自称 crops_watered=true 而 dry>0 ⇒ 账本自相矛盾（⚠ 不进 rc）"),
+    ("day_end.stamina_budget", "stamina_budget_day",
+     "日级体力预算留痕（dict，task-158；缺字段 ⇒【无法判定】，绝不当作「今天没用预算」）"),
     # task-144（dev-coder 在制）：壶空先补水、再把"这一轮没成事的已分配格"原样重跑；以及
     # `stopped==""` 与"分配过却没成事"不再共存（补如实 stop 原因）。两者都**不判红**。
     ("event:refill_retry", "refill_retry",
@@ -687,6 +722,14 @@ EVENT_BUCKETS = {
     "stage_shortfall": "stage_shortfalls",
     "stage_shortfall_day": "stage_shortfall_days",
     "deferred_tiles": "deferred_tiles",
+    # task-157（够不着 ⇒ 有界开路 water_far_open / 开路后仍站不到 water_far_blocked）与
+    # task-158（体力预算 stamina_budget / 只因预算被延后 deferred_by_budget）。四个都不是失败；
+    # `tools/verify-run3.py` 对这四个名字零命中 ⇒ 判红会两边反向 ⇒ 本工具只做呈现 + 可证伪 ⚠；
+    # 当天达不达标一律由 `checks.watered_outdoor` / `checks.no_unmet_stages` 说话。
+    "water_far_open": "water_far_opens",
+    "water_far_blocked": "water_far_blocks",
+    "stamina_budget": "stamina_budgets",
+    "deferred_by_budget": "deferred_by_budgets",
     # task-144（dev-coder 在制）：阶段内壶空 ⇒ 补水后把"这一轮没成事的已分配格"**原样**重跑
     # （`refill_retry`，不再重算窗口把那几格丢掉）；阶段自然走完（`stopped==""`）却仍有分配未成事的
     # 格 ⇒ 补一个**如实** stop 原因的留痕（`stage_stop_named`）。两者都是**修复生效的证据**、不是失败；
@@ -756,6 +799,10 @@ NEW_EVENT_BUCKETS = (
     # task-144（dev-coder 在制）：壶空先补水再"原样重跑"这一轮没成事的格（refill_retries）
     # + 阶段自然走完却仍有分配未成事的格 ⇒ 补如实 stop 原因（stage_stop_names）；均不判红
     "refill_retries", "stage_stop_names",
+    # task-157：够不着 ⇒ 有界开路（开路成功 ≠ 浇上水）后重试；开路后仍站不到 ⇒ 如实 blocked
+    "water_far_opens", "water_far_blocks",
+    # task-158：体力预算（每天一条 + 只因预算被延后；都不是失败，只解释"为什么今天不浇"）
+    "stamina_budgets", "deferred_by_budgets",
 )
 
 
@@ -2564,12 +2611,63 @@ def build_advice(report, top=8):
             _wparts.append(f"⚠ 当天补水预算用尽（tries ≥ limit）：行 "
                            f"{wfv.get('warn_budget_exhausted_lines')[:6]}"
                            "——剩余干格今天注定浇不上（只警告）")
+        # task-157：够不着 ⇒ 有界开路（开路成功 ≠ 浇上水）；开路后仍站不到 ⇒ 如实 blocked。
+        if wfv.get("has_open_events"):
+            _wparts.append(
+                f"开路 water_far_open {wfv.get('open_events', 0)} 次（code "
+                f"{'、'.join(f'{k}×{v}' for k, v in list((wfv.get('open_codes') or {}).items())[:4]) or '<缺失>'}；"
+                f"清了 {wfv.get('open_cleared_total', 0)} 格挡路格）")
+            _wparts.append(
+                f"开路后仍站不到 water_far_blocked {wfv.get('blocked_events', 0)} 格（因由 "
+                f"{'、'.join(f'{k}×{v}' for k, v in list((wfv.get('blocked_causes') or {}).items())[:4]) or '<缺失>'}）"
+                "——都是如实留痕、**不是失败**；开路成功也**不等于**那格浇上了水")
+            if wfv.get("warn_open_but_still_dry_lines"):
+                _wparts.append(f"⚠ 开路成功但那格当天最后仍在 dryTiles 里：行 "
+                               f"{wfv['warn_open_but_still_dry_lines'][:6]}（只警告）")
+            if wfv.get("warn_blocked_but_watered_lines"):
+                _wparts.append(f"⚠ 有格 blocked（确实没浇上）而当天却自称户外浇水达标"
+                               f"（watered_outdoor=true 且 final_water.dry=0）：行 "
+                               f"{wfv['warn_blocked_but_watered_lines'][:6]}（只警告）")
         advice.append({
-            "text": "窗口外浇水/壶空补水（信息项，**不是失败**）：" + "；".join(_wparts)
-                    + "。verify-run3.py 对 `water_far_refill` 零命中 ⇒ 本工具不判红、不进 rc；"
-                      "旧账本没有该事件 ⇒【无法判定】（缺失 ≠ 0）",
+            "text": "窗口外浇水/壶空补水/开路（信息项，**不是失败**）：" + "；".join(_wparts)
+                    + "。verify-run3.py 对 `water_far_refill` / `water_far_open` / `water_far_blocked` "
+                      "零命中 ⇒ 本工具不判红、不进 rc；"
+                      "旧账本没有这些事件 ⇒【无法判定】（缺失 ≠ 0）",
             "lines": sorted(set((wfv.get("far_lines") or []) + (wfv.get("refill_lines") or [])
-                                + (wfv.get("warn_refill_failed_but_watered_lines") or []))),
+                                + (wfv.get("open_lines") or []) + (wfv.get("blocked_lines") or [])
+                                + (wfv.get("warn_refill_failed_but_watered_lines") or [])
+                                + (wfv.get("warn_open_but_still_dry_lines") or [])
+                                + (wfv.get("warn_blocked_but_watered_lines") or []))),
+        })
+    # 0u) task-158：体力预算 —— 解释「为什么今天不浇」；**不是失败**（没浇完就是 crops_watered=false），
+    #     只列两条可证伪 ⚠（说延后却当天自称浇完 / 日级字段有延后数却没有对应事件）。
+    sbv = report.get("stamina_budget") or {}
+    if sbv.get("has_events"):
+        _bparts = [
+            f"体力预算 {sbv.get('events', 0)} 条（依据 "
+            f"{'、'.join(f'{k}×{v}' for k, v in list((sbv.get('basis') or {}).items())[:3]) or '<缺失>'}；"
+            f"reserve {sbv.get('water_reserve')} / capacity {sbv.get('capacity')}）",
+            f"只因预算被延后 deferred_by_budget {sbv.get('defer_events', 0)} 条"
+            f"（共 {sbv.get('deferred_total', 0)} 格"
+            + ("；任务 " + "、".join(f"{k}×{v}" for k, v in list((sbv.get('defer_tasks') or {}).items())[:4])
+               if sbv.get("defer_tasks") else "") + "）",
+        ]
+        if not sbv.get("has_day_field"):
+            _bparts.append("日级 `day_end.stamina_budget` <缺失>（旧账本 ⇒ 只能看事件口径）")
+        if sbv.get("warn_deferred_but_watered_lines"):
+            _bparts.append(f"⚠ 说「只因预算延后」但当天却自称户外浇水达标（dry=0）：行 "
+                           f"{sbv['warn_deferred_but_watered_lines'][:6]}（只警告）")
+        if sbv.get("warn_defer_missing_lines"):
+            _bparts.append(f"⚠ 日级 deferred_by_budget>0 却没有对应的 deferred_by_budget 事件：行 "
+                           f"{sbv['warn_defer_missing_lines'][:6]}（留痕不一致，只警告）")
+        advice.append({
+            "text": "体力预算/只因预算而不做（信息项，**不是失败**）：" + "；".join(_bparts)
+                    + "。verify-run3.py 对 `stamina_budget` / `deferred_by_budget` 零命中 ⇒ "
+                      "本工具不判红、不进 rc；当天达不达标由 `checks.watered_outdoor` / "
+                      "`checks.no_unmet_stages` 说话；旧账本没有这两个事件 ⇒【无法判定】（缺失 ≠ 0）",
+            "lines": sorted(set((sbv.get("lines") or []) + (sbv.get("defer_lines") or [])
+                                + (sbv.get("warn_deferred_but_watered_lines") or [])
+                                + (sbv.get("warn_defer_missing_lines") or []))),
         })
     # 0s) task-144：阶段内壶空 ⇒ 先补水再把"这一轮没成事的已分配格"**原样**重跑（refill_retry）；
     #     阶段自然走完（stopped==""）却仍有分配未成事的格 ⇒ 补**如实** stop 原因（stage_stop_named）
@@ -2966,6 +3064,22 @@ def build_undecidable(rows, sessions, prelude, report):
     elif not ((report.get("refill_retry") or {}).get("has_events")
               or (report.get("stage_stop_named") or {}).get("has_events")):
         out.append("task-144 事件存在但没进聚合（工具 bug 迹象）：无法判定阶段自愈/如实收工计数")
+    # task-157/158：开路/够不着 + 体力预算 —— 缺失 ≠ 0（旧账本没有这两族事件与字段）。
+    _t157_ev = [ev for _ln, ev in rows if ev.get("event") in ("water_far_open", "water_far_blocked")]
+    if not _t157_ev:
+        out.append("本账本没有任何 task-157 的 `water_far_open` / `water_far_blocked` 事件 ⇒ "
+                   "无法判定「够不着的干格有没有先有界开路再重试」以及「开路后仍站不到的格有没有"
+                   "如实记 blocked」—— **缺失 ≠ 0，绝不当'没有够不着的格'通过**（task-157）")
+    elif not ((report.get("water_far") or {}).get("has_open_events")):
+        out.append("task-157 事件存在但没进聚合（工具 bug 迹象）：无法判定开路/够不着计数")
+    _t158_ev = [ev for _ln, ev in rows if ev.get("event") == "stamina_budget"]
+    _t158_def = [ev for _ln, ev in rows if ev.get("event") == "deferred_by_budget"]
+    if not _t158_ev and not _t158_def and not (report.get("stamina_budget") or {}).get("has_day_field"):
+        out.append("本账本没有任何 task-158 的 `stamina_budget` / `deferred_by_budget` 事件、"
+                   "day_end 也没有 `stamina_budget` 字段 ⇒ 无法判定「今天不浇是不是因为体力预算」"
+                   "—— **缺失 ≠ 0，绝不当'今天没用预算'通过**（task-158）")
+    elif (_t158_ev or _t158_def) and not (report.get("stamina_budget") or {}).get("has_events"):
+        out.append("task-158 事件存在但没进聚合（工具 bug 迹象）：无法判定体力预算计数")
     # task-36：自称浇过、却没有 final_water 可核对的那些天（verify-run3.py:414-418 同口径：只记信息项）
     no_fw = [
         lineno for lineno, ev in rows
@@ -3091,6 +3205,8 @@ def build_report(rows, path, args, bad_lines):
             "final": as_dict(end.get("final")),
             # task-36：浇水证据（scope/tiles/crops/dry）随天带出来，供"每天一行"与测试核对
             "final_water": as_dict(end.get("final_water")),
+            # task-158：日级体力预算留痕（缺 ⇒ 空 dict ⇒ 报告写【无法判定】，绝不当作"今天没用预算"）
+            "stamina_budget": as_dict(end.get("stamina_budget")),
             # task-38：跨日证据（优先 day_after；final 只是旧账本兜底，且它本身是睡前快照）
             "start_day": as_dict(start).get("day"),
             "day_after": as_list(end.get("day_after")),
@@ -3794,6 +3910,62 @@ def build_report(rows, path, args, bad_lines):
             buy_partial["buy_ok_missing_wanted"] += 1
         elif _c is not None and _c >= _w:
             buy_partial["buy_ok_full"] += 1
+    # task-158（体力预算）：`stamina_budget` 每天一条（解释「为什么今天不浇」）+ `deferred_by_budget`
+    # 逐任务「只因预算而不做」。两者都**不判红**（当天达不达标由 `checks.watered_outdoor` /
+    # `checks.no_unmet_stages` 说话），只给两条可证伪 ⚠：
+    #   ① 说"只因预算延后"但当天 `watered_outdoor=true` 且 `final_water.dry==0`（延后了却又说全浇完）；
+    #   ② 日级 `day_end.stamina_budget.deferred_by_budget>0` 却没有任何 `deferred_by_budget` 事件（留痕缺）。
+    # 缺字段 ⇒【无法判定】（缺失 ≠ 0，也不当作"今天没用预算"）。
+    _sb_events = [(ln, ev) for ln, ev in rows if ev.get("event") == "stamina_budget"]
+    _sb_defers = [(ln, ev) for ln, ev in rows if ev.get("event") == "deferred_by_budget"]
+    _sb_day_field = [d.get("label") for d in days if as_dict(d.get("stamina_budget"))]
+    stamina_budget = {
+        "events": len(_sb_events), "lines": [ln for ln, _ in _sb_events],
+        "max": None, "stamina": None, "water_reserve": None, "capacity": None,
+        "water_cost_est": None, "path_allowance": None, "basis": {},
+        "deferred_total": 0, "defer_events": len(_sb_defers),
+        "defer_lines": [ln for ln, _ in _sb_defers], "defer_tasks": {}, "defer_whys": {},
+        "day_field_days": _sb_day_field,
+        "warn_deferred_but_watered_lines": [], "warn_defer_missing_lines": [],
+        "has_events": bool(_sb_events or _sb_defers or _sb_day_field),
+        "has_day_field": bool(_sb_day_field),
+    }
+    for _ln, ev in _sb_events:
+        for _k in ("max", "stamina", "water_reserve", "capacity", "water_cost_est", "path_allowance"):
+            _v = as_int(ev.get(_k), None)
+            if _v is not None:
+                stamina_budget[_k] = _v
+        _b = str(ev.get("basis") or "")
+        if _b:
+            stamina_budget["basis"][_b] = stamina_budget["basis"].get(_b, 0) + 1
+        _db = as_int(ev.get("deferred_by_budget"), None)
+        if _db:
+            stamina_budget["deferred_total"] += _db
+    _sb_defer_days = set()
+    for _ln, ev in _sb_defers:
+        _task = str(ev.get("task") or "?")
+        stamina_budget["defer_tasks"][_task] = stamina_budget["defer_tasks"].get(_task, 0) + 1
+        _why = str(ev.get("why") or "")
+        if _why:
+            stamina_budget["defer_whys"][_why] = stamina_budget["defer_whys"].get(_why, 0) + 1
+        _lab, _di = _lr_day_of(_ln)
+        _sb_defer_days.add(_di)
+        if _di < len(days):
+            _d = days[_di]
+            _fw = as_dict(_d.get("final_water"))
+            _ok_all = as_dict(_d.get("checks")).get("watered_outdoor") is True
+            try:
+                _dry_zero = int(_fw.get("dry")) == 0
+            except (TypeError, ValueError):
+                _dry_zero = False
+            if _ok_all and _dry_zero:
+                stamina_budget["warn_deferred_but_watered_lines"].append(_ln)
+    for _di, _d in enumerate(days):
+        _dbs = as_dict(_d.get("stamina_budget"))
+        if as_int(_dbs.get("deferred_by_budget"), 0) and _di not in _sb_defer_days:
+            _dl = as_list(_d.get("day_end_lines"))
+            if _dl:
+                stamina_budget["warn_defer_missing_lines"].append(_dl[0])
     # task-134 B（分配额口径）：`stage_shortfall`（阶段分下去的格没做完）/`stage_shortfall_day`
     # （日级 unmet=assigned_undone）/`deferred_tiles`（诚实上限留下的片区待办，**只作 info、
     # 不进 no_unmet_stages**）。三者本身都**不判红**（红由 `checks.no_unmet_stages=false` 说话）；
@@ -3923,6 +4095,11 @@ def build_report(rows, path, args, bad_lines):
     # ②当天补水预算用尽（`tries >= limit`）⇒ 剩下的干格今天注定浇不上。
     _wf_refills = [(ln, ev) for ln, ev in rows if ev.get("event") == "water_far_refill"]
     _wf_fars = [(ln, ev) for ln, ev in rows if ev.get("event") == "water_far"]
+    # task-157：够不着 ⇒ 先有界开路（`water_far_open`）再重试；开路之后仍站不到 ⇒ `water_far_blocked`。
+    # 两者都**不是失败**（当天达不达标由 checks.watered_outdoor / no_unmet_stages 说话），
+    # 只给可证伪形态的 ⚠（开路成功但那格仍干 / blocked 却自称浇完）。
+    _wf_opens = [(ln, ev) for ln, ev in rows if ev.get("event") == "water_far_open"]
+    _wf_blocks = [(ln, ev) for ln, ev in rows if ev.get("event") == "water_far_blocked"]
     water_far = {
         "refill_events": len(_wf_refills), "refill_lines": [ln for ln, _ in _wf_refills],
         "refill_ok": sum(1 for _, ev in _wf_refills if ev.get("ok") is True),
@@ -3942,6 +4119,15 @@ def build_report(rows, path, args, bad_lines):
         "far_tiles_status": {},
         "warn_refill_failed_but_watered_lines": [], "warn_budget_exhausted_lines": [],
         "has_events": bool(_wf_refills or _wf_fars), "has_refill_events": bool(_wf_refills),
+        # task-157：开路（够不着 ⇒ 清挡路邻格后重试同一格）与"开路后仍站不到"。
+        "open_events": len(_wf_opens), "open_lines": [ln for ln, _ in _wf_opens],
+        "open_ok": sum(1 for _, ev in _wf_opens if str(ev.get("code") or "") == "ok"),
+        "open_failed": sum(1 for _, ev in _wf_opens if str(ev.get("code") or "") != "ok"),
+        "open_codes": {}, "open_cleared_total": 0, "open_tiles": [],
+        "blocked_events": len(_wf_blocks), "blocked_lines": [ln for ln, _ in _wf_blocks],
+        "blocked_causes": {}, "blocked_tiles": [], "blocked_tries": [],
+        "warn_open_but_still_dry_lines": [], "warn_blocked_but_watered_lines": [],
+        "has_open_events": bool(_wf_opens or _wf_blocks),
     }
     for _ln, _ev in _wf_refills:
         _c = str(_ev.get("code") or "?")
@@ -3973,6 +4159,58 @@ def build_report(rows, path, args, bad_lines):
         _t = _ev.get("tile")
         if isinstance(_t, list) and _t and _t not in water_far["far_tiles"]:
             water_far["far_tiles"].append(_t)
+    # task-157：开路/够不着的逐条统计 + 两条可证伪 ⚠（都**不进 rc**）。
+    _wf_dry_after_tiles = set()
+    for _ln, _ev in _wf_opens:
+        _code = str(_ev.get("code") or "")
+        water_far["open_codes"][_code] = water_far["open_codes"].get(_code, 0) + 1
+        water_far["open_cleared_total"] += as_int(_ev.get("cleared_count"), 0) or 0
+        _t = _ev.get("tile")
+        if isinstance(_t, list) and _t and _t not in water_far["open_tiles"]:
+            water_far["open_tiles"].append(_t)
+    for _ln, _ev in _wf_fars:
+        if _ev.get("in_dry_tiles_after") is True:
+            _t = _ev.get("tile")
+            if isinstance(_t, list) and _t:
+                _wf_dry_after_tiles.add(tuple(_t))
+    for _ln, _ev in _wf_opens:
+        if str(_ev.get("code") or "") != "ok":
+            continue
+        _t = _ev.get("tile")
+        if isinstance(_t, list) and _t and tuple(_t) in _wf_dry_after_tiles:
+            water_far["warn_open_but_still_dry_lines"].append(_ln)
+    _wf_watered_tiles = set()
+    for _ln, _ev in _wf_fars:
+        if _ev.get("ok") is True:
+            _t = _ev.get("tile")
+            if isinstance(_t, list) and _t:
+                _wf_watered_tiles.add(tuple(_t))
+    _wf_blocked_by_day: dict[int, list[tuple[list[Any], int]]] = {}
+    for _ln, _ev in _wf_blocks:
+        _cause = str(_ev.get("cause") or "?")
+        water_far["blocked_causes"][_cause] = water_far["blocked_causes"].get(_cause, 0) + 1
+        _t = _ev.get("tile")
+        if isinstance(_t, list) and _t and _t not in water_far["blocked_tiles"]:
+            water_far["blocked_tiles"].append(_t)
+        water_far["blocked_tries"].append(as_int(_ev.get("attempts"), None))
+        _lab, _di = _lr_day_of(_ln)
+        _wf_blocked_by_day.setdefault(_di, []).append((_t if isinstance(_t, list) else [], _ln))
+    # ⚠①：开路回执 ok（或清了挡路格）但同一格当天最后一次证据仍是"还在 dryTiles 里" ⇒ 开路不等于浇上水。
+    # ⚠②：某格被 blocked（确实没浇上）而当天 `watered_outdoor=true` 且 `final_water.dry==0`、
+    #      且那一格当天没有任何 ok 的 `water_far` ⇒ 账本自相矛盾（谁把它浇上的？）。
+    for _di, _items in _wf_blocked_by_day.items():
+        if _di >= len(days):
+            continue
+        _d = days[_di]
+        _fw = _d.get("final_water") if isinstance(_d.get("final_water"), dict) else {}
+        _ok_all = (_d.get("checks") or {}).get("watered_outdoor") is True
+        try:
+            _dry_zero = int(_fw.get("dry")) == 0
+        except (TypeError, ValueError):
+            _dry_zero = False
+        for _t, _ln in _items:
+            if _ok_all and _dry_zero and tuple(_t) not in _wf_watered_tiles:
+                water_far["warn_blocked_but_watered_lines"].append(_ln)
     # 可证伪 ⚠①：补水没成（回执不 ok、水位也没涨）当天却把那格浇成了 —— 回执/水位有一边不可信。
     for _ln, _ev in _wf_refills:
         if _ev.get("ok") is True:
@@ -4064,6 +4302,7 @@ def build_report(rows, path, args, bad_lines):
         "buy_partial": buy_partial,
         # task-133：窗口外浇水 + 壶空先补水（壶空=前置条件、**不是「够不着」**；两条可证伪 ⚠）
         "water_far": water_far,
+        "stamina_budget": stamina_budget,
         # task-134 B：分配额口径（阶段没做完 / 日级 unmet / 诚实上限 deferred；均 info、不判红）
         "shortfall": shortfall,
         # task-144（dev-coder 在制）：壶空先补水再"原样重跑"（refill_retry）+ 阶段如实 stop 原因
@@ -4537,6 +4776,17 @@ MAPPING_TEXT = [
      "（只供守卫/换片/resume）；`deferred_tiles` = 体力/夜里收工/撞 budget 留下的片区待办，"
      "**只作 info、绝不进 no_unmet_stages**；唯一可证伪 ⚠ = 日级 `stopped_night=false` 而当天 "
      "`ended_reason` 是 night（口径打架，只警告）"),
+    ("event:water_far_open / water_far_blocked / stamina_budget / deferred_by_budget (task-157/158)",
+     "信息项：**都不是失败**（`verify-run3.py` 对这四个名字零命中 ⇒ 本工具不判红、不进 rc）；"
+     "当天达不达标一律由 `checks.watered_outdoor` / `checks.no_unmet_stages` 说话。"
+     "`water_far_open` = 够不着的干格先**有界开路**（清掉挡路邻格）再重试同一格（code/attempt/limit/"
+     "cleared_count；**开路成功 ≠ 浇上水**）；`water_far_blocked` = 开路后仍站不到 ⇒ 如实记没浇上"
+     "（cause∈no_route/unreachable/need_refill/truncated/no_evidence/not_watered）；"
+     "`stamina_budget` = 每天一条体力预算（reserve/capacity/basis∈farm/conservative）；"
+     "`deferred_by_budget` = 某任务**只因预算**被延后。四条可证伪 ⚠（只警告）：①开路成功但那格当天"
+     "最后仍在 dryTiles 里；②有格 blocked 而当天却自称户外浇水达标（dry=0）；③说「只因预算延后」"
+     "却当天自称浇完；④日级 `deferred_by_budget>0` 却没有对应事件。"
+     "旧账本没有这些事件/字段 ⇒ `<缺失>` +【无法判定】（缺失 ≠ 0）"),
     ("event:refill_retry / stage_stop_named (task-144)",
      "信息项：**修复生效的证据**、不是失败（`verify-run3.py` 对两名零命中 ⇒ 本工具不判红、不进 rc）。"
      "`refill_retry` = 阶段内壶空 ⇒ 补水后把这一轮没成事的已分配格**原样**重跑（不再重算窗口把格子丢掉）；"
@@ -4877,6 +5127,49 @@ def render_text(report, top):
                if wf.get("budget_exhausted_lines") else "")
             + (f"  ⚠ {wf.get('far_cause_missing')} 条 water_far 没有 cause 字段（旧账本形态）"
                if wf.get("far_cause_missing") else ""))
+    # task-157：够不着 ⇒ 有界开路（`water_far_open`）后重试同一格；开路后仍站不到 ⇒ `water_far_blocked`。
+    # 两者都**不是失败**：开路成功也**不等于**浇上水；当天达不达标由 `checks.watered_outdoor` 说话。
+    if wf.get("has_open_events"):
+        _wf_oc = "、".join(f"{k}×{v}" for k, v in list((wf.get("open_codes") or {}).items())[:4]) or "<缺失>"
+        _wf_bc = "、".join(f"{k}×{v}" for k, v in list((wf.get("blocked_causes") or {}).items())[:4]) or "<缺失>"
+        add(f"开路/够不着: 开路 {wf.get('open_events', 0)} 次（code {_wf_oc}；共清了 "
+            f"{wf.get('open_cleared_total', 0)} 格挡路格；tiles {(wf.get('open_tiles') or [])[:6]}）；"
+            f"开路后仍站不到 {wf.get('blocked_events', 0)} 格（因由 {_wf_bc}；tries "
+            f"{(wf.get('blocked_tries') or [])[:6]}）"
+            "；口径：**开路成功 ≠ 浇上水**、blocked 是如实承认没浇上（都不判红；达不达标由 "
+            "checks.watered_outdoor 说话）"
+            + (f"  ⚠ 开路成功但那格当天最后仍在 dryTiles 里：行 "
+               f"{wf.get('warn_open_but_still_dry_lines', [])[:6]}"
+               if wf.get("warn_open_but_still_dry_lines") else "")
+            + (f"  ⚠ 有格 blocked（确实没浇上）而当天却自称户外浇水达标"
+               f"（watered_outdoor=true 且 final_water.dry=0）：行 "
+               f"{wf.get('warn_blocked_but_watered_lines', [])[:6]}"
+               if wf.get("warn_blocked_but_watered_lines") else ""))
+    else:
+        add("开路/够不着: <缺失>（本账本没有 water_far_open / water_far_blocked 事件 ⇒ 无法判定"
+            "是否出现过；缺失 ≠ 0）")
+    # task-158：体力预算 —— 解释「为什么今天不浇」（不是失败；当天达不达标由 checks 说话）。
+    sb = report.get("stamina_budget") or {}
+    if not sb.get("has_events"):
+        add("体力预算: <缺失>（本账本没有 stamina_budget / deferred_by_budget 事件、"
+            "day_end 也没有 stamina_budget 字段 ⇒ 无法判定今天是否被预算限制；缺失 ≠ 0）")
+    else:
+        _sb_basis = "、".join(f"{k}×{v}" for k, v in list((sb.get("basis") or {}).items())[:3]) or "<缺失>"
+        _sb_tasks = "、".join(f"{k}×{v}" for k, v in list((sb.get("defer_tasks") or {}).items())[:4])
+        add(f"体力预算: reserve {sb.get('water_reserve')} / capacity {sb.get('capacity')}"
+            f"（max {sb.get('max')}、stamina {sb.get('stamina')}、水耗估计 {sb.get('water_cost_est')}、"
+            f"赶路预留 {sb.get('path_allowance')}；依据 {_sb_basis}）；by_budget 延后 "
+            f"{sb.get('defer_events', 0)} 条（共 {sb.get('deferred_total', 0)} 格"
+            + (f"；任务 {_sb_tasks}" if _sb_tasks else "") + "）"
+            + (f"；日级字段覆盖 {len(sb.get('day_field_days') or [])} 天"
+               if sb.get("has_day_field") else "；日级字段 <缺失>")
+            + "；口径：**只因预算而不做不是失败**（没浇完就是 crops_watered=false）"
+            + (f"  ⚠ 说「只因预算延后」但当天却自称户外浇水达标（dry=0）：行 "
+               f"{sb.get('warn_deferred_but_watered_lines', [])[:6]}"
+               if sb.get("warn_deferred_but_watered_lines") else "")
+            + (f"  ⚠ 日级 deferred_by_budget>0 却没有对应的 deferred_by_budget 事件：行 "
+               f"{sb.get('warn_defer_missing_lines', [])[:6]}"
+               if sb.get("warn_defer_missing_lines") else ""))
     pc, ws = report["events"].get("plots_capped", 0), report["events"].get("work_spot", 0)
     add(f"软上限/收尾: plots_capped {pc} 次（作业区配额到顶，信息项）；work_spot {ws} 次（收尾作业区）")
     # task-124/task-130：review 兜底 / 弃权 / 换片连发 —— 修复生效的证据（不判红），

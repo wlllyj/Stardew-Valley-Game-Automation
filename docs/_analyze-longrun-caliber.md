@@ -803,6 +803,37 @@ python tools/analyze-longrun.py --journal logs/longrun-3day-llm-run9c.jsonl --da
 rg -n '"event": ?"refill_retry"' logs/longrun-*.jsonl | rg "stage_refills|stage_limit"
 ```
 
+## 3.24 够不着 ⇒ 有界开路 + 体力预算（task-157/158，task-160 收录）—— 都不是失败
+
+### 事件与字段（brain：`brain/agentfarm/longrun.py`）
+
+| 事件 / 字段 | 形状 | 语义 |
+| --- | --- | --- |
+| `water_far_open` | `tile/code/attempt/limit/cleared_count/cleared ≤8/note` | 够不着的干格先**有界开路**（清掉挡路邻格）再重试同一格；**开路成功 ≠ 浇上水**；`FAR_DRY_OPEN_MAX=2` |
+| `water_far_blocked` | `tile/cause/attempts/limit/opens/cleared_count/cleared/note` | 开路后**仍然站不到** ⇒ 如实记 blocked；`cause` ∈ `no_route`（warp 图无路）/ `unreachable`（四邻站不过去）/ `need_refill` / `truncated` / `no_evidence` / `not_watered` |
+| `water_far` 增量 | `opens` / `opened_count` | 该格当天开过几次路（配 `blocked` 可看出「一直在开路却从没浇上」） |
+| `stamina_budget` | `max/stamina/live_crops/dry/water_reserve/water_cost_est/path_allowance/capacity/basis/deferred_by_budget/deferred[]` | 每天一条，解释「为什么今天不浇」；`basis ∈ farm/conservative`（证据不足 ⇒ fail-closed） |
+| `deferred_by_budget` | `task/why/stamina/water_reserve/dry/live_crops/basis/note` | 某任务**只因预算**被延后（不是没活） |
+| `day_end.stamina_budget` | dict | 日级留痕（`as_dict` 带出；缺 ⇒【无法判定】） |
+
+### 口径
+- 四个事件**都不是失败**：当天达不达标一律由 `checks.watered_outdoor` / `checks.no_unmet_stages` 说话，本工具**不重复判红**、不进 rc。
+- `tools/verify-run3.py` 对这四个名字**零命中** ⇒ 判红会两边反向；本工具只做呈现（头部 `开路/够不着` 与 `体力预算` 两行）+ 可证伪 ⚠。
+- 四条可证伪 ⚠（**只警告、不进 rc**）：①开路成功但那格当天最后仍在 `dryTiles` 里；②有格 `blocked` 而当天却自称户外浇水达标（`watered_outdoor=true` 且 `final_water.dry=0`）；③说「只因预算延后」却当天自称浇完；④日级 `deferred_by_budget>0` 却没有对应的 `deferred_by_budget` 事件（留痕不一致）。
+- 缺失行为：旧账本没有这些事件/字段 ⇒ 头部 `开路/够不着: <缺失>` / `体力预算: <缺失>` + 【无法判定】（**缺失 ≠ 0**，也绝不当作「今天没用预算」通过）。
+
+### 单测与读数
+- 单测：`TestOpenPathAndStaminaBudget` 6 条 —— 四事件有桶且不落未映射（`unmapped_events == {}`）/ 开路+blocked 可见且不判红 / 开路成功仍干 ⇒ ⚠ 不判红 / 体力预算与只延后可见且不判红 / 后两条 ⚠ / 旧账本 ⇒ `<缺失>` +【无法判定】。
+- 读数：`python -W error::SyntaxWarning -m py_compile` RC=0；`tests.test_analyze_longrun` **185 OK**；`discover -s tests` **838 OK（0 红，清掉 task-157/158 造成的两条漂移红）**；12 账本 rc 与 `verify-run3.py` 并排一字未变（run9c 仍是有意分歧，见 §3.23）。
+
+### grep 配方
+
+```
+git grep -n "water_far_open\|water_far_blocked\|stamina_budget\|deferred_by_budget" -- brain/agentfarm/
+python tools/analyze-longrun.py --journal logs/longrun-3day-llm-run9d.jsonl --days 7 | rg "开路/够不着|体力预算"
+rg -n '"event": ?"stamina_budget"' logs/longrun-*.jsonl | rg "water_reserve|deferred_by_budget"
+```
+
 ## 4. 复核命令
 
 ```
@@ -812,9 +843,10 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run7.jsonl --day
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run8.jsonl   # run8：背包空格死锁 ⇒ rc=1（回执 no_inventory_space×25）
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run9b.jsonl --days 7  # run9b：教训素材质量（hint_dropped 缺失 ⇒ ⚠ + 【无法判定】）
 python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run9c.jsonl --days 7  # run9c：阶段自愈/如实收工 <缺失>（录于 task-144 前）；本工具 rc=0，verify-run3 rc=1（Lead m06977 收紧的"户外在场"判据，本工具按指示不跟）
+python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run9d.jsonl --days 7  # run9d：rc=1（red=29）；开路/够不着 + 体力预算两行（task-157/158 新事件）
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
 python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
-python -m unittest tests.test_analyze_longrun  # 当前 179 OK（task-148 + stage_refills/stage_limit 增量）
-python -m unittest discover -s tests           # 当前 807 tests（我这轮 179 条零红；dev 在制的 brain/agentfarm/longrun.py 让 test_longrun 出 9 红，与本工具无关）
+python -m unittest tests.test_analyze_longrun  # 当前 185 OK（task-160 + 开路/体力预算 6 条）
+python -m unittest discover -s tests           # 当前 838 OK（0 红；task-157/158 的两条漂移红已随本卡清零）
 ```
