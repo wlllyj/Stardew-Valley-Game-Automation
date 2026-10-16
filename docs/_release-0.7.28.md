@@ -53,6 +53,7 @@ python tools\start-detached-longrun.py ^
 - **起跑命令行必须原文记录**（`docs/_run9-evidence.md` §1 + console 头）：run9 = run A（积累）、run10 = run B（注入），两次**只许 journal 路径不同**，其余参数（`--days/--size/--max-minutes/--max-days/--boundary-llm`）逐字一致，否则"演进对照"不成立。
 - 结束后立刻 `--tag end`，**先别退游戏**（Lead 要 live observe 对账），再写 `docs/_run9-evidence.md`。
 - 现场政策不变：`ui.eventUp=true` ⇒ **立即停手等人**（task-41）；不替游戏做选择。
+- **run10 交接（Lead 独占，且必须留痕）**：run9 结束后，把 `logs\longrun-3day-llm-run9-lessons.json` **原样拷贝**成 `logs\longrun-3day-llm-run10-lessons.json`（记录拷贝时刻 + 源/目标 SHA256，命令原文写进 `docs/_run10-evidence.md` §1 与版本 sidecar）。理由：教训库路径由 `--journal` 自动推导（`X.jsonl` ⇒ `X-lessons.json`），**没有任何命令行开关** ⇒ "把上一轮教训交给下一轮"必须由这一步显式交接完成；两次 run 的 journal 也必须各自独立（不许复用同一路径，否则证据互相覆盖）。
 
 ## 4. run9 验收判据（继承 0.7.27 + 本轮新增四条）
 
