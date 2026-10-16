@@ -221,11 +221,21 @@ namespace AgentFarm.Bridge
 
                         bool handled = false;
                         string err = null;
-                        // 【task-176 必修 ③】`acted` **不许自述成功**：`checkAction` 的返回值只是
-                        // "这一格被认领了"，真没真做事必须以**本调用内可独立观测的变化**为准
-                        // （目标格状态前后对比）。task-173 真机事故：回执 `{acted:true, ok:true}`
-                        // 但 `worldSeq 51→51`、作物还在、背包 +0、存档逐字节未变。
+                        // 【task-176 必修 ③ + task-182 必修 1/2】`acted` **不许自述成功**：
+                        // `checkAction` 的返回值只是"这一格被认领了"，真没真做事必须以**跨观测证据**为准。
+                        //   * task-173 事故：回执 `{acted:true, ok:true}` 但世界逐字节没变；
+                        //   * task-177 反向事故：再生作物**真的收成了**，可格子内那 6 个字段
+                        //     （watered/crop/phase/grown/dead/...）一项都不变 ⇒ 只比 TileSig 会把
+                        //     **成功**报成 `no_action`。
+                        // 现在按"格子级优先、全局面垫底"取证据：
+                        //   ① `TileSig` 变（老判据，保留）；
+                        //   ② 目标格 `ready` true→false 或 `readySource` 变化（再生作物的关键证据）；
+                        //   ③ 整场 `readyCrops` 下降；
+                        //   ④ 背包逐 qid 栈数增加（**弱证据**：同一 tick 别的系统也可能改背包 ⇒ 垫底）。
                         string sigBefore = TileSig(tx, ty);
+                        (bool? readyBefore, string readySourceBefore) = TileReady(tx, ty);
+                        int readyCropsBefore = ReadyCropCount();
+                        Dictionary<string, int> invBefore = InventoryStacks();
                         try
                         {
                             handled = Game1.currentLocation.checkAction(
@@ -233,12 +243,34 @@ namespace AgentFarm.Bridge
                         }
                         catch (Exception ex) { err = ex.GetType().Name + ": " + ex.Message; }
                         string sigAfter = TileSig(tx, ty);
+                        (bool? readyAfter, string readySourceAfter) = TileReady(tx, ty);
+                        int readyCropsAfter = ReadyCropCount();
+                        Dictionary<string, int> invAfter = InventoryStacks();
 
-                        bool observedChange = sigBefore != null && sigAfter != null
-                                              && !string.Equals(sigBefore, sigAfter, StringComparison.Ordinal);
-                        // 判据：必须**看到格子变了**才算 acted。`worldSeq` 前进但格没变 ⇒ 仍 false；
-                        // 拿不准（快照失败）⇒ false + no_action（宁可让人来核，也不许自述成功）。
-                        bool acted = err == null && observedChange;
+                        bool tileChanged = sigBefore != null && sigAfter != null
+                                           && !string.Equals(sigBefore, sigAfter, StringComparison.Ordinal);
+                        bool readyFlipped = readyBefore == true && readyAfter != true;
+                        bool readySourceChanged = readySourceBefore != null && readySourceAfter != null
+                                                  && !string.Equals(readySourceBefore, readySourceAfter, StringComparison.Ordinal);
+                        bool readyDropped = readyCropsBefore >= 0 && readyCropsAfter >= 0
+                                            && readyCropsAfter < readyCropsBefore;
+                        bool inventoryGrew = InventoryGrew(invBefore, invAfter);
+
+                        string evidence = null;
+                        if (tileChanged) evidence = "tile";
+                        else if (readyFlipped || readySourceChanged) evidence = "ready";
+                        else if (readyDropped) evidence = "readyCrops";
+                        else if (inventoryGrew) evidence = "inventory";
+
+                        // 拿不准（快照失败）⇒ 不算证据；全都不命中 ⇒ false + no_action
+                        // （宁可让人来核，也不许自述成功）。
+                        bool acted = err == null && evidence != null;
+                        string probeText =
+                            $"tile[{sigBefore ?? "快照失败"} → {sigAfter ?? "快照失败"}]；"
+                            + $"ready[{readyBefore?.ToString() ?? "?"} → {readyAfter?.ToString() ?? "?"}"
+                            + $"，readySource[{readySourceBefore ?? "?"} → {readySourceAfter ?? "?"}]；"
+                            + $"readyCrops[{readyCropsBefore} → {readyCropsAfter}]；"
+                            + $"inventoryGrew={inventoryGrew}";
 
                         return new ExecResponse
                         {
@@ -247,13 +279,14 @@ namespace AgentFarm.Bridge
                             Skill = "interact",
                             Schema = ExecSchema,
                             Acted = acted,
+                            ActedEvidence = evidence,
                             Reason = err == null
                                 ? (acted
-                                    ? $"已在 ({tx},{ty}) 调游戏自己的 checkAction，且**观测到这一格变了**"
-                                      + $"（checkAction 返回 {handled}；前[{sigBefore}] → 后[{sigAfter}]）。"
+                                    ? $"已在 ({tx},{ty}) 调游戏自己的 checkAction，且**观测到世界变了**"
+                                      + $"（证据来源 `{evidence}`；checkAction 返回 {handled}）。{probeText}。"
                                       + "若这一格是门/建筑入口，传送由游戏自己发起（有淡出期，**以 observe 到的地点为准**）"
-                                    : $"({tx},{ty}) 这一格**没有任何可独立观测的变化**"
-                                      + $"（checkAction 返回 {handled}；前[{sigBefore ?? "快照失败"}] → 后[{sigAfter ?? "快照失败"}]）。"
+                                    : $"({tx},{ty}) 这一格**没有任何跨观测证据**"
+                                      + $"（checkAction 返回 {handled}）。{probeText}。"
                                       + "`acted=false`、`status=\"no_action\"`、回执如实 failed；"
                                       + "请用 observe 复核这一格的真实状态（镰刀类作物必须走 use_tool，不是 interact）。")
                                 : "checkAction 抛异常：" + err,
@@ -400,6 +433,79 @@ namespace AgentFarm.Bridge
                 return sb.ToString();
             }
             catch { return null; }
+        }
+
+        /// <summary>【task-182 必修 1】目标格"现在能不能收"（游戏口径）与来源；不是作物格/读不到 ⇒ (null, null)。
+        /// 为什么单独要它：再生作物收成后 `TileSig` 的 6 个字段一项都不变（作物对象保留、阶段重置），
+        /// 只有 `ready` 会 true→false ⇒ 这一条是再生作物**唯一**的格子级证据。</summary>
+        private static (bool? Ready, string Source) TileReady(int x, int y)
+        {
+            try
+            {
+                GameLocation loc = Game1.currentLocation;
+                if (loc?.terrainFeatures == null) return (null, null);
+                StardewValley.TerrainFeatures.TerrainFeature tf;
+                if (!loc.terrainFeatures.TryGetValue(new Vector2(x, y), out tf)) return (null, null);
+                var hd = tf as StardewValley.TerrainFeatures.HoeDirt;
+                if (hd?.crop == null) return (null, null);
+                return CropMeta.Ready(hd, hd.crop);
+            }
+            catch { return (null, null); }
+        }
+
+        /// <summary>【task-182 必修 1】整场"现在可收"的作物格数（与 `FarmScan` 同判据、同一次遍历口径）。
+        /// 读不到 ⇒ **-1**（不是 0 —— 0 是"真的没有可收的"这个事实）。</summary>
+        private static int ReadyCropCount()
+        {
+            try
+            {
+                Farm farm = Game1.getFarm();
+                if (farm?.terrainFeatures == null) return -1;
+                int n = 0;
+                // `SerializableDictionary` 的枚举入口是 `Pairs`（与 `FarmScan.cs` 同款写法）。
+                foreach (var pair in farm.terrainFeatures.Pairs)
+                {
+                    var hd = pair.Value as StardewValley.TerrainFeatures.HoeDirt;
+                    if (hd?.crop == null) continue;
+                    if (CropMeta.Ready(hd, hd.crop).Value == true) n++;
+                }
+                return n;
+            }
+            catch { return -1; }
+        }
+
+        /// <summary>【task-182 必修 1】背包逐 qid 栈数快照（弱证据的来源；取不到 ⇒ 空字典）。</summary>
+        private static Dictionary<string, int> InventoryStacks()
+        {
+            var map = new Dictionary<string, int>(StringComparer.Ordinal);
+            try
+            {
+                Farmer who = Game1.player;
+                if (who?.Items == null) return map;
+                foreach (Item it in who.Items)
+                {
+                    if (it == null) continue;
+                    string qid = it.QualifiedItemId ?? it.ItemId ?? "";
+                    if (qid.Length == 0) continue;
+                    int cur;
+                    map.TryGetValue(qid, out cur);
+                    map[qid] = cur + Math.Max(0, it.Stack);
+                }
+            }
+            catch { }
+            return map;
+        }
+
+        /// <summary>任一 qid 的栈数比动作前多 ⇒ true（真值来源，绝不由"游戏返回值"推）。</summary>
+        private static bool InventoryGrew(Dictionary<string, int> before, Dictionary<string, int> after)
+        {
+            foreach (var pair in after)
+            {
+                int was;
+                if (!before.TryGetValue(pair.Key, out was)) was = 0;
+                if (pair.Value > was) return true;
+            }
+            return false;
         }
 
         /// <summary>已知技能名（用于区分 unknown_skill 与 not_implemented）。</summary>

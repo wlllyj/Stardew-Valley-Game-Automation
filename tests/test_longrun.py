@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import sys
 import tempfile
 import time
@@ -8841,17 +8842,22 @@ class TestTask176HarvestMethodSourceAndActed(unittest.TestCase):
         self.assertIn("JsonIgnoreCondition.Never", block,
                       "harvestMethod 必须**无条件输出**（缺键 ≠ null，0.7.33 的缺陷正是被缺键掩盖的）")
 
-    # ---------------------------------------------------------------- 源码契约（必修 ②）
+    # ---------------------------------------------------------------- 源码契约（必修 ② → task-182 外置）
     def test_ready_reports_its_source_and_keeps_the_equivalent_fields_path(self):
+        # 【task-182 必修 4】判据本体已搬进 `ClumpRules.cs`（纯函数，可被 C# 自检工程行为断言）；
+        # `CropMeta.Ready` 只负责取数 + 委托。这里断言"两条路径都还在、来源标记都在"。
         src = self._src("CropMeta.cs")
-        self.assertIn('return (direct, "game")', src)
-        self.assertIn('(false, "fields")', src)
-        self.assertIn('(true, "fields")', src)
-        self.assertIn("(null, null)", src)
+        rules = self._src("ClumpRules.cs")
+        self.assertIn('return (gameSaid.Value, "game")', rules)
+        self.assertIn('(false, "fields")', rules)
+        self.assertIn('return (true, "fields")', rules)
+        self.assertIn("(null, null)", rules)
         # 反射失败 + 字段齐全 ⇒ 允许给 "fields" 结论（与游戏 IL 逐条等价）；
         # 只有**字段缺项**才 null（fail-closed 过头会把整片可收作物变成不可收）。
-        fields = src.split("bool? direct = InvokeReadyForHarvest(dirt);")[1]
+        fields = rules.split("if (gameSaid.HasValue) return (gameSaid.Value, \"game\");")[1]
         self.assertIn('return (true, "fields")', fields)
+        # 委托必须真的发生（判据不许悄悄留在 CropMeta 里）
+        self.assertIn("return ClumpRules.Ready(gameSaid,", src)
 
     def test_ready_source_is_exposed_and_carried_into_the_snapshot(self):
         contracts = self._src("Contracts.cs")
@@ -8859,12 +8865,23 @@ class TestTask176HarvestMethodSourceAndActed(unittest.TestCase):
         self.assertIn("JsonIgnoreCondition.Never", block)
         self.assertIn("t.ReadySource = readyInfo.Source", self._src("WorldSnapshot.cs"))
 
-    # ---------------------------------------------------------------- 源码契约（必修 ③）
-    def test_interact_acted_comes_from_an_independent_tile_comparison(self):
+    # ---------------------------------------------------------------- 源码契约（必修 ③ → task-182 扩权）
+    def test_interact_acted_comes_from_cross_observation_evidence(self):
+        # 【task-182 必修 1】判据从"只看 TileSig"扩成四路**跨观测证据**（格子级优先、全局面垫底）：
+        #   tile / ready（再生作物唯一会动的那条）/ readyCrops / inventory（弱证据）。
+        # 旧实现只看 TileSig：再生作物收后格内 6 个字段一项不变 ⇒ 把**成功**报成 no_action
+        # （task-177 事故）；而只看 checkAction 返回值又是 task-173 的"回执谎报"。两头都要堵。
         src = self._src("Skills.cs")
         self.assertIn("TileSig(tx, ty)", src)
-        self.assertIn("observedChange", src)
-        self.assertIn("bool acted = err == null && observedChange;", src)
+        self.assertIn("(bool? readyBefore, string readySourceBefore) = TileReady(tx, ty);", src)
+        self.assertIn("int readyCropsBefore = ReadyCropCount();", src)
+        self.assertIn("Dictionary<string, int> invBefore = InventoryStacks();", src)
+        self.assertIn('if (tileChanged) evidence = "tile";', src)
+        self.assertIn('else if (readyFlipped || readySourceChanged) evidence = "ready";', src)
+        self.assertIn('else if (readyDropped) evidence = "readyCrops";', src)
+        self.assertIn('else if (inventoryGrew) evidence = "inventory";', src)
+        self.assertIn("bool acted = err == null && evidence != null;", src)
+        self.assertIn("ActedEvidence = evidence", src)
         # 旧缺陷：只看 `checkAction` 的返回值 ⇒ 游戏"认领了但没做事"也报 acted
         self.assertNotIn("Ok = err == null && handled", src)
 
@@ -8945,6 +8962,106 @@ class TestTask176HarvestMethodSourceAndActed(unittest.TestCase):
         self.assertFalse(st.ok)
         self.assertIn("acted", st.reason)
         self.assertIn(self.CROP, w.crops, "世界没变 ⇒ 作物必须还在（脑不许以为摘过了）")
+
+
+class TestTask182ActedEvidenceAndRules(unittest.TestCase):
+    """task-182：Mod 侧 `acted` 跨观测证据 + `actedEvidence` + CropMeta NIT-1 + 判据行为化。
+
+    背景（`docs\\_run10-harvest-verify-0734.md`）：0.7.34 上 `(60,29)` 的再生作物**真的收成了**
+    （`readyCrops 102→101`、背包 `(O)270 +1`、该格 `ready true→false`），但 Mod 回执
+    `acted=false / no_action` ⇒ 脑侧据回执判 failed。这是 task-176 (iii) 的反向错误。
+
+    本类只管**契约与结构**；"判据行为对不对"由 `TestTask182ClumpRulesBehaviour` 真跑 C# 断言。
+    """
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def _src(self, name: str) -> str:
+        return (self.ROOT / "mod" / "AgentFarm.Bridge" / name).read_text(encoding="utf-8")
+
+    # ---------------------------------------------------------------- 必修 2（契约）
+    def test_acted_evidence_is_declared_in_the_contract(self):
+        contracts = self._src("Contracts.cs")
+        self.assertIn('[JsonPropertyName("actedEvidence")] public string ActedEvidence', contracts)
+        # 取值清单写在 XML doc 里（属性行之前）⇒ 往前取窗口。
+        block = contracts.split('JsonPropertyName("actedEvidence")')[0][-1800:]
+        for value in ('"tile"', '"ready"', '"readyCrops"', '"inventory"'):
+            self.assertIn(value, block)
+
+    # ---------------------------------------------------------------- 必修 1（证据来源）
+    def test_evidence_comes_from_game_state_not_from_the_return_value(self):
+        src = self._src("Skills.cs")
+        self.assertIn("private static (bool? Ready, string Source) TileReady(int x, int y)", src)
+        self.assertIn("private static int ReadyCropCount()", src)
+        self.assertIn("private static Dictionary<string, int> InventoryStacks()", src)
+        self.assertIn("CropMeta.Ready(hd, hd.crop)", src)
+        self.assertIn("if (pair.Value > was) return true;", src)
+        self.assertIn("证据来源", src)
+
+    # ---------------------------------------------------------------- 必修 3（NIT-1）
+    def test_nit1_which_forage_crop_is_part_of_the_gate(self):
+        rules = self._src("ClumpRules.cs")
+        self.assertIn("if (forageCrop.Value && whichForageCrop == null) return (null, null);", rules)
+        # 旧缺陷：`which` 在闸外读、闸里比较 ⇒ 读不到时给 (true, "fields")，与文档自相矛盾
+        self.assertNotIn('forage.Value && which == "2"', self._src("CropMeta.cs"))
+
+    # ---------------------------------------------------------------- 必修 4（判据外置 + 单出口）
+    def test_cropmeta_ready_delegates_and_has_no_early_return_after_gathering(self):
+        meta = self._src("CropMeta.cs")
+        head = "internal static (bool? Value, string Source) Ready(HoeDirt dirt, Crop crop)"
+        body = meta.split(head, 1)[1].split("\n        }", 1)[0]
+        self.assertIn("ClumpRules.Ready(gameSaid,", body)
+        # 取数之后**不许**再有任何提前 return（`(null,null)` 也在此列）：一旦插入，
+        # 判据就被短路、而纯函数那边照样绿 ⇒ 这条结构契约负责抓"适配层被塞后门"。
+        middle = body.split("bool? gameSaid = InvokeReadyForHarvest(dirt);", 1)[1]
+        middle = middle.split("return ClumpRules.Ready(", 1)[0]
+        self.assertNotIn("return", middle,
+                         "`CropMeta.Ready` 取数之后只许有一条委托 return；"
+                         "任何'提前 return 兜底值'的变异都要被这条结构契约抓住")
+        self.assertIn("internal static (bool? Value, string Source) Ready(",
+                      self._src("ClumpRules.cs"))
+
+    def test_clump_rules_file_has_no_game_types(self):
+        rules = self._src("ClumpRules.cs")
+        # 只看**代码行**：注释里当然要提到 `HoeDirt.readyForHarvest()`（那是口径依据）。
+        code = "\n".join(ln for ln in rules.splitlines() if not ln.strip().startswith("//"))
+        for banned in ("HoeDirt", "Netcode", "StardewValley"):
+            self.assertNotIn(banned, code)
+
+
+class TestTask182ClumpRulesBehaviour(unittest.TestCase):
+    """task-182 必修 4（GAP-1）：把 C# 判据**跑起来**（不是读源码文本）。
+
+    `mod/AgentFarm.Bridge.Tests` 是极小控制台工程：只编译 `ClumpRules.cs`（纯函数、不引用
+    游戏类型、不需要任何 NuGet 包），`dotnet run` 退出码 0 才算过。
+
+    为什么必须这样：task-178 的对抗验收实测变异 `m178b`（在游戏分支之后插一句
+    `return (null, null);`，fail-closed 过头）让 5 条源码文本契约用例**全绿逃逸** ——
+    文本断言永远抓不到"行为变了"。变异装置对 `ClumpRules.cs` 打补丁后复跑本用例，
+    该变异会红（见 `Program.cs` 的 `fields_path_still_works_after_the_game_branch`）。
+
+    变异实测（`scratch/_t182_mutate.py`，brain/ + tests/ + mod/ 一起拷临时目录，跑完已删；
+    装置同时跑本类 + `TestTask182ActedEvidenceAndRules` + `TestTask176HarvestMethodSourceAndActed`）：
+      * 基线 `Ran 16 / OK`；
+      * **m178b_replay**（在游戏分支后插 `return (null, null);`）⇒ 杀 **1**（本类的行为断言，
+        就是 task-178 逃逸的那一个）；
+      * m182a（删 NIT-1 那道闸）⇒ 杀 2；m182b（把 `ready` 证据那一路短路）⇒ 杀 1；
+        m182c（回执不落 `actedEvidence`）⇒ 杀 1。
+    """
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def test_csharp_rules_self_test_passes(self):
+        proj = self.ROOT / "mod" / "AgentFarm.Bridge.Tests" / "AgentFarm.Bridge.Tests.csproj"
+        self.assertTrue(proj.exists(), f"缺少 C# 自检工程：{proj}")
+        proc = subprocess.run(
+            ["dotnet", "run", "--project", str(proj), "-c", "Release", "--nologo"],
+            cwd=str(self.ROOT), capture_output=True, text=True, timeout=600,
+        )
+        self.assertEqual(proc.returncode, 0,
+                         f"ClumpRules 行为自检未通过：\n{proc.stdout}\n{proc.stderr}")
+        self.assertIn("行为断言", proc.stdout)
+        self.assertIn("OK", proc.stdout)
 
 
 if __name__ == "__main__":  # pragma: no cover

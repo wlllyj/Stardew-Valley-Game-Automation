@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    task-182 必修 4（GAP-1）：把 ClumpRules.Ready 的判据"行为化"的极小 C# 自检工程。
+
+    为什么需要它
+      `CropMeta.Ready(HoeDirt, Crop)` 吃游戏类型，仓库里没有 C# 测试工程 ⇒ 旧的"契约用例"
+      只能做源码文本存在性断言。task-178 对抗验收实测：变异体在游戏中转之后插一句
+      `return (null, null);`（fail-closed 过头），5 条文本用例全绿逃逸。
+      现在判据本体搬进 `ClumpRules.cs`（纯函数、不引用任何游戏类型），本工程**只编译它**
+      ⇒ 可以真正 `dotnet run` 跑行为断言，退出码非 0 即红。
+
+    为什么不用 xunit / NuGet
+      离线环境与"不引入任何 NuGet 包"的项目纪律（见 AgentFarm.Bridge.csproj 注释）。
+      纯控制台 + 手写断言：零包依赖、构建 <2 秒。
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net6.0</TargetFramework>
+    <LangVersion>10.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>AgentFarm.Bridge.Tests</AssemblyName>
+    <RootNamespace>AgentFarm.Bridge.Tests</RootNamespace>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <DebugType>none</DebugType>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <!-- 判据本体：与 Mod 编译的是同一个文件（不是拷贝），变异打在哪，这里就红在哪。 -->
+    <Compile Include="..\AgentFarm.Bridge\ClumpRules.cs" />
+  </ItemGroup>
+
+</Project>

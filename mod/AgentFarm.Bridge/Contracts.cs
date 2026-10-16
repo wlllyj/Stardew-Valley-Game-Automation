@@ -997,6 +997,23 @@ namespace AgentFarm.Bridge
         /// </summary>
         [JsonPropertyName("acted")] public bool? Acted { get; set; }
 
+        /// <summary>
+        /// 【task-182 必修 2】`acted` 的**证据来源**（机器可读；不适用/没命中时 null）。
+        ///
+        /// 取值：`"tile"` = 目标格逐字段签名（`TileSig`）变了；`"ready"` = 目标格 `ready` 由
+        /// true 变 false（或 `readySource` 变化）—— 再生作物收后只有这一条会动；
+        /// `"readyCrops"` = 整场 `readyCrops` 下降；`"inventory"` = 背包逐 qid 栈数有增加。
+        ///
+        /// 【为什么要落来源】task-177 的事故：再生作物真的收成了，Mod 却报 `acted=false`；
+        /// 脑侧只能靠自己的观测差分去猜。有了这个字段，脑（task-181）与 analyzer 都能直接
+        /// 对账"这一次 acted 是谁给的证据"，而不是被回执拖死。
+        ///
+        /// 【弱证据声明】`"inventory"` 是**全局面**证据：同一 tick 里别的系统也可能改背包，
+        /// 因此判定顺序把它们分开——格子级证据（`tile`/`ready`/`readyCrops`）优先，
+        /// 只有它们都不动、而背包确实长了，才记 `"inventory"`。reason 里同时写清来源。
+        /// </summary>
+        [JsonPropertyName("actedEvidence")] public string ActedEvidence { get; set; }
+
         // ------------------------------------------------------------------
         //  里程碑 B（move_to_location）新增：成功/失败都给的“可审计行程单”
         //

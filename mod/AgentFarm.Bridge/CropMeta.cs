@@ -109,9 +109,13 @@ namespace AgentFarm.Bridge
         {
             if (dirt == null || crop == null) return (null, null);
 
-            bool? direct = InvokeReadyForHarvest(dirt);
-            if (direct != null) return (direct, "game");
-
+            // 【task-182 必修 4（GAP-1）】判据本体搬进 `ClumpRules.Ready`（纯函数、不引用游戏类型）
+            // ⇒ 最小 C# 自检工程能直接跑**行为断言**（`mod/AgentFarm.Bridge.Tests`，Python 侧
+            // `tests/test_longrun.py::TestTask182ClumpRulesBehaviour` 负责调它）。
+            // 本方法从此只做**取数**一件事：反射问游戏 + 反射读字段。
+            // 纪律：这里**只允许有一条 return**（那条委托）；任何"提前 return 兜底值"的变异
+            // 都会被 Python 侧的结构契约当场抓住（见 `TestTask182*` 的结构断言）。
+            bool? gameSaid = InvokeReadyForHarvest(dirt);
             try
             {
                 bool? fullyGrown = crop.fullyGrown != null ? (bool?)crop.fullyGrown.Value : null;
@@ -121,21 +125,7 @@ namespace AgentFarm.Bridge
                 bool? dead = crop.dead != null ? (bool?)crop.dead.Value : null;
                 bool? forage = NetBoolOf(ReadMember(crop, "forageCrop"));
                 string which = NetValue(ReadMember(crop, "whichForageCrop")) as string;
-
-                // 等价性依据：HoeDirt.readyForHarvest() 的 IL（`scratch\_t176_ready.txt`）
-                //   crop==null ⇒ false；fullyGrown && dayOfCurrentPhase>0 ⇒ false；
-                //   currentPhase < phaseDays.Count-1 ⇒ false；dead ⇒ false；
-                //   !forageCrop ⇒ true；否则 whichForageCrop != "2"
-                // 少任何一项就无法证明等价 ⇒ 判不了（不许给结论）。
-                if (fullyGrown == null || dayOfPhase == null || phase == null || phases == null
-                    || dead == null || forage == null)
-                    return (null, null);
-
-                if (fullyGrown.Value && dayOfPhase.Value > 0) return (false, "fields");   // ① 复收冷却
-                if (phase.Value < phases.Value - 1) return (false, "fields");             // ② 阶段没走完
-                if (dead.Value) return (false, "fields");                                 // ③ 枯死
-                if (forage.Value && which == "2") return (false, "fields");               // ④ 采集形态 2
-                return (true, "fields");
+                return ClumpRules.Ready(gameSaid, fullyGrown, dayOfPhase, phase, phases, dead, forage, which);
             }
             catch { return (null, null); }
         }
