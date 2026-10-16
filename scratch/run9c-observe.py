@@ -78,13 +78,15 @@ def day_key_from_journal(journal: str):
     return f"{str(day[1]).lower()}{int(day[2])}", n, last
 
 
-def next_path(out_dir: str, prefix: str, day_key: str) -> str:
+def next_path(out_dir: str, prefix: str, day_key: str, naming: str = "num") -> str:
+    """同名绝不覆盖：naming=num ⇒ `-2`/`-3`…；naming=alpha ⇒ `-b`/`-c`…（run9d 卡面口径）。"""
     base = os.path.join(out_dir, f"{prefix}{day_key}.json")
     if not os.path.exists(base):
         return base
     i = 2
     while True:
-        cand = os.path.join(out_dir, f"{prefix}{day_key}-{i}.json")
+        suffix = f"-{i}" if naming != "alpha" else f"-{chr(ord('a') + i - 1)}"
+        cand = os.path.join(out_dir, f"{prefix}{day_key}{suffix}.json")
         if not os.path.exists(cand):
             return cand
         i += 1
@@ -120,6 +122,8 @@ def main() -> int:
     ap.add_argument("--prefix", default=DEFAULT_PREFIX)
     ap.add_argument("--tag", default=None, help="显式 day key（如 summer13）")
     ap.add_argument("--force", action="store_true", help="允许覆盖同名文件（默认不允许）")
+    ap.add_argument("--naming", choices=("num", "alpha"), default="num",
+                    help="同名时的后缀风格：num=-2/-3…；alpha=-b/-c…（run9d 卡面口径）")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--dry-run", action="store_true", help="不调用桥，只打印将要写哪里")
     args = ap.parse_args()
@@ -147,7 +151,7 @@ def main() -> int:
 
     path = os.path.join(args.out_dir, f"{args.prefix}{day_key}.json")
     if os.path.exists(path) and not args.force:
-        path = next_path(args.out_dir, args.prefix, day_key)
+        path = next_path(args.out_dir, args.prefix, day_key, args.naming)
     print(f"目标文件 = {path}")
 
     if args.dry_run:
