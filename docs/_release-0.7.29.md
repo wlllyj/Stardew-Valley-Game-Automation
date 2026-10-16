@@ -18,9 +18,12 @@ run9（0.7.28）**已收尾，实测 0/5 VERIFIED**：`finish {"code":1,"verifie
 | 卡 | 内容 | 归属 | 是否本版 |
 |---|---|---|---|
 | task-121 | `REVIEW_MAX_TOKENS` 512→4096 + 截断自愈重试 1 次（8192）+ 失败留 `max_tokens`/`attempts` | dev-coder | ✅ `9a4da64` |
-| **task-126** | **P0 闸门**：钉死 `showEndOfNightStuff()` 的日终菜单链（`ShippingMenu` → `SaveGameMenu`），修掉"我们清模态把日切保存链掐断"（run9 实测 **4 NewDay / 0 save**，整跑未落盘）；交付 `docs/_il-shipmenu-save.md` + 修法 | log-analyst（取证 `8fdd3bb`）+ **task-129** dev-coder 修 | ✅ 取证已交 / **修法 task-129 在制** |
+| **task-126** | **P0 闸门**：钉死 `showEndOfNightStuff()` 的日终菜单链（`ShippingMenu` → `SaveGameMenu`），修掉"我们清模态把日切保存链掐断"（run9 实测 **4 NewDay / 0 save**，整跑未落盘）；交付 `docs/_il-shipmenu-save.md` + 修法 | log-analyst（取证 `8fdd3bb`）+ **task-129** dev-coder 修 | ✅ 取证 `8fdd3bb` / ✅ 修法 `2618166`（Lead 独立核：7 文件 +601/−8、定向 323 OK、越界零命中；**真机落盘验证在 run9b**） |
 | task-122 | 教训库新增 `stuck_with_leftover` / `plot_exhausted` 两类（含"干净日仍然 0 条"用例） | dev-coder | ✅ `affa7c8` |
-| task-123 | 买种子量力而行（`n=min(buy_count, money//price)`，`n>=1` 则 `buy_partial`） | dev-coder | ❌ **未交付**（board = `pending`/无 owner；`git grep buy_partial` 零命中；Lead 2026-10-16 误标 ✅，已由 task-125 A 段揭穿）⇒ **0.7.29 闸门** |
+| task-123 | 买种子量力而行（`n=min(buy_count, money//price)`，`n>=1` 则 `buy_partial`） | dev-coder | ❌ **未交付**（board = `pending`/无 owner；`git grep buy_partial` 零命中；Lead 2026-10-16 误标 ✅，已由 task-125 A 段揭穿）⇒ **0.7.29 闸门**；2026-10-16 晚已重新派 dev-coder 并放行（rev2 in_progress） |
+| task-130 | analyzer 收 task-124 新事件（`review_only_fallback`/`review_only_no_target`/`plot_exhausted_burst`/`review_only_fallback_failed`）⇒ 全量回 0 红（当前 712 / 2 红） | log-analyst | 🔄 in_progress（0.7.29 放行条件） |
+| task-131 | run9b（0.7.29 上的 run A）：落盘五串配对 + 教训库非空（L0）+ 尾部 3 日；交付 `docs/_run9b-evidence.md`；跑完拷 `-lessons.json` 供 run10 | machine-runner | ⏳ pending，`blocked_by [task-123, task-129, task-130]` |
+| task-125 | 0.7.29 批次独立对抗验收（121/122/123/124） | deputy-lead | ✅ `693e4d2`：121 PASS-WITH-NITS / 122 PASS / **123 FAIL（未交付）** / 124 PASS-WITH-NITS ⇒ 总结论「0.7.29 不可放行，等 123 + 129」 |
 | task-124 | review-only 决策不许白过：用守卫据以抱怨的那份 leftover 挑片地/挑格兜底（≥8 单测） | dev-coder | ✅ `08a2ae0`（Lead 独立核：407 OK 定向 / 全量 707 含 2 条 analyzer 漂移 → task-130） |
 | task-101 | `_farm_totals` 类型校验（`"abc"` 会让整天崩）、窗口全死苗 `watered_outdoor` 字段级收口 | dev-coder | 择机 |
 | task-107 | Mod `farm.dryTiles` 与 `farm.dryCrops` 同源 + `scanSeq` | dev-coder | 择机 |
@@ -30,7 +33,7 @@ run9（0.7.28）**已收尾，实测 0/5 VERIFIED**：`finish {"code":1,"verifie
 
 ## 2. 冻结与装机（九步，Lead 独占）
 1. 确认 §1 标记 ✅ 的卡片全部 completed，且 task-122（口径/素材类）过了独立对抗验收。
-1b. **P0 硬闸门（task-126）**：`docs/_il-shipmenu-save.md` 定案 + 修法落地 + 真机验证"关掉日终菜单后仍完成一次 `SaveGame.Save()`"（判据 = SMAPI `NewDay` 次数 == `Context: before save.` 次数 == `SaveGame.Save() called.` 次数 == `completed without exceptions` 次数，逐条配对）。**未过此闸门不许起 run9b**——run9 的 0/4 落盘使整跑证据链作废（见 `docs/_run6-criteria.md` §2 新口径）。
+1b. **P0 硬闸门（task-126）**：`docs/_il-shipmenu-save.md` 定案 + 修法落地 + 真机验证"关掉日终菜单后仍完成一次 `SaveGame.Save()`"（判据 = SMAPI `NewDay` 次数 == `Context: before save.` 次数 == `SaveGame.Save() called.` 次数 == `completed without exceptions` 次数，逐条配对）。**未过此闸门不许起 run9b**——run9 的 0/4 落盘使整跑证据链作废（见 `docs/_run6-criteria.md` §2 新口径）。**2026-10-16 更新**：修法已落地 `2618166`（Lead 独立核通过）；**真机验证由 task-131（run9b）完成** —— 每次跨日必须补齐 `NewDay` → `Context: before save.` → `SaveGame.Save() called.` → `Saving without compression...` → `completed without exceptions.` → `after save, starting <次日>` 六段配对，且存档 size/mtime 前进。
 2. `tools/_note-0729.txt`：首串必须是 `v0.7.29（…）`，逐条写本版内容。
 3. `python tools\_bump-mod-version.py 0.7.29 --note-file tools\_note-0729.txt` ⇒ `json.load` 核对 `manifest.json` 的 Version（脚本末句在 cp1252 下会 `UnicodeEncodeError`、退出码 1，**版本已写盘**）。
 4. `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.29"`（注释列本版内容）。
