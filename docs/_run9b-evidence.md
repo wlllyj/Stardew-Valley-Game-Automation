@@ -14,7 +14,7 @@
 | 2 | 尾部窗口 | `verify-run3.py --days 3`：**尾部连续 VERIFIED 0 / 要求 3** ⇒ `needs_review`；`analyze-longrun.py`：`VERIFIED 1/3`、窗口内红 45、历史 0 ⇒ 两侧同向 FAIL |
 | 3 | 最强单日 | **summer 17：`verified=True`、九项 checks 全 true、`ok 70 / skip 0 / fail 0`、`final_water farm dry 0/56`** |
 | 4 | 经济闭环 | `sell` 3 + `surplus_sell` 3（`why=need_slot`）→ 次日到账（summer 15 `day_start money 235`）→ `buy` 8（含 **`buy_partial` 2**）→ 播种多天有 ok |
-| 5 | L0 教训库 | 7 条非空，`logs/longrun-3day-llm-run9b-lessons.json` = 3568 B / SHA256 `C2312F2D…86A0`（已按占位拷贝成 `run10-lessons.json`，**该占位不得用于判决**，见 §7.2） |
+| 5 | L0 教训库 | 7 条非空，`logs/longrun-3day-llm-run9b-lessons.json` = 3568 B / SHA256 `C2312F2D…86A0`（已按占位拷贝成 `run10-lessons.json`，**该占位不得用于判决**，见 §7 第 2 条） |
 
 ---
 
@@ -309,7 +309,7 @@ summer 18  final FarmHouse t=600  体力=270   钱=205 作物=0  未浇=0 熟=0 
 - 值得点名的两条**自相矛盾/自证**（task-136 的输入）：
   - `far_dry_given_up|water_far`：`symptom="有 3 格窗口外干作物够不着（当天放弃）"`、`evidence="gave_up=3 dry_dead=0"`，但 `hint="作物全已浇水且无成熟…"` —— **hint 与 evidence 矛盾**（当天并没有"全已浇水"，而是有 3 格放弃）。
   - `slept_without_work|day`：`hint` 为空字符串（该 kind 没写提示），而它恰恰是最该被次日注入的一条（summer 18 的守卫事件）。
-- 拷贝（占位，**不得用于判决**）：`logs/longrun-3day-llm-run10-lessons.json`（同一 SHA256），重做规则见 §7.2。
+- 拷贝（占位，**不得用于判决**）：`logs/longrun-3day-llm-run10-lessons.json`（同一 SHA256），重做规则见 §7 第 2 条。
 
 ### ④ `review_only_fallback` / `plot_exhausted_burst` 是否生效、有界
 
@@ -389,7 +389,7 @@ summer 18  final FarmHouse t=600  体力=270   钱=205 作物=0  未浇=0 熟=0 
 | `logs/longrun-3day-llm-run9b.console.log` / `.console.err.log` | console 21251 B / 192 行；stderr **0 B** |
 | `logs/longrun-3day-llm-run9b-llm.jsonl` | LLM 调用留痕（decision 44 / LLM 31） |
 | `logs/longrun-3day-llm-run9b-lessons.json` | 教训库 7 条（L0 达标） |
-| `logs/longrun-3day-llm-run10-lessons.json` | **占位拷贝**（不得用于判决，见 §7.2） |
+| `logs/longrun-3day-llm-run10-lessons.json` | **占位拷贝**（不得用于判决，见 §7 第 2 条） |
 | `logs/run9b-smapi-window.txt` | 冻结窗口 340380 B / 4622 行 / SHA256 `BE554988…94E0` |
 | `logs/run9b-smapi-chain.txt` | 六串逐条行号表 |
 | `logs/run9b-verify.txt` / `logs/run9b-verify.json` | `verify-run3` 文本版 + JSON（verdict/strict_verdict） |
