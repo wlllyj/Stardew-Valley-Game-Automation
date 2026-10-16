@@ -83,19 +83,31 @@ def harvest(rows: list[dict]) -> dict:
         "decisions": 0, "decisions_llm": 0, "shapes": {},
         "cancel_by_task": {}, "stage_fail_by_task": {}, "stage_ok_by_task": {},
         "days": [], "trace_rows": 0,
+        # task-58/59/82 的演进对照（L1–L5）要用到的信号
+        "ended_by": {}, "event_counts": {}, "checks_false": [], "decision_texts": [],
     }
     for row in rows:
         ev = row.get("ev") or row.get("event") or ""
+        if ev:
+            info["event_counts"][ev] = info["event_counts"].get(ev, 0) + 1
         if ev == "day_start":
             info["day_start"] += 1
         elif ev == "day_end":
             info["day_end"] += 1
+            ended = str(row.get("ended_by") or "")
+            info["ended_by"][ended] = info["ended_by"].get(ended, 0) + 1
+            checks = row.get("checks") or {}
+            false_keys = sorted(k for k, v in checks.items() if v is False) if isinstance(checks, dict) else []
+            for k in false_keys:
+                if k not in info["checks_false"]:
+                    info["checks_false"].append(k)
             info["days"].append({
                 "day": row.get("day_key") or row.get("day"),
                 "ended_by": row.get("ended_by"),
                 "verified": row.get("verified"),
                 "ok_steps": row.get("ok_steps"),
                 "failed_steps": row.get("failed_steps"),
+                "checks_false": false_keys,
             })
             # 阶段结果在 day_end.stages[]（不是独立的 stage 事件；tiles 是整数不是坐标列表）
             for st in row.get("stages") or []:
@@ -124,6 +136,12 @@ def harvest(rows: list[dict]) -> dict:
             tasks = [str(i.get("task") or "") for i in intents_of(row)]
             key = shape_of(tasks)
             info["shapes"][key] = info["shapes"].get(key, 0) + 1
+            if len(info["decision_texts"]) < 400:
+                bits = [key]
+                for i in intents_of(row):
+                    bits.append(str(i.get("reason") or ""))
+                    bits.append(str(i.get("expected_evidence") or ""))
+                info["decision_texts"].append(" ".join(b for b in bits if b))
         elif ev == "intent_verdict":
             for v in row.get("verdicts") or []:
                 if isinstance(v, dict) and v.get("verdict") == "cancel":
@@ -196,6 +214,133 @@ def counter_table(title: str, left: dict, right: dict, la: str, lb: str,
         print(f"  {key:<44} {a:>6} {b:>6}   {flag}")
     if len(keys) > limit:
         print(f"  …另有 {len(keys) - limit} 项（省略）")
+
+
+# ---------------------------------------------------------------------------
+# 演进判据 L0–L5（`docs/_run10-criteria.md`）：把"带教训再玩"的对照做成**机械可算**的部分，
+# 不能机械判定的（L3 决策是否真受影响）只给旁证，并在结论里如实标注。
+_LESSON_SIGNAL = {
+    # lesson id 的 `kind` → 账本里可数的同形态信号
+    "stuck_with_leftover": ("ended_by", "stuck"),
+    "plot_exhausted": ("ended_by", "stuck"),
+    "slept_without_work": ("ended_by", "slept_without_work"),
+    "far_dry_given_up": ("ended_by", "gave_up_dry"),
+    "no_inventory_space": ("event", "buy_no_space"),
+}
+
+
+def lesson_kind(entry: dict) -> str:
+    return str(entry.get("id") or "").split("|", 1)[0]
+
+
+def tail_verified(days: list[dict]) -> int:
+    """尾部连续 `verified is True` 的天数（`None`/缺字段一律中断计数）。"""
+    count = 0
+    for day in reversed(days):
+        if day.get("verified") is True:
+            count += 1
+        else:
+            break
+    return count
+
+
+def _signal_count(info: dict, signal: tuple[str, str]) -> int:
+    kind, name = signal
+    if kind == "ended_by":
+        return int((info.get("ended_by") or {}).get(name, 0))
+    return int((info.get("event_counts") or {}).get(name, 0))
+
+
+def _tokens(text: str) -> set[str]:
+    """L3 旁证用：田区名 + 两位以上数字（教训文本里最可能被复述的具体指涉）。"""
+    return set(re.findall(r"field_[a-z]{2,}", text)) | set(re.findall(r"\d{2,}", text))
+
+
+def criteria(info_a: dict, info_b: dict, lessons: list[dict], hits: int,
+             prompts_b: list[str], la: str = "runA", lb: str = "runB") -> dict:
+    tail_a, tail_b = tail_verified(info_a["days"]), tail_verified(info_b["days"])
+    signals: list[dict] = []
+    for entry in lessons:
+        kind = lesson_kind(entry)
+        signal = _LESSON_SIGNAL.get(kind)
+        if not signal:
+            signals.append({"kind": kind, "lesson": lesson_text(entry)[:96], "signal": None,
+                            "a": None, "b": None, "improved": None})
+            continue
+        count_a, count_b = _signal_count(info_a, signal), _signal_count(info_b, signal)
+        signals.append({
+            "kind": kind, "lesson": lesson_text(entry)[:96],
+            "signal": f"{signal[0]}:{signal[1]}",
+            "a": count_a, "b": count_b,
+            "improved": (count_a == 0) or (count_b < count_a),
+        })
+    mapped = [s for s in signals if s["signal"]]
+    new_false = sorted(set(info_b.get("checks_false") or []) - set(info_a.get("checks_false") or []))
+    l0 = len(lessons) >= 1
+    l1 = bool(lessons) and bool(prompts_b) and hits > 0
+    l2 = bool(mapped) and all(bool(s["improved"]) for s in mapped)
+    l4 = (tail_b >= tail_a) and not new_false
+    # L3 只给旁证：教训里的具体指涉有没有出现在 run B 的决策理由/预期证据里
+    influence: list[dict] = []
+    for entry in lessons:
+        toks = _tokens(lesson_text(entry))
+        mentioned = 0
+        if toks:
+            for text in info_b.get("decision_texts") or []:
+                if toks & _tokens(text):
+                    mentioned += 1
+        influence.append({"lesson": lesson_text(entry)[:96], "decision_mentions": mentioned,
+                          "note": "旁证：只在「理由/预期证据里出现同一指涉」意义上成立，不等于决策被改变"})
+    if not l0:
+        verdict = "不足以判定自我进化（run A 没产出教训，A→B 对照作废）"
+    elif not l1:
+        verdict = "不足以判定自我进化（教训没有进 run B 的提示词）"
+    elif not l2:
+        verdict = "不足以判定自我进化（同形态在 run B 没有减少）"
+    elif tail_b < 3:
+        verdict = "有演进痕迹，但 run B 未达标（尾部连续 VERIFIED < 3 天）"
+    else:
+        verdict = "有演进证据（L1/L2/L4 机械成立；L3 需人工确认理由相关性）"
+    return {
+        "l0_lessons_exist": l0,
+        "l1_injection_effective": l1,
+        "l2_same_shape_decreased": l2,
+        "l3_influence_evidence": influence,
+        "l4_no_regression": l4,
+        "l5_verdict": verdict,
+        "tail_verified": {la: tail_a, lb: tail_b},
+        "signals": signals,
+        "new_false_checks_in_b": new_false,
+        "lesson_hits": hits,
+        "lessons_total": len(lessons),
+        "b_prompt_calls": len(prompts_b),
+    }
+
+
+def print_criteria(crit: dict, la: str, lb: str) -> None:
+    print("\n[6] 演进判据（L0–L5，机械可算部分 + 旁证）")
+    mark = lambda ok: "✅" if ok else "❌"  # noqa: E731
+    print(f"  L0 run A 有教训库（≥1 条）            : {mark(crit['l0_lessons_exist'])}"
+          f"  ({crit['lessons_total']} 条)")
+    print(f"  L1 教训确实进了 run B 提示词          : {mark(crit['l1_injection_effective'])}"
+          f"  ({crit['lesson_hits']}/{crit['lessons_total']} 命中，run B {crit['b_prompt_calls']} 次调用)")
+    print(f"  L2 同形态在 run B 减少                : {mark(crit['l2_same_shape_decreased'])}")
+    for sig in crit["signals"]:
+        if sig["signal"]:
+            print(f"       · {sig['kind']:<20} {sig['signal']:<28} {la}={sig['a']} → {lb}={sig['b']}"
+                  f"  {'✅ 减少' if sig['improved'] else '❌ 未减少'}")
+        else:
+            print(f"       · {sig['kind']:<20} （无可数信号，需人工看账本）")
+    tails = crit["tail_verified"]
+    print(f"  L4 无回归（尾部 VERIFIED 不降 + 无新失败类）: {mark(crit['l4_no_regression'])}"
+          f"  尾部 {la}={tails.get(la)} → {lb}={tails.get(lb)}"
+          + (f"；新增失败项 {crit['new_false_checks_in_b']}" if crit["new_false_checks_in_b"] else ""))
+    print("  L3 决策受影响的旁证（需人工确认）    :")
+    for item in crit["l3_influence_evidence"]:
+        print(f"       · 决策理由里同指涉出现 {item['decision_mentions']} 次 ｜ {item['lesson'][:72]}")
+    print(f"  L5 结论：{crit['l5_verdict']}")
+    print("  ⚠ 本工具的 L 判据只做机械对照；「自我进化」的正式结论必须并列"
+          " `verify-run3`/`analyze-longrun` 的判决与 L3 的人工核对。")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -278,6 +423,9 @@ def main(argv: list[str] | None = None) -> int:
               " ⇒ 无法核对注入；若 run B 未开 --boundary-llm，此处属预期")
     injection_effective = bool(lessons) and bool(prompts_b) and hits > 0
 
+    crit = criteria(info_a, info_b, lessons, hits, prompts_b, args.label_a, args.label_b)
+    print_criteria(crit, args.label_a, args.label_b)
+
     verdict = {
         "run_a": {"journal": str(ja), "info": info_a},
         "run_b": {"journal": str(jb), "info": info_b},
@@ -287,6 +435,7 @@ def main(argv: list[str] | None = None) -> int:
         "lessons_hits": hits,
         "injection_effective": injection_effective,
         "b_prompt_calls": len(prompts_b),
+        "criteria": crit,
     }
     if args.json_out:
         out = Path(args.json_out)

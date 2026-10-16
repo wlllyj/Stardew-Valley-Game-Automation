@@ -169,6 +169,90 @@ class LessonInjectionTests(unittest.TestCase):
             self.assertEqual(report["lessons_hits"], 1)
 
 
+class CriteriaTests(unittest.TestCase):
+    """L0–L5（`docs/_run10-criteria.md`）：机械可算的部分不许漏、不许自证演进。"""
+
+    def _info(self, days, ended_by, checks_false=(), decision_texts=()):
+        return {"days": list(days), "ended_by": dict(ended_by),
+                "checks_false": list(checks_false), "decision_texts": list(decision_texts),
+                "event_counts": {}}
+
+    def _lesson(self, kind="stuck_with_leftover", scope="till_area"):
+        return {"id": f"{kind}|{scope}", "symptom": "有格没做完", "evidence": "leftover=12",
+                "hint": "换片地再试"}
+
+    def test_tail_verified_counts_only_trailing_true(self):
+        days = [{"verified": True}, {"verified": False}, {"verified": True}, {"verified": True}]
+        self.assertEqual(cr.tail_verified(days), 2)
+        self.assertEqual(cr.tail_verified([{"verified": True}, {"verified": None}]), 0)
+        self.assertEqual(cr.tail_verified([]), 0)
+
+    def test_l5_reports_evolution_evidence_when_lesson_shape_drops(self):
+        info_a = self._info([{"verified": False}], {"stuck": 3}, ["no_unmet_stages"])
+        info_b = self._info([{"verified": True}] * 3, {"stuck": 0})
+        crit = cr.criteria(info_a, info_b, [self._lesson()], 1, ["提示词里有教训"],
+                           "run9c", "run10")
+        self.assertTrue(crit["l0_lessons_exist"])
+        self.assertTrue(crit["l1_injection_effective"])
+        self.assertTrue(crit["l2_same_shape_decreased"])
+        self.assertTrue(crit["l4_no_regression"])
+        self.assertIn("有演进证据", crit["l5_verdict"])
+        self.assertEqual(crit["signals"][0]["a"], 3)
+        self.assertEqual(crit["signals"][0]["b"], 0)
+
+    def test_l5_says_insufficient_when_injection_failed(self):
+        info_a = self._info([{"verified": True}] * 3, {"stuck": 3})
+        info_b = self._info([{"verified": True}] * 3, {"stuck": 0})
+        crit = cr.criteria(info_a, info_b, [self._lesson()], 0, [], "run9c", "run10")
+        self.assertFalse(crit["l1_injection_effective"])
+        self.assertIn("教训没有进", crit["l5_verdict"])
+
+    def test_l5_says_insufficient_when_run_a_has_no_lessons(self):
+        info_a = self._info([{"verified": False}], {"stuck": 2})
+        info_b = self._info([{"verified": True}] * 3, {"stuck": 0})
+        crit = cr.criteria(info_a, info_b, [], 0, ["x"], "run9c", "run10")
+        self.assertFalse(crit["l0_lessons_exist"])
+        self.assertIn("没产出教训", crit["l5_verdict"])
+
+    def test_l2_false_when_same_shape_does_not_drop(self):
+        info_a = self._info([{"verified": False}], {"stuck": 3})
+        info_b = self._info([{"verified": True}] * 3, {"stuck": 4})
+        crit = cr.criteria(info_a, info_b, [self._lesson()], 1, ["x"], "run9c", "run10")
+        self.assertFalse(crit["l2_same_shape_decreased"])
+        self.assertIn("同形态", crit["l5_verdict"])
+
+    def test_l4_flags_new_false_check_in_b(self):
+        info_a = self._info([{"verified": True}] * 3, {"sleep": 3})
+        info_b = self._info([{"verified": True}] * 3, {"sleep": 3}, ["day_justified"])
+        crit = cr.criteria(info_a, info_b, [self._lesson()], 1, ["x"], "run9c", "run10")
+        self.assertFalse(crit["l4_no_regression"])
+        self.assertEqual(crit["new_false_checks_in_b"], ["day_justified"])
+
+    def test_l3_evidence_counts_decision_mentions(self):
+        info_a = self._info([{"verified": False}], {"stuck": 3})
+        info_b = self._info([{"verified": True}] * 3, {"stuck": 0},
+                            decision_texts=["先去 field_ne 把 leftover 12 格做完"])
+        crit = cr.criteria(info_a, info_b, [self._lesson()], 1, ["x"], "run9c", "run10")
+        self.assertEqual(crit["l3_influence_evidence"][0]["decision_mentions"], 1)
+
+    def test_harvest_collects_ended_by_and_false_checks(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = pathlib.Path(raw) / "run.jsonl"
+            write_jsonl(path, [
+                {"event": "day_end", "day_key": [1, "summer", 3], "ended_by": "stuck",
+                 "verified": False, "ok_steps": 5, "failed_steps": 0,
+                 "checks": {"no_unmet_stages": False, "day_justified": True},
+                 "stages": []},
+                {"event": "buy_no_space", "t": 2.0},
+            ])
+            rows = cr.load_rows(path)
+            info = cr.harvest(rows)
+            self.assertEqual(info["ended_by"], {"stuck": 1})
+            self.assertEqual(info["event_counts"]["buy_no_space"], 1)
+            self.assertEqual(info["checks_false"], ["no_unmet_stages"])
+            self.assertEqual(info["days"][0]["checks_false"], ["no_unmet_stages"])
+
+
 class CliTests(unittest.TestCase):
     def test_missing_journal_exits_two(self):
         with tempfile.TemporaryDirectory() as raw:
