@@ -6,7 +6,8 @@
 
 ## §0 run9b 现状（证据：`logs/longrun-3day-llm-run9b.jsonl`、`docs/_run9-evidence.md`）
 
-- **P0「出货日日切不落盘」已修**：run9b 三次跨日 SMAPI 五串齐全（`Synchronizing 'NewDay' task…` → `Context: before save.` → `SaveGame.Save() called.` → `Saving without compression…` → `completed without exceptions.` → `after save, starting <次日>`），存档逐次前进：3731582/22:05:16 → 3770274/22:13:28 → 3813991/22:18:07。
+- **P0「出货日日切不落盘」已修**：run9b **五次跨日、5/5 全配对**（SMAPI 六串齐全：`Synchronizing 'NewDay' task…` → `Context: before save.` → `SaveGame.Save() called.` → `Saving without compression…` → `completed without exceptions.` → `after save, starting <次日>`），存档逐次前进：3706657 → 3731582/22:05:16 → 3770274/22:13:28 → 3813991/22:18:07 → 3843606/22:22:45 → **5766683/22:30:13.053**。取证原文 `docs/_run9b-evidence.md` §3（含 `save_called` 原始计数 6 vs 修正 5 的假阳性机制：插件描述行 L16 被正则命中）。
+- **6 个日报告里出现首个整天全 VERIFIED：summer 17**（`sleep`、`ok/skip/fail 70/0/0`、九项 checks 全 true、`dry 0/56`）。
 - **但 0/3 VERIFIED**（三天 `no_unmet_stages=false`）：
   - summer 13：`stuck`（同秒连发换片 5 次 ⇒ `plot_exhausted_burst`），9 格跨片 leftover 反复"回去看"10 次却一格没做；
   - summer 14：`stamina`（体力 4 < 12）；
@@ -26,12 +27,13 @@
 | task-109 | 卖货如实性（最大叠/最小损失）+ 卖后刷新 obs | pending | 顺延 |
 | task-110 | `ensure_location` 无 try/except ⇒ `BridgeError` 穿出 `run()` | pending | 顺延 |
 | task-117 | 教训内容模板校验 + 提示词标注"模型自述≠真值" | pending | 顺延 |
-| task-131 | run9b（0.7.29 上的 run A） | machine-runner 在跑 | — |
+| task-131 | run9b（0.7.29 上的 run A） | machine-runner **completed**（`732aa51`，证据 414 行） | — |
+| task-137 | 非 `sleep` 收尾分支的 `DayReport.final` 必须重取（证据字段滞后；run9b 尾部 `final.money=205` vs 现场 105 已查清=买前快照） | pending | 顺延（0.7.31） |
 
 ## §2 冻结与装机九步（Lead 独占）
 
-1. 确认 task-133/134/135 全 completed 且**全量单测 0 红**（`python -m unittest discover -s tests`）。
-2. 写 `tools/_note-0730.txt`，**首串必须是 `v0.7.30`**，逐条列 task-133/134。
+1. 确认 task-133/134/**136**/135 全 completed 且**全量单测 0 红**（`python -m unittest discover -s tests`）。
+2. 写 `tools/_note-0730.txt`，**首串必须是 `v0.7.30`**，逐条列 task-133/134/136（已于本夜写好，首串 `v0.7.30（run9b 复盘：water_far 补水与逐格判据 + resume 空转兜底 + 阶段口径账实相符 + 演进素材质量）`）。
 3. `python tools\_bump-mod-version.py 0.7.30 --note-file tools\_note-0730.txt`（末句在 cp1252 下会 `UnicodeEncodeError`、退出码 1，**版本已写盘** ⇒ 一律 `json.load` 核对 manifest）。
 4. `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.30"`（注释列本版两项）。
 5. `dotnet build .\mod\AgentFarm.Bridge\AgentFarm.Bridge.csproj -c Release --nologo --no-incremental` ⇒ 必须 0 警告 0 错误（本版若 Mod 无源码改动，dll 内容不变但版本号随 manifest）。
@@ -75,4 +77,5 @@
 - task-134 B 段是口径变更：**未过 task-135 不得冻结**。
 - **task-136 必须在 run9c 起跑前落地**：run9b 的 `logs/longrun-3day-llm-run9b-lessons.json` 里 `far_dry_given_up|water_far` 的 `hint`（"作物全已浇水…"）与它自己的 `evidence="gave_up=3 dry_dead=0"` 矛盾，且复盘调用本身没进 trace ⇒ 这是**反馈污染**：run9c 写进库的教训会被 run10 原样注入。run9c 前要么修好（首选，task-136），要么在 run9c 起跑前把旧 `-lessons.json` 清空重来。
 - run10 的演进判定按 `docs/_run10-criteria.md`（L0 要求 run A 的 `lessons.total>=1`，run9/run9b 实测 0 ⇒ run A 必须在 0.7.30 上重跑）。
-- 顺延卡见 §1 表（task-101/107/109/110/117），以及长期项 task-14（warp 活锁）、task-17（world_stuck）、task-18（职业选择）、task-20（工具等级）、task-53（农场级待清/待垦）、task-83/94（田块规整）。
+- 顺延卡见 §1 表（task-101/107/109/110/117/**137**），以及长期项 task-14（warp 活锁）、task-17（world_stuck）、task-18（职业选择）、task-20（工具等级）、task-53（农场级待清/待垦）、task-83/94（田块规整）。
+- **run9c 证据必查项（Lead 定的两条新注意点）**：①若 run9c 出现 `slept_without_work`/`gave_up_dry`/`blocked_modal` 收尾，**必须单独取一次收尾现场 `observe`**（这些分支的 `day_end.final` 可能是旧快照，见 task-137）；②`save_called` 的原始计数含 L16 插件描述行的假阳性 ⇒ 一律报"修正后 5/5"并附机制说明。

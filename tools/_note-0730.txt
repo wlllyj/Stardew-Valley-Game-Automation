@@ -1,0 +1,28 @@
+v0.7.30（run9b 复盘：water_far 补水与逐格判据 + resume 空转兜底 + 阶段口径账实相符 + 演进素材质量）
+
+本版三张卡 + 一张对抗验收（Mod 无源码改动，只 bump 版本号）：
+
+1. task-133（dev-coder）water_far 诚实浇水轨迹：
+   - 壶空不许再算"够不着"：`need_refill` 时先补水（复用现有 refill 路径）再重试，当天额度内；
+   - 逐格判据（钉死到"那一格"的 watered，不许用邻格/别格的全局计数下降冒充成功）；
+   - 收尾原因分清：够不着（unreachable）≠ 没水（need_refill/refill_failed）≠ 已浇；
+   - run9b 实证：`[12,30]` 是**能走到也能浇上**的（t=408.26 ok），三次 `need_refill` 后 `given_up=true` 且全程零 refill ⇒ 白留 3 格干作物、两天 `watered_outdoor=false`。
+
+2. task-134（dev-coder）"今天没做完"的账实相符 + resume 空转：
+   - `leftover` 是**片区口径**（`_leftover` 的 `local = plot["tiles"]`，浇水/收获/清死苗还用全窗口 `tmap`）⇒ `tiles 12 / ok 12 / leftover 12` 被记成"没做完"；
+   - 新增阶段级 `assigned_undone` + `plot_pending` 落 `day_end`；`no_unmet_stages` 改按 `assigned_undone` + 诚实上限白名单（stamina / 夜里收工 / budget 且 assigned_undone==0）计算，诚实上限留下的片区待办 ⇒ `deferred_tiles`（info）；`unreachable`/`refused` 越界仍 false，豁免结构一律不动；
+   - run9b 死循环（A 真缺陷）：`_resume_plot`/`review_only_fallback` 走回片区后没清任务级 `no_target` ⇒ 2.6 秒内 10 次 work_spot/resume_walk 零动作 ⇒ 5 次 `plot_exhausted` ⇒ burst ⇒ stuck 收工；修法 = resume 时清掉当日该片区的 `no_target`、resume 也计入 burst 上限、真无路时如实收尾（不空转）。
+
+3. task-136（dev-coder）演进素材质量（任务只许来自账本、理由必须自带证据）：
+   - 每条 lesson 的 `kind`/`count`/`evidence` 只能来自账本数字，`hint` 只能解释、不许引入账本为 False 的断言；
+   - 成对矛盾（evidence 与 hint 互斥）⇒ 丢弃该 lesson + journal `lesson_rejected{reason:"hint_contradicts_evidence"}`；
+   - run9b 实证：7 条 lesson 中 3 条 hint 与 evidence 自相矛盾（`far_dry_given_up|water_far` 说"有 3 格够不着"，evidence 是 `gave_up=3 dry_dead=0` 且那天 water_far 成功；另一条 `slept_without_work|day` 更直接），且经 task-58/59/82 的注入链进了第二天提示词。
+
+4. task-135（deputy-lead，对抗验收）0.7.30 批次：A 段范围/读数、B 段复现 run9b 三形态 FAIL→PASS（water_far 壶空白认输 / resume 空转 burst / 阶段口径错配）、C 段 ≥6 组对抗（不许用邻格计数冒充逐格成功、补水不得无限自旋、resume 不得死循环、口径不得掩盖真未完成、lesson 矛盾不得注入、诚实上限不得被滥用）。
+
+判据（run9c = run A）：
+- 尾部连续 3 天 `verified=true`（两侧工具同向 + `verdict`/`strict_verdict` 并列）；
+- 每次跨日落盘六串配对齐全（落盘硬判据，run9b 已 5/5 ✅）；
+- 无 `unreachable_within_bound=false`/`refused_within_bound=false`/`slept_without_work`/`gave_up_dry`；
+- `lessons.total >= 1` 且**零矛盾 lesson**（L0）；
+- 经济四步真机留痕（卖→次日到账→买→种），死苗字段缺失一律【无法判定】。
