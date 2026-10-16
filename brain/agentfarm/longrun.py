@@ -130,6 +130,24 @@ FAR_DRY_MAX_TRIES = 2
 #: 免得在"补水点走不到"时把整天耗在这一格上。
 FAR_DRY_REFILL_MAX = 2
 
+#: 【task-157】窗口外那格"走不到"时，**同一格一天最多**朝它开几次路。
+#:
+#: run9d 实证：`[12,30]` 在 t=827.6/827.99 连续两次 `code="unreachable"`、当天以 `gave_up_dry`
+#: 收尾 ⇒ `watered_outdoor=false`；summer 23/24 只因下雨（dry=0）才过。这一格在 run7/8/9/9b/9c
+#: 都出现过 ⇒ 只要当天不下雨就必然破"连续 VERIFIED"。task-68 已有 `open_way` 原语（清挡路邻格，
+#: 上限 `MAX_OPEN_ACTIONS`），这里只是**朝这一格**调用它，并把次数收在 2 以内：
+#: 开路本身有界（≤4 次清障/次），再乘 2 仍是常数；开完立刻**重试同一格**（同一次 try 之内，
+#: 不额外消耗该格的 `FAR_DRY_MAX_TRIES` 额度）。
+FAR_DRY_OPEN_MAX = 2
+
+#: 【task-157】`cause` 里区分"warp 图上根本没路"（Mod 的 `unreachable_no_route`）与一般"够不着"。
+#: 判据只看回执/reason 原文；命中 ⇒ `cause="no_route"`，否则 `"unreachable"`。
+#: 【task-157】"寻路图上压根没有路线"的 Mod 文案（`unreachable_no_route`）。与一般
+#: `unreachable`（"四邻都站不过去"）分开归因：前者开路也没用，后者开路可能有用。
+#: ⚠️ 这里**刻意不收**笼统的 `UNREACHABLE_HINTS` 词（如"无法到达"）——那会把普通的
+#: "够不着"误判成"无路可走"，归因就假了。
+NO_ROUTE_HINTS = ("unreachable_no_route", "no_route", "warp 图上无路")
+
 #: 【task-144】**一个阶段里**最多为"壶空"补几次水。
 #:
 #: run9c 现场：`water_area` 一次分下去 70 格，而壶只有 40 容量 ⇒ 阶段中途 `need_refill`。
@@ -750,6 +768,9 @@ class LongRun:
         self.far_dry_causes: dict[tuple[int, int], str] = {}
         #: 【task-133】当天为窗口外浇水补了几次水（上界 `FAR_DRY_REFILL_MAX`）。
         self.far_dry_refills_today = 0
+        #: 【task-157】每一格当天朝它开过几次路（上界 `FAR_DRY_OPEN_MAX`）：够不着先开路再试，
+        #: 但开路也要有界 —— 否则"四邻都清不动"的格会把整天烧在清障上。
+        self.far_dry_opens: dict[tuple[int, int], int] = {}
         #: 【task-104】当天出现过"人在室内 ⇒ 窗口外干作物没去浇"。用来给收尾理由点名
         #: `not_on_farm`（run8 day 12：被晨间 `ShippingMenu` 挡在 FarmHouse，`_water_far_dry`
         #: 照样对窗口外坐标走 6 格 × 2 次全 unreachable ⇒ 6 格当天全进 `given_up`）。
@@ -1118,8 +1139,12 @@ class LongRun:
             return "need_refill"
         if causes == {"unreachable"}:
             return "unreachable"
+        if causes == {"no_route"}:                      # 【task-157】warp 图上无路，与站不过去分开
+            return "no_route"
         if causes == {"no_evidence"}:
             return "no_evidence"
+        if causes == {"truncated"}:                     # 【task-157】dryTiles 被截断，另算一类
+            return "truncated"
         if causes == {"not_watered"}:
             return "not_watered"
         return "mixed"
@@ -1131,7 +1156,12 @@ class LongRun:
             return (f"壶里没水、补水也没成（当天补水 {self.far_dry_refills_today}/"
                     f"{FAR_DRY_REFILL_MAX} 次）——**不是「够不着」**")
         if cause == "unreachable":
-            return "坐标都够不着"
+            return "坐标都够不着（已试有界开路仍站不过去）"
+        if cause == "no_route":
+            return "寻路图上没有路线（Mod 的 `unreachable_no_route`）——**不是「四邻站不过去」**"
+        if cause == "truncated":
+            return ("`farm.dryTiles` 被截断（>64 格）⇒ 这一格判不了"
+                    "——**不是「够不着」、也不是「没证据」**")
         if cause == "no_evidence":
             return ("缺证据（`farm.dryTiles` 不可用或被截断，判不了这一格）"
                     "——**不是「够不着」**")
@@ -1302,13 +1332,9 @@ class LongRun:
                                  + ("；不再试这一格" if tile in self.far_dry_given_up else ""))
                 return False
 
-        walked, walk_note = True, ""
-        try:
-            walked = bool(self.worker.stand_next_to(tile, timeout_ms=30000))
-        except BridgeError as exc:
-            walked, walk_note = False, f"走过去失败：{exc}"
-        except Exception as exc:                      # pragma: no cover - 假 worker 的意外
-            walked, walk_note = False, f"走过去异常：{type(exc).__name__}: {exc}"
+        # 【task-157】站不到**不马上认输**：先有界开路（清挡路邻格）再重试同一格。
+        # `opened` 是开路证据（逐条 `clear()` 结果），进 journal；开路成功 ≠ 浇上水。
+        walked, walk_note, opened = self._walk_far_tile(tile)
 
         st: StepResult | None = None
         err = ""
@@ -1365,13 +1391,21 @@ class LongRun:
         receipt_ok = bool(st.ok) if st is not None else None
 
         # 因由留痕：成功 ⇒ 清掉；失败 ⇒ 归类（收尾文案与守卫理由都读它）。
+        # 【task-157】口径分离：`no_route`（warp 图上无路，Mod 的 `unreachable_no_route`）与
+        # 一般 `unreachable`（四邻站不过去）不是一回事；`truncated`（dryTiles 被截断）也从
+        # `no_evidence` 里拆出来 —— 卡面要求 `cause` 必须显式、不许混。
         if ok:
             self.far_dry_causes.pop(tile, None)
         elif not walked:
-            self.far_dry_causes[tile] = "unreachable"
+            blob = f"{walk_note} {err}"
+            self.far_dry_causes[tile] = ("no_route"
+                                         if any(h in blob for h in NO_ROUTE_HINTS)
+                                         else "unreachable")
         elif code == "need_refill":
             self.far_dry_causes[tile] = "need_refill"
-        elif tiles_status in ("unavailable", "truncated"):
+        elif tiles_status == "truncated":
+            self.far_dry_causes[tile] = "truncated"
+        elif tiles_status == "unavailable":
             self.far_dry_causes[tile] = "no_evidence"
         else:
             self.far_dry_causes[tile] = "not_watered"
@@ -1392,12 +1426,29 @@ class LongRun:
                       dry_tiles_status=tiles_status, cause=self.far_dry_causes.get(tile, ""),
                       refills=self.far_dry_refills_today,
                       retried_after_refill=bool(retried_after_refill),
+                      opens=self.far_dry_opens.get(tile, 0),
+                      opened_count=len(opened),
                       reason=(st.reason if st is not None else (walk_note or err)),
                       receipt=(st.receipt if st is not None else err),
                       given_up=bool(tile in self.far_dry_given_up),
                       note="窗口外干作物：Mod 的 farm.dryTiles 给了坐标 ⇒ 走过去浇"
-                           "（壶空先补水、补水后重试同一格；判据=**该格** watered=true 或"
-                           "该格已不在 dryTiles 里，绝不用全局 dryCrops 差值）")
+                           "（壶空先补水、补水后重试同一格；【task-157】够不着先有界开路再试；"
+                           "判据=**该格** watered=true 或该格已不在 dryTiles 里，"
+                           "绝不用全局 dryCrops 差值）")
+        if not walked and not ok:
+            # 【task-157 ②】开路之后仍然站不到 ⇒ 单独留痕（与 `water_far_skipped` 的
+            # "人不在农场、没扣额度"完全两回事）。当天照旧如实 `gave_up_dry`：
+            # **开路动作不算浇水**，`watered_outdoor` 仍由该格的观测证据决定。
+            self._journal("water_far_blocked", tile=list(tile),
+                          cause=self.far_dry_causes.get(tile, ""),
+                          attempts=tries, limit=FAR_DRY_MAX_TRIES,
+                          opens=self.far_dry_opens.get(tile, 0),
+                          cleared_tiles=[[int(c.get("neighbour", [0, 0])[0]),
+                                          int(c.get("neighbour", [0, 0])[1])]
+                                         for c in opened[:8]],
+                          cleared_count=len(opened),
+                          note="【task-157】有界开路之后仍然站不到这一格 ⇒ 如实记 blocked："
+                               "这一格**没浇上水**（开路成功不等于浇上），当天按 gave_up_dry 收尾")
         if ok:
             # 【task-102】浇成一格窗口外的干作物 = 一次真实的农场动作（`_do_sleep` 的
             # "0 动作不许睡"判据看它）。
@@ -1411,6 +1462,65 @@ class LongRun:
                              f"{walk_note or err or (st.reason if st is not None else code)}；{evidence}"
                              + ("；不再试这一格" if tile in self.far_dry_given_up else ""))
         return True
+
+    def _walk_far_tile(self, tile: tuple[int, int]
+                       ) -> tuple[bool, str, list[dict[str, Any]]]:
+        """走到窗口外那一格旁边；**站不到就先有界开路再重试同一格**（task-157）。
+
+        返回 `(walked, note, cleared)`。开路次数**按格**计（`FAR_DRY_OPEN_MAX`/天），
+        每次开路复用 `farmwork.FarmWorker.open_way`（它自己上限 `MAX_OPEN_ACTIONS` 次清障，
+        且清完会复核 `stand_next_to`）；清掉的每一格都计入当天农场动作
+        （`farm_actions_today`）——那是真动手，不是"没活"。
+
+        忠实性：开路成功 **不等于** 浇上了水（调用方的逐格判据说了算）；
+        worker 没有 `open_way`（假 worker / 旧实现）时**不假装开了路**，如实写进 note。
+        """
+        assert self.worker is not None
+        walked, note = True, ""
+        try:
+            walked = bool(self.worker.stand_next_to(tile, timeout_ms=30000))
+        except BridgeError as exc:
+            walked, note = False, f"走过去失败：{exc}"
+        except Exception as exc:                      # pragma: no cover - 假 worker 的意外
+            walked, note = False, f"走过去异常：{type(exc).__name__}: {exc}"
+        if walked:
+            return True, note, []
+
+        used = int(self.far_dry_opens.get(tile, 0))
+        if used >= FAR_DRY_OPEN_MAX:
+            return False, (note + f"；当天为这一格开路已用满额度（{used}/{FAR_DRY_OPEN_MAX}）"), []
+        opener = getattr(self.worker, "open_way", None)
+        if opener is None:
+            return False, (note + "；worker 不支持开路（无 open_way）⇒ 不开路，按走不到如实记"), []
+
+        self.far_dry_opens[tile] = used + 1
+        code, cleared, open_notes = "", [], []
+        err = ""
+        try:
+            code, cleared, open_notes = opener(tile)
+        except BridgeError as exc:
+            err = f"开路失败：{exc}"
+        except Exception as exc:                      # pragma: no cover - 假 worker 的意外
+            err = f"开路异常：{type(exc).__name__}: {exc}"
+        cleared = list(cleared or [])
+        if cleared:
+            self._actions += len(cleared)
+            self.farm_actions_today += len(cleared)
+        self._journal("water_far_open", tile=list(tile), code=str(code or ""),
+                      attempt=self.far_dry_opens[tile], limit=FAR_DRY_OPEN_MAX,
+                      cleared_count=len(cleared), cleared=cleared[:8],
+                      notes=[str(n)[:120] for n in (open_notes or [])][:6] or ([err] if err else []),
+                      note="【task-157】窗口外那一格走不到 ⇒ 先清挡路邻格（复用 `open_way`，"
+                           "每次 ≤`MAX_OPEN_ACTIONS` 次清障、每格每天 ≤2 轮）再重试同一格；"
+                           "开路成功**不等于**浇上了水")
+        if code == "ok":
+            # `open_way` 内部已经复核过 `stand_next_to` 通过 ⇒ 现在站得到这一格旁。
+            return True, "开路后已站到目标旁（open_way 内部复核 stand_next_to 通过）", cleared
+        # 把 `open_way` 的原始 notes（真实现里带 Mod 的 code/reason）一并带回：否则
+        # `no_route` 与普通 `unreachable` 的区别在归因时就丢了（卡面要求两者显式分开）。
+        hint = "；".join(str(n)[:120] for n in (open_notes or [])[:4])
+        return False, (note + f"；已开路 {len(cleared)} 格仍未通（{code or err or 'unknown'}）"
+                       + (f"；{hint}" if hint else "")), cleared
 
     @staticmethod
     def _water_left_obs(obs: dict[str, Any]) -> int | None:
@@ -4425,6 +4535,7 @@ class LongRun:
         # 【task-133】失败因由与补水次数也每日清零（"壶里有没有水"是新的一天的事）。
         self.far_dry_causes = {}
         self.far_dry_refills_today = 0
+        self.far_dry_opens = {}                 # 【task-157】每日重置（开路额度和补水一样按天算）
         self.water_far_not_on_farm = False      # 【task-104】每日重置（理由后缀用）
         self.far_dry_unavailable_noted = False
         # 【task-42】新的一天 ⇒ 清空出货白名单：昨天收获的东西昨天该出就出了，

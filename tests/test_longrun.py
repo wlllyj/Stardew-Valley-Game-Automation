@@ -38,7 +38,8 @@ from agentfarm.farmwork import (  # noqa: E402
     seed_items,
 )
 from agentfarm.longrun import (  # noqa: E402
-    DEFAULT_LLM_MAX_TOKENS, ENDED_BY_EVENT, ENDED_BY_MODAL, FAR_DRY_REFILL_MAX,
+    DEFAULT_LLM_MAX_TOKENS, ENDED_BY_EVENT, ENDED_BY_MODAL, FAR_DRY_MAX_TRIES,
+    FAR_DRY_OPEN_MAX, FAR_DRY_REFILL_MAX,
     FRONTIER_CLEAR_MAX, JUSTIFIED_END_REASONS, MAX_BUY_TRIES_PER_DAY, MAX_ENV_ATTEMPTS,
     MAX_STUCK_FLUSH, MAX_TILE_ATTEMPTS, PLOT_EXHAUSTED_BURST, DayReport, LongRun,
     _till_blocked_by, is_justified_end, plot_observe,
@@ -3387,7 +3388,10 @@ class TestTask133FarDryRefillAndPerTileEvidence(unittest.TestCase):
         ev = self._events(run, "water_far")
         self.assertTrue(ev, f"截断时仍该尝试（不能因为列表被截断就当成没有干格）：{ev}")
         self.assertFalse(any(e["ok"] for e in ev), f"截断 ⇒ 判不了，不许算成功：{ev}")
-        self.assertTrue(all(e["cause"] == "no_evidence" for e in ev), ev)
+        # 【task-157】卡面把 `cause` 拆细：`truncated`（列表被截断、判不了）与
+        # `no_evidence`（字段整个不可用）必须分开写 —— 这里从 `no_evidence` 改成 `truncated`，
+        # 改的是**口径词表**，判据（不许算成功）一字未动。
+        self.assertTrue(all(e["cause"] == "truncated" for e in ev), ev)
         self.assertTrue(all(e["receipt_ok"] for e in ev), "前提：回执是 ok=true")
         rep = run.days[0]
         self.assertFalse(rep.checks.get("watered_outdoor"))
@@ -7682,6 +7686,228 @@ class TestTask149FarmPlotWorkAndOffFarm(unittest.TestCase):
         self.assertTrue(str(day.ended_reason).startswith("no_work"), day.ended_reason)
         self.assertIs(day.checks["zero_action_evidenced"], True)
         self.assertIs(day.verified, True)
+
+
+class _FarOpenWayWorker(FakeWorker):
+    """task-157 夹具：窗口外那一格**第一次站不到**，靠 `open_way` 清障后才可能站得到。
+
+    `open_code`/`open_notes` 决定开路结局：
+      * `"ok"`        ⇒ 开路成功、随后 `stand_next_to` 为真（run9d `[12,30]` 的"可救"形态）；
+      * `"exhausted"` ⇒ 清了一格仍未通（仍走不到）；
+      * notes 里带 `warp 图上无路` ⇒ 归 `no_route`（开路根本没用那一类）。
+    `lie=True`：开路成功、但 `water()` 只回回执、世界一动不动（"开路成功≠浇上了水"）。
+    """
+
+    def __init__(self, world, *, tile, open_code="ok", cleared=1, open_notes=(),
+                 lie=False, refill_ok=True):
+        super().__init__(world)
+        self.tile = tuple(tile)
+        self.open_code = str(open_code)
+        self.cleared_n = int(cleared)
+        self.open_notes = list(open_notes)
+        self.lie = bool(lie)
+        self.refill_ok = bool(refill_ok)
+        self.open_calls: list[tuple[int, int]] = []
+        self._opened = False
+
+    def stand_next_to(self, tile, *, timeout_ms=15000):
+        if tuple(tile) == self.tile:
+            self.walk_steps += 1
+            return self._opened
+        return super().stand_next_to(tile, timeout_ms=timeout_ms)
+
+    def open_way(self, tile, *, timeout_ms=None):
+        self.open_calls.append(tuple(tile))
+        cleared = [{"neighbour": [self.tile[0], self.tile[1] + 1], "kind": "weed",
+                    "result": "cleared"} for _ in range(self.cleared_n)]
+        self._opened = self.open_code == "ok"
+        return self.open_code, cleared, list(self.open_notes)
+
+    def refill_can(self, *, timeout_ms=15000):
+        if not self.refill_ok:
+            st = StepResult("refill_can", ok=False, code="failed", reason="假世界：补水点也走不到")
+            self.steps.append(st)
+            return st
+        return super().refill_can(timeout_ms=timeout_ms)
+
+    def water(self, tile, *, timeout_ms=15000):
+        if self.lie:
+            st = StepResult("water", tuple(tile), ok=True, reason="假回执：浇过了（其实没有）")
+            self.steps.append(st)
+            return st
+        return super().water(tile, timeout_ms=timeout_ms)
+
+
+class TestTask157WaterFarOpenWay(unittest.TestCase):
+    """task-157：`water_far` 碰到"站不过去"先**有界开路**再试同一格（run9d 尾部 0/5 的结构性病灶）。
+
+    卡面实证（`logs/longrun-3day-llm-run9d.jsonl`）：t=827.6 / 827.99 两次
+    `water_far tile=[12,30] code="unreachable" cause="unreachable"` ⇒ `far_dry_given_up` ⇒
+    `watered_outdoor=false`；同一天作物 105→146、dry 17→79→140，尾巴整天 0 动作。
+    该格在 run7/8/9/9b/9c 都出现过 ⇒ 不是偶发。
+
+    三条不许破的线：
+      ①**有界**：同一格每天最多开路 `FAR_DRY_OPEN_MAX=2` 轮（开路另计，不吃 `far_dry` 的 try 额度）；
+      ②**开路成功 ≠ 浇上了水**：判据仍是逐格观测（该格 `watered=true` 或已不在 `dryTiles` 里）；
+      ③**归因显式**：`no_route`（warp 图上没路线）与普通 `unreachable`（四邻站不过去）分开写，
+         `need_refill`（壶空）绝不与它们混；缺字段 ⇒ `no_evidence`/`truncated`，不许当成功。
+
+    变异自检（`scratch/_t157_mutate.py`，`brain/`+`tests/` 一起拷临时目录、跑完即删；实测）：
+    基线 7/7 绿；**m157a**（`_walk_far_tile` 站不到就直接返回、不开路）杀 5 条（含
+    `test_open_way_then_walk_lets_the_far_tile_be_watered`）；**m157b**（把"开路成功"当浇上水）
+    杀 4 条（含 `test_open_way_success_does_not_count_as_watering`）；**m157c**（`NO_ROUTE_HINTS`
+    去掉 `no_route` 词）杀 `test_no_route_is_not_reported_as_plain_unreachable`。
+    """
+
+    FAR = (61, 10)          # 与 task-50/133 同款：MyopicWorld 半径 3，玩家在 [62,14] ⇒ 窗口外
+
+    def _world(self, *, with_dry_tiles: bool = True, water_left: int = 40) -> DryTilesWorld:
+        w = DryTilesWorld(seeds=0, money=0, weeds=0, water_left=water_left,
+                          with_dry_tiles=with_dry_tiles)
+        w.dirt.add(self.FAR)
+        w.crops[self.FAR] = {"watered": False, "ripe": False}
+        w.player_tile = [62, 14]
+        return w
+
+    def _run_for(self, w, factory, *, max_days: int = 1):
+        return make_run(w, target_days=1, max_days=max_days,
+                        client_factory=lambda: FakeClient(w),
+                        worker_factory=factory)
+
+    @staticmethod
+    def _events(run, event: str) -> list[dict]:
+        return [e for e in run.entries if e["event"] == event]
+
+    def test_open_way_then_walk_lets_the_far_tile_be_watered(self):
+        """①开路后站得到 ⇒ 那一格真浇上，`watered_outdoor` 可满足（可救形态）。"""
+        w = self._world()
+        worker = _FarOpenWayWorker(w, tile=self.FAR, open_code="ok", cleared=1)
+        run = self._run_for(w, lambda _c: worker)
+
+        code = run.run()
+
+        opens = self._events(run, "water_far_open")
+        self.assertEqual(len(opens), 1, f"应当恰好开路一轮：{opens}")
+        self.assertEqual(opens[0]["cleared_count"], 1)
+        self.assertEqual(opens[0]["cleared"][0]["kind"], "weed")
+        ev = self._events(run, "water_far")
+        self.assertTrue(ev and ev[0]["ok"], f"开路后必须真浇上：{ev}")
+        self.assertEqual(ev[0]["opened_count"], 1)
+        self.assertEqual(w.watered_tiles, [self.FAR], "那一格必须真的被浇")
+        self.assertEqual(self._events(run, "water_far_blocked"), [], "浇成了就不许有 blocked")
+        day = run.days[0]
+        self.assertIs(day.checks["watered_outdoor"], True)
+        self.assertEqual(code, 0, "唯一的干格浇掉了 ⇒ 这天该达标")
+        self.assertGreaterEqual(run.farm_actions_today, 1, "开路清障算真动手（不是「没活」）")
+
+    def test_open_way_that_still_cannot_reach_is_blocked_truthfully(self):
+        """②开路也站不到 ⇒ `water_far_blocked` 如实记，当天仍 `gave_up_dry`、不许 VERIFIED。"""
+        w = self._world()
+        worker = _FarOpenWayWorker(w, tile=self.FAR, open_code="exhausted", cleared=1)
+        run = self._run_for(w, lambda _c: worker)
+
+        run.run()
+
+        blocked = self._events(run, "water_far_blocked")
+        self.assertTrue(blocked, "走不到必须逐次留痕")
+        self.assertEqual(blocked[0]["tile"], list(self.FAR))
+        self.assertEqual(blocked[0]["cause"], "unreachable")
+        self.assertEqual(blocked[0]["cleared_count"], 1, "开路清了 1 格要如实报")
+        self.assertEqual(blocked[0]["attempts"], 1)
+        ev = self._events(run, "water_far")
+        self.assertTrue(ev and not any(e["ok"] for e in ev), f"走不到就不许算浇成：{ev}")
+        self.assertEqual(w.watered_tiles, [], "本格从未真的被浇")
+        day = run.days[0]
+        self.assertIs(day.checks["watered_outdoor"], False)
+        self.assertIs(day.verified, False, "没浇完的户外作物 ⇒ 不达标")
+        self.assertIn("gave_up_dry", str(day.ended_reason))
+
+    def test_open_way_is_bounded_to_two_rounds_per_tile_per_day(self):
+        """③有界：同一格每天最多开路两轮（`FAR_DRY_OPEN_MAX`），清障动作数跟着有上界。"""
+        w = self._world()
+        worker = _FarOpenWayWorker(w, tile=self.FAR, open_code="exhausted", cleared=1)
+        run = self._run_for(w, lambda _c: worker)
+
+        run.run()
+
+        opens = self._events(run, "water_far_open")
+        self.assertEqual(len(opens), FAR_DRY_OPEN_MAX, f"开路必须按格封顶：{opens}")
+        self.assertEqual([o["attempt"] for o in opens], [1, 2])
+        self.assertEqual(sum(int(o["cleared_count"]) for o in opens), FAR_DRY_OPEN_MAX,
+                         "清障动作数也有上界（每轮 1 格）")
+        self.assertLessEqual(len(self._events(run, "water_far")), FAR_DRY_MAX_TRIES)
+        self.assertEqual(len(worker.open_calls), FAR_DRY_OPEN_MAX, "不许偷偷多开")
+
+    def test_open_way_success_does_not_count_as_watering(self):
+        """④开路成功**不等于**浇上了水：回执撒谎时逐格判据必须判失败。"""
+        w = self._world()
+        worker = _FarOpenWayWorker(w, tile=self.FAR, open_code="ok", cleared=1, lie=True)
+        run = self._run_for(w, lambda _c: worker)
+
+        run.run()
+
+        self.assertTrue(self._events(run, "water_far_open"), "前提：开路确实成功了")
+        ev = self._events(run, "water_far")
+        self.assertTrue(ev, "必须尝试过浇水")
+        self.assertTrue(all(not e["ok"] for e in ev), f"世界没变就不许算成功：{ev}")
+        self.assertEqual(ev[0]["cause"], "not_watered")
+        self.assertEqual(w.watered_tiles, [], "本格从未真的被浇")
+        day = run.days[0]
+        self.assertIs(day.checks["watered_outdoor"], False)
+        self.assertIs(day.verified, False)
+
+    def test_no_route_is_not_reported_as_plain_unreachable(self):
+        """⑤归因显式：`warp 图上无路` ⇒ `no_route`；普通站不过去 ⇒ `unreachable`。"""
+        w1 = self._world()
+        run1 = self._run_for(w1, lambda _c: _FarOpenWayWorker(
+            w1, tile=self.FAR, open_code="exhausted", cleared=1,
+            open_notes=["unreachable_no_route: warp 图上无路"]))
+        run1.run()
+        ev1 = self._events(run1, "water_far")
+        self.assertTrue(ev1)
+        self.assertEqual(ev1[0]["cause"], "no_route", ev1[0])
+
+        w2 = self._world()
+        run2 = self._run_for(w2, lambda _c: _FarOpenWayWorker(
+            w2, tile=self.FAR, open_code="exhausted", cleared=1,
+            open_notes=["清了一格还是站不过去"]))
+        run2.run()
+        ev2 = self._events(run2, "water_far")
+        self.assertTrue(ev2)
+        self.assertEqual(ev2[0]["cause"], "unreachable", ev2[0])
+
+    def test_need_refill_is_never_mixed_with_unreachable(self):
+        """⑥壶空与走不到不许混：补不上水 ⇒ `need_refill`，而且**一轮开路都不该发生**。"""
+        w = self._world(water_left=0)
+        worker = _FarOpenWayWorker(w, tile=self.FAR, open_code="exhausted",
+                                   cleared=1, refill_ok=False)
+        run = self._run_for(w, lambda _c: worker)
+
+        run.run()
+
+        ev = self._events(run, "water_far")
+        self.assertTrue(ev, "壶空也要留痕")
+        self.assertTrue(all(e["cause"] == "need_refill" for e in ev), ev)
+        self.assertEqual(self._events(run, "water_far_open"), [],
+                         "补水没成就没到走路那一步 ⇒ 不许开路")
+        day = run.days[0]
+        self.assertIs(day.checks["watered_outdoor"], False)
+        self.assertFalse(str(day.ended_reason).startswith("no_work"))
+
+    def test_missing_dry_tile_list_never_opens_way(self):
+        """⑦旧 Mod 缺 `dryTiles` ⇒ `no_evidence` fail-closed：不挥、不开路、不当成功。"""
+        w = self._world(with_dry_tiles=False)
+        worker = _FarOpenWayWorker(w, tile=self.FAR, open_code="ok", cleared=1)
+        run = self._run_for(w, lambda _c: worker)
+
+        run.run()
+
+        self.assertEqual(self._events(run, "water_far_open"), [])
+        self.assertEqual(self._events(run, "water_far"), [])
+        self.assertTrue(self._events(run, "water_far_unavailable"), "证据不可用要留痕")
+        day = run.days[0]
+        self.assertIs(day.checks["watered_outdoor"], False)
+        self.assertIs(day.verified, False)
 
 
 if __name__ == "__main__":  # pragma: no cover
