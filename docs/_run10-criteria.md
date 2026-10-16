@@ -4,7 +4,7 @@
 > 诚实边界（**必须与结论一起写**）：本机制是「会话内记忆 + 提示词反馈」（每次调用留痕 + 夜间复盘 notes + 跨日教训库），**不是权重更新、不是在线训练**。没有下面的 A→B 对照证据，**不许**写"自我进化已实现"。
 
 ## 0. 设定
-- **run A = 累积轮**（原本排的 `logs/longrun-3day-llm-run9.jsonl`；**实测 run9 = 0/3 达标、`lessons.total=0`** —— 见 `docs/_run9-evidence.md` 与条目 055/056，两大病灶已立 task-121（复盘预算 512→4096，`9a4da64`）与 task-122/124（教训覆盖面缺口 + review-only 空转）⇒ **run A 必须在 0.7.29 上重跑**，run9 只作"病灶取证轮"，不参与 A→B 对照）。
+- **run A = 累积轮**（原本排的 `logs/longrun-3day-llm-run9.jsonl`；**实测 run9 = 0/3 达标、`lessons.total=0`** —— 见 `docs/_run9-evidence.md` 与条目 055/056，两大病灶已立 task-121（复盘预算 512→4096，`9a4da64`）与 task-122/124（教训覆盖面缺口 + review-only 空转）⇒ **run A 必须在 0.7.29 上重跑**，run9 只作"病灶取证轮"，不参与 A→B 对照；重跑卡 = **task-131**，journal `logs\longrun-3day-llm-run9b.jsonl`，出口 `…-run9b-lessons.json` 拷成 `…-run10-lessons.json` 再起 run B）。
 - **run B = 对照轮**：**同一存档线的下一段**（run A 收工后的世界继续），同一 Mod、同一 brain 代码，**唯一差异 = 注入的教训/笔记/决策史**（路径由 `--journal` 自动推导，没有新增开关）。
 - run B 起跑前必须先从 run A 的账本+教训库导出「待验证教训清单」（`tools/compare-runs.py` 的 §lessons 段），**先写下预测再跑**（避免事后挑证据）。
 
