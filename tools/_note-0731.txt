@@ -1,6 +1,6 @@
-v0.7.31（run9c 诊断后的分配额口径修复：播种不超手上种子数 + 浇水阶段壶空补水续做）
+v0.7.31（run9c 诊断后的口径修复：播种不超手上种子数 + 浇水壶空补水续做 + 农场级工作理由与在场证据闸门）
 
-本版两张卡 + 一张对抗验收（Mod 无源码改动，只 bump 版本号）：
+本版三张卡 + 两张对抗验收（Mod 无源码改动，只 bump 版本号）：
 
 1. task-143（dev-coder）播种分配额 = 手上种子数：
    - `_stage_tiles("plant_area")` 的上限改为 `limit = min(self.per_stage_tiles, seeds_total)`；
@@ -15,8 +15,18 @@ v0.7.31（run9c 诊断后的分配额口径修复：播种不超手上种子数 
 
 3. task-145（deputy-lead，对抗验收）0.7.31 批次：A 段范围/读数；B 段复现 run9c 两条形态 FAIL→PASS；C 段 ≥6 组对抗（重点打"新洗白通道"：壶空被写成够不着/诚实上限、分配额上限被用来掩盖真未完成、`stopped==""` 与 `assigned_undone>0` 并存、补水自旋、买不到种子被当成收工理由）。
 
+4. task-149（dev-coder）run9c 的 summer 20"真空日"暴露的 F1：**0 动作的一天不许被当成"没活可做"**：
+   - `work_reasons()`/`sleep_guard()` 必须有**农场级**的活源（`farm.hoeDirt`/`farm.emptyDirt`/成熟作物 —— 与窗口口径分开），农场证据缺失/不完整 ⇒ **fail-closed**（记【无法判定】并按"还有活"处理），不许当 0；
+   - 日首 `goto_farm` 被模态挡住（`ui_modal`）必须清模态后**重试一次**，不许原地放弃就回屋睡觉；
+   - 全天 0 农场动作 ⇒ **不得** `verified=true`（run9c summer 20 是反例：23 秒、0 动作、自称 VERIFIED）。
+   - 实证：run9c summer 20 `ok 0/0/0`、`verified=true`，而当时 `farm.hoeDirt 224 / emptyDirt 142`、手上 10 粒种子。
+
+5. task-150（deputy-lead，对抗验收）task-149：A 段范围/读数；B 段复现 summer 20 FAIL→PASS；C 段 ≥6 组（重点：伪造"农场级无活"、缺字段当 0、`complete=false` 时假收工、模态重试自旋、0 动作日换皮成 `slept_without_work` 骗过检查）。
+
+（另：本版还包含 Lead 侧工具收紧，**不属于 Mod 产物**——`tools\verify-run3.py` 增加"0 阶段却自称 VERIFIED 必须有在场证据（当天成功 `goto_farm` 或农场动作事件）"闸门，run9c 因此从 rc=0 变为 rc=1；`tests\test_verify_run3.py` 64 OK。）
+
 判据（run9d = run A，0.7.31 上重跑；run9c 只作诊断）：
-- 尾部连续 3 天 `verified=true`（两侧工具同向 + `verdict`/`strict_verdict` 并列）；
+- **尾部连续 5 天** `verified=true`（用户 2026-10-17 目标 2；两侧工具同向 + `verdict`/`strict_verdict` 并列）；
 - 每次跨日落盘六串配对齐全（`NewDay / before save / SaveGame.Save() called. / Saving without compression / completed / after save`）；
 - **每个游戏日 ≥2 份独立 `observe?detail=full` 端点**（晨间 A + 收尾 B，同名不覆盖）并出逐日世界差分表；只有 1 份端点 ⇒ 该日 tile 迁移记【无法判定】，整日无观测 ⇒ 记【无法判定·窗口错过】；
 - 无 `unreachable_within_bound=false`/`refused_within_bound=false`/`slept_without_work`/`gave_up_dry`；
