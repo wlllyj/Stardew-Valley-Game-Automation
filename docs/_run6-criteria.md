@@ -23,10 +23,14 @@
 | `watered_outdoor` | farm 口径 `dryCrops == 0`（或当天最后一个户外窗口逐格全湿） | **唯一浇水证据**（task-19）；字段缺失即问题 |
 | `day_justified` | `is_justified_end(ended_by, ended_reason)`；白名单 `night/stamina/no_work` | **不含** `no_plot`（task-32） |
 
-**真空日闸门（`tools/verify-run3.py` 已实现，2026-10-13 Lead 补）**：`verified == true` 的一天必须**真的做成过事**。
+**真空日闸门（`tools/verify-run3.py` 已实现，2026-10-13 Lead 补；2026-10-17 加"在场证据"要求）**：`verified == true` 的一天必须**真的做成过事**。
 
 - 有阶段记录但 `Σ stage.ok == 0` ⇒ **判红**（0 步不能自证做过事）。
 - 完全没有任何阶段记录 ⇒ 必须有 `no_work` / `night` / `stamina` 收尾理由或 `excuse` 事件，否则**判红**。
+- **【在场证据 · Lead 2026-10-17，源自 deputy-lead task-146 的 CAVEAT-1】**：0 阶段 + 自称 VERIFIED 时，**除"无活可做"的理由之外还必须有当天确实上过户外农场的在场证据**（journal 里出现 `plot`/`work_spot`/`water_far*`/`frontier_clear`/`tool_refused`/`unreachable` 之类**只可能在农场上产生**的事件，或一次成功的 `goto_farm`），否则 ⇒ **判红**。
+  - 反例（run9c summer 20）：雨天醒在 FarmHouse、日初 `goto_farm{day_start}` 被 `ShippingMenu` 挡住（`ui_modal`）、关框后没再试、06:10 体力 270/270 直接睡掉（全天 22.81 秒 / `ok_steps=0` / `decision=0`），却因"室内窗口 tillable=0 + farm 计数 dry/ripe/dead=0"的理由拿到 `verified=true`。**室内自述的 `no_work` 不是证据** —— 当天相邻观测显示 `hoeDirt=224 / emptyDirt=142`、手上有种子，"没活"不成立。
+  - ⇒ **P3 ⑥ 的达标尾链里，每一天都必须各有 ≥1 次农场动作、或至少有上过农场的在场证据**；只有"0 动作 + 室内自述"的日子**不计入连续天数**。
+  - 实现与用例：`tools/verify-run3.py` 的 `_FARM_SIGNAL_EVENTS` + `build_days` 的 `farm_signals`；`tests/test_verify_run3.py::test_zero_stage_day_without_farm_evidence_is_problem` 与 `::test_zero_stage_day_with_farm_evidence_is_accepted`。账本回归：green/run7 仍 rc=0，run2/3/5/6/9b 仍 rc=1，**run9c 由 0 变 1**（summer 20 被点名，符合预期）。
 - 成功动作 `< 5` 步、或只涉及一个阶段 ⇒ **只出 info**（合法但偏弱的一天，供复核时人读）。
 
 **不可达信息项（`tools/verify-run3.py` 已实现，2026-10-14 Lead 补）**：`unreachable`（"四邻都站不过去 / A* 算不出路"）按 task-52 **不计当天硬失败**，但账本必须自洽。
