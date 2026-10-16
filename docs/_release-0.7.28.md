@@ -50,6 +50,7 @@ python tools\start-detached-longrun.py ^
   --expect-version 0.7.28
 ```
 - 起跑前 `python scratch\run8-snapshot.py --tag start --expected-mod-version 0.7.28`（脚本沿用，输出 `scratch/run9-external-snapshots.jsonl`；PID 候选 `logs/run9.pid`）。
+- **起跑命令行必须原文记录**（`docs/_run9-evidence.md` §1 + console 头）：run9 = run A（积累）、run10 = run B（注入），两次**只许 journal 路径不同**，其余参数（`--days/--size/--max-minutes/--max-days/--boundary-llm`）逐字一致，否则"演进对照"不成立。
 - 结束后立刻 `--tag end`，**先别退游戏**（Lead 要 live observe 对账），再写 `docs/_run9-evidence.md`。
 - 现场政策不变：`ui.eventUp=true` ⇒ **立即停手等人**（task-41）；不替游戏做选择。
 
@@ -63,6 +64,12 @@ python tools\start-detached-longrun.py ^
 - **N3 无空格死锁**：同一天 `buy` 尝试 ≤3、`no_inventory_space` 后不再重试；若因背包满，必须出现 `surplus_sell{why:"need_slot"}`。
 - **N4 跨日与落盘**：每个 `day_after` 恰 +1；落盘缺口必须能用"日终菜单链（`ShippingMenu`/`SaveGameMenu`）"解释，否则记红。
 - **N5 死苗证据不许"真空通过"**：run8 全程 `farm.deadCrops=0`/`dryDeadCrops=0`/`day_end.dead_crops=0` ⇒ task-84 的死苗路径在真机上**仍是真空未验**（见 `docs/_run8-evidence.md` §4.3 ③）。run9 若同样没有死苗，evidence **必须明写"本轮无死苗 ⇒ 该判据真空，不算通过也不算失败"**；想真正验到它需要跨换季（下一次换季 = 秋1日，距今约 15 游戏日）或另设针对性场景 —— 记为后续 run 的必验项。
+
+**run10（run B）专属 —— N6 演进对照**（判据全文 = task-113 卡面 + `tools/compare-runs.py`）：
+- `--run-a logs\longrun-3day-llm-run9.jsonl --run-b logs\longrun-3day-llm-run10.jsonl` 必须跑通并把 JSON 附进 `docs/_run10-evidence.md`；
+- run A 的教训库（`<journal>-lessons.json`）逐条原文 + 每条在 run B 提示词里的命中/未命中；
+- run A 被 `cancel`/做不成的形态在 run B 的次数对照（**变了不等于因果，"没变"是硬事实**）；
+- 两侧 `verify-run3` + `analyze-longrun` 判决并列；**没有可辨认的"学到"就如实写"未观察到演进"**，禁止挑字符串硬凑。
 
 ## 5. 与 run8 的对比基线
 

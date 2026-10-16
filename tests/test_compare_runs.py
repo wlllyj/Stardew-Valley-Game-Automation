@@ -131,6 +131,21 @@ class LessonInjectionTests(unittest.TestCase):
             self.assertIn("读不到 run A 的教训库", text)
             self.assertEqual(report["lessons"], [])
 
+    def test_lessons_jsonl_variant_is_accepted(self):
+        """卡面允许 `<journal>-lessons.jsonl`；两种形态都必须读得出来。"""
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = pathlib.Path(raw)
+            ja = tmp / "runA.jsonl"
+            write_jsonl(ja, [day_end([1, "summer", 3], verified=False,
+                                     stages=[{"stage": "clear_area", "ok": 1, "failed": 0}])])
+            write_jsonl(tmp / "runA-lessons.jsonl",
+                        [{"day_key": [1, "summer", 3], "kind": "cancel",
+                          "lesson": "别给够不着的格子派活"}])
+            entries, path = cr.lessons_of(ja)
+            self.assertEqual(len(entries), 1)
+            self.assertTrue(path.endswith("-lessons.jsonl"))
+            self.assertEqual(cr.lesson_text(entries[0]), "别给够不着的格子派活")
+
 
 class CliTests(unittest.TestCase):
     def test_missing_journal_exits_two(self):

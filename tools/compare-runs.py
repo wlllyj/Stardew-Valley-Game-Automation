@@ -141,14 +141,27 @@ def harvest(rows: list[dict]) -> dict:
 
 
 def lessons_of(journal: Path) -> tuple[list[dict], str]:
-    path = sidecar(journal, "-lessons.json")
-    if not path.exists():
-        return [], ""
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    entries = raw.get("lessons") if isinstance(raw, dict) else raw
-    if not isinstance(entries, list):
-        entries = []
-    return [e for e in entries if isinstance(e, dict)], str(path)
+    """读 run A 的教训库（task-82 的产物）。
+
+    卡面允许 `<journal>-lessons.json` 或 `.jsonl`，也允许 `{"lessons": [...]}` 包裹；
+    这里三种都认，认不出就当"没有教训库"（**缺文件 ≠ 通过**，由调用方如实报）。
+    """
+    for suffix in ("-lessons.json", "-lessons.jsonl"):
+        path = sidecar(journal, suffix)
+        if not path.exists():
+            continue
+        if suffix.endswith(".jsonl"):
+            entries = [r for r in load_rows(path) if isinstance(r, dict)]
+            jsonl_wrapped = [e for r in entries for e in (r.get("lessons") or [])
+                             if isinstance(e, dict)]
+            entries = jsonl_wrapped or entries
+        else:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            entries = raw.get("lessons") if isinstance(raw, dict) else raw
+            if not isinstance(entries, list):
+                entries = []
+        return [e for e in entries if isinstance(e, dict)], str(path)
+    return [], ""
 
 
 def lesson_text(entry: dict) -> str:
