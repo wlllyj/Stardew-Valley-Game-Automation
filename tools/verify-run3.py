@@ -1284,11 +1284,15 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
                 "（两侧 target_days 口径可能不同，需人工核）"
             )
     elif rows:
-        infos.append("journal 里没有 finish 事件（长跑可能被中断；不以它当证据）")
+        infos.append(
+            "journal 里没有 finish 事件 ⇒ **判决为临时**（run 可能仍在进行中；本工具只应在 `finish` "
+            "之后拿账本当验收依据 —— 写到一半的账本会缺字段/半行，曾出现读到半行 `day_end` 的误判）"
+        )
 
     ok = _ok_now()
     summary = {
         "journal": None,
+        "finish_present": finish is not None,
         "bad_lines": len(bad_lines),
         "rows": len(rows),
         "events": dict(sorted(events.items(), key=lambda kv: (-kv[1], kv[0]))),

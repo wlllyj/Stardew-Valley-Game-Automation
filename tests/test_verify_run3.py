@@ -119,6 +119,22 @@ class TestVerifyRun3(unittest.TestCase):
         self.assertEqual(s["verified_streak_tail"], 3)
         self.assertEqual(s["problems"], [])
 
+    def test_missing_finish_marks_the_verdict_provisional(self):
+        """没有 finish 的账本（run 仍在进行/被中断）⇒ `finish_present=False` + info 明说判决为临时。
+
+        事故来源：Lead 曾在长跑器写盘途中读账本，读到半行 `day_end`（缺 verified）而误判。
+        """
+        rows = [r for r in green_rows() if r.get("event") != "finish"]
+        ok, s = self.check(rows)
+        self.assertFalse(s["finish_present"])
+        self.assertTrue(
+            any("判决为临时" in i for i in s["infos"]),
+            f"缺 finish 时必须提示判决为临时：{s['infos']}",
+        )
+        ok2, s2 = self.check(green_rows())
+        self.assertTrue(s2["finish_present"])
+        self.assertFalse(any("判决为临时" in i for i in s2["infos"]))
+
     # ------------------------------------------------------------ 负例矩阵
     def test_no_work_with_dry_crops_is_problem(self):
         """run3 连睡病灶：以 no_work 收尾却还有干作物（户外证据 dry>0）。"""
