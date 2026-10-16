@@ -3851,5 +3851,143 @@ class TestHarvestGaveUpAndCropReady(unittest.TestCase):
         self.assertEqual((rep["red"] or {}).get("total"), 0)
 
 
+class TestCropReadySource(unittest.TestCase):
+    """task-179（dev task-176 `037e599`）：`tiles[].readySource` 三态记账 + `harvestMethod` 键必存在。
+
+    口径（Lead 已用 il-probe 实证）：`ready=true` 对「末阶段未熟」的格是**游戏口径的真相**
+    （`HoeDirt.readyForHarvest()` 的 IL 与字段判据逐条等价）⇒ `readySource="fields"` 是
+    **正常的等价路径，不是 fail-open**；只有 `null` 才是"判不了"（⇒【无法判定】，既不当失败、
+    也绝不当通过）。旧账本缺这个键 ⇒【无法判定·旧 Mod】。`null` 占比高 = fail-closed 过头风险，
+    只给 ⚠，一律不进 rc。
+    """
+
+    TILES_OK = [
+        {"tile": [60, 29], "crop": "270", "ripe": True, "ready": True, "readySource": "game",
+         "harvestMethod": "Grab"},
+        {"tile": [61, 29], "crop": "262", "ripe": False, "ready": False, "readySource": "fields",
+         "harvestMethod": "Grab"},
+        {"tile": [62, 29], "crop": "262", "ripe": True, "ready": None, "readySource": None,
+         "harvestMethod": "Scythe"},
+    ]
+
+    def _tile_event(self, tiles, t=5.0):
+        return {"event": "review", "t": t, "zone": "field_ne", "tiles": tiles}
+
+    def _day(self, day, *, extra=(), farm=None):
+        nxt = [day[0], day[1], day[2] + 1]
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": True,
+                  "watered_outdoor": True}
+        _final = final(nxt)
+        if farm is not None:
+            _final = dict(_final)
+            _final["farm"] = farm
+        end = {"event": "day_end", "t": 9.0, "day": day, "ended_by": "sleep",
+               "ended_reason": "night", "verified": True, "checks": checks,
+               "stages": [{"stage": "harvest", "ok": 1, "skipped": 0, "failed": 0,
+                           "env_block": 0, "inconclusive": 0, "stopped": None, "leftover": 0}],
+               "ok_steps": 1, "skipped_steps": 0, "failed_steps": 0, "notes": [],
+               "final": _final,
+               "final_water": {"t": 9.0, "location": "Farm", "tiles": 84, "crops": 31,
+                               "dry": 0, "scope": "farm"}}
+        return [day_start(day), *extra, end]
+
+    def _report(self, events, name, *, days=1):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_ledger(tmp, name, events)
+            return report_for(path, days=days)
+
+    def test_field_probes_cover_ready_source_and_harvest_method(self):
+        probes = {p for _, p, _ in mod.FIELD_PROBES}
+        self.assertIn("tile_ready_source", probes)
+        self.assertIn("tile_harvest_method", probes)
+
+    def test_ready_source_distribution_is_visible_and_not_red(self):
+        rep = self._report(self._day([1, "fall", 9], extra=[self._tile_event(self.TILES_OK)]),
+                           "t179_dist.jsonl")
+        cr = rep["crop_ready"]
+        self.assertTrue(cr["has_ready_source"])
+        self.assertEqual(cr["ready_source_game"], 1)
+        self.assertEqual(cr["ready_source_fields"], 1)
+        self.assertEqual(cr["ready_source_null"], 1)
+        self.assertEqual(cr["ready_source_missing_tiles"], 0)
+        self.assertEqual(cr["harvest_method_missing_lines"], [])
+        text = mod.render_text(rep, 50)
+        self.assertIn("可收来源: readySource game 1 / fields 1 / null 1 / 缺键 0", text)
+        self.assertIn("不是 fail-open", text)
+        self.assertFalse(cr["warn_null_heavy"], "3 格里 1 格 null 没过半，不该报 fail-closed 过头")
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+
+    def test_fields_source_is_a_normal_equivalent_path_not_failure(self):
+        tiles = [{"tile": [60, 29], "crop": "270", "ripe": True, "ready": True,
+                  "readySource": "fields", "harvestMethod": "Grab"}]
+        rep = self._report(self._day([1, "fall", 9], extra=[self._tile_event(tiles)]),
+                           "t179_fields.jsonl")
+        cr = rep["crop_ready"]
+        self.assertEqual(cr["ready_source_fields"], 1)
+        self.assertEqual(cr["ready_source_missing_tiles"], 0)
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+        blob = " ".join(rep.get("undecidable") or [])
+        self.assertNotIn("`tiles[].readySource`（task-176）", blob,
+                         "有来源标记 ⇒ 不该报专用【无法判定·旧 Mod】行")
+        text = mod.render_text(rep, 50)
+        self.assertIn("逐条等价", text)
+        self.assertIn("不是 fail-open", text)
+
+    def test_ready_without_ready_source_is_undecidable_old_mod(self):
+        tiles = [{"tile": [60, 29], "crop": "270", "ripe": True, "ready": True,
+                  "harvestMethod": "Grab"}]
+        rep = self._report(self._day([1, "fall", 9], extra=[self._tile_event(tiles)]),
+                           "t179_oldmod.jsonl")
+        cr = rep["crop_ready"]
+        self.assertEqual(cr["ready_source_missing_tiles"], 1)
+        self.assertTrue(cr["ready_source_missing_lines"])
+        text = mod.render_text(rep, 50)
+        self.assertIn("缺键 1", text)
+        self.assertIn("无法判定·旧 Mod", text)
+        blob = " ".join(rep.get("undecidable") or [])
+        self.assertIn("`tiles[].readySource`（task-176）", blob)
+        self.assertIn("无法判定·旧 Mod", blob)
+        advice = " ".join(a.get("text", "") for a in rep.get("advice") or [])
+        self.assertIn("无法判定·旧 Mod", advice)
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+
+    def test_null_heavy_is_warning_not_red(self):
+        tiles = [{"tile": [i, 29], "crop": "262", "ripe": False, "ready": None,
+                  "readySource": None, "harvestMethod": "Grab"} for i in range(60, 64)]
+        rep = self._report(self._day([1, "fall", 9], extra=[self._tile_event(tiles)]),
+                           "t179_null.jsonl")
+        cr = rep["crop_ready"]
+        self.assertEqual(cr["ready_source_null"], 4)
+        self.assertTrue(cr["warn_null_heavy"])
+        text = mod.render_text(rep, 50)
+        self.assertIn("fail-closed 过头风险", text)
+        self.assertIn("只记【无法判定】", text)
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+
+    def test_harvest_method_key_must_exist(self):
+        tiles = [{"tile": [60, 29], "crop": "270", "ripe": True, "ready": True,
+                  "readySource": "game"}]
+        rep = self._report(self._day([1, "fall", 9], extra=[self._tile_event(tiles)]),
+                           "t179_hm.jsonl")
+        cr = rep["crop_ready"]
+        self.assertTrue(cr["harvest_method_missing_lines"])
+        text = mod.render_text(rep, 50)
+        self.assertIn("harvestMethod 键缺失", text)
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+
+    def test_no_ready_source_at_all_is_undecidable_not_pass(self):
+        rep = self._report(self._day([1, "fall", 9]), "t179_none.jsonl")
+        cr = rep["crop_ready"]
+        self.assertFalse(cr["has_ready_source"])
+        self.assertEqual(cr["ready_source_missing_tiles"], 0)
+        text = mod.render_text(rep, 50)
+        self.assertIn("可收来源: <缺失>", text)
+        self.assertIn("无法判定·旧 Mod", text)
+        blob = " ".join(rep.get("undecidable") or [])
+        self.assertIn("readySource", blob)
+        self.assertEqual((rep["red"] or {}).get("total"), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

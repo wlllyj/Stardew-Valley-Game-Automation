@@ -947,6 +947,52 @@ python tools\analyze-longrun.py --journal logs\longrun-runA-0732.jsonl --days 6 
 rg -n '"event": ?"harvest_gave_up"' logs/longrun-*.jsonl
 ```
 
+## 3.28 可收来源三态 + `harvestMethod` 出键（task-176 `037e599`，task-179 收录）
+
+**背景**：task-176 给 `/observe` 的作物可收判定加了「来源标记」：
+- `mod\AgentFarm.Bridge\CropMeta.cs`：`harvestMethod` 改由 public 无参 `Crop.GetHarvestMethod()` 提供
+  （返回 `"Grab"`/`"Scythe"`/未知值照实写数字；**删掉了字段反射** —— 1.6.15 上没有 `Crop.HarvestMethod`）；
+  `Ready()` 返回 `(bool? Value, string Source)`，`Source` ∈ `"game"`（反射 `HoeDirt.readyForHarvest()` 成功）
+  / `"fields"`（反射不可用但字段齐全）/ `null`（字段缺项 ⇒ 判不了）。
+- `mod\AgentFarm.Bridge\Contracts.cs`：`harvestMethod` 与新增的 `readySource` 都标
+  `[JsonIgnore(Condition = JsonIgnoreCondition.Never)]` ⇒ **无条件出键**（值可为 null）。
+- `mod\AgentFarm.Bridge\WorldSnapshot.cs:645 t.ReadySource = readyInfo.Source`；
+  `mod\AgentFarm.Bridge\FarmScan.cs:293 if (CropMeta.Ready(dirt, crop).Value == true) _acc.ReadyCrops++;`
+
+**三态记账（本工具）**：
+
+| 账本形态 | 记账 | 说明 |
+|---|---|---|
+| 缺 `readySource` 键 | 头部 `可收来源: <缺失>` + 专行【无法判定·旧 Mod】 | task-176 之前的 Mod 形态；**绝不当通过**（缺失 ≠ false） |
+| `readySource == null` | 【无法判定】（`null` 只说明判不了）；该账本 null 占比 >50% ⇒ 头部 ⚠ | fail-closed 过头风险，只警告、不判红 |
+| `readySource == "game"` / `"fields"` | 正常路径，与 `ready` 的 true/false 一起合计 | `fields` **不是** fail-open（见下） |
+| `ready == false` 且同格 `ripe == true` | 正常「不能收」+「看着熟其实不能收」⚠ | task-169 病根的可视化 |
+
+**`fields` 是等价路径（Lead 已用 il-probe 实证）**：`CropMeta` 的字段判据与
+`HoeDirt.readyForHarvest()` 的 IL **逐条等价** ⇒ `ready=true` 对「末阶段未熟」的格是游戏口径的真相；
+只有 `null` 才是判不了。别按旧诊断把 `fields` 写成 fail-open（同 `docs\_il-harvest-path.md` §0.5 的 live 观测）。
+
+**`harvestMethod` 出键**：`JsonIgnore(Never)` ⇒ **该键必须存在**（值可为 null）；缺键 = 旧 Mod 形态
+⇒ 头部 ⚠ +【无法判定】，且**不许用 `ripe` 顶替 `ready`**（旧写法按字段名读 ⇒ 恒 null ⇒
+镰刀类作物永远走 `interact`、永远摘不到）。
+
+**单测**：`tests/test_analyze_longrun.py::TestCropReadySource` 7 条 —— 缺键 ⇒ 旧 Mod 专行 + 不当通过 /
+`fields` 正常路径不报旧 Mod / `null` ⇒【无法判定】且过半 ⇒ ⚠ 不判红 / `harvestMethod` 缺键 ⇒ ⚠ /
+`readySource` 出现在头部行 / `false` + `ripe=true` ⇒「看着熟其实不能收」/ 真账本缺键回归。
+
+**读数**：`py_compile -W error::SyntaxWarning` RC=0；`tests.test_analyze_longrun` **207 OK**（+7）；
+全量 `discover -s tests` **Ran 911 tests / OK（0 红）**。旧账本回归
+（`scratch\_t172_matrix.py`，HEAD 版 vs 新版逐账本并排）：run A 1(117)→1(117)、run B 1(84)→1(84)、
+run9d 1(29)→1(29)、run9c 0(0)→0(0)、run9b 1(45)→1(45)、run9 1(84)→1(84) —— **判决与计数一字未变**
+（只多头部「可收来源」行 +【无法判定·旧 Mod】行），`verify-run3.py` 同向（run9c 为已知有意分歧）。
+
+**grep 配方**：
+
+```
+git grep -n "ReadySource\|GetHarvestMethod" -- mod/AgentFarm.Bridge/
+python tools\analyze-longrun.py --journal logs\longrun-runA-0732.jsonl --days 6 | rg "可收来源"
+```
+
 ## 4. 复核命令
 
 ```
@@ -960,6 +1006,6 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run9d.jsonl --da
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
 python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
-python -m unittest tests.test_analyze_longrun  # 当前 200 OK（task-172 + 收获放弃/熟可收对账 5 条）
-python -m unittest discover -s tests           # 当前 Ran 894 tests / OK（0 红；task-170 的漂移红已随 task-172 清零）
+python -m unittest tests.test_analyze_longrun  # 当前 207 OK（task-179 + `readySource` 三态 7 条）
+python -m unittest discover -s tests           # 当前 Ran 911 tests / OK（0 红）
 ```

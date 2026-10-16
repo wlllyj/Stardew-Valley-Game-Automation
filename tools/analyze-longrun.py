@@ -468,6 +468,20 @@ FIELD_PROBES = [
      "forageCrop / whichForageCrop / regrowsAfterHarvest", "tile_crop_meta",
      "task-170 逐格作物元数据（`ready` 的输入，用于解释「为什么看着熟却不能收」）；缺失 ⇒【无法判定】，"
      "**不许用 ripe 顶替 ready**"),
+    # task-179（dev task-176 `037e599`）：`ready` 的**来源**必须落账 —— 没有它就无法定案
+    #     "到底是游戏说的、还是我们兜底猜的"（task-173 的 FAIL 正是这样被掩盖的）。
+    #     `"game"` = 真的调用了 `HoeDirt.readyForHarvest()`；`"fields"` = 反射不可用、退回
+    #     **与该 IL 逐条等价**的字段判据 ⇒ **这是正常的等价路径，不是 fail-open**；
+    #     `null` = 判不了 ⇒【无法判定】。旧账本缺这个键 ⇒【无法判定·旧 Mod】，绝不当通过。
+    ("tiles[].readySource", "tile_ready_source",
+     "task-176：`ready` 的来源（`\"game\"`/`\"fields\"`/`null`）。`fields` = 反射不可用但字段判据与 "
+     "`HoeDirt.readyForHarvest()` 的 IL **逐条等价**（**不是 fail-open**，`ready=true` 对「末阶段未熟」"
+     "的格是游戏口径的真相）；只有 `null` 判不了 ⇒【无法判定】；缺键 = 旧 Mod 形态 ⇒"
+     "【无法判定·旧 Mod】、绝不当通过；null 占比高 = fail-closed 过头风险（只给 ⚠）"),
+    ("tiles[].harvestMethod", "tile_harvest_method",
+     "task-176：`harvestMethod` 改由 public 无参 `Crop.GetHarvestMethod()` 提供（`\"Grab\"`/`\"Scythe\"`/"
+     "未知值照实写数字；旧写法按字段名读 ⇒ 1.6.15 上恒 null ⇒ 镰刀类作物永远走 `interact`、永远摘不到）；"
+     "`Contracts.cs` 用 `JsonIgnore(Never)` ⇒ **该键必须存在**（值可为 null）；缺键 ⇒ 旧 Mod 形态、【无法判定】"),
     ("farm.readyCrops", "farm_readyCrops",
      "task-170 全农场「真能收」计数（与旧 `farm.ripeCrops` 并列）；两者差值 = 看着熟其实不能收"),
     ("day_end.final.farm.readyCrops / ripeCrops", "final_farm_ready_ripe",
@@ -2876,6 +2890,34 @@ def build_advice(report, top=8):
                     "task-169 的真病根就在这条差值上",
             "lines": cr.get("ripe_without_ready_lines") or [],
         })
+    # 0s-3) task-179：`ready` 的来源（game/fields/null/缺键）—— `fields` 是等价路径，不是 fail-open
+    if cr.get("ready_source_missing_tiles"):
+        advice.append({
+            "text": f"`tiles[].readySource` 缺键 {cr['ready_source_missing_tiles']} 格（旧 Mod 形态）："
+                    "**无法判定·旧 Mod** —— 分不清 `ready` 是游戏 `HoeDirt.readyForHarvest()` 判的、"
+                    "还是我们字段兜底猜的（task-173 的 FAIL 就是这样被掩盖的）；绝不因此判通过",
+            "lines": (cr.get("ready_source_missing_lines") or [])[:12],
+        })
+    elif not cr.get("has_ready_source"):
+        advice.append({
+            "text": "账本里没有 `tiles[].readySource`（task-176）：**无法判定·旧 Mod** —— `ready` 的来源"
+                    "不可考（缺失 ≠ 0、更 ≠ 通过）；0.7.34 之后的账本该带这个键",
+            "lines": [],
+        })
+    elif cr.get("warn_null_heavy"):
+        advice.append({
+            "text": f"`readySource=null` 占 {cr.get('ready_source_null')}/{cr.get('ready_source_seen')}"
+                    "（fail-closed 过头风险：反射与字段都读不到 ⇒ 这些格既不当能收、也不当不能收，"
+                    "只记【无法判定】）；若长期如此，说明反射面在 1.6.15 上不稳，值得报给 Mod 侧",
+            "lines": [],
+        })
+    if cr.get("harvest_method_missing_lines"):
+        advice.append({
+            "text": f"`tiles[].harvestMethod` 键缺失 {len(cr['harvest_method_missing_lines'])} 行"
+                    "（task-176 要求该键**无条件存在**，`Contracts.cs` 用 `JsonIgnore(Never)`）；"
+                    "缺键 ⇒ 旧 Mod 形态，镰刀类作物到底走 `interact` 还是工具路径无法判定",
+            "lines": (cr.get("harvest_method_missing_lines") or [])[:12],
+        })
     # 0c) 环境挡路 / 没拿到结论（task-22 记账）
     env = report.get("env_inconclusive") or {}
     if env.get("env_fail_events"):
@@ -3143,6 +3185,14 @@ def build_undecidable(rows, sessions, prelude, report):
                    "无法判定「看着熟」的总量 —— 缺失 ≠ 0")
     if _has_ready and not _has_ripecrops:
         out.append("有 `ready` 但没有 `ripeCrops`：两口径无法对账（只能各看一边）")
+    # task-179（dev task-176）：`ready` 的**来源**（`readySource`）是否落账 ——
+    #   `fields` 是**正常等价路径**（字段判据与 `HoeDirt.readyForHarvest()` 的 IL 逐条等价），
+    #   只有 `null` 判不了；旧 Mod 没有这个键 ⇒ 分不清"游戏说的"还是"我们猜的" ⇒【无法判定·旧 Mod】。
+    _has_ready_source = "readySource" in blob
+    if rows and not _has_ready_source:
+        out.append("本账本没有 `tiles[].readySource`（task-176）：**无法判定·旧 Mod** —— "
+                   "`ready` 到底是游戏 `HoeDirt.readyForHarvest()` 判的还是字段兜底猜的分不清"
+                   "（task-173 的 FAIL 正是这样被掩盖的）；**缺失 ≠ 0、更绝不因此判通过**")
     # task-111：复盘/教训库的证据是否存在（缺失 ⇒【无法判定】，绝不因此判通过、也不判红）
     _lr_ev = [ev for _ln, ev in rows
               if ev.get("event") in ("review_llm", "review_llm_failed", "lessons",
@@ -4634,6 +4684,46 @@ def build_report(rows, path, args, bad_lines):
                 crop_ready["window_ripe_true"] += 1
             if _t.get("ripe") is True and _t.get("ready") is False:
                 crop_ready["window_ripe_not_ready_lines"].append(_ln)
+    # task-179（dev task-176 `037e599`）：`tiles[].readySource` 三态记账 ——
+    #   `"game"`=真调了游戏 `HoeDirt.readyForHarvest()`；`"fields"`=反射不可用、字段判据与 IL
+    #   **逐条等价**（**正常等价路径，不是 fail-open**）；`None`=判不了（⇒【无法判定】，绝不当
+    #   false/通过）。缺键（有 `ready` 却没有 `readySource`）= 旧 Mod 形态 ⇒【无法判定·旧 Mod】。
+    #   null 占比 ≥ 半数 ⇒ fail-closed 过头风险，只给 ⚠、不进 rc。
+    crop_ready.update({
+        "ready_source_game": 0, "ready_source_fields": 0, "ready_source_null": 0,
+        "ready_source_other": {}, "ready_source_seen": 0,
+        "ready_source_missing_tiles": 0, "ready_source_missing_lines": [],
+        "harvest_method_missing_lines": [], "has_ready_source": False,
+        "warn_null_heavy": False,
+    })
+    for _ln, _ev in rows:
+        for _t in _tile_dicts(_ev):
+            if "readySource" in _t:
+                crop_ready["has_ready_source"] = True
+                _rs = _t.get("readySource")
+                if _rs == "game":
+                    crop_ready["ready_source_game"] += 1
+                elif _rs == "fields":
+                    crop_ready["ready_source_fields"] += 1
+                elif _rs is None:
+                    crop_ready["ready_source_null"] += 1
+                else:
+                    _rk = str(_rs)
+                    crop_ready["ready_source_other"][_rk] = \
+                        crop_ready["ready_source_other"].get(_rk, 0) + 1
+            elif "ready" in _t:
+                crop_ready["ready_source_missing_tiles"] += 1
+                if _ln not in crop_ready["ready_source_missing_lines"]:
+                    crop_ready["ready_source_missing_lines"].append(_ln)
+            if ("crop" in _t) and ("harvestMethod" not in _t):
+                if _ln not in crop_ready["harvest_method_missing_lines"]:
+                    crop_ready["harvest_method_missing_lines"].append(_ln)
+    crop_ready["ready_source_seen"] = (
+        crop_ready["ready_source_game"] + crop_ready["ready_source_fields"]
+        + crop_ready["ready_source_null"] + sum(crop_ready["ready_source_other"].values()))
+    crop_ready["warn_null_heavy"] = bool(
+        crop_ready["ready_source_seen"]
+        and crop_ready["ready_source_null"] * 2 >= crop_ready["ready_source_seen"])
     if not crop_ready["has_fields"]:
         crop_ready["note"] = ("账本层没有 ripeCrops/readyCrops（`day_end.final.farm` 白名单 "
                               "brain longrun.py:1690-1692 不含）⇒ 只能记【无法判定】；"
@@ -5612,6 +5702,26 @@ def render_text(report, top):
             + (f"  ⚠ 窗口里 ripe=true 但 ready=false：行 "
                f"{cr.get('window_ripe_not_ready_lines', [])[:6]}"
                if cr.get("window_ripe_not_ready_lines") else ""))
+    # task-179：`ready` 的**来源**（game/fields/null/缺键）—— `fields` 是等价路径，不是 fail-open。
+    if not cr.get("has_ready_source") and not cr.get("ready_source_missing_tiles"):
+        add("可收来源: <缺失>（本账本没有 `tiles[].readySource` ⇒【无法判定·旧 Mod】：分不清 `ready` "
+            "是游戏 `HoeDirt.readyForHarvest()` 判的、还是我们字段兜底猜的；缺失 ≠ 0，更绝不因此判通过）")
+    else:
+        add(f"可收来源: readySource game {cr.get('ready_source_game')} / fields "
+            f"{cr.get('ready_source_fields')} / null {cr.get('ready_source_null')} / 缺键 "
+            f"{cr.get('ready_source_missing_tiles')}；口径：`fields` = 反射不可用但字段判据与 "
+            "`HoeDirt.readyForHarvest()` 的 IL **逐条等价**（**不是 fail-open**），"
+            "只有 `null` 判不了 ⇒【无法判定】"
+            + (f"  ⚠ {cr.get('ready_source_missing_tiles')} 格有 `ready` 却没有 `readySource`"
+               f"（旧 Mod 形态）：行 {cr.get('ready_source_missing_lines', [])[:6]} ⇒【无法判定·旧 Mod】"
+               if cr.get("ready_source_missing_tiles") else "")
+            + (f"  ⚠ readySource=null 占 {cr.get('ready_source_null')}/{cr.get('ready_source_seen')}"
+               "（fail-closed 过头风险：反射与字段都读不到 ⇒ 这些格既不当能收、也不当不能收，"
+               "只记【无法判定】）"
+               if cr.get("warn_null_heavy") else "")
+            + (f"  ⚠ harvestMethod 键缺失的行 {cr.get('harvest_method_missing_lines', [])[:6]}"
+               "（task-176：该键必须**无条件存在**）"
+               if cr.get("harvest_method_missing_lines") else ""))
     # task-157：够不着 ⇒ 有界开路（`water_far_open`）后重试同一格；开路后仍站不到 ⇒ `water_far_blocked`。
     # 两者都**不是失败**：开路成功也**不等于**浇上水；当天达不达标由 `checks.watered_outdoor` 说话。
     if wf.get("has_open_events"):
