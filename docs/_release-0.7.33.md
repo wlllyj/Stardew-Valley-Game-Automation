@@ -59,4 +59,11 @@
 
 ## §7 执行记录（Lead 逐条追加）
 
-- （待第 4 步起逐条填）
+- **第 1 步 ✅**：`tools\_note-0733.txt` 写好（首串 `v0.7.33`）。
+- **第 2 步 ✅**：task-172（log-analyst `cc56c06`）落地 ⇒ 全量 **`Ran 894 tests / OK`（0 红）**；analyzer 单文件 200 OK；机械枚举未映射 4→3（只剩结构性三键）；六本旧账本判决/计数一字未变（`scratch/_t172_matrix.py` 并排）。
+- **第 3–7 步 ✅**：`_bump-mod-version.py 0.7.33` ⇒ manifest `0.7.32→0.7.33`；`bridge.py:39 MOD_VERSION_EXPECTED="0.7.33"`（并在注释头补了 v0.7.33 条目，历史注释保留）；`dotnet build --no-incremental` = **0 警 0 错，dll 194048 B**；冻结提交 **`4af3a52`**；`check-release --expect 0.7.33` = **六项全绿**（manifest==brain / 版本==期望 / dll 不比源码旧 / py_compile 22 文件 / 全量 894 OK / 工作树干净）。
+- **独立闸门（结论在冻结之后落库，方向不冲突）**：task-171（deputy-lead `b1693f7`）= **PASS-WITH-NITS，无必修项 ⇒ 明确写"0.7.33 可以据此冻结"**；探针 25 PASS / 0 FAIL；自建变异 control 0 红 / m170a 5 红 / m170b 3 红 / m170c 1 红（与作者自报一致）。**唯一点名 NIT-1**（`harvest_gave_up` 的窗口依赖假绿：放弃格离开观测窗口后仍可能 `verified=true` 而 `farm.readyCrops>0`）⇒ 立 **task-175**（0.7.34，Lead 倾向"日级记账、与窗口解耦"的收紧路线，`blocked_by task-173`）。
+- **第 8 步 ✅**：`deploy-mod.py --no-quit` ⇒ `0.7.32 → 0.7.33`（dll 194048 B / manifest 44885 B），桥 `modVersion=0.7.33 port=17890`，自动读档 `Wahaha_450799035`（FarmHouse (9,9)）。
+- **第 9 步 ✅**：`python -m agentfarm goto Farm` ok（7632ms，`hop1 source=[3,12] landing=[64,15]`）；`preflight --expect 0.7.33 --save-baseline logs\run10-baseline.json` = **✅ 可以起跑**（第1年 秋12日 06:50 **rain**、体力 247/270、钱 0g、作物 102、`dryCrops 0`、`unwateredCrops 2`、`waterLeft 27`、farmingLevel 1、`farmComplete true`、无模态、世界推进中）。
+- **下一步（task-173，已派 machine-runner 并 GO）**：同格 `(60,29)` 一次 harvest 定点取证（判据 a 真摘到 / b 判据纠正后不再算可收）；结论出来后决定是否解冻 brain 侧并做 task-168。
+
