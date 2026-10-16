@@ -18,10 +18,11 @@
 
 | 卡 | 内容 | 状态 | 0.7.30 必修 |
 |---|---|---|---|
-| task-133 | `_water_far_dry` 补水重试（≤2 次）+ **逐格判据**（`farm.dryTiles`/`watered`，禁止全局差值）+ 收尾分清因 | dev-coder 在制 | ✅ |
-| task-134 | A：resume/work_spot 空转有界（burst 计数覆盖）+ resume 重评 `no_target`；B：**leftover 口径拆分**（`assigned_undone` vs `plot_pending`） | 待 task-133 解阻 | ✅ |
-| task-135 | 独立对抗验收 task-133 + task-134（重点：口径变更是否引入新洗白通道） | 待 133/134 | ✅ |
-| task-136 | 决策演进链质量：复盘调用留痕 + 复盘提示词接地 + 教训 hint 防污染（`[模型自述·未验证]`） | 待 task-134 | ✅（run9c 前） |
+| task-133 | `_water_far_dry` 补水重试（≤2 次）+ **逐格判据**（`farm.dryTiles`/`watered`，禁止全局差值）+ 收尾分清因 | dev-coder **completed**（`57ef928`，Lead 已核） | ✅ |
+| task-134 | A：resume/work_spot 空转有界（burst 计数覆盖）+ resume 重评 `no_target`；B：**leftover 口径拆分**（`assigned_undone` vs `plot_pending`） | dev-coder **completed**（`903e6a4`，2 文件 +383/−4；Lead 亲核定向 433 OK / 全量 **757 OK**） | ✅ |
+| 工具侧对齐 | `tools/verify-run3.py` 3b 改按 `stages[].assigned_undone` 判 `no_unmet_stages`（`leftover`/`plot_pending` 只记录）+ 日级白名单补 `assigned_undone`/`plot_pending`/`plot_pending_by_kind`/`deferred_tiles` + 5 条新用例 | Lead **completed**（`c6cc654`；`tests.test_verify_run3` 58 OK、九账本 rc 并排不变） | ✅ |
+| task-135 | 独立对抗验收 task-133 + task-134（重点：口径变更是否引入新洗白通道） | deputy-lead 在制（已派，含工具侧对账） | ✅ |
+| task-136 | 决策演进链质量：复盘调用留痕 + 复盘提示词接地 + 教训 hint 防污染（`[模型自述·未验证]`） | dev-coder 在制 | ✅（run9c 前） |
 | task-101 | `_farm_totals` 类型校验（`dryCrops="abc"` 会让整天崩）等 NIT | pending | 顺延 |
 | task-107 | Mod `dryTiles` 与 `dryCrops` 同源 + `scanSeq` | pending | 顺延 |
 | task-109 | 卖货如实性（最大叠/最小损失）+ 卖后刷新 obs | pending | 顺延 |
@@ -32,7 +33,7 @@
 
 ## §2 冻结与装机九步（Lead 独占）
 
-1. 确认 task-133/134/**136**/135 全 completed 且**全量单测 0 红**（`python -m unittest discover -s tests`）。
+1. 确认 task-133/134/**136**/135 全 completed 且**全量单测 0 红**（`python -m unittest discover -s tests`）。本版**工具侧对齐已在冻结前完成**（`c6cc654`：3b 按 `assigned_undone` 判、日级白名单补四键、58 OK、九账本 rc 并排不变），冻结时只需再复跑一次确认。**task-139**（analyzer 收录 task-136 新事件）`blocked_by task-136`，**不阻塞冻结**，但必须在 run9c 判决前交（否则 `--window` 口径可能出现漂移红）。
 2. 写 `tools/_note-0730.txt`，**首串必须是 `v0.7.30`**，逐条列 task-133/134/136（已于本夜写好，首串 `v0.7.30（run9b 复盘：water_far 补水与逐格判据 + resume 空转兜底 + 阶段口径账实相符 + 演进素材质量）`）。
 3. `python tools\_bump-mod-version.py 0.7.30 --note-file tools\_note-0730.txt`（末句在 cp1252 下会 `UnicodeEncodeError`、退出码 1，**版本已写盘** ⇒ 一律 `json.load` 核对 manifest）。
 4. `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.30"`（注释列本版两项）。
