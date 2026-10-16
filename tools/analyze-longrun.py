@@ -85,6 +85,10 @@
     `LESSONS_MAX=20`）③教训库读不了/文件损坏（`missed:lessons_load_failed`）。教训库路径由
     journal 推导（`X.jsonl` ⇒ `X-lessons.json`，与 brain `_derive_lessons_path` 同约定，
     **不新增命令行开关**）；旧账本没有这些事件 ⇒ 头部 `<缺失>` + 【无法判定】（缺失 ≠ 0）。
+  * 教训库拒收（task-114 F1，`lessons_rejected`）：schema 校验丢条**必须留痕**，但**拒收本身不判红**
+    （文件被外部改过/结构不符时拒收是**正确**行为）⇒ 头部可 grep 的 `拒收 N 次 / M 条（原因…）`；
+    只有 `dropped>0` 且 `kept==0` **连续 ≥2 天**给 `warn:lessons_all_rejected` 可视行（不判红、不进 rc）；
+    缺 `kept`/缺事件 ⇒ 只进【无法判定】（缺失 ≠ 0，绝不当"没被拒收"通过）。
   * 事件映射不许漂移（Lead m02395）：brain 里 `_journal("<name>"` 的**每个**事件名都要在
     `EVENT_BUCKETS` 里有桶（结构性事件 `day_start`/`day_end`/`finish` 除外，见 `STRUCTURAL_EVENTS`）；
     账本里出现没桶的事件 ⇒ 报告头部逐条点名（名字×次数+行号）+ 建议 0a，**绝不静默丢弃**。
@@ -319,6 +323,14 @@ FIELD_PROBES = [
      "指不中断跑批，不指账目可信）"),
     ("event:lessons_save_failed", "lessons_save_failed",
      "教训库写不进去（task-82：path/error/note）⇒ 只记信息（本批教训只在内存里，跑批照常）"),
+    ("event:lessons_rejected", "lessons_rejected",
+     "教训库被拒收（task-114 F1：path/dropped/reasons/kept/note）⇒ **拒收本身不判红** —— 文件被外部"
+     "改过/结构不符时，拒收是**正确**行为；只有「dropped>0 且 kept==0」连续 ≥2 天时给 "
+     "`warn:lessons_all_rejected` 可视行（只警告、不判红、不进 rc）"),
+    ("event:lessons_rejected.kept", "lessons_rejected_kept",
+     "task-114：这次载入后**留下来**的教训条数（`kept==0` 表示这一版库一条都没通过 schema 校验）"),
+    ("event:lessons_rejected.dropped", "lessons_rejected_dropped",
+     "task-114：这次载入被**丢掉**的条数（>0 且 kept==0 ⇒ 整库不可用；两侧都要看，别只看一边）"),
     ("event:decision", "decision_memory",
      "决策史条数（task-58 的 `Brief.recent_decisions` 注入 = 账本里 `decision` 事件数；每条还补了 "
      "terminal/leftover/unreachable/refused/where 具名田区，**无坐标**）⇒ 头部`决策:`行已给总数；"
@@ -497,6 +509,9 @@ EVENT_BUCKETS = {
     "lessons": "lessons_events",
     "lessons_load_failed": "lessons_load_failures",
     "lessons_save_failed": "lessons_save_failures",
+    # task-114 F1：教训库 schema 校验丢条留痕 ⇒ **拒收本身不判红**（外部篡改/损坏时拒收是正确行为），
+    # 只有「dropped>0 且 kept==0 连续 ≥2 天」给 `warn:` 可视行（不判红、不进 rc）
+    "lessons_rejected": "lessons_rejections",
 }
 
 #: 结构性事件：由报告的其他字段单独统计（day_start/day_end 切会话与验收、finish 自述），
@@ -540,6 +555,8 @@ NEW_EVENT_BUCKETS = (
     # task-111：LLM 复盘 / 教训库（本日 notes、复盘失败、教训库新增/淘汰、读写失败）
     "review_llms", "review_llm_failures", "lessons_events",
     "lessons_load_failures", "lessons_save_failures",
+    # task-114：教训库拒收留痕（拒收本身不是失败；连续全丢才给 warn）
+    "lessons_rejections",
 )
 
 
@@ -2122,18 +2139,35 @@ def build_advice(report, top=8):
                            "⇒ 教训库不可信（'失败无害'只指不中断跑批）")
         if lri.get("file_status") == "corrupt":
             _lparts.append(f"教训库文件损坏（{lri.get('file_path')}：{lri.get('file_error')}）")
+        if (lri.get("warn_all_rejected_run") or 0) >= 2:
+            _lparts.append(f"教训库连续整版被拒 ×{lri.get('warn_all_rejected_run')} 天"
+                           "（warn:lessons_all_rejected，**不判红**）")
         advice.append({
             "text": "LLM 复盘/教训库（task-111）：" + "；".join(_lparts),
             "lines": (lri.get("without_notes_lines", []) + lri.get("over_limit_lines", [])
                       + lri.get("load_failed_lines", [])),
         })
+    elif (lri.get("warn_all_rejected_run") or 0) >= 2:
+        advice.append({
+            "text": "教训库连续整版被拒（warn:lessons_all_rejected，**不判红**）：连续 "
+                    f"{lri.get('warn_all_rejected_run')} 天 dropped>0 且 kept==0（"
+                    f"{'、'.join([str(x) for x in (lri.get('warn_all_rejected_days') or [])][:3])}）"
+                    "⇒ 拒收本身是正确行为（外部篡改/结构不符就该拒），但连着几天一条都没留下 ⇒ "
+                    "看一眼这个文件是不是被改坏、或被写成了别的 schema（task-114）；缺字段照旧【无法判定】",
+            "lines": (lri.get("rejected_lines") or [])[:6],
+        })
     elif lri.get("has_events"):
+        _rej_txt = (f"；拒收 {lri.get('rejected_events', 0)} 次 / {lri.get('rejected_dropped', 0)} 条"
+                    f"（原因 {'、'.join([str(x) for x in (lri.get('rejected_reasons') or ['—'])][:2])}）"
+                    if lri.get("rejected_events") else "")
         advice.append({
             "text": f"LLM 复盘/教训库（信息项，**不是失败**）：复盘 {lri.get('review_events', 0)} 次 "
                     f"/ notes {lri.get('notes_count', 0)} 条；教训库 total "
-                    f"{lri.get('lessons_total')} 条（本日新增 {lri.get('lessons_added')}）；"
-                    "空库 / 0 新增 / 复盘失败都只记信息（task-111）",
-            "lines": (lri.get("review_lines", []) + lri.get("lessons_lines", []))[:8],
+                    f"{lri.get('lessons_total')} 条（本日新增 {lri.get('lessons_added')}）"
+                    + _rej_txt
+                    + "；空库 / 0 新增 / 复盘失败 / 拒收都只记信息（task-111/114）",
+            "lines": (lri.get("review_lines", []) + lri.get("lessons_lines", [])
+                      + lri.get("rejected_lines", []))[:8],
         })
     # 0j) 可达性/开路（task-76：task-68 的被围住 + frontier_clear + clear_neighbor；**不判红**）
     rc = report.get("reachability") or {}
@@ -2434,12 +2468,14 @@ def build_undecidable(rows, sessions, prelude, report):
     # task-111：复盘/教训库的证据是否存在（缺失 ⇒【无法判定】，绝不因此判通过、也不判红）
     _lr_ev = [ev for _ln, ev in rows
               if ev.get("event") in ("review_llm", "review_llm_failed", "lessons",
-                                     "lessons_load_failed", "lessons_save_failed")]
+                                     "lessons_load_failed", "lessons_save_failed",
+                                     "lessons_rejected")]
     _lr = report.get("llm_review") or {}
     if rows and not _lr_ev:
-        out.append("本账本没有任何 task-59/82 的复盘/教训库事件（`review_llm`/`review_llm_failed`/"
-                   "`lessons`/`lessons_load_failed`/`lessons_save_failed`）：无法判定收工复盘与"
-                   "跨日教训库 —— **缺失 ≠ 0，绝不当'模型没学到东西'通过**（task-111）")
+        out.append("本账本没有任何 task-59/82/114 的复盘/教训库事件（`review_llm`/`review_llm_failed`/"
+                   "`lessons`/`lessons_load_failed`/`lessons_save_failed`/`lessons_rejected`）："
+                   "无法判定收工复盘与跨日教训库 —— **缺失 ≠ 0，绝不当'模型没学到东西'通过**"
+                   "（task-111/114）")
     elif _lr_ev:
         _lr_missing = []
         if not _lr.get("review_events") and not _lr.get("failed_events"):
@@ -2448,6 +2484,9 @@ def build_undecidable(rows, sessions, prelude, report):
             _lr_missing.append("lessons")
         if _lr_missing:
             out.append(f"复盘/教训库只写了一部分（缺 {_lr_missing}）：无法判定缺的那一列（缺失 ≠ 0）")
+        if _lr.get("rejected_events") and _lr.get("rejected_kept") is None:
+            out.append("`lessons_rejected` 缺 `kept` 字段：无法判定这次载入是否'整版被拒'"
+                       "（缺失 ≠ 0；只有 dropped>0 且 kept==0 连续 ≥2 天才给 warn，task-114）")
     # task-36：自称浇过、却没有 final_water 可核对的那些天（verify-run3.py:414-418 同口径：只记信息项）
     no_fw = [
         lineno for lineno, ev in rows
@@ -2915,6 +2954,20 @@ def build_report(rows, path, args, bad_lines):
     _ls_events = [(ln, ev) for ln, ev in rows if ev.get("event") == "lessons"]
     _ls_load_failed = [(ln, ev) for ln, ev in rows if ev.get("event") == "lessons_load_failed"]
     _ls_save_failed = [(ln, ev) for ln, ev in rows if ev.get("event") == "lessons_save_failed"]
+    _ls_rejected = [(ln, ev) for ln, ev in rows if ev.get("event") == "lessons_rejected"]
+    # task-114：拒收事件按行号归属到日（用于判「连续 ≥2 天 dropped>0 且 kept==0」）。
+    # 本函数里 `day_of_line` 还定义在后面，这里自带一份只依赖 `days` 的边界表。
+    _lr_bounds = []
+    for _i, _d in enumerate(days):
+        _bs = _d.get("start_line") or 0
+        _be = (days[_i + 1].get("start_line") - 1) if _i + 1 < len(days) else 10 ** 9
+        _lr_bounds.append((_bs, _be, _d.get("label"), _i))
+
+    def _lr_day_of(lineno):
+        for _bs, _be, _lab, _i in _lr_bounds:
+            if _bs <= lineno <= _be:
+                return _lab, _i
+        return None, None
     llm_review = {
         "lessons_max": LESSONS_MAX,
         "review_events": len(_rev_events), "review_lines": [ln for ln, _ in _rev_events],
@@ -2929,9 +2982,13 @@ def build_report(rows, path, args, bad_lines):
         "load_failed_lines": [ln for ln, _ in _ls_load_failed], "load_errors": [],
         "save_failed": len(_ls_save_failed),
         "save_failed_lines": [ln for ln, _ in _ls_save_failed], "save_errors": [],
+        # task-114：拒收（`lessons_rejected`）—— 只记信息 + 连续全丢时给 warn，绝不判红
+        "rejected_events": len(_ls_rejected), "rejected_lines": [ln for ln, _ in _ls_rejected],
+        "rejected_dropped": 0, "rejected_kept": None, "rejected_reasons": [],
+        "rejected_by_day": {}, "warn_all_rejected_run": 0, "warn_all_rejected_days": [],
         "file_status": "unknown", "file_path": "", "file_count": None, "file_error": "",
         "has_events": bool(_rev_events or _rev_failed or _ls_events or _ls_load_failed
-                           or _ls_save_failed),
+                           or _ls_save_failed or _ls_rejected),
     }
     for _ln, ev in _rev_events:
         notes = ev.get("notes")
@@ -2966,6 +3023,34 @@ def build_report(rows, path, args, bad_lines):
         llm_review["load_errors"].append(str(ev.get("error") or ""))
     for _ln, ev in _ls_save_failed:
         llm_review["save_errors"].append(str(ev.get("error") or ""))
+    # task-114：拒收统计（信息项）—— dropped / kept 两侧都看，只有"连续 ≥2 天全丢"才 warn
+    for _ln, ev in _ls_rejected:
+        _dr = as_int(ev.get("dropped"), None)
+        _kp = as_int(ev.get("kept"), None)
+        if _dr is not None:
+            llm_review["rejected_dropped"] += _dr
+        if _kp is not None:
+            llm_review["rejected_kept"] = _kp
+        for _rs in (ev.get("reasons") or [])[:8]:
+            _rst = str(_rs)
+            if _rst and _rst not in llm_review["rejected_reasons"]:
+                llm_review["rejected_reasons"].append(_rst)
+        _lab, _di = _lr_day_of(_ln)
+        if _di is not None and (_dr or 0) > 0 and _kp == 0:
+            llm_review["rejected_by_day"][_di] = {
+                "label": _lab, "dropped": _dr, "kept": _kp, "line": _ln}
+    _run = _best = 0
+    for _i in range(len(days)):
+        if _i in llm_review["rejected_by_day"]:
+            _run += 1
+            _best = max(_best, _run)
+        else:
+            _run = 0
+    llm_review["warn_all_rejected_run"] = _best
+    if _best >= 2:
+        llm_review["warn_all_rejected_days"] = [
+            (llm_review["rejected_by_day"].get(_i) or {}).get("label")
+            for _i in sorted(llm_review["rejected_by_day"])]
     _lp = None
     try:
         _jp = os.path.abspath(str(path))
@@ -3565,6 +3650,11 @@ MAPPING_TEXT = [
      "`recent_decisions` 的条数/长度看头部`决策:`行（task-58 给每条补了 terminal/leftover/"
      "unreachable/refused/where，无坐标）；旧账本没有这些事件 ⇒ 头部 `<缺失>` + 【无法判定】"
      "（缺失 ≠ 0，绝不当'模型没学到东西'通过）"),
+    ("lessons_rejected（task-114 F1、`brain/agentfarm/longrun.py:1674`）",
+     "教训库**拒收留痕**（信息项，**拒收本身不判红** —— 文件被外部改过/结构不符时拒收是正确行为）："
+     "`path/dropped/reasons/kept/note`；头部'LLM 复盘/教训库'行里有可 grep 的 `拒收 N 次 / M 条（原因…）`；"
+     "只有 `dropped>0` 且 `kept==0` **连续 ≥2 天**时给 `warn:lessons_all_rejected` 可视行"
+     "（只警告、不判红、不进 rc）；缺 `kept` 字段 ⇒ 只进【无法判定】（缺失 ≠ 0）"),
     ("encircled / encircled_stage / encircled_summary（task-68、task-76）",
      "5 环境挡路·可达性/开路（信息项，**无硬闸门 ⇒ 一律不判红**）：被不可清障物围住（四邻没有"
      "「可站+可清」的突破口）＝与 `unreachable`（物理走不到）**分开计数**、不封格、不进任何豁免分子；"
@@ -3776,9 +3866,17 @@ def render_text(report, top):
             f" / 淘汰 {lri.get('lessons_dropped') if lri.get('lessons_dropped') is not None else '<缺失>'}）"
             f"；读写失败 load {lri.get('load_failed', 0)} / save {lri.get('save_failed', 0)}"
             f"；{_fstat}"
+            + (f"；拒收 {lri.get('rejected_events', 0)} 次 / {lri.get('rejected_dropped', 0)} 条"
+               f"（原因 {'、'.join([str(x) for x in (lri.get('rejected_reasons') or ['—'])][:3])}）"
+               if lri.get("rejected_events") else "")
             + ("  ⚠ 复盘声称成功却 0 条 notes"
                if lri.get("without_notes_lines") else "")
             + ("  ⚠ 教训库超上限" if lri.get("over_limit_lines") else "")
+            + (f"  ⚠ warn:lessons_all_rejected（连续 {lri.get('warn_all_rejected_run')} 天 "
+               f"dropped>0 且 kept==0："
+               f"{'、'.join([str(x) for x in (lri.get('warn_all_rejected_days') or [])][:3])}"
+               "；只作警告、不判红 —— 拒收本身是正确行为，这里只是提示'库连续整版不可用'）"
+               if (lri.get("warn_all_rejected_run") or 0) >= 2 else "")
             + "；口径：**没学到东西不是失败**（空 notes/空库只记信息）")
     sleep_days = [d for d in report["days"] if d.get("ended_by") == "sleep"]
     if sleep_days:

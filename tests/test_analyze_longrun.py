@@ -2403,6 +2403,92 @@ class TestLlmReviewAndLessons(unittest.TestCase):
         self.assertEqual(rep["red"]["total"], 0, "缺证据既不算通过也不算失败 ⇒ 不许判红")
         text = mod.render_text(rep, 50)
         self.assertIn("LLM 复盘/教训库: <缺失>", text)
+
+
+class TestLessonsRejected(unittest.TestCase):
+    """task-116（Lead m05592）：task-114 F1 的教训库拒收留痕（`lessons_rejected`）。
+
+    口径：**拒收本身不判红**（文件被外部改过/结构不符时，拒收是**正确**行为 ⇒ 信息项）；
+    只有 `dropped>0` 且 `kept==0` **连续 ≥2 天**才给 `warn:lessons_all_rejected` 可视行
+    （只警告、不判红、不进 rc）；缺字段 ⇒ 【无法判定】（缺失 ≠ 0，绝不当"没被拒收"通过）。
+    """
+
+    REJECT = {"event": "lessons_rejected", "t": 8.5, "path": "<journal>-lessons.json",
+              "dropped": 2, "kept": 5, "reasons": ["unknown_kind:foo", "too_long:hint"],
+              "note": "schema 校验丢条留痕（task-114 F1）"}
+    ALL_GONE = {"event": "lessons_rejected", "t": 8.5, "path": "<journal>-lessons.json",
+                "dropped": 3, "kept": 0, "reasons": ["bad_schema:x"],
+                "note": "整版都不合格 ⇒ 全丢"}
+
+    def _day(self, day, *, extra=()):
+        nxt = [day[0], day[1], day[2] + 1]
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": True,
+                  "watered_outdoor": True}
+        end = {"event": "day_end", "t": 9.0, "day": day, "day_text": "", "ended_by": "sleep",
+               "ended_reason": "night", "verified": True, "checks": checks,
+               "stages": [{"stage": "water_area", "ok": 5, "skipped": 0, "failed": 0,
+                           "env_block": 0, "inconclusive": 0, "stopped": None, "leftover": 0}],
+               "outcomes": [], "ok_steps": 5, "skipped_steps": 0, "failed_steps": 0,
+               "notes": [], "final": final(nxt),
+               "final_water": {"t": 9.0, "location": "Farm", "tiles": 84, "crops": 31,
+                               "dry": 0, "scope": "farm"}}
+        return [day_start(day), *extra, end]
+
+    def _report(self, events, name, *, days=1):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = write_ledger(tmp.name, name, events)
+        self._tmp = tmp
+        return report_for(path, days=days, top=50)
+
+    def test_event_has_bucket_and_is_not_unmapped(self):
+        self.assertIn("lessons_rejected", mod.EVENT_BUCKETS,
+                      "task-114 的 lessons_rejected 必须有桶，否则漂移红")
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.REJECT)]),
+                           "lr_bucket.jsonl")
+        self.assertEqual(rep["unmapped_events"], {})
+        self.assertEqual(rep["events"]["lessons_rejected"], 1)
+        self.assertEqual(rep["llm_review"]["rejected_events"], 1)
+        self.assertEqual(rep["llm_review"]["rejected_dropped"], 2)
+
+    def test_rejection_itself_is_info_not_red(self):
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.REJECT)]),
+                           "lr_info.jsonl")
+        self.assertEqual(rep["red"]["total"], 0, "拒收本身是正确行为 ⇒ 绝不判红")
+        text = mod.render_text(rep, 50)
+        self.assertIn("拒收 1 次 / 2 条", text)
+        self.assertIn("unknown_kind:foo", text)
+        self.assertNotIn("⚠ warn:lessons_all_rejected", text, "只有一天 ⇒ 不给连续警告")
+
+    def test_all_rejected_two_days_is_warning_not_red(self):
+        events = (self._day([1, "summer", 5], extra=[dict(self.ALL_GONE)])
+                  + self._day([1, "summer", 6], extra=[dict(self.ALL_GONE)]))
+        rep = self._report(events, "lr_warn.jsonl", days=2)
+        self.assertEqual(rep["red"]["total"], 0, "warn 不是红：不进 rc")
+        self.assertGreaterEqual(rep["llm_review"]["warn_all_rejected_run"], 2)
+        text = mod.render_text(rep, 50)
+        self.assertIn("warn:lessons_all_rejected", text)
+        self.assertIn("拒收 2 次 / 6 条", text)
+        self.assertIn("只作警告、不判红", text)
+        self.assertIn("连续整版被拒", " ".join(a["text"] for a in rep["advice"]))
+
+    def test_all_rejected_single_day_has_no_warning(self):
+        rep = self._report(self._day([1, "summer", 5], extra=[dict(self.ALL_GONE)]),
+                           "lr_single.jsonl")
+        self.assertEqual(rep["red"]["total"], 0)
+        self.assertLess(rep["llm_review"]["warn_all_rejected_run"], 2)
+        self.assertNotIn("⚠ warn:lessons_all_rejected", mod.render_text(rep, 50))
+
+    def test_missing_kept_is_undecidable_not_warning(self):
+        no_kept = {k: v for k, v in self.ALL_GONE.items() if k != "kept"}
+        events = (self._day([1, "summer", 5], extra=[dict(no_kept)])
+                  + self._day([1, "summer", 6], extra=[dict(no_kept)]))
+        rep = self._report(events, "lr_nokept.jsonl", days=2)
+        self.assertEqual(rep["red"]["total"], 0)
+        self.assertIsNone(rep["llm_review"]["rejected_kept"], "缺 kept ⇒ 不许当成 0")
+        self.assertNotIn("⚠ warn:lessons_all_rejected", mod.render_text(rep, 50))
+        self.assertIn("缺 `kept` 字段", " ".join(rep["undecidable"]))
         self.assertIn("复盘/教训库", str(rep["undecidable"]),
                       "旧账本要进【无法判定】（缺失 ≠ 0）")
 

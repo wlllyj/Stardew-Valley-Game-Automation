@@ -484,6 +484,42 @@ python tools/analyze-longrun.py --journal logs/<run>.jsonl | rg "LLM 复盘/教�
 python -c "import json;d=json.load(open('logs/<run>-lessons.json',encoding='utf-8'));print(len(d.get('lessons',[])))"
 ```
 
+## 3.17 教训库拒收留痕（task-114 F1，task-116 收录）—— 拒收不是失败，连续整版不可用才是警告
+
+**背景**：task-114（commit `c135edc`）给跨日教训库加了 schema 校验：读回来的每条都过
+`planner._sanitize_lesson()`（只认自己写出去的格式；未知 kind / 结构不符 / 超长 / 多行 /
+抬高 severity 一律洗掉），**丢条必须留痕** ⇒ `brain/agentfarm/longrun.py:1674` 写
+`lessons_rejected`（懒加载一次/进程）。analyzer 不收就出现漂移红（全量 2 条），卡住 0.7.28 冻结。
+
+| 事件 | 字段（brain 权威，`longrun.py:1674-1677`） | 本工具 |
+|---|---|---|
+| `lessons_rejected` | `path` / `dropped`（丢掉几条）/ `reasons`（原因串）/ `kept`（这次载入**留下来**的条数）/ `note` | **信息项，拒收本身绝不判红**；头部 `拒收 N 次 / M 条（原因…）`；只有 `dropped>0 && kept==0` **连续 ≥2 天** ⇒ `warn:lessons_all_rejected` 可视行（不判红、不进 rc） |
+
+**红口径（本卡不加任何红，只加一条警告）**
+1. 拒收 = **正确行为**：文件被外部改过/结构不符时就该拒 ⇒ `dropped>0` 本身只记信息
+   （与 task-111 的"没学到东西不是失败"同一家族）。
+2. `dropped>0 && kept==0` 一天 ⇒ 仍只是信息（可能这一版库整体过期）；**连续 ≥2 天**
+   （按行号归属到 `day_start` 分天、要求相邻两天的日序连续）⇒ 头部 + 建议给
+   `warn:lessons_all_rejected`（文案写明"只作警告、不判红"）。
+3. 缺 `kept`（或事件缺失）⇒ 只进【无法判定】（**缺失 ≠ 0，绝不当"没被拒收"通过**）。
+4. `warn:` 是**可视行**不是红：`report["red"]` 不含它，`rc` 不变（退出码只表达有没有红）。
+
+**呈现**：`LLM 复盘/教训库:` 行尾部追加 `；拒收 N 次 / M 条（原因 r1、r2）`（可 grep `拒收`）；
+连续整版被拒时再追加 `⚠ warn:lessons_all_rejected（连续 K 天 dropped>0 且 kept==0：…；只作警告、不判红）`；
+建议 0o 在无红时也会给一条 warn 文案（有红时并入红那条）。
+
+**读数（task-116，2026-10-16）**：`py_compile -W error::SyntaxWarning` → `RC=0`；
+`tests.test_analyze_longrun` **135 OK**（+5：`TestLessonsRejected` —— 入桶不漂移 / 拒收本身不判红 /
+两连续天全丢只给警告 / 单天全丢不给警告 / 缺 `kept` ⇒ 无法判定）；全量 `discover -s tests`
+**677 OK（0 红）** ⇒ 0.7.28 放行条件的漂移红清零。八账本 rc 并排（本工具 / `verify-run3.py`）：
+green 0/0、run2 1/1、run3 1/1、run5 1/1、run6 1/1、run7 0/0、run8 1/1、vacuum 1/1 —— **一字未变**。
+
+```
+rg -n '"event": ?"lessons_rejected"' logs/longrun-*.jsonl
+python tools/analyze-longrun.py --journal logs/<run>.jsonl | rg "拒收|warn:lessons_all_rejected"
+python -c "import json;d=json.load(open('logs/<run>-lessons.json',encoding='utf-8'));print(type(d))"
+```
+
 ## 4. 复核命令
 
 ```
@@ -494,6 +530,6 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run8.jsonl   # r
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
 python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
-python -m unittest tests.test_analyze_longrun  # 当前 130 OK（task-111）
-python -m unittest discover -s tests           # 当前 665 OK（0 红；0.7.28 装机放行条件）
+python -m unittest tests.test_analyze_longrun  # 当前 135 OK（task-116）
+python -m unittest discover -s tests           # 当前 677 OK（0 红；0.7.28 装机放行条件）
 ```
