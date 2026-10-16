@@ -18,6 +18,11 @@
 3. **无硬失败**：当天 stages 的 failed 之和为 0。
 3b. **阶段后置条件成立**：优先读 `day_end.checks.no_unmet_stages`（task-15 起），读不到就
     按 `day_end.stages[].leftover` 自己算 —— 只认「做过且做完」，`blocked`/封格不得洗白成功。
+    **task-134 起（Lead 对齐）**：新账本会写 `stages[].assigned_undone`（**分配下去**的格 − 做成/
+    按规跳过）与日级 `deferred_tiles`（诚实上限 `stamina`/夜里/`budget` 留下的片区待办）；
+    `leftover`（= `DayReport.plot_pending`，整片还有多少可做）**只记录、不驱动** unmet ——
+    一天里阶段只领 `--size` 格，片区还有活 ≠ 这一段没做完。没有 `assigned_undone` 的旧账本
+    一律退回 leftover 口径（历史判决不许翻案）。
 3c. **过程里没有异常事件**：`bridge_down` / `watchdog_stop` / `modal_timeout` / `no_day_progress`
     出现任意一条即判未达标（这些是"人不在场也出过事"的证据）。
 4. **LLM 覆盖**：`decision` 条数、其中 `llm==true`（发起过模型调用）与 `source=="llm"`（模型结果真被采纳）
@@ -275,6 +280,12 @@ def build_days(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "dry_dead",
                     "dry_dead_status",
                     "gave_up_tiles",
+                    # task-134：日级「分配内未完成 / 片区还剩 / 诚实上限延后」三个口径
+                    # （阶段级同名字段在 `stages[]` 里，这里取日级汇总）。
+                    "assigned_undone",
+                    "plot_pending",
+                    "plot_pending_by_kind",
+                    "deferred_tiles",
                 )
             }
             fin_key = day_key({"final": cur["final"]}) if cur["final"] else "?"
@@ -877,30 +888,62 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         # **各自**扣掉 ⇒ 自算值也必须扣同样两笔，否则 run6 会被误判成"自述与自算不一致"。
         # 另有一条与 longrun 同义的防真空：扣完为 0、但当天没有任何成功动作、且两笔豁免都非零时，
         # 账本会写 no_unmet_stages=false（不能靠"全被豁免"换一个达标日）。
+        # task-134 起（Lead 对齐）：账本把「阶段分配下去的格 − 做成/按规跳过」写进
+        # `stages[].assigned_undone`（分配内没做完），而 `leftover`（= 片区还剩多少可做，
+        # 即 `DayReport.plot_pending`）**只作记录、不再驱动** `no_unmet_stages` —— 理由：
+        # 一天里阶段只领 `--size` 格（run9b 实测 12 格/段），片区还有活不等于这一段没做完；
+        # 另有一类"诚实上限"（`stamina`/夜里收工/`budget`）留下的片区待办降为 `deferred_tiles`。
+        # 旧账本没有 `assigned_undone` ⇒ 一律退回 leftover 口径，历史判决不许翻案。
+        _assigned_recs = [s for s in last_by_stage.values() if "assigned_undone" in s]
+        _has_assigned = bool(_assigned_recs)
+        if _has_assigned:
+            assigned_undone = sum(int(s.get("assigned_undone") or 0) for s in _assigned_recs)
+            deferred_tiles = int(end_stats.get("deferred_tiles") or 0)
+            effective_unmet = max(0, assigned_undone - unreach_exempt - refused_exempt)
+        else:
+            assigned_undone = None
+            deferred_tiles = 0
+            effective_unmet = max(0, leftover_targeted - unreach_exempt - refused_exempt)
         unmet = checks.get("no_unmet_stages")
-        effective_leftover = max(0, leftover_targeted - unreach_exempt - refused_exempt)
         _progress = int(_ok_self or 0) > 0
-        _vacuum_exempt = effective_leftover == 0 and not _progress and (unreach_exempt + refused_exempt) > 0
-        expected_unmet = (effective_leftover == 0) and not _vacuum_exempt
+        _vacuum_exempt = effective_unmet == 0 and not _progress and (unreach_exempt + refused_exempt) > 0
+        expected_unmet = (effective_unmet == 0) and not _vacuum_exempt
         if unmet is not None and bool(unmet) != expected_unmet:
+            _basis = (
+                f"分配内未完成 assigned_undone={assigned_undone} 格"
+                if _has_assigned
+                else f"有目标阶段遗留 leftover={leftover_targeted} 格"
+            )
             problems.append(
                 f"[{name}] checks.no_unmet_stages={unmet} 与自算不一致"
-                f"（有目标阶段遗留 leftover={leftover_targeted} 格，扣掉不可达豁免 {unreach_exempt}"
-                f" + 锄不动豁免 {refused_exempt} 后剩 {effective_leftover} 格、当天成功动作 {_ok_self}"
+                f"（{_basis}，扣掉不可达豁免 {unreach_exempt}"
+                f" + 锄不动豁免 {refused_exempt} 后剩 {effective_unmet} 格、当天成功动作 {_ok_self}"
                 f"；期望 {expected_unmet}）"
             )
         # 自述说"有阶段没做完"就一律算问题，**不因自算结果与它一致而放行**
         # （deputy-lead 负例 D：checks.no_unmet_stages=false 与 stages.leftover=5 一致地没做完，
         #   且 day_end.verified 自述 true ⇒ 旧口径零问题。工具的意义就是不信自述。）
         if unmet is False:
-            problems.append(
-                f"[{name}] checks.no_unmet_stages=false（有阶段后置条件未成立"
-                f"；自算有目标阶段 leftover={leftover_targeted} 格）"
+            _basis = (
+                f"分配内未完成 assigned_undone={assigned_undone} 格"
+                if _has_assigned
+                else f"自算有目标阶段 leftover={leftover_targeted} 格"
             )
-        if unmet is None and effective_leftover:
+            problems.append(f"[{name}] checks.no_unmet_stages=false（有阶段后置条件未成立；{_basis}）")
+        if unmet is None and effective_unmet:
             problems.append(
-                f"[{name}] 当天有阶段遗留目标 leftover={effective_leftover}"
+                f"[{name}] 当天有阶段遗留目标 unmet={effective_unmet}"
                 f"（阶段没做完；已扣不可达豁免 {unreach_exempt} + 锄不动豁免 {refused_exempt}）"
+            )
+        # task-134：片区待办只作信息 —— 但必须可见，否则复核的人会以为"没做完就是没做完"。
+        if _has_assigned and leftover_targeted:
+            infos.append(
+                f"[{name}] 片区还剩 {leftover_targeted} 格可做（plot_pending），但当日分配内已做净"
+                f"（task-134 口径；其中诚实上限延后 {deferred_tiles} 格）⇒ 不计 unmet"
+            )
+        elif _has_assigned is False and leftover_targeted:
+            infos.append(
+                f"[{name}] 旧口径账本：片区 leftover={leftover_targeted} 格（按 leftover 判 unmet）"
             )
         if leftover_zero_target:
             problems.append(

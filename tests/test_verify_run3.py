@@ -906,6 +906,70 @@ class TestVerifyRun3(unittest.TestCase):
         self.assertNotIn(vr.problem_day("[spring] 11] boom", known), known)
         self.assertNotIn(vr.problem_day("[summer 99] boom", known), known)
 
+    # ------------------------------------------------------------ task-134：assigned_undone 口径
+    def test_assigned_done_with_plot_pending_is_not_unmet(self):
+        """分配内做净、片区还剩（run9b 的假红形态）⇒ 新口径不许判 mismatch、只记信息。
+
+        run9b 真账本样例行：`{'stage':'till_area','tiles':12,'ok':12,'leftover':12,
+        'assigned':12,'assigned_undone':0}` —— 旧 leftover 口径会算出 effective_leftover=12
+        而账本写 `no_unmet_stages=true`，于是报"自述与自算不一致"。
+        """
+        rows = green_rows()
+        for r in rows:
+            if r.get("event") == "day_end":
+                r["stages"] = [stage("till_area", tiles=12, ok=12, leftover=12,
+                                     assigned=12, assigned_undone=0)]
+        ok, s = self.check(rows)
+        self.assertTrue(ok, s.get("problems"))
+        self.assertEqual(s["problems"], [])
+        self.assertTrue(any("plot_pending" in i for i in s["infos"]), s["infos"])
+
+    def test_assigned_undone_positive_matches_no_unmet_false(self):
+        """分配内真没做完 + 账本如实写 false ⇒ 不报 mismatch（但 false 本身仍是问题）。"""
+        rows = green_rows()
+        for r in rows:
+            if r.get("event") == "day_end":
+                r["stages"] = [stage("till_area", tiles=12, ok=9, leftover=15,
+                                     assigned=12, assigned_undone=3)]
+                r["checks"]["no_unmet_stages"] = False
+                r["verified"] = False
+        ok, s = self.check(rows, days=0)
+        self.assertFalse(any("与自算不一致" in p for p in s["problems"]), s["problems"])
+        self.assertTrue(any("no_unmet_stages=false" in p for p in s["problems"]), s["problems"])
+
+    def test_assigned_undone_lying_true_is_still_caught(self):
+        """账本谎报 true 而分配内还有 3 格没做完 ⇒ mismatch 必须被 SelfCheck 抓住。"""
+        rows = green_rows()
+        for r in rows:
+            if r.get("event") == "day_end":
+                r["stages"] = [stage("till_area", tiles=12, ok=9, leftover=15,
+                                     assigned=12, assigned_undone=3)]
+        ok, s = self.check(rows, days=0)
+        self.assertTrue(any("assigned_undone=3" in p and "与自算不一致" in p for p in s["problems"]),
+                        s["problems"])
+
+    def test_deferred_tiles_is_reported_as_info(self):
+        """诚实上限延后的片区待办：`deferred_tiles` 只作信息，不许变成 unmet。"""
+        rows = green_rows()
+        for r in rows:
+            if r.get("event") == "day_end":
+                r["stages"] = [stage("till_area", tiles=12, ok=11, skipped=1, leftover=11,
+                                     assigned=12, assigned_undone=0)]
+                r["deferred_tiles"] = 11
+        ok, s = self.check(rows)
+        self.assertTrue(ok, s.get("problems"))
+        self.assertTrue(any("诚实上限延后 11 格" in i for i in s["infos"]), s["infos"])
+
+    def test_legacy_ledger_without_assigned_still_uses_leftover(self):
+        """无 `assigned_undone` 的旧账本 ⇒ 退回 leftover 口径（历史判决不许翻案）。"""
+        rows = green_rows()
+        for r in rows:
+            if r.get("event") == "day_end":
+                r["stages"] = [stage("till_area", tiles=12, ok=12, leftover=12)]
+        ok, s = self.check(rows, days=0)
+        self.assertTrue(any("与自算不一致" in p and "leftover=12" in p for p in s["problems"]),
+                        s["problems"])
+
 
 if __name__ == "__main__":
     unittest.main()
