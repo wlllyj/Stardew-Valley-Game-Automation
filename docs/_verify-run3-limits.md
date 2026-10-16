@@ -8,6 +8,7 @@
 - **v5 2026-10-14 22:4x（本文档当前版本，task-79）**：记录 task-68 的 `encircled` 带来的**V5 洗白通道已关闭** —— 上界分母从 `attempted` 换成 **`bound_basis = attempted − encircled`**（"被围住的格既不是走不到、也不是干了没成，不该为豁免额度做贡献"）：脑侧 task-78 落地字段、工具侧 Lead 镜像提交 **`2ce830b`**（1051 行，sha256 `FDB4E8D9…`；自算 `max(5, floor(0.2×bound_basis))`，账本 `bound_basis` > 自算 或账本 `*_bound` > 自算 ⇒ problem）。§2.1 补双侧读数、§3 加第 13 条、§4 新增 **B15（已关闭）/ B16（开放）/ B17（开放）**、§9.5 记双侧实测原文。**明确保留开放、不许写成已修**：**V1 = B16**（0 阶段 + `no_work` 理由 + `verified` ⇒ 两侧都 exit 0）、**V2 = B17**（遮蔽，task-15 已知）、**B11**。
 - **v6 2026-10-15 20:4x（task-86）**：Lead 把**验收口径**从"整本账本零问题"改成"**尾部连续 N 天达标 + 窗口内问题为空**"（提交 **`7c4ff68`**：`tools/verify-run3.py` +30 / `tests/test_verify_run3.py` +35 / `docs/_run6-criteria.md` +5 / `scratch/_run7_summary.py` +44；父 `1ffe2ca`）。窗口之外日子的**日级**问题降级为 `--json` 的 **`history_problems`**（人类输出里"历史问题（达标窗口之外…）"段），`streak < --days` **不降级**，不带 `[day]` 前缀的**全局**问题（journal 损坏 / `mod_version_mismatch` / `finish` 自相矛盾）**永不降级**。我独立两侧复跑 78 本账本（`scratch/_t86_side.py`）：**只有 run7 一本改变**（rc 1→0、9 条问题→9 条 history、VERIFIED），其余逐字不变；`--days 5` 零变化。**同时打穿/新增三条盲区 B19–B21**（详见 §11）：B19 = 打穿（窗口内问题可被"含 `]` 的 day 标签"降级）；B20 = 窗口外系统性缺陷被一路放过（设计取舍，需明示）；B21 = `analyze-longrun.py`（整本）与本工具（窗口）结论反向。判定见 `docs\_review-caliber-2026-10-15.md`（**FAIL**）。
 - **v7 2026-10-15 20:5x（task-90，本文档当前版本）**：**B19（日标签注入 ⇒ 假 VERIFIED）已关闭** —— Lead 提交 **`c6d2a7a`**（`tools/verify-run3.py` +44/−5：新增 `_clean_label()` 净化 `[`/`]`/换行/制表、`problem_day()` 按**已知日标签最长前缀匹配**、降级条件改成 `head and head in known_names and head not in tail_names` ⇒ **头部标签不属于任何已知日 ⇒ 一律 fatal**；`tests/test_verify_run3.py` +55 两条新用例；`docs/_run6-criteria.md` +2）。我独立三副本复跑（`old`=`7c4ff68^` / `buggy`=`7c4ff68` / `fixed`=`c6d2a7a`，冻结脚本 `scratch/_t90_freeze.py`）：A4b 从 `buggy rc 0 / VERIFIED` 变 **`fixed rc 1 / needs_review`、问题留在 `problems`、history 为空**；85 本并排里 **`buggy`↔`fixed` 只有 A4b 一本不同**（run7 两者逐字相同 rc 0/0/9）；**同类洞普查**：全工具只有 1 处"按首个 `]` 截断"（`:127` 的 fallback），609 次 `problem_day` 调用里 **0 次走 fallback**（606 次最长前缀命中、3 条全局问题无前缀）⇒ 该分支对工具自产问题不可达；其余"从文本解析结构化字段"的站点（`ended_reason`/`reason` 的 `startswith` 白名单、`_UNREACH_MARKS` 子串）属**信任账本自述**类（B11/B16/B20 一线），不是分隔符截断。**B20 / B21 与 B11/B16/B17 一律保留开放**。§0 记录、§4 表、§12 为本次新增。
+- **v8 2026-10-16 21:2x（task-128，本文档当前版本）**：Lead 进一步收紧 SMAPI 落盘判据（commit **`99eb8e0`** + task-126）—— **每次跨日都必须完成一次落盘**，`Synchronizing 'NewDay' task` 次数 > `SaveGame.Save() called.` 次数 ⇒ **硬问题**（task-61 的"有期限豁免"作废）。我把 `scratch/_t45_three_source.py` 的 **P3c 从 info 升为 problem**（文案以"跨日未落盘"开头；连续缺失合并；"日志仍在写"不再豁免，只加 info；缺失 ≠ 通过），保留 P3a/P3b。双侧实测：**run7 exit 0 / GREEN（NewDay 8 = Save-called 8，用 run7 时代存档）**、**run9 exit 1 且点出"连续 4 次跨日都没有 SaveGame.Save() called."**；夹具 10 例改判 **只有 `pos-G-one-day-no-save` 0 → 1**（期望表待改，属口径收紧的直接后果）。详见 **§14**。
 - **一句话结论（v3）**：K3（`finish` 自述反向）、K4（浇水两处自述矛盾）、**K2（window 口径 0 覆盖却自称浇过户外水）**已被抓（exit 1）；**完全自洽的伪造账本 `review-neg-K` 仍然 exit 0** —— `verify-run3.py` 验的是**这一本账本自己是否自洽**，**不是世界真的推进过 3 天**。防伪造仍必须靠**账本之外的证据**（§5）。
 
 ## §0 修订记录（初版 → v2 加固 → v3）
@@ -449,4 +450,51 @@ $env:PYTHONUTF8="1"
 & $py scratch\_t93_matrix.py          # task-93 六项正/负例 → scratch\_t93_matrix_out.txt
 & $py scratch\_t45_run_matrix.py      # 既有 10 例回归（pos-I 期望已按 NIT-5 改成 1）
 ```
+
+## §14 task-128 实测：判据收紧"每次跨日都必须落盘"（P3c info → problem，2026-10-16）
+
+**来源**：Lead commit `99eb8e0`（`docs/_run6-criteria.md` §2 +4 行、`scratch/run9-lead-check.py` +11/−4；**没碰本工具**）＋ task-126（用 IL 钉死"第二天早晨清 `ShippingMenu` 掐断保存链"）。口径原文：**每次跨日都必须完成一次落盘**；`Synchronizing 'NewDay' task` 次数 > `SaveGame.Save() called.` 次数 ⇒ **硬问题**（task-61 的"有期限豁免"作废，只留档）。
+
+**改动（只改 `check_smapi_pairs`，文件 `scratch/_t45_three_source.py`）**
+
+- P3c 判据从"NewDay 后 `grace_s` 内无 `SaveGame.Save() completed.` ⇒ info `save_skipped_by_game`（连续 ≥2 才 problem）"改为"**每个 NewDay 必须在 `--save-grace`（默认 180s）内配一条 `SaveGame.Save() called.`，缺 ⇒ 一律 problem，文案以「跨日未落盘」开头**"；连续缺失合并成一条（`连续 N 次跨日都没有 SaveGame.Save() called.`）。
+- 旧的"最后一个 NewDay 之后日志仍在写 ⇒ 豁免"删除，改为在该次缺失上**另记一条 info**（"日志仍在写 ⇒ 可能仍在落盘"），**但 problem 照记** —— 即 **缺失计数 ⇒ 无法判定，缺失 ≠ 通过**。
+- 新增（info）：`SaveGame.Save() called.` 有、`completed` 无 ⇒ "落盘未完成（缺失 ≠ 通过）"；**硬判据只看 NewDay ↔ called**。
+- P3a（每次跨日配一条 NewDay）与 P3b（`completed` 反查 NewDay）**原样保留**。
+
+**双侧读数**
+
+| 样本 | 改前 | 改后 | 关键证据 |
+| --- | --- | --- | --- |
+| run7（`logs/longrun-3day-llm-run7.jsonl` + `scratch/_t86_smapi_run7_live.txt` + **run7 时代存档**） | exit 0（GREEN） | **exit 0 / problem 0 / info 6 / ok 13（GREEN）** | SMAPI `NewDay 8 / Save-called 8 / Save-done 8` ⇒ 8/8 全配对 |
+| run9（`logs/longrun-3day-llm-run9.jsonl` + `logs/run9-smapi-window.txt` + 实时存档） | exit 1 / problem 5（旧 P3c 已报"连续 3 次跨日都没有落盘"） | **exit 1 / problem 5 / info 9 / ok 5**，第 1 条改写 | `跨日未落盘：连续 4 次跨日都没有 SaveGame.Save() called.（1年 summer 15日（行 997 @ 20:44:28）、1年 summer 16日（行 1887 @ 20:49:22）、第 3 次跨日（行 3003 @ 20:55:44）、第 4 次跨日（行 4532 @ 21:04:09））⇒ 存档链断了，账本的天数没有存档背书` |
+
+改前 run9 那条是旧口径的 `save_skipped_by_game：连续 3 次跨日都没有落盘`；改后按"每次 NewDay 都要 called"报 **4 次**，第 4 次不再因"日志仍在写"被豁免。
+
+**run7 为什么必须换存档目录**：实时 `Wahaha_450799035` 已是 run8 的落盘（3706657 B / `[1,'summer',13]` / money 188 / mtime `2026-10-15 22:22:57.011`），直接喂 run7 会得到与本次改动**无关**的 P4 红（`存档比账本收尾还新 3 天`）。本卡用 `_old` 对（3648782 B / `[1,'summer',11]` / money 14 / mtime `2026-10-14 23:33:11.539`，run7 收工后、run8 之前的世代）以 `shutil.copy2` 复制成 `scratch/_t128_fx/save_run7/{Wahaha_450799035,SaveGameInfo}`（保留 mtime）⇒ P4 走 task-93 的"存档新 1 天 + 有 `finish` ⇒ info" ⇒ GREEN。
+
+**夹具矩阵改判（逐条；`scratch/_t45_run_matrix.py`，改前 `scratch/_t128_before_matrix.txt`、改后 `scratch/_t128_after_matrix.txt`）**
+
+| 夹具 | 改前 exit/期望 | 改后 exit/期望 | 为什么 |
+| --- | --- | --- | --- |
+| `ok` | 0/0 | 0/0 | 无缺失 |
+| `pos-E-save-one-day-behind` | 0/0 | 0/0 | 无缺失 |
+| **`pos-G-one-day-no-save`** | **0/0** | **1/0（不符期望）** | 它字面就是"有一天 NewDay 没落盘"⇒ 新口径下正是 problem：`跨日未落盘：1年 spring 28日（行 10 @ 20:40:00）有 Synchronizing 'NewDay' task，但 180s 内没有 SaveGame.Save() called.` |
+| `pos-I-midrun-last-day-open` / `neg-A` / `neg-B` / `neg-C` / `neg-D` / `neg-F` / `neg-H` | 1/1 | 1/1 | 逐字不变 |
+| **合计** | 10/10 符合 | **9/10 符合**（唯一不符 = `pos-G`，**期望表过期**，非工具回归） | 本卡写范围只允许上面两个文件，故 **未改** runner 的期望表；建议随后把 `pos-G` 期望 `0 → 1`（一行）并注明 "task-128 判据收紧" |
+
+**复跑命令**（原文输出：`scratch/_t128_{before,after}_run7.txt`、`..._run9.txt`、`..._matrix.txt`）
+
+```powershell
+$py = "C:\Users\admin\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
+$env:PYTHONUTF8="1"
+# run7（run7 时代存档 ⇒ 必须 exit 0 / GREEN）
+& $py scratch\_t45_three_source.py --ledger logs\longrun-3day-llm-run7.jsonl --smapi scratch\_t86_smapi_run7_live.txt --save-dir scratch\_t128_fx\save_run7 --snapshots scratch\no_such.jsonl --baseline logs\run7-baseline.json --date 2026-10-14
+# run9（实时存档 ⇒ 必须 exit 1，且含"跨日未落盘"）
+& $py scratch\_t45_three_source.py --ledger logs\longrun-3day-llm-run9.jsonl --smapi logs\run9-smapi-window.txt --save-dir "$env:APPDATA\StardewValley\Saves\Wahaha_450799035" --snapshots scratch\run9-external-snapshots.jsonl --baseline logs\run9-baseline.json --date 2026-10-16
+# 夹具 10 例（现 9/10；pos-G 期望待改）
+& $py scratch\_t45_run_matrix.py
+```
+
+**范围声明**：本卡只写 `scratch/_t45_three_source.py` 与本文档；**没有碰** `brain/`、`mod/`、`tools/verify-run3.py`、`docs/_run6-criteria.md`。run7 时代存档夹具是新写的**数据**目录 `scratch/_t128_fx/save_run7/`（不含代码）。
 

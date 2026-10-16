@@ -263,10 +263,12 @@ def check_ledger_chain(led, rep: Report) -> list[dict]:
 
 
 def check_smapi_pairs(advances: list[dict], sm, led, rep: Report, grace_s: float) -> None:
-    """P2/P3a-c（Lead 裁定后的口径）：
-    P3a 每次跨日必须配对一条 NewDay；
+    """P2/P3a-c（Lead 2026-10-16 收紧后的口径，来源 commit 99eb8e0 + task-126）：
+    P3a 每次跨日必须配对一条 `Synchronizing 'NewDay' task`；
     P3b **反方向**：不许出现 `SaveGame.Save() completed` 却找不到对应 NewDay；
-    P3c NewDay 有、Save 没有 ⇒ 记 info（`save_skipped_by_game`，游戏自身跳过保存），**连续 ≥2 天**才升 problem。
+    P3c **每次 NewDay 必须配一条 `SaveGame.Save() called.`，缺 ⇒ 一律 problem「跨日未落盘」**
+    （旧的"游戏自身跳过保存只记 info / 连续 ≥2 才升"与"日志仍在写 ⇒ 豁免"作废，只留档；
+     缺失计数 ⇒ 无法判定，**缺失 ≠ 通过**）。
     """
     if sm is None:
         rep.info("没有 SMAPI 日志可读 ⇒ 只做账本与存档对账（证据强度下降）")
@@ -288,36 +290,44 @@ def check_smapi_pairs(advances: list[dict], sm, led, rep: Report, grace_s: float
         if not any(0 <= (sd["at"] - nd["at"]).total_seconds() <= grace_s for nd in newdays):
             rep.problem(f"L{sd['line']} @ {sd['at'].strftime('%H:%M:%S')} 有 'SaveGame.Save() completed'，"
                         f"但前面 {int(grace_s)}s 内没有 `Synchronizing 'NewDay' task`（反方向对不上）")
-    # ---- P3c：NewDay 之后没落盘
+    # ---- P3c：每次 NewDay 都必须落盘（Lead 2026-10-16 收紧；`called` 级配对）
     missing: list[tuple[int, dict]] = []
     for i, nd in enumerate(newdays, 1):
-        if not any(0 <= (sd["at"] - nd["at"]).total_seconds() <= grace_s for sd in sm["save_done"]):
+        if not any(0 <= (sd["at"] - nd["at"]).total_seconds() <= grace_s for sd in sm["save_called"]):
             missing.append((i, nd))
     if missing and sm.get("mtime"):
         log_mtime = datetime.fromtimestamp(sm["mtime"])
-        last_nd = newdays[-1]
-        if missing[-1][1] is last_nd and 0 <= (log_mtime - last_nd["at"]).total_seconds() < grace_s:
-            i, nd = missing.pop()
+        i, nd = missing[-1]
+        if 0 <= (log_mtime - nd["at"]).total_seconds() < grace_s:
             rep.info(f"第 {i} 次 NewDay（行 {nd['line']} @ {nd['at'].strftime('%H:%M:%S')}）之后 "
-                     f"{int(grace_s)}s 内还没有 Save，但日志仍在写（mtime {log_mtime.strftime('%H:%M:%S')}）"
-                     "⇒ 暂按『可能仍在写盘』处理，不计入跳过")
+                     f"{int(grace_s)}s 内还没有 Save，且日志仍在写（mtime {log_mtime.strftime('%H:%M:%S')}）"
+                     "⇒ 可能仍在落盘；按收紧后的口径（缺失 ≠ 通过）仍记 problem")
     runs: list[list[tuple[int, dict]]] = []
     for item in missing:
         if runs and item[0] == runs[-1][-1][0] + 1:
             runs[-1].append(item)
         else:
             runs.append([item])
+
+    def _who(i, nd):
+        day = ordinal_str(advances[i - 1]["end_day"]) if i <= len(advances) else f"第 {i} 次跨日"
+        return f"{day}（行 {nd['line']} @ {nd['at'].strftime('%H:%M:%S')}）"
+
     for run in runs:
-        def _who(i, nd):
-            day = ordinal_str(advances[i - 1]["end_day"]) if i <= len(advances) else f"第 {i} 次跨日"
-            return f"{day}（行 {nd['line']} @ {nd['at'].strftime('%H:%M:%S')}）"
         where = "、".join(_who(i, nd) for i, nd in run)
         if len(run) >= 2:
-            rep.problem(f"save_skipped_by_game：连续 {len(run)} 次跨日都没有落盘（{where}）"
-                        "⇒ 游戏连续多日不落盘，账本的天数没有存档背书")
+            rep.problem(f"跨日未落盘：连续 {len(run)} 次跨日都没有 `SaveGame.Save() called.`（{where}）"
+                        "⇒ 存档链断了，账本的天数没有存档背书（每次跨日都必须完成一次落盘；缺失 ≠ 通过）")
         else:
-            rep.info(f"save_skipped_by_game：{where} 有 NewDay 但没有 SaveGame.Save() completed"
-                     f"（{int(grace_s)}s 内）⇒ 按『游戏自身跳过保存』记 info（task-47 在挖触发条件），不判 problem")
+            rep.problem(f"跨日未落盘：{where} 有 `Synchronizing 'NewDay' task`，但 "
+                        f"{int(grace_s)}s 内没有 `SaveGame.Save() called.`"
+                        "⇒ 这次跨日的进度没有落盘背书（每次跨日都必须完成一次落盘；缺失 ≠ 通过）")
+    # `SaveGame.Save() called.` 有、`completed` 没有：落盘开始却没看到完成行。硬判据只看 NewDay↔called，
+    # 这里只记 info（活的跑批尾部可能仍在写），但同样遵守"缺失 ≠ 通过"。
+    for sc in sm["save_called"]:
+        if not any(0 <= (dn["at"] - sc["at"]).total_seconds() <= grace_s for dn in sm["save_done"]):
+            rep.info(f"L{sc['line']} @ {sc['at'].strftime('%H:%M:%S')} 有 `SaveGame.Save() called.`，"
+                     f"但 {int(grace_s)}s 内没有 `SaveGame.Save() completed.` ⇒ 落盘未完成（缺失 ≠ 通过）")
 
 
 def check_save(advances: list[dict], sv, led, rep: Report) -> None:
