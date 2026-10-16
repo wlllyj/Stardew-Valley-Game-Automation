@@ -1266,8 +1266,10 @@ class TestTask42Sell(unittest.TestCase):
 
     @staticmethod
     def _ripe(tile=(62, 15)) -> dict:
+        # 【task-170】`ready` 是游戏口径（Mod 0.7.32+ 发），缺它 ⇒ 脑侧 fail-closed 不摘。
         return {"tile": list(tile), "kind": "dirt", "feature": "HoeDirt", "crop": "24",
-                "ripe": True, "watered": True, "standable": True, "actionable": True}
+                "ripe": True, "ready": True, "harvestMethod": "Grab",
+                "watered": True, "standable": True, "actionable": True}
 
     def test_harvest_records_loot_only_when_inventory_grows(self):
         """①作物摘下来 + 背包多了一件 ⇒ 进白名单；只摘下来而背包没多 ⇒ **不进**白名单。"""

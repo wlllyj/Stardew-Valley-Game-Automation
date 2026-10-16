@@ -535,6 +535,7 @@ namespace AgentFarm.Bridge
                 case "weed": plan.Add("hoe"); break;                 // ← 真机实证：锄头除草
                 case "dirt": plan.Add(hasCrop ? "can" : "hoe"); break;
                 case "grass": plan.Add("scythe"); break;
+                case "scytheCrop": plan.Add("scythe"); break;   // 【task-170】镰刀类作物只能走工具路径
                 case "tree":
                     plan.Add("axe"); break;
                 case "clump":
@@ -626,7 +627,20 @@ namespace AgentFarm.Bridge
                 StardewValley.TerrainFeatures.TerrainFeature tf = null;
                 try { if (loc.terrainFeatures != null) loc.terrainFeatures.TryGetValue(v, out tf); } catch { }
                 if (tf is StardewValley.TerrainFeatures.Grass) return "grass";
-                if (tf is StardewValley.TerrainFeatures.HoeDirt) return "dirt";
+                if (tf is StardewValley.TerrainFeatures.HoeDirt)
+                {
+                    // 【task-170】镰刀类作物（`harvestMethod==Scythe`）的正确入口是**工具动作**
+                    // （`HoeDirt.performToolAction` 的 scythe 分支：`scratch\il-hv-4.txt:136-240`），
+                    // 而 `interact` 走的 `performUseAction` 分支永远摘不到它 ⇒ 单独给一个 kind，
+                    // 让 plan 首选镰刀、Done() 等"作物消失"。
+                    try
+                    {
+                        var hd = (StardewValley.TerrainFeatures.HoeDirt)tf;
+                        if (hd.crop != null && CropMeta.IsScythe(hd.crop)) return "scytheCrop";
+                    }
+                    catch { }
+                    return "dirt";
+                }
                 if (tf is StardewValley.TerrainFeatures.Tree) return "tree";
             }
             catch { }
@@ -694,6 +708,10 @@ namespace AgentFarm.Bridge
                 string kind = this._wantedKind ?? "";
                 if (kind == "hoe") return hd != null;
                 if (kind == "can") return hd != null && watered;
+                // 【task-170】镰刀类作物（走工具路径的那种）：判据 = 这一格的作物**真的没了**。
+                // 不能落到下面的默认分支 —— HoeDirt 上没有"物体"、也不是 Tree/Clump，
+                // 默认分支会立刻回 true（= 一刀没挥就报"已经空了"，正是 run1 grass 假 ok 的形态）。
+                if (kind == "scytheCrop") return CropAt(this.Target) == null;
 
                 if (hasObject) return false;
                 if (tf is StardewValley.TerrainFeatures.Tree) return false;

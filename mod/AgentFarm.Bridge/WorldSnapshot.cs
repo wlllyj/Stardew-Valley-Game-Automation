@@ -634,11 +634,18 @@ namespace AgentFarm.Bridge
                                 {
                                     t.Crop = cr.indexOfHarvest?.Value;
                                     t.Ripe = cr.fullyGrown != null && cr.fullyGrown.Value;
+                                    // 【task-170】`ripe` 保留裸 `Crop.fullyGrown`（历史口径，勿当判据）；
+                                    // `ready` = 游戏自己的 `HoeDirt.readyForHarvest()` 等价实现
+                                    // （见 `CropMeta`），另外把子形态判别量一次填齐。
+                                    CropMeta.Fill(t, cr);
+                                    t.Ready = CropMeta.Ready(hd, cr);
                                     t.Dead = cr.dead != null && cr.dead.Value;
                                     // task-84：枯死作物**不该浇水**（用户 m11003：死苗还在被浇）⇒
                                     // Tool 不再对死苗返回 "can"（观测层就不再把它当"该浇水"）。
                                     // 清死苗走 task-51 的 clear_dead（镰刀/锄头），不是水壶。
-                                    t.Tool = (t.Ripe || t.Dead) ? "none" : "can";
+                                    // 【task-170】"该浇水"的判据也从裸 `ripe` 换成真口径 `ready`：
+                                    // 复收冷却 / 未熟但 `fullyGrown` 的格**要浇水**（旧代码把它当"熟了"⇒ 永不浇）。
+                                    t.Tool = (t.Ready == true || t.Dead) ? "none" : "can";
                                 }
                                 else
                                 {

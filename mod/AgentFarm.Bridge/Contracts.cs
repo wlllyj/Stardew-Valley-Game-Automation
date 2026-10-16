@@ -522,6 +522,47 @@ namespace AgentFarm.Bridge
         /// <summary>作物是否已枯死（`Crop.dead`）。</summary>
         [JsonPropertyName("dead")] public bool Dead { get; set; }
 
+        // ------------------------------------------------------------------
+        //  【task-170】作物"能不能收"的游戏口径 + 子形态判别量
+        //
+        //  run A/B 事故：旧 `ripe` = 裸 `Crop.fullyGrown`，而游戏给收的判据是
+        //  `HoeDirt.readyForHarvest()` ⇒ `(60,29)` 跨 8 个游戏日恒 `ripe=true`、284 次尝试 0 成功。
+        //  `ripe` **保留原义**（历史字段，勿当判据）；`ready` 才是权威口径，
+        //  判不了时是 **null（不是 false）**。
+        // ------------------------------------------------------------------
+
+        /// <summary>
+        /// 【task-170】**游戏口径**的"现在可收"= `HoeDirt.readyForHarvest()`
+        /// （等价实现见 `CropMeta.Ready`）。没有作物 / 不是耕地 / 判据缺项 ⇒ **null（判不了）**。
+        /// 脑侧只许用它选收获目标（fail-closed：null ⇒ 不摘）。
+        /// </summary>
+        [JsonPropertyName("ready")] public bool? Ready { get; set; }
+
+        /// <summary>裸 `Crop.fullyGrown`（历史字段；**不要**拿它当"可收"判据）。</summary>
+        [JsonPropertyName("fullyGrown")] public bool? FullyGrown { get; set; }
+
+        /// <summary>`Crop.HarvestMethod.ToString()`：`"Grab"` / `"Scythe"`；没有作物 ⇒ null。
+        /// `Scythe` ⇒ 只能走**工具路径**（`interact` 永远摘不到）。</summary>
+        [JsonPropertyName("harvestMethod")] public string HarvestMethod { get; set; }
+
+        /// <summary>`Crop.currentPhase`（没有作物 / 读不到 ⇒ null）。</summary>
+        [JsonPropertyName("currentPhase")] public int? CurrentPhase { get; set; }
+
+        /// <summary>`Crop.phaseDays.Count`（没有作物 / 读不到 ⇒ null）。</summary>
+        [JsonPropertyName("phaseDays")] public int? PhaseDays { get; set; }
+
+        /// <summary>`Crop.dayOfCurrentPhase`（复收冷却期 &gt; 0；没有作物 / 读不到 ⇒ null）。</summary>
+        [JsonPropertyName("dayOfCurrentPhase")] public int? DayOfCurrentPhase { get; set; }
+
+        /// <summary>`Crop.forageCrop`（采集作物；没有作物 / 读不到 ⇒ null）。</summary>
+        [JsonPropertyName("forageCrop")] public bool? ForageCrop { get; set; }
+
+        /// <summary>`Crop.whichForageCrop`（采集作物形态 `"2"` 游戏不给收；读不到 ⇒ null）。</summary>
+        [JsonPropertyName("whichForageCrop")] public string WhichForageCrop { get; set; }
+
+        /// <summary>`Crop.RegrowsAfterHarvest()`（复收作物；读不到 ⇒ null）。</summary>
+        [JsonPropertyName("regrowsAfterHarvest")] public bool? RegrowsAfterHarvest { get; set; }
+
         /// <summary>耕地是否已浇水（`HoeDirt.isWatered()`）。</summary>
         [JsonPropertyName("watered")] public bool Watered { get; set; }
 
@@ -597,6 +638,13 @@ namespace AgentFarm.Bridge
         [JsonPropertyName("emptyDirt")] public int EmptyDirt { get; set; }
         [JsonPropertyName("crops")] public int Crops { get; set; }
         [JsonPropertyName("ripeCrops")] public int RipeCrops { get; set; }
+
+        /// <summary>
+        /// 【task-170】**游戏口径**的可收作物格数（`HoeDirt.readyForHarvest()`，等价实现
+        /// `CropMeta.Ready`），与逐格 `tiles[].ready` 同源。`ripeCrops`（裸 `Crop.fullyGrown`）
+        /// 保留作历史字段 —— run A/B 284 次 0 成功就是拿它当"可收"判据的后果。
+        /// </summary>
+        [JsonPropertyName("readyCrops")] public int ReadyCrops { get; set; }
 
         /// <summary>
         /// **枯死作物格数**（farm-wide 真值，与 <see cref="Crops"/>/<see cref="RipeCrops"/> **同一次扫描口径**：
@@ -914,6 +962,16 @@ namespace AgentFarm.Bridge
         /// 其它技能恒为 `true`（本字段对它们无意义，可忽略）。
         /// </summary>
         [JsonPropertyName("worldResumed")] public bool WorldResumed { get; set; } = true;
+
+        /// <summary>
+        /// 【task-170】技能自己报的"**是否真的做成了**"（机器可读；不适用时 null）。
+        ///
+        /// `interact` 专用：游戏 `checkAction` 的返回值就是"这一格有没有可执行动作"，
+        /// 旧实现只看有没有抛异常（`Ok = err == null`）⇒ **游戏拒绝也报 ok**、`acted` 只写在 reason
+        /// 文本里（run A/B 的"回执谎报"第三次）。现在 `acted == false` ⇒ `ok=false` + `status="no_action"`，
+        /// 脑不必再靠 reason 猜。
+        /// </summary>
+        [JsonPropertyName("acted")] public bool? Acted { get; set; }
 
         // ------------------------------------------------------------------
         //  里程碑 B（move_to_location）新增：成功/失败都给的“可审计行程单”

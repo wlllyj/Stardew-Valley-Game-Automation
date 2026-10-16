@@ -91,6 +91,9 @@ class FakeWorld:
         self.clump_meta: dict[tuple[int, int], dict] = {}
         self.dirt: set[tuple[int, int]] = set()
         self.crops: dict[tuple[int, int], dict[str, bool]] = {}
+        #: 【task-170】`True` ⇒ 观测里**不发** `tiles[].ready`（模拟 <0.7.32 的旧 Mod）：
+        #: 用来逼出"缺新字段 ⇒ fail-closed（不摘、不生成 harvest 目标）"。
+        self.drop_ready_fields = False
         self.player_tile = [62, 14]
         self.is_in_bed = True
         #: 当前地点名 —— `FarmWorker.ensure_location/sleep` 会读它（task-15 让真 `FarmWorker`
@@ -127,6 +130,11 @@ class FakeWorld:
         # task-4：`use_tool` 的计数与"白挥"集合（真机 run1：镰刀在背包里、挥了世界不变）。
         self.swings: dict[tuple[int, int], int] = {}
         self.stuck: set[tuple[int, int]] = set()
+        #: 【task-170】`interact` 命中可收作物 ⇒ 真的摘掉（模拟游戏 `checkAction` →
+        #: `HoeDirt.performUseAction` → `Crop.harvest`）。`harvest_item=None` ⇒ 摘掉了但什么都没进背包。
+        self.harvest_on_interact = True
+        self.harvest_item: str | None = "Parsnip"
+        self.interacted: list[tuple[int, int]] = []
         #: task-22：环境挡路 / 没结论的注入队列（见 `take_fail_status`）。
         self.fail_status: dict[tuple[int, int], str | list[str]] = {}
         # ---- task-11：模态脚本（mode guard）----
@@ -168,8 +176,17 @@ class FakeWorld:
                         "standable": True, "actionable": True}
             c = self.crops.get(t)
             if c:
-                tv.update({"crop": "24", "ripe": bool(c["ripe"]), "watered": bool(c["watered"]),
+                # 【task-170】真 Mod 0.7.32+ 的作物格带**游戏口径** `ready`（反射
+                # `HoeDirt.readyForHarvest()`）与 `harvestMethod`。默认 `ready = ripe`
+                # （保持老用例语义），要造"裸 ripe=true 但游戏不给收"就显式写
+                # `{"ripe": True, "ready": False}`；`drop_ready_fields=True` 模拟旧 Mod（缺字段）。
+                tv.update({"crop": "24", "ripe": bool(c["ripe"]),
+                           "ready": bool(c.get("ready", c.get("ripe"))),
+                           "harvestMethod": str(c.get("harvestMethod") or "Grab"),
+                           "watered": bool(c["watered"]),
                            "dead": bool(c.get("dead")), "plantable": False})
+                if self.drop_ready_fields:
+                    tv.pop("ready", None)
             else:
                 tv.update({"plantable": True, "watered": False})
             tiles.append(tv)
@@ -238,6 +255,9 @@ class FakeWorld:
         return {
             "loaded": True, "complete": True,
             "crops": crops, "ripeCrops": ripe, "deadCrops": dead,
+            # 【task-170】`readyCrops` = 游戏口径可收数（与逐格 `ready` 同源）。
+            "readyCrops": sum(1 for c in self.crops.values()
+                              if c.get("ready", c.get("ripe"))),
             "dryCrops": dry, "dryDeadCrops": dry_dead,
             "dryTiles": sorted(dry_tiles), "dryTilesTruncated": False,
             "unwateredCrops": crops, "hoeDirt": len(self.dirt),
@@ -362,10 +382,38 @@ class FakeWorld:
             self.water_left -= 1
             self.spend("water")
             return {"ok": True, "status": "ok", "reason": "浇过"}
+        if tool == "scythe" and _c is not None and str(_c.get("harvestMethod") or "") == "Scythe" \
+                and _c.get("ready", _c.get("ripe")):
+            # 【task-170 ③】镰刀类作物只能走工具路径（真机 `HoeDirt.performToolAction` 的
+            # scythe 分支；`interact` 永远摘不到）。
+            return self.harvest_now(t)
         if self.blockers.pop(t, None) is None:
             return {"ok": True, "status": "ok", "reason": "挥了，但这格本来就没东西"}
         self.spend("clear")
         return {"ok": True, "status": "ok", "reason": "清掉"}
+
+    def harvest_now(self, tile):
+        """【task-170】真 `FarmWorker.harvest()` 的假世界版：可收作物 ⇒ crop 消失（可选 +1 进背包）。
+
+        （假执行层 `FakeWorker` 用的是上面那个 `harvest()`（返回 `StepResult`）；这里是
+        **桥路径**：真 `FarmWorker` 走 `client.interact`/`client.use_tool`，回执必须是 dict。）
+        回执口径与真 Mod 对齐：**没动手就必须说没动手**（`ok=false` 或 `acted=false`），
+        这正是 run A/B "284 次尝试 0 成功还报 ok" 的第二层病根。
+        """
+        t = tuple(tile)
+        c = self.crops.get(t)
+        if c is None:
+            return {"ok": True, "status": "no_action", "acted": False, "reason": "这一格没有作物"}
+        if not c.get("ready", c.get("ripe")):
+            return {"ok": True, "status": "no_action", "acted": False,
+                    "reason": "游戏口径不可收（ready=false：复收冷却/阶段没走完/枯死）"}
+        del self.crops[t]
+        self.spend("harvest")
+        if self.harvest_item is not None:
+            self.inventory.append({"slot": len(self.inventory), "id": "24",
+                                   "qualifiedId": "(O)24", "name": self.harvest_item,
+                                   "stack": 1, "isTool": False})
+        return {"ok": True, "status": "ok", "acted": True, "reason": "摘到了"}
 
     def till(self, tile):
         if tile in self.dirt:
@@ -537,6 +585,10 @@ class FakeClient:
         return {"ok": True, "status": "ok", "location": str(name)}
 
     def interact(self, tile, *, timeout_ms=None):
+        # 【task-170】作物格：模拟游戏 `checkAction` 真的摘（`harvest_on_interact` 可关）。
+        if self.w.harvest_on_interact and tuple(tile) in self.w.crops:
+            self.w.interacted.append(tuple(tile))
+            return self.w.harvest_now(tile)
         return {"ok": True, "status": "ok", "reason": "假世界：交互不影响跨日"}
 
     def sleep(self, *, timeout_ms=None):
@@ -8551,6 +8603,178 @@ class TestTask163BudgetDeferralIsNotWork(unittest.TestCase):
         rep = run._run_day()
         self.assertIs(rep.verified, False)
         self.assertIs(rep.checks.get("crops_watered"), False)
+
+
+class TestTask170HarvestReady(unittest.TestCase):
+    """【task-170】收获判据换成游戏口径 `ready` + 同格上限 + 守卫不被钉住。
+
+    真机事故：run A/B 共 284 次 `harvest` 尝试、**0 成功**；`(60,29)` 跨 8 个游戏日恒
+    `ripe=true`（裸 `fullyGrown`）却永远摘不到，`interact` 还被写成"没动手也回 ok"，
+    于是守卫整天被这格熟作物钉住（`veto sleep 35 / recover 13`）。
+    本类每条对应卡面的一条验收。变异（`scratch/_t170_mutate.py`，brain+tests 一起拷临时目录）：
+    **m170a**（`tile_ready` 换回裸 `ripe`）红 **5**、**m170b**（去掉 `_note_harvest_gave_up` 调用）
+    红 **3**、**m170c**（`sleep_guard` 不扣 `harvest_gave_up`）红 **1**；基线 10/10 绿。
+    """
+
+    CROP = (60, 10)
+
+    @staticmethod
+    def _plot(*tiles) -> dict:
+        tiles = list(tiles) or [(60, 10)]
+        return {"zone": "", "label": "", "anchor": list(tiles[0]),
+                "tiles": [list(t) for t in tiles], "note": "task-170 用例的作业区"}
+
+    def _world(self, *, ready=True, ripe=True, method="Grab", **kw) -> FakeWorld:
+        w = FakeWorld(weeds=0, seeds=0, money=0, water_left=40, **kw)
+        w.player_tile = [62, 14]
+        w.dirt.add(self.CROP)
+        w.crops[self.CROP] = {"watered": True, "ripe": ripe, "ready": ready,
+                              "harvestMethod": method}
+        w.farm = w.farm_scan()
+        return w
+
+    def _run(self, w: FakeWorld):
+        client = FakeClient(w)
+        worker = FarmWorker(client, log=lambda *_: None)
+        run = make_run(w, target_days=1, max_days=1,
+                       client_factory=lambda: client, worker_factory=lambda c: worker)
+        run.worker = worker
+        run.client = client
+        return run
+
+    @staticmethod
+    def _events(run, name: str) -> list:
+        return [e for e in run.entries if e.get("event") == name]
+
+    # ---- ① 裸 ripe 但游戏不给收 ⇒ 不进目标、不生成"有熟作物"的守卫理由 ----
+    def test_not_ready_crop_is_not_a_harvest_target(self):
+        w = self._world(ripe=True, ready=False)
+        run = self._run(w)
+        self.assertEqual(run._stage_tiles("harvest", w.obs(), self._plot(self.CROP)), [])
+        self.assertEqual([r for r in run.work_reasons(w.obs()) if "熟" in r], [])
+        st = run.worker.harvest(self.CROP)
+        self.assertEqual(st.code, "skipped")
+        self.assertEqual(w.interacted, [])
+
+    # ---- ② 真可收 ⇒ 摘到 + 游戏口径计数下降 ----
+    def test_ready_crop_is_harvested_and_the_gauge_drops(self):
+        w = self._world()
+        run = self._run(w)
+        self.assertEqual(w.farm_scan()["readyCrops"], 1)
+        self.assertEqual(run._stage_tiles("harvest", w.obs(), self._plot(self.CROP)),
+                         [self.CROP])
+        rep = DayReport(day_key=("spring", 1, 6), started_at=0.0)
+        out = run._step_stage("harvest", w.obs(), self._plot(self.CROP), rep)
+        self.assertTrue(out.postcondition_met)
+        self.assertNotIn(self.CROP, w.crops)
+        self.assertEqual(w.farm_scan()["readyCrops"], 0)
+        self.assertEqual(w.interacted, [self.CROP])
+        self.assertEqual(run.worker.harvested, {"(O)24": 1})
+
+    # ---- ③ 缺 `ready` 字段（旧 Mod）⇒ fail-closed：不摘、不白试 ----
+    def test_missing_ready_field_is_fail_closed(self):
+        w = self._world()
+        w.drop_ready_fields = True
+        run = self._run(w)
+        self.assertEqual(run._stage_tiles("harvest", w.obs(), self._plot(self.CROP)), [])
+        st = run.worker.harvest(self.CROP)
+        self.assertEqual(st.code, "skipped")
+        self.assertIn("ready", st.reason)
+        self.assertEqual(w.interacted, [])
+        self.assertIn(self.CROP, w.crops)
+
+    # ---- ④ 回执说"没动手" ⇒ 如实 failed（不许再报 ok）----
+    def test_refused_interact_receipt_is_failed(self):
+        w = self._world()
+
+        class _NoActionClient(FakeClient):
+            def interact(self, tile, *, timeout_ms=None):
+                return {"ok": False, "status": "no_action", "acted": False,
+                        "reason": "没有可执行的动作（收不了）"}
+
+        worker = FarmWorker(_NoActionClient(w), log=lambda *_: None)
+        st = worker.harvest(self.CROP)
+        self.assertEqual(st.code, "failed")
+        self.assertIn("没有真的动手", st.reason)
+        self.assertEqual(worker.harvested, {})
+        self.assertIn(self.CROP, w.crops)
+
+    # ---- ⑤ 镰刀类作物走工具路径（`interact` 永远摘不到）----
+    def test_scythe_crop_goes_through_the_tool_path(self):
+        w = self._world(method="Scythe")
+        worker = FarmWorker(FakeClient(w), log=lambda *_: None)
+        st = worker.harvest(self.CROP)
+        self.assertTrue(st.ok)
+        self.assertEqual(w.interacted, [])
+        self.assertEqual(w.swings.get(self.CROP), 1)
+        self.assertNotIn(self.CROP, w.crops)
+
+    # ---- ⑥ 同格上限：试满 MAX_TILE_ATTEMPTS ⇒ 当天放弃 + 逐格 journal ----
+    def test_gave_up_cap_is_journalled_and_the_tile_stops_being_chosen(self):
+        w = self._world()
+        w.harvest_on_interact = False          # 交互回 ok 但世界不动（run A/B 的形态）
+        run = self._run(w)
+        rep = DayReport(day_key=("spring", 1, 6), started_at=0.0)
+        for _ in range(MAX_TILE_ATTEMPTS):
+            run._step_stage("harvest", w.obs(), self._plot(self.CROP), rep)
+        self.assertIn(self.CROP, run.harvest_gave_up)
+        gave = self._events(run, "harvest_gave_up")
+        self.assertEqual(len(gave), 1)
+        self.assertEqual(gave[0]["tile"], list(self.CROP))
+        self.assertEqual(gave[0]["limit"], MAX_TILE_ATTEMPTS)
+        self.assertEqual(run._stage_tiles("harvest", w.obs(), self._plot(self.CROP)), [])
+        self.assertNotIn(self.CROP, run._pending_work())
+
+    # ---- ⑦ 守卫不再被这格钉住（但当天照旧不达标）----
+    def test_guard_is_not_pinned_by_an_unharvestable_crop(self):
+        w = self._world()
+        w.harvest_on_interact = False
+        run = self._run(w)
+        rep = DayReport(day_key=("spring", 1, 6), started_at=0.0)
+        for _ in range(MAX_TILE_ATTEMPTS):
+            run._step_stage("harvest", w.obs(), self._plot(self.CROP), rep)
+        self.assertEqual([r for r in run.work_reasons(w.obs()) if "熟" in r], [])
+        allowed, code, _why = run.sleep_guard(w.obs())
+        self.assertTrue(allowed)
+        self.assertEqual(code, "no_work")
+
+    # ---- ⑧ `_leftover` 不排除已放弃的格（诚实 unmet，不洗白）----
+    def test_leftover_still_counts_the_gave_up_tile(self):
+        w = self._world()
+        w.harvest_on_interact = False
+        run = self._run(w)
+        rep = DayReport(day_key=("spring", 1, 6), started_at=0.0)
+        for _ in range(MAX_TILE_ATTEMPTS):
+            run._step_stage("harvest", w.obs(), self._plot(self.CROP), rep)
+        self.assertIn(self.CROP, run.harvest_gave_up)
+        self.assertEqual(run._leftover("harvest", w.obs(), self._plot(self.CROP)), [self.CROP])
+
+    # ---- ⑨ 三类"游戏不给收"的形态（复收冷却/采集形态 2/枯死）只认 `ready` ----
+    def test_regrow_forage_and_dead_shapes_are_not_harvest_targets(self):
+        cases = {
+            "复收冷却": {"watered": True, "ripe": True, "ready": False, "dayOfCurrentPhase": 1},
+            "采集形态2": {"watered": True, "ripe": True, "ready": False,
+                          "forageCrop": True, "whichForageCrop": "2"},
+            "枯死": {"watered": True, "ripe": True, "ready": False, "dead": True},
+        }
+        for label, crop in cases.items():
+            with self.subTest(label):
+                w = self._world()
+                w.crops[self.CROP] = dict(crop)
+                run = self._run(w)
+                self.assertEqual(run._stage_tiles("harvest", w.obs(), self._plot(self.CROP)), [])
+        w = self._world()                      # 对照组：真可收 ⇒ 是目标
+        run = self._run(w)
+        self.assertEqual(run._stage_tiles("harvest", w.obs(), self._plot(self.CROP)),
+                         [self.CROP])
+
+    # ---- ⑩ 旧 Mod 的 farm 块没有 `readyCrops` ⇒ 退回 `ripeCrops`（行为与改前一致）----
+    def test_missing_ready_crops_in_farm_falls_back_to_ripe_crops(self):
+        w = self._world()
+        w.farm = {"loaded": True, "complete": True, "dryCrops": 0, "ripeCrops": 3,
+                  "crops": 3, "hoeDirt": 1, "emptyDirt": 0}
+        run = self._run(w)
+        self.assertEqual(run._farm_scope_work(w.obs()), (0, 3))
 
 
 if __name__ == "__main__":  # pragma: no cover

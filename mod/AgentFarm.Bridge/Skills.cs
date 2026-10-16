@@ -228,15 +228,23 @@ namespace AgentFarm.Bridge
                         }
                         catch (Exception ex) { err = ex.GetType().Name + ": " + ex.Message; }
 
+                        // 【task-170 回执诚实化】`checkAction` 的返回值就是"这一格有没有可执行的动作/门"。
+                        // 旧实现只看有没有抛异常（`Ok = err == null`）⇒ **游戏拒绝（false）也报 ok**，
+                        // `acted` 只躺在 reason 文本里（run A/B 的"回执谎报"第三次，`docs\_il-harvest-path.md`）。
+                        // 现在 `acted=false` ⇒ `ok=false` + `status="no_action"`，且 `acted` 是机器可读字段。
                         return new ExecResponse
                         {
-                            Ok = err == null,
-                            Status = err == null ? "ok" : "error",
+                            Ok = err == null && acted,
+                            Status = err == null ? (acted ? "ok" : "no_action") : "error",
                             Skill = "interact",
                             Schema = ExecSchema,
+                            Acted = acted,
                             Reason = err == null
-                                ? $"已在 ({tx},{ty}) 调游戏自己的 checkAction（返回 {acted}：true = 这一格有可执行的动作/门）。"
-                                  + "若这一格是门/建筑入口，传送由游戏自己发起（有淡出期，**以 observe 到的地点为准**）"
+                                ? (acted
+                                    ? $"已在 ({tx},{ty}) 调游戏自己的 checkAction（返回 true：这一格有可执行的动作/门）。"
+                                      + "若这一格是门/建筑入口，传送由游戏自己发起（有淡出期，**以 observe 到的地点为准**）"
+                                    : $"({tx},{ty}) 上**没有**可执行的动作（checkAction 返回 false：这一格现在收不了/开不了）。"
+                                      + "回执如实回 failed，`acted=false`；请用 observe 复核这一格的真实状态。")
                                 : "checkAction 抛异常：" + err,
                             ElapsedMs = 0,
                             WorldSeqBefore = world.WorldSeq,

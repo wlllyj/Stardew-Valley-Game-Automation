@@ -47,7 +47,7 @@ from .farmwork import (CLUMP_KINDS, ENV_BLOCK_STATUSES, FRONTIER_KINDS, PATH_STA
                        STAMINA_COST_TILL, STAMINA_COST_WATER, FarmWorker, StageResult, StepResult,
                        buy_count_for, farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles,
                        is_seed_offer, pick_seed_offer, player_free_slots, seed_items,
-                       surplus_sell_plan, till_blocked_by)
+                       surplus_sell_plan, tile_ready, till_blocked_by)
 from .planner import (DECISIONS_KEPT, LESSONS_INJECT_CHARS, LESSONS_INJECT_MAX, BoundaryPlanner, Brief,
                       PlannerState, TaskIntent, TaskOutcome, decision_line, deterministic_plan,
                       load_lessons_file, make_lesson, prune_lessons, render_lessons,
@@ -828,6 +828,9 @@ class LongRun:
         # 观测窗口之外，脑侧连坐标都没有，只能 `no_work` 收工（`day_justified=true` 白拿）。
         self.far_dry_tries: dict[tuple[int, int], int] = {}
         self.far_dry_given_up: set[tuple[int, int]] = set()
+        #: 【task-170 ②】今天"试满上限仍没摘下来"的收获格：目标池与守卫都不再算它们，
+        #: `_leftover("harvest")` **不排除**（没收到就是没收到，如实留 unmet）。
+        self.harvest_gave_up: set[tuple[int, int]] = set()
         #: 【task-133】每格的失败**因由**（`need_refill`/`unreachable`/`no_evidence`/…）：
         #: 收尾文案必须分清因 —— run9b 把"壶空"写成"够不着"，验收就被误导了。
         self.far_dry_causes: dict[tuple[int, int], str] = {}
@@ -970,7 +973,7 @@ class LongRun:
         tiles = FarmWorker.tiles_of(obs)
         return (
             tuple(sorted((t, str(v.get("kind") or ""), str(v.get("crop") or ""),
-                          bool(v.get("watered")), bool(v.get("ripe"))) for t, v in tiles.items())),
+                          bool(v.get("watered")), tile_ready(v)) for t, v in tiles.items())),
             tuple(sorted(FarmWorker.tillable_of(obs))),
             p.get("money"),
             (p.get("wateringCan") or {}).get("waterLeft"),
@@ -1082,7 +1085,13 @@ class LongRun:
         if farm.get("complete") is not True or farm.get("loaded") is False:
             return None                     # 旧 Mod / 未加载（全 0）⇒ 不算证据
         dry = farm.get("dryCrops")
-        ripe = farm.get("ripeCrops")
+        # 【task-170】熟作物的"游戏口径"计数优先 `readyCrops`（0.7.32+）：`ripeCrops`（裸
+        # `fullyGrown`）会把复收冷却/阶段没走完/枯死/采集形态 2 的格算成熟 ⇒ 守卫被摘不到的
+        # 作物钉住一整天（run B 实证 `veto sleep 35 / recover 13`、0 成功）。旧 Mod 缺字段时
+        # 退回 `ripeCrops`，行为与改前一致（fail-open 只在"新字段缺失"这一种旧版本情形）。
+        ripe = farm.get("readyCrops")
+        if ripe is None:
+            ripe = farm.get("ripeCrops")
         if dry is None:
             # 【task-99 ①】干作物数**未知**（<0.7.22 的 Mod）⇒ 不是 0，是"拿不到证据"。
             return None
@@ -1670,7 +1679,7 @@ class LongRun:
             "unwatered_crops": len([t for t in crops
                                     if not tiles[t].get("watered") and not tiles[t].get("dead")]),
             "dead_crops": len([t for t in crops if tiles[t].get("dead")]),
-            "ripe": len([t for t in crops if tiles[t].get("ripe")]),
+            "ripe": len([t for t in crops if tile_ready(tiles[t])]),
             "tillable": len(loc.get("tillable") or []),
             "waterLeft": (p.get("wateringCan") or {}).get("waterLeft"),
             "seeds": [list(x) for x in seed_items(p)],
@@ -2145,7 +2154,9 @@ class LongRun:
                     return True
                 continue
             if tv.get("crop"):
-                if not tv.get("watered") or tv.get("ripe"):
+                # 【task-170 ②】"可收"那半句要扣掉今天已证明收不到的格（`harvest_gave_up`）：
+                # 否则一格摘不到的作物会让"这片地还有活"永远成立 ⇒ 守卫 veto 收工。
+                if not tv.get("watered") or (tile_ready(tv) and t not in self.harvest_gave_up):
                     return True
                 # 【task-51】枯死作物**也是活**：它占着耕地、挡着 `till`（`till_blocked_by` 见 crop 就拒），
                 # 不清掉就永远开不了这一格。run5 真机夏季 2 日：窗口 24 个作物里 23 个 `dead=True`
@@ -2223,7 +2234,7 @@ class LongRun:
         # 但它**不是**"该浇水"（`_stage_tiles("water_area")`/`counts["unwatered_crops"]`
         # 都已剔除死苗），这里只是把它所在的格子当作业区容器用。
         tiles = [t for t, v in tmap.items()
-                 if v.get("crop") and (not v.get("watered") or v.get("ripe") or v.get("dead"))]
+                 if v.get("crop") and (not v.get("watered") or tile_ready(v) or v.get("dead"))]
         if not tiles:
             return None
         pt = FarmWorker.player_tile(obs)
@@ -2409,8 +2420,13 @@ class LongRun:
             facts["dry_scope"] = "farm"
         if farm.get("crops") is not None:
             facts["crops"] = int(farm.get("crops") or 0)
-        if farm.get("ripeCrops") is not None:
-            facts["ripe"] = int(farm.get("ripeCrops") or 0)
+        # 【task-170】熟作物优先用**游戏口径** `readyCrops`（`ripeCrops` 会把摘不到的格
+        # 算成熟，复盘事实段跟着错）；旧 Mod 缺字段时退回 `ripeCrops`。
+        ripe_farm = farm.get("readyCrops")
+        if ripe_farm is None:
+            ripe_farm = farm.get("ripeCrops")
+        if ripe_farm is not None:
+            facts["ripe"] = int(ripe_farm or 0)
         final = getattr(rep, "final", None) or {}
         if isinstance(final, dict):
             if facts.get("crops") is None and final.get("crops") is not None:
@@ -2685,7 +2701,9 @@ class LongRun:
                     if v.get("crop") and not v.get("watered") and not v.get("dead")]
             limit = self.water_stage_tiles
         elif task == "harvest":
-            pool = [t for t, v in tmap.items() if v.get("crop") and v.get("ripe")]
+            # 【task-170】目标只取**游戏口径可收**（`tile_ready`）且今天还没判过"收不到"的格。
+            pool = [t for t, v in tmap.items()
+                    if v.get("crop") and tile_ready(v) and t not in self.harvest_gave_up]
         elif task == "clear_dead":
             # 【task-51】枯死作物**按窗口取**（与 harvest 同口径）：死苗是农场卫生问题，
             # 一个作业区里往往散着十几格（真机窗口 23 格），按区取会把它们拖到明天。
@@ -2770,7 +2788,7 @@ class LongRun:
             return [t for t, v in tmap.items()
                     if v.get("crop") and not v.get("watered") and not v.get("dead")]
         if task == "harvest":
-            return [t for t, v in tmap.items() if v.get("crop") and v.get("ripe")]
+            return [t for t, v in tmap.items() if v.get("crop") and tile_ready(v)]
         if task == "clear_dead":
             # 【task-51】与 `_stage_tiles` 同口径、**刻意不排除 `self.blocked`**（task-9 铁律）：
             # 窗口里还有枯死作物 ⇒ 这一阶段就没做完（清不掉的那些由 `_step_stage` 单独报数）。
@@ -2823,7 +2841,13 @@ class LongRun:
                      if v.get("crop") and not v.get("watered") and not v.get("dead")]
         if unwatered:
             reasons.append(f"有 {len(unwatered)} 格作物没浇水")
-        ripe = [t for t, v in tmap.items() if v.get("crop") and v.get("ripe")]
+        # 【task-170 ②】"还有熟作物"这条理由**不许被今天已经证明收不到的格子钉住**：
+        # 已进 `harvest_gave_up`（试满上限仍没摘下来）或今天已封格（`blocked`：够不着/被拒）
+        # 的格不算"还有活" —— run B 正是被一格裸 `ripe=true` 的作物 veto 掉整天的。
+        # 注意：`_leftover("harvest")` **不排除**它们 ⇒ 当天照旧如实 unmet、不洗白。
+        ripe = [t for t, v in tmap.items()
+                if v.get("crop") and tile_ready(v)
+                and t not in self.harvest_gave_up and t not in self.blocked]
         if ripe:
             reasons.append(f"有 {len(ripe)} 格作物熟了")
         seeds, money, can_plant = self._seed_outlook(obs)
@@ -2860,8 +2884,9 @@ class LongRun:
             dry, ripe = farm_work
             if dry > 0:
                 reasons.append(f"人不在农场，但 farm 口径还有 {dry} 格干作物（先回去浇）")
-            if ripe > 0:
-                reasons.append(f"人不在农场，但 farm 口径还有 {ripe} 格熟作物（先回去收）")
+            ripe_live = max(0, ripe - len(self.harvest_gave_up))
+            if ripe_live > 0:
+                reasons.append(f"人不在农场，但 farm 口径还有 {ripe_live} 格熟作物（先回去收）")
         if plot_work is not None and "plant_area" not in deferred:
             # 【task-149 A】农场级"还有耕地/空地"来源（与人在不在农场无关）：
             # 雨天作物被浇好之后，run9c 只剩这一条能说明"地里还有活"。
@@ -2886,8 +2911,10 @@ class LongRun:
                 # 如实记（`day_justified=False`、当天不 VERIFIED），而不是刷"还有活"。
                 if not self._far_dry_all_given_up(obs):
                     reasons.append(self._far_dry_reason(obs, dry_f))
-            if ripe_f > len(ripe):
-                reasons.append(f"农场口径还有 {ripe_f} 格熟作物（当前窗口只看到 {len(ripe)} 格）")
+            # 【task-170 ②】farm 级熟作物数也要扣掉今天已判过、收不到的格（否则守卫被钉住）。
+            ripe_f_live = max(0, ripe_f - len(self.harvest_gave_up))
+            if ripe_f_live > len(ripe):
+                reasons.append(f"农场口径还有 {ripe_f_live} 格熟作物（当前窗口只看到 {len(ripe)} 格）")
         # 【task-49】今天**已经见过、但还没做完**的格子（`_step_stage` 的 `leftover`）。
         # 换到别的片地之后，那些格子不在玩家窗口里 ⇒ 必须靠这份记账才知道"还有活"，
         # 否则就是 run5 的 `no_work` 早睡。已封格（`tool_ineffective` 一类）**不算** ——
@@ -2914,8 +2941,10 @@ class LongRun:
         它们不该再让守卫说"还有活"（延后格数在 `budget_deferred_tiles{task: n}` 里如实记着）。
         """
         defer = self._budget_deferred_tile_set()
+        # 【task-170 ②】今天已判"收不到"的收获格同样不算"还有活"（否则守卫被一格钉住）。
         return sorted(t for t in self.leftover_targets
-                      if t not in self.blocked and t not in defer)
+                      if t not in self.blocked and t not in defer
+                      and t not in self.harvest_gave_up)
 
     # ------------------------------------------------ task-124：review 独苗的对账路径
 
@@ -3231,6 +3260,9 @@ class LongRun:
         totals = self._farm_totals(obs)
         if self._is_farm(obs) and totals is not None:
             dry_f, ripe_f = totals
+            # 【task-170 ②】扣掉今天已判"收不到"的格：否则一格摘不到的熟作物会把守卫
+            # 永远钉在 `keep_working`（run B：`veto sleep 35`、整天 0 成功）。
+            ripe_f = max(0, ripe_f - len(self.harvest_gave_up))
             if ripe_f > 0:
                 return False, "keep_working", (
                     f"农场口径还有 {ripe_f} 格熟作物（当前窗口没盖到，别处还有活），先去收")
@@ -3827,7 +3859,9 @@ class LongRun:
         for v in (FarmWorker.tiles_of(obs) or {}).values():
             t = tuple(v.get("tile") or ())
             if len(t) == 2:
-                out[t] = (v.get("kind"), v.get("crop"), v.get("watered"), v.get("ripe"),
+                # 【task-170】"熟了"用**游戏口径** `tile_ready`（不是裸 `ripe`）：复收冷却
+                # 的格不算可动作状态，否则"挥了没变"会被误判成世界没动。
+                out[t] = (v.get("kind"), v.get("crop"), v.get("watered"), tile_ready(v),
                           v.get("plantable"))
         return out
 
@@ -4008,6 +4042,32 @@ class LongRun:
                 continue
             self.tile_attempts[key] = self.tile_attempts.get(key, 0) + 1
 
+    #: 【task-170 ②】收获同格上限的留痕（一天一次一格）。
+    def _note_harvest_gave_up(self, steps: list[StepResult], rep: DayReport) -> None:
+        """摘不下来的熟作物：试满 `MAX_TILE_ATTEMPTS` 就当天放弃（守卫不再被它钉住）。
+
+        为什么必须单独记：run B 里 `(60,29)` 这类格（裸 `ripe=true` 但游戏不给收）让
+        `work_reasons`/farm 级熟作物理由一直非空 ⇒ `veto sleep 35`、`recover 13`、整天 0 成功。
+        这里把"当天已判过、不再动人"的格子显式列出来，守卫与目标池据此闭嘴，
+        **但 `_leftover("harvest")` 不排除它们**（当天确实没收到 ⇒ 如实 unmet、不洗白）。
+        """
+        for s in steps:
+            if not s.tile or s.ok or s.skipped:
+                continue
+            key = tuple(s.tile)
+            if self.tile_attempts.get(key, 0) < MAX_TILE_ATTEMPTS:
+                continue
+            if key in self.harvest_gave_up:
+                continue
+            self.harvest_gave_up.add(key)
+            codes = sorted({str(getattr(s, "code", "") or "") for s in steps
+                            if s.tile and tuple(s.tile) == key})
+            self._journal("harvest_gave_up", tile=list(key), attempts=self.tile_attempts.get(key, 0),
+                          limit=MAX_TILE_ATTEMPTS, codes=codes,
+                          note="同一格今天试满上限仍没摘下来 ⇒ 当天不再动人；守卫不再被它钉住"
+                               "（`_leftover(\"harvest\")` 仍如实留 unmet）")
+            rep.notes.append(f"收获放弃一格 {list(key)}（试满 {MAX_TILE_ATTEMPTS} 次：{codes}）")
+
     def _walk_into_plot(self, obs: dict[str, Any], plot: dict[str, Any]) -> bool:
         """走进作业区（站到区内某一格的旁边）。用来补偿"观测以玩家为中心"这件事。
 
@@ -4141,6 +4201,11 @@ class LongRun:
             # 被重新选中再白试一次（run1 的两格 grass 就是这么被连挥的）。
             self._count_attempts(res.steps)
             self._mark_blocked(snap, self._snap(), res.steps, rep, stage=task)
+            # 【task-170 ②】收获的同格上限：试满 `MAX_TILE_ATTEMPTS` 仍没摘下来的格子，
+            # 当天记进 `harvest_gave_up`（journal 逐格 `harvest_gave_up`），守卫/目标池都不
+            # 再被它钉住。`_leftover("harvest")` **刻意不排除**它（那天就是没做成，如实 unmet）。
+            if task == "harvest":
+                self._note_harvest_gave_up(res.steps, rep)
             # task-15 §④：本轮有**环境挡路**的失败步 ⇒ 先收模态、再重跑同一批格子。
             # 判据只有一份（`is_env_blocked` → `farmwork.ENV_BLOCK_STATUSES`），不另抄状态码。
             env_round = [s for s in res.steps if is_env_blocked(s)]
@@ -4540,7 +4605,7 @@ class LongRun:
         # 且政策顺序跟 `planner.deterministic_plan` 一致：harvest → clear_dead → water_area。
         unwatered = [t for t, v in tmap.items()
                      if v.get("crop") and not v.get("watered") and not v.get("dead")]
-        ripe = [t for t, v in tmap.items() if v.get("crop") and v.get("ripe")]
+        ripe = [t for t, v in tmap.items() if v.get("crop") and tile_ready(v)]
         dead = [t for t, v in tmap.items() if v.get("crop") and v.get("dead")]
         must: list[TaskIntent] = []
         notes: list[str] = []
@@ -4948,6 +5013,7 @@ class LongRun:
         # 【task-50】窗口外干作物的重试记账，每天清零（第二天壶/世界都变了，重新判）。
         self.far_dry_tries = {}
         self.far_dry_given_up = set()
+        self.harvest_gave_up = set()            # 【task-170 ②】收获放弃格同样每天重判
         # 【task-133】失败因由与补水次数也每日清零（"壶里有没有水"是新的一天的事）。
         self.far_dry_causes = {}
         self.far_dry_refills_today = 0

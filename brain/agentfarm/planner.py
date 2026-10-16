@@ -1292,7 +1292,11 @@ class Brief:
                 crop = tile.get("crop")
                 if crop:
                     counts["crops"] += 1
-                    if tile.get("ripe"):
+                    # 【task-170】"成熟"用**游戏口径** `ready`（Mod：反射 `HoeDirt.readyForHarvest()`），
+                    # 不用裸 `ripe`（`fullyGrown`）：复收冷却/阶段没走完/枯死/采集形态 2 的格
+                    # 游戏不给收，旧口径会把它们算成熟 ⇒ 策略层也追着摘不到的作物跑。
+                    # fail-closed：缺 `ready` 字段（旧 Mod）⇒ 不算成熟（不生成 harvest 意图）。
+                    if tile.get("ready") is True:
                         counts["ripe"] += 1
                     if tile.get("dead"):
                         counts["dead"] += 1

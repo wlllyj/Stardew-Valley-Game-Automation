@@ -630,9 +630,9 @@ class BriefTests(unittest.TestCase):
                 {"tile": [62, 20], "kind": "twig", "tool": "axe"},
                 {"tile": [63, 20], "kind": "dirt", "feature": "HoeDirt", "plantable": True, "watered": False},
                 {"tile": [64, 20], "kind": "dirt", "feature": "HoeDirt", "plantable": False,
-                 "crop": "24", "ripe": True, "watered": True},
+                 "crop": "24", "ripe": True, "ready": True, "watered": True},
                 {"tile": [65, 20], "kind": "dirt", "feature": "HoeDirt", "plantable": False,
-                 "crop": "24", "ripe": False, "watered": False},
+                 "crop": "24", "ripe": False, "ready": False, "watered": False},
             ],
         },
         "farm": {"weeds": 3, "stones": 1, "twigs": 1, "trees": 0, "hoeDirt": 3, "crops": 2},
@@ -733,6 +733,8 @@ class PlanCommandCliTests(unittest.TestCase):
             snapshot = copy.deepcopy(snapshot)
             for tile in (snapshot.get("location") or {}).get("tiles") or []:
                 tile["ripe"] = False
+                # 【task-170】"成熟"以游戏口径 `ready` 为准（fail-closed），这里要一起抹掉。
+                tile["ready"] = False
 
         class FakeClient:
             def __init__(self, *a, **k):

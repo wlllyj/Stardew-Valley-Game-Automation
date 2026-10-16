@@ -75,6 +75,8 @@ __all__ = [
     "seed_offers_from",
     "surplus_sell_plan",
     "till_blocked_by",
+    "tile_ready",
+    "harvest_tool",
     "tool_missing_reason",
     "tool_presence",
 ]
@@ -376,6 +378,45 @@ def till_blocked_by(tv: dict[str, Any] | None, player: dict[str, Any] | None = N
         miss = tool_missing_reason(player, "hoe")
         if miss:
             return miss
+    return ""
+
+
+def tile_ready(tv: dict[str, Any] | None) -> bool:
+    """这一格的作物**游戏口径**现在可收吗（task-170）。
+
+    判据只有一条：Mod 的 `ready` 字段（`CropMeta.Ready` ⇒ 反射 `HoeDirt.readyForHarvest()`，
+    取不到时用等价字段判据）。**fail-closed**：
+      * 缺 `ready` 字段（旧 Mod）⇒ **False**（不摘、不白试）；
+      * `ready is None`（Mod 明确说"判不了"）⇒ **False**，理由与"熟没熟"分开写（见 `_ready_note`）。
+
+    ⚠️ 不再用裸 `ripe`：run A/B 实测 284 次尝试 0 成功，根因就是 `ripe`(=裸 `fullyGrown`)
+    把"复收冷却 / 阶段没走完 / 枯死 / 采集作物形态 2"四类**游戏不给收**的格报成熟了
+    （取证 `docs\\_il-harvest-path.md`）。
+    """
+    if not tv:
+        return False
+    return tv.get("ready") is True
+
+
+def harvest_tool(tv: dict[str, Any] | None) -> str | None:
+    """这一格的作物该用哪条路收（task-170）。
+
+    `harvestMethod == "Scythe"` ⇒ 返回 `"scythe"`（必须走工具路径：
+    `HoeDirt.performToolAction` 的 scythe 分支；`interact` 的 `performUseAction` 永远摘不到它）。
+    其余（含判不了/缺字段）⇒ `None`（走游戏自己的 `checkAction`，即 `interact`）。
+    """
+    if not tv:
+        return None
+    method = str(tv.get("harvestMethod") or "").strip().lower()
+    return "scythe" if method == "scythe" else None
+
+
+def _ready_note(tv: dict[str, Any] | None) -> str:
+    """`ready` 缺失/判不了时给一句人能看懂的说明（写进 reason，方便回执复核）。"""
+    if not tv:
+        return "没有这一格的观测"
+    if "ready" not in tv or tv.get("ready") is None:
+        return "这一格缺 ready 字段（Mod 判不了是否可收）⇒ 不摘"
     return ""
 
 
@@ -2227,10 +2268,17 @@ class FarmWorker:
 
     # ------------------------------------------------------------- 单格：收获
     def harvest(self, tile: tuple[int, int]) -> StepResult:
-        """收获成熟作物：走游戏自己的 `checkAction`（`interact`），判据 = 该格作物没了。
+        """收获成熟作物（task-170 起按**游戏口径**判"可收"）。
 
-        ⚠️ 这条路的真机证据还薄（本轮 3 日连跑里作物尚未成熟），所以失败时**如实记失败**，
-        不假装收过。
+        判据链（全部来自观测、动手之前）：
+          1. 有作物且 `tile_ready(tv)`（Mod `ready` = 反射 `HoeDirt.readyForHarvest()`）；
+             缺字段/`ready is None`（判不了）⇒ `skipped` + 说明 —— fail-closed，不摘也不白试。
+          2. `harvestMethod == "Scythe"` ⇒ 走 `use_tool(tool="scythe")`（工具路径才割得到）；
+             其余走 `interact`（游戏 `checkAction` → `HoeDirt.performUseAction` → `Crop.harvest`）。
+          3. 判据 = **该格作物没了**（观测差分），回执不算证据；背包差分照旧进 `self.harvested`
+             （出货白名单只认它）。
+          4. 回执如实：`acted == false` / `ok == false` 一律 `failed` —— task-170 之前这里是
+             `Ok = err == null`，没动手也报 ok，所以账本上"284 次 0 成功"根本看不出被拒。
         """
         r = StepResult(action="harvest", tile=tile)
         obs = self.snap()
@@ -2240,20 +2288,39 @@ class FarmWorker:
         if not (tv or {}).get("crop"):
             r.code, r.reason = "skipped", "这一格没有作物"
             return r
-        if not (tv or {}).get("ripe"):
-            r.code, r.reason = "skipped", "还没成熟"
+        if not tile_ready(tv):
+            note = _ready_note(tv)
+            r.code = "skipped"
+            r.reason = (f"游戏口径不可收 ⇒ 不摘；{note}" if note else
+                        "游戏口径不可收（ready != true：复收冷却 / 阶段没走完 / 枯死 / 采集作物形态 2）⇒ 不摘")
             return r
         # 【task-68】站不到旁边 ⇒ **先看四邻能不能开路**（清掉 weeds/stone/twig/grass 再重试）；
         # 开路后仍站不到 ⇒ 被不可清障物围住记 `encircled`、清了上限还不通记 `unreachable`
         # （task-52：不是 `failed`，当天不白试、次日重试，日级各有有界豁免）。
         if not self._ensure_reachable(tile, r):
             return r
+        tool = harvest_tool(tv)
         status = ""
+        receipt: dict[str, Any] | None = None
         try:
-            self.c.interact(tile, timeout_ms=8000)
+            if tool:
+                receipt = self.c.use_tool(tile, tool=tool, timeout_ms=15000)
+            else:
+                receipt = self.c.interact(tile, timeout_ms=8000)
         except BridgeError as exc:
             status = _exc_status(exc)
             r.receipt = _receipt(exc)
+        if isinstance(receipt, dict):
+            r.receipt = r.receipt or _receipt_of(receipt)
+            status = status or str(receipt.get("status") or "")
+            # 【task-170】Mod 现在会把"到底动没动手"写成机器可读的 `acted`；被拒（没动手）
+            # 必须如实记 failed —— 否则脑会以为"摘过了"，然后整天盯着一格没变的作物。
+            acted = receipt.get("acted")
+            if acted is False or receipt.get("ok") is False:
+                r.code = "failed"
+                r.reason = (f"Mod 回执说没有真的动手（acted={acted}，"
+                            f"status={status or 'ok'}）：{r.receipt or ''}")
+                return r
         obs = self.snap()
         tv = self.tile_view(obs, tile)
         r.after = self.tile_essence(tv)
@@ -2279,7 +2346,8 @@ class FarmWorker:
             r.reason = (f"收获请求回「走不到」（{status}）：没有落脚点/没算出路径 ⇒ 不算硬失败；"
                         f"作物还在；{r.receipt}")
             return r
-        r.reason = (f"交互后作物还在（可能没摘到）{f'；Mod status={status}' if status else ''}")
+        r.reason = (f"游戏口径可收但作物还在（交互/挥镰后没摘到）"
+                    f"{f'；Mod status={status}' if status else ''}{f'；{r.receipt}' if r.receipt else ''}")
         return r
 
     # ------------------------------------------------------------- task-42：出货（卖出）

@@ -285,6 +285,14 @@ namespace AgentFarm.Bridge
                         if (crop.fullyGrown.Value) _acc.RipeCrops++;
                     }
                     catch { }
+                    // 【task-170】游戏口径的可收格数（`HoeDirt.readyForHarvest()` 的等价实现，见 `CropMeta`）。
+                    // `RipeCrops`（裸 `fullyGrown`）保留作历史字段：run A/B 共 284 次尝试 0 成功，
+                    // 就是拿它当"可收"判据的后果（`docs\_il-harvest-path.md`）。
+                    try
+                    {
+                        if (CropMeta.Ready(dirt, crop) == true) _acc.ReadyCrops++;
+                    }
+                    catch { }
                     try
                     {
                         if (dirt.needsWatering()) _acc.UnwateredCrops++;
