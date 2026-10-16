@@ -1656,6 +1656,11 @@ class LongRun:
         格式）；被丢掉的条目**必须留痕** ⇒ 记 `lessons_rejected`（`path`/`dropped`/`reasons`）。
         信任边界：这个文件是我们自己写自己读的，但一旦被外部改过，里面的自由文本会原样进
         提示词 ⇒ 一律按不可信处理（未知 kind、结构不符、超长、多行、抬高 severity 都会被洗掉）。
+
+        【task-118 A】没带 `src == LESSON_SRC` 的条目（含旧格式整库）按**不可信**处理：
+        仍进内存用于填位展示，但被钳过 `last_seq`/`count`、排不进 20 名额（见
+        `planner.prune_lessons`），回写时也不会被持久化（防洗白）。这里把不可信条数一并
+        记进 `lessons_rejected`，让"这个库里有多少不是自己写的"在账本里看得见。
         """
         if self.lessons_loaded:
             return
@@ -1670,11 +1675,13 @@ class LongRun:
                           note="教训库读不了 ⇒ 本次当作没有教训（绝不影响判定）")
         dropped = int(report.get("dropped") or 0)
         reasons = list(report.get("reasons") or [])
-        if dropped or reasons:
+        untrusted = int(report.get("untrusted") or 0)
+        if dropped or reasons or untrusted:
             self._journal("lessons_rejected", path=str(self.lessons_path), dropped=dropped,
-                          reasons=reasons, kept=len(lessons),
+                          reasons=reasons, kept=len(lessons), untrusted=untrusted,
                           note="教训库只认自己写出去的 schema ⇒ 不合格条目被丢弃/截断；"
-                               "外部改过的内容一律不可信（task-114 F1）")
+                               "没有 `src` 标记的条目按不可信处理（钳上界、不抢名额、不回写）；"
+                               "外部改过的内容一律不可信（task-114 F1 / task-118 A）")
 
     def _lessons_from_day(self, rep: DayReport) -> list[dict[str, Any]]:
         """把今天的**客观账本**拍成教训（代码写事实；不写回执、不写坐标）。
@@ -1759,8 +1766,13 @@ class LongRun:
         before = len(self.lessons)
         self.lessons = prune_lessons(list(self.lessons) + added)
         self.lessons_hints = []
+        written = 0
+        skipped_untrusted = 0
         if self.lessons_path is not None:
-            err = save_lessons_file(self.lessons_path, self.lessons)
+            save_report: dict[str, Any] = {}
+            err = save_lessons_file(self.lessons_path, self.lessons, report=save_report)
+            written = int(save_report.get("written") or 0)
+            skipped_untrusted = int(save_report.get("skipped") or 0)
             if err:
                 self._journal("lessons_save_failed", path=str(self.lessons_path), error=err,
                               note="教训库写不进去 ⇒ 本批教训只在内存里，跑批照常")
@@ -1768,8 +1780,10 @@ class LongRun:
         self._journal("lessons", day_key=list(rep.day_key) if rep.day_key else None,
                       added=[str(it.get("id") or "") for it in added], total=len(self.lessons),
                       dropped=max(0, before + len(added) - len(self.lessons)),
+                      written=written, skipped_untrusted=skipped_untrusted,
                       path=str(self.lessons_path) if self.lessons_path else "",
-                      note="只有客观账本事实；hint 仅来自收工复盘的笔记；只喂提示词、不参与判定")
+                      note="只有客观账本事实；hint 仅来自收工复盘的笔记；只喂提示词、不参与判定；"
+                           "落盘只写 src=agentfarm 的条目（不可信条目绝不回写）")
 
     def _stage_tiles(self, task: str, obs: dict[str, Any], plot: dict[str, Any]) -> list[tuple[int, int]]:
         """这一阶段要动的格子（已排序、已限数）。

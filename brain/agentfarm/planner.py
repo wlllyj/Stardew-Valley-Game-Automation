@@ -78,6 +78,7 @@ __all__ = [
     # 【task-82】跨日教训库（客观事实由代码写、hint 只许 LLM 写；只喂提示词，不参与判定）
     "LESSONS_MAX", "LESSONS_INJECT_MAX", "LESSONS_INJECT_CHARS", "LESSONS_SECTION_MAX_CHARS",
     "LESSON_SEVERITY", "LESSON_TEXT_MAX_CHARS", "LESSONS_REJECT_REASONS_MAX",
+    "LESSON_SRC", "LESSON_COUNT_MAX", "UNTRUSTED_LESSON_PREFIX",
     "make_lesson", "prune_lessons", "render_lessons",
     "load_lessons_file", "save_lessons_file",
     "BoundaryPlanner", "PLAN_SCHEMA_EXAMPLE",
@@ -418,7 +419,8 @@ NOTES_SECTION_MAX_CHARS = 200
 
 #: 【task-82】跨日教训库（`<journal>-lessons.json`）：客观事实由代码从账本写，
 #: `hint` **只允许**来自 LLM（收工复盘的笔记），拿不到就留空、绝不自己编。
-#: 上限 20 条，按 `(last_seq, severity, count)` 从新到旧淘汰；次日注入 ≤3 条、≤200 字符。
+#: 上限 20 条，按 `(trusted, last_seq, severity, count)` 从新到旧淘汰（**可信组永远在前**）；
+#: 次日注入 ≤3 条、≤200 字符。
 #: ⚠️ 与决策史/复盘笔记同一条诚实边界：只影响**提示词文本**，绝不参与任何判定。
 LESSONS_MAX = 20
 LESSONS_INJECT_MAX = 3
@@ -443,6 +445,16 @@ LESSON_SEVERITY_DEFAULT = 1
 #: 超长文本、多行注入、`severity` 被抬高、坐标样式，全部洗掉或整条丢弃。
 LESSON_TEXT_MAX_CHARS = 160
 LESSONS_REJECT_REASONS_MAX = 6
+#: 【task-118 A】来源标记：**只有本机制自己**（`make_lesson()`）写出去的条目才带
+#: `src == LESSON_SRC`。这是"这条教训是账本产物"的唯一凭据 —— 载入时缺这个标记（含旧格式
+#: 文件与外部改写的文件）一律按**不可信**处理：仍然可见（填补空位、兼容旧库），但
+#: **不参与 20 名额抢占**、注入行上会被显式标成外部条目、回写时**绝不**被重新盖戳写回。
+LESSON_SRC = "agentfarm"
+#: 不可信条目的 `count` 上界（task-118 A.2）：`prune_lessons` 的第四排序键是 `count`，
+#: 不钳的话外部能靠 `count=10**9` 在同类合并/排序里抬位。
+LESSON_COUNT_MAX = 10 ** 6
+#: 【task-118 B】不可信条目在提示词里的显式前缀：让模型知道自己读到的不是账本产物。
+UNTRUSTED_LESSON_PREFIX = "[外部条目·未验证] "
 
 #: 【task-59】复盘专用 system 提示词。和主决策提示词完全分开：它**不做决策**，
 #: 只让模型对着当天简报写 1–3 条给明天的短笔记（禁坐标、禁长篇行动计划）。
@@ -565,6 +577,9 @@ def make_lesson(
     绝不自己编。`symptom`/`evidence`/`hint` 里的坐标样式数字会被洗成「某格」。
 
     同一个 `id`（`kind|scope`）在多天出现时由 `prune_lessons()` 合并（`count` 累加）。
+
+    【task-118 A.1】写出去的每条都带 `src = LESSON_SRC`（`"agentfarm"`）—— 这是
+    "本机制自产"的唯一凭据：载入侧据此区分可信/不可信，回写侧据此过滤。
     """
     scope_text = str(scope or "")
     day_values = _day_key_values(day_key)
@@ -581,6 +596,7 @@ def make_lesson(
         "last_seq": int(day_seq),
         "severity": int(LESSON_SEVERITY.get(str(kind), LESSON_SEVERITY_DEFAULT)
                         if severity is None else severity),
+        "src": LESSON_SRC,
     }
 
 
@@ -593,7 +609,11 @@ def prune_lessons(
 
     * 合并键 = `id`（`kind|scope`）：`count` 累加、`last_day`/`last_seq`/`evidence`
       取最新那次、`severity` 取历次最大、`hint` 取第一个非空（**只来自 LLM**）；
-    * 排序 = `(last_seq, severity, count)` 从大到小 ⇒ 越近、越严重、越反复的越先留下；
+    * 排序 = **`(trusted, last_seq, severity, count)`** 从大到小（task-118 A.3）：
+      `trusted` = 条目带 `src == LESSON_SRC`。**可信组永远在前** ⇒ 20 条可信时外部伪造
+      条目一个名额也拿不到，只能在可信条目不足 20 时填补空位（旧格式文件即此情形）；
+    * 合并的可信性取**最保守**：只有参与的每一条都带 `src` 才保留 `src`，否则去掉标记
+      （伪造条目无法靠与真教训"同类合并"沾上可信身份）；
     * 非法条目（不是映射 / 没有 `id`）直接跳过，坏输入当空库。
     """
     merged: dict[str, dict[str, Any]] = {}
@@ -617,13 +637,25 @@ def prune_lessons(
             cur["symptom"] = item.get("symptom") or cur.get("symptom")
         if not cur.get("hint") and item.get("hint"):
             cur["hint"] = item["hint"]
+        if cur.get("src") != LESSON_SRC or item.get("src") != LESSON_SRC:
+            cur.pop("src", None)
     ranked = sorted(
         merged.values(),
-        key=lambda it: (int(it.get("last_seq") or 0), int(it.get("severity") or LESSON_SEVERITY_DEFAULT),
+        key=lambda it: (_is_trusted_lesson(it),
+                        int(it.get("last_seq") or 0), int(it.get("severity") or LESSON_SEVERITY_DEFAULT),
                         int(it.get("count") or 1)),
         reverse=True,
     )
     return [dict(it) for it in ranked[: max(0, int(max_lessons))]]
+
+
+def _is_trusted_lesson(item: Mapping[str, Any]) -> int:
+    """条目是不是"本机制自产"（task-118 A）：只有带 `src == LESSON_SRC` 的算可信。
+
+    返回 `0/1` 而不是 `bool`：它直接进 `sorted()` 的排序键；显式用整数更不容易被后续
+    改动弄坏（`bool` 在元组排序里也能用，但没法一眼看出这是"可信优先级"）。
+    """
+    return 1 if item.get("src") == LESSON_SRC else 0
 
 
 def render_lessons(
@@ -636,6 +668,9 @@ def render_lessons(
 
     只取前 `max_items` 条、总长 ≤ `max_chars`；`hint` 非空时附在行尾（它来自 LLM）。
     渲染前再洗一遍坐标 —— 双保险。
+
+    【task-118 B】不可信条目（`src` 不是 `LESSON_SRC`）除了排在可信条目之后，行首还会带
+    `UNTRUSTED_LESSON_PREFIX`，让模型知道这条不是账本产物。
     """
     picked = prune_lessons(lessons)[: max(0, int(max_items))]
     if not picked:
@@ -646,7 +681,8 @@ def render_lessons(
         symptom = str(it.get("symptom") or "").strip()
         if not symptom:
             continue
-        line = f"- {symptom}"
+        mark = "" if _is_trusted_lesson(it) else UNTRUSTED_LESSON_PREFIX
+        line = f"- {mark}{symptom}"
         evidence = str(it.get("evidence") or "").strip()
         if evidence:
             line += f"｜{evidence}"
@@ -686,6 +722,11 @@ def _sanitize_lesson(raw: Any, *, notes: list[str]) -> dict[str, Any] | None:
     必须是真整数（`bool` 不算）、三个文本字段必须是字符串且限长 + 折叠换行 + 洗坐标、
     `symptom` 不能为空，`severity` **一律由 kind 重算**（文件里那个数不可信 ⇒ 否则
     外部能把任意一条抬到最高优先级、把真教训挤出 20 条上限）。
+
+    【task-118 A.2】`src != LESSON_SRC`（含缺失、旧格式文件）⇒ 条目标 `untrusted=True`
+    （不是丢弃：仍可见、能填补空位，但不抢 20 名额、渲染时带外部前缀、回写时不持久化）。
+    不可信条目的 `count` 这里就钳到 `LESSON_COUNT_MAX`；`last_seq` 需要跨条目比较
+    （`≤ max(可信 last_seq) + 1`），所以由 `load_lessons_file()` 统一钳。
     """
     if not isinstance(raw, Mapping):
         notes.append("not_a_mapping")
@@ -719,6 +760,9 @@ def _sanitize_lesson(raw: Any, *, notes: list[str]) -> dict[str, Any] | None:
     if not isinstance(last_seq, int) or isinstance(last_seq, bool):
         notes.append("bad_seq")
         return None
+    trusted = raw.get("src") == LESSON_SRC
+    if not trusted:
+        count = min(count, LESSON_COUNT_MAX)
     first_day = _day_key_values(raw.get("first_day"))
     last_day = _day_key_values(raw.get("last_day")) or list(first_day)
     return {
@@ -733,6 +777,8 @@ def _sanitize_lesson(raw: Any, *, notes: list[str]) -> dict[str, Any] | None:
         "last_day": last_day,
         "last_seq": last_seq,
         "severity": int(LESSON_SEVERITY.get(kind, LESSON_SEVERITY_DEFAULT)),
+        "src": LESSON_SRC if trusted else "",
+        "untrusted": (not trusted),
     }
 
 
@@ -777,22 +823,47 @@ def load_lessons_file(path: Any,
                 reasons.append(why)          # 截断不算丢条，只如实记一笔
             elif clean is None:
                 reasons.append(why)
+    # 【task-118 A.2】不可信条目的 `last_seq` 钳到 `max(可信 last_seq) + 1`：
+    # 结构性防止"外部写一个 999999 就排到注入列表首位"。整库都不可信（旧格式）时
+    # 上界取 1 ⇒ 仍然可见、但永远排不到可信条目前面。
+    trusted_seq = [int(it.get("last_seq") or 0) for it in kept if _is_trusted_lesson(it)]
+    ceiling = (max(trusted_seq) + 1) if trusted_seq else 1
+    untrusted = 0
+    for it in kept:
+        if _is_trusted_lesson(it):
+            continue
+        untrusted += 1
+        if int(it.get("last_seq") or 0) > ceiling:
+            it["last_seq"] = ceiling
+            it["untrusted"] = True
+            reasons.append("clamped:last_seq")
     if report is not None:
         report["dropped"] = dropped
         report["reasons"] = reasons[:LESSONS_REJECT_REASONS_MAX]
+        report["untrusted"] = untrusted
     return prune_lessons(kept), ""
 
 
-def save_lessons_file(path: Any, lessons: Iterable[Mapping[str, Any]] | None) -> str:
+def save_lessons_file(path: Any, lessons: Iterable[Mapping[str, Any]] | None,
+                      *, report: dict[str, Any] | None = None) -> str:
     """写跨日教训库（task-82）。**绝不抛**：成功 ⇒ `""`，失败 ⇒ 原因串。
 
     先写临时文件再 `replace` ⇒ 中途崩掉不会留下半截 JSON（"文件损坏"面里最讨厌的一种）。
+
+    【task-118 A.4 防洗白】只持久化 `src == LESSON_SRC` 的条目：外部改写过（或旧格式）的
+    条目这一轮也许被读到、也许在内存里还在（用于填位展示），但**绝不**因为"被我们读过一次"
+    就被重新盖戳写回文件。传了 `report` 时回填 `{"written": 写了几条, "skipped": 跳了几条}`。
     """
+    items: list[dict[str, Any]] = [dict(it) for it in (lessons or ()) if isinstance(it, Mapping)]
+    kept = [it for it in items if it.get("src") == LESSON_SRC]
+    if report is not None:
+        report["written"] = len(kept)
+        report["skipped"] = len(items) - len(kept)
     try:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_name(p.name + ".tmp")
-        payload = {"lessons": [dict(it) for it in (lessons or ())]}
+        payload = {"lessons": kept}
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
         tmp.replace(p)
     except Exception as exc:  # noqa: BLE001
