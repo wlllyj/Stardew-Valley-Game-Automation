@@ -1,0 +1,19 @@
+v0.7.33（harvest 判据纠正：熟不熟交给游戏自己判、回执不再谎报、"收不动"不许再钉住整天）
+
+本版一张代码卡（Mod + 脑侧同批）+ 一张独立验收卡：
+
+1. task-170（dev-coder，`d88498d`）harvest 判据与回执诚实化：
+   - run A/B 实证（`docs\_il-harvest-path.md`、`docs\_runA-0732-evidence.md`）：`[60,29]` 格作物 `ripe=true` 且可站立，`interact` 一天失败 41 次、两天 284 次尝试 0 成功 ⇒ 当天 `ok_steps=0` 并被钉住整天。根因三条：①Mod 用裸 `Crop.fullyGrown` 判"熟"（游戏自己用 `HoeDirt.readyForHarvest()`，两者在**复收冷却 / 末阶段 / 枯死 / 采集形态**四处不等价）；②`interact` 回执只报"没报错"（`Ok = err == null`），没动手也回 `ok`；③脑侧没有"同格试满就当天放弃"的收口。
+   - Mod 侧：
+     * 新增 `CropMeta.cs`（**反射**是唯一权威）：`Ready` 优先调游戏 `HoeDirt.readyForHarvest()`，取不到退回等价字段判据（`!(fullyGrown && dayOfCurrentPhase>0) && currentPhase>=phaseDays.Count-1 && !dead && !(forageCrop && whichForageCrop=="2")`）；**任一判据缺项 ⇒ null（判不了）**。`Crop.HarvestMethod` 在 1.6.15 非 public ⇒ 必须反射。
+     * `Contracts.TileView` 新增 `ready`/`fullyGrown`/`harvestMethod`/`currentPhase`/`phaseDays`/`dayOfCurrentPhase`/`forageCrop`/`whichForageCrop`/`regrowsAfterHarvest`（全部 `null` = 判不了）；`FarmView` 新增 `readyCrops`（旧口径 `ripeCrops` **原样保留**）；`ExecResponse` 新增 `acted`。
+     * `WorldSnapshot`：`tiles[].tool` 判据改 `(ready == true || dead) ? "none" : "can"`（复收冷却 / 未熟但 `fullyGrown` 的格**要浇水**，旧代码当"熟了"⇒ 永不浇）。
+     * `FarmScan`：`readyCrops` 与逐格 `ready` 同源。
+     * `Skills.interact`：`Ok = err == null && acted`、`Status = err==null ? (acted ? "ok" : "no_action") : "error"`。
+     * `UseToolSkill`：`harvestMethod == "Scythe"` ⇒ 走工具路径（`Done()` 判 `CropAt(Target) == null`，不新造挥空）。
+   - 脑侧：`farmwork.tile_ready`（fail-closed：`ready is True` 才算，缺字段/`None` 一律不摘）+ `harvest_tool`；`harvest()` 回执 `acted==false`/`ok==false` ⇒ `failed`；`longrun.py` 全部"熟作物"判据换 `tile_ready`，farm 级优先 `readyCrops`（旧 Mod 缺字段退回 `ripeCrops`）；新增 `harvest_gave_up`（同格试满 `MAX_TILE_ATTEMPTS` ⇒ 当天放弃，逐格 journal `{tile,attempts,limit,codes}`），目标池与守卫理由都扣掉它，但 **`_leftover("harvest")` 不扣**（如实 unmet，不洗白）；`planner.counts["ripe"]` 用 `ready`。
+   - 验证：新增 10 条单测（`TestTask170HarvestReady`）；变异 m170a（`tile_ready` 换回裸 `ripe`）红 5 / m170b（去掉同格上限）红 3 / m170c（守卫不扣 `harvest_gave_up`）红 1；`dotnet build -c Release --no-incremental` = 0 警 0 错。
+
+2. task-171（deputy-lead）对 task-170 的独立对抗验收：重点打四条洗白通道 —— ①判据 fail-open（缺字段被当"不能收"以外的任何默认）；②回执谎报复活（`acted` 缺失时脑侧仍算 ok）；③`harvest_gave_up` 变成新豁免额度（进 `checks` 或有界扣减）；④`readyCrops` / `ripeCrops` 口径混淆（用旧字段冒充新判据）。
+
+（Lead 侧工具，不属于 Mod 产物：`tools\analyze-longrun.py` 已补 `harvest_gave_up` 桶与新字段口径（task-172）；`tools\verify-run3.py` / `tools\compare-runs.py` 口径不变。）
