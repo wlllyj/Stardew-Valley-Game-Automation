@@ -3,6 +3,7 @@
 - 验收人：deputy-lead（独立自写探针，**未读**作者探针；作者 docstring 引用的 `scratch/_t181_mutate.py`/`_t182_mutate.py` 不存在 ⇒ 变异装置由我自建）
 - 对象：**task-181 = `c840b00`**（brain，2 文件 +266/−30）、**task-182 = `7236a9c`**（Mod，7 文件 +453/−42）
 - 结论：**PASS-WITH-NITS（无必修项）⇒ 0.7.35 可以据此冻结**（NIT 见 §7，均不阻塞；残余风险见 §8）
+- 覆盖状态：开工 `7236a9c`，收尾前 HEAD 前进到 `26a3ce1`（delta 为纯注释/文档 + docstring，逐行核过，见 §2.1；复跑读数逐条一致）
 
 ---
 
@@ -28,6 +29,22 @@
 | `dotnet run --project .\mod\AgentFarm.Bridge.Tests\... -c Release` | **rc=0 / `OK 18 断言全部通过`** |
 
 留档：`scratch/_t183_targeted.txt`、`_t183_full.txt`、`_t183_build.txt`、`_t183_cstests.txt`、`_t183_diff_brain.txt`(234 行)、`_t183_diff_mod.txt`(637 行)。
+
+### §2.1 验收期间 HEAD 前进（并发变更核对，必须记）
+
+我开工时 HEAD = `7236a9c`（上表读数取自该状态）。收尾前发现 HEAD 已前进两提交（**不是我的**）：
+
+| 提交 | 内容 | 是否影响被验逻辑 |
+|---|---|---|
+| `145c65c` | `tools/_note-0735.txt` +7（0.7.35 备注） | 否 |
+| `26a3ce1` | `docs/_t176-harvest-ready-findings.md` +26、`mod/AgentFarm.Bridge/Skills.cs` **+8（纯注释）**、`tests/test_longrun.py` +16/−5（**docstring-only**） | **否** |
+
+- `git diff 7236a9c..26a3ce1 -- mod/AgentFarm.Bridge/Skills.cs` 逐行读过：只新增【NIT-2 局限】注释块（门/入口传送格可能落 `acted=false`/`no_action`，今天无害），**无任何逻辑改动**；测试侧的改动只更正 `TestTask176HarvestMethodSourceAndActed` 的 docstring（GAP-2 变异读数），**断言与用例个数未变**。
+- 复跑读数（当前工作树 = `26a3ce1`）：定向 `tests.test_farmwork tests.test_longrun tests.test_planner` = **Ran 532 / OK**、全量 `discover -s tests` = **Ran 924 / OK**、`dotnet build --no-incremental` rc=0 / **0 错误**、`dotnet run`（C# 自检）rc=0 / **`OK 18 断言全部通过`** ⇒ 与本节原读数逐条一致（留档 `scratch/_t183_targeted2.txt`、`_t183_full2.txt`、`_t183_build2.txt`、`_t183_cstests2.txt`）。
+- `mod/AgentFarm.Bridge/Skills.cs` 指纹按当前状态更新为 `4FB3C7D77D8FA99E` / 44089 B（开工时 `B3C62601FAB23318` / 43249 B；`farmwork.py`、`CropMeta.cs` 指纹未变）。
+- 我的探针与变异矩阵**本身就是在前进后的工作树上跑的**（0.7.35 全量状态）⇒ §3–§6 的结论覆盖 `26a3ce1`，不是只覆盖 `7236a9c`。
+- 附注：`26a3ce1` 自己更正了 GAP-2 的变异读数（`m176a`–`m176d` 各杀 1 条、杀点全是**文本契约**、行为层当时无用例）——与我 task-178 的实测（`m178a` 杀 1）互相印证，也再次说明 task-182 新建 C# 自检工程的必要性。
+
 
 ---
 
