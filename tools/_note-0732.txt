@@ -1,0 +1,40 @@
+v0.7.32（run9d 诊断后的目标 2 解药：够不着的活苗开路再浇 + 单日体力预算与规模控制；并补 Mod 障碍物/工具等级观测）
+
+本版四张代码卡 + 两张对抗验收（Mod 侧只有 task-155 改代码；其余为脑侧/工具侧）：
+
+1. task-157（dev-coder，`ef59f30`）water_far 够不着时先有界开路再试：
+   - run9d 实证：`[12,30]` 活苗干作物 `water_far code=unreachable` ⇒ 当天 `gave_up_dry`、不 VERIFIED（run9d 尾链 0/5 的第一条病灶）；
+   - 改法：够不着 ⇒ 先做**有界**开路（清该格四邻的可清障碍，次数/格数有上限）再回浇同一格；
+   - 仍走不到 ⇒ `water_far_blocked{tile,cause,attempts,limit,opens,cleared_tiles,note}` + 当天**如实** `gave_up_dry`（**开路 ≠ 浇水**，不许把"清出了路"当"这格浇了"）；
+   - `cause` 显式区分 `no_route`/`unreachable`/`need_refill`/`truncated`/`no_evidence`/`not_watered`；`water_far` 行新增 `opens`/`opened_count`。
+
+2. task-158（dev-coder，`cf7432a` + 补钉 `63ef273`）体力预算与规模控制：
+   - run9d 实证：作物 105→151，`water_reserve` 292 > 满体力 270 ⇒ 浇水前体力见底（`dry` 17→79→140 逐日堆积），尾链 0/5 的第二条病灶；
+   - `farmwork.py` 集中估算常量（水 2.0 / 锄 5.0 / 清 2.0 / 播 0.0 + 路程余量 12，**未标定** ⇒ task-161）；
+   - `longrun._stamina_budget()`：`water_reserve = 活苗×2.0 + 12`、`capacity = (max_stamina − reserve − 5) // 2`；`farm` 计数不可用/不完整 ⇒ `basis="conservative"`（体力全留给浇水，fail-closed）；
+   - `_budget_defer_reason()` 在 `_stage_tiles()` 最前：体力 ≤ reserve 且仍有浇水债 ⇒ **只**延后 `clear_area`/`till_area`/`plant_area`（journal `deferred_by_budget`）；`harvest`/`clear_dead` **永不延后**（恢复路径靠收获 + 不再播种 + 清死苗让作物数单调下降）；
+   - 留痕 journal `stamina_budget` + `day_end.stamina_budget`；**不新增任何 `checks` 键**。
+
+3. task-155（dev-coder）Mod 障碍物/工具元数据（目标 1 的观测前置）：
+   - 障碍物补 `clumpIndex`/`clumpKind`/`clumpWidth`/`clumpHeight`/`clumpHealth` + 推导 `clumpTarget{tool,minLevel}`/`toolOk`（未知 ⇒ 显式 `unknown`，**不许默认斧头**）；
+   - `FarmView` 按 clumpIndex 分流：`stumps`/`logs`/`boulders`/`rockPiles`/`greenRain`/`clumpsTotal` + `clumpsUnclassified`（**树桩/大木头不再进 `stones`**）；
+   - `ToolsView.tools[]` 带每件工具 `upgradeLevel`；`PlayerView` 带 `toolBeingUpgraded`/`toolUpgradeDaysLeft`；
+   - `UseToolSkill` 按 `clumpTarget.tool` 选镐/斧；等级不够 ⇒ `skipped` + `precondition_failed` 理由（**不许空挥**）。
+
+4. task-20（dev-coder，收窄为纯脑侧）消费 task-155 的元数据：工具选择/等级不足的决策口径（等级不够不发请求）；`clumpTarget` 缺失 ⇒ `precondition_failed` + 理由，不许默认斧头。
+
+5. task-161（dev-coder）阶段体力实测留痕与标定（**只留痕、不改判据**）：stage 记录补 `stamina_before`/`stamina_after`/`stamina_spent` + `day_end.stamina_calibration`（按 stage 的 `actions`/`per_action`），用于下一轮把 `farmwork.py` 的估算常量换成实测值（**改常量必须单独一步并过对抗验收**）。
+
+6. 两张对抗验收：task-159（deputy-lead）对 task-157+158（重点打"少干活/开路当浇水"的洗白通道）；task-160（log-analyst）收 `water_far_open`/`water_far_blocked`/`stamina_budget`/`deferred_by_budget` 等新事件与字段 ⇒ **全量单测回 0 红**（0.7.32 放行条件）。
+
+（Lead 侧工具，不属于 Mod 产物：`tools\verify-run3.py` 已有"0 阶段自称 VERIFIED 必须有在场证据"与"缺 finish ⇒ 判决为临时"两道闸门；`tools\compare-runs.py` 的 L0–L5 演进判据已就绪。）
+
+判据（A/B 必须**同一份 0.7.32 构建**；run9d 是 0.7.31 诊断跑，**不参与**对照）：
+- run A = task-162（`logs\longrun-runA-0732.jsonl`，`--days 5 --size 5 --max-minutes 240 --max-days 12`），起点 = 夏 23 日清晨存档；
+- 起跑前把 A 的 `logs\longrun-runA-0732-lessons.json` 原样拷成 `logs\longrun-runB-0732-lessons.json`，run B = task-113（`logs\longrun-runB-0732.jsonl`），**除 journal 路径与预置教训库外命令逐字相同**（用两侧 sidecar 的 `argv` 对照）；
+- **尾部连续 5 天** `verified=true`（目标 2），且两侧工具同向（`verdict` + `strict_verdict` 两行都抄）；
+- 每次跨日落盘六串配对齐全（`NewDay / before save / SaveGame.Save() called. / Saving without compression / completed / after save`）；
+- **每个游戏日 ≥2 份独立 `observe?detail=full` 端点**（晨间 A + 收尾 B，同名不覆盖）并出逐日世界差分表；只有 1 份端点 ⇒ 该日 tile 迁移记【无法判定】，整日无观测 ⇒ 【无法判定·窗口错过】；
+- 无 `unreachable_within_bound=false`/`refused_within_bound=false`/`slept_without_work`/`gave_up_dry`/`stuck_flush` 长期化；
+- 经济四步真机留痕（卖 → 次日到账 → 买 → 种）；缺字段一律【无法判定】、缺失 ≠ 通过；
+- 演进对照 L0–L5（`tools\compare-runs.py`）：L0 A 的教训库非空、L1 教训确实进 B 的提示词、L2 同形态计数下降、L3 只作旁证、L4 无回归、L5 任一不成立 ⇒ 如实写"不足以判定自我进化"。
