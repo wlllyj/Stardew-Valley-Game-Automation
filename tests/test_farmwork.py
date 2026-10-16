@@ -37,7 +37,8 @@ class MiniWorld:
     """只有一格或几格的假世界：`use_tool` 真的改它、`obs()` 真的反映它。"""
 
     def __init__(self, *, records=None, tillable=(), inventory=None, tools=None,
-                 farming_level: int = 0, stamina: float = 270.0, money: int = 500) -> None:
+                 farming_level: int = 0, stamina: float = 270.0, money: int = 500,
+                 inventory_capacity: int | None = None) -> None:
         self.records = [dict(r) for r in (records or [])]
         self.tillable = {tuple(t) for t in tillable}
         self.inventory = [dict(i) for i in (inventory or [])]
@@ -132,6 +133,11 @@ class MiniWorld:
         # ---- task-55：`farm` 级计数（`emptyDirt` 是"卖盈余材料换种子钱"的门闸之一）----
         #: 默认 None ⇒ `obs()["farm"] == {}` ⇒ farm 证据不可用（既有用例不受影响）。
         self.farm: dict | None = None
+        # ---- task-181：背包**容量**字段（`inventoryCount`）----
+        #: None ⇒ 观测里没有这个键（口径不可用 ⇒ 收获的"背包满"前置不触发）；给了才参与判满。
+        #: 真机里它是**容量**（腾出一格后仍读 12），空槽必须用 `inventory[]` 行数算。
+        self.inventory_capacity: int | None = (
+            None if inventory_capacity is None else int(inventory_capacity))
 
     # ---- 观测 ----
     def obs(self) -> dict:
@@ -142,6 +148,9 @@ class MiniWorld:
                                       for i in self.inventory]}
         if self.tools is not None:
             player["tools"] = dict(self.tools)
+        if self.inventory_capacity is not None:
+            # 真机它是**容量**（不是空槽数）—— 判满必须数 `inventory` 行数（task-181 必修 3）。
+            player["inventoryCount"] = int(self.inventory_capacity)
         player["isInBed"] = self.in_bed
         return {
             "ok": True, "status": "ok",
@@ -2270,6 +2279,161 @@ class TestTask20ToolGatedClumps(unittest.TestCase):
         self.assertTrue(r.ok, r.reason)
         self.assertNotEqual(w.calls, [], "普通杂草必须照旧挥")
         self.assertIs(r.blocked_by_tool, False)
+
+
+class TestTask181HarvestEvidence(unittest.TestCase):
+    """task-181：收获成功判据 = **动作前后观测差分四选一**，Mod 自述只作线索。
+
+    真机来源 `docs/_run10-harvest-verify-0734.md`（machine-runner `f851423`）：0.7.34 上
+    那格其实**收成了**（`readyCrops 102→101`、背包 `(O)270 +1`、`ready true→false`、
+    `worldSeq 60→61`），但旧判据只认"该格 crop 消失" ⇒ 对 `regrowsAfterHarvest=true` 的
+    再生作物**系统性假阴性**；同时 Mod 的 `acted` 只比格子内 6 个字段 ⇒ 误报 `no_action`。
+    所以这里钉四件事：①判据只认观测差分；②Mod `acted` 只是线索；③loot 按动作前后
+    **逐 qid 差分**记账（一次动作可能收多格）；④"背包满"必须数 `inventory[]` **行数**
+    （`inventoryCount` 是**容量**字段，腾出一格后仍读 12）。
+
+    变异预期（`scratch/_t181_mutate.py`，brain + tests 一起拷临时目录，跑完已删；实测）：
+    基线 7/7 绿；m181a（判据退回"只看 crop 消失"）杀 2 条
+    （`test_regrowing_crop_ready_flip_with_loot_is_a_success`、`test_ready_crops_drop_alone_is_enough`）；
+    m181b（行数换回 `inventoryCount` 容量）杀 2 条（两条 `test_full_backpack_...`）；
+    m181c（loot 记账改回"一格一物"）杀 1 条
+    （`test_one_swing_can_harvest_several_tiles_and_reports_each_qid`）。
+    """
+
+    def _worker(self, w: MiniWorld, bridge_cls=MiniBridge) -> FarmWorker:
+        return FarmWorker(bridge_cls(w), log=lambda _s: None, pause=lambda _s: None)
+
+    @staticmethod
+    def _crop(tile=(62, 15), **kw) -> dict:
+        rec = {"tile": list(tile), "kind": "dirt", "feature": "HoeDirt", "crop": "270",
+               "ripe": True, "ready": True, "harvestMethod": "Grab",
+               "regrowsAfterHarvest": True, "watered": True, "standable": True,
+               "actionable": True}
+        rec.update(kw)
+        return rec
+
+    # ---- ① 再生作物：crop 对象还在、ready 翻转 ⇒ 必须算成功（旧判据的假阴性现场）----
+    def test_regrowing_crop_ready_flip_with_loot_is_a_success(self):
+        w = MiniWorld(records=[self._crop()])
+
+        class _RegrowBridge(MiniBridge):
+            def interact(self, tile=None, *, timeout_ms=None):
+                for r in self.w.records:
+                    if tuple(r["tile"]) == tuple(tile):
+                        r["ready"] = False          # 再生作物：crop 留着、阶段重置
+                self.w.inventory.append({"slot": 9, "id": "270", "qualifiedId": "(O)270",
+                                         "name": "Corn", "stack": 1, "isTool": False})
+                return {"ok": True, "status": "ok", "acted": False,
+                        "reason": "再生作物收成（Mod 误报 acted=false）"}
+
+        worker = self._worker(w, _RegrowBridge)
+        st = worker.harvest((62, 15))
+        self.assertTrue(st.ok, st.reason)
+        self.assertIn("ready true→False", st.reason)
+        self.assertIn("再生作物", st.reason)
+        self.assertNotIn("没有真的动手", st.reason)
+        self.assertEqual(worker.harvested, {"(O)270": 1})
+        self.assertEqual((st.after or {}).get("loot"), {"(O)270": 1})
+        self.assertTrue(w.records[0].get("crop"), "再生作物：crop 对象必须还在（正是旧判据的盲区）")
+
+    # ---- ② 一次动作收多格：逐 qid 差分记账（真机一镰刀连收 4 格：+4 Wheat / +2 Hay）----
+    def test_one_swing_can_harvest_several_tiles_and_reports_each_qid(self):
+        w = MiniWorld(records=[self._crop((62, 15), harvestMethod="Scythe"),
+                               self._crop((60, 28), harvestMethod="Scythe")])
+
+        class _ScytheBridge(MiniBridge):
+            def use_tool(self, tile, *, tool=None, timeout_ms=None):
+                for r in self.w.records:            # 一镰刀连收两格
+                    r.pop("crop", None)
+                    r.pop("ready", None)
+                self.w.inventory.append({"slot": 6, "id": "262", "qualifiedId": "(O)262",
+                                         "name": "Wheat", "stack": 4, "isTool": False})
+                self.w.inventory.append({"slot": 7, "id": "178", "qualifiedId": "(O)178",
+                                         "name": "Hay", "stack": 2, "isTool": False})
+                return {"ok": True, "status": "ok", "acted": True}
+
+        worker = self._worker(w, _ScytheBridge)
+        st = worker.harvest((60, 28))
+        self.assertTrue(st.ok, st.reason)
+        self.assertEqual((st.after or {}).get("loot"), {"(O)262": 4, "(O)178": 2})
+        self.assertEqual(worker.harvested, {"(O)262": 4, "(O)178": 2})
+        self.assertIn("进背包", st.reason)
+
+    # ---- ③ 四条判据全不成立 ⇒ failed（回执自称 ok/acted=true 也不认）----
+    def test_no_evidence_at_all_is_a_failure_even_when_the_receipt_claims_success(self):
+        w = MiniWorld(records=[self._crop()])
+
+        class _LyingBridge(MiniBridge):
+            def interact(self, tile=None, *, timeout_ms=None):
+                return {"ok": True, "status": "ok", "acted": True, "reason": "回执说收了"}
+
+        worker = self._worker(w, _LyingBridge)
+        st = worker.harvest((62, 15))
+        self.assertFalse(st.ok)
+        self.assertEqual(st.code, "failed")
+        self.assertIn("四条判据全不成立", st.reason)
+        self.assertIn("背包没有新增物品", st.reason)
+        self.assertEqual(worker.harvested, {})
+        self.assertTrue(w.records[0].get("crop"), "世界没变 ⇒ 作物必须还在")
+
+    # ---- ④ 背包满：必须数 `inventory[]` 行数（`inventoryCount=12` 是容量，不是空槽）----
+    def test_full_backpack_is_judged_by_row_count_not_capacity(self):
+        rows = [{"slot": i, "id": "388", "qualifiedId": "(O)388", "name": "Wood",
+                 "stack": 99, "isTool": False} for i in range(12)]
+        w = MiniWorld(records=[self._crop()], inventory=rows, inventory_capacity=12)
+        worker = self._worker(w)
+        st = worker.harvest((62, 15))
+        self.assertFalse(st.ok)
+        self.assertEqual(st.code, "failed")
+        self.assertIn("背包满", st.reason)
+        self.assertEqual(w.harvests, [], "判满必须在**发请求之前**")
+        self.assertTrue(w.records[0].get("crop"))
+
+    # ---- ⑤ 前置优先于回执：满背包时连"自称成功"的回执都不许把当天记成收成 ----
+    def test_full_backpack_blocks_the_request_entirely(self):
+        rows = [{"slot": i, "id": "388", "qualifiedId": "(O)388", "name": "Wood",
+                 "stack": 99, "isTool": False} for i in range(12)]
+        w = MiniWorld(records=[self._crop()], inventory=rows, inventory_capacity=12)
+
+        class _WouldSucceedBridge(MiniBridge):
+            def interact(self, tile=None, *, timeout_ms=None):
+                self.w.harvests.append((62, 15))
+                return {"ok": True, "status": "ok", "acted": True}
+
+        worker = self._worker(w, _WouldSucceedBridge)
+        st = worker.harvest((62, 15))
+        self.assertFalse(st.ok)
+        self.assertIn("背包满", st.reason)
+        self.assertEqual(w.harvests, [])
+
+    # ---- ⑥ 旧路径（非再生作物 crop 消失）必须仍然成功 ----
+    def test_crop_gone_still_passes_without_ready_flip(self):
+        w = MiniWorld(records=[self._crop(regrowsAfterHarvest=False)])
+        # 假桥 `interact` 真摘 + 按 `harvest_item` 进背包 ⇒ 这里让它进的是这格作物的 qid。
+        w.harvest_item = {"slot": 9, "id": "270", "qualifiedId": "(O)270", "name": "Corn",
+                          "stack": 1, "isTool": False}
+        worker = self._worker(w)
+        st = worker.harvest((62, 15))
+        self.assertTrue(st.ok, st.reason)
+        self.assertIn("crop 已消失", st.reason)
+        self.assertNotIn("再生作物", st.reason)
+        self.assertEqual(worker.harvested, {"(O)270": 1})
+
+    # ---- ⑦ 只有 `farm.readyCrops` 下降也算证据（第 d 条）----
+    def test_ready_crops_drop_alone_is_enough(self):
+        w = MiniWorld(records=[self._crop()])
+        w.farm = {"loaded": True, "complete": True, "crops": 2, "readyCrops": 2}
+
+        class _FarmCountBridge(MiniBridge):
+            def interact(self, tile=None, *, timeout_ms=None):
+                self.w.farm["readyCrops"] = 1       # 只动 farm 级计数（格子上什么都没变）
+                return {"ok": True, "status": "ok", "acted": True}
+
+        worker = self._worker(w, _FarmCountBridge)
+        st = worker.harvest((62, 15))
+        self.assertTrue(st.ok, st.reason)
+        self.assertIn("farm.readyCrops 2→1", st.reason)
+        self.assertEqual(worker.harvested, {}, "只动计数、没进背包 ⇒ 白名单必须是空的")
 
 
 if __name__ == "__main__":  # pragma: no cover

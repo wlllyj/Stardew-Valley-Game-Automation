@@ -22,6 +22,11 @@
   ⚠️ 观测里**没有斧/镐/锄的升级等级**（只有 `player.tools{}` 的"有没有"和 `wateringCan.upgradeLevel`），
   所以"等级不够"判不了；能判的只有"没这件工具"。见 `tool_missing_reason`。
 * **全局缺料单独报**：种子 / 水用光时回 `no_seed` / `need_refill`，别让后面每一格去撞同一堵墙。
+* **背包"满不满"数 `inventory[]` 的**行数**，不读 `inventoryCount`**（task-181 缺陷 D）：`inventoryCount`
+  是**容量**字段（真机腾出一格后仍读 12），`inventory[]` 只含非空格 ⇒ 空槽 = `inventoryCount − len(inventory)`
+  （实现 = `player_free_slots()`）。收获的前置判满、出货前的腾格判断一律走这条口径。
+* **一次动作可能收多格**（task-181 必修 2）：一镰刀下去可能连带 4 格（+4 Wheat / +2 Hay），
+  所以收获的记账粒度是**动作前后背包逐 qualifiedId 差值**，不是"一格一物"。
 """
 
 from __future__ import annotations
@@ -1367,8 +1372,8 @@ class FarmWorker:
     def tile_essence(tv: dict[str, Any] | None) -> dict[str, Any] | None:
         if tv is None:
             return None
-        keys = ("kind", "tool", "feature", "crop", "ripe", "watered", "plantable", "standable",
-                "objId", "actionable")
+        keys = ("kind", "tool", "feature", "crop", "ripe", "ready", "readySource", "watered",
+                "plantable", "standable", "objId", "actionable")
         return {k: tv.get(k) for k in keys if k in tv}
 
     def tile_view(self, obs: dict[str, Any], tile: tuple[int, int]) -> dict[str, Any] | None:
@@ -2268,23 +2273,35 @@ class FarmWorker:
 
     # ------------------------------------------------------------- 单格：收获
     def harvest(self, tile: tuple[int, int]) -> StepResult:
-        """收获成熟作物（task-170 起按**游戏口径**判"可收"）。
+        """收获成熟作物（task-170 起按**游戏口径**判"可收"；task-181 起按**四选一证据**判"收成"）。
 
         判据链（全部来自观测、动手之前）：
           1. 有作物且 `tile_ready(tv)`（Mod `ready` = 反射 `HoeDirt.readyForHarvest()`）；
              缺字段/`ready is None`（判不了）⇒ `skipped` + 说明 —— fail-closed，不摘也不白试。
-          2. `harvestMethod == "Scythe"` ⇒ 走 `use_tool(tool="scythe")`（工具路径才割得到）；
+          2. 背包**满**（`player_free_slots()` 按 `inventory[]` **行数**算空槽，**不读 `inventoryCount`**）
+             ⇒ 一次都不交互，直接 `failed` + 文案点名"背包满"。
+          3. `harvestMethod == "Scythe"` ⇒ 走 `use_tool(tool="scythe")`（工具路径才割得到）；
              其余走 `interact`（游戏 `checkAction` → `HoeDirt.performUseAction` → `Crop.harvest`）。
-          3. 判据 = **该格作物没了**（观测差分），回执不算证据；背包差分照旧进 `self.harvested`
-             （出货白名单只认它）。
-          4. 回执如实：`acted == false` / `ok == false` 一律 `failed` —— task-170 之前这里是
-             `Ok = err == null`，没动手也报 ok，所以账本上"284 次 0 成功"根本看不出被拒。
+          4. **成功判据 = 下列任一成立**（每条都必须来自动作前后的**观测差分**；Mod 的 `acted`
+             只是线索、不算证据 —— task-177 真机里 Mod 报 `no_action` 而那格其实收成了）：
+             a) 该格 `crop` 键消失 / 为 null；
+             b) 该格 `ready` 由 `true` 变 `false`（或 `readySource` 变化）；
+             c) 背包逐 qualifiedId 差值里出现的该作物物品（**一次动作可能收多格**，见必修 2）；
+             d) `farm.readyCrops` 下降。
+             四条全不成立 ⇒ `failed`。`reason` 写清命中了哪几条。
+          5. **再生作物**（`regrowsAfterHarvest == true`）收后 `crop` 对象保留、阶段重置 ⇒
+             旧判据（只看 crop 消失）系统性假阴性，这正是 run A/B"同日同格 284 次 0 成功"的根因。
         """
         r = StepResult(action="harvest", tile=tile)
         obs = self.snap()
         tv = self.tile_view(obs, tile)
         r.before = self.tile_essence(tv)
-        inv_before = self._inventory_counts(self.player_of(obs))
+        ready_before = (tv or {}).get("ready")
+        ready_source_before = (tv or {}).get("readySource")
+        player = self.player_of(obs)
+        inv_before = self._inventory_counts(player)
+        ready_tiles_before = self._ready_crop_tiles(obs)
+        ready_crops_before = self._ready_crops_count(obs)
         if not (tv or {}).get("crop"):
             r.code, r.reason = "skipped", "这一格没有作物"
             return r
@@ -2294,6 +2311,14 @@ class FarmWorker:
             r.reason = (f"游戏口径不可收 ⇒ 不摘；{note}" if note else
                         "游戏口径不可收（ready != true：复收冷却 / 阶段没走完 / 枯死 / 采集作物形态 2）⇒ 不摘")
             return r
+        # 【task-181 必修 3】背包满 ⇒ 一次都不动：空槽按 `inventory[]` **行数**算
+        # （`inventoryCount` 是**容量**字段，真机腾出一格后仍读 12 ⇒ 拿它判满会永远"满"）。
+        free_rows, free_status = player_free_slots(player or {})
+        if free_status == "ok" and free_rows <= 0:
+            r.code = "failed"
+            r.reason = ("背包满（空槽 = `inventoryCount` 容量 − `inventory[]` 行数 = 0；"
+                        "`inventoryCount` 是容量字段，不能拿它判满）⇒ 先出货/整理背包再来收")
+            return r
         # 【task-68】站不到旁边 ⇒ **先看四邻能不能开路**（清掉 weeds/stone/twig/grass 再重试）；
         # 开路后仍站不到 ⇒ 被不可清障物围住记 `encircled`、清了上限还不通记 `unreachable`
         # （task-52：不是 `failed`，当天不白试、次日重试，日级各有有界豁免）。
@@ -2301,6 +2326,7 @@ class FarmWorker:
             return r
         tool = harvest_tool(tv)
         status = ""
+        acted: Any = None
         receipt: dict[str, Any] | None = None
         try:
             if tool:
@@ -2313,30 +2339,51 @@ class FarmWorker:
         if isinstance(receipt, dict):
             r.receipt = r.receipt or _receipt_of(receipt)
             status = status or str(receipt.get("status") or "")
-            # 【task-170】Mod 现在会把"到底动没动手"写成机器可读的 `acted`；被拒（没动手）
-            # 必须如实记 failed —— 否则脑会以为"摘过了"，然后整天盯着一格没变的作物。
+            # 【task-170 → task-181】Mod 的 `acted` 只是**线索**、不再当判据：task-177 真机里
+            # 它对再生作物报 `no_action`，而那格其实收成了（ready 翻转 + 背包 +1）。
+            # 它只进失败文案；成没成一律看下面的观测差分。
             acted = receipt.get("acted")
-            if acted is False or receipt.get("ok") is False:
-                r.code = "failed"
-                r.reason = (f"Mod 回执说没有真的动手（acted={acted}，"
-                            f"status={status or 'ok'}）：{r.receipt or ''}")
-                return r
         obs = self.snap()
         tv = self.tile_view(obs, tile)
-        r.after = self.tile_essence(tv)
-        if not (tv or {}).get("crop"):
-            # 【task-42】判据之外再记一件事：**背包真的多了什么**。出货白名单只认这份差分
-            # （回执不算证据），所以"收成了但没进背包"必须如实写出来 —— 否则出货那一步
-            # 会去卖一件根本没进过背包的东西。
-            gained = self._loot_delta(inv_before, self._inventory_counts(self.player_of(obs)))
+        inv_after = self._inventory_counts(self.player_of(obs))
+        # 【task-181 必修 1】四选一证据（全部来自动作前后的观测差分）：
+        crop_gone = not (tv or {}).get("crop")
+        ready_after = (tv or {}).get("ready")
+        ready_flipped = (ready_before is True and ready_after is not True)
+        source_changed = (ready_source_before != (tv or {}).get("readySource"))
+        gained = self._loot_delta(inv_before, inv_after)
+        ready_crops_after = self._ready_crops_count(obs)
+        ready_dropped = (isinstance(ready_crops_before, int) and isinstance(ready_crops_after, int)
+                         and ready_crops_after < ready_crops_before)
+        # 【task-181 必修 2】一次动作可能收多格 ⇒ 用"前后 ready 格集合差分"推断受影响格；
+        # 推不出就如实写 unknown（不许编）。
+        affected = sorted(ready_tiles_before - self._ready_crop_tiles(obs))
+        r.after = {**(self.tile_essence(tv) or {}), "loot": gained, "harvested": gained,
+                   "affected_tiles": [list(t) for t in affected] if affected else "unknown"}
+        if gained:
+            # 【task-42】出货白名单的唯一真源 = 逐 qualifiedId 背包差分（回执不算证据）。
             for qid, n in gained.items():
                 self.harvested[qid] = self.harvested.get(qid, 0) + int(n)
-            if gained:
-                r.after = {**(r.after or {}), "harvested": gained}
-                r.reason = f"作物已收走（crop 变空）；进背包：{gained}"
-            else:
-                r.reason = "作物已收走（crop 变空）；⚠ 背包没有新增物品（收货可能丢了，不能出货）"
+        evidence: list[str] = []
+        if crop_gone:
+            evidence.append("该格 crop 已消失")
+        if ready_flipped:
+            evidence.append(f"该格 ready true→{ready_after}")
+        elif source_changed:
+            evidence.append(f"该格 readySource {ready_source_before}→{(tv or {}).get('readySource')}")
+        if gained:
+            evidence.append(f"进背包：{gained}（逐 qid 差分；一次动作可能收多格）")
+        if ready_dropped:
+            evidence.append(f"farm.readyCrops {ready_crops_before}→{ready_crops_after}")
+        if evidence:
             r.ok = True
+            r.reason = f"收获成功（判据：{'；'.join(evidence)}）"
+            r.reason += (f"；受影响格：{[list(t) for t in affected[:8]]}" if affected
+                         else "；受影响格：unknown")
+            if not crop_gone and (ready_flipped or source_changed):
+                r.reason += "；再生作物：crop 对象保留、阶段重置（旧判据只看 crop 消失 ⇒ 假阴性）"
+            if not gained:
+                r.reason += "；⚠ 背包没有新增物品（收货可能丢了，不能出货）"
             return r
         r.code = "failed"
         _mark_status(r, status)     # 渐黑/模态 ⇒ 不封格、不占配额；超时 ⇒ 不封格但占配额
@@ -2346,8 +2393,13 @@ class FarmWorker:
             r.reason = (f"收获请求回「走不到」（{status}）：没有落脚点/没算出路径 ⇒ 不算硬失败；"
                         f"作物还在；{r.receipt}")
             return r
-        r.reason = (f"游戏口径可收但作物还在（交互/挥镰后没摘到）"
-                    f"{f'；Mod status={status}' if status else ''}{f'；{r.receipt}' if r.receipt else ''}")
+        self_note = ("；Mod 回执说没有真的动手（acted=False —— 只是线索、不是判据；"
+                     "task-177 真机里它对再生作物误报过 no_action）") if acted is False else ""
+        r.reason = (f"游戏口径可收但四条判据全不成立（交互/挥镰后世界没变；作物还在、ready 没翻转、"
+                    f"背包没有新增物品、farm.readyCrops 没下降）"
+                    f"{f'；Mod status={status}' if status else ''}"
+                    f"{self_note}"
+                    f"{f'；{r.receipt}' if r.receipt else ''}")
         return r
 
     # ------------------------------------------------------------- task-42：出货（卖出）
@@ -2380,6 +2432,26 @@ class FarmWorker:
             d = int(n) - int((before or {}).get(qid, 0))
             if d > 0:
                 out[qid] = d
+        return out
+
+    @staticmethod
+    def _ready_crops_count(obs: dict[str, Any]) -> int | None:
+        """`farm.readyCrops`（游戏口径的可收格数）；缺字段 / 类型不对 ⇒ `None`（判不了，**不当 0**）。"""
+        raw = (obs.get("farm") or {}).get("readyCrops")
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            return None
+        return int(raw)
+
+    def _ready_crop_tiles(self, obs: dict[str, Any]) -> set[tuple[int, int]]:
+        """当前窗口里 `ready == true` 的作物格集合。
+
+        【task-181 必修 2】用来**推断**一次动作影响了哪些格（前后差分）；推不出就是空集，
+        调用方如实写 `unknown`，不许编。
+        """
+        out: set[tuple[int, int]] = set()
+        for tile, tv in self.tiles_of(obs).items():
+            if (tv or {}).get("crop") and tv.get("ready") is True:
+                out.add(tile)
         return out
 
     def reset_harvested(self) -> None:
