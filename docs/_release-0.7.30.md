@@ -22,7 +22,8 @@
 | task-134 | A：resume/work_spot 空转有界（burst 计数覆盖）+ resume 重评 `no_target`；B：**leftover 口径拆分**（`assigned_undone` vs `plot_pending`） | dev-coder **completed**（`903e6a4`，2 文件 +383/−4；Lead 亲核定向 433 OK / 全量 **757 OK**） | ✅ |
 | 工具侧对齐 | `tools/verify-run3.py` 3b 改按 `stages[].assigned_undone` 判 `no_unmet_stages`（`leftover`/`plot_pending` 只记录）+ 日级白名单补 `assigned_undone`/`plot_pending`/`plot_pending_by_kind`/`deferred_tiles` + 5 条新用例 | Lead **completed**（`c6cc654`；`tests.test_verify_run3` 58 OK、九账本 rc 并排不变） | ✅ |
 | task-135 | 独立对抗验收 task-133 + task-134（重点：口径变更是否引入新洗白通道） | deputy-lead 在制（已派，含工具侧对账） | ✅ |
-| task-136 | 决策演进链质量：复盘调用留痕 + 复盘提示词接地 + 教训 hint 防污染（`[模型自述·未验证]`） | dev-coder 在制 | ✅（run9c 前） |
+| task-136 | 决策演进链质量：复盘调用留痕 + 复盘提示词接地 + 教训 hint 防污染（`[模型自述·未验证]`） | dev-coder **completed**（`7d4450f`，4 文件 +463/−23；Lead 亲核定向 438 OK / 全量 **767 OK**） | ✅（run9c 前） |
+| task-139 | analyzer 收录 task-136 的 `lessons.hint_dropped` + 头部「教训素材质量」行 + 三条 ⚠（不进 rc） | log-analyst **completed**（`1e1d2cf`，3 文件 +247/−2；Lead 亲核 analyzer 171 OK / 全量 **774 OK**，十账本 rc 一字未变） | ✅（不阻塞冻结，run9c 判决前交） |
 | task-101 | `_farm_totals` 类型校验（`dryCrops="abc"` 会让整天崩）等 NIT | pending | 顺延 |
 | task-107 | Mod `dryTiles` 与 `dryCrops` 同源 + `scanSeq` | pending | 顺延 |
 | task-109 | 卖货如实性（最大叠/最小损失）+ 卖后刷新 obs | pending | 顺延 |

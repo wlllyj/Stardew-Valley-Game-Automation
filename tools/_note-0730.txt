@@ -14,8 +14,10 @@ v0.7.30（run9b 复盘：water_far 补水与逐格判据 + resume 空转兜底 +
    - run9b 死循环（A 真缺陷）：`_resume_plot`/`review_only_fallback` 走回片区后没清任务级 `no_target` ⇒ 2.6 秒内 10 次 work_spot/resume_walk 零动作 ⇒ 5 次 `plot_exhausted` ⇒ burst ⇒ stuck 收工；修法 = resume 时清掉当日该片区的 `no_target`、resume 也计入 burst 上限、真无路时如实收尾（不空转）。
 
 3. task-136（dev-coder）演进素材质量（任务只许来自账本、理由必须自带证据）：
-   - 每条 lesson 的 `kind`/`count`/`evidence` 只能来自账本数字，`hint` 只能解释、不许引入账本为 False 的断言；
-   - 成对矛盾（evidence 与 hint 互斥）⇒ 丢弃该 lesson + journal `lesson_rejected{reason:"hint_contradicts_evidence"}`；
+   - 复盘调用也写进 `<journal>-llm.jsonl`（`kind="review"`，决策行加 `kind="decision"`、旧字段名不变）；
+   - 复盘提示词接地：19 个当天事实字段（缺失写「未观测到」、0 照实写 0）；
+   - 每条 lesson 的 `kind`/`count`/`evidence` 只能来自账本数字，`hint` 只能解释、不许引入账本为 False 的断言（渲染时加 `[模型自述·未验证]` 前缀）；
+   - 成对矛盾（evidence 与 hint 互斥）⇒ **丢掉该条的 `hint`**（lesson 本身保留、`hint` 置空），既有 `lessons` 事件新增 `hint_dropped` 计数（未新增事件名）；矛盾 `hint` 绝不许进提示词；
    - run9b 实证：7 条 lesson 中 3 条 hint 与 evidence 自相矛盾（`far_dry_given_up|water_far` 说"有 3 格够不着"，evidence 是 `gave_up=3 dry_dead=0` 且那天 water_far 成功；另一条 `slept_without_work|day` 更直接），且经 task-58/59/82 的注入链进了第二天提示词。
 
 4. task-135（deputy-lead，对抗验收）0.7.30 批次：A 段范围/读数、B 段复现 run9b 三形态 FAIL→PASS（water_far 壶空白认输 / resume 空转 burst / 阶段口径错配）、C 段 ≥6 组对抗（不许用邻格计数冒充逐格成功、补水不得无限自旋、resume 不得死循环、口径不得掩盖真未完成、lesson 矛盾不得注入、诚实上限不得被滥用）。
