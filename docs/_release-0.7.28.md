@@ -32,7 +32,9 @@
 
 ## 2. 冻结与装机九步（Lead 独占，链式，不许并行）
 
-1. `team_task_get` 确认 **task-102 / task-104 / task-106 / task-58 / task-59 / task-82 已 completed**，且 **task-103 / task-108 / task-112** PASS 或 PASS-WITH-NITS（无必修）、**task-111** 已交（八本账本两侧 rc 同向、`TestEventMappingDrift` 零红）。
+1. `team_task_get` 确认 **task-102 / task-104 / task-106 / task-58 / task-59 / task-82 / task-111 / task-114 已 completed**，且 **task-103 / task-108 / task-112 PASS 或 PASS-WITH-NITS（无必修）、task-115 PASS 或 PASS-WITH-NITS（无必修）**。
+   - 其中 **task-112 = FAIL**（`docs/_review-llmfeedback.md`：F1 教训库来源可信性、F2 裁剪优先级）⇒ **task-114 修 → task-115 delta 复验**；两条都不阻塞 run9 判定正确性，但削弱演进机制，故列为本版必修。
+   - task-111 已交 **`d10dc6b`**（5 个新事件入桶 + `review_llm_without_notes`/`lessons_over_limit`/`lessons_load_failed` 三条红；全量 **665 OK / 0 红**；八账本 rc 与 `verify-run3` 一字未变）。
 2. 确认 `tools/_note-0728.txt` 存在且**首串是 `v0.7.28`**（列本版两批卡片：run8 两病灶 + LLM 复盘/教训库；LLM 两条等 task-82/task-59 落地后按实际内容补写）。
 3. `python tools/_bump-mod-version.py 0.7.28 --note-file tools\_note-0728.txt`（⚠️ cp1252 下末句 print 会 `UnicodeEncodeError` 且退出码 1，但**版本已写盘** ⇒ 一律用 `json.load` 核对 `manifest.json` 的 `Version`）。
 4. `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.28"`。
