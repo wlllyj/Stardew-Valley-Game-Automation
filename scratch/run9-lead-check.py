@@ -27,10 +27,21 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
 SEASONS = ("spring", "summer", "fall", "winter")
+
+# 真正的 SMAPI 日志行带 `[HH:MM:SS LEVEL CHANNEL]` 前缀；插件描述行**也有**前缀
+# （`[23:46:36 INFO  SMAPI] AgentFarm Bridge 0.7.30 by AgentFarm | v0.7.30…`），
+# 但它含 ` by AgentFarm ` / `| v0.` 这类描述标记 ⇒ 两个条件都要用（task-127 `eff88e5`）。
+_LOG_PREFIX = re.compile(r"^\[\d{2}:\d{2}:\d{2}\s+[A-Z]+\s+[^\]]+\]")
+_DESC_MARKERS = (" by AgentFarm ", "| v0.")
+
+
+def is_trigger_line(line: str) -> bool:
+    return bool(_LOG_PREFIX.match(line)) and not any(m in line for m in _DESC_MARKERS)
 
 
 def load_rows(path: Path) -> list[dict]:
@@ -151,7 +162,14 @@ def main() -> int:
     if spath and spath.exists():
         text = spath.read_text(encoding="utf-8", errors="replace").splitlines()
         newday, before, called, done = [], [], [], []
+        skipped_desc = 0
         for i, line in enumerate(text):
+            # task-127 `eff88e5`：插件描述行（列出触发器的文本）里也含 `SaveGame.Save() called.`
+            # 字样，但它带的是描述标记（` by AgentFarm ` / `| v0.`）⇒ 计进去会造出 6 vs 5 的假阳性。
+            if not is_trigger_line(line):
+                if "SaveGame.Save() called." in line:
+                    skipped_desc += 1
+                continue
             if "Synchronizing 'NewDay' task" in line:
                 newday.append(i)
             elif "Context: before save." in line:
@@ -162,6 +180,8 @@ def main() -> int:
                 done.append(i)
         print(f"    · 窗口 {spath.name} 行 {len(text)}｜ NewDay {len(newday)} / before save {len(before)} "
               f"/ Save called {len(called)} / completed {len(done)}")
+        if skipped_desc:
+            print(f"    · 已排除 {skipped_desc} 行插件描述行（含 ` by AgentFarm `/`| v0.` 标记，假阳性防护，task-127）")
         if len(before) != len(called):
             problems.append(f"SMAPI 里 before save({len(before)}) != Save called({len(called)})")
         if len(called) > len(newday):
