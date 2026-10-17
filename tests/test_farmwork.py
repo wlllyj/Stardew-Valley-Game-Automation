@@ -23,7 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "brain"))
 
 from agentfarm.bridge import BridgeError  # noqa: E402
 from agentfarm.farmwork import (  # noqa: E402
-    NEIGHBORS, FarmWorker, KIND_TOOL, MAX_CLEAR_SWINGS, StepResult as SR, StageResult,
+    NEIGHBORS, FarmWorker, KIND_TOOL, LOOT_CONFIRM_TRIES, LOOT_CONFIRM_WAIT_S,
+    MAX_CLEAR_SWINGS, StepResult as SR, StageResult,
     SURPLUS_MATERIAL_IDS, buy_count_for, farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles,
     farm_empty_dirt, is_seed_offer,
     is_unreachable, pick_seed_offer, player_free_slots, seed_offers_from, surplus_sell_plan,
@@ -1296,7 +1297,11 @@ class TestTask42Sell(unittest.TestCase):
         st2 = worker2.harvest((62, 15))
         self.assertTrue(st2.ok)
         self.assertEqual(worker2.harvested, {})
-        self.assertIn("背包没有新增物品", st2.reason)
+        # 【task-189 / R2】文案改了：格子级证据在、逐 qid 差分却始终为空时，必须说"**对不上**"
+        # （旧文案写"背包没有新增物品"，而真机反例 `(O)262 +4` 证明那句话可能是错的 ——
+        # 掉落物延迟入包）。语义不变：**观测不到新增 ⇒ 一律不进白名单、不出货**。
+        self.assertIn("对不上", st2.reason)
+        self.assertNotIn("背包没有新增物品", st2.reason)
 
     def test_sell_loot_ships_whitelisted_loot_and_shrinks_the_list(self):
         """②白名单里的东西**整件**进箱；工具在旁边一动不动；**钱当天不变**（等 NewDay 结算）。"""
@@ -2549,6 +2554,145 @@ class TestTask186MissingTileAndWhitelistBinding(unittest.TestCase):
         self.assertIn("farm.readyCrops 无法判定", st.reason)
         self.assertNotIn("readyCrops 2→1 没下降", st.reason)
         self.assertNotIn("没下降", st.reason)
+
+
+class TestTask189LootAccounting(unittest.TestCase):
+    """task-189（R2）：loot 记账必须覆盖「多格一次动作 + 合并进既有同一叠 + 掉落物延迟入包」。
+
+    真机来源 = task-184 复测（machine-runner `61031b6`）的 R2：对照格实测 `(O)262 +4` /
+    `(O)178 +2`，而脑侧 reason 写「⚠ 背包没有新增物品（收货可能丢了，不能出货）」；
+    单格新物品时（`{'(O)270': 1}`）是对的。
+
+    判据（卡面）：**以动作前后 `inventory[]` 逐 qualifiedId 计数差为准**（不是"只看新出现的
+    qid"、也不是"只看目标格"），把差额与 `affected_tiles` 对账；对不上就**如实写 reason**（写明
+    对不上），不许写"没有新增物品"这种与实测相反的结论。安全约束不放宽：白名单仍受 task-186
+    必修 2 约束（qid ⊆ 本次动作有格子级证据的那批）；"收货可能丢了"的告警**只在真对不上时**报。
+
+    为什么需要"有界确认"：掉落物被自动拾取有延迟，动作后第一张观测里背包可能还是旧的。
+    只在**有格子级证据**时才有界地再等再观测（`LOOT_CONFIRM_TRIES` × `LOOT_CONFIRM_WAIT_S`），
+    证据本身仍取自动作后的第一张观测。
+
+    变异预期（`scratch/_t189_mutate.py`，brain+tests 一起拷临时目录，跑完已删；**实测**）：
+    基线 3/3 绿；**m189a**（去掉有界确认循环）杀 **2**；**m189b**（`_loot_delta` 只看"新出现的 qid"）
+    杀 **1**；**m189c**（去掉"对不上"文案、退回"背包没有新增物品"）杀 **1**。
+    """
+
+    @staticmethod
+    def _crop(tile=(62, 15), **kw) -> dict:
+        rec = {"tile": list(tile), "kind": "dirt", "feature": "HoeDirt", "crop": "262",
+               "ripe": True, "ready": True, "harvestMethod": "Grab", "watered": True,
+               "standable": True, "actionable": True}
+        rec.update(kw)
+        return rec
+
+    def _worker(self, world, bridge_cls, **kw):
+        """构造 worker 并记录 `pause` 调用（用来断言"有界"）。"""
+        pauses: list[float] = []
+        bridge = bridge_cls(world, **kw)
+        worker = FarmWorker(bridge, log=lambda _s: None, pause=pauses.append)
+        return worker, pauses
+
+    @staticmethod
+    def _add_qid(world, qid: str, n: int) -> None:
+        """把 n 件 qid 加进背包（**并入既有同一叠**，没有既有叠才开新槽）。"""
+        for it in world.inventory:
+            if it.get("qualifiedId") == qid:
+                it["stack"] = int(it.get("stack") or 0) + n
+                return
+        world.inventory.append({"slot": len(world.inventory), "id": qid.split(")")[-1],
+                                "qualifiedId": qid, "name": qid, "stack": n, "isTool": False})
+
+    # ---- ① 多格一次动作 + 并入既有叠 + 延迟入包 ⇒ 记账必须对得上，且 reason 不许说"没有新增" ----
+    def test_multi_tile_swing_merging_into_existing_stacks_is_recorded(self):
+        w = MiniWorld(records=[self._crop((62, 15)), self._crop((63, 15))])
+        self._add_qid(w, "(O)262", 5)          # 既有叠：真机 `(O)262 +4` 就是并进这一叠
+
+        class _LateLootBridge(MiniBridge):
+            """一次挥动收两格；`(O)262` 并入既有叠 +4、`(O)178` 开新叠 +2；掉落物延迟一张观测。"""
+
+            def __init__(self, world):
+                super().__init__(world)
+                self.armed = False
+                self.polls = 0
+                self.applied = False
+
+            def interact(self, tile=None, *, timeout_ms=None):
+                for r in list(self.w.records):
+                    if tuple(r["tile"]) == tuple(tile):
+                        self.w.records.remove(r)          # 目标格 crop 消失（格子级证据）
+                for r in self.w.records:
+                    if tuple(r["tile"]) == (63, 15):
+                        r["ready"] = False               # 同一次挥动的第二格：ready 翻转
+                self.armed = True
+                return {"ok": True, "status": "ok", "acted": True}
+
+            def observe(self, detail="summary", *, timeout=None):
+                if self.armed and not self.applied:
+                    self.polls += 1
+                    if self.polls > 1:                   # 第一张动作后观测还看不到新增
+                        TestTask189LootAccounting._add_qid(self.w, "(O)262", 4)
+                        TestTask189LootAccounting._add_qid(self.w, "(O)178", 2)
+                        self.applied = True
+                return super().observe(detail, timeout=timeout)
+
+        worker, pauses = self._worker(w, _LateLootBridge)
+        st = worker.harvest((62, 15))
+        after = st.after or {}
+        self.assertTrue(st.ok, st.reason)
+        self.assertEqual(after.get("loot"), {"(O)262": 4, "(O)178": 2})
+        self.assertEqual(after.get("loot_waits"), 1)
+        self.assertEqual(pauses, [LOOT_CONFIRM_WAIT_S])
+        self.assertNotIn("背包没有新增物品", st.reason)
+        self.assertIn("多等 1 次观测", st.reason)
+        self.assertIn("逐 qid 差分", st.reason)
+        self.assertEqual(after.get("affected_tiles"), [[63, 15]], "多格一次动作的第二格要认领")
+        self.assertEqual(worker.harvested, {"(O)262": 4, "(O)178": 2})
+
+    # ---- ② 确有丢失（格子级证据在、背包永不新增）⇒ 如实告警，不许沉默 ----
+    def test_permanently_unobserved_loot_is_reported_as_a_mismatch(self):
+        w = MiniWorld(records=[self._crop()])
+
+        class _GoneNoLootBridge(MiniBridge):
+            def interact(self, tile=None, *, timeout_ms=None):
+                for r in self.w.records:
+                    if tuple(r["tile"]) == tuple(tile):
+                        r["crop"] = None                  # crop 消失，但一件都没进背包
+                return {"ok": True, "status": "ok", "acted": True}
+
+        worker, pauses = self._worker(w, _GoneNoLootBridge)
+        st = worker.harvest((62, 15))
+        after = st.after or {}
+        self.assertTrue(st.ok, st.reason)                 # 格子级证据仍在 ⇒ 步骤算成功
+        self.assertEqual(pauses, [LOOT_CONFIRM_WAIT_S] * LOOT_CONFIRM_TRIES)
+        self.assertEqual(after.get("loot"), {})
+        self.assertIs(after.get("loot_unconfirmed"), True)
+        self.assertIn("对不上", st.reason)
+        self.assertIn("背包逐 qid 计数差", st.reason)
+        self.assertNotIn("背包没有新增物品", st.reason)
+        self.assertEqual(worker.harvested, {}, "观测不到新增 ⇒ 不许进白名单（更不许凭空生成）")
+
+    # ---- ③ 无关物品进背包（没有格子级证据）⇒ 步骤可成功，但绝不进白名单 ----
+    def test_unrelated_gain_without_tile_evidence_never_whitelists(self):
+        w = MiniWorld(records=[self._crop()])
+
+        class _BystanderBridge(MiniBridge):
+            """这一格什么都没变，只是背包多了别的系统给的物品。"""
+
+            def interact(self, tile=None, *, timeout_ms=None):
+                TestTask189LootAccounting._add_qid(self.w, "(O)999", 3)
+                return {"ok": True, "status": "ok", "acted": True}
+
+        worker, pauses = self._worker(w, _BystanderBridge)
+        st = worker.harvest((62, 15))
+        after = st.after or {}
+        self.assertTrue(st.ok, st.reason)
+        self.assertEqual(after.get("loot"), {"(O)999": 3})
+        self.assertEqual(after.get("loot_waits"), 0, "没有格子级证据 ⇒ 不做有界确认（省观测）")
+        self.assertEqual(pauses, [])
+        self.assertIs(after.get("whitelist_bound"), False)
+        self.assertEqual(after.get("loot_whitelisted"), [])
+        self.assertIn("不进出货白名单", st.reason)
+        self.assertEqual(worker.harvested, {})
 
 
 if __name__ == "__main__":  # pragma: no cover

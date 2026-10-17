@@ -112,6 +112,14 @@ CLUMP_KINDS = ("clump", "stump", "log", "boulder", "rockPile", "greenRain")
 #: ⇒ 一格 grass 最多要 4 刀（IL 级证据见 `docs/_analyze-longrun-run1.md`）。
 MAX_CLEAR_SWINGS = 4
 
+#: 【task-189 / R2】收获记账的"有界确认"次数与间隔。
+#: 真机 task-184 复测：一次动作收多格、或掉进**既有同一叠**（`(O)262 +4` / `(O)178 +2`）时，
+#: 动作后**第一张观测**里背包可能还没反映出来（掉落物被玩家自动拾取有延迟），而脑侧当时
+#: 直接写了"背包没有新增物品（收货可能丢了）" —— 与实测相反。判据必须是**逐 qid 背包差分**，
+#: 所以这里在有"格子级证据"的前提下多等一会儿再观测（有界，最大 `LOOT_CONFIRM_TRIES` 次）。
+LOOT_CONFIRM_TRIES = 2
+LOOT_CONFIRM_WAIT_S = 0.35
+
 #: `use_tool` 回执里代表"**这一格本身**挥不动"的状态码（Mod 已换遍工具 / 前置条件不成立）
 #: ⇒ 再重发同样的请求不会变，直接按"今天干不动"封格。
 TILE_INERT_STATUSES = ("tool_ineffective", "precondition_failed")
@@ -2380,6 +2388,19 @@ class FarmWorker:
         # 只凭背包差分（可能是别人顺手捡的、别的系统给的）不能证明 qid 与目标格有关 ⇒ 不入白名单。
         # 这**不是**放宽 `sell`（不卖工具/武器/种子/建材的红线一字不动），而是收紧它的输入。
         tile_level_evidence = bool(crop_gone or ready_flipped or source_changed or affected)
+        # 【task-189 / R2】多格一次动作 + 合并进既有同一叠 + 掉落物延迟入包 ⇒ 动作后第一张观测里
+        # 背包可能还是旧的。只要**格子级证据**说明这一格真的动了，就有界地再等再观测，直到逐 qid
+        # 差分出现新增或用完次数 —— 判据仍是"逐 qid 背包计数差"（覆盖多格合计与并入既有叠），
+        # 绝不把"还没看见"写成"没有新增物品"。证据本身仍取自**动作后的第一张观测**（等多几眼只为
+        # 背包，避免观测窗口抖动把"这一格看见了没"也改掉）。
+        loot_waits = 0
+        while tile_level_evidence and not gained and loot_waits < LOOT_CONFIRM_TRIES:
+            loot_waits += 1
+            self.pause(LOOT_CONFIRM_WAIT_S)
+            later = self.snap()
+            inv_after = self._inventory_counts(self.player_of(later))
+            gained = self._loot_delta(inv_before, inv_after)
+        loot_unconfirmed = bool(tile_level_evidence and not gained)
         whitelisted: list[str] = []
         if gained and tile_level_evidence:
             # 【task-42】出货白名单的唯一真源 = 逐 qualifiedId 背包差分（回执不算证据）。
@@ -2389,7 +2410,9 @@ class FarmWorker:
         r.after = {**(self.tile_essence(tv) or {}), "loot": gained, "harvested": gained,
                    "affected_tiles": [list(t) for t in affected] if affected else "unknown",
                    "loot_whitelisted": whitelisted, "whitelist_bound": bool(tile_level_evidence),
-                   "tile_seen": tile_seen}
+                   "tile_seen": tile_seen, "loot_waits": loot_waits}
+        if loot_unconfirmed:
+            r.after["loot_unconfirmed"] = True
         if not tile_seen:
             r.after["not_seen"] = True
         evidence: list[str] = []
@@ -2413,8 +2436,18 @@ class FarmWorker:
             if gained and not whitelisted:
                 r.reason += ("；⚠ 背包有新增但**只有背包差分、没有格子级证据** ⇒ 这批 qid "
                              "不进出货白名单（防误卖与本次动作无关的物品）")
+            if gained and loot_waits:
+                r.reason += (f"；⚠ 动作后的第一张观测里背包还没反映这次收获，"
+                             f"多等 {loot_waits} 次观测（{LOOT_CONFIRM_WAIT_S}s/次）后才看到逐 qid 新增")
             if not gained:
-                r.reason += "；⚠ 背包没有新增物品（收货可能丢了，不能出货）"
+                if tile_level_evidence:
+                    # 【task-189 / R2】有格子级证据却始终等不到逐 qid 新增 ⇒ 如实写明"对不上"，
+                    # 不许写"背包没有新增物品"这种与实测可能相反的结论（真机 `+4`/`+2` 就是反例）。
+                    r.reason += (f"；⚠ 对不上：该格有格子级证据，但**背包逐 qid 计数差**在"
+                                 f"{1 + loot_waits} 次观测里始终为空（说明这次新增一个都没观测到；"
+                                 f"收货可能掉在地上/被别的系统收走）⇒ 不出货（白名单为空）")
+                else:
+                    r.reason += "；⚠ 背包没有新增物品（收货可能丢了，不能出货）"
             if not tile_seen:
                 r.reason += f"；{not_seen_note}"
             return r
