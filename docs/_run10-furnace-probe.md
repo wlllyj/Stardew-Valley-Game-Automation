@@ -1,91 +1,129 @@
-# task-214 · Furnace 配方/触发器真机内省取证（0.7.37）
+# task-214 · Furnace 配方/触发器真机内省取证（0.7.38 复跑）
 
-> **状态：BLOCKED（环境/构建缺陷），不是 FAIL。** 装机 0.7.37 的 Mod 在 `Skills.IsKnownSkill` 白名单里没有
-> `debug_dump` / `add_missed_recipes`（`upgrade_tool`/`pickup_tool`/`craft_item`/`place_object`/`machine` 也没有），
-> 请求在**进主线程之前**就被 `unknown_skill` 拒掉 ⇒ 本卡**未取得任何配方/触发器证据**，步骤 ②③④ 无法开始。
-> 修复在 `8f357bd`（WIP，未冻结未装机），将随 **0.7.38 重冻结**装机后原样重跑四步。
-> 我对世界的写操作：**零**（未 `add_missed_recipes`、未开菜单、未 `load_save`、未 `craft/place/buy/sell`）。
+> **状态：已复跑完毕，结论 = 【仍无法判定】（三态中的第三态）。** 0.7.37 的 `unknown_skill` 事故**未复现**（白名单护栏生效）；
+> 但「Furnace 配方能否被合法授权」被一个新缺陷卡住：`debug_dump` 只支持 `Dictionary<string,string>` 型数据表，
+> `Data/TriggerActions`（1.6 是 `List<TriggerActionData>`）**取不到原文** ⇒ 触发器通道这一支无法验证。
+> 已测到的硬事实：**假设 A（技能升级补发）已证伪**（`AddMissedMailAndRecipes()` 一次 → 0 条新增）；配方本身存在于游戏数据。
+> 本轮对世界的写操作只有 `add_missed_recipes` 一次（实测 0 增量）；**存档零落盘**（§4）。
 
-## §1 五文件指纹与命令原文
+## §1 冻结件指纹与前置
 
-**本卡实际只执行了一条 Mod 命令**（其余步骤因阻塞未发）：
+**冻结件**：HEAD **`2ca6dc8`**（`freeze(0.7.38): task-216 F3 修复 + SkillCatalog 技能名单一数据源护栏（白名单事故永久护栏）+ 等待日留痕/判据收紧`）。
 
-```
+**五文件指纹逐字比对 —— 5/5 MATCH**（全 64 位 SHA256）：
+
+| 文件 | size / mtime | SHA256 |
+| --- | --- | --- |
+| `brain/agentfarm/longrun.py` | 479469 / 2026-10-18 00:34:38.655 | `AAFD0CC1C93B7E3E9178ABFC77BB2561D2C1A35A80009C7B9D36E57B356A0023` |
+| `brain/agentfarm/farmwork.py` | 204190 / 00:34:39.820 | `B0C719E23D4D048271E0803FDE0C909E2B59F97E8D8EC3F094D766614BE0F2B1` |
+| `brain/agentfarm/bridge.py` | 60322 / 01:03:31.308 | `BBAE61454E809DB2FB7F195E80FEC06B8F8F368AAABA5608A02B95664D755062` |
+| `mod/AgentFarm.Bridge/bin/Release/AgentFarm.Bridge.dll` | 269312 / 01:03:41.564 | `16FA5D161F94E9DC8ACFC7ED687EEB59015F85DF056E08DABB51A69D6AE76938` |
+| `mod/AgentFarm.Bridge/manifest.json` | 57736 / 01:03:09.831 | `63B7D82C944DB225B058969B852C32137828BBFCD6AABFA51BC02040067CFBE2` |
+
+装机目录 `…\Mods\AgentFarm.Bridge\AgentFarm.Bridge.dll` 与 `manifest.json` 的 size/mtime/SHA256 **与上表 dll/manifest 完全相同**（= 装的就是这份）。
+
+**环境**：`health = {ok:true, status:"ok", modVersion:"0.7.38", runtime:{ticks:2599, uptimeSeconds:49.7, worldSeq:15, hasSaveLoaded:true, onTitleScreen:false}, server:{port:17890}}`；
+`preflight` 由 Lead 跑（`logs/run10f-baseline.json`，`generatedAt 2026-10-18T01:04:29+07:00`、`worldSeq 11`、`day [1,"fall",21]`、`money 2042`、`stamina 270.0`、`location Farm`）；
+存档四条 before：`Wahaha_450799035` **4383128 B / 2026-10-17 23:38:17.154**、`SaveGameInfo` 29605 / 23:38:17.251、`_old` 4417243 / 12:09:48.738、`SaveGameInfo_old` 29567 / 12:09:48.738。
+
+**本轮实际发出的命令**（`scratch\_t214_run.py` 顺序执行并逐步落盘）：
+
+```pwsh
+python scratch\_t213_probe.py --table crafting_recipes --key Furnace
+python scratch\_t213_probe.py --table trigger_actions
+python scratch\_t213_probe.py --add-missed            # 只调一次，无循环；第 1 步失败则根本不执行
 python scratch\_t213_probe.py --table crafting_recipes --key Furnace
 ```
 
-**五文件指纹**（16 位大写 SHA256 前缀；`[我复算]` = 我在本机重新算过，`[Lead 提供]` = 冻结时给的），冻结提交 **`063351d`**（`freeze: 0.7.37`，2026-10-17 23:21:03）：
+## §2 每步原始回执（原文，未改写）
 
-| 文件 | size / mtime | sha16 | 与 Lead 指纹 |
-| --- | --- | --- | --- |
-| `brain/agentfarm/longrun.py` | 479420 / 2026-10-17 23:43:23.922 | `A71D304234A9832E` [我复算] | ❌ 不一致（Lead：`5D13B16DD8E824EE`）— **冻结后 dev-coder 又改过**（mtime 23:43 > freeze 23:21，`git status` 显示 ` M`），属在制改动，非我触碰 |
-| `brain/agentfarm/farmwork.py` | 204190 / 2026-10-17 23:41:22.847 | `B0C719E23D4D0482` [我复算] | ❌ 不一致（Lead：`EB41BF868A69B346`）— 同上，` M` 在制 |
-| `brain/agentfarm/bridge.py` | 58932 / 2026-10-17 23:19:40.983 | `40D1A2B300306F07` [我复算] | ✅ **逐字一致** |
-| `mod/AgentFarm.Bridge/bin/Release/AgentFarm.Bridge.dll`（仓库构建） | 269312 / 23:36:04.521 | `1FDE5F709EAC1EC1` | — 这是**含修复的重建版**，比装机新（见 §3） |
-| `mod/AgentFarm.Bridge/manifest.json` | 56017 / 23:18:45.036 | `87094344E412C2FB` [我复算] | ✅ **逐字一致**（Version `0.7.37`） |
-| **装机** `…\Mods\AgentFarm.Bridge\AgentFarm.Bridge.dll` | **263168** / 23:20:40.742 | **`C1470B014037D38B`** [我复算] | ✅ **逐字一致**（= Lead 给的 dll 指纹；= 冻结件构建） |
-| **装机** `…\Mods\AgentFarm.Bridge\manifest.json` | 56017 / 23:18:45.036 | `87094344E412C2FB` | ✅ 与仓库同一份 |
+**步骤 1 · 白名单验活 = PASS**（`logs/run10f-step1_crafting_recipes.txt`）：
 
-装机目录里只有**一份** `AgentFarm.Bridge.dll`（263168 B），其余是 `.bak-2026*` 历史备份（最大 203776 B）⇒ SMAPI 加载的就是这份，不存在"加载到旧备份"。
-
-## §2 回执原文（一字不改）
-
-`logs/run10e-step1.txt`，**exit 1**：
-
-```
-❌ debug_dump(crafting_recipes) 失败：unknown_skill: [unknown_skill] (HTTP 200) 未知技能“debug_dump”（本 Mod 不认识这个技能名）
+```json
+{"ok": true, "status": "ok", "skill": "debug_dump", "reason": "按 key 过滤：exact 命中 1 条", "schema": "agentfarm-exec/2",
+ "elapsedMs": 0, "worldSeqBefore": 24, "worldSeqAfter": 24, "uiOpened": false, "worldResumed": true,
+ "table": "crafting_recipes", "count": 150, "truncated": false, "entries": [],
+ "matched": [["Furnace", "378 20 390 25/Home/13/true/l 2/"]], "matchMode": "exact", "matchedCount": 1, "matchedTruncated": false}
 ```
 
-**注意码名**：是 **`unknown_skill`**（进主线程之前的白名单拒绝），**不是 `not_implemented`**（那才是"技能已登记但没实现"）。Mod 侧 reason 模板原文（`BridgeHost.cs:531-533`）：
+⇒ 0.7.37 的 `unknown_skill` **未复现**；Furnace 配方**在游戏数据里存在**：配料 `378 20 390 25` = **20×铜矿(378) + 25×石头(390)**，产物 `13`（Furnace），条件串 `l 2`。
 
-```csharp
-Status = "unknown_skill",
-Reason = $"未知技能“{skill}”（本 Mod 不认识这个技能名）"
+**步骤 2 · `trigger_actions` = 取不到（Mod 能力缺口）**（`logs/run10f-step2_trigger_actions.txt`，exit 1）：
+
+```
+load_failed: [load_failed] (HTTP 200) 读 Data/TriggerActions 失败：InvalidCastException: Unable to cast object of type
+'System.Collections.Generic.List`1[StardewValley.GameData.TriggerActionData]' to type
+'System.Collections.Generic.Dictionary`2[System.String,System.String].'；程序集里找不到 TriggerActionData 类型
 ```
 
-## §3 证明方式：为什么是"白名单漏登记"，而不是装错文件/没编进去
+同样失败（同为强类型资产，`logs/run10f-extra2.json`）：`objects`（`Dictionary<string,ObjectData>`）、`big_craftables`（`Dictionary<string,BigCraftables.BigCraftableData>`）、`machines`。**可用的只有 `crafting_recipes` / `cooking_recipes` / `mail` 三张字符串表**（Mod 自报支持 `crafting_recipes, cooking_recipes, trigger_actions, mail, machines, objects, big_craftables`，但后四张实际都抛 InvalidCastException）。
 
-1. **拒绝点**在 `mod/AgentFarm.Bridge/BridgeHost.cs:520-535`：`if (!Skills.IsKnownSkill(skill)) { …unknown_skill… }` —— 之后才会 `Skills.ClampTimeoutFor(...)` / `Skills.Create(...)`，**分发代码根本没被调用**。
-2. **白名单**只有一处：`mod/AgentFarm.Bridge/Skills.cs` 的 `private static readonly HashSet<string> KnownSkills`（`IsKnownSkill` :802）。**冻结提交 `063351d` 里这个表只有 19 个名字**：
-   `noop, move_to, dismiss_modal, move_to_location, load_save, quit_game, interact, use_tool, select_item, plant, sleep, buy, sell` + 规划中 `exit_building, harvest, pickup_debris, collect_machine, refill_watering_can, talk`
-   ⇒ **`debug_dump` / `add_missed_recipes` 未登记**；`upgrade_tool` / `pickup_tool` / `craft_item` / `place_object` / `machine` 也都没登记。
-3. **不是"没编进 dll"**：同提交里 `Skills.Create` 已有 `case "debug_dump": case "add_missed_recipes":`（`Skills.cs:99-102` / `:454-456`）；类型 `DebugDumpSkill`/`AddMissedRecipesSkill` 在装机 dll 与仓库 dll 里都在；按 **UTF-16LE** 规则扫 dll 字面量，`debug_dump`/`add_missed_recipes`/`craft_item`/`crafting_recipes`/`trigger_actions`/`pickup_tool` **装机版与仓库版都命中**（先前用 ASCII 扫全 False 是方法错误：.NET 字符串常量在 #US 堆是 UTF-16LE）。
-4. **修复已在 `8f357bd`**（HEAD，2026-10-17 23:36:53，"wip(task-210) 机器技能 feed/collect 在制"）：`Skills.cs:795` 补了 `"upgrade_tool", "pickup_tool", "debug_dump", "add_missed_recipes",` + `"craft_item", "place_object", "machine",`，并给该表加了自述注释——「⚠️ 必须与 `Skills.Create` 的 case 逐字同步：`BridgeHost.ServeExec` 在进主线程之前就按这张表把不认识的技能一律 `unknown_skill` 拒掉。task-205/213/210 的真机事故教训：Create 里加了 case 但忘了这里 ⇒ 装机后才炸。」
-5. **时间线（根因）**：`063351d` freeze **23:21:03** → 装机 dll **23:20:40**（由 `063351d` 构建）→ **`8f357bd` 23:36:53 才提交修复** ⇒ 装机版天生没有它；仓库 Release 重建 dll **23:36:04 / 269312 B / `1FDE5F70…`** 才含修复，但**未 deploy**。
-6. 可复跑：`python scratch\_t214_vercheck.py`（只读）⇒ `logs/run10e-dll-vercheck.json`（两侧 dll/manifest 的 size/mtime/SHA256、UTF-16LE 字面量探针、`health`）。
+**步骤 3 · `add_missed_recipes`（只调一次）= ok 但 0 增量**（`logs/run10f-step3_add_missed.txt`）：
 
-## §4 后续（等 0.7.38 重冻结装机后原样重跑）
+```json
+{"ok": true, "status": "ok", "skill": "add_missed_recipes",
+ "reason": "已调用一次 Farmer.AddMissedMailAndRecipes()：crafting +0、cooking +0、mail +0（共 0 条；前后计数见 beforeCounts/afterCounts）",
+ "worldSeqBefore": 24, "worldSeqAfter": 24, "uiOpened": false, "worldResumed": true,
+ "craftingRecipesAdded": [], "cookingRecipesAdded": [], "mailAdded": [],
+ "beforeCounts": {"crafting_recipes": 19, "cooking_recipes": 1, "mail": 5},
+ "afterCounts":  {"crafting_recipes": 19, "cooking_recipes": 1, "mail": 5}}
+```
 
-1. 0.7.38 将包含：`8f357bd` 的白名单修复 + task-216（F3 取回死锁）+ task-210（机器链，若交付）+ **结构性护栏**（自检断言：`Create` 每个 case 名必须 ∈ `KnownSkills`）。
-2. 装好后 Lead 发我五文件指纹；我先发**一发只读验活**：`debug_dump --table crafting_recipes --key Furnace` —— 只要不再 `unknown_skill`（哪怕 Furnace 不在表里）即证明分发通了。
-3. 然后按本卡原序重跑：① `crafting_recipes`（含 `--limit 2000` 全表复核）② `trigger_actions` 全量 ③ **`add_missed_recipes` 只调一次** ④ 复核条数 ⑤ SMAPI 冻结 + 存档四条 + 优雅退出。
-4. 判据与交付同原卡（`docs/_run10-furnace-probe.md` §2/§3/§4 的真机数据 + 结论二选一）。
+**步骤 4 · 复核**：与步骤 1 **逐字相同**（`count 150` / `matchedCount 1` / 同一条 `378 20 390 25/Home/13/true/l 2/`）⇒ 补发调用前后**玩家字典无变化**。
 
-## §5 存档与 SMAPI 前后（本次收尾）
+**补充只读取证**（`logs/run10f-extra.json`、`logs/run10f-extra2.json`、`scratch/run10f-crafting-recipes-full.json`、`scratch/run10f-mail-full.json`）：
 
-**存档四条 —— 退前 / 退出后（退出本身零写入）**：
+* 整张 `Data/CraftingRecipes` 落盘 **150 条**（`truncated=false`），同类条件串对照：
+
+  | 配方 | 数据原文 | 条件串形态 |
+  | --- | --- | --- |
+  | **Furnace** | `378 20 390 25/Home/13/true/l 2/` | **`l 2`**（未知语义，非技能形态） |
+  | Charcoal Kiln | `388 20 334 2/Home/114/true/s Foraging 2/` | `s Foraging 2`（技能） |
+  | Scarecrow | `388 50 382 1 771 20/Home/8/true/s Farming 1/` | `s Farming 1`（技能） |
+  | Chest | `388 50/Home/130/true/default/` | `default`（无条件） |
+  | Torch | `388 1 92 2/Field/93/false/default/` | `default`（无条件） |
+  | Bee House | `388 40 382 8 335 1 724 1/Home/10/true/s Farming 3/` | `s Farming 3`（技能） |
+
+* **存档 XML 真值**：`player.craftingRecipes` **19 条**（Wood Fence / Gate / Chest / Torch / Wood Sign / Stone Sign / Text Sign / Wood Path / Gravel Path / Cobblestone Path / Campfire / Cherry Bomb / Wild Seeds (Sp) / Field Snack / Scarecrow / Basic Fertilizer / Stone Fence / Mayonnaise Machine / Sprinkler）—— **无 Furnace**；`mailReceived` 5 条（`button_tut_1`/`button_tut_2`/`geodeFound`/`BackpackTip`/`sawQiPlane`）。
+* `Data/Mail` 全表 179 条：正文含 `Furnace` 的只有 1 条（`elliottLetter5`，文学描写，**不是配方授予**）；没有 `%item recipe Furnace` 类邮件。
+
+## §3 结论（三态取一：**仍无法判定**）
+
+**取「仍无法判定」的理由**：把问题拆成两条假设后，一条已被真机证伪、另一条被 Mod 能力缺口卡住：
+
+1. **假设 A（技能升级时由 `Farmer.AddMissedMailAndRecipes()` 补发）—— 已证伪。**
+   判据（`docs/_il-furnace-recipe.md` §4 判据 A：调一次后 `craftingRecipes` 是否出现 Furnace）本轮真机执行：**调用成功但 0 条新增，前后计数 19/1/5 完全相同**。并且 Furnace 的条件串是 **`l 2`**，不是 `TryParseLevelRequirement` 认识的 `s <技能> <等级>` 形态（对照 Charcoal Kiln `s Foraging 2`、Scarecrow `s Farming 1`）—— 与"补发链路给它 0 条"完全自洽。
+2. **假设 B（由 `Data/TriggerActions` 的触发器动作授予，可能依赖矿井进度）—— 未验证（唯一证据缺口）。**
+   需要触发器原文，但 `debug_dump trigger_actions` 抛 `InvalidCastException`（`List<TriggerActionData>` → `Dictionary<string,string>`）：**Mod 的 `debug_dump` 只支持字符串字典型数据表**。这是本次**唯一的阻塞点**，且属 Mod 侧能力缺口，不是我方执行问题。
+3. **已钉死的旁证**（不构成"可授权"）：配方**存在于游戏数据**（150 条中命中，20 铜矿 + 25 石头 → object 13），但玩家**未学会**（存档 19 条无 Furnace），且**没有配方邮件**（mail 179 条无授予项、`mailReceived` 无 Clint 信）⇒ 现状下 `craft_item` 应如实返回 `recipe_unknown`，**不许硬造**。
+
+**建议（供 Lead 决策，不在本卡自作主张）**：
+* **M1（推荐，Mod 侧）**：给 `debug_dump` 加 1.6 强类型数据资产支持（至少 `Data/TriggerActions` 的 `List<TriggerActionData>`，最好连 `Objects`/`BigCraftables`/`Machines` 一起），随后重跑步骤 2 —— 命中含 `Furnace`/`AddCraftingRecipe` 的条目即可定案 B；若 B 也不含，则结论变为「当前版本/存档无合法授予入口」，再谈 R2（手动执行触发器动作）或 R3（直接写 `player.craftingRecipes`，属改存档，需明确批准）。
+* **M2（可并行）**：把 `player.craftingRecipes` 的 key 列表（或至少 `furnaceRecipeKnown` 布尔）暴露进观测，让脑侧不靠猜（`docs/_il-furnace-recipe.md` §6 已提过）。
+* **护栏确认**：0.7.37 的 `unknown_skill` 事故本轮**未复现**（步骤 1/3/4 全部 `ok`）⇒ SkillCatalog 单一数据源护栏在真机上生效。
+
+## §4 SMAPI 窗口 + 存档四条 + 退出确认
+
+**SMAPI 窗口（退出后复制，字节一致）**：`logs/run10f-smapi-window.txt` = **78993 B / 431 行 / SHA256 `BE2A0AD3BF29AC044F74E3CFA876549C120D60E987ED2F7DB8555709CA4890E7` / dst mtime 2026-10-18 01:09:58.906 / `BYTE_IDENTICAL=True`**。尾部：
+
+```
+[01:09:58 INFO  AgentFarm Bridge] POST /v1/exec → 200 · 7ms · worldSeq=56
+[01:09:58 TRACE game] Disconnected: ClosedGame
+[01:09:58 TRACE SMAPI] Disposing...
+[01:09:58 INFO  AgentFarm Bridge] 已删除发现文件 …\StardewValley\AgentFarm\bridge.json。
+[01:09:58 TRACE SMAPI] Disposing the content coordinator.
+```
+
+**存档四条 —— 退前 / 退出后（逐字相同 ⇒ 本轮零落盘）**：
 
 | 文件 | 退前 | 退出后 |
 | --- | --- | --- |
-| `Wahaha_450799035` | **4383128 B / 2026-10-17 23:38:17.154** | 同左（逐字未变） |
-| `SaveGameInfo` | 29605 B / 23:38:17.251 | 同左 |
-| `Wahaha_450799035_old` | 4417243 B / 12:09:48.738 | 同左 |
-| `SaveGameInfo_old` | 29567 B / 12:09:48.842 | 同左 |
+| `Wahaha_450799035` | 4383128 B / 2026-10-17 23:38:17.154 | **同左** |
+| `SaveGameInfo` | 29605 B / 23:38:17.251 | **同左** |
+| `Wahaha_450799035_old` | 4417243 B / 12:09:48.738 | **同左** |
+| `SaveGameInfo_old` | 29567 B / 12:09:48.738 | **同左** |
 
-**SMAPI 窗口（退出后复制，字节一致）**：`logs/run10e-smapi-window.txt` = **77248 B / 439 行 / SHA256 `010AFBC786D64D411D2D283120A266F7134B97A6E0D3583EC3EFA7630FFD5587` / dst mtime 23:50:26.221 / `BYTE_IDENTICAL=True`**。尾部原文：
+**优雅退出核对**（`python tools\stop-game.py`，**exit 0**，回执 `✅ 游戏已退出（原 pids=[17340]）`）：`StardewModdingAPI` 进程 **0** / `bridge.json` **已删** / 17890 **无 LISTENING**（仅 2 条 `TIME_WAIT`）/ 存档四条前后一致。
+`add_missed_recipes` 虽通过（0 增量）也未跨日、未触发落盘 ⇒ 内存中的调用随退出消失。
 
-```
-[23:50:26 INFO  AgentFarm Bridge] POST /v1/exec → 200 · 5ms · worldSeq=231
-[23:50:26 TRACE game] Disconnected: ClosedGame
-[23:50:26 TRACE SMAPI] Disposing...
-[23:50:26 INFO  AgentFarm Bridge] 已删除发现文件 …\StardewValley\AgentFarm\bridge.json。
-[23:50:26 TRACE SMAPI] Disposing the content coordinator.
-```
-
-**优雅退出核对**（`python tools\stop-game.py`，exit 0，回执 `✅ 游戏已退出（原 pids=[11104]）`）：`StardewModdingAPI` 进程 **0** / `bridge.json` **已删**（`Test-Path=False`）/ 17890 **无 LISTENING**（仅 2 条 `TIME_WAIT`）/ 存档四条退出前后**逐字未变**。
-
-## §6 本次未调用任何游戏方法 —— 但纠正一条："存档逐字节未变"不成立
-
-- **本卡对游戏方法的调用 = 0**（`debug_dump` 被白名单拒在主线程之前，`add_missed_recipes` 一次没发）⇒ 卡面本身没有改动世界。
-- **但存档确实变了**：主档 `4417243 B / 12:09:48.738` → **`4383128 B / 23:38:17.154`**，两份主档里的 `money`：**2268 → 2042（−226g）**。变化发生在 **23:38:17**，即游戏在**无人值守**状态下被自己的 **2:00 强制昏睡**（10% 医疗费）结算并落盘 —— 正是你警告的那条事故（2268 × 10% ≈ 226.8 → 扣 226g）；`_old` 保留的 12:09:48 那份就是被覆盖前的旧主档。**这一次不是我的动作造成的，但我必须如实记录**：它是"游戏开着不动"的代价，也是本卡收尾必须立刻退出的原因。
-- 退出动作本身：退出前后四条存档读数**完全相同**（§5）⇒ `stop-game.py` 的 `Game1.quit` 路径没有触发额外落盘。
+**保留物**：`logs/run10f-step1_crafting_recipes.txt`、`logs/run10f-step2_trigger_actions.txt`、`logs/run10f-step3_add_missed.txt`、`logs/run10f-step4_crafting_recipes_again.txt`、`logs/run10f-steps.json`、`logs/run10f-extra.json`、`logs/run10f-extra2.json`、`logs/run10f-smapi-window.txt`、`scratch/run10f-crafting-recipes-full.json`、`scratch/run10f-mail-full.json`；脚本 `scratch/_t214_run.py`、`scratch/_t214_extra.py`、`scratch/_t214_extra2.py`、`scratch/_t214_vercheck.py`。
