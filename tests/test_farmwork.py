@@ -28,7 +28,7 @@ from agentfarm.farmwork import (  # noqa: E402
     SURPLUS_MATERIAL_IDS, buy_count_for, farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles,
     farm_empty_dirt, is_seed_offer,
     is_unreachable, pick_seed_offer, player_free_slots, seed_offers_from, surplus_sell_plan,
-    farm_ready_tiles,
+    farm_ready_tiles, known_crafting_recipes,
     till_blocked_by, tool_missing_reason, tool_presence,
 )
 
@@ -3059,6 +3059,50 @@ class TestTask205ToolUpgrade(unittest.TestCase):
         self.assertIsNone(st.after["being"])
         self.assertFalse(st.after["tool_back"])
         self.assertIn("背包没多出工具", st.reason)
+
+
+class TestTask222KnownRecipes(unittest.TestCase):
+    """task-222：已知制作配方的只读内省面（三态 fail-closed：缺字段/截断/完整）。"""
+
+    def _obs(self, **player_fields) -> dict:
+        w = MiniWorld(records=[])
+        obs = make_worker(w).snap()
+        obs["player"].update(player_fields)
+        return obs
+
+    def test_full_list_is_ok(self):
+        obs = self._obs(knownCraftingRecipes=["Furnace", "Chest"],
+                        knownCraftingRecipesCount=2, knownRecipesTruncated=False)
+        names, status = known_crafting_recipes(obs)
+        self.assertEqual(status, "ok")
+        self.assertEqual(names, ["Furnace", "Chest"])
+
+    def test_empty_list_is_still_valid_evidence(self):
+        names, status = known_crafting_recipes(
+            self._obs(knownCraftingRecipes=[], knownCraftingRecipesCount=0,
+                      knownRecipesTruncated=False))
+        self.assertEqual((names, status), ([], "ok"),
+                         "空数组 = 真一个都没学会，是有效信息；不许和下面的 unavailable 混为一谈")
+
+    def test_truncated_is_reported(self):
+        obs = self._obs(knownCraftingRecipes=["Furnace"], knownCraftingRecipesCount=500,
+                        knownRecipesTruncated=True)
+        names, status = known_crafting_recipes(obs)
+        self.assertEqual(status, "truncated")
+        self.assertEqual(names, ["Furnace"])
+
+    def test_missing_field_is_fail_closed(self):
+        obs = self._obs()
+        obs["player"].pop("knownCraftingRecipes", None)
+        names, status = known_crafting_recipes(obs)
+        self.assertEqual(status, "unavailable",
+                         "旧 Mod 缺字段 ⇒ 不知道，绝不当成「没有配方」")
+        self.assertEqual(names, [])
+
+    def test_wrong_type_is_fail_closed(self):
+        names, status = known_crafting_recipes(
+            self._obs(knownCraftingRecipes={"Furnace": 1}))
+        self.assertEqual((names, status), ([], "unavailable"))
 
 
 if __name__ == "__main__":  # pragma: no cover

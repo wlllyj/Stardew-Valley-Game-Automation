@@ -206,6 +206,33 @@ namespace AgentFarm.Bridge
         /// `null` = 读不到。
         /// </summary>
         [JsonPropertyName("toolUpgradeNotice")] public bool? ToolUpgradeNotice { get; set; }
+
+        // ---- 【task-222】观测面：已知制作配方（只读，供内省/task-214 取证）----
+
+        /// <summary>
+        /// **task-222 新增**：玩家**已学会**的制作配方键名（`Farmer.craftingRecipes.Keys`，按序数排序）。
+        ///
+        /// 【为什么必须有】`AddMissedMailAndRecipes()` 是否把 Furnace 补进玩家字典，是升级链的
+        /// 硬阻塞（`docs/_il-furnace-recipe.md`）。任务 213 的 `debug_dump` 能读**游戏数据表**，
+        /// 但"玩家**已学会**哪些配方"只存在于玩家字典里 ⇒ 必须从观测面暴露。
+        ///
+        /// 【纪律】只读：本字段**不进任何技能判据**（不改变任何行为），脑侧只做只读封装；
+        /// 三态可辨：字段缺失（旧 Mod）/`null`（读不到）/空数组（真的一个都没学会）。
+        /// 上限 200 条（超出截断，`knownRecipesTruncated=true`）。
+        /// </summary>
+        [JsonPropertyName("knownCraftingRecipes")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+        public string[] KnownCraftingRecipes { get; set; }
+
+        /// <summary>已学会的制作配方**总数**（截断前）。`null` = 读不到（不是 0）。</summary>
+        [JsonPropertyName("knownCraftingRecipesCount")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+        public int? KnownCraftingRecipesCount { get; set; }
+
+        /// <summary>已知配方列表是否被截断（上限 200）。`null` = 读不到。</summary>
+        [JsonPropertyName("knownRecipesTruncated")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+        public bool? KnownRecipesTruncated { get; set; }
     }
 
     /// <summary>
@@ -1342,6 +1369,21 @@ namespace AgentFarm.Bridge
 
         /// <summary><c>debug_dump</c> 专用：该表的总条数（不受 limit 影响）。【可选字段】</summary>
         [JsonPropertyName("count")] public int? Count { get; set; }
+
+        /// <summary>
+        /// 【task-222】<c>debug_dump</c> 专用：本次实际加载的资产**形态标签**
+        /// （例如 `Dictionary&lt;string,ObjectData&gt;` / `List&lt;TriggerActionData&gt;` /
+        /// `Dictionary&lt;string,string&gt;`）。真机取证时用来确认"这张表在 1.6 里到底是哪种形状"。
+        /// 【可选字段】
+        /// </summary>
+        [JsonPropertyName("type")] public string Type { get; set; }
+
+        /// <summary>
+        /// 【task-222】<c>debug_dump</c> 专用：本张表**逐表 fail-closed** 的失败原文
+        /// （`load_failed` 时与 `Reason` 同义，单独给一份便于机器读）。成功时为 null。
+        /// 【可选字段】
+        /// </summary>
+        [JsonPropertyName("error")] public string Error { get; set; }
 
         /// <summary><c>debug_dump</c> 专用：<c>entries</c> 是否被截断（总条数 &gt; 返回条数）。【可选字段】</summary>
         [JsonPropertyName("truncated")] public bool? Truncated { get; set; }

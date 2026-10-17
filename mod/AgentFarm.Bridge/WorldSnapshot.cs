@@ -272,8 +272,35 @@ namespace AgentFarm.Bridge
                 ToolUpgradeDaysLeft = SafeIntOrNull(() => p.daysLeftForToolUpgrade.Value),
                 ToolUpgradeNotice = SafeBoolOrNull(() => p.hasReceivedToolUpgradeMessageYet),
             };
+
+            // 【task-222】已学会的制作配方（只读、供内省取证；三态可辨：null=读不到/空数组=真没有）。
+            // 数据来源：`Farmer.craftingRecipes`（`NetStringDictionary<int,NetInt>`，键名即配方名）。
+            try
+            {
+                List<string> keys = null;
+                if (p != null && p.craftingRecipes != null)
+                {
+                    keys = new List<string>();
+                    foreach (string key in p.craftingRecipes.Keys) keys.Add(key);
+                }
+                if (keys != null)
+                {
+                    keys.Sort(StringComparer.Ordinal);
+                    view.KnownCraftingRecipesCount = keys.Count;
+                    int take = Math.Min(keys.Count, KnownRecipesMax);
+                    view.KnownCraftingRecipes = keys.GetRange(0, take).ToArray();
+                    view.KnownRecipesTruncated = keys.Count > take;
+                }
+            }
+            catch
+            {
+                // 读不到 ⇒ 三个字段保持 null（fail-closed：null ≠ 空数组）
+            }
             return view;
         }
+
+        /// <summary>【task-222】已知配方列表上限（截断有标志，不当"全部"）。</summary>
+        private const int KnownRecipesMax = 200;
 
         /// <summary>
         /// 【task-155】填 `ResourceClump` 的元数据（`clumpIndex/Width/Height/Health/Kind/Target/ToolOk`），

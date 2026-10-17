@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Reflection;
 using StardewModdingAPI;
 using StardewValley;
@@ -18,12 +19,21 @@ namespace AgentFarm.Bridge
     /// 这也是通用「Mod 内省面」：以后查任何数据表/补发逻辑都复用它（`add_missed_recipes`
     /// 是它的伴生写操作，见 `AddMissedRecipesSkill`）。
     ///
+    /// 【task-222：1.6 强类型资产】真机（task-214）暴露：1.6 的数据表**不再清一色**
+    /// `Dictionary&lt;string,string&gt;` —— `Data/TriggerActions` 是 `List&lt;TriggerActionData&gt;`、
+    /// `Data/Objects`/`BigCraftables`/`Machines` 是 `Dictionary&lt;string,XxxData&gt;` ⇒ 旧实现
+    /// 强转字典全挂（`InvalidCastException`），能读的只剩配方/信件三张。
+    /// 现在改成**按表登记期望形态**（字典 or 列表 + 值类型简单名）走泛型 `Load&lt;T&gt;`，
+    /// 再交给 `DumpRules.EnumerateEntries` 泛型摊平（纯函数、自检工程可跑行为断言）。
+    /// **每张表 fail-closed 独立**：一张读不出来只影响它自己（回执带 `error` 原文），
+    /// 绝不因为一张表挂了就整类内省不可用。
+    ///
     /// 【纪律】
     ///   * **只读**：本技能绝不写玩家/世界状态（写操作在 `add_missed_recipes` 里，且单独回执）；
-    ///   * 表名与 `limit` 的判据全在 `DumpRules`（纯函数，自检工程可跑行为断言）；
+    ///   * 表名与 `limit` 的判据全在 `DumpRules`（纯函数）；
     ///   * **不许**把整张表无界塞进回执：`limit` 默认 200 / 上限 2000，`truncated` 如实报；
     ///   * fail-closed：不认识的表 ⇒ `table_unknown`（reason 列出支持的表）；
-    ///     读表抛异常 ⇒ `load_failed`（异常原文进 reason，不许猜）；
+    ///     读表抛异常 ⇒ `load_failed`（异常原文进 `reason`/`error`，不许猜）；
     ///   * 复杂值用 `DumpRules.Describe`（反射逐成员 + 截断），**不打新依赖**。
     ///
     /// 【单 tick 同步技能】不加入 `BridgeHost.IsLongTaskSkill`：一次读表即完成；
@@ -37,25 +47,23 @@ namespace AgentFarm.Bridge
 
         private long _seqBefore;
 
-        /// <summary>规范表名 → 资产名（`Game1.content.Load` 的 asset）。</summary>
-        private static readonly Dictionary<string, string> Assets = new Dictionary<string, string>
+        /// <summary>一张表的加载规格：资产名 + 期望形态（列表/字典）+ 值类型简单名（null=string）。</summary>
+        private sealed class TableSpec
         {
-            ["crafting_recipes"] = "Data/CraftingRecipes",
-            ["cooking_recipes"] = "Data/CookingRecipes",
-            ["trigger_actions"] = "Data/TriggerActions",
-            ["mail"] = "Data/Mail",
-            ["machines"] = "Data/Machines",
-            ["objects"] = "Data/Objects",
-            ["big_craftables"] = "Data/BigCraftables",
-        };
+            public string Asset;
+            public bool IsList;
+            public string ValueTypeName;
+        }
 
-        /// <summary>复杂表的游戏数据值类型简单名（在 StardewValley 程序集里按名字解析）。</summary>
-        private static readonly Dictionary<string, string[]> ComplexValueTypes = new Dictionary<string, string[]>
+        private static readonly Dictionary<string, TableSpec> Specs = new Dictionary<string, TableSpec>
         {
-            ["machines"] = new[] { "MachineData" },
-            ["objects"] = new[] { "ObjectData" },
-            ["big_craftables"] = new[] { "BigCraftableData" },
-            ["trigger_actions"] = new[] { "TriggerActionData" },
+            ["crafting_recipes"] = new TableSpec { Asset = "Data/CraftingRecipes" },
+            ["cooking_recipes"] = new TableSpec { Asset = "Data/CookingRecipes" },
+            ["mail"] = new TableSpec { Asset = "Data/Mail" },
+            ["trigger_actions"] = new TableSpec { Asset = "Data/TriggerActions", IsList = true, ValueTypeName = "TriggerActionData" },
+            ["machines"] = new TableSpec { Asset = "Data/Machines", ValueTypeName = "MachineData" },
+            ["objects"] = new TableSpec { Asset = "Data/Objects", ValueTypeName = "ObjectData" },
+            ["big_craftables"] = new TableSpec { Asset = "Data/BigCraftables", ValueTypeName = "BigCraftableData" },
         };
 
         /// <summary>单参泛型 `Load&lt;T&gt;(string)` 的缓存（`Game1.content` 是 ContentManager）。</summary>
@@ -69,13 +77,16 @@ namespace AgentFarm.Bridge
             this._monitor = monitor;
         }
 
-        private ExecResponse Fail(string status, string reason)
+        private ExecResponse Fail(string status, string reason, string type = null, string table = null)
             => new ExecResponse
             {
                 Ok = false,
                 Status = status,
                 Skill = "debug_dump",
                 Reason = reason,
+                Error = reason,
+                Table = table,
+                Type = type,
                 Schema = Skills.ExecSchema,
                 ElapsedMs = 0,
                 WorldSeqBefore = this._seqBefore,
@@ -89,43 +100,39 @@ namespace AgentFarm.Bridge
 
             string raw = this._req != null && this._req.Args != null ? this._req.Args.Table : null;
             string table = DumpRules.NormalizeTable(raw);
-            if (!DumpRules.IsKnownTable(table))
+            if (!DumpRules.IsKnownTable(table) || !Specs.TryGetValue(table, out TableSpec spec))
             {
                 return this.Fail("table_unknown",
                     "不支持的数据表 " + Describe(raw) + "；支持的表：" + string.Join(", ", DumpRules.Tables));
             }
 
-            string asset = Assets[table];
             int limit = DumpRules.ClampLimit(this._req != null && this._req.Args != null
                 ? this._req.Args.Limit : (int?)null);
             string wanted = this._req != null && this._req.Args != null ? this._req.Args.Key : null;
 
-            IDictionary data;
+            object root;
+            string typeLabel;
             string loadNote = "";
             try
             {
-                data = LoadTableDetail(table, asset, out loadNote);
+                root = LoadAsset(spec, out typeLabel, out loadNote);
             }
             catch (Exception ex)
             {
                 Exception inner = Unwrap(ex);
-                return this.Fail("load_failed",
-                    "读 " + asset + " 失败：" + inner.GetType().Name + ": " + inner.Message
-                    + (string.IsNullOrEmpty(loadNote) ? "" : "；" + loadNote));
+                string reason = "读 " + spec.Asset + " 失败：" + inner.GetType().Name + ": " + inner.Message
+                                + (string.IsNullOrEmpty(loadNote) ? "" : "；" + loadNote);
+                return this.Fail("load_failed", reason, null, table);
             }
-            if (data == null)
-                return this.Fail("load_failed", "读 " + asset + " 返回 null（游戏没有加载这张表？）"
-                    + (string.IsNullOrEmpty(loadNote) ? "" : "；" + loadNote));
-
-            var all = new List<KeyValuePair<string, string>>();
-            foreach (DictionaryEntry entry in data)
+            if (root == null)
             {
-                string key;
-                try { key = Convert.ToString(entry.Key, System.Globalization.CultureInfo.InvariantCulture) ?? ""; }
-                catch { key = ""; }
-                all.Add(new KeyValuePair<string, string>(key, DumpRules.Describe(entry.Value)));
+                return this.Fail("load_failed",
+                    "读 " + spec.Asset + " 返回 null（游戏没有加载这张表？）"
+                    + (string.IsNullOrEmpty(loadNote) ? "" : "；" + loadNote), null, table);
             }
-            all.Sort((a, b) => string.CompareOrdinal(a.Key, b.Key));
+            typeLabel = DumpRules.ShapeLabel(root);
+
+            List<KeyValuePair<string, string>> all = DumpRules.EnumerateEntries(root);
 
             var resp = new ExecResponse
             {
@@ -137,6 +144,7 @@ namespace AgentFarm.Bridge
                 WorldSeqBefore = this._seqBefore,
                 WorldSeqAfter = this._world != null ? this._world.WorldSeq : this._seqBefore,
                 Table = table,
+                Type = typeLabel,
                 Count = all.Count,
             };
 
@@ -152,7 +160,18 @@ namespace AgentFarm.Bridge
                     else if (kind == 2) fuzzy.Add(new[] { pair.Key, pair.Value });
                 }
                 string mode = exact.Count > 0 ? "exact" : (fuzzy.Count > 0 ? "substring" : "none");
-                var matched = exact.Count > 0 ? exact : fuzzy;
+                List<string[]> matched = exact.Count > 0 ? exact : fuzzy;
+                if (matched.Count == 0 && spec.IsList)
+                {
+                    // 【task-222】列表型表（如 TriggerActions）的 key 是下标，按 key 找 `Furnace`
+                    // 永远找不到 ⇒ 再按**值内容**子串试一次（只加一条证据，不改 key 语义）。
+                    foreach (KeyValuePair<string, string> pair in all)
+                    {
+                        if (pair.Value.IndexOf(wanted, StringComparison.OrdinalIgnoreCase) >= 0)
+                            matched.Add(new[] { pair.Key, pair.Value });
+                    }
+                    if (matched.Count > 0) mode = "value_substring";
+                }
                 int cap = Math.Min(matched.Count, Math.Min(limit, DumpRules.MatchMax));
                 resp.MatchMode = mode;
                 resp.Matched = matched.GetRange(0, cap).ToArray();
@@ -161,7 +180,8 @@ namespace AgentFarm.Bridge
                 resp.Entries = new string[0][];
                 resp.Truncated = false;
                 resp.Reason = matched.Count == 0
-                    ? "表 " + table + " 里没有匹配 " + Describe(wanted) + " 的 key（精确与子串都没有）"
+                    ? "表 " + table + "（" + typeLabel + "）里没有匹配 " + Describe(wanted)
+                      + " 的 key（精确、子串" + (spec.IsList ? "、值子串" : "") + "都没有）"
                     : "按 key 过滤：" + mode + " 命中 " + matched.Count + " 条"
                       + (resp.MatchedTruncated == true ? "（只回前 " + cap + " 条）" : "");
                 return resp;
@@ -173,49 +193,74 @@ namespace AgentFarm.Bridge
                 entries[i] = new[] { all[i].Key, all[i].Value };
             resp.Entries = entries;
             resp.Truncated = all.Count > take;
-            resp.Reason = "表 " + table + " 共 " + all.Count + " 条"
+            resp.Reason = "表 " + table + "（" + typeLabel + "）共 " + all.Count + " 条"
                           + (resp.Truncated == true ? "（按 limit=" + limit + " 只回前 " + take + " 条）" : "（全部返回）");
             return resp;
         }
 
-        /// <summary>按表名读数据；复杂表先在游戏程序集里按简单名解析值类型，解析不到再退回字符串表。</summary>
-        private static IDictionary LoadTableDetail(string table, string asset, out string note)
+        /// <summary>
+        /// 按表登记形态加载资产：先按期望类型（字典/列表 + 值类型）读；复杂表读失败再退回
+        /// `Dictionary&lt;string,string&gt;`（老版本资产形状）。两条都失败 ⇒ 抛出合并后的异常原文。
+        /// </summary>
+        private static object LoadAsset(TableSpec spec, out string typeLabel, out string note)
         {
+            typeLabel = "";
             note = "";
-            if (!ComplexValueTypes.TryGetValue(table, out string[] valueTypeNames))
-                return LoadDictionary(asset, typeof(string));
+            var errors = new List<string>();
 
-            foreach (string simpleName in valueTypeNames)
+            if (!string.IsNullOrEmpty(spec.ValueTypeName))
             {
-                Type valueType = ResolveGameType(simpleName);
+                Type valueType = ResolveGameType(spec.ValueTypeName);
                 if (valueType == null)
                 {
-                    note = "程序集里找不到 " + simpleName + " 类型";
-                    continue;
+                    errors.Add("程序集里找不到 " + spec.ValueTypeName + " 类型");
+                    note = string.Join("；", errors);
                 }
-                try
+                else
                 {
-                    return LoadDictionary(asset, valueType);
-                }
-                catch (Exception ex)
-                {
-                    note = "按 " + valueType.FullName + " 读失败：" + Unwrap(ex).GetType().Name
-                           + ": " + Unwrap(ex).Message;
+                    try
+                    {
+                        object typed = LoadContainer(spec.Asset, spec.IsList, valueType);
+                        typeLabel = DumpRules.ShapeLabel(typed);
+                        return typed;
+                    }
+                    catch (Exception ex)
+                    {
+                        Exception inner = Unwrap(ex);
+                        errors.Add("按 " + valueType.FullName + " 读失败：" + inner.GetType().Name + ": " + inner.Message);
+                        note = string.Join("；", errors);
+                    }
                 }
             }
-            // 兜底：有些版本把这些表暴露成 Dictionary<string,string>（读到就可用，读不到就抛）。
-            return LoadDictionary(asset, typeof(string));
+
+            // 兜底：老版本（或某些表）把资产暴露成 Dictionary<string,string>。
+            try
+            {
+                object legacy = LoadContainer(spec.Asset, false, typeof(string));
+                typeLabel = DumpRules.ShapeLabel(legacy);
+                return legacy;
+            }
+            catch (Exception ex)
+            {
+                Exception inner = Unwrap(ex);
+                errors.Add("按 Dictionary<string,string> 兜底读也失败：" + inner.GetType().Name + ": " + inner.Message);
+            }
+
+            throw new InvalidOperationException(string.Join("；", errors));
         }
 
-        private static IDictionary LoadDictionary(string asset, Type valueType)
+        private static object LoadContainer(string asset, bool isList, Type valueType)
         {
             MethodInfo method = FindLoadMethod();
             if (method == null)
                 throw new MissingMethodException("Game1.content 上找不到单参泛型 Load<T>(string)（游戏版本不支持内省读表）");
-            Type dictType = typeof(Dictionary<,>).MakeGenericType(typeof(string), valueType);
-            object result = method.MakeGenericMethod(dictType).Invoke(Game1.content, new object[] { asset });
-            if (result is IDictionary dict) return dict;
-            throw new InvalidCastException("Load 返回的不是字典：" + (result == null ? "null" : result.GetType().FullName));
+            Type container = isList
+                ? typeof(List<>).MakeGenericType(valueType)
+                : typeof(Dictionary<,>).MakeGenericType(typeof(string), valueType);
+            object result = method.MakeGenericMethod(container).Invoke(Game1.content, new object[] { asset });
+            if (result == null)
+                throw new InvalidCastException("Load 返回 null（资产没加载）");
+            return result;
         }
 
         private static MethodInfo FindLoadMethod()
@@ -240,12 +285,35 @@ namespace AgentFarm.Bridge
             return _loadMethod;
         }
 
-        /// <summary>在游戏程序集里按**类型简单名**解析（命名空间在各版本间不稳定，不写死全名）。</summary>
+        /// <summary>
+        /// 在**所有已加载程序集**里按类型简单名解析（1.6 把这些数据类放在
+        /// `StardewValley.GameData` 命名空间下，有的版本在游戏程序集里、有的在附属程序集里；
+        /// 命名空间与程序集位置都不写死）。
+        /// </summary>
         private static Type ResolveGameType(string simpleName)
+        {
+            Type found = ResolveGameType(typeof(Game1).Assembly, simpleName);
+            if (found != null) return found;
+            try
+            {
+                foreach (Assembly asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    if (asm == typeof(Game1).Assembly) continue;
+                    Type t = ResolveGameType(asm, simpleName);
+                    if (t != null) return t;
+                }
+            }
+            catch
+            {
+                // 遍历失败 ⇒ 调用方按"读不了"处理（fail-closed）
+            }
+            return null;
+        }
+
+        private static Type ResolveGameType(Assembly asm, string simpleName)
         {
             try
             {
-                Assembly asm = typeof(Game1).Assembly;
                 Type[] types;
                 try { types = asm.GetTypes(); }
                 catch (ReflectionTypeLoadException ex)
@@ -259,7 +327,7 @@ namespace AgentFarm.Bridge
             }
             catch
             {
-                // 解析失败 ⇒ 调用方按"读不了"处理（fail-closed）
+                // 解析失败 ⇒ null
             }
             return null;
         }

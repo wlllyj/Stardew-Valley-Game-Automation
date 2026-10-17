@@ -253,5 +253,84 @@ namespace AgentFarm.Bridge
             try { return Convert.ToString(key, CultureInfo.InvariantCulture) ?? ""; }
             catch { return "?"; }
         }
+
+        /// <summary>
+        /// 【task-222】把**任意形态**的数据资产摊平成 `[key, value]` 列表（纯函数，自检工程可跑）。
+        ///
+        /// 1.6 的数据表不再是清一色 `Dictionary&lt;string,string&gt;`：
+        /// `Data/TriggerActions` 是 `List&lt;TriggerActionData&gt;`、`Data/Objects` 是
+        /// `Dictionary&lt;string,ObjectData&gt;` …（task-214 真机：强转字典 ⇒ `InvalidCastException`）。
+        /// 判据：`IDictionary` ⇒ 逐 key（key 排序后返回）；非字符串 `IEnumerable` ⇒ 逐项、key 是
+        /// **十进制下标**（保持原始顺序，不排序 —— 下标按字符串排序会变成 10 &lt; 2）；其余 ⇒ 单条。
+        /// 每一项的值都经 <see cref="Describe"/>（复杂对象反射公共成员，深度/长度都有界）。
+        /// **null 根 ⇒ 空列表**（"没拿到" ≠ "表里没东西"，由调用方按 fail-closed 处理）。
+        /// </summary>
+        public static List<KeyValuePair<string, string>> EnumerateEntries(
+            object root, int maxChars = ValueMaxChars)
+        {
+            var rows = new List<KeyValuePair<string, string>>();
+            if (root == null) return rows;
+            if (root is IDictionary dict)
+            {
+                foreach (DictionaryEntry entry in dict)
+                    rows.Add(new KeyValuePair<string, string>(SafeKey(entry.Key), Describe(entry.Value, maxChars)));
+                rows.Sort((a, b) => string.CompareOrdinal(a.Key, b.Key));
+                return rows;
+            }
+            if (root is IEnumerable seq && !(root is string))
+            {
+                int index = 0;
+                foreach (object item in seq)
+                {
+                    rows.Add(new KeyValuePair<string, string>(
+                        index.ToString(CultureInfo.InvariantCulture), Describe(item, maxChars)));
+                    index++;
+                }
+                return rows;
+            }
+            rows.Add(new KeyValuePair<string, string>("", Describe(root, maxChars)));
+            return rows;
+        }
+
+        /// <summary>
+        /// 【task-222】数据资产的**形态标签**（写进回执 `type`，真机取证用）：
+        /// 字典 ⇒ `Dictionary&lt;K,V&gt;`；列表 ⇒ `List&lt;T&gt;`；其它 ⇒ 类型名。
+        /// null ⇒ `"null"`。
+        /// </summary>
+        public static string ShapeLabel(object root)
+        {
+            if (root == null) return "null";
+            Type type = root.GetType();
+            try
+            {
+                foreach (Type iface in type.GetInterfaces())
+                {
+                    if (!iface.IsGenericType) continue;
+                    Type def = iface.GetGenericTypeDefinition();
+                    if (def == typeof(IDictionary<,>) || def == typeof(IReadOnlyDictionary<,>))
+                        return "Dictionary<" + Abbreviate(iface.GetGenericArguments()) + ">";
+                    if (def == typeof(IEnumerable<>) || def == typeof(IReadOnlyCollection<>)
+                        || def == typeof(IReadOnlyList<>))
+                    {
+                        if (def == typeof(IEnumerable<>) || def == typeof(IReadOnlyList<>))
+                            return "List<" + Abbreviate(iface.GetGenericArguments()) + ">";
+                    }
+                }
+                if (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(List<>))
+                    return "List<" + Abbreviate(type.GetGenericArguments()) + ">";
+            }
+            catch
+            {
+                // 反射失败 ⇒ 退回类型名
+            }
+            return type.Name;
+        }
+
+        private static string Abbreviate(Type[] args)
+        {
+            var names = new List<string>();
+            foreach (Type t in args) names.Add(t == null ? "?" : t.Name);
+            return string.Join(", ", names);
+        }
     }
 }

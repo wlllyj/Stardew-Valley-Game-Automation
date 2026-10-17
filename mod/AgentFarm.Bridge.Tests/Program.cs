@@ -345,6 +345,35 @@ namespace AgentFarm.Bridge.Tests
                   "值渲染：字典 ⇒ {k=v}；超长截断并标注原长；null ⇒ \"null\"（不许抛）");
 
             // ==============================================================
+            //  task-222：1.6 强类型资产的**泛型摊平**（TriggerActions/Objects 不再是字符串字典）
+            // ==============================================================
+            Console.WriteLine("DumpRules 泛型摊平断言（task-222）");
+
+            List<KeyValuePair<string, string>> dictRows =
+                DumpRules.EnumerateEntries(new Dictionary<string, int> { ["b"] = 2, ["a"] = 1 });
+            Check("t222_dictionary_entries_sorted",
+                  dictRows.Count == 2 && dictRows[0].Key == "a" && dictRows[1].Key == "b"
+                  && dictRows[0].Value.Length > 0,
+                  "字典形态（Dictionary<string,XxxData>）⇒ 逐 key、按序数排序，值为 Describe 后的字符串");
+
+            var listRows = DumpRules.EnumerateEntries(new List<char[]> { new[] { 'x' }, new[] { 'y', 'z' } });
+            Check("t222_list_entries_use_index_keys",
+                  listRows.Count == 2 && listRows[0].Key == "0" && listRows[1].Key == "1"
+                  && listRows[1].Value.Length > 0,
+                  "列表形态（List<TriggerActionData>）⇒ key 是十进制下标、保持原始顺序（不按字符串排序）");
+
+            Check("t222_shape_label_reports_container",
+                  DumpRules.ShapeLabel(new Dictionary<string, int>()).StartsWith("Dictionary<")
+                  && DumpRules.ShapeLabel(new List<string>()).StartsWith("List<")
+                  && DumpRules.ShapeLabel(null) == "null",
+                  "回执 type 字段：字典/列表形态可辨（真机取证时确认资产形状）；null ⇒ \"null\"");
+
+            Check("t222_null_asset_and_unknown_object_are_safe",
+                  DumpRules.EnumerateEntries(null).Count == 0
+                  && DumpRules.Describe(new object()) != null,
+                  "null 资产 ⇒ 空列表不抛（逐表 fail-closed 的前提）；Describe 对任意对象不抛");
+
+            // ==============================================================
             //  task-210：机器链契约（objects 台账的排序/截断/三态）纯规则断言
             // ==============================================================
             Console.WriteLine("TileListRules 台账断言（task-210）");

@@ -75,6 +75,7 @@ __all__ = [
     "farm_dry_tiles",
     "farm_ready_tiles",
     "farm_dead_crops",
+    "known_crafting_recipes",
     "farm_dry_dead_crops",
     "farm_empty_dirt",
     "player_free_slots",
@@ -1011,6 +1012,49 @@ def farm_dead_crops(obs: dict[str, Any]) -> tuple[int, str]:
         return max(0, int(raw)), "ok"
     except (TypeError, ValueError):
         return 0, "unavailable"
+
+
+# ======================================================================
+#  已知制作配方（task-222：只读内省面，不进任何技能判据）
+# ======================================================================
+
+#: 【task-222】`player.knownCraftingRecipes` 的脑侧上限（与 Mod 端一致：200 条）。
+KNOWN_RECIPES_MAX = 200
+
+
+def known_crafting_recipes(obs: dict[str, Any]) -> tuple[list[str], str]:
+    """玩家**已学会**的制作配方键名（`player.knownCraftingRecipes`，task-222）。
+
+    返回 `(配方名列表, 状态)`，三态与 Mod 端逐字一致：
+
+    * `"ok"` —— 拿到完整列表（**空数组 = 真一个都没学会**，是有效信息）；
+    * `"truncated"` —— 拿到但被截断（`knownRecipesTruncated`/条数 > 上限）；
+    * `"unavailable"` —— 旧 Mod 缺字段、`null`、类型不对 ⇒ 列表回 `[]`，
+      但调用方**绝不**能把 `[]` 当成"没有配方"（那只是"不知道"）。
+
+    为什么放在这里而不是 `longrun`：这是**内省取证面**（task-214：Furnace 配方到底有没有
+    被 `AddMissedMailAndRecipes()` 补进玩家字典），只读、不参与任何技能判据/守卫/账本；
+    `debug_dump` 读的是**游戏数据表**，"玩家已学会哪些"只有玩家字典里有。
+    """
+    player = obs.get("player") or {}
+    raw = player.get("knownCraftingRecipes")
+    if raw is None:
+        return [], "unavailable"
+    if not isinstance(raw, (list, tuple)):
+        return [], "unavailable"
+    names: list[str] = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            names.append(item.strip())
+    truncated = player.get("knownRecipesTruncated")
+    count = player.get("knownCraftingRecipesCount")
+    try:
+        total = int(count) if count is not None else len(names)
+    except (TypeError, ValueError):
+        total = len(names)
+    if truncated is True or total > len(names) or len(names) > KNOWN_RECIPES_MAX:
+        return names, "truncated"
+    return names, "ok"
 
 
 # ======================================================================
