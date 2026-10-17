@@ -47,3 +47,11 @@
 1. **`worldSeq` 不是成功信号（R3）**：真机实测 `interact` 路径收获成功时 `worldSeq 60→60`（**不推进**；Mod 回执也如实写 60→60），而 `use_tool` 一次挥动 `65→67`。⇒ **任何判据都不许拿 `worldSeq` 前进当"动作成功"的证据**。成功证据只认这四类：①目标格 `ready` 由 `true→false`（或 `readySource` 变化）；②背包**逐 qid 计数**增加（对得上 `affected_tiles` 的 gained）；③`farm.readyCrops` 下降；④对照观测的 `TileSig` 变化。**失败的判据也不许用 `worldSeq` 未动**（否则会把失败判成功或反之）。
 2. **回执 `ok` 仍不等于世界变了**（族里第三次教训）：`interact`/`use_tool` 都必须以「跨观测证据」为准（task-182 的 `acted`/`actedEvidence`，Mod 侧 `use_tool` 见 task-188 补齐）。报告中若出现「回执 ok 但世界未变」必须单列，不许并进成功计数。
 3. **落盘/跨日口径**：跨日 ≠ 落盘（有 `displayedShippedItems` 时 `ShippingMenu` 会推迟 `SaveGameMenu`）；六串配对（`Synchronizing 'NewDay'` / `before save` / `SaveGame.Save() called` / `Saving without compression` / `completed` / `after save, starting <day>`）**必须成组出现**，缺组即如实写【无法判定】，不许按"存档 mtime 没变"直接判失败或通过。
+
+## 6. 测量规则（**2026-10-17 A′ 叫停后固化，0.7.37 起生效**）
+
+> 起因：A′（0.7.36）被「背包满 ⇒ `harvest` 全线被拒」支配，`no_hard_failures=false` 整天、守卫拿 farm 级计数空转 `stuck`（`docs\_runA3-0736-evidence.md`）。这三条是**判据层**的修正，不替代硬验收。
+
+1. **「背包满」不是硬失败（task-198）**：无空格 ⇒ 阻塞类（`no_slot` 同族），**不进 `failed_steps`/`no_hard_failures`、不吃 `harvest_gave_up` 上限、不封格**；报告里单列「背包满阻塞次数」，与「真失败」分开。若某天因此无法 VERIFIED，`ended_reason` 必须写**可执行**的原因（"背包满、需先腾格/出货"），**不许**写成"没干活"。
+2. **守卫的「还有活」必须能落到可执行目标（task-199）**：`work_reasons()` 给出的每一条理由，都必须能对应到**具体可执行目标**（坐标/指派阶段）；farm 级计数（`readyCrops` 等）只能当**线索**，不能单独作为"还有活"的证据 —— 否则会像 A′ day13 那样空转 `stuck`。窗口外目标要么有坐标可走过去（`readyTiles` 一族），要么如实记 `*_far_blocked` 并**不进入**"还有活"。
+3. **sell 白名单归因分两通道（task-193/196）**：作物白名单（`whitelist_source="crop_product"`，只收本格作物产物 id；取不到 crop id ⇒ 空白名单 + `unavailable`，**宁可少挣、不许乱卖**）与材料白名单（盈余材料换种子钱，`task-55`）**必须分列统计**；连带掉落（`collateral_loot`）不许进作物白名单。任何"白名单里出现与目标格无关 qid"都要单列为 ⚠。
