@@ -29,7 +29,12 @@
 | **task-197** | tests | 消除子进程抓 stdout 的编码依赖（显式 `encoding="utf-8"` 或 ASCII 标记断言）+ 「不带 PYTHONUTF8 也绿」回归护栏 | 两种环境（带/不带 `PYTHONUTF8`）都 `Ran N / OK`，读数原文贴进交付 |
 | **task-200** | deputy-lead | 本批**独立对抗验收**（6 卡逐卡 + 变异自报 vs 实测两列 + 是否可冻结；只写 `docs/_review-0.7.37.md` + `scratch/`） | PASS / PASS-WITH-NITS / FAIL + 可冻结结论 |
 
-**实施顺序（单写者 dev-coder 串行）**：`198 → 199 → 195 → 196 → 197`；`193`（log-analyst）可并行；`200`（deputy-lead）在三卡以上交付后可滚动开始，最终冻结前必须完成。
+**实施顺序（单写者 dev-coder 串行）**：`198 → 199 → 195 → 196 → 197`；`193`（随 dev-coder，原误派 log-analyst 已回滚）在其后；`200`（deputy-lead）在三卡以上交付后可滚动开始，最终冻结前必须完成。
+
+**进度（Lead 实时维护）**：
+- ✅ **task-198** `62e9089`（4 文件 +733/−18）：Lead 亲核 `py_compile` 0、定向 484 OK、全量 986 仅 2 条 analyzer 漂移（归 task-193）；变异 m198a–g 实测杀 10/4/2/1/2/3/1；offline 推演 A′ 两组通过。板上 completed。
+- 🛠 **task-199** 在制（dev-coder，Mod `farm.readyTiles` + 脑侧走过去）。
+- ⏸ task-195 / 196 / 193 / 197 待开工；task-200 滚动预检中（在制树三轮，最新 PASS=24/FAIL=0/SKIP=4）。
 
 ## 2. 冻结九步（Lead 独占，链条冻结后一次做完）
 
