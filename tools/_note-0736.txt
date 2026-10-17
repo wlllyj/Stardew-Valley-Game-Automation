@@ -1,0 +1,8 @@
+v0.7.36：收获证据面收口（task-186/188/189 —— task-184 真机复测的三项残留 + task-183 的受限假阳面）
+- Mod `UseToolSkill`：`use_tool` 回执补 `acted` + `actedEvidence`（与 `interact` 同一套跨观测证据口径；**fail-closed**：证据不可得 ⇒ `acted=false`，不许 true）；reason 不再把原物渲染成空（`该格原本是 （空）` ⇒ 如实内容）（task-188 = R1/R4）。
+- Mod：跨观测证据提取为共享方法，`interact` 与 `use_tool`（以及任何改世界的技能）同源；`mod/AgentFarm.Bridge.Tests` 增加 `use_tool` 的行为断言（有变化/无变化/证据不可得三态）。
+- 脑侧 `farmwork.harvest()`：动作后**该格不在观测窗口内**时，不许再用"crop 消失"这一路判成功（其余三路照旧可用），reason 写明"该格不在观测窗口内，无法据此判成功" —— 堵住 task-183 指出的**新假绿通道**；同时不许因此把成功判成失败（task-186 F1）。
+- 脑侧 loot 记账：以动作前后 `inventory[]` **逐 qid 计数差**为准（覆盖"一次工具动作影响多格 + 合并进既有栈"的形态），并与 `affected_tiles` 的 gained 对账；对不上时如实列出哪些 qid 对不上（不许再写"背包没有新增物品"这种与实测相反的结论）（task-189 = R2）。
+- 脑侧 `sell` 白名单收窄为 `qid ⊆ 本次动作 affected_tiles 的 gained`（防无关物品被误卖）；既有安全约束（不卖工具/武器/种子/建材）**不变**，且不许拿"目标格变化"当放宽白名单的理由（task-186 F3/NIT-4）。
+- 措辞诚实：`readyCrops` 不可判定（字段缺失 / `-1`）时，失败文案写"**无法判定**"而不是"没下降"（task-186 F5）；仅有 `readySource` 标签变化即判成功是**有意**口径，写进文档（task-186 F4/NIT）。
+- 判据文档（非 Mod 内容）：`docs\_run10-criteria.md` §5 新增测量规则 —— **`worldSeq` 不是成功信号**（真机实测 `interact` 收获成功时 `60→60`）、回执 `ok` 不等于世界变了、跨日落盘六串必须成组出现（缺组 ⇒【无法判定】）。
