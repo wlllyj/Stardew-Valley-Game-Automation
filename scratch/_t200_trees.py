@@ -28,8 +28,9 @@ MARKERS: dict[str, list[tuple[str, str]]] = {
     "199": [("mod/AgentFarm.Bridge/FarmScan.cs", "readyTiles"),
             ("mod/AgentFarm.Bridge/Contracts.cs", "readyTiles"),
             ("brain/agentfarm/farmwork.py", "ready_far_blocked")],
-    "195": [("mod/AgentFarm.Bridge/ClumpRules.cs", "Target"),
-            ("mod/AgentFarm.Bridge/Skills.cs", "Affected")],
+    "195": [("tests/test_longrun.py", "TestTask195"),
+            ("mod/AgentFarm.Bridge/Skills.cs", "affectedTiles"),
+            ("mod/AgentFarm.Bridge/Contracts.cs", "evidenceScope")],
     "196": [("brain/agentfarm/farmwork.py", "collateral_loot")],
     "197": [("tests/test_longrun.py", 'encoding="utf-8"')],
 }
@@ -80,8 +81,20 @@ def build(rev: str, name: str) -> Path:
     if r2.returncode != 0:
         raise SystemExit(f"tar 解包失败：{(r2.stderr or '').strip()[:300]}")
     tarp.unlink(missing_ok=True)
+    # 夹具补齐：gitignored 的账本/合成 ledger 不在 git archive 里，但 analyzer/verify-run3 的用例要读
+    copied = 0
+    srcs = (list((WS / "logs").glob("*.jsonl")) + list((WS / "logs").glob("*.json"))
+            + list((WS / "scratch").glob("_ledger_*.jsonl"))
+            + [WS / "scratch" / "_t5x_vacuum.jsonl"])
+    for src in srcs:
+        if not src.is_file():
+            continue
+        dst = dest / src.relative_to(WS)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        copied += 1
     n = sum(1 for _ in dest.rglob("*") if _.is_file())
-    print(f"[OK] {name} ← {rev[:12]}（{n} 文件）")
+    print(f"[OK] {name} ← {rev[:12]}（{n} 文件，另补夹具 {copied} 个）")
     return dest
 
 

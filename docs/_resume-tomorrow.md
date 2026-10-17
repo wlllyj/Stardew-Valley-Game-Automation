@@ -1,5 +1,48 @@
 # 接续清单 · 2026-10-11 收工时点（明天从这里开始）
 
+## 0k. 2026-10-17 12:52 · **用户要求暂停（`m18566`「暂停吧，后续再启动」）—— 0.7.37 批次最后一卡停在 WIP**
+
+**停点一句话**：**HEAD `8ee33cb`（`wip(task-205): 工具升级/取回闭环`，12 文件 +2102/−4，未 bump/未部署/未写 completed）**；`brain/`、`mod/`、`tests/` **干净**；树上只剩 deputy 的报告 + 各人的 `scratch/` 探针。**goal 已 `paused`（rev17，disarmed）**，用户说「启动」时再 resume。游戏**已优雅退出**，存档 = 第1年 秋 20 日（`4417241 B`）。
+
+**task-205 的真实状态（WIP，可续）**
+- ✅ **Mod 侧完成并验证**：新增 `ToolUpgradeRules.cs`（纯函数 `Precheck`/`Select`/`Evidence`/kind 归一）+ `ToolUpgradeSkill.cs`（`upgrade_tool` = `TryOpenShopMenu("ClintUpgrade")` → 跨 tick 等 `ShopMenu` → readOnly 自检 → 按 kind+tier 唯一选条目 → 反射 `tryToPurchaseItem` → **观测差分**判成功；`pickup_tool` = blacksmith 取回分支 + `daysLeft`/空格/地点前置）；`Contracts.cs`/`Skills.cs`（`ClampUpgradeTimeout`）/`BridgeHost.IsLongTaskSkill` 接线；C# 自检 **`OK 50 断言`**（38→50）；`dotnet build --no-incremental` **0 警 0 错**。
+- ✅ **brain 侧完成**：`bridge.py` 两包装；`farmwork.py` 的 `UPGRADE_*`、`tools_of`/`tool_tier`/`tool_being_upgraded`/`tool_upgrade_days_left`/`tool_suspended_stages`、`upgrade_tool`/`pickup_tool`（**在途再买直接拒 = 防白扣钱锭**）；`longrun.py` 的 `TOOL_UPGRADE_MAX_PER_DAY=1`、`_tool_upgrade_plan`（**取回优先于新升级**）、`_tool_suspended_stages`（在途工具对应阶段空池 + 守卫不再拿"没浇水"钉住）、`_maybe_tool_upgrade`、`_tool_upgrade_due` + 主循环接线。
+- ✅ 单测 21 条（`TestTask205ToolUpgrade` 8 + `TestTask205ToolUpgradePlan` 13）定向 21/OK；变异实测杀数 m205a 2 / m205b 3 / m205c 5 / m205d 1。
+- ❌ **唯一剩项**：全量 `Ran 1026 / FAILED (failures=2)` —— 两条都是 analyzer 未收本卡 4 个新事件：`upgrade_tool`、`pickup_tool`、`tool_upgrade_skipped`、`tool_upgrade_blocked_work` ⇒ **归 task-207**（log-analyst，analyzer 卡；dev-coder 按纪律没碰 `tools/`）。
+- ❌ **真机未验**：存档铜锭/铜矿/煤全 0、五件工具全 0 级 ⇒ 今天物理上买不了升级（见下方「硬阻塞」）。
+
+**两条新硬阻塞（明天第一优先级）**
+1. **熔炉（Furnace）配方没有**：run10 存档 `craftingRecipes` 19 条**无 Furnace**；mining 1 级/279xp、`deepestMineLevel=0`、`mailbox` 无 Clint 信 ⇒ 常识的「Mining 1 级后 Clint 邮寄」在我们存档里没兑现。**task-212（log-analyst，在制/暂停点未知）** 在查「授予点 + 是否是我们早期 `dismiss_modal` 关 LevelUpMenu 把授予弄丢 + 合法恢复路径」。
+2. **机器链能力未做**：task-210（craft_item / place_object / machine feed+collect）`blocked_by task-205`；其 IL 已由 **task-211**（`b053340`，`docs/_il-machine-chain.md`）定案：制作 = `CraftingRecipe.createItem()`+`consumeIngredients()`（1.6.15 **没有** `Craft(int)`）、放置 = `Utility.tryToPlaceItem(loc,item,px,py)`（**失败也返 true，返回值不可信**）、投料/取货复用 `GameLocation.checkAction`（自带防双扣；`readyForHarvest` 是 **NetBool 字段**）。
+
+**0.7.37 批次（入版 = `{192,198,199,208,205}`）**
+| 卡 | 状态 |
+|---|---|
+| task-192 释放记账 | ✅ `1246cdd`（亲核 965 OK） |
+| task-198 背包阻塞/腾格 | ✅ `62e9089`（deputy PASS-WITH-NITS：pre 6/15 → post 24/0，7 变异与自报 100% 相符；NIT = `stages[].env_block` 累计易误读） |
+| task-199 窗口外熟作物 | ✅ `edcd581`（亲核全量 1005 OK；变异 6/1/1/1） |
+| task-202 analyzer 收事件 | ✅ `f2e72e3`（全量 992 OK 归零） |
+| task-204 铁匠铺 IL | ✅ `d6d55e2`（`docs/_il-tool-upgrade.md` 重写） |
+| task-208 显式对话应答 | ✅ `dadd356`（C# 38 断言；亲核过） |
+| **task-205 工具升级闭环** | 🟡 **WIP `8ee33cb`**（只差 analyzer 归零） |
+| task-206 task-205 对抗验收 | ⏸ 待 205 收口 |
+| task-200 本批独立验收 | 🟡 报告 §1/§2/§6 已写，§3/§4/§5/§7 待本批收口后补 |
+
+**环境**：Mod **0.7.36 已装机**（dll 202752 B）；游戏已退出、桥不在；存档 `Wahaha_450799035` = 秋 20 日（4417241 B）。全量单测 **1026（2 红 = analyzer 漂移）**，带 `PYTHONUTF8=1`。**注意**：今天下午游戏无人值守跑到 2:00 **昏睡被扣 10%（251g）** ⇒ 教训：游戏开着必须有人/有脑在跑，跑完立刻优雅退出（`m02833`）。
+
+**明天开工顺序（Lead 串行放行）**
+1. **log-analyst**：① 收 task-212（熔炉配方授予 + 恢复路径）——**这是升级链第一优先级**；② task-207（analyzer 收 task-205 四事件）⇒ 全量应变 `1026/OK`。
+2. **deputy-lead**：task-206（task-205 对抗验收：≥8 通道 + 变异自报 vs 实测两列）+ task-200（在 `git archive` 冻结树上对本批 5 卡做正式 pre/post 与变异实测，出「可冻结」结论）。
+3. **Lead**：全绿 ⇒ **冻结 0.7.37**（`docs/_release-0.7.37.md` §2 九步；`tools/_note-0737.txt` 必须补 Mod 侧三处：199 `readyTiles`、208 显式应答、205 `upgrade_tool`/`pickup_tool`）⇒ 装机 ⇒ `goto Farm` ⇒ `preflight --save-baseline logs/run10e-baseline.json`。
+4. **然后才是 task-210 机器链**（配方阻塞解除后）⇒ 按 `docs/_upgrade-protocol.md` 跑「卖钱→买矿煤→造熔炉→炼 5 铜锭→升铜斧」真机验收（预算 6275g，现有约 2268g）。
+5. 最后 **task-113 A″/B″**（0.7.37 上各 5 天，`logs\longrun-runA4-0737.jsonl` / `runB4-0737.jsonl`；B′ 不跑）+ `tools/compare-runs.py` 的 L0–L5。
+
+**判据要点（别忘）**：`docs/_release-0.7.37.md` §3（198 的 A′ 原型复现 = 冻结硬判据；199 同源一致；208 必须真选中；205 防重复购买 + fail-closed 七码）；`docs/_run10-criteria.md` §5（`worldSeq` 不是成功信号）、§6（背包满不算硬失败 / 守卫"还有活"必须落到可执行目标 / sell 白名单两通道）；`docs/_upgrade-protocol.md`（升级验收 9 步 + 失败分支）。
+
+**目标不变**（`User said (m15155)`）：①农场全部清理 + 钱在作物再投资与工具升级间平衡（验收 = 完成一次完整清理）；②连续 5 个游戏日全自主 + 大模型策略生成/结果校验/据结果优化（验收 = 5 日 VERIFIED + 每日 ≥2 份独立观测 + 落盘六串 + L0–L5 对照）。**goal 已 `paused`（rev17）**，用户说「启动」时再 resume。
+
+---
+
 ## 0j. 2026-10-17 11:10 · **用户要求暂停（`m18188`「可以先暂停，稍后再重新启动」）—— 0.7.37 批次停在中途**
 
 **停点一句话**：**HEAD `f2e72e3`（task-202 收口，全量 `Ran 992 / OK` 零红）**；工作树里有 **task-199 的在制 WIP**（Mod 半已完成并自测通过、brain 半 5 绿 1 红、farmwork 三态用例未写）+ deputy 的 `docs/_review-0.7.37.md`(untracked) 与 `scratch/_t200_*`。**没有提交任何半成品**（Lead 决定：不留 wip 提交，等 199 完整了再按卡提交）。
