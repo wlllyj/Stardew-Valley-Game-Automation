@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -549,6 +550,58 @@ def case_A6b() -> None:
           any("150" in r for r in dry_reasons), f"dry_reasons={dry_reasons}")
 
 
+def case_C2() -> None:
+    """卡面 C③④⑤⑥⑦⑧：不许洗 `no_unmet_stages`、不许换名、不许跨 run 继承、不许藏观测、理由不许幻觉、多天不许自洽成 true。"""
+    print("== C2 洗白面：no_unmet/换名/跨 run/观测/理由/多天 ==")
+    A = api()
+    if A["shed_one"] is None:
+        return skip("C2", "task-168 未交付")
+    # ④ 换名躲：认输不许被当成"主动收工"的理由
+    justified = tuple(getattr(LR, "JUSTIFIED_END_REASONS", ()) or ())
+    check("C2a `scope_shed`/`reduce_scope` 不在 JUSTIFIED_END_REASONS（认输 ≠ 收工理由）",
+          not any("shed" in str(x) or "scope" in str(x) for x in justified), str(justified))
+    w, run, obs, z0, ztiles = _shed_setup(200, tag="c2")
+    rep = rep_for()
+    pl = plot(z0, run._zone_observed_tiles(z0, obs))
+    run._shed_scope(z0, obs, rep)
+    # ③ 洗白 no_unmet_stages：认输后该区仍是"有目标但没做完" ⇒ 当天 leftover 只能非空
+    left = run._leftover("water_area", obs, pl)
+    check("C2b 认输后该区 leftover 仍非空 ⇒ 当天 no_unmet_stages 只能 False（洗不白）",
+          bool(left) and len(left) >= ztiles, f"leftover={len(left)} zone={ztiles}")
+    check("C2c 认输格在观测里仍是未浇活苗（dry 未被抹）",
+          all(not (w.crops.get(t) or {}).get("watered") for t in run._shed_tile_set()),
+          str(sorted(run._shed_tile_set())[:3]))
+    # ⑥ 不许把认输格从窗口观测里藏掉
+    check("C2d 认输后该区在窗口观测里格数不变（没被静默藏掉）",
+          len(run._zone_observed_tiles(z0, obs)) == ztiles,
+          f"now={len(run._zone_observed_tiles(z0, obs))} before={ztiles}")
+    check("C2e farm 口径 dryCrops 不减（认输 ≠ 作物消失）",
+          int(((obs.get("farm") or {}).get("dryCrops")) or 0) >= ztiles,
+          str((obs.get("farm") or {}).get("dryCrops")))
+    # ⑧ 理由不许含坐标/未观测事实
+    reason = str((rep.scope_shed or {}).get("reason") or "")
+    check("C2f 认输理由不含坐标（只有 zone/格数/原因）",
+          not re.search(r"\[\s*\d+\s*,", reason) and str(run._zone_bounds(z0, obs)) not in reason,
+          reason[:140])
+    # ⑤ 持久层不许被别的 run 继承（scope 文件按 journal 命名）
+    run2 = mk(world(200), journal=JOURNALS / "c2_other.jsonl")
+    run2._scope_load()
+    check("C2g 换一本 journal ⇒ 认输状态不继承",
+          not run2.shed_zones and not run2._shed_tile_set(),
+          f"zones={sorted(run2.shed_zones)} path={getattr(run2, 'scope_path', None)}")
+    # ⑦ 连续多天认输：第二天仍不许自洽成 true（要么被 34% 上界拒，要么仍留 leftover）
+    run.scope_shed_today = False                      # 模拟日切重置（longrun.py:5405-5407）
+    obs3 = world(200).obs()
+    others = [n for n in zone_names(run, obs3) if n != z0]
+    ok2 = bool(run._shed_scope(others[0], obs3, rep_for(day=11))) if others else False
+    cap_refused = any(e.get("reason") == "cap" for e in events(run, "scope_shed_refused"))
+    left2 = (run._leftover("water_area", obs3, plot(others[0], run._zone_observed_tiles(others[0], obs3)))
+             if others else [])
+    check("C2h 第二天再认输仍不许自洽成 true（被 34% 上界拒 或 仍留 leftover）",
+          (not ok2 and cap_refused) or (ok2 and bool(left2)),
+          f"ok2={ok2} cap_refused={cap_refused} leftover2={len(left2)}")
+
+
 def case_T3() -> None:
     """工具侧交叉（Lead 的 task-168 口径核对）：自述 vs journal 逐条、认输却自称 VERIFIED。"""
     print("== T3 工具侧交叉核对（verify-run3）==")
@@ -599,6 +652,7 @@ CASES = {
     "P1": case_P1, "A2": case_A2, "A3": case_A3, "A4": case_A4,
     "B1": case_B1, "B2": case_B2, "A7": case_A7, "R1": case_R1,
     "X1": case_X1, "T1": case_T1, "T3": case_T3, "A6": case_A6, "A6b": case_A6b,
+    "C2": case_C2,
 }
 
 

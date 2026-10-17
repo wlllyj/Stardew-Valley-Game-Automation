@@ -14,10 +14,10 @@
 | 定向 `tests.test_farmwork tests.test_longrun tests.test_planner` | **Ran 542 / OK**（与 release doc 一致） |
 | 全量 `discover -s tests` | **Ran 945 / OK**（0 红，与 release doc 一致） |
 | `tests.test_verify_run3`（含 4 条 scope_shed 用例） | **Ran 69 / OK** |
-| 我的对抗探针（冻结 post 树） | **50 PASS / 0 FAIL** |
-| pre 树（`e56f2fc^`，无该特性） | 11 SKIP（特性不存在）+ 2 FAIL（该树的工具是旧版、无 scope_shed 判据 ⇒ 不可比） |
-| 自建变异矩阵 | control **50/0**，**6 变异 6 杀** |
-| 作弊通道 | 9 条逐条打，**未发现能把"认输"洗成"当天达标"的通道** |
+| 我的对抗探针（冻结 post 树） | **58 PASS / 0 FAIL**（含卡面点名的 C③④⑤⑥⑦⑧） |
+| pre 树（`e56f2fc^`，无该特性） | 12 SKIP（特性不存在）+ 2 FAIL（该树的工具是旧版、无 scope_shed 判据 ⇒ 不可比） |
+| 自建变异矩阵 | control **58/0**，**7 变异 7 杀**（含卡面点名的 `JUSTIFIED_END_REASONS`） |
+| 作弊通道 | 15 条逐条打（我方 9 + 卡面点名 6），**未发现能把"认输"洗成"当天达标"的通道** |
 
 一句话给 Lead：**task-168 的"认输"在判定、会计、浇水证据三处都没有被动过（只改目标池与守卫理由），上界与留痕经跨进程复核与变异复核都成立；0.7.35 可以冻结。** 唯一要拍板的是 §6 NIT-1（认输被释放后 `day_end` 快照不归零，可能让工具把雨天释放日误判为"认输却自称 VERIFIED"）。
 
@@ -63,7 +63,7 @@
 - pre 树没有这些能力（11 条 SKIP）⇒ 卡面三条在 pre 上**不可判**（不是"曾经失败"）。
 - 真正的 FAIL→PASS 是我的骨架阶段发现的 **F-X1**（重启后 `shed_zone_tiles` 为空 ⇒ 34% 累计上界归零）：我当时在 WIP 树上复现（`loaded=0 / disk=50`），dev-coder 用 `<journal>-scope.json` + `_scope_load` 灌回修掉；修后 X1 五条全绿（§2 ③），并且我的变异 m185a/m185b 仍能把这两点打红 ⇒ **修复被钉住**。
 
-## §3 C 段：作弊通道逐条对抗（9 条）
+## §3 C 段：作弊通道逐条对抗（15 条 = 我方 9 + 卡面点名 6）
 
 | # | 通道 | 构造 | 实测 | 结论 |
 | --- | --- | --- | --- | --- |
@@ -76,6 +76,12 @@
 | C-f | 证据不可用当"没有活" | `complete=false` | `deficit=None` ⇒ `no_farm_evidence`，绝不认输 | **不通** |
 | C-g | `day_end` 快照漏字段 | 变异去掉 `tiles` | A2 两条红（快照必须带 tiles） | **不通** |
 | C-h | 认输永久粘死 | 区内浇好 | `scope_released` 撤销、剔除集清空 | **不通**（粘性跨进程由 X1 覆盖） |
+| C-i | 用认输洗 `no_unmet_stages` | 认输后算 `_leftover`（C2b） | 该区 50 格仍在 leftover（≥ 认输格数）⇒ 当天 `no_unmet_stages` 只能 False | **不通** |
+| C-j | `no_target`/`no_work`/`scope_shed` 换名躲（卡面③） | `JUSTIFIED_END_REASONS` + 排除名单变异（C2a） | 常量 = `("night","stamina","no_work")`，认输不在其中；`m185g` 把它加进去 ⇒ C2a 立刻变红 | **不通** |
+| C-k | `<journal>-scope.json` 被**别的 run** 继承（卡面⑤） | 换一条 journal 路径再 `_scope_load`（C2g） | `shed_zones={}`、剔除集空（scope 文件按 journal 命名） | **不通** |
+| C-l | 认输格被静默排除出窗口观测（卡面⑥） | 认输后看 `_zone_observed_tiles` / `dryCrops`（C2d/C2e） | 观测格数 50→50 不变、`dryCrops` 未减、认输格仍是未浇活苗（C2c） | **不通** |
+| C-m | 连续多天认输、某天忽然自洽成 true（卡面⑦） | 日切重置后再认输（C2h） | 要么被 34% 累计上界拒（`cap`），要么仍留 leftover ⇒ 都不 VERIFIED | **不通** |
+| C-n | 认输理由里塞坐标/幻觉（卡面⑧） | 正则 `\[\s*\d+\s*,` + 区界串比对（C2f） | 理由只有 zone/格数/原因，无坐标 | **不通** |
 
 一句话结论：**未发现新洗白通道**。认输只改"选择哪片地/怎么解释还剩多少活"，判定（`checks`/`verified`）、会计（`_leftover`/`assigned_undone`/`plot_pending`）、浇水证据（`watered_outdoor`/`final_water`）三处都没被触碰。
 
@@ -85,13 +91,14 @@
 
 | 变异 | 改动 | 红了哪几条 |
 | --- | --- | --- |
-| control | 无 | 无（**50 PASS / 0 FAIL**） |
+| control | 无 | 无（**58 PASS / 0 FAIL**） |
 | m185a_no_hydration | `_scope_load` 不灌回格清单 | X1 灌回（loaded=0 disk=50） |
 | m185b_cap_counts_zones | 上界 `already` 按区数算 | X1 上界生效 + X1 理由=cap |
 | m185c_leftover_subtracts | `_leftover` 扣掉认输格 | A4 逐字相同 + A4 认输格仍在 leftover |
 | m185d_shed_deducts_everything | `live_crops_at_shed=1e9` | A6b 农场级理由仍在 + A6b 格数=150 |
 | m185e_no_deficit_gate | 去掉 `deficit<=0` 门闸 | P1 理由=no_deficit |
 | m185f_snapshot_no_tiles | `day_end.scope_shed` 去掉 `tiles` | A2 快照带 tiles + A2 认输格数 |
+| m185g_shed_is_justified_end | `JUSTIFIED_END_REASONS` 加 `"scope_shed"` | C2a（认输不许当收工理由） |
 
 ⇒ **6/6 被杀**（作者删除的变异脚本由我重建；m185d 是我第一版探针漏掉的通道，靠给 A6 加"农场级理由必须仍存在"的断言才补上，见 §6 INFO-2）。
 
@@ -111,7 +118,8 @@
 - INFO-1：`day_end.scope_shed` 只记**当天那一次**认输；跨日粘住的区只在 `<journal>-scope.json` +journal `scope_loaded` 里（作者注释已说明，符合卡面字面）。复核历史账本时要同时看 scope 文件，否则会以为"累计上界只有 1 个区"。
 - INFO-2：探针第一版 A6 只断言"守卫还有理由"，被 `live_crops_at_shed=1e9` 变异绕过 ⇒ 已加 A6b（人回室内后 farm 级干作物理由必须仍报"150 格"）。教训：**"理由非空"太弱，要断言"理由里那个数字对得上"**。
 - INFO-3：`_harvest_zone`（`:1163`）在认输前先把该区成熟作物收掉（一轮有界、用 task-181 的 `tile_ready` 口径）⇒ 卡面未要求，属"不拔苗、不让收成烂在地里"的加分设计；我确认它不改判定与会计。
-- 未判定项：**无**。卡面三条验收 + 九条通道 + 跨进程 + 工具侧全部可判。
+- INFO-4：赛后按卡面逐字复核，发现首版探针**漏测卡面点名的 6 条通道**（C③④⑤⑥⑦⑧），已补 `case_C2`（C2a–C2h 八条断言）+ 第 7 个变异 `m185g`；补测后 post 树 58 PASS / 0 FAIL、变异 7/7 杀，结论不变。教训：**交付前要拿卡面原文逐条勾，不能只用自己设计的通道表**。
+- 未判定项：**无**。卡面三条验收 + 十五条通道 + 跨进程 + 工具侧全部可判。
 
 ## §7 复跑命令与原始读数
 
@@ -120,7 +128,7 @@ $py = "C:\Users\admin\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\
 $env:PYTHONUTF8 = "1"; Set-Location <repo>
 # ① 冻结 post 树（= e56f2fc / 被 630e594 吸收）
 $env:T185_ROOT = "<repo>\scratch\_t185_post"; & $py -W error::SyntaxWarning scratch\_t185_probe.py
-# ② pre 树（无该特性 ⇒ 11 SKIP；该树工具为旧版 ⇒ T3 不可比）
+# ② pre 树（无该特性 ⇒ 12 SKIP；该树工具为旧版 ⇒ T3 不可比）
 $env:T185_ROOT = "<repo>\scratch\_t185_pre";  & $py -W error::SyntaxWarning scratch\_t185_probe.py
 # ③ 变异矩阵（自建：拷冻结树 + 文本变异 + 同一套探针）
 & $py -W error::SyntaxWarning scratch\_t185_mutate.py
@@ -129,9 +137,9 @@ $env:T185_ROOT = "<repo>\scratch\_t185_pre";  & $py -W error::SyntaxWarning scra
 & $py -W error::SyntaxWarning -m unittest discover -s tests
 ```
 
-- `scratch\_t185_post_out.txt` ⇒ `PASS=50 FAIL=0 SKIP=0`。
-- `scratch\_t185_pre_out.txt` ⇒ `PASS=3 FAIL=2 SKIP=11`（FAIL 为旧版工具的 T3a/T3b）。
-- `scratch\_t185_mut_out.txt` ⇒ control `PASS=50 FAIL=0`，6 变异全杀。
+- `scratch\_t185_post_v3.txt` ⇒ `PASS=58 FAIL=0 SKIP=0`（补测后的最终读数；v1/v2 为 46/50）。
+- `scratch\_t185_pre_v3.txt` ⇒ `PASS=3 FAIL=2 SKIP=12`（FAIL 为旧版工具的 T3a/T3b）。
+- `scratch\_t185_mut_v3.txt` ⇒ control `PASS=58 FAIL=0`，**7 变异 7 杀**（1/2/2/2/1/2/1 条）。
 - 探针 journal 与 scope 文件：`scratch\_t185_j\*`；变异树：`scratch\_t185_mut\<case>\`（每个 case 另存 `<case>.out.txt`）。
 
 ## §8 越界声明

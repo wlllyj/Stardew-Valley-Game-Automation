@@ -51,6 +51,11 @@ MUTANTS: dict[str, list[tuple[str, str]]] = {
         ('rep.scope_shed = {"zone": zone_name, "tiles": len(tiles), "reason": reason,',
          'rep.scope_shed = {"zone": zone_name, "reason": reason,'),
     ],
+    # 卡面③点名：把"认输"偷渡成合法收工理由 ⇒ 换名躲（应被 C2a 抓住）
+    "m185g_shed_is_justified_end": [
+        ('JUSTIFIED_END_REASONS = ("night", "stamina", "no_work")',
+         'JUSTIFIED_END_REASONS = ("night", "stamina", "no_work", "scope_shed")'),
+    ],
 }
 
 
