@@ -5,3 +5,4 @@ v0.7.35：再生作物收获的因果链修正（run A/B 第一病灶的收尾�
 - Mod `CropMeta`：`forageCrop && whichForageCrop == null` 进闸 ⇒ 判"判不了"（`(null,null)`），与"任一判据缺项 ⇒ null"的文档一致（task-178 NIT-1）。
 - 新增零依赖 C# 自检工程 `mod/AgentFarm.Bridge.Tests`（纯控制台 + 手写断言，`dotnet run` 退出码当红绿）：承担 `CropMeta.Ready()` 的**行为化回归**，堵住"源码文本存在性断言"的逃逸（task-178 GAP-1 的 m178b 变异现在被杀死）。`bin/`、`obj/` 由根 `.gitignore` 覆盖，不入库。
 - 脑侧（同批，非 Mod 内容）：`farmwork.harvest()` 成功判据改为观测差分四择一 + 逐 qid loot 记账 + 背包满按 `inventory[]` 行数判；Mod 的 `acted` 降级为线索，不进判据（task-181）。
+- 脑侧（同批，非 Mod 内容）：task-168「规模取舍」—— 当活苗浇水成本 > 满体力（`deficit > 0`）且 ≥2 个田区时，新意图 `reduce_scope` 主动**认输一个田区**（先收该区熟作物，再把该区从目标池/守卫理由/延后集里剔除）。诚实边界：认输格**仍留在会计里**（`_leftover`/`plot_pending`/`assigned_undone` 一字不改）⇒ 当天如实**不 VERIFIED**、`checks` 零新增键；上界双保险 = 一天 ≤1 区 + 整 run 累计 ≤ 农场可作业格 34%；证据不可用/浇得完/区看不见 ⇒ 如实拒绝并记 `scope_shed_refused`。认输区格清单持久化在 `<journal>-scope.json`（重启后累计不归零）。
