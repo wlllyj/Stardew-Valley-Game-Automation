@@ -35,6 +35,8 @@ PASS = 0
 FAIL = 0
 SKIPPED = 0
 FINDINGS: list[str] = []
+# `T190_FORCE=1`：忽略"特性缺失 ⇒ SKIP"的门闸，让通道照跑（pre 树取 FAIL→PASS 原文用）
+FORCE = bool(os.environ.get("T190_FORCE"))
 SRC = (ROOT / "brain" / "agentfarm" / "farmwork.py").read_text(encoding="utf-8")
 
 
@@ -63,21 +65,21 @@ def skip(tag: str, why: str) -> None:
 
 
 def has_186() -> bool:
-    return "tile_seen" in SRC and "whitelist_bound" in SRC
+    return FORCE or ("tile_seen" in SRC and "whitelist_bound" in SRC)
 
 
 def has_189() -> bool:
-    return "LOOT_CONFIRM_TRIES" in SRC
+    return FORCE or ("LOOT_CONFIRM_TRIES" in SRC)
 
 
 def has_188() -> bool:
-    mod = ROOT / "mod" / "AgentFarm.Bridge" / "UseToolSkill.cs"
-    tests = ROOT / "mod" / "AgentFarm.Bridge.Tests"
-    body = mod.read_text(encoding="utf-8") if mod.exists() else ""
-    probe = ""
-    for p in tests.glob("*.cs"):
-        probe += p.read_text(encoding="utf-8")
-    return "actedEvidence" in (body + probe)
+    """`ActedEvidence` 落在 `Skills.cs` / `ClumpRules.cs`（不是 `UseToolSkill.cs`）⇒ 全扫一遍 Mod 侧。"""
+    if FORCE:
+        return True
+    cands = [ROOT / "mod" / "AgentFarm.Bridge" / n
+             for n in ("Skills.cs", "ClumpRules.cs", "UseToolSkill.cs", "Contracts.cs")]
+    cands += list((ROOT / "mod" / "AgentFarm.Bridge.Tests").glob("*.cs"))
+    return any("ActedEvidence" in p.read_text(encoding="utf-8") for p in cands if p.exists())
 
 
 # ═══════════════════════════════ 夹具 ═══════════════════════════════
@@ -193,6 +195,29 @@ def case_f3() -> None:
     check("C2c 只凭背包差分、没有格子级证据时白名单为空",
           (st.after or {}).get("whitelist_bound") is True or not worker.harvested,
           f"after={st.after}")
+
+    # C2b：世界**完全没变**（作物还在）但同一次动作里背包进了无关注物品 ⇒ 白名单必须为空
+    class GainNoTileBridge(TF.MiniBridge):
+        def interact(self, tile=None, *, timeout_ms=None):
+            for row in self.w.inventory:
+                if row.get("qualifiedId") == "(O)128":
+                    row["stack"] += 7          # 只有背包差分，没有任何格子级证据
+            return {"ok": True, "status": "ok", "acted": True,
+                    "actedEvidence": "inventory", "reason": "交互了一下"}
+
+        def use_tool(self, tile=None, *, tool=None, timeout_ms=None):
+            return self.interact(tile)
+
+    w2b = World(records=[crop()], inventory=[item("(O)388", 99, 7, "Stone"),
+                                             item("(O)128", 1, 8, "Sardine")])
+    w2b.farm = farm()
+    wr2b = mk(w2b, GainNoTileBridge)
+    st2b = wr2b.harvest(tuple(w2b.records[0]["tile"]))
+    check("C2b 无格子级证据 + 有 gained ⇒ 白名单必须为空（不许只凭背包差分绑定）",
+          not wr2b.harvested and (st2b.after or {}).get("whitelist") in (None, [], {}),
+          f"harvested={wr2b.harvested} whitelist={(st2b.after or {}).get('whitelist')} "
+          f"loot={(st2b.after or {}).get('loot')}")
+
     # 红线不放宽：工具行不许进 sellable_slots
     w3 = World(records=[crop()], inventory=[item("(O)388", 99), item("(T)Hoe", 1, 3, "Hoe", True)])
     w3.farm = farm()
@@ -250,22 +275,21 @@ def case_r2() -> None:
           "没有新增物品" not in st.reason, st.reason)
     check("C4c ok 且理由写明逐 qid 差分", st.ok is True and "进背包" in st.reason, st.reason)
 
-    # 延迟入包：第一张后观测里背包还是旧的，第二张才出现 ⇒ loot_waits ≥ 1 且记账正确
+    # 延迟入包：动作后**第 3 张观测**才看得到新增 ⇒ 必须真的走 `loot_waits` 那两轮等待
     class LateBridge(TF.MiniBridge):
         def __init__(self, w):
             super().__init__(w)
-            self.calls = 0
+            self.obs_calls = 0
 
         def use_tool(self, tile=None, *, tool=None, timeout_ms=None):
             for r in self.w.records:
                 r["crop"] = None
-            self.calls += 1
             return {"ok": True, "status": "ok", "acted": True}
 
         def observe(self, *a, **kw):
             obs = super().observe(*a, **kw)
-            self.calls += 1
-            if self.calls >= 2:
+            self.obs_calls += 1
+            if self.obs_calls >= 3:                  # 前两张后观测都看不到（延迟入包）
                 for row in self.w.inventory:
                     if row.get("qualifiedId") == "(O)262":
                         row["stack"] += 4
@@ -274,8 +298,9 @@ def case_r2() -> None:
     w2 = World(records=[crop(crop="262", harvestMethod="Scythe")], inventory=[dict(r) for r in base])
     w2.farm = farm()
     st2 = mk(w2, LateBridge).harvest((60, 29))
-    check("C4d 延迟入包 ⇒ 有界多等后仍记到 +4",
-          ((st2.after or {}).get("loot") or {}).get("(O)262") == 4,
+    check("C4d 延迟入包 ⇒ 有界多等后仍记到 +4（真的走了等待轮）",
+          ((st2.after or {}).get("loot") or {}).get("(O)262") == 4
+          and int((st2.after or {}).get("loot_waits") or 0) >= 1,
           f"loot={(st2.after or {}).get('loot')} waits={(st2.after or {}).get('loot_waits')}")
 
     # 真丢失：有格子级证据但背包始终没新增 ⇒ 如实写「对不上」，不许写「没有新增物品」
@@ -294,27 +319,77 @@ def case_r2() -> None:
           ((st3.after or {}).get("loot_whitelisted") or []) == [], str(st3.after))
 
 
-# ═══════════════════════════════ C5（R1 Mod 回执，等 task-188） ═══════════════════════════════
+# ═══════════════════════════════ C5（R1 Mod 回执，三源复核） ═══════════════════════════════
 def case_r1() -> None:
-    print("== C5 R1：use_tool 回执 acted/actedEvidence（fail-closed）==")
+    print("== C5 R1：use_tool 回执 acted/actedEvidence —— 三源复核 ==")
     if not has_188():
-        return skip("C5", "task-188 未落地（UseToolSkill/自检工程里还没有 actedEvidence）")
+        return skip("C5", "task-188 未落地（Mod 侧没有 ActedEvidence）")
     proj = ROOT / "mod" / "AgentFarm.Bridge.Tests" / "AgentFarm.Bridge.Tests.csproj"
     if not proj.exists():
         return skip("C5", "C# 自检工程不存在")
+    # —— 源①：行为（真跑编译产物）——
     proc = subprocess.run(["dotnet", "run", "--project", str(proj), "-c", "Release", "--nologo"],
                           cwd=str(ROOT), capture_output=True, text=True, timeout=900)
     out = (proc.stdout or "") + (proc.stderr or "")
-    check("C5a C# 自检工程真的跑编译产物且 exit 0", proc.returncode == 0, out[-400:])
-    check("C5b 自检输出含「断言全部通过」", "断言全部通过" in out, out[-400:])
-    body = (ROOT / "mod" / "AgentFarm.Bridge" / "UseToolSkill.cs").read_text(encoding="utf-8")
-    check("C5c use_tool 回执带 actedEvidence", "actedEvidence" in body or "ActedEvidence" in body, "")
-    check("C5d use_tool 不许把 acted 简化成 err == null",
-          not re.search(r"bool\s+acted\s*=\s*err\s*==\s*null\s*;", body), "")
-    # 共享口径：interact 与 use_tool 走同一个证据方法
+    n_ok = len(re.findall(r"^\s*ok\s", out, re.M))
+    n_fail = len(re.findall(r"^FAIL\s", out, re.M))
+    check("C5a C# 自检工程真跑编译产物且 exit 0", proc.returncode == 0, out[-300:])
+    check("C5b 自检输出「断言全部通过」且 FAIL 行为 0", "断言全部通过" in out and n_fail == 0,
+          f"ok={n_ok} fail={n_fail}")
     skills = (ROOT / "mod" / "AgentFarm.Bridge" / "Skills.cs").read_text(encoding="utf-8")
-    check("C5e 跨观测证据提取成共享方法（interact/use_tool 同源）",
-          bool(re.search(r"(private|internal|static).*(Evidence|CrossObservation|WorldChange)", skills)), "")
+    rules = (ROOT / "mod" / "AgentFarm.Bridge" / "ClumpRules.cs").read_text(encoding="utf-8")
+    # —— 源②：Mod 契约（共享纯函数 + fail-closed 表达式）——
+    check("C5c 纯函数 `ClumpRules.ActedEvidence` 存在（五类证据按序判定）",
+          "static string ActedEvidence(" in rules and '"tile"' in rules
+          and '"readyCrops"' in rules and '"inventory"' in rules, "")
+    check("C5d `acted` 由证据派生（不是 err == null 的旧口径）",
+          "Acted(string evidence) => !string.IsNullOrEmpty(evidence)" in rules.replace("\n", " ")
+          or re.search(r"bool\s+Acted\(string\s+evidence\)\s*=>\s*!\s*string\.IsNullOrEmpty", rules) is not None,
+          "")
+    check("C5e `interact` 与 `use_tool` 走同一个 wrapper（逐字同源）",
+          skills.count("WithActedEvidence(") >= 2, f"出现 {skills.count('WithActedEvidence(')} 次")
+    check("C5f 证据不可得 ⇒ `acted=false`（fail-closed，不写死 true）",
+          not re.search(r"resp\.Acted\s*=\s*true", skills), "")
+    check("C5g 无证据时降级 `no_action`（Lead 已批准的 fail-closed）",
+          'no_action' in skills and "!resp.Acted.Value" in skills, "")
+    use_tool = (ROOT / "mod" / "AgentFarm.Bridge" / "UseToolSkill.cs").read_text(encoding="utf-8")
+    code_only = "\n".join(l for l in use_tool.splitlines() if not l.strip().startswith("//"))
+    check("C5h R4 渲染路径不再写死 `（空）`（只有注释里提到旧文案）",
+          "（空）" not in code_only and "{this.OriginalText()}" in code_only,
+          "代码行里仍出现 `（空）`")
+    # —— 源③：脑侧与世界证据（真机 farmwork 路径：Mod acted 只是线索）——
+    w = World(records=[crop()], inventory=[item("(O)388", 99)])
+    w.farm = farm()
+
+    class LyingActedBridge(TF.MiniBridge):
+        """Mod 回执说 acted=true/证据 tile，但世界**没动** ⇒ 脑侧必须 failed（回执不当判据）。
+
+        `harvestMethod="Grab"` 时脑侧走 `interact`，所以两个入口都要覆盖。
+        """
+
+        def interact(self, tile=None, *, timeout_ms=None):
+            return {"ok": True, "status": "ok", "acted": True, "actedEvidence": "tile"}
+
+        def use_tool(self, tile=None, *, tool=None, timeout_ms=None):
+            return {"ok": True, "status": "ok", "acted": True, "actedEvidence": "tile"}
+
+    st = mk(w, LyingActedBridge).harvest((60, 29))
+    check("C5i 回执 acted=true + 世界没动 ⇒ 脑侧 failed（三源里以世界证据为准）",
+          st.ok is False and st.code == "failed", f"ok={st.ok} code={st.code} reason={st.reason}")
+    w2 = World(records=[crop(crop="262", harvestMethod="Scythe")], inventory=[item("(O)388", 99)])
+    w2.farm = farm()
+
+    class SilentButRealBridge(TF.MiniBridge):
+        """Mod 回执 acted=false（老口径漏报），世界真的变了 ⇒ 脑侧仍须 ok（task-177 教训）。"""
+
+        def use_tool(self, tile=None, *, tool=None, timeout_ms=None):
+            for r in self.w.records:
+                r["crop"] = None
+            return {"ok": True, "status": "ok", "acted": False, "actedEvidence": None}
+
+    st2 = mk(w2, SilentButRealBridge).harvest((60, 29))
+    check("C5j 回执 acted=false 但世界真变 ⇒ 脑侧仍 ok（没把线索当判据）",
+          st2.ok is True, f"ok={st2.ok} code={st2.code} reason={st2.reason}")
 
 
 # ═══════════════════════════════ C6（GAP 类） ═══════════════════════════════
@@ -373,7 +448,12 @@ def main() -> int:
         if fn is None:
             print(f"  ?? 未知通道 {name}")
             continue
-        fn()
+        try:
+            fn()
+        except Exception as exc:                      # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            check(f"{name} 通道跑完不抛异常", False, f"{type(exc).__name__}: {exc}")
     print(f"\n== 汇总：PASS={PASS} FAIL={FAIL} SKIP={SKIPPED}；复现发现 {len(FINDINGS)} 条 ==")
     for f in FINDINGS:
         print(f"   - {f}")
