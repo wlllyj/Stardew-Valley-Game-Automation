@@ -4328,5 +4328,160 @@ class TestSlotReliefAndInventoryBlocked(unittest.TestCase):
         self.assertIn("event:inventory_blocked", blob)
 
 
+class TestToolUpgradeAccounting(unittest.TestCase):
+    """task-207（dev task-205 工具升级全链）：桶 / 可见性 / 可证伪 ⚠ /【无法判定】。
+
+    口径红线：`upgrade_tool` 是**动作、不是豁免** —— 判据只认观测差分（钱减少 + 工具被
+    `toolBeingUpgraded` 拿走 + 等级变化），回执只是声明；`tool_upgrade_skipped` 与
+    `tool_upgrade_blocked_work` 是**如实跳过**（钱/材料不够、等取回、背包满、在途期间工具不在
+    身上）⇒ 一律 info、绝不进 rc。唯一可证伪 ⚠ = 自报成功却 `toolBeingUpgraded` 没出现、
+    或钱差与货架价对不上（只警告）。缺事件 = 旧账本 ⇒【无法判定】（缺失 ≠ 0）。
+    """
+
+    UPGRADE_EVENTS = [
+        {"event": "upgrade_tool", "t": 100.0, "ok": True, "code": "ok",
+         "reason": "升级成功（观测差分：钱 −2000、工具被拿走）", "tool": "pickaxe",
+         "before": {"money": 4268, "tier": 0, "being": None, "days_left": 0,
+                    "trade_item": "(O)334", "trade_have": 5, "location": "Blacksmith"},
+         "after": {"money": 2268, "money_delta": -2000, "price": 2000,
+                   "money_delta_matches_price": True, "tier": 1, "being": "Copper Pickaxe",
+                   "days_left": 2, "trade_item": "(O)334", "trade_have": 0}},
+        {"event": "upgrade_tool", "t": 110.0, "ok": False, "code": "failed",
+         "reason": "回执 no_action（没点到 Upgrade 选项）", "tool": "axe",
+         "before": {"money": 2268, "tier": 0}, "after": {"money": 2268, "money_delta": 0}},
+        {"event": "pickup_tool", "t": 120.0, "ok": False, "code": "no_slot",
+         "reason": "背包满，取不回", "before": {"being": "Copper Pickaxe", "days_left": 0,
+                                              "tier": 0, "free_slots": 0},
+         "after": {"being": "Copper Pickaxe", "days_left": 0, "tier": 0}},
+        {"event": "tool_upgrade_skipped", "t": 130.0, "reason": "钱/材料不够", "money": 2268},
+        {"event": "tool_upgrade_skipped", "t": 131.0, "reason": "有工具在升级中，等取回",
+         "action": "wait", "being": "Copper Pickaxe", "days_left": 1, "free_slots": 8},
+        {"event": "tool_upgrade_blocked_work", "t": 140.0,
+         "stages": ["till_area", "clear_dead"], "being": "Copper Pickaxe",
+         "note": "工具在 Clint 那里升级，相关阶段暂停（不是失败，是工具不在身上）"},
+    ]
+
+    OK_WITHOUT_BEING = {
+        "event": "upgrade_tool", "t": 100.0, "ok": True, "code": "ok",
+        "reason": "升级成功（但观测里没有工具被拿走）", "tool": "hoe",
+        "before": {"money": 5000, "tier": 0},
+        "after": {"money": 3000, "money_delta": -2000, "price": 2000, "being": None},
+    }
+
+    MONEY_MISMATCH = {
+        "event": "upgrade_tool", "t": 100.0, "ok": True, "code": "ok",
+        "reason": "升级成功（钱差与货架价对不上）", "tool": "can",
+        "before": {"money": 5000, "tier": 0},
+        "after": {"money": 3500, "money_delta": -1500, "price": 2000, "being": "Copper Watering Can"},
+    }
+
+    def _day(self, day, *, extra=()):
+        nxt = [day[0], day[1], day[2] + 1]
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": True,
+                  "watered_outdoor": True}
+        end = {"event": "day_end", "t": 950.0, "day": day, "ended_by": "sleep",
+               "ended_reason": "night", "verified": True, "checks": checks,
+               "stages": [{"stage": "water_area", "ok": 9, "skipped": 0, "failed": 0,
+                           "env_block": 0, "inconclusive": 0, "stopped": None,
+                           "leftover": 0}],
+               "ok_steps": 9, "skipped_steps": 0, "failed_steps": 0, "notes": [],
+               "final": final(nxt),
+               "final_water": {"t": 949.0, "location": "Farm", "tiles": 84, "crops": 31,
+                               "dry": 0, "scope": "farm"}}
+        return [day_start(day), *extra, end]
+
+    def _report(self, events, name, *, days=1):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_ledger(tmp, name, events)
+            return report_for(path, days=days)
+
+    def test_events_have_buckets_and_are_not_unmapped(self):
+        checks = [("upgrade_tool", "tool_upgrades"), ("pickup_tool", "tool_pickups"),
+                  ("tool_upgrade_skipped", "tool_upgrade_skips"),
+                  ("tool_upgrade_blocked_work", "tool_upgrade_blocks")]
+        for ev_name, bucket in checks:
+            self.assertEqual(mod.EVENT_BUCKETS.get(ev_name), bucket, ev_name)
+            self.assertIn(bucket, mod.NEW_EVENT_BUCKETS, bucket)
+        rep = self._report(self._day([1, "fall", 9], extra=self.UPGRADE_EVENTS),
+                           "t207_buckets.jsonl")
+        self.assertEqual(sorted((rep.get("unmapped_events") or {}).keys()), [],
+                         "新事件必须全部有桶、不许静默丢弃")
+
+    def test_upgrade_info_is_visible_and_not_red(self):
+        rep = self._report(self._day([1, "fall", 9], extra=self.UPGRADE_EVENTS),
+                           "t207_info.jsonl")
+        tu = rep["tool_upgrade"]
+        self.assertTrue(tu["has_events"])
+        self.assertEqual(tu["upgrade_events"], 2)
+        self.assertEqual(tu["ok"], 1)
+        self.assertEqual(tu["failed"], 1)
+        self.assertEqual(tu["kinds"], {"pickaxe": 1, "axe": 1})
+        self.assertEqual(tu["tiers_before"], {"0": 2})
+        self.assertEqual(tu["tiers_after"], {"1": 1},
+                         "失败那行没读到 tier ⇒ 不编造（缺失 ≠ 0；只数真实出现的值）")
+        self.assertEqual(tu["prices"], {"2000": 1})
+        self.assertEqual(tu["pickup_events"], 1)
+        self.assertEqual(tu["pickup_failed"], 1)
+        self.assertEqual(len(tu["pickup_no_slot_lines"]), 1, "取回失败要留痕（不是硬失败）")
+        self.assertEqual(tu["skip_events"], 2)
+        self.assertEqual(tu["skip_actions"], {"wait": 1})
+        self.assertEqual(tu["blocked_events"], 1)
+        self.assertEqual(tu["blocked_stages"], {"till_area": 1, "clear_dead": 1})
+        self.assertEqual(tu["warn_ok_without_being_lines"], [])
+        self.assertEqual(tu["warn_money_mismatch_lines"], [])
+        self.assertEqual(rep["red"]["total"], 0, "升级/跳过/阻塞一律不进 rc")
+        self.assertEqual(rep["red"]["subjects"], [],
+                         "升级链任何形态都不该进红色 subject 清单")
+        text = mod.render_text(rep, 20)
+        self.assertIn("工具升级: 升级动作 2 次", text)
+        self.assertIn("如实跳过 2 次", text)
+        self.assertIn("在途阻塞留痕 1 次", text)
+        self.assertIn("不是豁免", text)
+        self.assertIn("先腾格", text, "取回 no_slot 要提示腾格，而不是判失败")
+
+    def test_ok_without_being_is_warning_not_red(self):
+        rep = self._report(self._day([1, "fall", 9], extra=[self.OK_WITHOUT_BEING]),
+                           "t207_warn_being.jsonl")
+        tu = rep["tool_upgrade"]
+        self.assertEqual(tu["ok"], 1)
+        self.assertGreaterEqual(len(tu["warn_ok_without_being_lines"]), 1)
+        self.assertEqual(rep["red"]["total"], 0, "⚠ 只警告、不进 rc")
+        text = mod.render_text(rep, 20)
+        self.assertIn("自报升级成功却没有", text)
+        adv = " ".join(a.get("text", "") for a in (rep.get("advice") or []))
+        self.assertIn("观测差分对不上", adv)
+
+    def test_money_mismatch_is_warning_not_red(self):
+        rep = self._report(self._day([1, "fall", 9], extra=[self.MONEY_MISMATCH]),
+                           "t207_warn_money.jsonl")
+        tu = rep["tool_upgrade"]
+        self.assertEqual(len(tu["warn_money_mismatch_lines"]), 1)
+        self.assertEqual(tu["money_deltas"], [-1500])
+        self.assertEqual(rep["red"]["total"], 0, "钱差对不上只警告、不进 rc（钱可能在别处变动）")
+        self.assertIn("钱差与货架价不一致", mod.render_text(rep, 20))
+
+    def test_blocked_then_verified_is_warning_not_red(self):
+        rep = self._report(self._day([1, "fall", 9], extra=[self.UPGRADE_EVENTS[-1]]),
+                           "t207_block_verified.jsonl")
+        tu = rep["tool_upgrade"]
+        self.assertEqual(tu["blocked_events"], 1)
+        self.assertGreaterEqual(len(tu["blocked_then_verified_lines"]), 1,
+                                "在途暂停却自称 VERIFIED ⇒ 互斥组合要可见")
+        self.assertEqual(rep["red"]["total"], 0, "互斥组合是 ⚠，不进 rc（判决权在 checks）")
+
+    def test_missing_events_is_undecidable_not_pass(self):
+        rep = self._report(self._day([1, "fall", 9]), "t207_missing.jsonl")
+        tu = rep["tool_upgrade"]
+        self.assertFalse(tu["has_events"] or tu["has_pickup"] or tu["has_skip"]
+                         or tu["has_blocked"])
+        text = mod.render_text(rep, 20)
+        self.assertIn("工具升级: <缺失>", text)
+        und = " ".join(rep.get("undecidable") or [])
+        self.assertIn("task-205 的工具升级事件", und)
+        self.assertIn("缺失 ≠ 0", und)
+        self.assertEqual(rep["red"]["total"], 0, "缺失只记【无法判定】，绝不因此判红/判通过")
+
+
 if __name__ == "__main__":
     unittest.main()

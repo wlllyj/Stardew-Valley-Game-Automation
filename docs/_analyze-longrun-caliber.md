@@ -1131,6 +1131,59 @@ python tools\analyze-longrun.py --journal logs\longrun-runA-0732.jsonl --days 6 
 python scratch\_t202_matrix.py    # 旧版 HEAD 导出 vs 新版：rc/红/#无法判定 并排
 ```
 
+## 3.32 工具升级全链（task-205，task-207 收录）—— **升级是动作、不是豁免**
+
+**背景**：task-205（dev `8ee33cb`）把「去铁匠铺升级/取回工具」做成完整链路（Mod 技能 + 脑侧策略：
+每天最多一次、紧急农活优先、在途期间暂停相关阶段），并新增 journal 事件。机械枚举实捕 **4 个**新名
+（与 Lead 转述一致，无额外名）；⚠ 注意：交付消息里列的 `tier_before`/`price`/`tool_being_upgraded`
+等**不是顶层键** —— brain 实际写的是观测快照 `before`/`after`（以 `brain/agentfarm/longrun.py` 为准）：
+
+| 事件 | brain 位置 | 字段 | 语义 |
+|---|---|---|---|
+| `upgrade_tool` | `longrun.py:4624` ⇒ `_journal("upgrade_tool", ok, code, reason, receipt, tool=kind, before, after)` | `before{money,tier,being,days_left,trade_item,trade_have,location}`、`after{money,money_delta,price,money_delta_matches_price,tier,being,days_left,…}` | **升级动作**（成功/失败） |
+| `pickup_tool` | `longrun.py:4614` | ok/code/reason/receipt、`before{being,days_left,tier,free_slots}`、`after{being,days_left,tier}` | 从 Clint 处**取回**升级好的工具 |
+| `tool_upgrade_skipped` | `longrun.py:4598`（无 plan）与 `:4606`（wait/need_slot） | ①`{reason,money}` ②`{reason,action=wait\|need_slot,being,days_left,free_slots}` | 当天**如实跳过**（每天只记一次） |
+| `tool_upgrade_blocked_work` | `longrun.py:4588` | stages（排序后的阶段名）/being/note | 在途升级期间被工具缺失/等级**阻塞的农活阶段**（每天只记一次） |
+
+**口径红线（三不许）**：
+1. `upgrade_tool` 是**动作**、不是失败**也不是豁免**：判据只认**观测差分**（钱减少 + `toolBeingUpgraded`
+   把工具拿走 + 次日等级变化），回执只是声明（task-3 镰刀空挥、v0.7.17 种子不扣都栽在"信回执"上）；
+2. `tool_upgrade_skipped` / `tool_upgrade_blocked_work` 是**如实跳过**：钱/材料不够、需要等取回、
+   背包满（`pickup_tool` 的 `no_slot`）、在途期间工具不在身上 —— 都**不进 `failed_steps`、不进 rc**；
+3. 不许把「跳过」写成「做完」：当天判定仍由 `checks` 说话（`watered_outdoor`/`no_unmet_stages`）。
+
+**本工具**：`EVENT_BUCKETS`/`NEW_EVENT_BUCKETS` +4；`FIELD_PROBES` +6（4 事件 + `upgrade_tool.tool`
++ `upgrade_tool.after.money_delta`；缺失 ⇒【无法判定】，缺失 ≠ 0）；`build_report` 新增 `tool_upgrade`
+聚合（升级成功/失败/工具分布/`tiers_before|after`/`prices`/`money_deltas`/`days_left`；取回成/败/
+`no_slot`；跳过原因/动作；在途阻塞阶段）；头部新增「工具升级:」行（旧账本 `<缺失>`）；建议 0s-7；
+`build_undecidable` 专行；`MAPPING_TEXT` +1 行；docstring +1 条。
+
+**唯一可证伪 ⚠（一律不进 rc）**：①自报 `ok=true` 却 `after.being` 为空（`toolBeingUpgraded` 没出现）
+⇒ 先核观测面、别信回执；②`after.money_delta` 与 `after.price` 对不上（扣了多少 ≠ 该扣多少；
+钱可能在别处变动）；③在途阻塞当天却自称 VERIFIED（互斥组合）；④取回 `no_slot` 点名（先腾格，
+不是硬失败）。`tools\verify-run3.py` 对这四个事件名**零命中**（实测 0 处）⇒ 本工具绝不判红
+（判红会两边反向）。
+
+**「#无法判定」并排（任务卡要求说明）**：6 本旧账本上 rc 与红数**一字未变**（runA 1/117、runB 1/84、
+run9 1/84、run9b 1/45、run9c 0/0、run9d 1/29），`#无法判定` 每本 **+7** —— 这 7 条 = 本卡新增的
+6 条探针 + 1 条专行，旧账本全无这些事件（实测 0 命中）⇒ 按「缺失 ⇒ 无法判定（缺失 ≠ 0）」如实报出；
+方向是**新增可见性**而非判据变化。
+
+**单测**：`tests/test_analyze_longrun.py::TestToolUpgradeAccounting` 6 条 —— 四事件有桶不落未映射 /
+升级+取回+跳过+阻塞全可见且 rc=0（含 `no_slot` 提示腾格）/ 自报成功却 `being` 为空 ⇒ ⚠ 不判红 /
+钱差与货架价不符 ⇒ ⚠ 不判红 / 在途阻塞却 VERIFIED ⇒ ⚠ 不判红 / 旧账本 `<缺失>` +【无法判定】。
+
+**读数**：`py_compile -W error::SyntaxWarning` RC=0；`tests.test_analyze_longrun` **231 OK**（+6）；
+全量 `discover -s tests` **Ran 1032 tests / OK（0 红）**（改动前 1026 里那 2 条漂移红已归零）。
+
+**grep 配方**：
+
+```
+git grep -n "_journal(\"upgrade_tool\|_journal(\"pickup_tool\|_journal(\"tool_upgrade" -- brain/agentfarm/longrun.py
+python tools\analyze-longrun.py --journal logs\longrun-runA-0732.jsonl --days 6 | rg "工具升级"
+python scratch\_t194_undec.py    # HEAD 导出 vs 新版：六账本 rc/红/#无法判定 并排
+```
+
 ## 4. 复核命令
 
 ```
@@ -1144,6 +1197,6 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run9d.jsonl --da
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
 python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
-python -m unittest tests.test_analyze_longrun  # 当前 225 OK（task-202 + 腾格回路/背包阻塞 6 条）
-python -m unittest discover -s tests           # 当前 Ran 992 tests / OK（0 红）
+python -m unittest tests.test_analyze_longrun  # 当前 231 OK（task-207 + 工具升级全链 6 条）
+python -m unittest discover -s tests           # 当前 Ran 1032 tests / OK（0 红）
 ```

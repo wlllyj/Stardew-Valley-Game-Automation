@@ -188,6 +188,11 @@
     多一条可证伪 ⚠：当天有 `scope_released` 而末态没跟着下降（毛−释放 ≠ 末态）⇒「末态与毛−释放对不上」，
     仍**不进 rc**；三个新字段缺失 ⇒【无法判定】（缺失 ≠ 0，旧账本据此不翻红）。旧账本缺
     这些事件 ⇒ `<缺失>` +【无法判定】（缺失 ≠ 0，绝不当『没认输过』或『都做完了』通过）。
+  * 工具升级全链（task-205，task-207 收录）：`upgrade_tool`/`pickup_tool`/`tool_upgrade_skipped`/
+    `tool_upgrade_blocked_work` —— **升级是动作、不是豁免**：判据只认观测差分（钱减少 + 工具被
+    `toolBeingUpgraded` 拿走 + 等级变化），回执只是声明；跳过（钱/材料不够、需要等取回、背包满）与
+    在途期间阶段暂停都是**如实跳过、不进 rc**；唯一可证伪 ⚠ = 自报成功却 `toolBeingUpgraded` 没出现
+    或钱差与货架价不符。旧账本没有这些事件 ⇒ `<缺失>` +【无法判定】（缺失 ≠ 0）。
   * 事件映射不许漂移（Lead m02395）：brain 里 `_journal("<name>"` 的**每个**事件名都要在
     `EVENT_BUCKETS` 里有桶（结构性事件 `day_start`/`day_end`/`finish` 除外，见 `STRUCTURAL_EVENTS`）；
     账本里出现没桶的事件 ⇒ 报告头部逐条点名（名字×次数+行号）+ 建议 0a，**绝不静默丢弃**。
@@ -674,6 +679,27 @@ FIELD_PROBES = [
      "不是失败、也不是豁免；唯一可证伪 ⚠ = 那天却自称 VERIFIED"),
     ("event:inventory_blocked.free_slots", "inventory_blocked_free_slots",
      "收尾时刻的背包空格数（task-198；与 `reserve` 一起看是否真到低水位；缺失 ⇒【无法判定】）"),
+    # task-207（dev task-205 `8ee33cb`，工具升级全链）：**升级是动作、不是豁免**；跳过/在途阻塞是
+    #   **如实跳过**（不进 rc）；唯一可证伪 ⚠ = 号称成功但钱没少 / `toolBeingUpgraded` 没出现
+    #   （判据只认观测差分，回执只是声明）。
+    ("event:upgrade_tool", "tool_upgrade",
+     "工具升级动作（task-205：ok/code/reason/tool/before{money,tier,being,days_left,trade_item,"
+     "trade_have}/after{money,money_delta,price,money_delta_matches_price,tier,being,days_left,"
+     "trade_item,trade_have}）⇒ **动作不是豁免**；唯一可证伪 ⚠ = 自报 ok 却钱没少或工具没被拿走"),
+    ("event:upgrade_tool.tool", "tool_upgrade_kind",
+     "升的是哪把工具（task-205：axe/pickaxe/hoe/can；缺失 ⇒【无法判定】升级对象）"),
+    ("event:upgrade_tool.after.money_delta", "tool_upgrade_money_delta",
+     "升级后观测到的钱差（task-205；与 `after.price` 对照 = 「扣了多少 / 该扣多少」；"
+     "缺失 ⇒【无法判定】是否真扣钱）"),
+    ("event:pickup_tool", "pickup_tool",
+     "从 Clint 处取回升级好的工具（task-205：ok/code/reason/before{being,days_left,tier,free_slots}/"
+     "after{being,days_left,tier}）⇒ 取回失败常见原因是背包满（`no_slot`），**不是硬失败**"),
+    ("event:tool_upgrade_skipped", "tool_upgrade_skipped",
+     "如实跳过升级（task-205：`{reason,money}` 或 `{reason,action=wait|need_slot,being,days_left,"
+     "free_slots}`；每天只记一次）⇒ **如实跳过，不进 rc**"),
+    ("event:tool_upgrade_blocked_work", "tool_upgrade_blocked_work",
+     "在途升级期间被工具缺失/等级阻塞的农活阶段（task-205：stages/being/note；每天只记一次）"
+     "⇒ **如实跳过，不是硬失败**；若同期自称 VERIFIED 才是互斥组合"),
 ]
 OUTCOME_RE = re.compile(
     r"目标\s*(\d+)\s*步：做成\s*(\d+)、跳过\s*(\d+)、失败\s*(\d+)"
@@ -932,6 +958,12 @@ EVENT_BUCKETS = {
     "ready_far_skipped": "ready_far_skips",
     "ready_far_truncated": "ready_far_truncateds",
     "ready_far_unavailable": "ready_far_unavailables",
+    # task-207（dev task-205 `8ee33cb`）：工具升级全链 —— 升级/取回/如实跳过/在途阻塞。
+    #   都是**动作或如实跳过**（不是失败、不是豁免、不进 rc）；唯一可证伪 ⚠ 在 render/advice 里。
+    "upgrade_tool": "tool_upgrades",
+    "pickup_tool": "tool_pickups",
+    "tool_upgrade_skipped": "tool_upgrade_skips",
+    "tool_upgrade_blocked_work": "tool_upgrade_blocks",
 }
 
 #: 结构性事件：由报告的其他字段单独统计（day_start/day_end 切会话与验收、finish 自述），
@@ -1009,6 +1041,8 @@ NEW_EVENT_BUCKETS = (
     # task-202 副产物：dev task-199 在制的窗口外熟作物 5 事件（未 commit，先入桶免得漂移红）
     "ready_fars", "ready_far_blocks", "ready_far_skips",
     "ready_far_truncateds", "ready_far_unavailables",
+    # task-207（dev task-205）：工具升级全链（升级/取回/如实跳过/在途阻塞；不判红、不进 rc）
+    "tool_upgrades", "tool_pickups", "tool_upgrade_skips", "tool_upgrade_blocks",
 )
 
 
@@ -3061,6 +3095,19 @@ def build_advice(report, top=8):
             "lines": ((sr0.get("zero_freed_lines") or [])[:3]
                       + (ib0.get("warn_verified_lines") or [])[:3]),
         })
+    # 0s-7（task-207，dev task-205）：工具升级全链 —— 动作/如实跳过，唯一可证伪形态给 ⚠（不进 rc）。
+    tu0 = report.get("tool_upgrade") or {}
+    if tu0.get("warn_ok_without_being_lines") or tu0.get("warn_money_mismatch_lines"):
+        advice.append({
+            "text": "工具升级号称成功但观测差分对不上（**只警告、不进 rc**）："
+                    + ("`toolBeingUpgraded` 没出现 ⇒ 先确认观测面（回执不是判据）；"
+                       if tu0.get("warn_ok_without_being_lines") else "")
+                    + ("钱差额与货架价不一致 ⇒ 核对「扣了多少 / 该扣多少」（可能是取回/退款/其它交易）；"
+                       if tu0.get("warn_money_mismatch_lines") else "")
+                    + "这条链要的是「钱减少 + 工具被拿走 + 等级变化」三者同时成立",
+            "lines": ((tu0.get("warn_ok_without_being_lines") or [])[:3]
+                      + (tu0.get("warn_money_mismatch_lines") or [])[:3]),
+        })
     # 0c) 环境挡路 / 没拿到结论（task-22 记账）
     env = report.get("env_inconclusive") or {}
     if env.get("env_fail_events"):
@@ -3356,6 +3403,15 @@ def build_undecidable(rows, sessions, prelude, report):
                    "`scope_released`/`scope_loaded`/`scope_saved`/`scope_save_failed`/"
                    "`scope_rejected`/`scope_harvest`/`scope_harvest_failed`）：无法判定当时是否出现过"
                    "「主动认输片区」—— **缺失 ≠ 0，绝不当『没认输过』或『都做完了』通过**")
+    # task-207（dev task-205）：工具升级全链是否落账 —— 缺失 ≠ 0（旧账本没有这些事件）。
+    _tu_ev = [ev for _ln, ev in rows
+              if ev.get("event") in ("upgrade_tool", "pickup_tool",
+                                     "tool_upgrade_skipped", "tool_upgrade_blocked_work")]
+    if rows and not _tu_ev:
+        out.append("本账本没有任何 task-205 的工具升级事件（`upgrade_tool`/`pickup_tool`/"
+                   "`tool_upgrade_skipped`/`tool_upgrade_blocked_work`）：无法判定当时是否试过"
+                   "「去铁匠铺升级/取回工具」，也分不清「没试」与「试了但没留痕」"
+                   "—— **缺失 ≠ 0，绝不当'没有未完成的升级'通过**")
     # task-111：复盘/教训库的证据是否存在（缺失 ⇒【无法判定】，绝不因此判通过、也不判红）
     _lr_ev = [ev for _ln, ev in rows
               if ev.get("event") in ("review_llm", "review_llm_failed", "lessons",
@@ -5065,6 +5121,99 @@ def build_report(rows, path, args, bad_lines):
         if _d.get("verified") is True:
             inventory_blocked["warn_verified_days"].append(_d.get("label"))
             inventory_blocked["warn_verified_lines"].append(_d.get("start_line"))
+    # task-207（dev task-205 `8ee33cb`）：工具升级全链。**升级是动作、不是豁免**；跳过/在途阻塞
+    #   是**如实跳过**（不进 rc）。判据只认观测差分：`after.money_delta` 与 `after.price` 对不上、
+    #   或自报 ok 却 `after.being` 仍为空 ⇒ 可证伪 ⚠（只警告，绝不判红 —— 钱/材料可能在别处变动）。
+    tool_upgrade = {
+        "upgrade_events": 0, "upgrade_lines": [], "ok": 0, "failed": 0,
+        "kinds": {}, "codes": {}, "tiers_before": {}, "tiers_after": {},
+        "prices": {}, "money_deltas": [], "days_left": [],
+        "warn_money_mismatch_lines": [], "warn_ok_without_being_lines": [],
+        "pickup_events": 0, "pickup_lines": [], "pickup_ok": 0, "pickup_failed": 0,
+        "pickup_codes": {}, "pickup_no_slot_lines": [],
+        "skip_events": 0, "skip_lines": [], "skip_reasons": {}, "skip_actions": {},
+        "blocked_events": 0, "blocked_lines": [], "blocked_stages": {},
+        "blocked_then_verified_lines": [],
+        "has_events": False, "has_pickup": False, "has_skip": False, "has_blocked": False,
+    }
+    for _ln, _ev in rows:
+        _name = _ev.get("event")
+        if _name == "upgrade_tool":
+            tool_upgrade["upgrade_events"] += 1
+            tool_upgrade["upgrade_lines"].append(_ln)
+            tool_upgrade["has_events"] = True
+            _ok = _ev.get("ok") is True
+            tool_upgrade["ok" if _ok else "failed"] += 1
+            _tool = str(_ev.get("tool") or "?")
+            tool_upgrade["kinds"][_tool] = tool_upgrade["kinds"].get(_tool, 0) + 1
+            _code = str(_ev.get("code") or "")
+            if _code:
+                tool_upgrade["codes"][_code] = tool_upgrade["codes"].get(_code, 0) + 1
+            _before = as_dict(_ev.get("before"))
+            _after = as_dict(_ev.get("after"))
+            _tb = _before.get("tier")
+            _ta = _after.get("tier")
+            if _tb is not None:
+                tool_upgrade["tiers_before"][str(_tb)] = \
+                    tool_upgrade["tiers_before"].get(str(_tb), 0) + 1
+            if _ta is not None:
+                tool_upgrade["tiers_after"][str(_ta)] = \
+                    tool_upgrade["tiers_after"].get(str(_ta), 0) + 1
+            _price = as_int(_after.get("price"), None)
+            if _price is not None:
+                tool_upgrade["prices"][str(_price)] = tool_upgrade["prices"].get(str(_price), 0) + 1
+            _delta = as_int(_after.get("money_delta"), None)
+            if _delta is not None:
+                tool_upgrade["money_deltas"].append(_delta)
+            _dl = as_int(_after.get("days_left"), None)
+            if _dl is not None:
+                tool_upgrade["days_left"].append(_dl)
+            # ⚠① 观测到的钱差与货架价对不上 —— 只警告，不判红
+            if (_ok and _delta is not None and _price is not None
+                    and _delta not in (-_price, _price)):
+                tool_upgrade["warn_money_mismatch_lines"].append(_ln)
+            # ⚠② 自报成功却没看到「工具被拿走」（after.being 空）—— 只警告
+            if _ok and not str(_after.get("being") or "").strip():
+                tool_upgrade["warn_ok_without_being_lines"].append(_ln)
+        elif _name == "pickup_tool":
+            tool_upgrade["pickup_events"] += 1
+            tool_upgrade["pickup_lines"].append(_ln)
+            tool_upgrade["has_pickup"] = True
+            if _ev.get("ok") is True:
+                tool_upgrade["pickup_ok"] += 1
+            else:
+                tool_upgrade["pickup_failed"] += 1
+            _code = str(_ev.get("code") or "")
+            if _code:
+                tool_upgrade["pickup_codes"][_code] = \
+                    tool_upgrade["pickup_codes"].get(_code, 0) + 1
+            if _code == "no_slot":
+                tool_upgrade["pickup_no_slot_lines"].append(_ln)
+        elif _name == "tool_upgrade_skipped":
+            tool_upgrade["skip_events"] += 1
+            tool_upgrade["skip_lines"].append(_ln)
+            tool_upgrade["has_skip"] = True
+            _r = str(_ev.get("reason") or "<missing>")
+            tool_upgrade["skip_reasons"][_r] = tool_upgrade["skip_reasons"].get(_r, 0) + 1
+            _a = str(_ev.get("action") or "")
+            if _a:
+                tool_upgrade["skip_actions"][_a] = tool_upgrade["skip_actions"].get(_a, 0) + 1
+        elif _name == "tool_upgrade_blocked_work":
+            tool_upgrade["blocked_events"] += 1
+            tool_upgrade["blocked_lines"].append(_ln)
+            tool_upgrade["has_blocked"] = True
+            for _st in as_list(_ev.get("stages")):
+                tool_upgrade["blocked_stages"][str(_st)] = \
+                    tool_upgrade["blocked_stages"].get(str(_st), 0) + 1
+    # ⚠③ 在途阻塞当天却自称 VERIFIED（互斥组合：阶段因工具不在身上被暂停，却说该做的都做了）
+    _tu_block_day_idx = set()
+    for _ln in tool_upgrade["blocked_lines"]:
+        _blab, _bdi = _lr_day_of(_ln)
+        _tu_block_day_idx.add(_bdi)
+    for _bdi in sorted(_tu_block_day_idx):
+        _bd = days[_bdi] if 0 <= _bdi < len(days) else {}
+        if _bd.get("verified") is True:
+            tool_upgrade["blocked_then_verified_lines"].append(_bd.get("start_line"))
     sleep_ok = sum(1 for _, ev in rows if ev.get("event") == "sleep" and ev.get("ok"))
     sleep_failed = sum(1 for _, ev in rows if ev.get("event") == "sleep" and not ev.get("ok"))
     blocked_by_action = {}
@@ -5153,6 +5302,7 @@ def build_report(rows, path, args, bad_lines):
         "harvest_gave_up": harvest_gave_up,
         "crop_ready": crop_ready,
         "scope_shed": scope_shed,
+        "tool_upgrade": tool_upgrade,
         "stamina_budget": stamina_budget,
         "tool_gate": tool_gate,
         # task-134 B：分配额口径（阶段没做完 / 日级 unmet / 诚实上限 deferred；均 info、不判红）
@@ -5650,6 +5800,14 @@ MAPPING_TEXT = [
      "`verified=true`）⇒ 核对「延后是否只在体力 ≤ water_reserve **且** 有浇水债时生效」"
      "（task-163 红线）；②同日有延后但 `stamina_budget` 没有浇水债（`live_crops<=0`/`dry<=0`）"
      "⇒ 延后可能变成免罚额度。旧账本/旧日缺字段 ⇒ `<缺失>` +【无法判定】（缺失 ≠ 0）"),
+    ("event:upgrade_tool / pickup_tool / tool_upgrade_skipped / tool_upgrade_blocked_work (task-205/task-207)",
+     "工具升级全链：**升级是动作、不是豁免** —— brain 每天最多一次铁匠铺动作（升级或取回），"
+     "判据只认观测差分（钱减少 + 工具被 `toolBeingUpgraded` 拿走 + 次日等级变化），回执只是声明；"
+     "`tool_upgrade_skipped`（钱/材料不够、需要等取回、背包满）与 `tool_upgrade_blocked_work`"
+     "（在途期间相关阶段因工具不在身上暂停）都是**如实跳过** ⇒ 一律 info、不进 rc。"
+     "唯一可证伪 ⚠ =『自报升级成功但 `toolBeingUpgraded` 没出现 / 钱差与货架价对不上』"
+     "（取回因 `no_slot` 失败不是硬失败，先腾格）；旧账本缺事件 ⇒ `<缺失>` +【无法判定】"
+     "（缺失 ≠ 0，绝不当『没有未完成的升级』通过）"),
     ("event:scope_shed / scope_shed_refused / scope_released / scope_loaded / scope_saved / scope_save_failed / scope_rejected / scope_harvest / scope_harvest_failed + day_end.scope_shed (task-168/task-187)",
      "规模取舍：**策略性认输、不是豁免额度** —— brain 把认输区从目标池/守卫理由扣掉，"
      "但 `_leftover` 一字不改 ⇒ 认输格仍留在会计里、当天如实不 VERIFIED；"
@@ -6134,6 +6292,39 @@ def render_text(report, top):
                if ss.get("save_failed_lines") else "")
             + (f"  ⚠ 认输记录整份被拒收：行 {ss.get('rejected_lines', [])[:6]}"
                if ss.get("rejected_lines") else ""))
+    # task-207（dev task-205）：工具升级全链 —— 升级是**动作**（不是豁免）；跳过/在途阻塞是
+    # **如实跳过**、不进 rc。判据只认观测差分（钱减少 + 工具被拿走 + 等级变化），回执只是声明。
+    tu = report.get("tool_upgrade") or {}
+    if not (tu.get("has_events") or tu.get("has_pickup")
+            or tu.get("has_skip") or tu.get("has_blocked")):
+        add("工具升级: <缺失>（本账本没有任何 task-205 的 `upgrade_tool`/`pickup_tool`/"
+            "`tool_upgrade_skipped`/`tool_upgrade_blocked_work` 事件 ⇒ 无法判定当时是否试过"
+            "「去铁匠铺升级/取回工具」—— 缺失 ≠ 0、更绝不因此判通过）")
+    else:
+        _tu_k = "、".join(f"{k}×{v}" for k, v in
+                         list((tu.get("kinds") or {}).items())[:4]) or "<无>"
+        _tu_sk = "、".join(f"{k}×{v}" for k, v in
+                          list((tu.get("skip_reasons") or {}).items())[:3]) or "<无>"
+        _tu_st = "、".join(f"{k}×{v}" for k, v in
+                          list((tu.get("blocked_stages") or {}).items())[:4]) or "<无>"
+        add(f"工具升级: 升级动作 {tu.get('upgrade_events')} 次（成功 {tu.get('ok')} / 失败 "
+            f"{tu.get('failed')}；工具 {_tu_k}）；取回 {tu.get('pickup_events')} 次"
+            f"（成功 {tu.get('pickup_ok')} / 失败 {tu.get('pickup_failed')}）；"
+            f"如实跳过 {tu.get('skip_events')} 次（{_tu_sk}）；在途阻塞留痕 "
+            f"{tu.get('blocked_events')} 次（暂停阶段 {_tu_st}）"
+            + (f"  ⚠ 自报升级成功却没有「工具被拿走」：行 "
+               f"{tu.get('warn_ok_without_being_lines')[:6]}（`toolBeingUpgraded` 观测缺失 ⇒ "
+               "先核观测面，别只信回执）"
+               if tu.get("warn_ok_without_being_lines") else "")
+            + (f"  ⚠ 钱差与货架价不一致：行 {tu.get('warn_money_mismatch_lines')[:6]}"
+               "（核对「扣了多少 / 该扣多少」，可能是取回/退款/其它交易；⚠ info，不进 rc）"
+               if tu.get("warn_money_mismatch_lines") else "")
+            + (f"  ⚠ 取回因背包满失败：行 {tu.get('pickup_no_slot_lines')[:4]}"
+               "（先腾格；不是硬失败）" if tu.get("pickup_no_slot_lines") else "")
+            + (f"  ⚠ 在途阻塞当天却自称 VERIFIED：行 "
+               f"{tu.get('blocked_then_verified_lines')[:4]}（互斥组合，人工核对）"
+               if tu.get("blocked_then_verified_lines") else "")
+            + "；口径：`upgrade_tool` 是**动作不是豁免**，跳过/阻塞一律 info、不进 rc")
     # task-157：够不着 ⇒ 有界开路（`water_far_open`）后重试同一格；开路后仍站不到 ⇒ `water_far_blocked`。
     # 两者都**不是失败**：开路成功也**不等于**浇上水；当天达不达标由 `checks.watered_outdoor` 说话。
     if wf.get("has_open_events"):
