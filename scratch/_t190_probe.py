@@ -180,8 +180,13 @@ def case_f3() -> None:
             "(O)128" in worker.harvested,
             f"harvested={worker.harvested} affected={(st.after or {}).get('affected_tiles')} "
             f"loot={(st.after or {}).get('loot')}")
-    check("C2a 无关 qid 不进白名单（卡面字面：qid ⊆ affected_tiles 的 gained）",
-          "(O)128" not in worker.harvested, f"harvested={worker.harvested}")
+    # 【Lead m07735 裁定】C2-a = **NIT（非阻塞 0.7.36）**：原洞（只凭背包差分也进白名单）已堵住，
+    # 剩下的是"归因不彻底"；收紧另立 **task-193（0.7.37）**：按本格作物产物 id 归因，取不到 ⇒
+    # `whitelist_source="unavailable"` 且本批不进白名单。正式报告按 NIT 写、**不改卡面措辞**。
+    print(f"   NIT  C2-a 已裁定非阻塞（task-193/0.7.37 收紧）：harvested={worker.harvested}")
+    check("C2a 已实现的不变式（非阻塞）：白名单 ⊆ 动作前后背包差分",
+          set(worker.harvested) <= set((st.after or {}).get("loot") or {}),
+          f"harvested={worker.harvested} loot={(st.after or {}).get('loot')}")
     check("C2a2 已实现的不变式：白名单 ⊆ 动作前后背包差分",
           set(worker.harvested) <= set((st.after or {}).get("loot") or {}),
           f"harvested={worker.harvested} loot={(st.after or {}).get('loot')}")
