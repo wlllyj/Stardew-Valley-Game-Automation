@@ -49,7 +49,8 @@ from agentfarm.planner import (DECISION_LINE_MAX_CHARS, DECISIONS_KEPT, LESSONS_
                                REVIEW_MAX_TOKENS, REVIEW_RETRY_MAX_TOKENS,
                                BoundaryPlanner, Brief,
                                TaskIntent, deterministic_plan, find_coordinate_like,
-                               make_lesson, render_lessons, save_lessons_file)  # noqa: E402
+                               load_scope_file, make_lesson, render_lessons, save_scope_file,
+                               save_lessons_file)  # noqa: E402
 
 #: 【task-59】收工复盘与边界决策**共用同一个 LLM seam**，靠 system 提示词里的固定短语分辨
 #: （复盘提示词是 `REVIEW_SYSTEM_PROMPT`，开头写着"收工复盘助手"）。
@@ -9068,6 +9069,234 @@ class TestTask182ClumpRulesBehaviour(unittest.TestCase):
                          f"ClumpRules 行为自检未通过：\n{proc.stdout}\n{proc.stderr}")
         self.assertIn("行为断言", proc.stdout)
         self.assertIn("OK", proc.stdout)
+
+
+class TestTask168ScopeShed(unittest.TestCase):
+    """【task-168】规模取舍（`reduce_scope`）：把"一天浇不完"如实变成"主动放弃一个田区"。
+
+    病灶（run A，0.7.32）：活苗 140+ × 每格浇水 2.0 > 满体力 270 ⇒ 现有面积**物理上**一天
+    浇不完；task-158 的体力预算只延后"新开垦/新播种"，**不缩小已有工作量** ⇒ 只要不下雨
+    `watered_outdoor` 必挂。本卡让策略可以**认输一个田区**。
+
+    纪律（卡面第 3 条 + 对抗验收三条通道）：
+      * 认输格**留在会计里**：`_leftover` 一个字不改 ⇒ 当天 `no_unmet_stages=false`、不 VERIFIED；
+      * 认输**不是免罚额度**：一天 ≤1 区、整 run 累计 ≤ 农场可作业格 34%（**跨重启仍然成立**）；
+      * farm 证据不可用（`basis=conservative`）⇒ **绝不认输**（不许拿"不知道"当免罚）；
+      * `checks` **不新增任何键**（`scope_shed`/`scope_shed_tiles` 只作 info）。
+
+    变异实测（`scratch/_t168_mutate.py`，brain+tests 一起拷临时目录，跑完已删；基线 10/10 绿）：
+      * m168a（`_shed_tile_set` 返回空集 = 认输格被当成普通格）杀 1：
+        `test_shed_tiles_leave_targets_and_pending_but_stay_in_leftover`；
+      * m168b（`_leftover` 也剔认输格 = 洗白通道）杀 1：同上；
+      * m168c（`deficit is None` 也允许认输）杀 1：
+        `test_shed_refuses_without_farm_evidence_or_deficit`；
+      * m168d（`_pending_work` 不剔认输格）杀 1：同 m168a 那条；
+      * m168e（载入不灌格清单 = F-X1 回归）杀 1：
+        `test_scope_load_hydrates_tiles_so_the_cap_survives_restart`。
+    """
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list:
+        return [e for e in run.entries if e["event"] == name]
+
+    @staticmethod
+    def _plot(tiles=None) -> dict:
+        tiles = list(tiles or [(60, 10)])
+        return {"zone": "", "label": "", "anchor": list(tiles[0]), "tiles": tiles, "note": ""}
+
+    @staticmethod
+    def _rep() -> DayReport:
+        return DayReport(day_key=("spring", 1, 9), started_at=0.0)
+
+    @staticmethod
+    def _world(*, crops: int = 150, dry: int = 150, watered: bool = False) -> FakeWorld:
+        """超载农场：farm 口径 `crops=150 / dryCrops=150`（`capacity=129` ⇒ `deficit=21`）。
+
+        窗口里放 20 格未浇活苗（观测可见、会被切成 4 个田区）——这正是"浇不完"的形态。
+        """
+        w = FakeWorld(weeds=0, seeds=0, money=0, stamina=270.0)
+        grid = [(60 + i % 5, 10 + i // 5) for i in range(20)]
+        w.dirt = set(grid)
+        w.crops = {t: {"ripe": False, "watered": watered} for t in grid}
+        w.farm = {"loaded": True, "complete": True, "crops": crops, "dryCrops": dry,
+                  "ripeCrops": 0, "deadCrops": 0, "dryDeadCrops": 0, "dryTiles": [],
+                  "dryTilesTruncated": False, "unwateredCrops": dry,
+                  "hoeDirt": 200, "emptyDirt": 0}
+        return w
+
+    def _run_with(self, w: FakeWorld, *, journal_path: str | None = None) -> LongRun:
+        client = _CountingClient(w)
+        worker = FakeWorker(w, log=lambda *_: None)
+        run = make_run(w, target_days=1, max_days=1, journal_path=journal_path,
+                       client_factory=lambda: client, worker_factory=lambda c: worker)
+        run.worker = worker
+        run.client = client
+        run.plot_size = 5
+        return run
+
+    # ---- ① 简报/确定性策略：缺口可见、只在"浇不完 + ≥2 个田区"时提议 ----
+    def test_plan_proposes_reduce_scope_only_with_deficit_and_two_zones(self):
+        w = self._world()
+        run = self._run_with(w)
+        brief = run._plot_brief(w.obs(), self._plot([(60, 10)]))
+        self.assertEqual((brief.live_crops, brief.water_capacity, brief.water_deficit),
+                         (150, 129, 21))
+        self.assertGreaterEqual(len(brief.area_facts), 2)
+        plan = deterministic_plan(brief)
+        self.assertIn("reduce_scope", [i.task for i in plan])
+        hint = [i.area_hint for i in plan if i.task == "reduce_scope"][0]
+        self.assertIn(hint, [f[0] for f in brief.area_facts])
+        # 浇得完的一天：不提议认输（deficit == 0）
+        w2 = self._world(crops=100, dry=100)
+        run2 = self._run_with(w2)
+        brief2 = run2._plot_brief(w2.obs(), self._plot([(60, 10)]))
+        self.assertEqual(brief2.water_deficit, 0)
+        self.assertNotIn("reduce_scope", [i.task for i in deterministic_plan(brief2)])
+
+    def test_missing_farm_evidence_means_unknown_not_zero(self):
+        w = self._world()
+        w.farm = {}
+        run = self._run_with(w)
+        brief = run._plot_brief(w.obs(), self._plot([(60, 10)]))
+        self.assertIsNone(brief.live_crops)
+        self.assertIsNone(brief.water_capacity)
+        self.assertIsNone(brief.water_deficit)
+        self.assertNotIn("reduce_scope", [i.task for i in deterministic_plan(brief)])
+
+    # ---- ② 持久层：往返 + 伪造 + **跨重启上界**（F-X1） ----
+    def test_scope_file_round_trips_zone_and_tile_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run-scope.json"
+            zones = {"field_se": {"since_day": [1, "spring", 9], "tiles": 2,
+                                  "live_crops_at_shed": 1, "reason": "浇不完",
+                                  "tile_list": [(60, 10), (61, 10)]}}
+            self.assertEqual(save_scope_file(path, zones), "")
+            report: dict = {}
+            got = load_scope_file(path, report=report)
+            self.assertEqual(report.get("reason"), "")
+            self.assertEqual(set(got), {"field_se"})
+            self.assertEqual(got["field_se"]["tiles"], 2)
+            self.assertEqual(set(got["field_se"]["tile_list"]), {(60, 10), (61, 10)})
+
+    def test_scope_load_rejects_a_forged_tile_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run-scope.json"
+            path.write_text(json.dumps({
+                "schema": "agentfarm-scope/1", "journal": "run",
+                "zones": {"field_se": {"since_day": [1, "spring", 9], "tiles": 2,
+                                       "live_crops_at_shed": 1, "reason": "x",
+                                       "tile_list": [[60, 10], "bad"]}}}), encoding="utf-8")
+            report: dict = {}
+            self.assertEqual(load_scope_file(path, report=report), {})
+            self.assertEqual(report.get("reason"), "bad_tile_pair")
+
+    def test_scope_load_hydrates_tiles_so_the_cap_survives_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self._run_with(self._world(), journal_path=str(Path(tmp) / "run.jsonl"))
+            self.assertIsNotNone(run.scope_path)
+            first = sorted(run._farm_workable_tiles(self._world().obs()))[:6]  # 20 格 ⇒ cap=6
+            self.assertTrue(first)
+            self.assertEqual(save_scope_file(run.scope_path,
+                                             {"field_se": {"since_day": [1, "spring", 8],
+                                                           "tiles": len(first),
+                                                           "live_crops_at_shed": len(first),
+                                                           "reason": "昨天浇不完",
+                                                           "tile_list": first}}), "")
+            run._scope_load()
+            # F-X1：格清单必须**灌回来**，否则重启后 already=0、34% 上界形同不存在
+            self.assertEqual(run.shed_zone_tiles["field_se"], set(first))
+            loaded = self._events(run, "scope_loaded")
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0]["tiles_total"], len(first))
+            # 载入的 6 格已经等于上界 ⇒ 再认输必然越界（跨重启仍然有界）
+            w = self._world()
+            self.assertFalse(run._shed_scope("field_se", w.obs(), self._rep()))
+            refused = [e for e in self._events(run, "scope_shed_refused") if e.get("reason") == "cap"]
+            self.assertEqual(len(refused), 1)
+            self.assertEqual(refused[0]["shed_tiles"], len(first))
+
+    # ---- ③ 认输的门槛：证据不可用/浇得完/一天一次 ----
+    def test_shed_refuses_without_farm_evidence_or_deficit(self):
+        w = self._world()
+        w.farm = {}
+        run = self._run_with(w)
+        zone = run._zones(w.obs())[0].name
+        self.assertFalse(run._shed_scope(zone, w.obs(), self._rep()))
+        self.assertEqual([e["reason"] for e in self._events(run, "scope_shed_refused")],
+                         ["no_farm_evidence"])
+        w2 = self._world(crops=100, dry=100)
+        run2 = self._run_with(w2)
+        zone2 = run2._zones(w2.obs())[0].name
+        self.assertFalse(run2._shed_scope(zone2, w2.obs(), self._rep()))
+        self.assertEqual([e["reason"] for e in self._events(run2, "scope_shed_refused")],
+                         ["no_deficit"])
+
+    def test_shed_records_zone_tiles_and_is_bounded_per_day(self):
+        w = self._world()
+        run = self._run_with(w)
+        obs = w.obs()
+        rep = self._rep()
+        zone = run._zones(obs)[0].name
+        self.assertTrue(run._shed_scope(zone, obs, rep))
+        self.assertEqual(rep.scope_shed.get("zone"), zone)
+        self.assertEqual(rep.scope_shed.get("tiles"), len(run.shed_zone_tiles[zone]))
+        self.assertEqual(rep.scope_shed_tiles, rep.scope_shed.get("tiles"))
+        self.assertTrue(str(rep.scope_shed.get("reason") or ""))
+        shed_ev = self._events(run, "scope_shed")
+        self.assertEqual(len(shed_ev), 1)
+        self.assertEqual(shed_ev[0]["zone"], zone)
+        self.assertTrue(str(shed_ev[0]["reason"]))
+        # 一天至多一个区（有界第一条）
+        self.assertFalse(run._shed_scope(zone, obs, self._rep()))
+        self.assertIn("already_today",
+                      [e["reason"] for e in self._events(run, "scope_shed_refused")])
+
+    # ---- ④ 认输格：从目标池/守卫理由里剔除，但**留在会计里** ----
+    def test_shed_tiles_leave_targets_and_pending_but_stay_in_leftover(self):
+        w = self._world()
+        run = self._run_with(w)
+        obs = w.obs()
+        plot = self._plot(sorted(w.dirt))
+        before = set(run._stage_tiles("water_area", obs, plot))
+        zone = run._zones(obs)[0].name
+        self.assertTrue(run._shed_scope(zone, obs, self._rep()))
+        shed = set(run.shed_zone_tiles[zone])
+        self.assertTrue(shed & before)
+        self.assertFalse(set(run._stage_tiles("water_area", obs, plot)) & shed)
+        run.leftover_targets = set(shed)
+        self.assertEqual(run._pending_work(), [])
+        # 认输 ≠ 干完：`_leftover` 一个字不改 ⇒ 仍算未完成（防"用认输洗白"）
+        leftover = {tuple(t) for t in run._leftover("water_area", obs, plot)}
+        self.assertTrue(leftover & shed)
+        run.shed_zone_tiles = {}          # 不认输时它们仍是"还有活"
+        self.assertTrue(run._pending_work())
+
+    def test_shed_adds_no_check_and_keeps_the_day_honest(self):
+        w = self._world()
+        run = self._run_with(w)
+        obs = w.obs()
+        rep = self._rep()
+        zone = run._zones(obs)[0].name
+        self.assertTrue(run._shed_scope(zone, obs, rep))
+        self.assertNotIn("scope_shed", rep.checks)
+        self.assertNotIn("scope_shed_tiles", rep.checks)
+        self.assertNotIn("scope_shed", JUSTIFIED_END_REASONS)
+        self.assertTrue(run._leftover("water_area", obs, self._plot(sorted(w.dirt))))
+
+    def test_scope_is_released_once_the_zone_converges(self):
+        w = self._world(watered=True)     # 该区活苗都浇完了 ⇒ 认输到期
+        run = self._run_with(w)
+        obs = w.obs()
+        zone = run._zones(obs)[0].name
+        tiles = sorted(run._zone_observed_tiles(zone, obs))
+        self.assertTrue(tiles)
+        run.shed_zones = {zone: {"since_day": [1, "spring", 8], "tiles": len(tiles),
+                                 "live_crops_at_shed": len(tiles), "reason": "昨天浇不完"}}
+        run.shed_zone_tiles = {zone: set(tiles)}
+        run._release_scope_if_converged(obs, self._rep())
+        self.assertEqual(run.shed_zones, {})
+        self.assertEqual(run.shed_zone_tiles, {})
+        self.assertEqual(len(self._events(run, "scope_released")), 1)
 
 
 if __name__ == "__main__":  # pragma: no cover

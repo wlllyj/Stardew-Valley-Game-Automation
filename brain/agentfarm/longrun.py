@@ -50,8 +50,8 @@ from .farmwork import (CLUMP_KINDS, ENV_BLOCK_STATUSES, FRONTIER_KINDS, PATH_STA
                        surplus_sell_plan, tile_ready, till_blocked_by)
 from .planner import (DECISIONS_KEPT, LESSONS_INJECT_CHARS, LESSONS_INJECT_MAX, BoundaryPlanner, Brief,
                       PlannerState, TaskIntent, TaskOutcome, decision_line, deterministic_plan,
-                      load_lessons_file, make_lesson, prune_lessons, render_lessons,
-                      render_review_facts, save_lessons_file)
+                      load_lessons_file, load_scope_file, make_lesson, prune_lessons, render_lessons,
+                      render_review_facts, save_lessons_file, save_scope_file)
 
 try:  # 田区规划是**可选**依赖：拿不到就退回"玩家周围窗口"，不让长跑起不来
     from . import fields as fields_mod
@@ -315,6 +315,13 @@ def is_env_blocked(step: StepResult) -> bool:
 #: 体力 144.7/270 就 `no_plot` 回家睡，`work_reasons` 还在喊"还有地要清/开/种"）。
 #: `no_plot` 只允许作为"没睡成的说明"，不许据此判 `verified`（用户 m02532/m00707）。
 JUSTIFIED_END_REASONS = ("night", "stamina", "no_work")
+#: 【task-168】规模取舍（`reduce_scope`）的两个上界 —— **认输不是免罚额度**：
+#: * `SCOPE_SHED_MAX_PER_DAY`：一天最多认输 1 个田区（策略性取舍，不是"每天挑一片放弃"）；
+#: * `SCOPE_SHED_MAX_FRACTION`：整个 run 累计认输的格数 ≤ 农场可作业格的 34%
+#:   （农场 245 格量级 ⇒ ≈83 格）。超过就记 `scope_shed_refused` 并**如实不认输**
+#:   （宁可累垮，也不许用"认输"把规模问题永久洗成达标）。
+SCOPE_SHED_MAX_PER_DAY = 1
+SCOPE_SHED_MAX_FRACTION = 0.34
 
 
 def is_justified_end(ended_by: str, ended_reason: str) -> bool:
@@ -491,6 +498,12 @@ class DayReport:
     #: `actions == 0` ⇒ `null`）。**只用于事后标定 `farmwork.py` 的估算常量**，不进 `checks`、
     #: 不改任何判据；观测缺 `stamina` 的条目不参与求和（`stamina_spent` 为 `null`）。
     stamina_calibration: dict[str, Any] = field(default_factory=dict)
+    #: 【task-168】当天**主动认输**的田区（`scope_shed` journal 的同名快照）：
+    #: `{zone: {"since_day","tiles","live_crops_at_shed","reason"}}`；`scope_shed_tiles` 是当天
+    #: 认输的格数合计。**只作 info**：不新增 `checks` 键、不扣 `plot_pending`/`assigned_undone`
+    #: （认输格仍算未完成 ⇒ 当天如实不 VERIFIED）。
+    scope_shed: dict[str, Any] = field(default_factory=dict)
+    scope_shed_tiles: int = 0
 
     @property
     def failed_steps(self) -> int:
@@ -568,6 +581,9 @@ class DayReport:
             "plot_pending": self.plot_pending,
             "plot_pending_by_kind": dict(self.plot_pending_by_kind),
             "deferred_tiles": self.deferred_tiles,
+            # 【task-168】主动认输的片区（只 info：不进 checks、不扣 plot_pending/assigned_undone）
+            "scope_shed": dict(self.scope_shed),
+            "scope_shed_tiles": self.scope_shed_tiles,
             "stamina_budget": dict(self.stamina_budget),
             "stamina_calibration": {k: dict(v) for k, v in self.stamina_calibration.items()},
         }
@@ -730,6 +746,17 @@ class LongRun:
         self.budget_deferred_tiles: dict[str, list[tuple[int, int]]] = {}
         #: 【task-163 NIT-2】容量上限已留痕的任务（一天每类只发一条 `stage_capped_by_capacity`）。
         self.capacity_capped_noted: set[str] = set()
+        # ---- 【task-168】规模取舍（认输片区）----
+        #: 跨日**粘住**的认输记录 `{zone: {"since_day","tiles","live_crops_at_shed","reason"}}`。
+        #: 读自 `<journal>-scope.json`、写回同一份；同 run 内粘住，换 run 不继承（与教训库同纪律）。
+        self.shed_zones: dict[str, dict[str, Any]] = {}
+        #: 认输区里"放弃时点"的格坐标 → 目标池/守卫按它剔除（不靠重算窗口，防窗口漂移）。
+        self.shed_zone_tiles: dict[str, set[tuple[int, int]]] = {}
+        self.scope_loaded = False
+        #: 当天是否已认输过一个区 / 当天认输的格数 / 当天是否已因超上界被拒（journal 去重）。
+        self.scope_shed_today = False
+        self.scope_shed_tiles_today = 0
+        self.scope_cap_refused_today = False
         self.refills_today = 0
         self.idle_rounds = 0
         self.fail_streak = 0
@@ -782,6 +809,9 @@ class LongRun:
         # 内容诚实边界：客观字段由代码从当天账本搬，`hint` 只允许来自收工复盘的笔记；
         # 只喂提示词，绝不参与 `verified`/`ended_by`/`checks`（与 task-58/59 同级）。
         self.lessons_path = self._derive_lessons_path(self.journal_path)
+        # 【task-168】规模取舍的跨日记录：同样从 `--journal` **自动推导**
+        # （`X.jsonl` ⇒ `X-scope.json`），不加命令行开关（run A/B 只许 journal 路径不同）。
+        self.scope_path = self._derive_scope_path(self.journal_path)
         self.lessons: list[dict[str, Any]] = []
         self.lessons_loaded = False
         # 今晚复盘产出的笔记 ⇒ 挂到今天新增的教训上当 `hint`（hint 只许 LLM 写）。
@@ -953,13 +983,301 @@ class LongRun:
         stem = journal_path.name[: -len(journal_path.suffix)] if journal_path.suffix else journal_path.name
         return journal_path.with_name(f"{stem}-lessons.json")
 
+    @staticmethod
+    def _derive_scope_path(journal_path: Path | None) -> Path | None:
+        """【task-168】`logs/run9.jsonl` ⇒ `logs/run9-scope.json`（认输记录放日记旁边）。
+
+        与教训库同纪律：只靠 journal 路径推导、不加开关；`journal=None` ⇒ 只在内存里
+        （一次性 `agentfarm plan` 不需要跨日记忆）。
+        """
+        if journal_path is None:
+            return None
+        stem = journal_path.name[: -len(journal_path.suffix)] if journal_path.suffix else journal_path.name
+        return journal_path.with_name(f"{stem}-scope.json")
+
     def _elapsed_minutes(self) -> float:
         return (self.now() - self.started) / 60.0
-
     def _budget_exhausted(self) -> bool:
         if self.max_minutes > 0 and self._elapsed_minutes() >= self.max_minutes:
             return True
         return self.max_steps > 0 and self._actions >= self.max_steps
+
+    # ---- 【task-168】规模取舍：认输片区的粘性记录 / 池子剔除 ----
+    def _scope_load(self) -> None:
+        """懒加载跨日认输记录（一次）。读不了/被外部改过 ⇒ 记一笔并当作"没认输过"。
+
+        信任边界同教训库：文件里只有田区名/格数/原因，**绝不让它决定判定**；本方法只负责
+        "今天还记得昨天放弃了哪片"。整份不合 schema ⇒ `load_scope_file` 返回 `{}`。
+        """
+        if self.scope_loaded:
+            return
+        self.scope_loaded = True
+        if self.scope_path is None:
+            return
+        report: dict[str, Any] = {}
+        zones = load_scope_file(self.scope_path, report=report)
+        self.shed_zones = dict(zones)
+        for name, item in self.shed_zones.items():
+            # 【task-168 F-X1】格清单必须**灌回来**：`shed_zone_tiles` 是当天目标池/守卫理由
+            # 与累计上界的共同依据。旧写法只 `setdefault(name, set())` ⇒ 重启后每区都是空集，
+            # "整 run 累计 ≤ 农场可作业格 34%"立刻归零（deputy 实测：文件自述 50、载入后 0）。
+            loaded = {tuple(t) for t in (item.get("tile_list") or ()) if len(tuple(t)) == 2}
+            self.shed_zone_tiles[name] = loaded
+        reason = str(report.get("reason") or "")
+        if reason:
+            self._journal("scope_rejected", path=str(self.scope_path), reason=reason,
+                          note="认输记录整份不可信 ⇒ 本次当作没认输过（可能今天重新评估并如实留痕）")
+        loaded_total = sum(len(v) for v in self.shed_zone_tiles.values())
+        self._journal("scope_loaded", path=str(self.scope_path), zones=sorted(self.shed_zones),
+                      tiles_total=loaded_total,
+                      tile_counts={k: len(v) for k, v in sorted(self.shed_zone_tiles.items())},
+                      note="跨日粘住的认输片区（只影响目标池/守卫理由，不影响任何 checks）；"
+                           "tiles_total 是对账用的载入格数")
+
+    def _scope_flush(self, rep: DayReport) -> None:
+        """把当前认输记录写回 `<journal>-scope.json`（原子写）。失败只留痕，绝不影响当天。"""
+        if self.scope_path is None:
+            return
+        report: dict[str, Any] = {}
+        # 【task-168 F-X1】把每区的**格清单**一并落盘：只存计数的话，重启后
+        # `shed_zone_tiles` 是空集 ⇒ 当天剔除会失效、累计上界也会归零。
+        zones_out: dict[str, dict[str, Any]] = {}
+        for name, item in self.shed_zones.items():
+            row = dict(item)
+            row["tile_list"] = sorted(self.shed_zone_tiles.get(name) or ())
+            zones_out[name] = row
+        err = save_scope_file(self.scope_path, zones_out,
+                              journal_stem=(self.journal_path.stem if self.journal_path else ""),
+                              report=report)
+        if err:
+            self._journal("scope_save_failed", path=str(self.scope_path), error=err,
+                          note="认输记录写不进去 ⇒ 只影响跨日记忆，不影响今天的判定")
+        else:
+            self._journal("scope_saved", path=str(self.scope_path), zones=len(self.shed_zones),
+                          written=int(report.get("written") or 0))
+
+    def _shed_tile_set(self) -> set[tuple[int, int]]:
+        """所有认输片区里"放弃掉的格子"的并集（目标池/守卫理由按它剔除；`_leftover` 不动）。"""
+        out: set[tuple[int, int]] = set()
+        for tiles in self.shed_zone_tiles.values():
+            out |= set(tiles)
+        return out
+
+    def _shed_live_crops(self) -> int:
+        """认输记录里"放弃时点的未浇活苗格数"合计（farm 级理由据此扣减）。
+
+        **只在有明确记录时才扣**（`live_crops_at_shed` 是 int）：记不清就用 0（= 不扣）——
+        宁可让守卫多说一句"还有活"（人还能去看一眼），也不许凭认输记录把"还有活"抹掉
+        （那正是 task-168 对抗验收要打的"scope_shed 变免罚额度"通道）。
+        """
+        total = 0
+        for item in self.shed_zones.values():
+            live = item.get("live_crops_at_shed")
+            if isinstance(live, int) and not isinstance(live, bool):
+                total += max(0, live)
+        return total
+
+    def _zone_bounds(self, zone_name: str, obs: dict[str, Any]) -> tuple[int, int, int, int] | None:
+        for z in self._zones(obs):
+            if str(getattr(z, "name", "")) != zone_name:
+                continue
+            try:
+                x0, y0, x1, y1 = (int(v) for v in tuple(z.bounds))  # type: ignore[attr-defined]
+            except Exception:  # pragma: no cover - 田区坏了当作看不见
+                return None
+            return x0, y0, x1, y1
+        return None
+
+    def _zone_observed_tiles(self, zone_name: str, obs: dict[str, Any]) -> list[tuple[int, int]]:
+        """该区在**当前观测**里看得见、且**值得干活**的格子（作物/可清障/可锄）。
+
+        观测是玩家窗口 ⇒ 人不在那边就一格都看不见（返回空 ⇒ 调用方按"判不了"处理，
+        绝不当成"这个区没事了"）。
+        """
+        bounds = self._zone_bounds(zone_name, obs)
+        if bounds is None:
+            return []
+        x0, y0, x1, y1 = bounds
+        tmap = FarmWorker.tiles_of(obs)
+        tillable = FarmWorker.tillable_of(obs)
+        out: list[tuple[int, int]] = []
+        for (x, y), tv in tmap.items():
+            if not (x0 <= x <= x1 and y0 <= y <= y1):
+                continue
+            kind = str(tv.get("kind") or "")
+            if tv.get("crop") or kind in ACTIONABLE_KINDS or (x, y) in tillable:
+                out.append((x, y))
+        return sorted(out)
+
+    def _zone_live_crops(self, zone_name: str, obs: dict[str, Any]) -> int | None:
+        """该区观测里"活苗且还没浇"的格数；**该区一格都看不见 ⇒ None（判不了）**。"""
+        bounds = self._zone_bounds(zone_name, obs)
+        if bounds is None:
+            return None
+        x0, y0, x1, y1 = bounds
+        tmap = FarmWorker.tiles_of(obs)
+        seen = 0
+        dry = 0
+        for (x, y), tv in tmap.items():
+            if not (x0 <= x <= x1 and y0 <= y <= y1):
+                continue
+            seen += 1
+            if tv.get("crop") and not tv.get("watered") and not tv.get("dead"):
+                dry += 1
+        return dry if seen > 0 else None
+
+    def _release_scope_if_converged(self, obs: dict[str, Any], rep: DayReport) -> None:
+        """【task-168 释放】认输是**粘但可释放**的：条件成立就撤销，让策略重新看得见那片地。
+
+        释放条件（任一）：①该区观测里已经没有未浇活苗（收完了/清掉了）；②**全农场**缺口归零
+        （`water_deficit == 0`，体力重新够浇完所有活苗）。
+        判不了（该区看不见 / farm 计数不可用）⇒ **不释放**（粘住，fail-closed）。
+        """
+        if not self.shed_zones:
+            return
+        try:
+            _live, _cap, deficit = self._work_budget_facts(obs)
+        except Exception:  # pragma: no cover - 预算算不出来就只按区口径判
+            deficit = None
+        for name in list(self.shed_zones):
+            live = self._zone_live_crops(name, obs)
+            reason = ""
+            if live == 0:
+                reason = "zone_has_no_unwatered_crops"
+            elif live is not None and deficit == 0:
+                reason = "farm_deficit_zero"
+            if not reason:
+                continue
+            self._release_zone(name, reason, rep, live=live)
+
+    def _release_zone(self, zone_name: str, reason: str, rep: DayReport, *,
+                      live: int | None = None) -> None:
+        item = self.shed_zones.pop(zone_name, {}) or {}
+        tiles = len(self.shed_zone_tiles.pop(zone_name, set()) or ())
+        self._journal("scope_released", zone=zone_name, reason=reason, tiles=tiles,
+                      live_crops_now=live,
+                      note="认输撤销（粘但可释放）⇒ 该区重新进目标池与守卫理由")
+        rep.notes.append(f"撤销认输：{zone_name}（{reason}）")
+        self._scope_flush(rep)
+
+    def _harvest_zone(self, zone_name: str, obs: dict[str, Any], rep: DayReport) -> int:
+        """认输前**先把该区成熟作物收掉**（收成不能因为"放弃这片"就烂在地里）。
+
+        一轮有界（`max_steps=len(tiles)`）；用 task-181 的 `tile_ready` 口径（游戏真判据），
+        目标只挑"该区观测里看得见的可收格"。返回真正发出的请求数（0 ⇒ 没什么可收）。
+        """
+        tiles = self._zone_observed_tiles(zone_name, obs)
+        ripe: list[tuple[int, int]] = []
+        tmap = FarmWorker.tiles_of(obs)
+        for t in tiles:
+            if tile_ready(tmap.get(t) or {}):
+                ripe.append(t)
+        if not ripe or self.worker is None:
+            return 0
+        self._journal("scope_harvest", zone=zone_name, tiles=len(ripe),
+                      targets=[list(t) for t in ripe[:6]],
+                      note="认输前先把该区成熟作物收掉（收成不因放弃而烂掉）")
+        try:
+            res = self.worker.run_stage("harvest", ripe, min_stamina=self.min_stamina,
+                                       max_steps=len(ripe))
+        except Exception as exc:  # pragma: no cover - 收不动不该拖垮认输流程
+            self._journal("scope_harvest_failed", zone=zone_name,
+                          error=f"{type(exc).__name__}: {exc}")
+            return 0
+        self._actions += len(res.steps)
+        self._count_attempts(res.steps)
+        self._mark_blocked(obs, self._snap(), res.steps, rep, stage="harvest")
+        self._note_harvest_gave_up(res.steps, rep)
+        oks = sum(1 for s in res.steps if s.ok)
+        rep.notes.append(f"认输前收成：{zone_name} 收下 {oks}/{len(ripe)} 格")
+        return len(res.steps)
+
+    def _shed_scope(self, zone_name: str, obs: dict[str, Any], rep: DayReport) -> bool:
+        """【task-168】认输一个田区（六步）。返回是否真的认输。
+
+        **防洗白设计**（卡面第 3 条 + 对抗验收三条通道）：
+        * 认输格**留在会计里** ⇒ `_leftover` 一字不改 ⇒ `no_unmet_stages` 因为"该区还有未浇
+          活苗"而为 false ⇒ 当天**如实不 VERIFIED**；`watered_outdoor` 也照旧挂（作物确实没浇）。
+        * 上界双保险：一天 ≤1 个区（`SCOPE_SHED_MAX_PER_DAY`）、累计 ≤ 农场可作业格的 34%
+          （`SCOPE_SHED_MAX_FRACTION`）⇒ 不可能是"永久免罚额度"。
+        * 仅在 `basis=="farm"` 且 `deficit > 0` 时成立 ⇒ 拿不到 farm 计数时**不认输**。
+        """
+        live, cap, deficit = self._work_budget_facts(obs)
+        if not self._is_farm(obs):
+            self._journal("scope_shed_refused", zone=zone_name, reason="not_on_farm",
+                          note="人不在户外农场 ⇒ 看不到片区，不许认输")
+            return False
+        if deficit is None:
+            self._journal("scope_shed_refused", zone=zone_name, reason="no_farm_evidence",
+                          note="farm 计数不可用（basis=conservative）⇒ 绝不拿『不知道』当免罚")
+            return False
+        if deficit <= 0:
+            self._journal("scope_shed_refused", zone=zone_name, reason="no_deficit",
+                          live_crops=live, water_capacity=cap,
+                          note="今天浇得完（deficit=0）⇒ 没有认输的理由")
+            return False
+        if self.scope_shed_today:
+            self._journal("scope_shed_refused", zone=zone_name, reason="already_today",
+                          limit=SCOPE_SHED_MAX_PER_DAY,
+                          note="今天已经认输过一个区（有界：一天最多 1 个）")
+            return False
+        tiles = self._zone_observed_tiles(zone_name, obs)
+        if not tiles:
+            self._journal("scope_shed_refused", zone=zone_name, reason="zone_not_visible",
+                          note="该区在观测里一格都看不见 ⇒ 判不了，不认输")
+            return False
+        # 累计上界：农场里"可作业格"总数（观测口径）——拿不到就不认输（宁可不做，也不越界）。
+        farm_workable = len(self._farm_workable_tiles(obs))
+        cap_tiles = int(max(0.0, SCOPE_SHED_MAX_FRACTION * farm_workable))
+        already = sum(int(z.get("tiles") or 0) for z in self.shed_zones.values())
+        if cap_tiles <= 0 or already + len(tiles) > cap_tiles:
+            if not self.scope_cap_refused_today:
+                self.scope_cap_refused_today = True
+                self._journal("scope_shed_refused", zone=zone_name, reason="cap",
+                              shed_tiles=already, this_zone=len(tiles),
+                              cap_tiles=cap_tiles, farm_workable=farm_workable,
+                              note="累计认输格数超过 34% 上界 ⇒ 如实不认输（宁可累垮，也不许"
+                                   "把规模问题永久洗成达标）")
+            return False
+        harvested = self._harvest_zone(zone_name, obs, rep)
+        live_zone = self._zone_live_crops(zone_name, obs)
+        reason = (f"今天有 {deficit} 格活苗浇不完（最多浇 {cap} 格）⇒ 主动放弃 {zone_name}"
+                  f"（策略性取舍，不是够不着；该区仍留在会计里，当天如实不 VERIFIED）")
+        self.shed_zones[zone_name] = {
+            "since_day": list(FarmWorker.day_key(obs) or ()),
+            "tiles": len(tiles),
+            "live_crops_at_shed": live_zone,
+            "reason": reason,
+        }
+        self.shed_zone_tiles[zone_name] = set(tiles)
+        self.scope_shed_today = True
+        self.scope_shed_tiles_today += len(tiles)
+        # 【task-168】`day_end.scope_shed{zone,tiles,reason}`：只记**今天那一次**认输
+        # （跨日粘住的其余区在 `<journal>-scope.json` 与 `scope_loaded` 里，各有单一来源）。
+        rep.scope_shed = {"zone": zone_name, "tiles": len(tiles), "reason": reason,
+                          "live_crops": live, "water_capacity": cap, "deficit": deficit,
+                          "since_day": list(FarmWorker.day_key(obs) or ()),
+                          "harvested_steps": harvested}
+        rep.scope_shed_tiles = int(self.scope_shed_tiles_today)
+        self._journal("scope_shed", zone=zone_name, tiles=len(tiles),
+                      live_crops=live, water_capacity=cap, deficit=deficit,
+                      target_tiles=len(tiles), harvested_steps=harvested,
+                      reason=reason, note="主动认输片区（scope_shed 只作 info、不进 checks；"
+                                          "该区格子仍算未完成 ⇒ 当天如实不 VERIFIED）")
+        rep.notes.append(f"主动认输 {zone_name}（{len(tiles)} 格）：{reason}")
+        self._scope_flush(rep)
+        return True
+
+    def _farm_workable_tiles(self, obs: dict[str, Any]) -> set[tuple[int, int]]:
+        """观测里"农场可作业格"（作物/可清障/可锄）——累计认输上界的分母。"""
+        tmap = FarmWorker.tiles_of(obs)
+        tillable = FarmWorker.tillable_of(obs)
+        out: set[tuple[int, int]] = set()
+        for t, tv in tmap.items():
+            kind = str(tv.get("kind") or "")
+            if tv.get("crop") or kind in ACTIONABLE_KINDS or t in tillable:
+                out.add(t)
+        return out
 
     @staticmethod
     def _fingerprint(obs: dict[str, Any]) -> tuple[Any, ...]:
@@ -1924,6 +2242,59 @@ class LongRun:
             budget["deferred"] = list(prev.get("deferred") or [])
         return budget
 
+    # ---- 【task-168】规模取舍：进简报的工作量缺口 + 各田区的事实 ----
+    def _work_budget_facts(self, obs: dict[str, Any]) -> tuple[int | None, int | None, int | None]:
+        """`(live_crops, water_capacity, water_deficit)`；farm 证据不可用 ⇒ `(None, None, None)`。
+
+        * `live_crops` 直接取 `_stamina_budget()` 的 `live_crops`（**同一份真值**，不另算一套）；
+        * `water_capacity = floor((max_stamina − 路程余量) / STAMINA_COST_WATER)`
+          —— **刻意不额外扣"补水预留"**：模型里没有可靠的补水体力系数，编一个数不如不编；
+          这个方向只会**高估**容量 ⇒ `deficit` 偏小 ⇒ 更少认输（fail-safe，不会拿未知当免罚）；
+        * `basis != "farm"` ⇒ 三个都 `None`+【未观测到】（**绝不许**把"不知道"写成 0）。
+        """
+        b = self._stamina_budget(obs)
+        if str(b.get("basis")) != "farm":
+            return None, None, None
+        try:
+            live = max(0, int(b.get("live_crops") or 0))
+            max_stam = float(b.get("max") or 0.0)
+            path = float(b.get("path_allowance") or PATH_STAMINA_ALLOWANCE)
+        except (TypeError, ValueError):
+            return None, None, None
+        cost = float(STAMINA_COST_WATER)
+        if cost <= 0.0:
+            return live, None, None
+        capacity = int(max(0.0, (max_stam - path)) // cost)
+        return live, capacity, max(0, live - capacity)
+
+    def _area_facts(self, obs: dict[str, Any]) -> tuple[tuple[str, int, int], ...]:
+        """各田区的 `(名字, 未浇活苗格数, 该区格数)`（**只数观测里看得见的格**）。
+
+        死苗不算"未浇活苗"（task-84：浇水目标只认活苗）；区里一格观测都没有 ⇒ **不收录**
+        （宁可不提议认输，也不拿空数据当"这个区没事"）。返回按名字排序 ⇒ 可复现。
+        """
+        zones = self._zones(obs)
+        if not zones:
+            return ()
+        tmap = FarmWorker.tiles_of(obs)
+        out: list[tuple[str, int, int]] = []
+        for z in zones:
+            try:
+                x0, y0, x1, y1 = (int(v) for v in tuple(z.bounds))  # type: ignore[attr-defined]
+            except Exception:  # pragma: no cover - 田区坏了不该拖垮简报
+                continue
+            tiles = 0
+            dry = 0
+            for (x, y), tv in tmap.items():
+                if not (x0 <= x <= x1 and y0 <= y <= y1):
+                    continue
+                tiles += 1
+                if tv.get("crop") and not tv.get("watered") and not tv.get("dead"):
+                    dry += 1
+            if tiles > 0:
+                out.append((str(getattr(z, "name", "")), dry, tiles))
+        return tuple(sorted(out, key=lambda it: it[0]))
+
     # ---- 【task-161】阶段体力实测聚合（只留痕） ----
     def _stamina_calibration(self, rep: DayReport) -> dict[str, Any]:
         """把当天 `rep.stages` 的实测体力按 stage 聚合：`{stage: {actions, stamina_spent, per_action}}`。
@@ -2142,9 +2513,12 @@ class LongRun:
         # 而 `_stage_tiles` 被预算拦住不产目标 ⇒ 白烧一天且当天不可能 VERIFIED）。
         # 浇水/收获/清死苗**永不延后**，所以下面 crop 分支照旧。
         deferred = self._budget_deferred_tasks()
+        # 【task-168】认输片区里的格子**不算"还有活"**（主动放弃 ⇒ 守卫闭嘴）。
+        # 注意这不影响会计：`_leftover`/`plot_pending`/`assigned_undone` 照旧把这些格算未完成。
+        shed = self._shed_tile_set()
         for t in tiles:
-            if t in self.blocked:
-                continue  # 今天已经证明"动了没用"
+            if t in self.blocked or t in shed:
+                continue  # 今天已经证明"动了没用" / 今天已主动认输
             tv = tmap.get(t)
             if tv is None:
                 # 没动过的格子在 tiles[] 里根本不存在，只能靠 tillable[] 认。
@@ -2235,6 +2609,11 @@ class LongRun:
         # 都已剔除死苗），这里只是把它所在的格子当作业区容器用。
         tiles = [t for t, v in tmap.items()
                  if v.get("crop") and (not v.get("watered") or tile_ready(v) or v.get("dead"))]
+        # 【task-168】认输片区的格子不算"收尾活"（主动放弃 ≤ 一天 1 个区，有界）。
+        if tiles:
+            shed = self._shed_tile_set()
+            if shed:
+                tiles = [t for t in tiles if t not in shed]
         if not tiles:
             return None
         pt = FarmWorker.player_tile(obs)
@@ -2342,6 +2721,14 @@ class LongRun:
                     area_lines = tuple(fields_mod.zone_brief_lines(zones))
                 except Exception:  # pragma: no cover - 田区简报不该影响主流程
                     area_lines = ()
+        # 【task-168】工作量缺口 + 各田区事实（进提示词，让慢脑自己看见"今天浇不完"）。
+        # 计算失败一律退回 None/空（fail-closed：宁可让模型看不到，也不给它一个假 0）。
+        try:
+            budget_live, budget_cap, budget_deficit = self._work_budget_facts(obs)
+            area_facts = self._area_facts(obs)
+        except Exception:  # pragma: no cover - 简报缺口不该影响主流程
+            budget_live = budget_cap = budget_deficit = None
+            area_facts = ()
         return replace(
             local,
             counts=counts,
@@ -2361,6 +2748,11 @@ class LongRun:
             # 【task-82】把跨日教训库喂回提示词（空 ⇒ 不出现这一节；只读、只影响文本）。
             recent_lessons=render_lessons(self.lessons, max_items=LESSONS_INJECT_MAX,
                                           max_chars=LESSONS_INJECT_CHARS),
+            # 【task-168】工作量缺口：`None` 照实进提示词（渲染成「未观测到」），绝不当 0。
+            live_crops=budget_live,
+            water_capacity=budget_cap,
+            water_deficit=budget_deficit,
+            area_facts=area_facts,
         )
 
     def _review_brief(self, obs: dict[str, Any], rep: DayReport | None = None) -> Brief:
@@ -2761,6 +3153,11 @@ class LongRun:
             pool = [t for t in pool
                     if t not in self.blocked
                     and self.tile_attempts.get(t, 0) < MAX_TILE_ATTEMPTS]
+        # 【task-168】今天主动认输的片区**一格都不再进目标池**（防 task-124/163 那种
+        # "守卫说有活、执行层又去碰"的错配复发）；`_leftover` 一个字不改 ⇒ 认输格仍算未完成。
+        shed = self._shed_tile_set()
+        if shed:
+            pool = [t for t in pool if t not in shed]
         pool = sorted(set(pool), key=lambda t: (_dist(t, pt), t[1], t[0]))
         return pool[:limit]
 
@@ -2839,6 +3236,10 @@ class LongRun:
         # 它的去处是 `clear_dead`（`_stage_tiles("clear_dead")` 单独管）。
         unwatered = [t for t, v in tmap.items()
                      if v.get("crop") and not v.get("watered") and not v.get("dead")]
+        # 【task-168】认输片区的格子不算"还有活"（主动放弃 ⇒ 守卫闭嘴；会计处照旧算未完成）。
+        shed = self._shed_tile_set()
+        if shed:
+            unwatered = [t for t in unwatered if t not in shed]
         if unwatered:
             reasons.append(f"有 {len(unwatered)} 格作物没浇水")
         # 【task-170 ②】"还有熟作物"这条理由**不许被今天已经证明收不到的格子钉住**：
@@ -2848,6 +3249,8 @@ class LongRun:
         ripe = [t for t, v in tmap.items()
                 if v.get("crop") and tile_ready(v)
                 and t not in self.harvest_gave_up and t not in self.blocked]
+        if shed:
+            ripe = [t for t in ripe if t not in shed]
         if ripe:
             reasons.append(f"有 {len(ripe)} 格作物熟了")
         seeds, money, can_plant = self._seed_outlook(obs)
@@ -2882,9 +3285,12 @@ class LongRun:
             reasons.append(self._farm_evidence_reason(obs))
         elif not self._is_farm(obs):
             dry, ripe = farm_work
+            # 【task-168】farm 级读数扣掉当天主动认输的活苗（有明确记录才扣）。
+            shed_live = self._shed_live_crops()
+            dry = max(0, dry - shed_live)
             if dry > 0:
                 reasons.append(f"人不在农场，但 farm 口径还有 {dry} 格干作物（先回去浇）")
-            ripe_live = max(0, ripe - len(self.harvest_gave_up))
+            ripe_live = max(0, ripe - len(self.harvest_gave_up) - shed_live)
             if ripe_live > 0:
                 reasons.append(f"人不在农场，但 farm 口径还有 {ripe_live} 格熟作物（先回去收）")
         if plot_work is not None and "plant_area" not in deferred:
@@ -2902,6 +3308,10 @@ class LongRun:
         totals = self._farm_totals(obs)
         if self._is_farm(obs) and totals is not None:
             dry_f, ripe_f = totals
+            # 【task-168】farm 级读数扣掉当天主动认输片区的活苗（有明确记录才扣）。
+            shed_live_f = self._shed_live_crops()
+            dry_f = max(0, dry_f - shed_live_f)
+            ripe_f = max(0, ripe_f - shed_live_f)
             if dry_f > len(unwatered):
                 # 【task-50】干作物常常在玩家 400 格窗口之外 ⇒ 理由里带上 Mod 报的坐标，
                 # 否则"还有 1 格干"既没法行动、也没法在收尾时点名（run5 三天全挂的形态）。
@@ -2942,9 +3352,11 @@ class LongRun:
         """
         defer = self._budget_deferred_tile_set()
         # 【task-170 ②】今天已判"收不到"的收获格同样不算"还有活"（否则守卫被一格钉住）。
+        # 【task-168】认输片区的格子也不算（主动放弃 ⇒ 守卫闭嘴；会计处照旧算未完成）。
+        shed = self._shed_tile_set()
         return sorted(t for t in self.leftover_targets
                       if t not in self.blocked and t not in defer
-                      and t not in self.harvest_gave_up)
+                      and t not in self.harvest_gave_up and t not in shed)
 
     # ------------------------------------------------ task-124：review 独苗的对账路径
 
@@ -4541,6 +4953,25 @@ class LongRun:
         verdicts: list[dict[str, Any]] = []
         for intent in intents:
             task = str(getattr(intent, "task", ""))
+            if task == "reduce_scope":
+                # 【task-168】认输意图也要过同一道关：田区必须**当前观测里真的存在**
+                # （`resolve_zone`/名字匹配），且今天还没认输过。不满足 ⇒ `cancel`
+                # ——注意 cancel 只否掉**这一轮**，不写 `no_target`（否则一次算错就把
+                # 当天的机制锁死；下一个决策轮还能重新提议）。
+                zone_name = str(getattr(intent, "area_hint", "") or "")
+                zones = {str(getattr(z, "name", "")) for z in self._zones(obs)}
+                reason = ""
+                if self.scope_shed_today:
+                    reason = "今天已经认输过一个区（一天上限 1）"
+                elif not zone_name or zone_name not in zones:
+                    reason = f"观测里找不到田区「{zone_name or '(空)'}」"
+                if reason:
+                    verdicts.append({"task": task, "verdict": "cancel", "reason": reason})
+                else:
+                    kept.append(intent)
+                    verdicts.append({"task": task, "verdict": "keep", "targets": 1,
+                                     "zone": zone_name})
+                continue
             if task not in STAGE_ACTION:
                 kept.append(intent)          # review / sleep 之类不按"有没有目标格"判
                 continue
@@ -4639,6 +5070,12 @@ class LongRun:
         assert self.worker is not None
         for intent in decision.intents:
             task = intent.task
+            if task == "reduce_scope":
+                # 【task-168】规模取舍：先把该区成熟作物收掉，再记账认输、把该区从目标池剔除。
+                # 判定一个字不动（`checks`/`plot_pending`/`assigned_undone` 照旧算未完成）。
+                acted = self._shed_scope(str(intent.area_hint or ""), obs, rep) or acted
+                obs = self._snap()
+                continue
             hint = str(intent.area_hint or "")
             # LLM 给了具名田区 ⇒ 下一片地就往那儿去（"方向由大模型给，坐标由代码落"）
             if fields_mod is not None and hint:
@@ -4965,6 +5402,10 @@ class LongRun:
         # 【task-163】预算延后记账每天重来（`deferred` 只描述"今天"）。
         self.budget_deferred_tiles = {}
         self.capacity_capped_noted = set()
+        # 【task-168】当天认输额度每天清零（`shed_zones` 是**跨日粘性**的，故意不在这里清）。
+        self.scope_shed_today = False
+        self.scope_shed_tiles_today = 0
+        self.scope_cap_refused_today = False
         self.refills_today = 0
         self.idle_rounds = 0
         self.blocked = {}
@@ -5062,6 +5503,10 @@ class LongRun:
         # `_stage_tiles` 可能一整天都不会被叫到，于是延后永远记不上、守卫永远不闭嘴
         # ⇒ 3 轮零变化 ⇒ `stuck`（有界、不假绿，但白烧一天且当天不可能 VERIFIED）。
         self._note_budget_deferrals(obs)
+        # 【task-168】跨日粘住的认输片区：日初懒加载一次，然后**判断能不能释放**
+        # （该区已无未浇活苗 / 全农场缺口归零 ⇒ 撤销认输、重新进目标池）。判不了就不释放。
+        self._scope_load()
+        self._release_scope_if_converged(obs, rep)
 
         last_obs = obs
         # task-19：当天**最后一个户外农场快照**（窗口口径浇水证据的来源）。日终再问必然是室内的
@@ -5661,6 +6106,8 @@ class LongRun:
             + f" 阶段分下去的格少做 {unmet_leftover} 格（no_unmet_stages={rep.checks.get('no_unmet_stages')}）"
             + f"；片区待做 {raw_unmet} 格"
             + (f"（其中 {rep.deferred_tiles} 格是诚实上限留下的，只作 info）" if rep.deferred_tiles else "")
+            + (f"；主动认输 {rep.scope_shed_tiles} 格（{rep.scope_shed.get('zone')}，只作 info、"
+               f"仍算未完成）" if rep.scope_shed_tiles else "")
             + (f" 走不到 {rep.unreachable} 格（豁免界 {unreachable_bound}、实扣 {unreachable_exempt}）"
                if rep.unreachable else "")
             + (f" 游戏拒绝 {rep.refused} 格（豁免界 {refused_bound}、实扣 {refused_exempt}）"

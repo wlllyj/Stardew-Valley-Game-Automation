@@ -84,6 +84,8 @@ __all__ = [
     "HINT_UNVERIFIED_PREFIX", "hint_contradicts_evidence",
     "make_lesson", "prune_lessons", "render_lessons",
     "load_lessons_file", "save_lessons_file",
+    # 【task-168】规模取舍的跨日持久层（`<journal>-scope.json`）
+    "SCOPE_SCHEMA", "load_scope_file", "save_scope_file",
     "BoundaryPlanner", "PLAN_SCHEMA_EXAMPLE",
 ]
 
@@ -99,6 +101,7 @@ TASK_KINDS: tuple[str, ...] = (
     "plant_area",       # 播种
     "water_area",       # 浇水
     "harvest",          # 收获成熟作物
+    "reduce_scope",     # 【task-168】规模取舍：主动认输一个田区（今天不做它，如实不 VERIFIED）
     "clear_dead",       # 清掉枯死作物（只清 crop.dead，活苗绝不碰；task-51）
     "ship",             # 出货（把今天亲手收获的东西放进农场出货箱，task-42）
     "recover_stamina",  # 体力恢复（进食/睡觉）
@@ -990,6 +993,127 @@ def save_lessons_file(path: Any, lessons: Iterable[Mapping[str, Any]] | None,
     return ""
 
 
+SCOPE_SCHEMA = "agentfarm-scope/1"
+
+
+def load_scope_file(path: Any,
+                    *, report: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+    """读跨日"规模取舍"记录（task-168，`<journal>-scope.json`）。**绝不抛**。
+
+    返回 `{zone: {"since_day", "tiles", "live_crops_at_shed", "reason"}}`；缺文件 ⇒ `{}`；
+    schema 不符 / JSON 坏 / 条目字段类型错 ⇒ **整份丢弃**并把原因回填 `report["reason"]`
+    （调用方记 `scope_rejected` 后照常跑）。
+
+    【信任边界（照 `load_lessons_file`）】这是磁盘上的外部文件：**绝不让它决定判定**。
+    只用来"跨日记住今天主动放弃了哪个区"，任何一处不合 schema 就整份不认 —— 宁可当天重新
+    评估（可能又认输一次、如实留痕），也不拿一个可疑文件当免罚依据。
+    """
+    if report is not None:
+        report["reason"] = ""
+        report["zones"] = 0
+    try:
+        p = Path(path)
+    except Exception as exc:  # noqa: BLE001
+        if report is not None:
+            report["reason"] = f"bad_path:{type(exc).__name__}"
+        return {}
+    if not p.exists():
+        return {}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        if report is not None:
+            report["reason"] = f"read_failed:{type(exc).__name__}: {exc}"
+        return {}
+    if not isinstance(raw, Mapping) or raw.get("schema") != SCOPE_SCHEMA:
+        if report is not None:
+            report["reason"] = "bad_schema"
+        return {}
+    zones = raw.get("zones")
+    if not isinstance(zones, Mapping):
+        if report is not None:
+            report["reason"] = "zones_not_mapping"
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for name, item in zones.items():
+        if not isinstance(name, str) or not name or not isinstance(item, Mapping):
+            if report is not None:
+                report["reason"] = "bad_entry"
+            return {}
+        tiles = item.get("tiles")
+        live = item.get("live_crops_at_shed")
+        reason = item.get("reason")
+        if not isinstance(tiles, int) or isinstance(tiles, bool) or tiles < 0:
+            if report is not None:
+                report["reason"] = "bad_tiles"
+            return {}
+        if not (live is None or (isinstance(live, int) and not isinstance(live, bool))):
+            if report is not None:
+                report["reason"] = "bad_live_crops"
+            return {}
+        if not isinstance(reason, str) or not reason:
+            if report is not None:
+                report["reason"] = "bad_reason"
+            return {}
+        # 【task-168 F-X1】格清单（可选但**必须**在时合法）：重启后靠它把
+        # `shed_zone_tiles` 灌回来，否则"整 run 累计 ≤34%"的上界一重启就归零。
+        raw_list = item.get("tile_list")
+        tile_list: list[tuple[int, int]] = []
+        if raw_list is not None:
+            if not isinstance(raw_list, (list, tuple)):
+                if report is not None:
+                    report["reason"] = "bad_tile_list"
+                return {}
+            for pair in raw_list:
+                if (not isinstance(pair, (list, tuple)) or len(pair) != 2
+                        or isinstance(pair[0], bool) or isinstance(pair[1], bool)
+                        or not isinstance(pair[0], int) or not isinstance(pair[1], int)):
+                    if report is not None:
+                        report["reason"] = "bad_tile_pair"
+                    return {}
+                tile_list.append((int(pair[0]), int(pair[1])))
+        out[name] = {"since_day": item.get("since_day"), "tiles": tiles,
+                     "live_crops_at_shed": live, "reason": reason,
+                     "tile_list": tuple(tile_list)}
+    if report is not None:
+        report["zones"] = len(out)
+    return out
+
+
+def save_scope_file(path: Any, zones: Mapping[str, Mapping[str, Any]], *,
+                    journal_stem: str = "", report: dict[str, Any] | None = None) -> str:
+    """原子写规模取舍记录（task-168）。**绝不抛**：成功 ⇒ `""`，失败 ⇒ 原因串。
+
+    先写 `.tmp` 再 `replace`（与 `save_lessons_file` 同一纪律）：中途崩掉不会留下半截 JSON
+    —— 半截文件下次会被 `load_scope_file` 整份拒收，等于把"主动放弃"的记忆静默清空。
+    """
+    payload: dict[str, Any] = {"schema": SCOPE_SCHEMA, "journal": str(journal_stem or "")}
+    clean: dict[str, dict[str, Any]] = {}
+    for name, item in (zones or {}).items():
+        if not isinstance(name, str) or not name or not isinstance(item, Mapping):
+            continue
+        clean[name] = {
+            "since_day": item.get("since_day"),
+            "tiles": int(item.get("tiles") or 0),
+            "live_crops_at_shed": item.get("live_crops_at_shed"),
+            "reason": str(item.get("reason") or ""),
+            "tile_list": [[int(t[0]), int(t[1])] for t in (item.get("tile_list") or ())
+                          if isinstance(t, (list, tuple)) and len(t) == 2],
+        }
+    payload["zones"] = clean
+    if report is not None:
+        report["written"] = len(clean)
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(p)
+    except Exception as exc:  # noqa: BLE001
+        return f"write_failed:{type(exc).__name__}: {exc}"
+    return ""
+
+
 def decision_line(
     *,
     day_key: Any = None,
@@ -1142,6 +1266,17 @@ class Brief:
     #: **只在 `build_review_messages()` 里用**：决策提示词不含它（决策看的是当下的简报）。
     #: 空 ⇒ 复盘 user 段只有简报（旧行为，向后兼容）。
     review_facts: str = ""
+    #: 【task-168】工作量缺口（**进提示词**，让慢脑自己看见"今天的活超过一天的体力"）。
+    #: 三个都可以是 `None` = **【未观测到】**（farm 计数不可用 / 窗口看不到农场）—— 绝不许当 0：
+    #: 0 是"没事"的意思，None 是"不知道"，混起来就会拿未知当绿灯（task-96/99 的老教训）。
+    #: 由长跑控制器 `_plot_brief()` 用 `replace(...)` 注入；`from_observe()` **不算**（planner 不依赖
+    #: `farmwork` 的体力常量，只认控制器给的真值）。
+    live_crops: int | None = None          # 全农场活苗（`farm.crops` 同口径）
+    water_capacity: int | None = None      # 一整管体力最多浇几格
+    water_deficit: int | None = None       # `max(0, live_crops - water_capacity)`
+    #: 【task-168】各田区的（未浇活苗格数, 该区格数）——确定性"认输哪一个区"的代理指标。
+    #: 同样由控制器注入；直接调 `from_observe()` 时恒空 ⇒ 不提议认输（fail-closed）。
+    area_facts: tuple[tuple[str, int, int], ...] = ()
 
     # ---- 派生量（确定性策略用） ----
     @property
@@ -1178,6 +1313,13 @@ class Brief:
             # 田区摘要放在中段：既让模型有"方向"可选，又不至于被末尾截断吃掉
             lines.append(f"areas={list(self.areas)}")
             lines.extend(f"- {line}" for line in self.area_lines)
+        # 【task-168】工作量缺口 —— 属**核心事实**（不是可选节）：模型必须能看出"今天浇不完"。
+        # 三个数任一拿不到就照实写「未观测到」，**绝不许**用 0 冒充（0 = 没事，None = 不知道）。
+        if self.live_crops is None or self.water_capacity is None or self.water_deficit is None:
+            lines.append("water_budget: live_crops=未观测到 water_capacity=未观测到 water_deficit=未观测到")
+        else:
+            lines.append(f"water_budget: live_crops={self.live_crops} "
+                         f"water_capacity={self.water_capacity} water_deficit={self.water_deficit}")
         return lines
 
     def decisions_text(self) -> str:
@@ -1583,6 +1725,21 @@ def deterministic_plan(brief: Brief) -> tuple[TaskIntent, ...]:
             f"有 {brief.counts.get('ripe', 0)} 格作物成熟了，先收掉腾地",
             "location.tiles[].ripe 的格子数量下降",
         ),)
+
+    # 【task-168】规模取舍：今天的活（活苗 × 浇水成本）超过一天的体力 ⇒ **主动认输**最不划算的
+    # 一个田区，把体力留给其余田区。确定性代理 = 未浇活苗最多 → 区小 → 名字典序（可复现，无随机）。
+    # 只在 `water_deficit` 是**可用的 int > 0** 且至少 2 个田区时才提议：`None`（farm 计数不可用）/
+    # `0`（浇得完）/ 单区 ⇒ **一律不提议**（fail-closed，拿不到真值就不许拿"未知"当免罚依据）。
+    if (brief.water_deficit is not None and brief.water_deficit > 0
+            and len(brief.area_facts) >= 2):
+        name, dry, _tiles = max(brief.area_facts, key=lambda kv: (kv[1], -kv[2], kv[0]))
+        if dry > 0:
+            return (TaskIntent(
+                "reduce_scope", name,
+                f"今天有 {brief.water_deficit} 格活苗浇不完（最多浇 {brief.water_capacity} 格）；"
+                f"先保其余田区，{name} 今天主动不做",
+                "该田区不再做目标、守卫不再为它报『还有活』；日终 scope_shed 如实留痕",
+            ),)
 
     # 【task-51 / task-84 位置调整】清掉**枯死**作物，排在**浇水之前**。
     # 位置理由（Lead task-84 卡面建议序 `harvest → clear_dead → water_area → ship → …`）：
