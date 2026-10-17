@@ -1,9 +1,10 @@
-v0.7.37：A′ 提前叫停后的两处 P0 收口（task-198/199）+ 收获证据面三处残留（task-195/196/193）+ 测试编码护栏（task-197）
+v0.7.37：A′ 提前叫停后的 P0 收口批次（Mod 侧四项 = 窗口外熟作物/工具升级链/显式应答/内省面；脑侧 = 背包满阻塞类与腾格回路）
 - Mod `FarmScan`/`FarmView`：新增 `readyTiles[]`（熟作物坐标，与 `readyCrops` 同源同扫描；上限 64、按 (y,x) 排序、`readyTilesTruncated`）—— 窗口外熟作物不再让脑侧守卫空转 `stuck`（task-199）。
-- Mod `UseToolSkill`/`Skills`：`actedEvidence` 必须绑**目标格**（或明确标注聚合来源）；原始 `use_tool` 在目标格 `ready != true` 时不得静默连带，影响必须如实入回执（受影响格/连带掉落）（task-195 = R7/R8）。
-- 脑侧 `farmwork.harvest()`：背包满/无空格归**阻塞类**（`no_slot`，不封格、不吃 `harvest_gave_up` 上限、不计硬失败）；日级策略加**腾格优先的收敛回路**（`slot_relief`，有界、每轮至少腾 1 格，腾不出 ⇒ 如实 `inventory_blocked`）；`clear`/`till`/`water` 的掉落计入当天预算（task-198 = A′ 主因）。
+- Mod `ToolUpgradeSkill`/`ToolUpgradeRules` + `pickup_tool`：铁匠铺升级闭环（`Utility.TryOpenShopMenu("ClintUpgrade")` → 读 `ShopBuilder.GetShopStock` → `tryToPurchaseItem`；买前自检 `toolBeingUpgraded==null && daysLeft==0 && !readOnly`；回执带价格/材料/`tool_being_upgraded`/`days_left`；取回需 ≥1 空格）—— 等级在「买下」时即换（task-205）。
+- Mod 显式应答（`AnswerRules`）：`ExecArgs.answerIndex`/`answerText`（互斥；未设 ⇒ 旧行为不变；越界/找不到 ⇒ `choice_not_found`、多处命中 ⇒ `choice_ambiguous`、无提问 ⇒ `no_question`；绝不回退自动选 Yes；回执带 `chosenAnswer`）—— 为铁匠铺/对话类交互提供可指定选项的能力（task-208）。
+- Mod `debug_dump`（`Data/CraftingRecipes`/`CookingRecipes`/`TriggerActions`/`Mail`/`Machines`/`Objects`/`BigCraftables`，带 `key`/`limit`，fail-closed `table_unknown`/`load_failed`）+ `add_missed_recipes`（反射 `Farmer.AddMissedMailAndRecipes()`，回执前后差分）—— 真机内省面，用于一锤定音「熔炉配方为什么没有」（task-213）。
+- 脑侧 `farmwork.harvest()`：背包满/无空格归**阻塞类**（`no_slot`，不封格、不吃 `harvest_gave_up` 上限、不计硬失败）；日级策略加**腾格优先的收敛回路**（`slot_relief`，有界、每轮至少腾 1 格，腾不出 ⇒ 如实 `inventory_blocked` 收尾）；`clear`/`till`/`water` 的掉落计入当天预算（task-198 = A′ 主因）。
 - 脑侧 `harvest` 目标池：窗口内不足时按 `farm.readyTiles` 走过去收（复用 `water_far` walker 一族），走不到如实 `ready_far_blocked`、不许无限换片地（task-199 脑侧）。
-- 脑侧 loot 记账：**目标格掉落**与**连带掉落**分栏（`loot` / `collateral_loot`），白名单只认目标格产物；口径不一致如实列（task-196）。
-- 脑侧 `sell` 白名单：只收**本格作物产物 id**（`whitelist_source="crop_product"`），取不到 crop id ⇒ 空白名单 + `whitelist_source="unavailable"`（宁可少挣、不许乱卖）；**材料白名单通道保留**（task-193 = C2-a）。
-- 工程侧：消除子进程抓 stdout 的编码依赖（显式 `encoding="utf-8"` 或 ASCII 断言标记），带/不带 `PYTHONUTF8` 均全绿（task-197）。
+- 脑侧 loot 记账（task-189，上一批已入）：目标格掉落与连带掉落分栏，白名单只认目标格产物。
+- 脑侧工具升级策略（task-205 脑侧）：每天最多 1 次、浇水/收获之后、开新地之前；在途两天里依赖该工具的动作如实 `skipped`（不吃硬失败）。
 - 判据文档（非 Mod 内容，Lead 冻结时补）：`docs\_run6-criteria.md` / `docs\_run10-criteria.md` 补三条口径 ——「背包满 ⇒ `no_slot` 不算硬失败」「守卫的『还有活』必须能落到可执行目标」「whitelist 归因分作物/材料两通道」。

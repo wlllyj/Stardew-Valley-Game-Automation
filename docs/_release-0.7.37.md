@@ -1,6 +1,6 @@
 # 0.7.37 发布计划 — 背包阻塞/窗口外熟作物收口 + 显式对话应答 + 工具升级闭环
 
-> 状态：**批内 4 卡已交付并亲核（192 / 198 / 199 / 208），task-205 在制，task-206 待 task-205**。冻结时机 = 205 落地 + deputy（task-200）对冻结树做完本批独立验收之后，一次冻结装机。
+> 状态：**批内 5 卡已交付并亲核（192 / 198 / 199 / 202 / 204 / 208 / 205），task-213 在制、task-207 在制（analyzer）、task-206 待 205**。冻结时机 = **213 落地 + 207 全量归零 + deputy（task-200/206）对冻结树做完本批独立验收之后**，一次冻结装机。
 > 前置：`docs/_release-0.7.36.md`（0.7.36 冻结装机 + task-191 真机复测）；`docs/_runA3-0736-evidence.md`（A′ 叫停证据）；`docs/_il-tool-upgrade.md`（铁匠铺链 IL 定案）；`docs/_run10-material-scan.md`（真机材料盘点）；`docs/_upgrade-protocol.md`（真机升级验收协议）。
 > 背景：A′（task-113）被 Lead **提前叫停**——该臂被「背包满 ⇒ `harvest` 全线被拒」支配（45 条同句失败 / `harvest_gave_up` 59 次 / `no_hard_failures=false` / 两天 `stuck`），**不作验收证据、L0–L5 不判、B′ 不跑**。本批据此收口，并叠加用户当场提的优先级（`User said (m18271)`「赶紧做工具升级吧」）。
 
@@ -14,6 +14,7 @@
 2. **task-192**：认输区「释放」后当日记账不归零 ⇒ 雨天「先认输→浇好→释放→其余活做完」的诚实日会被工具误判 needs_review。
 3. **task-208**：`dismiss_modal` 只能按「Yes/第一项」应答，无法**显式指定选项** ⇒ 铁匠铺升级、职业选择这类必须选特定项的对话无法自动化。新增 `answerIndex`/`answerText`，互斥、fail-closed、绝不回退自动 Yes。
 4. **task-205（工具升级闭环）**：IL 已定案（铁匠铺 `ClintUpgrade`，`tryToPurchaseItem` 私有需反射；钱+材料先扣、`actionWhenPurchased` 才换工具 ⇒ 必须自检 `toolBeingUpgraded==null`）。真机材料盘点：铜锭 0 / 铜矿 0 / 煤 0 / 熔炉 0 / 配方无 Furnace ⇒ 升级被**材料链**卡住（熔炉链 = task-210 + IL task-211），故 205 先交付**代码闭环**，真机成功验收按 `docs/_upgrade-protocol.md` 在材料到位后执行。
+5. **task-213（Mod 内省面）**：熔炉配方问题是升级链最后一道硬阻塞——`docs/_il-furnace-recipe.md` 定案「唯一合法授予通道是玩家技能升级时构造 `LevelUpMenu` → `AddMissedMailAndRecipes()`」，而自动化从未构造过 LevelUpMenu；条件串在打包 xnb 里读不到 ⇒ 用 `debug_dump` + `add_missed_recipes` 做**一次真机内省**：先拿 `Data/CraftingRecipes` 的 Furnace 配方串与触发器原文，再试游戏自己的补发方法并看差分。若补发成功 ⇒ 配方阻塞当场解除（走游戏自己的方法，不算造假）。
 
 ## 1. 本批卡片（入版范围）
 
@@ -25,15 +26,17 @@
 | **task-202** | analyzer | 收 task-198 的 `inventory_blocked`/`slot_relief`/`slot_relief_noted` + task-199 的 `ready_far*` 五名；旧账本判决/计数不变 | ✅ `f2e72e3`（全量 992 OK 归零） |
 | **task-204** | docs（IL） | 铁匠铺升级链 IL 定案（入口/选工具/扣钱/回执/取回 + `GetShopStock` 公共接口） | ✅ `d6d55e2` |
 | **task-208** | Mod | `dismiss_modal` 显式应答：`answerIndex`/`answerText` 互斥；未设 ⇒ 老行为不变；越界/不匹配 ⇒ `choice_not_found`（附选项清单）、多义 ⇒ `choice_ambiguous`、无提问 ⇒ `no_question`；绝不回退自动 Yes；`chosenAnswer` 可审计；不接管 ShippingMenu/存档菜单 | ✅ `dadd356`（C# 自检 38 断言；Lead 亲核） |
-| **task-205** | Mod+brain | `upgrade_tool`：开店→读价（`GetShopStock`/`GetToolUpgradeData`）→硬自检（`toolBeingUpgraded==null` && 钱够 && 材料够 && 非 readOnly）→反射购买→钱差判据；脑侧策略（每天≤1 次、在浇水/收获之后、拾取工具优先、2 天在飞如实跳过）+ fail-closed 码 | 🛠 在制 |
-| **task-206** | deputy-lead | task-205 独立对抗验收（≥8 作弊通道 + 变异自报 vs 实测两列） | ⏸ 待 205 |
+| **task-205** | Mod+brain | `upgrade_tool`：开店→读价（`GetShopStock`/`GetToolUpgradeData`）→硬自检（`toolBeingUpgraded==null` && 钱够 && 材料够 && 非 readOnly）→反射购买→钱差判据；脑侧策略（每天≤1 次、在浇水/收获之后、拾取工具优先、2 天在飞如实跳过）+ fail-closed 码 | ✅ `8ee33cb`（21 单测 + 变异 m205a/b/c/d=2/3/5/1；build 0/0；C# 自检 50 断言；全量 1026 仅 2 analyzer 漂移→task-207） |
+| **task-213** | Mod+brain | Mod 内省面：`debug_dump`（7 张数据表，`key`/`limit`，fail-closed）+ `add_missed_recipes`（反射 `Farmer.AddMissedMailAndRecipes()`，前后差分）+ 脑侧薄包装 + `scratch/_t213_probe.py`；用于一锤定音「熔炉配方为什么没有」 | 🛠 在制 |
+| **task-207** | analyzer | 收 task-205 的 4 个新事件（`upgrade_tool`/`pickup_tool`/`tool_upgrade_skipped`/`tool_upgrade_blocked_work`）+ 字段 + 口径卡；六账本 rc/红数不变；全量归零 | 🛠 在制 |
+| **task-206** | deputy-lead | task-205 独立对抗验收（≥8 作弊通道 + 变异自报 vs 实测两列） | ⏸ 待 205 冻结树 |
 
 **移出本批（→ 0.7.39）**：task-195（`actedEvidence` 目标格绑定）、task-196（连带掉落分栏）、task-193（白名单两通道）、task-197（测试编码护栏）。
 **下一批（→ 0.7.38）**：task-210（机器链 craft/place/feed/collect）、task-211（IL 定案，进行中）、task-200 的冻结树正式验收。
 
 ## 2. 冻结九步（Lead 独占，链条冻结后一次做完）
 
-1. `tools\_note-0737.txt`（**首串必须 `v0.7.37`**，列本批 Mod 侧：199 `readyTiles`、208 显式应答、205 `upgrade_tool`）。
+1. `tools\_note-0737.txt`（**首串必须 `v0.7.37`**，列本批 Mod 侧：199 `readyTiles`、208 显式应答、205 `upgrade_tool`/`pickup_tool`、213 `debug_dump`/`add_missed_recipes`）。
 2. `python tools\_bump-mod-version.py 0.7.37 --note-file tools\_note-0737.txt` ⇒ manifest `0.7.36 → 0.7.37`（用 `json.load` 复核；cp1252 下最后一行 print 会 UnicodeEncodeError 但文件已写）。
 3. `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.37"`（注释补本批条目、上一版转历史）。
 4. `dotnet build .\mod\AgentFarm.Bridge\AgentFarm.Bridge.csproj -c Release --nologo --no-incremental` ⇒ **0 警 0 错**；记 dll/manifest size 与 mtime。
@@ -56,7 +59,7 @@
 - 本批**不碰** `checks` 键集、不碰 `_leftover` / `JUSTIFIED_END_REASONS` 语义。
 - `acted` 是跨观测推断，不是游戏真值；任何新字段都要 fail-closed。
 - task-198 与 task-199/205 都改 `brain/agentfarm` ⇒ 单写者串行；`Contracts.cs` 被 199/208/205 三卡先后改过，冻结前必须整体 build 复核。
-- 工具升级的真机成功路径**被材料链卡住**：0 铜锭、无熔炉、无 Furnace 配方 ⇒ 本批只交付能力，真机验收等 task-210 机器链（熔炉→铜锭）到位。
+- 工具升级的真机成功路径**被材料链卡住**：0 铜锭、无熔炉、无 Furnace 配方 ⇒ 本批交付能力 + **内省面（task-213）**先解配方阻塞；造熔炉/炼铜锭的机器链（task-210）与真机升级验收（`docs/_upgrade-protocol.md`）排在本批冻结装机之后。
 - 升级后 2 天内该工具不可用 ⇒ 日循环必须如实跳过依赖它的活（205 的脑侧策略已含）。
 
 ## 5. 执行记录
