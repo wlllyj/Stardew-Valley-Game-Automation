@@ -4225,5 +4225,108 @@ class TestScopeTerminalAccounting(unittest.TestCase):
         self.assertEqual(rep["red"]["total"], 0)
 
 
+class TestSlotReliefAndInventoryBlocked(unittest.TestCase):
+    """task-202（dev task-198 `62e9089`）：背包满 ⇒ 腾格回路 / 诚实「背包阻塞」收尾。
+
+    口径红线：`slot_relief` = 回路真动过（**不是失败、不是豁免**，`freed==0` 的日子要点名）；
+    `inventory_blocked` = **如实上限**（`ended_by=inventory_blocked`、`verified=false`、
+    `failed_steps=0`），不许写成失败或豁免；唯一可证伪 ⚠ = 那天却自称 VERIFIED（不进 rc）。
+    """
+
+    def _report(self, events, name):
+        with tempfile.TemporaryDirectory() as tmp:
+            return report_for(write_ledger(tmp, name, events), days=1)
+
+    def _events(self, *, relief=True, freed=3, shipped=True, blocked=False,
+                ended_by="sleep", verified=True):
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": True,
+                  "watered_outdoor": True}
+        ev = [day_start([1, "spring", 12])]
+        if relief:
+            ev.append({"event": "slot_relief", "t": 10.0, "need": 3, "freed": freed,
+                       "shipped": shipped, "freeSlots_before": 1,
+                       "freeSlots_after": 1 + int(freed), "round": 1, "max_rounds": 3,
+                       "reserve": 1, "note": "腾格"})
+            ev.append({"event": "slot_relief_noted", "t": 9.0, "free_slots": 1, "reserve": 1,
+                       "round": 1, "limit": 3, "note": "低水位先腾格"})
+        if blocked:
+            ev.append({"event": "inventory_blocked", "t": 20.0, "free_slots": 0, "reserve": 1,
+                       "rounds": 2, "limit": 3, "reason": "no_sellable", "note": "如实收尾"})
+        ev.append({"event": "day_end", "t": 950.0, "day": [1, "spring", 12],
+                   "ended_by": ended_by, "ended_reason": "night", "verified": verified,
+                   "checks": checks,
+                   "stages": [{"stage": "water_area", "tiles": 10, "ok": 10, "skipped": 0,
+                               "failed": 0}],
+                   "ok_steps": 10, "skipped_steps": 0, "failed_steps": 0, "notes": [],
+                   "final": final([1, "spring", 13]),
+                   "final_water": {"t": 949.0, "location": "Farm", "tiles": 84, "crops": 31,
+                                   "dry": 0, "scope": "farm"}})
+        return ev
+
+    def test_events_have_buckets_and_are_not_unmapped(self):
+        rep = self._report(self._events(blocked=True), "t202_buckets.jsonl")
+        self.assertEqual(rep["events"].get("slot_relief"), 1)
+        self.assertEqual(rep["events"].get("slot_relief_noted"), 1)
+        self.assertEqual(rep["events"].get("inventory_blocked"), 1)
+        self.assertEqual(rep["unmapped_events"], {}, "三个新事件都必须有桶、不许落未映射")
+
+    def test_slot_relief_is_info_not_failure(self):
+        rep = self._report(self._events(), "t202_relief.jsonl")
+        sr = rep["slot_relief"]
+        self.assertEqual(sr["events"], 1)
+        self.assertEqual(sr["freed_total"], 3)
+        self.assertEqual(sr["shipped"], 1)
+        self.assertEqual(sr["zero_freed_lines"], [])
+        self.assertEqual(rep["red"]["total"], 0, "腾格回路是信息项 ⇒ 不判红")
+        text = mod.render_text(rep, 50)
+        self.assertIn("腾格回路: `slot_relief` 1 次", text)
+        self.assertIn("不是失败、不是豁免", text)
+
+    def test_freed_zero_is_flagged_not_red(self):
+        rep = self._report(self._events(freed=0), "t202_zero.jsonl")
+        sr = rep["slot_relief"]
+        self.assertEqual(sr["freed_total"], 0)
+        self.assertTrue(sr["zero_freed_lines"], "腾格尝试却没真腾出格 ⇒ 必须点名")
+        self.assertEqual(rep["red"]["total"], 0)
+        text = mod.render_text(rep, 50)
+        self.assertIn("腾格尝试却没真腾出格（freed=0）", text)
+        self.assertIn("腾格回路空转", " ".join(a["text"] for a in rep["advice"]))
+
+    def test_inventory_blocked_is_honest_limit_not_failure(self):
+        rep = self._report(self._events(relief=False, blocked=True,
+                                        ended_by="inventory_blocked", verified=False),
+                           "t202_blocked.jsonl")
+        ib = rep["inventory_blocked"]
+        self.assertEqual(ib["events"], 1)
+        self.assertEqual(ib["ended_by_days"], 1)
+        self.assertEqual(ib["warn_verified_lines"], [])
+        self.assertEqual(rep["red"]["total"], 0, "如实上限 ⇒ **不是失败**、不判红")
+        text = mod.render_text(rep, 50)
+        self.assertIn("背包阻塞: `inventory_blocked` 1 次", text)
+        self.assertIn("如实上限", text)
+
+    def test_inventory_blocked_with_verified_is_warning_not_red(self):
+        rep = self._report(self._events(relief=False, blocked=True,
+                                        ended_by="inventory_blocked", verified=True),
+                           "t202_verified.jsonl")
+        ib = rep["inventory_blocked"]
+        self.assertTrue(ib["warn_verified_lines"], "背包阻塞当天却自称 VERIFIED ⇒ 互斥组合 ⚠")
+        self.assertEqual(rep["red"]["total"], 0, "只警告、**不进 rc**")
+        self.assertIn("背包阻塞当天却自称 VERIFIED", mod.render_text(rep, 50))
+
+    def test_old_ledger_without_events_is_missing_not_zero(self):
+        rep = self._report(self._events(relief=False), "t202_old.jsonl")
+        self.assertFalse(rep["slot_relief"]["has_events"])
+        self.assertFalse(rep["inventory_blocked"]["has_events"])
+        self.assertEqual(rep["red"]["total"], 0)
+        text = mod.render_text(rep, 50)
+        self.assertIn("腾格回路: <缺失>", text)
+        self.assertIn("背包阻塞: <缺失>", text)
+        blob = " ".join(rep.get("undecidable") or [])
+        self.assertIn("event:slot_relief", blob)
+        self.assertIn("event:inventory_blocked", blob)
+
+
 if __name__ == "__main__":
     unittest.main()

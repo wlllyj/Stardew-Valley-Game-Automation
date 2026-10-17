@@ -658,6 +658,22 @@ FIELD_PROBES = [
     ("event:blocked_by_tool_summary", "blocked_by_tool_summary",
      "日级汇总（count/tiles ≤6/kinds/tools/note）⇒ 这些格**不算活、不进守卫理由**（否则一块"
      "暂时敲不动的巨石会让人永远收不了工）；本工具**不判红、不进 rc**"),
+    # task-202（dev task-198 `62e9089`）：背包满 ⇒ `slot_relief` 腾格回路 + `inventory_blocked` 诚实收尾。
+    #   三态：旧账本没有这些事件 ⇒ `<缺失>` +【无法判定】（缺失 ≠ 0）；`null`/`""` ⇒ 无法判定；
+    #   有值 ⇒ 正常。语义红线：腾格**不是失败、不是豁免**；阻塞收尾是**如实上限**。
+    ("event:slot_relief", "slot_relief",
+     "腾格回路真动过（task-198：need/freed/shipped/freeSlots_before/freeSlots_after/round/"
+     "max_rounds/reserve/note）⇒ **不是失败、不是豁免**；`freed==0` = 没真腾出格（要点名）"),
+    ("event:slot_relief.freed", "slot_relief_freed",
+     "本轮实际腾出的空格数（task-198；`0` = 腾格尝试空转 ⇒ 头部『腾格回路』⚠；缺失 ⇒【无法判定】）"),
+    ("event:slot_relief_noted", "slot_relief_noted",
+     "同日『需要腾格』只记一次的去重标记（task-198：free_slots/reserve/round/limit）⇒ 纯标记、无判据"),
+    ("event:inventory_blocked", "inventory_blocked",
+     "当天**腾不出格 ⇒ 诚实收工**（task-198：free_slots/reserve/rounds/limit/reason/note；"
+     "`ended_by=inventory_blocked`、`verified=false`、`failed_steps=0`）⇒ **如实上限**，"
+     "不是失败、也不是豁免；唯一可证伪 ⚠ = 那天却自称 VERIFIED"),
+    ("event:inventory_blocked.free_slots", "inventory_blocked_free_slots",
+     "收尾时刻的背包空格数（task-198；与 `reserve` 一起看是否真到低水位；缺失 ⇒【无法判定】）"),
 ]
 OUTCOME_RE = re.compile(
     r"目标\s*(\d+)\s*步：做成\s*(\d+)、跳过\s*(\d+)、失败\s*(\d+)"
@@ -901,6 +917,21 @@ EVENT_BUCKETS = {
     # **不是失败**（不进 failed、不判红；`tools\verify-run3.py` 对该名零命中），只作信息项 +
     # 两条可证伪 ⚠ 警告（自称买满却买少且无留痕 / 同日 `buy_partial` 与 `cannot_afford` 同时出现）。
     "buy_partial": "buy_partials",
+    # task-202（dev task-198 `62e9089`）：背包满 ⇒ 腾格优先收敛回路 + 诚实「背包阻塞」收尾。
+    #   `slot_relief` = 回路真动过（**不是失败、不是豁免**；`freed==0` 的日子要点名）；
+    #   `slot_relief_noted` = 同日去重标记；`inventory_blocked` = 当天腾不出格 ⇒ **如实上限**
+    #   （`ended_by=inventory_blocked`、`verified=false`、`failed_steps=0`），不许写成失败或豁免。
+    "slot_relief": "slot_reliefs",
+    "slot_relief_noted": "slot_relief_noteds",
+    "inventory_blocked": "inventory_blockeds",
+    # task-202 副产物：机械枚举同时抓到 dev task-199 在制（未提交）的 5 个 `ready_far*` 事件
+    #   （窗口外熟作物：农场给出 `readyTiles` 坐标 ⇒ 走过去收；不可用/截断/不在农场 三种留痕）。
+    #   名字来自工作区 brain 源码、**尚未 commit**；先入桶保证全量漂移绿，语义待 task-199 落定再补口径。
+    "ready_far": "ready_fars",
+    "ready_far_blocked": "ready_far_blocks",
+    "ready_far_skipped": "ready_far_skips",
+    "ready_far_truncated": "ready_far_truncateds",
+    "ready_far_unavailable": "ready_far_unavailables",
 }
 
 #: 结构性事件：由报告的其他字段单独统计（day_start/day_end 切会话与验收、finish 自述），
@@ -973,6 +1004,11 @@ NEW_EVENT_BUCKETS = (
     "budget_deferred_tiles_events", "stage_capped_by_capacities",
     # task-20 / task-164：工具门槛封格（逐格 + 日级汇总；诚实跳过、不进守卫理由、不判红）
     "blocked_by_tools", "blocked_by_tool_summaries",
+    # task-202（dev task-198）：背包满 ⇒ 腾格回路 / 背包阻塞诚实收尾（信息项，不进 rc）
+    "slot_reliefs", "slot_relief_noteds", "inventory_blockeds",
+    # task-202 副产物：dev task-199 在制的窗口外熟作物 5 事件（未 commit，先入桶免得漂移红）
+    "ready_fars", "ready_far_blocks", "ready_far_skips",
+    "ready_far_truncateds", "ready_far_unavailables",
 )
 
 
@@ -3012,6 +3048,19 @@ def build_advice(report, top=8):
                      + (ss0.get("save_failed_lines") or [])[:3]
                      + (ss0.get("rejected_lines") or [])[:3],
         })
+    # 0s-6（task-202，dev task-198）：腾格回路与「背包阻塞」诚实收尾 —— 都是信息项，不进 rc。
+    sr0 = report.get("slot_relief") or {}
+    ib0 = report.get("inventory_blocked") or {}
+    if sr0.get("zero_freed_lines") or ib0.get("warn_verified_lines"):
+        advice.append({
+            "text": "背包腾格/阻塞（信息项，**不是失败、不是豁免**）："
+                    + ("腾格尝试却没真腾出格（freed=0）⇒ 腾格回路空转（先看有没有可出货/可卖的叠）；"
+                       if sr0.get("zero_freed_lines") else "")
+                    + ("`ended_by=inventory_blocked` 当天却自称 VERIFIED ⇒ 与『背包满 ⇒ 诚实收尾』互斥，"
+                       "人工核对" if ib0.get("warn_verified_lines") else ""),
+            "lines": ((sr0.get("zero_freed_lines") or [])[:3]
+                      + (ib0.get("warn_verified_lines") or [])[:3]),
+        })
     # 0c) 环境挡路 / 没拿到结论（task-22 记账）
     env = report.get("env_inconclusive") or {}
     if env.get("env_fail_events"):
@@ -4959,6 +5008,63 @@ def build_report(rows, path, args, bad_lines):
                 scope_shed["warn_terminal_mismatch_lines"].append(_ln)
             if _tlab not in scope_shed["warn_terminal_mismatch_days"]:
                 scope_shed["warn_terminal_mismatch_days"].append(_tlab)
+    # task-202（dev task-198 `62e9089`）：背包满 ⇒ **腾格优先收敛回路** + **诚实的「背包阻塞」收尾**。
+    #   语义红线：`slot_relief` = 回路真动过（**不是失败、不是豁免**）；`inventory_blocked` = 当天
+    #   腾不出格 ⇒ **如实上限**（`ended_by=inventory_blocked`、`verified=false`、`failed_steps=0`），
+    #   **不许写成失败或豁免**；唯一可证伪 ⚠ = 那天却自称 VERIFIED（不进 rc）。
+    slot_relief = {
+        "events": 0, "lines": [], "freed_total": 0, "freed_missing_lines": [],
+        "zero_freed_lines": [], "shipped": 0, "noted_events": 0,
+        "max_rounds": None, "reserve": None, "has_events": False,
+    }
+    inventory_blocked = {
+        "events": 0, "lines": [], "reasons": {}, "free_slots": [], "rounds": [],
+        "limit": None, "reserve": None, "ended_by_days": 0, "ended_by_lines": [],
+        "warn_verified_lines": [], "warn_verified_days": [], "has_events": False,
+    }
+    for _ln, _ev in rows:
+        _sn = _ev.get("event")
+        if _sn == "slot_relief":
+            slot_relief["events"] += 1
+            slot_relief["lines"].append(_ln)
+            _fed = as_int(_ev.get("freed"), None)
+            if _fed is None:
+                slot_relief["freed_missing_lines"].append(_ln)
+            else:
+                slot_relief["freed_total"] += _fed
+                if _fed <= 0:
+                    slot_relief["zero_freed_lines"].append(_ln)
+            if _ev.get("shipped"):
+                slot_relief["shipped"] += 1
+            if slot_relief["max_rounds"] is None:
+                slot_relief["max_rounds"] = as_int(_ev.get("max_rounds"), None)
+            if slot_relief["reserve"] is None:
+                slot_relief["reserve"] = as_int(_ev.get("reserve"), None)
+        elif _sn == "slot_relief_noted":
+            slot_relief["noted_events"] += 1
+        elif _sn == "inventory_blocked":
+            inventory_blocked["events"] += 1
+            inventory_blocked["lines"].append(_ln)
+            _rs = str(_ev.get("reason") or "?")
+            inventory_blocked["reasons"][_rs] = inventory_blocked["reasons"].get(_rs, 0) + 1
+            inventory_blocked["free_slots"].append(as_int(_ev.get("free_slots"), None))
+            inventory_blocked["rounds"].append(as_int(_ev.get("rounds"), None))
+            if inventory_blocked["limit"] is None:
+                inventory_blocked["limit"] = as_int(_ev.get("limit"), None)
+            if inventory_blocked["reserve"] is None:
+                inventory_blocked["reserve"] = as_int(_ev.get("reserve"), None)
+    slot_relief["has_events"] = bool(slot_relief["events"] or slot_relief["noted_events"])
+    inventory_blocked["has_events"] = bool(inventory_blocked["events"])
+    # 日级：`ended_by == inventory_blocked` 的日子（那天 `_do_sleep` 成功 ⇒ 游戏日确实翻篇）；
+    #   这些天却自称 VERIFIED ⇒ 互斥组合 ⚠（只警告、不进 rc）。
+    for _d in days:
+        if str(_d.get("ended_by") or "") != "inventory_blocked":
+            continue
+        inventory_blocked["ended_by_days"] += 1
+        inventory_blocked["ended_by_lines"].append(_d.get("start_line"))
+        if _d.get("verified") is True:
+            inventory_blocked["warn_verified_days"].append(_d.get("label"))
+            inventory_blocked["warn_verified_lines"].append(_d.get("start_line"))
     sleep_ok = sum(1 for _, ev in rows if ev.get("event") == "sleep" and ev.get("ok"))
     sleep_failed = sum(1 for _, ev in rows if ev.get("event") == "sleep" and not ev.get("ok"))
     blocked_by_action = {}
@@ -5029,6 +5135,9 @@ def build_report(rows, path, args, bad_lines):
         "same_day_retries": same_day_retries,
         "buy": buy_counts,
         "sell": sell,
+        # task-202（dev task-198）：背包满 ⇒ 腾格回路 + 诚实「背包阻塞」收尾（信息项，不进 rc）
+        "slot_relief": slot_relief,
+        "inventory_blocked": inventory_blocked,
         # task-70：种子经济（task-67 的种子三事件；与 buy 一起才是守卫死锁的完整指纹）
         "seed_economy": seed_economy,
         # task-84：死苗/放弃格（`dead_crops`/`dry_dead`/`gave_up_tiles`；缺失 ⇒【无法判定】）
@@ -5761,6 +5870,11 @@ MAPPING_TEXT = [
     ("t 回退",
      "信息项：同一会话内 t 倒退只记录，不判失败（verify-run3.py 同口径）"),
     ("本工具与 tools\\verify-run3.py", "独立读数、交叉核对：同一本账本给出相反结论 ⇒ 停下来人工对账，别单方面改口径"),
+    ("event:slot_relief / slot_relief_noted / inventory_blocked (task-198)",
+     "信息项：背包满 ⇒ 先腾格（`slot_relief` 真动过，**不是失败、不是豁免**；`freed==0` 的日子要点名）"
+     " / 同日去重标记（`slot_relief_noted`，纯标记无判据）；`inventory_blocked` = 当天腾不出格 ⇒ "
+     "**如实上限**（`ended_by=inventory_blocked`、`verified=false`、`failed_steps=0`；`slept_by_us` 也认），"
+     "**不许写成失败或豁免**；唯一可证伪 ⚠ = 那天却自称 VERIFIED（不进 rc）"),
     ("refill / plot", "辅助：补水、观测（截断警告）"),
     ("idle", "辅助：一整轮没动作（acted/rounds）⇒ 空转，常与'该做没做'并看"),
 ]
@@ -5939,6 +6053,32 @@ def render_text(report, top):
             + (f"  ⚠ 窗口里 ripe=true 但 ready=false：行 "
                f"{cr.get('window_ripe_not_ready_lines', [])[:6]}"
                if cr.get("window_ripe_not_ready_lines") else ""))
+    # task-202（dev task-198）：腾格回路 + 诚实「背包阻塞」收尾（都是信息项：不是失败、不是豁免）。
+    sr = report.get("slot_relief") or {}
+    ib = report.get("inventory_blocked") or {}
+    if not sr.get("has_events"):
+        add("腾格回路: <缺失>（本账本没有任何 task-198 的 `slot_relief` / `slot_relief_noted` 事件 ⇒ "
+            "无法判定当时背包满时有没有走『先腾格』回路 —— 缺失 ≠ 0）")
+    else:
+        add(f"腾格回路: `slot_relief` {sr.get('events')} 次（腾出 {sr.get('freed_total')} 格；"
+            f"其中出货腾格 {sr.get('shipped')} 次；同轮去重标记 {sr.get('noted_events')} 条；"
+            f"上限 {sr.get('max_rounds')} 轮 / 保留 {sr.get('reserve')} 格）"
+            "—— 回路真动过，**不是失败、不是豁免**"
+            + (f"  ⚠ 腾格尝试却没真腾出格（freed=0）：行 {sr.get('zero_freed_lines', [])[:6]}"
+               if sr.get("zero_freed_lines") else "")
+            + (f"  ⚠ `freed` 键缺失的行 {sr.get('freed_missing_lines', [])[:6]}（无法判定腾了几格）"
+               if sr.get("freed_missing_lines") else ""))
+    if not ib.get("has_events") and not ib.get("ended_by_days"):
+        add("背包阻塞: <缺失>（本账本没有 `inventory_blocked` 事件、也没有 `ended_by=inventory_blocked` "
+            "的收工 ⇒ 无法判定当时是否被背包满诚实地停过 —— 缺失 ≠ 0）")
+    else:
+        _ibr = "、".join(f"{k}×{v}" for k, v in list((ib.get("reasons") or {}).items())[:4]) or "<无>"
+        add(f"背包阻塞: `inventory_blocked` {ib.get('events')} 次（{_ibr}）；以 "
+            f"`ended_by=inventory_blocked` 收工 {ib.get('ended_by_days')} 天（当天 `failed_steps=0`、"
+            "`slept_by_us` 也认这一天）—— 这是**如实上限**，不是失败、也不是豁免"
+            + (f"  ⚠ 背包阻塞当天却自称 VERIFIED：行 {ib.get('warn_verified_lines', [])[:6]}"
+               "（互斥组合 ⇒ 人工核对；不进 rc）"
+               if ib.get("warn_verified_lines") else ""))
     # task-179：`ready` 的**来源**（game/fields/null/缺键）—— `fields` 是等价路径，不是 fail-open。
     if not cr.get("has_ready_source") and not cr.get("ready_source_missing_tiles"):
         add("可收来源: <缺失>（本账本没有 `tiles[].readySource` ⇒【无法判定·旧 Mod】：分不清 `ready` "

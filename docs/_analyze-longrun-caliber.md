@@ -1078,6 +1078,59 @@ git grep -n "shed_tiles_remaining\|shed_ever_total\|released_tiles" -- brain/age
 python tools\analyze-longrun.py --journal logs\longrun-runA-0732.jsonl --days 6 | rg "规模取舍|末态"
 ```
 
+## 3.31 背包腾格与「背包阻塞」收尾（task-198，task-202 收录）
+
+**背景**：task-198（dev `62e9089`）让大脑在背包满/将满时先走**腾格优先收敛回路**（把盈余材料出货或
+卖一件来腾格，再回去干活），实在腾不出来就**诚实收工**（不再空转）。机械枚举实捕 **3 个**新 journal 事件名：
+
+| 事件 | brain 位置 | 字段 | 语义 |
+|---|---|---|---|
+| `slot_relief` | `brain/agentfarm/longrun.py:4403`（`_slot_relief` 尾部） | need/freed/shipped/freeSlots_before/freeSlots_after/round/max_rounds/reserve/note | **腾格回路真动过**（返回 True ⇒ 调用方重新观测/决策） |
+| `slot_relief_noted` | `brain/agentfarm/longrun.py:4384` | free_slots/reserve/round/limit/note | 同日「需要腾格」只记一次的**去重标记**（纯标记、无判据） |
+| `inventory_blocked` | `brain/agentfarm/longrun.py:4346`（`_note_inventory_blocked`） | free_slots/reserve/rounds/limit/reason/note | 当天**腾不出格 ⇒ 如实收尾**（每天只记一次） |
+
+常量与联动：`SLOT_RELIEF_MAX = 3`（`:133`）、`SLOT_RESERVE = 1`（`:138`）；`freed == 0` ⇒ 立刻
+`_note_inventory_blocked` + 返回 False；`brain/agentfarm/longrun.py:6689` 把
+`checks["slept_by_us"]` 认成 `rep.ended_by in ("sleep", "inventory_blocked")`（那天确实睡了、游戏日翻篇）。
+
+**口径红线（三不许）**：
+1. `slot_relief` **不是失败**（不进 `failed_steps`/`no_hard_failures`），**也不是豁免**（不进任何豁免分子、不洗白 leftover）；
+2. `freed == 0` 的日子必须点名（腾格尝试空转 ⇒ 先看有没有可出货/可卖的叠）；
+3. `inventory_blocked` = **如实上限**：那天 `ended_by="inventory_blocked"`、`verified=false`、`failed_steps=0`；
+   它**不在** `JUSTIFIED_END_REASONS` ⇒ `day_justified=false`（`brain/agentfarm/longrun.py:4097-4101`）。
+   **不许写成失败，也不许写成豁免**。
+
+**本工具**：头部新增两行「腾格回路:」/「背包阻塞:」（旧账本缺事件 ⇒ `<缺失>`，**缺失 ≠ 0**）；
+`FIELD_PROBES` +5（三事件 + `slot_relief.freed` + `inventory_blocked.free_slots`，三态：缺键 = 旧账本 /
+`null` = 无法判定 / 有值 = 正常）；建议 0s-6；`MAPPING_TEXT` +1 行。
+唯一可证伪 ⚠ = `inventory_blocked` 当天却自称 `verified=true`（互斥组合 ⇒ 人工核对，**不进 rc**）。
+`tools\verify-run3.py` 对 `slot_relief`/`inventory_blocked`/`ready_far*` **零命中**（实测 0 处）
+⇒ 本工具绝不判红（判红会两边反向）。
+
+**「#无法判定」并排（任务卡要求说明）**：8 本旧账本上 rc 与红数**一字未变**，`#无法判定` 每本 **+5**——
+这 5 条正是本卡新增的探针按「缺失 ⇒ 无法判定（缺失 ≠ 0）」如实报出的（旧账本全无这三事件，实测 0 命中）；
+方向是**新增可见性**而非判据变化。如要求字面零增量，只需撤掉这 5 条探针（头部 `<缺失>` 行仍保留语义）。
+
+**副产物（task-199 在制）**：机械枚举同时抓到 dev task-199 **未提交**的 5 个 `ready_far*` 事件
+（`ready_far` / `ready_far_blocked` / `ready_far_skipped` / `ready_far_truncated` /
+`ready_far_unavailable`，语义 = 窗口外熟作物按 `farm.readyTiles` 坐标走过去收）——
+已入桶保证全量漂移测试绿（漂移测试直接扫工作区 brain 源码），**语义待 task-199 commit 后再补口径节**。
+
+**单测**：`tests/test_analyze_longrun.py::TestSlotReliefAndInventoryBlocked` 6 条 —— 三事件有桶不落未映射 /
+腾格是信息项不判红 / `freed==0` 点名且建议点出「回路空转」/ 阻塞收尾是如实上限不判红 /
+阻塞当天却 VERIFIED ⇒ ⚠ 但 rc=0 / 旧账本 `<缺失>` +【无法判定】。
+
+**读数**：`py_compile -W error::SyntaxWarning` RC=0；`tests.test_analyze_longrun` **225 OK**（+6）；
+全量 `discover -s tests` **Ran 992 tests / OK（0 红）**（基线 986 里那 2 条漂移红已归零）。
+
+**grep 配方**：
+
+```
+git grep -n "_journal(\"slot_relief\|_journal(\"inventory_blocked" -- brain/agentfarm/longrun.py
+python tools\analyze-longrun.py --journal logs\longrun-runA-0732.jsonl --days 6 | rg "腾格回路|背包阻塞"
+python scratch\_t202_matrix.py    # 旧版 HEAD 导出 vs 新版：rc/红/#无法判定 并排
+```
+
 ## 4. 复核命令
 
 ```
@@ -1091,6 +1144,6 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run9d.jsonl --da
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
 python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
-python -m unittest tests.test_analyze_longrun  # 当前 219 OK（task-194 + 末态口径/子字段探针修复 5 条）
-python -m unittest discover -s tests           # 当前 Ran 970 tests / OK（0 红）
+python -m unittest tests.test_analyze_longrun  # 当前 225 OK（task-202 + 腾格回路/背包阻塞 6 条）
+python -m unittest discover -s tests           # 当前 Ran 992 tests / OK（0 红）
 ```
