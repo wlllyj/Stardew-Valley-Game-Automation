@@ -13,7 +13,9 @@
 
 它**不改判据、不参与验收 rc**：真正的判决仍以
 `tools/verify-run3.py`（尾部窗口 + 严格整本第二判决）与 `tools/analyze-longrun.py` 为准。
-本工具恒退出 0；文件读不到时退出 2 并说明缺哪个文件（缺文件 ≠ 通过）。
+**退出码承诺（task-217 统一）**：账本/sidecar 读不到或读坏 ⇒ `rc=2` 并说明是哪个文件
+（缺文件/坏文件 ≠ 通过）；只要能读，L 级结论只进文本与 `--json`，**恒 `rc=0`**。
+**L1 分母**只算 `-llm.jsonl` 的**决策行**（`kind="review"` 复盘行单独报数、不计入）。
 
 用法：
     python tools/compare-runs.py --run-a logs\\longrun-3day-llm-run9.jsonl \\
@@ -35,9 +37,22 @@ PROBLEM_STOPPED = {
 }
 
 
+class LedgerReadError(Exception):
+    """读不到/读坏账本或 sidecar。
+
+    task-217：本工具的退出码承诺统一为——**读不到/读坏 ⇒ rc=2；能读 ⇒ 恒 rc=0**
+    （L 级结论只进文本与 `--json`，不参与验收 rc）。以前这里 `raise SystemExit("[exit 2] …")`
+    会被 Python 当成"错误消息 + rc=1"，文案却写着 `[exit 2]`，自相矛盾。
+    """
+
+
 def load_rows(path: Path) -> list[dict]:
     rows: list[dict] = []
-    with path.open("r", encoding="utf-8") as fh:
+    try:
+        fh = path.open("r", encoding="utf-8")
+    except OSError as exc:
+        raise LedgerReadError(f"读不到 {path}：{exc}") from exc
+    with fh:
         for lineno, line in enumerate(fh, 1):
             line = line.strip()
             if not line:
@@ -45,7 +60,7 @@ def load_rows(path: Path) -> list[dict]:
             try:
                 row = json.loads(line)
             except json.JSONDecodeError as exc:
-                raise SystemExit(f"[exit 2] {path}:{lineno} 不是合法 JSON：{exc}")
+                raise LedgerReadError(f"{path}:{lineno} 不是合法 JSON：{exc}") from exc
             if isinstance(row, dict):
                 rows.append(row)
     return rows
@@ -85,6 +100,9 @@ def harvest(rows: list[dict]) -> dict:
         "days": [], "trace_rows": 0,
         # task-58/59/82 的演进对照（L1–L5）要用到的信号
         "ended_by": {}, "event_counts": {}, "checks_false": [], "decision_texts": [],
+        # task-217：L2 按**现行形态**取信号（旧版 `ended_by:stuck` 在 0.7.37 起恒 0）
+        "stage_stopped": {}, "stage_stopped_total": {},
+        "stage_leftover": {}, "leftover_days_total": 0, "dead_crops_days": 0,
     }
     for row in rows:
         ev = row.get("ev") or row.get("event") or ""
@@ -110,6 +128,9 @@ def harvest(rows: list[dict]) -> dict:
                 "checks_false": false_keys,
             })
             # 阶段结果在 day_end.stages[]（不是独立的 stage 事件；tiles 是整数不是坐标列表）
+            if int(row.get("dead_crops") or 0) > 0:
+                info["dead_crops_days"] += 1
+            day_has_leftover = False
             for st in row.get("stages") or []:
                 if not isinstance(st, dict):
                     continue
@@ -120,6 +141,18 @@ def harvest(rows: list[dict]) -> dict:
                     info["stage_ok_by_task"][stage] = info["stage_ok_by_task"].get(stage, 0) + ok
                 if bad or str(st.get("stopped") or "") in PROBLEM_STOPPED:
                     info["stage_fail_by_task"][stage] = info["stage_fail_by_task"].get(stage, 0) + max(1, bad)
+                # task-217：现行"卡住带 leftover"的真实形态 = 阶段 stopped + leftover>0
+                stopped = str(st.get("stopped") or "")
+                if stopped:
+                    info["stage_stopped"][f"{stage}|{stopped}"] = (
+                        info["stage_stopped"].get(f"{stage}|{stopped}", 0) + 1)
+                    info["stage_stopped_total"][stopped] = (
+                        info["stage_stopped_total"].get(stopped, 0) + 1)
+                if int(st.get("leftover") or 0) > 0:
+                    info["stage_leftover"][stage] = info["stage_leftover"].get(stage, 0) + 1
+                    day_has_leftover = True
+            if day_has_leftover:
+                info["leftover_days_total"] += 1
         elif ev == "finish":
             info["finish"] = {
                 "code": row.get("code"),
@@ -174,7 +207,12 @@ def lessons_of(journal: Path) -> tuple[list[dict], str]:
                              if isinstance(e, dict)]
             entries = jsonl_wrapped or entries
         else:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except OSError as exc:
+                raise LedgerReadError(f"读不到 {path}：{exc}") from exc
+            except json.JSONDecodeError as exc:
+                raise LedgerReadError(f"{path} 不是合法 JSON：{exc}") from exc
             entries = raw.get("lessons") if isinstance(raw, dict) else raw
             if not isinstance(entries, list):
                 entries = []
@@ -231,7 +269,13 @@ def lesson_section_present(prompts: list[str]) -> bool:
     return any(LESSON_SECTION_MARK in p for p in prompts if isinstance(p, str))
 
 
-def prompts_of(journal: Path) -> list[str]:
+def prompt_rows_of(journal: Path) -> list[dict]:
+    """读 `<journal>-llm.jsonl` 的每行 `{kind, prompt}`（缺文件 ⇒ 空列表，不算读坏）。
+
+    task-217：L1 的**分母只算决策行**。0.7.37 起 brain 把夜间复盘的 review 调用也写进
+    同一份留痕（`kind="review"`）；把它算进"LLM 调用数"会稀释命中率（runB-0732 实测
+    70 决策 + 2 review ⇒ 旧版报 72 次）。缺 `kind` 的旧留痕按决策行算（兼容）。
+    """
     path = sidecar(journal, "-llm.jsonl")
     if not path.exists():
         return []
@@ -239,8 +283,20 @@ def prompts_of(journal: Path) -> list[str]:
     for row in load_rows(path):
         prompt = row.get("prompt")
         if isinstance(prompt, str):
-            out.append(prompt)
+            out.append({"kind": str(row.get("kind") or ""), "prompt": prompt})
     return out
+
+
+def split_prompts(rows: list[dict]) -> tuple[list[str], list[str]]:
+    """`(决策行提示词, review 行提示词)`。L1 三信号只用前者。"""
+    decision = [r["prompt"] for r in rows if r["kind"] != "review"]
+    review = [r["prompt"] for r in rows if r["kind"] == "review"]
+    return decision, review
+
+
+def prompts_of(journal: Path) -> list[str]:
+    """兼容旧调用：只返回**决策行**提示词（review 复盘行不计入 L1 分母）。"""
+    return split_prompts(prompt_rows_of(journal))[0]
 
 
 def counter_table(title: str, left: dict, right: dict, la: str, lb: str,
@@ -259,13 +315,26 @@ def counter_table(title: str, left: dict, right: dict, la: str, lb: str,
 # ---------------------------------------------------------------------------
 # 演进判据 L0–L5（`docs/_run10-criteria.md`）：把"带教训再玩"的对照做成**机械可算**的部分，
 # 不能机械判定的（L3 决策是否真受影响）只给旁证，并在结论里如实标注。
-_LESSON_SIGNAL = {
-    # lesson id 的 `kind` → 账本里可数的同形态信号
-    "stuck_with_leftover": ("ended_by", "stuck"),
-    "plot_exhausted": ("ended_by", "stuck"),
-    "slept_without_work": ("ended_by", "slept_without_work"),
-    "far_dry_given_up": ("ended_by", "gave_up_dry"),
-    "no_inventory_space": ("event", "buy_no_space"),
+# task-217：L2 的信号表必须跟着**现行账本形态**走。
+# 旧表把"卡住带 leftover"映射到 `ended_by:stuck`，但 0.7.37 起该形态落在
+# `day_end.stages[].stopped/leftover`（`ended_by` 只是 sleep/sleep_failed）⇒ 旧信号恒 0，
+# 叠加旧的 `count_a == 0 ⇒ improved` 假阳性，L2 就永远"✅ 减少"。这里改为多候选、现行形态优先。
+_LESSON_SIGNALS: dict[str, list[tuple[str, str]]] = {
+    "stuck_with_leftover": [("stage_leftover", ""), ("stage_stopped", "incomplete"), ("ended_by", "stuck")],
+    "plot_exhausted": [("event", "plot_exhausted"), ("stage_stopped", "no_target")],
+    "slept_without_work": [("ended_by", "slept_without_work")],
+    "far_dry_given_up": [("ended_by", "gave_up_dry")],
+    "no_inventory_space": [("event", "buy_no_space"), ("event", "inventory_blocked")],
+    "stage_incomplete": [("stage_stopped", "incomplete")],
+    "dead_crops": [("day_dead_crops", "")],
+    # task-217：run A 的教训 id 实际是 `dead_crops_blocking|farm`（不是 `dead_crops`）⇒ 旧表查不到任何信号
+    "dead_crops_blocking": [("day_dead_crops", "")],
+}
+
+# L4「无新增硬失败类别」只认这些 checks 键；其它 check（如 `zero_action_evidenced`）只作附注
+HARD_FAILURE_CHECKS = {
+    "no_hard_failures", "no_unmet_stages", "no_blocking_modal",
+    "watered_outdoor", "unreachable_within_bound", "refused_within_bound",
 }
 
 
@@ -284,11 +353,43 @@ def tail_verified(days: list[dict]) -> int:
     return count
 
 
-def _signal_count(info: dict, signal: tuple[str, str]) -> int:
-    kind, name = signal
+def _signal_count(info: dict, kind: str, name: str = "", scope: str = "") -> int:
+    """数一种"同形态"在账本里出现了几次（task-217：支持现行阶段形态与 scope）。"""
     if kind == "ended_by":
         return int((info.get("ended_by") or {}).get(name, 0))
-    return int((info.get("event_counts") or {}).get(name, 0))
+    if kind == "event":
+        return int((info.get("event_counts") or {}).get(name, 0))
+    if kind == "stage_leftover":
+        table = info.get("stage_leftover") or {}
+        if scope:
+            return int(table.get(scope, 0))
+        return sum(int(v) for v in table.values())
+    if kind == "stage_stopped":
+        if scope:
+            return int((info.get("stage_stopped") or {}).get(f"{scope}|{name}", 0))
+        return int((info.get("stage_stopped_total") or {}).get(name, 0))
+    if kind == "day_dead_crops":
+        return int(info.get("dead_crops_days") or 0)
+    return 0
+
+
+def _signal_candidates(entry: dict, info_a: dict) -> list[tuple[str, str, str]]:
+    """教训 → 候选信号 `[(kind, name, scope)]`；scope 优先，但只在 run A 真出现过该阶段时生效。
+
+    文档 L20 要求按 `(kind, scope)` 匹配：scope 是阶段名（如 `harvest`）时只数该阶段；
+    不是阶段名（如田区名）或 run A 里没有该阶段 ⇒ 退回全阶段聚合，避免"scope 不匹配 ⇒ 恒 0"。
+    """
+    kind = lesson_kind(entry)
+    scope_raw = str(entry.get("scope") or "")
+    stages_a = set((info_a.get("stage_leftover") or {}).keys())
+    stopped_a = info_a.get("stage_stopped") or {}
+    scope_ok = bool(scope_raw) and (
+        scope_raw in stages_a or any(k.startswith(scope_raw + "|") for k in stopped_a))
+    out: list[tuple[str, str, str]] = []
+    for sig_kind, name in _LESSON_SIGNALS.get(kind) or []:
+        use_scope = scope_raw if (scope_ok and sig_kind in ("stage_leftover", "stage_stopped")) else ""
+        out.append((sig_kind, name, use_scope))
+    return out
 
 
 def _tokens(text: str) -> set[str]:
@@ -298,31 +399,69 @@ def _tokens(text: str) -> set[str]:
 
 def criteria(info_a: dict, info_b: dict, lessons: list[dict], hits: int,
              prompts_b: list[str], la: str = "runA", lb: str = "runB",
-             section_present: bool | None = None) -> dict:
-    tail_a, tail_b = tail_verified(info_a["days"]), tail_verified(info_b["days"])
+             section_present: bool | None = None, window: int = 3,
+             review_calls: int = 0) -> dict:
+    """L0–L5 的机械判定（task-217 修订）。
+
+    修订要点：
+      * L0 补「至少 1 条 `count >= 1`」（文档 §1 一直这么要求，代码旧版漏了）；
+      * L2 改**严格三态**（减少 / 未变 / 增加；两边都没有 ⇒ 无可比），并按现行形态取信号 + scope；
+      * L4 只看尾部 `window` 天（= 验收窗口），新增失败只认 `HARD_FAILURE_CHECKS`；
+      * L5 门禁补齐 L0–L3 + 尾部达标（旧版只串行门 L0/L1/L2 且 `tail_b < 3` 硬编码）。
+    """
+    tail_a = tail_verified((info_a.get("days") or [])[-window:])
+    tail_b = tail_verified((info_b.get("days") or [])[-window:])
     signals: list[dict] = []
     for entry in lessons:
         kind = lesson_kind(entry)
-        signal = _LESSON_SIGNAL.get(kind)
-        if not signal:
+        cands = _signal_candidates(entry, info_a)
+        if not cands:
             signals.append({"kind": kind, "lesson": lesson_full_text(entry)[:96], "signal": None,
-                            "a": None, "b": None, "improved": None})
+                            "a": None, "b": None, "status": "无可数信号（需人工看账本）",
+                            "improved": None, "comparable": False})
             continue
-        count_a, count_b = _signal_count(info_a, signal), _signal_count(info_b, signal)
+        chosen: tuple[str, str, str, int, int] | None = None
+        for sig_kind, name, scope in cands:  # 优先选 run A 真出现过的形态
+            a = _signal_count(info_a, sig_kind, name, scope)
+            if a > 0:
+                chosen = (sig_kind, name, scope, a, _signal_count(info_b, sig_kind, name, scope))
+                break
+        if chosen is None:  # 两边都没有该形态（或 run A 无基线）
+            sig_kind, name, scope = cands[0]
+            chosen = (sig_kind, name, scope, 0, _signal_count(info_b, sig_kind, name, scope))
+        sig_kind, name, scope, count_a, count_b = chosen
+        if count_a == 0 and count_b == 0:
+            status, improved, comparable = "两边都没有（无可比）", None, False
+        elif count_a == 0:
+            status, improved, comparable = f"run A 无基线、run B={count_b}（更差）", False, False
+        elif count_b < count_a:
+            status, improved, comparable = "减少", True, True
+        elif count_b == count_a:
+            status, improved, comparable = "未变", False, True
+        else:
+            status, improved, comparable = "增加", False, True
+        label = f"{sig_kind}:{name}" + (f"@{scope}" if scope else "")
         signals.append({
             "kind": kind, "lesson": lesson_full_text(entry)[:96],
-            "signal": f"{signal[0]}:{signal[1]}",
-            "a": count_a, "b": count_b,
-            "improved": (count_a == 0) or (count_b < count_a),
+            "signal": label, "a": count_a, "b": count_b,
+            "status": status, "improved": improved, "comparable": comparable,
         })
     mapped = [s for s in signals if s["signal"]]
+    comparable = [s for s in mapped if s.get("comparable")]
     new_false = sorted(set(info_b.get("checks_false") or []) - set(info_a.get("checks_false") or []))
-    l0 = len(lessons) >= 1
+    new_hard_false = [k for k in new_false if k in HARD_FAILURE_CHECKS]
+    other_new_false = [k for k in new_false if k not in HARD_FAILURE_CHECKS]
+    counts = [int(e.get("count") or 0) for e in lessons if isinstance(e.get("count"), int)]
+    l0_count_ok = any(c >= 1 for c in counts) if counts else None
+    l0 = len(lessons) >= 1 and l0_count_ok is True
     if section_present is None:
         section_present = lesson_section_present(prompts_b)
     l1 = bool(lessons) and bool(prompts_b) and hits > 0
-    l2 = bool(mapped) and all(bool(s["improved"]) for s in mapped)
-    l4 = (tail_b >= tail_a) and not new_false
+    if not mapped or not comparable:
+        l2: bool | None = None  # 无法判定：没有任何 run A 里真出现过的可比形态
+    else:
+        l2 = all(bool(s["improved"]) for s in comparable)
+    l4 = (tail_b >= tail_a) and not new_hard_false
     # L3 只给旁证：教训里的具体指涉有没有出现在 run B 的决策理由/预期证据里
     influence: list[dict] = []
     for entry in lessons:
@@ -334,51 +473,89 @@ def criteria(info_a: dict, info_b: dict, lessons: list[dict], hits: int,
                     mentioned += 1
         influence.append({"lesson": lesson_full_text(entry)[:96], "decision_mentions": mentioned,
                           "note": "旁证：只在「理由/预期证据里出现同一指涉」意义上成立，不等于决策被改变"})
+    l3_evidence = any(int(item["decision_mentions"]) > 0 for item in influence)
     if not l0:
-        verdict = "不足以判定自我进化（run A 没产出教训，A→B 对照作废）"
+        why = ("run A 没产出教训" if not lessons
+               else "教训库没有任何 count>=1 的条目" if l0_count_ok is False
+               else "教训库缺 count 字段，无法证明有可注入教训")
+        verdict = f"不足以判定自我进化（L0：{why} ⇒ A→B 对照作废）"
     elif not l1:
-        verdict = "不足以判定自我进化（教训没有进 run B 的提示词）"
+        verdict = "不足以判定自我进化（L1：教训没有进 run B 的决策提示词）"
+    elif l2 is None:
+        verdict = "不足以判定自我进化（L2：教训对应的形态在 run A 里没出现过，无可比基线）"
     elif not l2:
-        verdict = "不足以判定自我进化（同形态在 run B 没有减少）"
-    elif tail_b < 3:
-        verdict = "有演进痕迹，但 run B 未达标（尾部连续 VERIFIED < 3 天）"
+        verdict = "不足以判定自我进化（L2：同形态在 run B 没有减少）"
+    elif not l4:
+        verdict = ("不足以判定自我进化（L4：run B 尾部窗口 VERIFIED 未达标"
+                   + (f"，新增硬失败类别 {new_hard_false}" if new_hard_false else "") + "）")
+    elif not l3_evidence:
+        verdict = "不足以判定自我进化（L3：没有任何决策受影响的旁证）"
+        if tail_b < window:
+            verdict += f"；且 run B 尾部连续 VERIFIED {tail_b} < {window} 天"
+    elif tail_b < window:
+        verdict = f"有演进痕迹，但 run B 未达标（尾部连续 VERIFIED {tail_b} < {window} 天）"
     else:
-        verdict = "有演进证据（L1/L2/L4 机械成立；L3 需人工确认理由相关性）"
+        verdict = "有演进证据（L0/L1/L2/L4 机械成立且 L3 有旁证；正式结论仍需人工核对）"
     return {
         "l0_lessons_exist": l0,
+        "l0_count_ok": l0_count_ok,
         "l1_injection_effective": l1,
         "l2_same_shape_decreased": l2,
+        "l2_comparable_signals": len(comparable),
         "l3_influence_evidence": influence,
+        "l3_evidence_present": l3_evidence,
         "l4_no_regression": l4,
         "l5_verdict": verdict,
         "tail_verified": {la: tail_a, lb: tail_b},
+        "tail_window_days": window,
         "signals": signals,
         "new_false_checks_in_b": new_false,
+        "new_hard_false_checks_in_b": new_hard_false,
+        "other_new_false_checks_in_b": other_new_false,
         "lesson_hits": hits,
         "lessons_total": len(lessons),
         "lesson_section_present": bool(section_present),
         "b_prompt_calls": len(prompts_b),
+        "b_review_calls": review_calls,
     }
 
 
 def print_criteria(crit: dict, la: str, lb: str) -> None:
     print("\n[6] 演进判据（L0–L5，机械可算部分 + 旁证）")
-    mark = lambda ok: "✅" if ok else "❌"  # noqa: E731
-    print(f"  L0 run A 有教训库（≥1 条）            : {mark(crit['l0_lessons_exist'])}"
-          f"  ({crit['lessons_total']} 条)")
-    print(f"  L1 教训确实进了 run B 提示词          : {mark(crit['l1_injection_effective'])}"
-          f"  ({crit['lesson_hits']}/{crit['lessons_total']} 命中，run B {crit['b_prompt_calls']} 次调用)")
-    print(f"  L2 同形态在 run B 减少                : {mark(crit['l2_same_shape_decreased'])}")
+    def mark(ok: object) -> str:
+        if ok is None:
+            return "❓"
+        return "✅" if ok else "❌"
+
+    count_note = ("count 字段缺失（无法证明有 count>=1）" if crit["l0_count_ok"] is None
+                  else f"至少 1 条 count>=1：{crit['l0_count_ok']}")
+    print(f"  L0 run A 有教训库（≥1 条且 ≥1 条 count>=1）: {mark(crit['l0_lessons_exist'])}"
+          f"  ({crit['lessons_total']} 条；{count_note})")
+    print(f"  L1 教训确实进了 run B 决策提示词      : {mark(crit['l1_injection_effective'])}"
+          f"  ({crit['lesson_hits']}/{crit['lessons_total']} 命中，run B {crit['b_prompt_calls']} 次决策调用"
+          f"；另有 {crit['b_review_calls']} 次 review 复盘调用不计入分母)")
+    print(f"  L2 同形态在 run B 减少                : {mark(crit['l2_same_shape_decreased'])}"
+          f"  （可比信号 {crit['l2_comparable_signals']} 条）")
+    status_flag = {
+        "减少": "✅ 减少", "未变": "❌ 未减少", "增加": "⚠ 增加",
+        "两边都没有（无可比）": "➖ 无可比（两边都没有）",
+    }
     for sig in crit["signals"]:
         if sig["signal"]:
-            print(f"       · {sig['kind']:<20} {sig['signal']:<28} {la}={sig['a']} → {lb}={sig['b']}"
-                  f"  {'✅ 减少' if sig['improved'] else '❌ 未减少'}")
+            flag = status_flag.get(sig["status"], f"❌ {sig['status']}")
+            print(f"       · {sig['kind']:<20} {sig['signal']:<34} {la}={sig['a']} → {lb}={sig['b']}"
+                  f"  {flag}")
         else:
             print(f"       · {sig['kind']:<20} （无可数信号，需人工看账本）")
     tails = crit["tail_verified"]
-    print(f"  L4 无回归（尾部 VERIFIED 不降 + 无新失败类）: {mark(crit['l4_no_regression'])}"
+    print(f"  L4 无回归（尾部 {crit['tail_window_days']} 天 VERIFIED 不降 + 无新硬失败类）: "
+          f"{mark(crit['l4_no_regression'])}"
           f"  尾部 {la}={tails.get(la)} → {lb}={tails.get(lb)}"
-          + (f"；新增失败项 {crit['new_false_checks_in_b']}" if crit["new_false_checks_in_b"] else ""))
+          + (f"；新增硬失败项 {crit['new_hard_false_checks_in_b']}"
+             if crit["new_hard_false_checks_in_b"] else ""))
+    if crit["other_new_false_checks_in_b"]:
+        print(f"       附注（不判 L4）：新增的非硬失败 check 项 "
+              f"{crit['other_new_false_checks_in_b']}（如 `zero_action_evidenced`，只作线索）")
     print("  L3 决策受影响的旁证（需人工确认）    :")
     for item in crit["l3_influence_evidence"]:
         print(f"       · 决策理由里同指涉出现 {item['decision_mentions']} 次 ｜ {item['lesson'][:72]}")
@@ -397,6 +574,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--run-b", required=True, help="run B 账本（带着教训再玩的那次）")
     ap.add_argument("--label-a", default="runA")
     ap.add_argument("--label-b", default="runB")
+    ap.add_argument("--days", type=int, default=3,
+                    help="验收窗口天数（L4 尾部窗口 / L5 尾部达标都按它算；默认 3）")
     ap.add_argument("--json", dest="json_out", default="", help="把结构化对照结果写到这个文件")
     args = ap.parse_args(argv)
 
@@ -406,13 +585,20 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[exit 2] 账本不存在：{path}")
             return 2
 
-    rows_a, rows_b = load_rows(ja), load_rows(jb)
-    info_a, info_b = harvest(rows_a), harvest(rows_b)
+    try:
+        rows_a, rows_b = load_rows(ja), load_rows(jb)
+        lessons, lessons_path = lessons_of(ja)
+        prompt_rows_a = prompt_rows_of(ja)
+        prompt_rows_b = prompt_rows_of(jb)
+    except LedgerReadError as exc:  # task-217：读不到/读坏统一 rc=2
+        print(f"[exit 2] {exc}")
+        return 2
 
-    lessons, lessons_path = lessons_of(ja)
-    prompts_b = prompts_of(jb)
-    info_a["trace_rows"] = len(prompts_of(ja))
-    info_b["trace_rows"] = len(prompts_b)
+    info_a, info_b = harvest(rows_a), harvest(rows_b)
+    prompts_a, review_a = split_prompts(prompt_rows_a)
+    prompts_b, review_b = split_prompts(prompt_rows_b)
+    info_a["trace_rows"] = len(prompt_rows_a)
+    info_b["trace_rows"] = len(prompt_rows_b)
     joined_b = "\n".join(prompts_b)
     joined_b_norm = norm(joined_b)
 
@@ -458,7 +644,8 @@ def main(argv: list[str] | None = None) -> int:
             hits += 1 if hit else 0
             mark = "✅ 进提示词" if hit else "❌ 未见"
             print(f"  {idx:>2}. [{mark}] {text[:96]}")
-        print(f"  ⇒ {hits}/{len(lessons)} 条教训文本出现在 run B 的 {len(prompts_b)} 次 LLM 调用提示词里"
+        print(f"  ⇒ {hits}/{len(lessons)} 条教训文本出现在 run B 的 {len(prompts_b)} 次**决策**调用提示词里"
+              f"（另 {len(review_b)} 次 review 复盘调用不计入 L1 分母）"
               "（子串比对；注入后被裁掉的部分算未见）")
         print(f"  教训节抬头「{LESSON_SECTION_MARK}」在 run B 提示词里："
               f"{'✅ 出现' if section_present else '❌ 未见'}")
@@ -480,7 +667,7 @@ def main(argv: list[str] | None = None) -> int:
     injection_effective = bool(lessons) and bool(prompts_b) and hits > 0
 
     crit = criteria(info_a, info_b, lessons, hits, prompts_b, args.label_a, args.label_b,
-                    section_present)
+                    section_present, window=args.days, review_calls=len(review_b))
     print_criteria(crit, args.label_a, args.label_b)
 
     verdict = {
@@ -493,6 +680,12 @@ def main(argv: list[str] | None = None) -> int:
         "lesson_section_present": section_present,
         "injection_effective": injection_effective,
         "b_prompt_calls": len(prompts_b),
+        "b_decision_calls": len(prompts_b),
+        "b_review_calls": len(review_b),
+        "b_trace_rows": len(prompt_rows_b),
+        "a_decision_calls": len(prompts_a),
+        "a_review_calls": len(review_a),
+        "window_days": args.days,
         "criteria": crit,
     }
     if args.json_out:
@@ -506,6 +699,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  python tools/verify-run3.py --journal {jb} --days 3")
     print(f"  python tools/analyze-longrun.py --journal {ja} --days 3")
     print(f"  python tools/analyze-longrun.py --journal {jb} --days 3")
+    print("\n注：本工具读不到/读坏账本或 sidecar ⇒ rc=2；其余恒 rc=0"
+          "（L 级结论只进文本与 --json，不参与验收 rc）。")
     return 0
 
 

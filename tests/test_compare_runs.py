@@ -179,7 +179,7 @@ class CriteriaTests(unittest.TestCase):
 
     def _lesson(self, kind="stuck_with_leftover", scope="till_area"):
         return {"id": f"{kind}|{scope}", "symptom": "有格没做完", "evidence": "leftover=12",
-                "hint": "换片地再试"}
+                "hint": "换片地再试", "count": 1}
 
     def test_tail_verified_counts_only_trailing_true(self):
         days = [{"verified": True}, {"verified": False}, {"verified": True}, {"verified": True}]
@@ -189,7 +189,8 @@ class CriteriaTests(unittest.TestCase):
 
     def test_l5_reports_evolution_evidence_when_lesson_shape_drops(self):
         info_a = self._info([{"verified": False}], {"stuck": 3}, ["no_unmet_stages"])
-        info_b = self._info([{"verified": True}] * 3, {"stuck": 0})
+        info_b = self._info([{"verified": True}] * 3, {"stuck": 0},
+                            decision_texts=["先去做 leftover 12 格，别再换片"])
         crit = cr.criteria(info_a, info_b, [self._lesson()], 1, ["提示词里有教训"],
                            "run9c", "run10")
         self.assertTrue(crit["l0_lessons_exist"])
@@ -223,10 +224,19 @@ class CriteriaTests(unittest.TestCase):
 
     def test_l4_flags_new_false_check_in_b(self):
         info_a = self._info([{"verified": True}] * 3, {"sleep": 3})
-        info_b = self._info([{"verified": True}] * 3, {"sleep": 3}, ["day_justified"])
+        info_b = self._info([{"verified": True}] * 3, {"sleep": 3}, ["no_hard_failures"])
         crit = cr.criteria(info_a, info_b, [self._lesson()], 1, ["x"], "run9c", "run10")
         self.assertFalse(crit["l4_no_regression"])
-        self.assertEqual(crit["new_false_checks_in_b"], ["day_justified"])
+        self.assertEqual(crit["new_hard_false_checks_in_b"], ["no_hard_failures"])
+
+    def test_l4_soft_check_is_note_not_regression(self):
+        """task-217：`zero_action_evidenced` 这类 check 键不算"新增硬失败类别"。"""
+        info_a = self._info([{"verified": True}] * 3, {"sleep": 3})
+        info_b = self._info([{"verified": True}] * 3, {"sleep": 3}, ["zero_action_evidenced"])
+        crit = cr.criteria(info_a, info_b, [self._lesson()], 1, ["x"], "run9c", "run10")
+        self.assertTrue(crit["l4_no_regression"])
+        self.assertEqual(crit["other_new_false_checks_in_b"], ["zero_action_evidenced"])
+        self.assertEqual(crit["new_hard_false_checks_in_b"], [])
 
     def test_l3_evidence_counts_decision_mentions(self):
         info_a = self._info([{"verified": False}], {"stuck": 3})
@@ -336,6 +346,161 @@ class BrainLessonFieldTests(unittest.TestCase):
         self.assertFalse(verdict["injection_effective"])
         self.assertTrue(verdict["lesson_section_present"])
         self.assertEqual(verdict["lessons_hits"], 0)
+
+
+class Task217FixesTests(unittest.TestCase):
+    """task-217：L0/L2/L5 + L1 分母 + 恒退码 的回归钉死。
+
+    背景：task-215 审计发现 `improved = (count_a == 0) or (count_b < count_a)`
+    ⇒ `0 → 0` 被报「✅ 减少」，叠加过期的信号表（`stuck_with_leftover→ended_by:stuck`
+    在 0.7.37 起恒 0）⇒ L2 自动变绿，能把 A″/B″ 的结论直接判反。
+    """
+
+    @staticmethod
+    def _rows(leftovers: list[int]) -> list[dict]:
+        rows = []
+        for leftover in leftovers:
+            rows.append({
+                "event": "day_end", "day_key": [1, "fall", 3], "ended_by": "sleep",
+                "verified": leftover == 0, "ok_steps": 3, "failed_steps": 0,
+                "dead_crops": 0, "checks": {},
+                "stages": [{"stage": "harvest", "ok": 3, "failed": 0,
+                            "stopped": "incomplete" if leftover else "", "leftover": leftover}],
+            })
+        return rows
+
+    @staticmethod
+    def _info(*, days=None, leftover_days=None, texts=None) -> dict:
+        rows = Task217FixesTests._rows(leftover_days or []) if leftover_days is not None else []
+        info = cr.harvest(rows) if rows else {"days": [], "ended_by": {}, "checks_false": [],
+                                              "decision_texts": [], "event_counts": {},
+                                              "stage_leftover": {}, "stage_stopped": {},
+                                              "stage_stopped_total": {}, "dead_crops_days": 0}
+        if days is not None:
+            info["days"] = [{"verified": v} for v in days]
+        if texts is not None:
+            info["decision_texts"] = list(texts)
+        return info
+
+    @staticmethod
+    def _lesson(**extra) -> dict:
+        base = {"id": "stuck_with_leftover|harvest", "symptom": "有格没做完",
+                "evidence": "leftover=2", "hint": "先把 leftover 做完", "count": 1}
+        base.update(extra)
+        return base
+
+    def test_l2_zero_to_zero_is_not_improvement(self):
+        """两本账本都是 0 ⇒ 报「无可比」，绝不报「减少」（旧的假阳性）。"""
+        info_a = self._info()
+        info_b = self._info()
+        crit = cr.criteria(info_a, info_b, [self._lesson()], 1, ["提示词里有教训"])
+        self.assertIsNone(crit["l2_same_shape_decreased"])
+        self.assertEqual(crit["signals"][0]["status"], "两边都没有（无可比）")
+        self.assertIn("无可比基线", crit["l5_verdict"])
+
+    def test_l2_counts_current_stage_form_and_scope(self):
+        """现行形态 = `day_end.stages[].leftover/stopped`；教训的 `scope` 要参与匹配。"""
+        info_a = self._info(leftover_days=[2])
+        info_b = self._info(leftover_days=[0])
+        crit = cr.criteria(info_a, info_b, [self._lesson(scope="harvest")], 1, ["x"])
+        self.assertTrue(crit["l2_same_shape_decreased"])
+        self.assertEqual(crit["signals"][0]["a"], 1)
+        self.assertEqual(crit["signals"][0]["b"], 0)
+        self.assertTrue(crit["signals"][0]["signal"].endswith("@harvest"))
+
+    def test_l2_equal_counts_report_unchanged_not_improved(self):
+        info_a = self._info(leftover_days=[2, 2])
+        info_b = self._info(leftover_days=[2, 2])
+        crit = cr.criteria(info_a, info_b, [self._lesson(scope="harvest")], 1, ["x"])
+        self.assertFalse(crit["l2_same_shape_decreased"])
+        self.assertEqual(crit["signals"][0]["status"], "未变")
+        self.assertIn("同形态", crit["l5_verdict"])
+
+    def test_l0_requires_count_at_least_one(self):
+        crit = cr.criteria(self._info(), self._info(), [{"lesson": "x", "count": 0}],
+                           0, ["p"])
+        self.assertFalse(crit["l0_lessons_exist"])
+        self.assertFalse(crit["l0_count_ok"])
+        self.assertIn("count>=1", crit["l5_verdict"])
+
+    def test_l0_count_missing_is_undecidable(self):
+        crit = cr.criteria(self._info(), self._info(), [{"lesson": "x"}], 0, ["p"])
+        self.assertFalse(crit["l0_lessons_exist"])
+        self.assertIsNone(crit["l0_count_ok"])
+        self.assertIn("缺 count", crit["l5_verdict"])
+
+    def test_l5_requires_l3_evidence(self):
+        """机械项全绿但没有"决策理由里出现同指涉"的旁证 ⇒ 仍不足以判定。"""
+        info_a = self._info(days=[False], leftover_days=[2])
+        info_b = self._info(days=[True, True, True], leftover_days=[0])
+        crit = cr.criteria(info_a, info_b, [self._lesson(scope="harvest")], 1, ["x"])
+        self.assertTrue(crit["l2_same_shape_decreased"])
+        self.assertFalse(crit["l3_evidence_present"])
+        self.assertIn("L3", crit["l5_verdict"])
+
+    def test_tail_window_follows_days_argument(self):
+        """L4 的尾部窗口 = `--days`（旧版数整本）。"""
+        verdicts = [False, False, True, True, True]
+        info_a = self._info(days=verdicts)
+        info_b = self._info(days=verdicts)
+        crit2 = cr.criteria(info_a, info_b, [self._lesson()], 1, ["x"], window=2)
+        crit5 = cr.criteria(info_a, info_b, [self._lesson()], 1, ["x"], window=5)
+        self.assertEqual(crit2["tail_verified"], {"runA": 2, "runB": 2})
+        self.assertEqual(crit5["tail_verified"], {"runA": 3, "runB": 3})
+        self.assertEqual(crit2["tail_window_days"], 2)
+
+    def test_bad_json_journal_exits_two(self):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = pathlib.Path(raw)
+            (tmp / "a.jsonl").write_text('{"event": "day_end"}\n{不是 JSON\n', encoding="utf-8")
+            write_jsonl(tmp / "b.jsonl", [day_end([1, "summer", 4], verified=True, stages=[])])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = cr.main(["--run-a", str(tmp / "a.jsonl"), "--run-b", str(tmp / "b.jsonl")])
+            out = buf.getvalue()
+        self.assertEqual(code, 2)
+        self.assertIn("[exit 2]", out)
+
+    def test_bad_lessons_json_exits_two(self):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = pathlib.Path(raw)
+            write_jsonl(tmp / "a.jsonl", [day_end([1, "summer", 3], verified=False, stages=[])])
+            write_jsonl(tmp / "b.jsonl", [day_end([1, "summer", 4], verified=True, stages=[])])
+            (tmp / "a-lessons.json").write_text("{坏掉的 JSON", encoding="utf-8")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = cr.main(["--run-a", str(tmp / "a.jsonl"), "--run-b", str(tmp / "b.jsonl")])
+            out = buf.getvalue()
+        self.assertEqual(code, 2)
+        self.assertIn("[exit 2]", out)
+
+    def test_l1_denominator_excludes_review_rows(self):
+        """L1 分母只算决策行；review 复盘行单独报数（runB-0732 曾 70 决策 + 2 review）。"""
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = pathlib.Path(raw)
+            write_jsonl(tmp / "a.jsonl", [day_end([1, "summer", 3], verified=False, stages=[])])
+            write_jsonl(tmp / "b.jsonl", [day_end([1, "summer", 4], verified=True, stages=[])])
+            (tmp / "a-lessons.json").write_text(
+                json.dumps({"lessons": [{"hint": "先浇水再开新地", "count": 1}]},
+                           ensure_ascii=False), encoding="utf-8")
+            write_jsonl(tmp / "b-llm.jsonl", [
+                {"kind": "decision", "prompt": "简报：教训=先浇水再开新地"},
+                {"kind": "decision", "prompt": "简报：没有教训文本"},
+                {"kind": "review", "prompt": "复盘：先浇水再开新地"},
+            ])
+            out_json = tmp / "v.json"
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = cr.main(["--run-a", str(tmp / "a.jsonl"), "--run-b", str(tmp / "b.jsonl"),
+                                "--json", str(out_json)])
+            out = buf.getvalue()
+            report = json.loads(out_json.read_text(encoding="utf-8"))
+        self.assertEqual(code, 0)
+        self.assertEqual(report["b_decision_calls"], 2)
+        self.assertEqual(report["b_review_calls"], 1)
+        self.assertEqual(report["b_trace_rows"], 3)
+        self.assertEqual(report["lessons_hits"], 1)
+        self.assertIn("次**决策**调用", out)
 
 
 if __name__ == "__main__":

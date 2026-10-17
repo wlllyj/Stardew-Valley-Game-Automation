@@ -15,12 +15,12 @@
 ## 1. 五条判定（全部要有原文读数）
 | # | 判据 | 证据来源 | 通过条件 |
 |---|---|---|---|
-| **L0** | **run A 真有教训可注入**（前置，不满足则整条对照作废） | run A 的 `<journal>-lessons.json` 与 journal `lessons` 事件 | `lessons.total >= 1` 且至少 1 条 `count >= 1`；`lessons.total == 0` ⇒ **直接写"run A 未产出教训，A→B 对照作废"**，不许拿"无教训"当"没有演进需求" |
-| L1 | **教训确实被注入** | `<runB>-llm.jsonl` 的 prompt 原文 + journal `lessons`（`kept`/`loaded`） | run A 教训库中至少 **1 条**出现在 run B 某次真实调用（role=user）的 prompt 里；且 `kept>=1` |
-| L2 | **同形态不再出现** | 两侧 journal 的失败/取消事件按 `(kind, scope)` 聚合 | 该教训对应的形态在 run B 的**出现次数严格小于** run A（或为 0）；`scope` 必须可比（同名田区/同类事件） |
+| **L0** | **run A 真有教训可注入**（前置，不满足则整条对照作废） | run A 的 `<journal>-lessons.json` 与 journal `lessons` 事件 | `lessons.total >= 1` 且至少 1 条 `count >= 1`。**只有 `count >= 1` 的条目算"可注入素材"**；0.7.37 前的旧库没有 `count` 字段 ⇒ 一律按 0 计并打 ⚠「旧库无 count，L0 只认总数」，不许把"没记录次数"说成"有进化素材"。`lessons.total == 0` ⇒ **直接写"run A 未产出教训，A→B 对照作废"**，不许拿"无教训"当"没有演进需求" |
+| L1 | **教训确实被注入** | `<runB>-llm.jsonl` 的 prompt 原文 + journal `lessons`（`kept`/`loaded`） | **三信号同时上报**：`lessons_total`（A 库条数）/ `lessons_hits`（`hint` 整段子串命中数）/ `lesson_section_present`（教训节抬头出现）。**L1 分母只算决策行**：`-llm.jsonl` 里 `kind != "review"` 的行（review 行是夜间复盘，不是决策；先例 runB = 47 决策 + 1 review）；L1 成立 = 节在 且 命中 ≥1；命中 0 但节在 ⇒ 报「比对口径警告」，**不许**写"教训根本没送到" |
+| L2 | **同形态不再出现** | 两侧 journal 的失败/取消事件按 `(kind, scope)` 聚合 | **严格三态**：`count_b < count_a` = 减少 ✅；`count_b == count_a` = 未变 ❌；`count_b > count_a` = 增加 ❌；**`count_a == 0 && count_b == 0` = 两边都没有（无可比）**，既不算"减少"也不算"没有演进"。只有"减少"项计入可比信号数。信号必须取自**现行账本形态**（`day_end.stages[].stopped/leftover`；0.7.37 起 `ended_by` 只有 sleep/sleep_failed，不再是 stuck 载体），并按教训 `scope` 优先匹配阶段名 |
 | L3 | **决策可见地受影响** | `<runB>-llm.jsonl` 的 raw/`accepted` 意图 与 journal `decision`/`intent_verdict` | 至少 **1 条** run B 边界决策的 `intents` 或 `reason` 明确体现该教训（例：run A 反复 `cancel` 的意图在 run B 主动避开/换序），或守卫因教训改变了任务序 |
-| L4 | **无回归** | `tools/verify-run3.py` + `tools/analyze-longrun.py` + `scratch/run9-lead-check.py` 原文 | run B 尾部窗口 VERIFIED 天数 **≥** run A；且无新增硬失败类别 |
-| L5 | **诚实审计** | `tools/compare-runs.py` 输出 + `docs/_run10-evidence.md` | 逐条列出"注入了什么/出现几次/结局如何"；**L0–L3 任一不成立 ⇒ 结论写"不足以判定自我进化"**，不许含糊 |
+| L4 | **无回归** | `tools/verify-run3.py` + `tools/analyze-longrun.py` + `scratch/run9-lead-check.py` 原文 | 尾部窗口 = `--days`（默认 3，与验收窗口一致）内 run B 连续 VERIFIED 天数 **≥** run A；且无**新增硬失败类别**（只认 `HARD_FAILURE_CHECKS`：`no_hard_failures`/`no_unmet_stages`/`no_blocking_modal`/`watered_outdoor`/`unreachable_within_bound`/`refused_within_bound`/`day_justified`；`zero_action_evidenced` 这类非硬检查只作附注，不进 L4） |
+| L5 | **诚实审计** | `tools/compare-runs.py` 输出 + `docs/_run10-evidence.md` | 门禁顺序 **L0 → L1 → L2 → L4 → L3 → 尾部达标**：任一不过即写"不足以判定自我进化（点名哪条不过）"；全部通过**且** `tail_b >= window` 才可写"有演进证据（正式结论仍需人工核对）"。逐条列出"注入了什么/出现几次/结局如何" |
 
 ### L1 的测量口径（**2026-10-17 事故后固化，必须双信号上报**）
 - 量 L1 的工具是 `tools\compare-runs.py`。它的"取教训文本"口径**必须与 brain 落盘字段一致**：brain 写的是 `id/symptom/evidence/hint/count`，所以取文本按「`hint` → `lesson/text/summary/note/why/reason/symptom`」；**曾因只认 `lesson/text/...` 而退化成"把字段拼成长串" ⇒ 假报 `0/6`（"教训根本没送到"）**，而同一份留痕直查是 47/47 条决策提示词都含教训节 —— 教训：**工具自己数错的方向是"看起来没注入"，会直接把 A/B 对照判死**。
@@ -46,7 +46,7 @@
 
 1. **`worldSeq` 不是成功信号（R3）**：真机实测 `interact` 路径收获成功时 `worldSeq 60→60`（**不推进**；Mod 回执也如实写 60→60），而 `use_tool` 一次挥动 `65→67`。⇒ **任何判据都不许拿 `worldSeq` 前进当"动作成功"的证据**。成功证据只认这四类：①目标格 `ready` 由 `true→false`（或 `readySource` 变化）；②背包**逐 qid 计数**增加（对得上 `affected_tiles` 的 gained）；③`farm.readyCrops` 下降；④对照观测的 `TileSig` 变化。**失败的判据也不许用 `worldSeq` 未动**（否则会把失败判成功或反之）。
 2. **回执 `ok` 仍不等于世界变了**（族里第三次教训）：`interact`/`use_tool` 都必须以「跨观测证据」为准（task-182 的 `acted`/`actedEvidence`，Mod 侧 `use_tool` 见 task-188 补齐）。报告中若出现「回执 ok 但世界未变」必须单列，不许并进成功计数。
-3. **落盘/跨日口径**：跨日 ≠ 落盘（有 `displayedShippedItems` 时 `ShippingMenu` 会推迟 `SaveGameMenu`）；六串配对（`Synchronizing 'NewDay'` / `before save` / `SaveGame.Save() called` / `Saving without compression` / `completed` / `after save, starting <day>`）**必须成组出现**，缺组即如实写【无法判定】，不许按"存档 mtime 没变"直接判失败或通过。
+3. **落盘/跨日口径**：跨日 ≠ 落盘（有 `displayedShippedItems` 时 `ShippingMenu` 会推迟 `SaveGameMenu`）；六串配对**必须成组出现**，缺组即如实写【无法判定】，不许按"存档 mtime 没变"直接判失败或通过。**逐字锚点（SMAPI-latest.txt 原文，按顺序）**：①`Synchronizing 'NewDay' task`；②`Context: before save`；③`SaveGame.Save() called`；④`Synchronizing 'Save' task`（即"Save task"串）；⑤`completed without exceptions`（另 `Saving without compression` 是 0.7.37 真机实测多出来的一行，`completed` 结尾另有 `task complete.`，两者都不单独当判据）；⑥`Context: after save, starting <season> <day>`。**一条命令出配对表**：`python scratch\_ab_save_pairs.py logs\longrun-runB-0732.jsonl`（任务 1 用法见 §7；输出每对编号 + 六串到齐/缺哪串）。历史脚本 `scratch\_t215_pairs.py` 只做全量计数，缺逐对配对，仍保留作对照。
 
 ## 6. 测量规则（**2026-10-17 A′ 叫停后固化，0.7.37 起生效**）
 
@@ -55,3 +55,23 @@
 1. **「背包满」不是硬失败（task-198）**：无空格 ⇒ 阻塞类（`no_slot` 同族），**不进 `failed_steps`/`no_hard_failures`、不吃 `harvest_gave_up` 上限、不封格**；报告里单列「背包满阻塞次数」，与「真失败」分开。若某天因此无法 VERIFIED，`ended_reason` 必须写**可执行**的原因（"背包满、需先腾格/出货"），**不许**写成"没干活"。
 2. **守卫的「还有活」必须能落到可执行目标（task-199）**：`work_reasons()` 给出的每一条理由，都必须能对应到**具体可执行目标**（坐标/指派阶段）；farm 级计数（`readyCrops` 等）只能当**线索**，不能单独作为"还有活"的证据 —— 否则会像 A′ day13 那样空转 `stuck`。窗口外目标要么有坐标可走过去（`readyTiles` 一族），要么如实记 `*_far_blocked` 并**不进入**"还有活"。
 3. **sell 白名单归因分两通道（task-193/196）**：作物白名单（`whitelist_source="crop_product"`，只收本格作物产物 id；取不到 crop id ⇒ 空白名单 + `unavailable`，**宁可少挣、不许乱卖**）与材料白名单（盈余材料换种子钱，`task-55`）**必须分列统计**；连带掉落（`collateral_loot`）不许进作物白名单。任何"白名单里出现与目标格无关 qid"都要单列为 ⚠。
+
+## 7. task-217 修订记录（2026-10-18，源自 task-215 审计）
+
+> 起因：task-215 只读审计（`docs\_audit-ab-criteria.md`）发现 7 处「文档 ↔ `tools/compare-runs.py`」实施偏差。本节记录**代码与文档同步修订**后的口径；代码 = `tools/compare-runs.py`（704 行），测试 = `tests/test_compare_runs.py`（34 条）。
+
+### 7.1 七项修订（对应 §1 表的行）
+
+1. **L0**：代码改成 `lessons_total >= 1` **且**「至少 1 条 `count >= 1`」。旧库无 `count` 字段 ⇒ 按 0 计并打 ⚠（不伪装成有素材）。
+2. **L1 分母**：`-llm.jsonl` 的行按 `kind` 分为**决策行 / review 行**；L1 的调用集与命中**只算决策行**，review 数单列（`b_review_calls`/`a_review_calls`）；旧行无 `kind` ⇒ 按决策行（兼容旧格式）。L1 成立 = `lesson_section_present` 且 `lessons_hits >= 1`；节在而 0 命中 ⇒ 只报「比对口径警告」。
+3. **L2 严格三态**：`减少 / 未变 / 增加 / 无可比（0→0）`；只有"减少"计入可比信号。信号表改按**现行账本形态**多候选（`day_end.stages[].leftover` / `stopped=incomplete`；`ended_by:stuck` 只兜底），并按教训 `scope` 优先匹配阶段名；另补 `dead_crops_blocking → day_dead_crops`（run A 真实教训 kind，旧表漏映射）。
+4. **L4 窗口与硬检查**：尾部窗口 = `--days`（默认 3，与验收窗口一致）；"新增失败类别"只认 `HARD_FAILURE_CHECKS`（7 键），`zero_action_evidenced` 这类非硬检查降为**附注**（`other_new_false_checks_in_b`）。
+5. **L5 门禁**：顺序 **L0→L1→L2→L4→L3→尾部达标**；L3 不过时同时点名「run B 尾部连续 VERIFIED n < window」；只有全过且 `tail_b >= window` 才可写"有演进证据"。
+6. **恒退码**：统一「读不到/读坏账本或 sidecar ⇒ **rc=2**；其余恒 **rc=0**」——删掉旧的 `raise SystemExit("[exit 2] …")`（它实际 rc=1 且文案误导），改 `LedgerReadError` → 打印 + `return 2`。
+7. **`--json`**：结构化结果新增窗口/门禁/三态等字段（`l2_signal_states`、`l5_gates` 等），便于证据文档直接引用。
+
+### 7.2 实测读数（2026-10-18，runA-0732 → runB-0732，`--days 3`）
+
+- L0 ✅（6 条；`count>=1` True）；L1 ✅（**4/6** 命中，run B **70 次决策调用**，另 2 次 review 不计入）；L2 ✅（**6 条可比信号**：harvest leftover 79→71、plant_area 1→0、till_area 1→0、stage_incomplete@harvest 79→71、`dead_crops_blocking` 4→0、water_area 4→1；**旧版曾打三行 `0→0 ✅ 减少` 的假阳性**）；L4 ✅（尾部 runA=0 → runB=0；新增非硬 check `zero_action_evidenced` 只作附注）；L3 全部 0 次旁证；L5 =「**不足以判定自我进化**（L3：没有任何决策受影响的旁证）；且 run B 尾部连续 VERIFIED 0 < 3 天」。
+- 单测：`tests.test_compare_runs` **34 OK**（原 23 + 新增 11）；全量 `discover -s tests` **Ran 1055 / OK（0 红）**。
+- **A″/B″ 提醒**：现行 A″/B″（`runA2/runB2-0735`）的 `-llm.jsonl` sidecar 在本机**缺失** ⇒ 对其跑 L1 会得到"读不到留痕"（预期路径缺失 ≠ 没注入）；Lead 重跑前需补齐 sidecar，否则 L1 只能标【无法判定】。

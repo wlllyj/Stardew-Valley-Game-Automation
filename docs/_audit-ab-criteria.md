@@ -129,3 +129,31 @@ python tools\compare-runs.py --run-a scratch\_t215_bad.jsonl --run-b logs\longru
 - `_t215_probe.py`：runA-0732-llm = 75 决策 + 6 review；runB-0732-llm = 70 + 2；run9c = 21 + 5；run9d = 17 + 8；run6/7/8/9/9b 全 `<missing>`（旧行，按决策算）。
 - 教训库形状：`id/kind/scope/symptom/evidence/hint/count/first_day/last_day/last_seq/severity/src(/untrusted)` —— 文档 L26 说的 `id/symptom/evidence/hint/count` ✅ 齐备，且**多出 `kind/scope`**（L2 应按它聚合）。
 - 六串配对：run9 = 0/4 组（缺组⇒无法判定）；runA-0732 = 5/5 组 ✅。
+
+## 6. 修复回执（task-217，2026-10-18；本工具**已由 Lead 授权修订**）
+
+> 卡 task-217 把 §4 的 7 项全部修掉并补用例（本文件 §1–§5 是**修订前**的快照，保留作对照）。
+
+| §4 编号 | 修订 | 落地位置 |
+|---|---|---|
+| 1（高）L2 假阳性 | 严格三态：`count_a>`0 且 `count_b<count_a` 才是减少；`0→0` = 无可比 | `criteria()` 的 `l2_signal_states` / `_decide` |
+| 2（高）L2 信号过期 | 信号表按现行形态多候选 + 按教训 `scope` 匹配阶段 + 补 `dead_crops_blocking→day_dead_crops` | `_LESSON_SIGNALS` / `_signal_candidates()` |
+| 3（中）L1 分母含 review | `read_llm_calls()` 按 `kind` 拆决策/review；L1 只算决策行，review 单列 | `prompts_of()` / `criteria(review_calls=)` |
+| 4（中）恒退码有洞 | `LedgerReadError` → 打印 + `return 2`；不再 `raise SystemExit("[exit 2] …")` | `load_rows()` / `main()` |
+| 5（低）L0 缺 count>=1 | 补 `l0_count_ok`，旧库无 `count` 打 ⚠ | `criteria()` |
+| 6（低）L5 门禁/硬编码 | 门禁顺序 L0→L1→L2→L4→L3→尾部；`--days` 参数化尾部窗口 | `criteria()` / `parse_args()` |
+| 7（低）L4 new_false 口径 | 只认 `HARD_FAILURE_CHECKS`；其余降 `other_new_false_checks_in_b` | `criteria()` |
+
+**修前 / 修后同一 runA→runB 读数对比**（同一账本、`--days 3`）：
+
+| 项 | 修前（§1–§5 快照） | 修后（2026-10-18） |
+|---|---|---|
+| L1 分母 | 72 次（含 2 review） | **70 决策**（review 2 单列） |
+| L2 | 3 行 `0→0 ✅ 减少`（假阳性） | **6 条真信号**（harvest 79→71 等，含 `dead_crops_blocking` 4→0） |
+| L4 | ❌（尾部 0→0，且把 `zero_action_evidenced` 当新失败类） | ✅（尾部 0→0 不降；非硬检查只作附注） |
+| L5 | 「有演进痕迹，但 run B 未达标」 | 「**不足以判定自我进化**（L3 无旁证）；且尾部 0 < 3 天」 |
+| 恒退码 | 坏 JSON 行 rc=1（文案写 2） | 读不到/读坏一律 **rc=2**；其余恒 0 |
+
+**读数**：`tests.test_compare_runs` **34 OK**（23 → 34）；全量 `discover -s tests` **Ran 1055 / OK（0 红）**；`py_compile -W error::SyntaxWarning` RC=0。
+
+**仍存在的薄弱点（属判据边界，未改）**：① L3 只能做"同指涉"旁证，"intents/reason 明确体现教训"无法机械判定（文档已写需人工核对）；② `lesson_text()` 取 `hint`，而渲染会 `_strip_coordinates` 洗坐标 ⇒ 含坐标的 `hint` 可能命不中（当前 4/6，未见此坑）；③ 旧库无 `count` ⇒ L0 只能认总数（已打 ⚠）；④ **A″/B″ sidecar 缺失**：`runA2/runB2-0735` 的 `-llm.jsonl` 本机不存在 ⇒ L1 会读不到（预期路径缺失 ≠ 没注入），Lead 重跑前需补齐。
