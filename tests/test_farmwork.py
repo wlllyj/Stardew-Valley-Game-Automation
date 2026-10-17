@@ -155,6 +155,24 @@ class MiniWorld:
         #: 其它非空值 ⇒ 抛 `BridgeError(status=...)`（如 `no_money`/`no_trade_item`）。
         self.upgrade_mode = "ok"
         self.pickup_mode = "ok"
+        # ---- task-210：机器链（craft_item / place_object / machine）----
+        #: 已学会的配方：`{配方名: {"qid": 产物 qualifiedId, "need": {材料 qid: 数量}}}`
+        self.craft_recipes: dict[str, dict] = {}
+        #: "ok" = 真扣料、真进包；"no_effect" = 回执 ok 但世界一动不动；
+        #: 其它非空值 ⇒ 抛 `BridgeError(status=...)`（如 `recipe_unknown`/`no_materials`/`no_slot`）。
+        self.craft_mode = "ok"
+        self.craft_calls: list[dict] = []
+        #: "ok" 真放置+真扣件；"placed_only" 只放不扣；"consumed_only" 只扣不放；
+        #: "no_effect" 回执 ok 但不动；其它 ⇒ 抛 `BridgeError(status=...)`。
+        self.place_mode = "ok"
+        self.place_calls: list[dict] = []
+        #: 机器格 → 运行时状态（`obs()` 的 tiles 直接反映它，`machine` 技能改它）：
+        #: `{"objId": "114", "heldObject": {...}|None, "readyForHarvest": bool,
+        #:   "minutesUntilReady": int|None, "accepts": {qid: n}, "produces": {...}, "minutes": 30}`
+        self.machines: dict[tuple[int, int], dict] = {}
+        self.machine_mode = "ok"     # ok / no_effect / <status> 抛
+        self.machine_calls: list[dict] = []
+        self.exec_calls: list[dict] = []   # 所有走 `exec_skill` 的请求（元组回执，便于断言"有没有发请求"）
 
     # ---- 观测 ----
     def obs(self) -> dict:
@@ -180,12 +198,30 @@ class MiniWorld:
             # 真机它是**容量**（不是空槽数）—— 判满必须数 `inventory` 行数（task-181 必修 3）。
             player["inventoryCount"] = int(self.inventory_capacity)
         player["isInBed"] = self.in_bed
+        tiles = [dict(r) for r in self.records]
+        # 【task-210】机器状态是**运行时**的：以 `self.machines` 为准覆盖进观测的 tiles
+        # （真机 `TileView` 也是每次快照现读 `Object` / `heldObject` / `readyForHarvest`）。
+        for tile, st in self.machines.items():
+            has_obj = bool(st.get("objId"))
+            row = next((r for r in tiles if tuple(r.get("tile") or ()) == tuple(tile)), None)
+            if row is None:
+                if not has_obj:
+                    # 只有"预先登记的机器规格"、还没真的放置 ⇒ 观测里这一格什么都没有
+                    continue
+                row = {"tile": [int(tile[0]), int(tile[1])], "kind": "object"}
+                tiles.append(row)
+            if st.get("objId"):
+                row["kind"] = str(st.get("kind") or "object")
+            row["objId"] = st.get("objId")
+            row["heldObject"] = dict(st["heldObject"]) if st.get("heldObject") else None
+            row["readyForHarvest"] = st.get("readyForHarvest")
+            row["minutesUntilReady"] = st.get("minutesUntilReady")
         return {
             "ok": True, "status": "ok",
             "clock": {"year": 1, "season": "spring", "day": self.day, "timeOfDay": self.tod},
             "player": player,
             "location": {"name": self.location_name, "isOutdoorFarm": False,
-                         "tiles": [dict(r) for r in self.records],
+                         "tiles": tiles,
                          "tillable": [list(t) for t in sorted(self.tillable)],
                          "refillTiles": [],
                          "furniture": [{"tile": list(self.bed), "isBed": True,
@@ -245,6 +281,152 @@ class MiniWorld:
         self.inventory[int(slot)] = None
         self.shipping_bin.append(dict(item))
         return {"ok": True, "status": "ok", "reason": "已放进出货箱（钱等 NewDay）"}
+
+    # ---- task-210：机器链（craft / place / machine）----
+    @staticmethod
+    def _inv_qid(item) -> str:
+        if not isinstance(item, dict):
+            return ""
+        return str(item.get("qualifiedId") or item.get("id") or "")
+
+    @classmethod
+    def _qid_match(cls, item, wanted) -> bool:
+        """`(O)334` / `334` / `Copper Ore` 视为同一件（脑侧 `_qid_variants` 的同款宽松比较）。"""
+        qid = cls._inv_qid(item)
+        want = str(wanted or "")
+        if not qid or not want:
+            return False
+        if qid.lower() == want.lower():
+            return True
+        digits = "".join(ch for ch in want if ch.isdigit())
+        qdig = "".join(ch for ch in qid if ch.isdigit())
+        if digits and qdig and digits == qdig:
+            return True
+        return want.lower() in str(item.get("name") or "").lower()
+
+    def _take_items(self, need: dict) -> bool:
+        """按 qid 扣材料（不足 ⇒ 一枚都不扣、返回 False —— 与游戏 `consumeIngredients` 一致）。"""
+        have: dict[str, int] = {}
+        for it in self.inventory:
+            if isinstance(it, dict):
+                q = self._inv_qid(it)
+                have[q] = have.get(q, 0) + int(it.get("stack") or 1)
+        for q, n in need.items():
+            if have.get(q, 0) < int(n):
+                return False
+        for q, n in need.items():
+            left = int(n)
+            for i, it in enumerate(self.inventory):
+                if left <= 0:
+                    break
+                if not isinstance(it, dict) or self._inv_qid(it) != q:
+                    continue
+                stack = int(it.get("stack") or 1)
+                take = min(stack, left)
+                left -= take
+                if take >= stack:
+                    self.inventory[i] = None
+                else:
+                    it["stack"] = stack - take
+        return True
+
+    def _add_item(self, qid: str, *, name: str = "", stack: int = 1) -> None:
+        for it in self.inventory:
+            if isinstance(it, dict) and self._inv_qid(it) == qid:
+                it["stack"] = int(it.get("stack") or 1) + stack
+                return
+        self.inventory.append({"slot": len(self.inventory) + 1, "id": qid,
+                               "qualifiedId": qid, "name": name or qid, "stack": stack,
+                               "isTool": False})
+
+    def do_craft(self, recipe: str) -> dict:
+        """Mod `craft_item` 的离线替身：只认已学配方；扣料/进包都真的发生。"""
+        self.craft_calls.append({"recipe": str(recipe)})
+        mode = str(self.craft_mode or "ok")
+        if mode not in ("ok", "no_effect"):
+            raise BridgeError(f"制作失败（{mode}）", status=mode)
+        spec = self.craft_recipes.get(str(recipe))
+        if spec is None:
+            raise BridgeError(f"没学会配方「{recipe}」", status="recipe_unknown")
+        qid = str(spec.get("qid") or "")
+        if mode == "no_effect":
+            return {"ok": True, "status": "ok", "craftedQid": qid}
+        if not self._take_items(dict(spec.get("need") or {})):
+            raise BridgeError("材料不足", status="no_materials")
+        self._add_item(qid, name=str(spec.get("name") or recipe))
+        return {"ok": True, "status": "ok", "craftedQid": qid}
+
+    def do_place(self, item: str, tile: tuple[int, int]) -> dict:
+        """Mod `place_object` 的离线替身：真删一件、真在格子上放一个物体。"""
+        tile = (int(tile[0]), int(tile[1]))
+        self.place_calls.append({"item": str(item), "tile": [tile[0], tile[1]]})
+        mode = str(self.place_mode or "ok")
+        if mode not in ("ok", "placed_only", "consumed_only", "no_effect"):
+            raise BridgeError(f"放置失败（{mode}）", status=mode)
+        prev = self.machines.get(tile) or {}
+        occupied = bool(prev.get("objId")) or any(
+            tuple(r.get("tile") or ()) == tile and r.get("objId") for r in self.records)
+        if occupied:
+            raise BridgeError("目标格上有东西", status="tile_occupied")
+        row = next((i for i, it in enumerate(self.inventory)
+                    if self._qid_match(it, item)), None)
+        if row is None:
+            raise BridgeError("背包里没有这件", status="no_object")
+        if mode == "no_effect":
+            return {"ok": True, "status": "ok"}
+        if mode in ("ok", "consumed_only"):
+            it = self.inventory[row]
+            if int(it.get("stack") or 1) > 1:
+                it["stack"] = int(it["stack"]) - 1
+            else:
+                self.inventory[row] = None
+        if mode in ("ok", "placed_only"):
+            obj_id = "".join(ch for ch in str(item) if ch.isdigit()) or str(item)
+            self.machines[tile] = {**{k: v for k, v in prev.items()
+                                      if k in ("accepts", "produces", "minutes")},
+                                   "objId": obj_id, "heldObject": None,
+                                   "readyForHarvest": False, "minutesUntilReady": None,
+                                   "kind": "object"}
+        return {"ok": True, "status": "ok"}
+
+    def do_machine(self, tile: tuple[int, int], action: str, item=None) -> dict:
+        """Mod `machine` 的离线替身：`feed` 只扣一次料（熔炉 = 矿+煤一次性投料）、`collect` 取产物。"""
+        tile = (int(tile[0]), int(tile[1]))
+        self.machine_calls.append({"tile": [tile[0], tile[1]], "action": str(action),
+                                   "item": item})
+        mode = str(self.machine_mode or "ok")
+        if mode not in ("ok", "no_effect"):
+            raise BridgeError(f"机器动作失败（{mode}）", status=mode)
+        st = self.machines.get(tile)
+        if st is None:
+            raise BridgeError("这一格没有机器", status="no_machine")
+        if mode == "no_effect":
+            return {"ok": True, "status": "ok"}
+        if str(action) == "feed":
+            need = {str(k): int(v) for k, v in (st.get("accepts") or {}).items()}
+            if not self._take_items(need):
+                raise BridgeError("投料不足", status="no_materials")
+            st["heldObject"] = {"id": "334", "name": "Copper Ore",
+                                "stack": sum(need.values())}
+            st["readyForHarvest"] = False
+            st["minutesUntilReady"] = int(st.get("minutes") or 30)
+        else:  # collect
+            st["heldObject"] = None
+            st["readyForHarvest"] = False
+            st["minutesUntilReady"] = None
+            prod = dict(st.get("produces") or {})
+            if prod:
+                self._add_item(str(prod.get("qid") or prod.get("id") or ""),
+                               name=str(prod.get("name") or ""),
+                               stack=int(prod.get("stack") or 1))
+        return {"ok": True, "status": "ok"}
+
+    def advance_machine(self, tile: tuple[int, int], *, ready: bool = True) -> None:
+        """把机器推进到"可收"（真机是等 30 游戏分钟；离线直接拨表）。"""
+        st = self.machines.get((int(tile[0]), int(tile[1])))
+        if st is not None:
+            st["readyForHarvest"] = bool(ready)
+            st["minutesUntilReady"] = None if ready else int(st.get("minutes") or 30)
 
     def do_buy(self, item, count) -> dict:
         """Mod `BuySkill` 的离线替身（task-67）。
@@ -407,6 +589,22 @@ class MiniBridge:
                 raise BridgeError("observe 失败：桥连接中断（模拟跨日之后掉线）",
                                   status=w.observe_fail_status)
         return w.obs()
+
+    def exec_skill(self, skill, args=None, *, timeout_ms=None, based_on_seq=None,
+                   http_timeout=None):
+        """task-210：机器链三技能的最小桥面（真机由 `Skills.Create` 路由到 Mod 技能）。"""
+        payload = dict(args or {})
+        self.w.exec_calls.append({"skill": str(skill), **payload})
+        if str(skill) == "craft_item":
+            return self.w.do_craft(str(payload.get("item") or ""))
+        if str(skill) == "place_object":
+            tile = payload.get("tile") or (0, 0)
+            return self.w.do_place(str(payload.get("item") or ""), (int(tile[0]), int(tile[1])))
+        if str(skill) == "machine":
+            tile = payload.get("tile") or (0, 0)
+            return self.w.do_machine((int(tile[0]), int(tile[1])),
+                                     str(payload.get("action") or ""), payload.get("item"))
+        raise BridgeError(f"未知技能 {skill}", status="unknown_skill")
 
     def move_to(self, x, y, *, timeout_ms=None, based_on_seq=None, allow_bed=False):
         self.w.moves.append({"tile": [int(x), int(y)], "allow_bed": bool(allow_bed)})
@@ -3103,6 +3301,161 @@ class TestTask222KnownRecipes(unittest.TestCase):
         names, status = known_crafting_recipes(
             self._obs(knownCraftingRecipes={"Furnace": 1}))
         self.assertEqual((names, status), ([], "unavailable"))
+
+
+class TestTask210MachineChain(unittest.TestCase):
+    """task-210：`craft_item` / `place_object` / `machine` 三件套。
+
+    全部判据 = **观测差分**（Mod 回执只是声明）：造熔炉 → 放到空地 → 投 5 铜矿+1 煤 →
+    等 30 分钟 → 收 1 铜锭。这条链是工具升级（5 铜锭）与机器化的公共前置。
+    """
+
+    ORE = {"slot": 1, "id": "334", "qualifiedId": "(O)334", "name": "Copper Ore",
+           "stack": 5, "isTool": False}
+    COAL = {"slot": 2, "id": "382", "qualifiedId": "(O)382", "name": "Coal",
+            "stack": 1, "isTool": False}
+    STONE = {"slot": 3, "id": "390", "qualifiedId": "(O)390", "name": "Stone",
+             "stack": 25, "isTool": False}
+    FURNACE = {"slot": 4, "id": "114", "qualifiedId": "(BC)114", "name": "Furnace",
+               "stack": 1, "isTool": False}
+    BAR = {"qid": "(O)337", "id": "(O)337", "name": "Copper Bar", "stack": 1}
+    ORE20 = {"slot": 1, "id": "334", "qualifiedId": "(O)334", "name": "Copper Ore",
+             "stack": 20, "isTool": False}
+
+    def _world(self, inventory=None) -> MiniWorld:
+        w = MiniWorld(records=[{"tile": [60, 10], "kind": "dirt"}],
+                      inventory=[dict(i) for i in (inventory or ())])
+        w.craft_recipes["Furnace"] = {"qid": "(BC)114", "name": "Furnace",
+                                      "need": {"(O)334": 20, "(O)390": 25}}
+        w.machines[(60, 10)] = {"objId": "114", "heldObject": None, "readyForHarvest": False,
+                                "minutesUntilReady": None, "accepts": {"(O)334": 5, "(O)382": 1},
+                                "produces": dict(self.BAR), "minutes": 30}
+        return w
+
+    # ---- craft_item ----
+    def test_craft_is_judged_by_inventory_diff(self):
+        w = MiniWorld(inventory=[dict(self.ORE20), dict(self.STONE)])
+        w.craft_recipes["Furnace"] = {"qid": "(BC)114", "name": "Furnace",
+                                      "need": {"(O)334": 20, "(O)390": 25}}
+        st = make_worker(w).craft_item("Furnace")
+        self.assertTrue(st.ok, st.reason)
+        self.assertEqual(st.after["crafted_qid"], "(BC)114")
+        self.assertEqual(w.craft_calls, [{"recipe": "Furnace"}])
+        self.assertEqual(w.inventory[0], None, "材料由游戏扣（这里由假桥扣）")
+
+    def test_craft_false_ok_receipt_is_failed(self):
+        w = MiniWorld(inventory=[dict(self.ORE20), dict(self.STONE)])
+        w.craft_recipes["Furnace"] = {"qid": "(BC)114", "need": {}}
+        w.craft_mode = "no_effect"
+        st = make_worker(w).craft_item("Furnace")
+        self.assertFalse(st.ok)
+        self.assertEqual(st.code, "failed")
+        self.assertIn("制作没生效", st.reason)
+        self.assertEqual(st.status, "ok")
+
+    def test_craft_unknown_recipe_fails_closed(self):
+        w = MiniWorld(inventory=[dict(self.ORE)])
+        st = make_worker(w).craft_item("Furnace")
+        self.assertFalse(st.ok)
+        self.assertEqual(st.code, "failed")
+        self.assertEqual(st.status, "recipe_unknown")
+        self.assertIn("recipe_unknown", st.reason)
+
+    # ---- place_object ----
+    def test_place_ok_consumes_one_and_shows_on_tile(self):
+        w = MiniWorld(records=[{"tile": [60, 10], "kind": "dirt"}],
+                      inventory=[dict(self.FURNACE)])
+        st = make_worker(w).place_object("(BC)114", (60, 10))
+        self.assertTrue(st.ok, st.reason)
+        self.assertTrue(st.after["placed"])
+        self.assertTrue(st.after["consumed"])
+        self.assertEqual(w.inventory[0], None)
+        self.assertEqual(w.machines[(60, 10)]["objId"], "114")
+
+    def test_place_consumed_without_placement_is_failed_and_not_recompensated(self):
+        w = MiniWorld(records=[{"tile": [60, 10], "kind": "dirt"}],
+                      inventory=[dict(self.FURNACE)])
+        w.place_mode = "consumed_only"
+        st = make_worker(w).place_object("(BC)114", (60, 10))
+        self.assertFalse(st.ok)
+        self.assertEqual(st.code, "failed")
+        self.assertIn("没出现", st.reason)
+        self.assertIn("不自己补", st.reason)
+        self.assertIsNone(w.inventory[0])
+
+    def test_place_refuses_occupied_tile_without_sending_a_request(self):
+        w = self._world(inventory=[dict(self.FURNACE)])
+        st = make_worker(w).place_object("(BC)114", (60, 10))   # (60,10) 已有机器
+        self.assertFalse(st.ok)
+        self.assertEqual(st.code, "tile_occupied")
+        self.assertEqual(w.place_calls, [], "前置判掉就不许发请求（省一次动作）")
+
+    # ---- machine ----
+    def test_machine_feed_is_judged_by_observation(self):
+        w = self._world(inventory=[dict(self.ORE), dict(self.COAL)])
+        st = make_worker(w).machine((60, 10), "feed", item="(O)334")
+        self.assertTrue(st.ok, st.reason)
+        self.assertEqual(st.after["evidence"], "heldObject")
+        self.assertEqual(st.after["lost"].get("(O)334"), 5)
+        self.assertIsNotNone(w.machines[(60, 10)]["heldObject"])
+
+    def test_machine_collect_is_judged_by_observation(self):
+        w = self._world(inventory=[dict(self.ORE), dict(self.COAL)])
+        st = make_worker(w).machine((60, 10), "feed", item="(O)334")
+        self.assertTrue(st.ok, st.reason)
+        w.advance_machine((60, 10))
+        st2 = make_worker(w).machine((60, 10), "collect")
+        self.assertTrue(st2.ok, st2.reason)
+        self.assertIsNone(w.machines[(60, 10)]["heldObject"])
+        self.assertIn(self.BAR["id"], [i.get("qualifiedId") for i in w.inventory if i])
+
+    def test_machine_collect_not_ready_is_gated(self):
+        w = self._world()
+        w.machines[(60, 10)]["heldObject"] = {"id": "334", "name": "Copper Ore", "stack": 5}
+        st = make_worker(w).machine((60, 10), "collect")
+        self.assertFalse(st.ok)
+        self.assertEqual(st.code, "not_ready")
+        self.assertEqual(w.machine_calls, [])
+
+    def test_machine_feed_when_full_is_refused(self):
+        w = self._world(inventory=[dict(self.ORE)])
+        w.machines[(60, 10)]["heldObject"] = {"id": "334", "name": "Copper Ore", "stack": 5}
+        st = make_worker(w).machine((60, 10), "feed", item="(O)334")
+        self.assertFalse(st.ok)
+        self.assertEqual(st.code, "already_full")
+        self.assertEqual(w.machine_calls, [])
+
+    def test_machine_requires_machine_metadata(self):
+        w = MiniWorld(records=[{"tile": [60, 10], "kind": "dirt"}])
+        st = make_worker(w).machine((60, 10), "feed", item="(O)334")
+        self.assertFalse(st.ok)
+        self.assertEqual(st.code, "no_machine")
+        self.assertEqual(w.machine_calls, [])
+
+    def test_full_chain_craft_place_feed_collect(self):
+        """一条自证链：造熔炉 → 放到空地 → 投 5 铜矿+1 煤 → 等 → 收 1 铜锭。"""
+        w = MiniWorld(inventory=[dict(self.ORE20), dict(self.COAL), dict(self.STONE)])
+        w.craft_recipes["Furnace"] = {"qid": "(BC)114", "name": "Furnace",
+                                      "need": {"(O)334": 20, "(O)390": 25}}
+        # 预先登记"熔炉这个物体被放上之后会怎么工作"（无 objId ⇒ 不算占用目标格）
+        w.machines[(60, 10)] = {"accepts": {"(O)334": 5, "(O)382": 1},
+                                "produces": dict(self.BAR), "minutes": 30}
+        worker = make_worker(w)
+        st1 = worker.craft_item("Furnace")
+        self.assertTrue(st1.ok, st1.reason)
+        # 假桥的 do_craft 把产物加进背包（真机由 `addItemToInventoryBool`）
+        st2 = worker.place_object("(BC)114", (60, 10))
+        self.assertTrue(st2.ok, st2.reason)
+        st3 = worker.machine((60, 10), "feed", item="(O)334")
+        self.assertFalse(st3.ok, "这里只剩 5 铜矿（造熔炉已扣 20）⇒ 投料不足应如实失败")
+        # 补足铜矿再投：材料必须由游戏扣，脑侧不补账
+        w._add_item("(O)334", name="Copper Ore", stack=5)
+        st4 = worker.machine((60, 10), "feed", item="(O)334")
+        self.assertTrue(st4.ok, st4.reason)
+        w.advance_machine((60, 10))
+        st5 = worker.machine((60, 10), "collect")
+        self.assertTrue(st5.ok, st5.reason)
+        self.assertIn(self.BAR["id"], [i.get("qualifiedId") for i in w.inventory if i])
 
 
 if __name__ == "__main__":  # pragma: no cover
