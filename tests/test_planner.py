@@ -1645,5 +1645,96 @@ class Task218CapabilityGuards(unittest.TestCase):
         self.assertEqual(brief.counts["blockers"], 3)
 
 
+class Task219GapsGuard(unittest.TestCase):
+    """task-219：能力缺口清单（`<journal>-gaps.json`）的**信任边界**与提示词接入。
+
+    纪律（与教训库同一套）：磁盘文件只许影响提示词，**绝不许影响任何判定**；
+    坏文件整份丢弃、坏条目单条丢弃，永不抛。
+    """
+
+    @staticmethod
+    def _gap(kind="stump", tool="axe", reason="tool_level", count=1, seq=1):
+        return {"kind": kind, "tool": tool, "reason": reason, "count": count,
+                "first_seen": "spring1", "last_seen": f"spring{seq}",
+                "sample_tiles": [[60, 10]], "src": P.LESSON_SRC}
+
+    def _write(self, tmp, payload):
+        path = Path(tmp) / "run-gaps.json"
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    def test_roundtrip_keeps_sorted_items(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run-gaps.json"
+            gaps = {f"{g['kind']}|{g['tool']}|{g['reason']}": g
+                    for g in (self._gap(count=2), self._gap(kind="boulder", tool="pickaxe", count=9))}
+            self.assertEqual(P.save_gaps_file(path, gaps), "")
+            loaded, err = P.load_gaps_file(path)
+            self.assertEqual(err, "")
+            self.assertEqual(len(loaded), 2)
+            first = list(loaded.values())[0]
+            self.assertEqual(first["kind"], "boulder", "按次数降序写盘（最容易复发的在前）")
+            self.assertEqual(first["src"], P.LESSON_SRC)
+
+    def test_bad_schema_is_rejected_whole(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, {"schema": "other/1", "gaps": [self._gap()]})
+            loaded, err = P.load_gaps_file(path)
+            self.assertEqual((loaded, err), ({}, "bad_schema"))
+            path2 = self._write(tmp, {"schema": P.GAPS_SCHEMA, "gaps": "nope"})
+            self.assertEqual(P.load_gaps_file(path2), ({}, "not_a_list"))
+            path3 = Path(tmp) / "broken.json"
+            path3.write_text("{not json", encoding="utf-8")
+            loaded3, err3 = P.load_gaps_file(path3)
+            self.assertEqual(loaded3, {})
+            self.assertTrue(err3.startswith("read_failed"), err3)
+
+    def test_bad_entries_are_dropped_and_counted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = {"schema": P.GAPS_SCHEMA, "gaps": [
+                self._gap(),
+                {"kind": "", "reason": "tool_level", "count": 1},          # 缺 kind
+                {"kind": "stump", "reason": "tool_level", "count": 0},     # count<1
+                "not a mapping",
+            ]}
+            path = self._write(tmp, payload)
+            report: dict = {}
+            loaded, err = P.load_gaps_file(path, report=report)
+            self.assertEqual(err, "")
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(report["dropped"], 3)
+            self.assertIn("missing_kind_or_reason", report["reasons"])
+
+    def test_non_agentfarm_items_are_never_written_back(self):
+        """外部改写过的条目（`src` 不符）绝不因为"被读过一次"就回写（防洗白）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run-gaps.json"
+            forged = dict(self._gap(), src="")
+            self.assertEqual(P.save_gaps_file(path, {"x": forged}), "")
+            loaded, _ = P.load_gaps_file(path)
+            self.assertEqual(loaded, {}, "只持久化自己的条目")
+
+    def test_gaps_section_is_capped_and_comes_after_notes(self):
+        brief = P.Brief(recent_notes=("昨晚复盘",),
+                        recent_gaps=tuple(f"缺口{i}" for i in range(P.GAPS_INJECT_MAX + 3)))
+        text = brief.situation_text()
+        self.assertIn("recent_gaps（之前反复没做成的能力缺口）", text)
+        # 只放 ≤GAPS_INJECT_MAX 条
+        shown = [ln for ln in text.splitlines() if ln.startswith("- 缺口")]
+        self.assertEqual(len(shown), P.GAPS_INJECT_MAX)
+        # 顺序：复盘笔记在缺口之前（缺口优先级最低、最后追加）
+        self.assertLess(text.index("recent_notes"), text.index("recent_gaps"))
+
+    def test_gaps_section_is_dropped_before_higher_priority_sections(self):
+        """余量不够 ⇒ 先丢能力缺口（整节丢）；高优先级的教训库该在的还在。"""
+        filler = tuple("x" * 95 for _ in range(15))       # 把本体顶到 ~1500 字符
+        brief = P.Brief(areas=("field_se",), area_lines=filler,
+                        recent_lessons="L" * P.LESSONS_SECTION_MAX_CHARS,
+                        recent_gaps=("缺口" * 200,))
+        text = brief.situation_text()
+        self.assertIn("L" * 50, text, "教训库是高优先级，必须还在")
+        self.assertNotIn("recent_gaps", text, "塞不下就整节丢，不发半截")
+
+
 if __name__ == "__main__":
     unittest.main()

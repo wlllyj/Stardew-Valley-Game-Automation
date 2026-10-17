@@ -86,6 +86,9 @@ __all__ = [
     "load_lessons_file", "save_lessons_file",
     # 【task-168】规模取舍的跨日持久层（`<journal>-scope.json`）
     "SCOPE_SCHEMA", "load_scope_file", "save_scope_file",
+    # 【task-219】能力缺口清单（`<journal>-gaps.json`；只提示、不进判定）
+    "GAPS_SCHEMA", "GAPS_MAX_ITEMS", "GAPS_SAMPLE_TILES", "GAPS_INJECT_MAX",
+    "GAPS_SECTION_MAX_CHARS", "GAPS_TEXT_MAX_CHARS", "load_gaps_file", "save_gaps_file",
     "BoundaryPlanner", "PLAN_SCHEMA_EXAMPLE",
 ]
 
@@ -429,6 +432,20 @@ REVIEW_NOTES_MAX = 3
 REVIEW_NOTES_MAX_CHARS = 200
 #: 【task-59】次日简报里 `recent_notes` 这一节的硬上限。与决策史同口径：**最先被裁**。
 NOTES_SECTION_MAX_CHARS = 200
+
+#: 【task-219】能力缺口清单（`<journal>-gaps.json`）：按 `(capability|kind, tool, reason)`
+#: 聚合"想干却没能力/被挡"的证据（用户 m18972：不执行的策略必须记录、能找到问题）。
+#: 三条硬纪律（`docs/_run10-criteria.md` §8.3 + 0.7.39 P0-4）：
+#:  * brain 只写**本 run** 的聚合文件；跨 run 聚合由 analyzer 只读做（`logs/gaps-registry.json`）；
+#:  * 只作**提示**（`Brief.recent_gaps`），**不进 `checks`、不做豁免、不改 `_leftover`**；
+#:  * 缺口**绝不**自动转成教训库条目（教训只从客观账本事实来）。
+GAPS_SCHEMA = "agentfarm-gaps/1"
+GAPS_MAX_ITEMS = 50
+GAPS_SAMPLE_TILES = 5
+GAPS_INJECT_MAX = 3
+GAPS_SECTION_MAX_CHARS = 200
+#: 单条缺口文本上限（`"{count} 次「{kind}」因{reason}没做成（需要 {tool}）"` 的保守上限）。
+GAPS_TEXT_MAX_CHARS = 80
 
 #: 【task-82】跨日教训库（`<journal>-lessons.json`）：客观事实由代码从账本写，
 #: `hint` **只允许**来自 LLM（收工复盘的笔记），拿不到就留空、绝不自己编。
@@ -993,6 +1010,125 @@ def save_lessons_file(path: Any, lessons: Iterable[Mapping[str, Any]] | None,
     return ""
 
 
+def _sanitize_gap(item: Any, notes: list[str]) -> dict[str, Any] | None:
+    """【task-219】把磁盘上的一条缺口记录过一遍自己的 schema；不合 ⇒ None（丢）。"""
+    if not isinstance(item, Mapping):
+        notes.append("not_a_mapping")
+        return None
+    kind = str(item.get("kind") or "").strip()[:GAPS_TEXT_MAX_CHARS // 2]
+    tool = str(item.get("tool") or "").strip()[:24]
+    reason = str(item.get("reason") or "").strip()[:40]
+    if not kind or not reason:
+        notes.append("missing_kind_or_reason")
+        return None
+    try:
+        count = int(item.get("count") or 0)
+    except Exception:  # noqa: BLE001
+        notes.append("bad_count")
+        return None
+    if count < 1:
+        notes.append("bad_count")
+        return None
+    sample: list[list[int]] = []
+    raw_tiles = item.get("sample_tiles")
+    if isinstance(raw_tiles, list):
+        for pair in raw_tiles[:GAPS_SAMPLE_TILES]:
+            if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+                try:
+                    sample.append([int(pair[0]), int(pair[1])])
+                except Exception:  # noqa: BLE001
+                    continue
+    return {
+        "kind": kind,
+        "tool": tool,
+        "reason": reason,
+        "count": count,
+        "first_seen": str(item.get("first_seen") or "")[:40],
+        "last_seen": str(item.get("last_seen") or "")[:40],
+        "sample_tiles": sample,
+        "src": LESSON_SRC if item.get("src") == LESSON_SRC else "",
+    }
+
+
+def load_gaps_file(path: Any,
+                   *, report: dict[str, Any] | None = None) -> tuple[dict[str, dict[str, Any]], str]:
+    """读本 run 的能力缺口清单（task-219，`<journal>-gaps.json`）。**绝不抛**。
+
+    返回 `{(kind, tool, reason): {...}}`；缺文件 ⇒ `({}, "")`；坏 JSON / schema 不符 /
+    条目类型错 ⇒ **整份丢弃**并把原因回填 `report["reason"]`（调用方记一笔 journal 后照常跑）。
+    与教训库同一条信任边界：磁盘文件**绝不许决定任何判定**，只用来填提示词。
+    """
+    if report is not None:
+        report["dropped"] = 0
+        report["reasons"] = []
+    try:
+        p = Path(path)
+    except Exception as exc:  # noqa: BLE001
+        return {}, f"bad_path:{type(exc).__name__}"
+    if not p.exists():
+        return {}, ""
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return {}, f"read_failed:{type(exc).__name__}: {exc}"
+    if not isinstance(raw, Mapping) or raw.get("schema") != GAPS_SCHEMA:
+        return {}, "bad_schema"
+    items = raw.get("gaps")
+    if not isinstance(items, list):
+        return {}, "not_a_list"
+    out: dict[str, dict[str, Any]] = {}
+    dropped = 0
+    reasons: list[str] = []
+    for item in items:
+        notes: list[str] = []
+        clean = _sanitize_gap(item, notes)
+        if clean is None:
+            dropped += 1
+            reasons.extend(notes)
+            continue
+        key = f"{clean['kind']}|{clean['tool']}|{clean['reason']}"
+        out[key] = clean
+    if report is not None:
+        report["dropped"] = dropped
+        report["reasons"] = reasons[:6]
+    if not out:
+        return {}, ""
+    return out, ""
+
+
+def save_gaps_file(path: Any, gaps: Any, *, report: dict[str, Any] | None = None) -> str:
+    """写本 run 的能力缺口清单（task-219）。**绝不抛**：成功 ⇒ `""`，失败 ⇒ 原因串。
+
+    先写临时文件再 `replace`（与教训库/认输记录同一纪律：中途崩掉不留半截 JSON）。
+    只持久化 `src == LESSON_SRC` 的条目（外部改写过的条目绝不因为"被读过一次"就回写）。
+    """
+    items: list[dict[str, Any]] = []
+    if isinstance(gaps, Mapping):
+        raw = gaps.values()
+    else:
+        raw = gaps or ()
+    for it in raw:
+        if isinstance(it, dict):
+            items.append(dict(it))
+    kept = [it for it in items if it.get("src") == LESSON_SRC]
+    kept.sort(key=lambda it: (-int(it.get("count") or 0),
+                              str(it.get("last_seen") or ""), str(it.get("kind") or "")))
+    kept = kept[:GAPS_MAX_ITEMS]
+    if report is not None:
+        report["written"] = len(kept)
+        report["skipped"] = len(items) - len(kept)
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        payload = {"schema": GAPS_SCHEMA, "gaps": kept}
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(p)
+    except Exception as exc:  # noqa: BLE001
+        return f"write_failed:{type(exc).__name__}: {exc}"
+    return ""
+
+
 SCOPE_SCHEMA = "agentfarm-scope/1"
 
 
@@ -1338,6 +1474,11 @@ class Brief:
     #: 由长跑控制器从 `<journal>-lessons.json` 读取后注入；空 ⇒ 这一节不出现。
     #: ⚠️ 与决策史/复盘笔记同一条诚实边界：只影响**提示词文本**，绝不参与任何判定。
     recent_lessons: str = ""
+    #: 【task-219】能力缺口提示（"此前 N 次「树」因工具等级不够没做成（需要斧头等级 2）"）。
+    #: 由长跑控制器从 `<journal>-gaps.json` 读出来渲染后注入（≤`GAPS_INJECT_MAX` 条 /
+    #: ≤`GAPS_SECTION_MAX_CHARS` 字符）；空 ⇒ 这一节不出现。
+    #: ⚠️ 只作**提示**：不进 `checks`、不做豁免、不改 `_leftover`；也**绝不**自动转成教训库条目。
+    recent_gaps: tuple[str, ...] = ()
     #: 【task-136 B】复盘提示词专用的「当天事实（账本）」文本（`render_review_facts()` 渲染）。
     #: **只在 `build_review_messages()` 里用**：决策提示词不含它（决策看的是当下的简报）。
     #: 空 ⇒ 复盘 user 段只有简报（旧行为，向后兼容）。
@@ -1444,21 +1585,40 @@ class Brief:
             text += item
         return text if text != head else ""
 
+    def gaps_text(self) -> str:
+        """【task-219】能力缺口一节（≤ `GAPS_SECTION_MAX_CHARS`）；空 ⇒ 空串（不出现空节）。
+
+        **只作提示**：让慢脑知道"这类活之前反复做不成、缺什么能力"，别再把同一条注定
+        失败的任务提一整天。它不进 `checks`、不做豁免、不改 `_leftover`。
+        """
+        if not self.recent_gaps:
+            return ""
+        head = "recent_gaps（之前反复没做成的能力缺口）:"
+        text = head
+        for line in tuple(self.recent_gaps)[:GAPS_INJECT_MAX]:
+            item = f"\n- {str(line)[:GAPS_TEXT_MAX_CHARS]}"
+            if len(text) + len(item) > GAPS_SECTION_MAX_CHARS:
+                break
+            text += item
+        return text if text != head else ""
+
     def situation_text(self) -> str:
-        """简报全文（进 prompt）【task-58/59/82】裁切优先级：
+        """简报全文（进 prompt）【task-58/59/82/219】裁切优先级：
 
         1. 先保证本体（`base_lines()`）完整；
         2. 可选节只在**本体之后**还有余量时追加，且各自有硬上限
            （教训 `LESSONS_SECTION_MAX_CHARS`、复盘笔记 `NOTES_SECTION_MAX_CHARS`、
-           决策史 `DECISIONS_MAX_CHARS`）；
+           决策史 `DECISIONS_MAX_CHARS`、能力缺口 `GAPS_SECTION_MAX_CHARS`）；
         3. 【task-114 F2，Lead m10474 裁定】保护优先级 = **核心字段 > 教训库 > 决策史 > 复盘笔记**
-           （追加顺序即 `(lessons, decisions, notes)`）：余量不够时先丢复盘笔记、再丢决策史、
+           （追加顺序即 `(lessons, decisions, notes, gaps)`）：余量不够时先丢能力缺口（task-219
+           把它排在**最后**：它只是"提示"，丢了不影响当天判定与安全），再丢复盘笔记、再丢决策史、
            最后才丢教训库；核心字段一个都不许被挤掉（可选节**要么整节进、要么不进**：塞不满余量就丢它，并连同更低优先级的节一起丢，不切半节）。理由：教训是从多天账本攒出来的
            （稀缺、跨日），决策史只覆盖最近几次边界决策，复盘笔记是当晚一次性的、丢了明天还能再写。
         """
         base = "\n".join(self.base_lines())
         tail = ""
-        for block in (self.lessons_section(), self.decisions_text(), self.notes_text()):
+        for block in (self.lessons_section(), self.decisions_text(),
+                      self.notes_text(), self.gaps_text()):
             if not block:
                 continue
             room = PROMPT_BRIEF_MAX_CHARS - len(base) - len(tail) - 1

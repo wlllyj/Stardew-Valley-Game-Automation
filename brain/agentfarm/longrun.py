@@ -52,10 +52,13 @@ from .farmwork import (CLUMP_KINDS, ENV_BLOCK_STATUSES, FRONTIER_KINDS, PATH_STA
                        is_seed_offer, pick_seed_offer, player_free_slots, seed_items,
                        surplus_sell_plan, tile_ready, till_blocked_by,
                        tool_being_upgraded, tool_suspended_stages, tool_tier, tool_upgrade_days_left)
-from .planner import (DECISIONS_KEPT, LESSONS_INJECT_CHARS, LESSONS_INJECT_MAX, BoundaryPlanner, Brief,
+from .planner import (DECISIONS_KEPT, GAPS_INJECT_MAX, GAPS_MAX_ITEMS, GAPS_SAMPLE_TILES,
+                      GAPS_TEXT_MAX_CHARS, LESSONS_INJECT_CHARS, LESSONS_INJECT_MAX,
+                      DEFERRED_KINDS, BoundaryPlanner, Brief,
                       PlannerState, TaskIntent, TaskOutcome, decision_line, deterministic_plan,
-                      load_lessons_file, load_scope_file, make_lesson, prune_lessons, render_lessons,
-                      render_review_facts, save_lessons_file, save_scope_file)
+                      load_gaps_file, load_lessons_file, load_scope_file, make_lesson, prune_lessons,
+                      render_lessons, render_review_facts, save_gaps_file, save_lessons_file,
+                      save_scope_file)
 
 try:  # 田区规划是**可选**依赖：拿不到就退回"玩家周围窗口"，不让长跑起不来
     from . import fields as fields_mod
@@ -84,6 +87,21 @@ CLEARABLE_KINDS = ACTIONABLE_KINDS + (TREE_KIND,) + CLUMP_KINDS
 #: 【task-218 ④】一天最多砍几棵树。一棵树 ~10 体力/刀 × 8–12 刀 ≈ 100 体力（`TREE_STAMINA_ESTIMATE`），
 #: 砍多了必然漏浇 ⇒ 再加一条"剩余体力够不够砍一棵"的门槛；**浇水/收获永远优先**。
 TREE_CLEAR_MAX_PER_DAY = 2
+
+#: 【task-219】"不产生瓦片级执行对账"的任务：它们本来就不按"有没有目标格"判，
+#: 所以**免于**"非空 reasons 才合格"这条不变式（但它们仍然要有 `intent_execution` 记录）。
+#: `docs/_run10-criteria.md` §8.2c（0.7.39 P0-3）点名要求这四个必须在 ACTIONLESS_TASKS 里。
+ACTIONLESS_TASKS: tuple[str, ...] = ("sleep", "review", "wait_for_save", "recover_stamina")
+
+#: 【task-219】意图未执行的**原因码闭合集**（`docs/_run10-criteria.md` §8.2 + 0.7.39 P0-3）：
+#: 集外一律算缺陷（analyzer 判红）。P0-3 的拆分：
+#:  * `cancelled_by_verify` 拆成 ⇒ cancel 用 `no_target`、unknown 用 `unknown_evidence`；
+#:  * `_apply_policy` 改写掉的意图用 `superseded`；
+#:  * 结论拿不到（半步证据不足）用 `unknown_evidence`（**不许**拿 `no_target` 冒充）。
+INTENT_REASON_CODES: tuple[str, ...] = (
+    "no_target", "deferred_capability", "tool_level", "budget", "blocked_tile",
+    "blocked_modal", "no_slot", "world_stuck", "unknown_evidence", "superseded", "gated",
+)
 
 
 def _tool_blocked_tv(tv: Mapping[str, Any] | None) -> bool:
@@ -569,6 +587,12 @@ class DayReport:
     #: （认输格仍算未完成 ⇒ 当天如实不 VERIFIED）。
     scope_shed: dict[str, Any] = field(default_factory=dict)
     scope_shed_tiles: int = 0
+    #: 【task-219】当天**每个意图的执行对账**（用户 m18972：大模型的策略不执行必须记录、能找到问题）。
+    #: 每条 = `{intent_id, task, requested_tiles, ok_tiles, failed_tiles, unexecuted_tiles,
+    #: executed_steps, reasons:{code:count}, source, boundary, area_hint, area?}`；
+    #: `intent_id` 全局唯一 `<day>#<seq>`（跨日续跑新开 id）。**不新增 checks 键**
+    #: （`tools/verify-run3.py` 的 day_end 白名单不扩，对账归 analyzer，见 0.7.39 P0-5）。
+    intent_coverage: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def failed_steps(self) -> int:
@@ -649,6 +673,8 @@ class DayReport:
             # 【task-168】主动认输的片区（只 info：不进 checks、不扣 plot_pending/assigned_undone）
             "scope_shed": dict(self.scope_shed),
             "scope_shed_tiles": self.scope_shed_tiles,
+            # 【task-219】意图执行对账（只 info：不进 checks、不做豁免；analyzer 判红）
+            "intent_coverage": [dict(it) for it in self.intent_coverage],
             "stamina_budget": dict(self.stamina_budget),
             "stamina_calibration": {k: dict(v) for k, v in self.stamina_calibration.items()},
         }
@@ -882,6 +908,20 @@ class LongRun:
         # 【task-168】规模取舍的跨日记录：同样从 `--journal` **自动推导**
         # （`X.jsonl` ⇒ `X-scope.json`），不加命令行开关（run A/B 只许 journal 路径不同）。
         self.scope_path = self._derive_scope_path(self.journal_path)
+        # 【task-219】能力缺口清单：同样从 `--journal` 自动推导（`X.jsonl` ⇒ `X-gaps.json`）。
+        # brain 只写**本 run** 的聚合；跨 run 聚合由 analyzer 只读做（0.7.39 P0-4）。
+        self.gaps_path = self._derive_gaps_path(self.journal_path)
+        self.gaps: dict[str, dict[str, Any]] = {}
+        self.gaps_loaded = False
+        self.gaps_rejected_note = ""
+        self.gaps_dirty = False
+        # 【task-219】意图执行对账（每日重置）：`intent_plans` 是"模型/策略交出来的意图"，
+        # `intent_coverage` 是"每个意图最后怎么了" —— 两者按 `intent_id` 对齐。
+        self.intent_plans: dict[str, dict[str, Any]] = {}
+        self.intent_coverage: list[dict[str, Any]] = []
+        self.intent_seq = 0
+        self.intent_ids: dict[int, str] = {}
+        self.intent_day = ""
         self.lessons: list[dict[str, Any]] = []
         self.lessons_loaded = False
         # 今晚复盘产出的笔记 ⇒ 挂到今天新增的教训上当 `hint`（hint 只许 LLM 写）。
@@ -1105,6 +1145,208 @@ class LongRun:
             return None
         stem = journal_path.name[: -len(journal_path.suffix)] if journal_path.suffix else journal_path.name
         return journal_path.with_name(f"{stem}-scope.json")
+
+    @staticmethod
+    def _derive_gaps_path(journal_path: Path | None) -> Path | None:
+        """【task-219】`logs/run10.jsonl` ⇒ `logs/run10-gaps.json`（能力缺口清单放日记旁边）。
+
+        与教训库/认输记录同纪律：只靠 journal 路径推导、不加命令行开关；
+        `journal=None` ⇒ 只在内存里。**只写本 run**，跨 run 聚合归 analyzer（0.7.39 P0-4）。
+        """
+        if journal_path is None:
+            return None
+        stem = journal_path.name[: -len(journal_path.suffix)] if journal_path.suffix else journal_path.name
+        return journal_path.with_name(f"{stem}-gaps.json")
+
+    # ------------------------------------------------ 【task-219】意图执行对账
+    def _intent_id(self, intent: Any) -> str:
+        """给一个意图对象发一个**当天唯一**的 `intent_id`（`<day>#<seq>`，seq 每日重置）。
+
+        为什么按对象身份缓存：同一个意图对象会被 `_apply_policy`/`_verify_intents` 原样传递，
+        用 `id()` 做键能保证"记计划"和"记执行"落在同一个 id 上；确定性/兜底新造的意图在执行时
+        才发新号（跨日续跑也是新号，旧号由 analyzer 当 `carried_over` 看，不在 brain 里造新事件）。
+        """
+        key = id(intent)
+        got = self.intent_ids.get(key)
+        if got:
+            return got
+        self.intent_seq += 1
+        ident = f"{self.intent_day or 'day'}#{self.intent_seq:02d}"
+        self.intent_ids[key] = ident
+        return ident
+
+    def _plan_intents(self, decision: Any) -> list[dict[str, Any]]:
+        """【task-219】把决策层交出来的意图记成计划（挂到既有 `decision` journal 行的 `plans` 字段）。"""
+        plans: list[dict[str, Any]] = []
+        for it in list(getattr(decision, "intents", ()) or ()):
+            ident = self._intent_id(it)
+            plan = {
+                "intent_id": ident,
+                "task": str(getattr(it, "task", "") or ""),
+                "area_hint": str(getattr(it, "area_hint", "") or ""),
+                "source": str(getattr(decision, "source", "") or ""),
+                "boundary": str(getattr(decision, "boundary", "") or ""),
+                "at": round(self.now() - self.started, 2) if self.started else 0.0,
+            }
+            self.intent_plans[ident] = plan
+            plans.append(plan)
+        return plans
+
+    def _record_intent(self, intent: Any = None, *, intent_id: str = "", task: str = "",
+                       requested_tiles: int = 0, ok_tiles: int = 0, failed_tiles: int = 0,
+                       unexecuted_tiles: int = 0, executed_steps: int = 0,
+                       reasons: Mapping[str, int] | None = None, area: str = "",
+                       note: str = "") -> dict[str, Any]:
+        """【task-219】记一条**执行对账**（`day_end.intent_coverage[]`）。
+
+        不变式（按**瓦片**不按 step）：`requested_tiles == ok_tiles + failed_tiles + unexecuted_tiles`；
+        `Σ reasons.count == failed_tiles + unexecuted_tiles`（非 actionless 意图）。
+        集外原因码不丢、放 `bad_reasons`（analyzer 判红，见 `docs/_run10-criteria.md` §8.2b）。
+        """
+        ident = intent_id or (self._intent_id(intent) if intent is not None else "")
+        plan = self.intent_plans.get(ident, {})
+        task_name = task or str(plan.get("task") or "")
+        rec: dict[str, Any] = {
+            "intent_id": ident,
+            "task": task_name,
+            "area_hint": str(plan.get("area_hint") or ""),
+            "area": str(area or ""),
+            "source": str(plan.get("source") or ""),
+            "boundary": str(plan.get("boundary") or ""),
+            "requested_tiles": int(max(0, requested_tiles)),
+            "ok_tiles": int(max(0, ok_tiles)),
+            "failed_tiles": int(max(0, failed_tiles)),
+            "unexecuted_tiles": int(max(0, unexecuted_tiles)),
+            "executed_steps": int(max(0, executed_steps)),
+            "reasons": {str(k): int(v) for k, v in dict(reasons or {}).items()},
+            "actionless": task_name in ACTIONLESS_TASKS,
+        }
+        if note:
+            rec["note"] = note
+        # 【task-219】瓦片口径 vs 意图口径：有瓦片的记录必须满足
+        # `Σ reasons.count == failed_tiles + unexecuted_tiles`；被校验取消/被替代/被门闸挡下
+        # 的意图**一格都没分下去**（`requested_tiles == 0`），它的原因码是**意图级**的，
+        # 用这个布尔位显式区分（analyzer 按位分开核，别把两种口径混在一起算）。
+        rec["reasons_are_intent_level"] = bool(rec["reasons"]) and rec["requested_tiles"] == 0
+        bad = [c for c in rec["reasons"] if c not in INTENT_REASON_CODES]
+        if bad:
+            rec["bad_reasons"] = bad
+        self.intent_coverage.append(rec)
+        return rec
+
+    def _record_stage_intent(self, intent: Any, rep: DayReport) -> None:
+        """阶段意图：用 `_step_stage` 刚写下的阶段账本填执行对账（唯一数据源，不另算一遍）。"""
+        stage = rep.stages[-1] if rep.stages else {}
+        self._record_intent(
+            intent,
+            task=str(stage.get("stage") or ""),
+            requested_tiles=int(stage.get("requested_tiles") or 0),
+            ok_tiles=int(stage.get("ok_tiles") or 0),
+            failed_tiles=int(stage.get("failed_tiles") or 0),
+            unexecuted_tiles=int(stage.get("unexecuted_tiles") or 0),
+            executed_steps=int(stage.get("attempted") or 0),
+            reasons=dict(stage.get("reasons") or {}),
+            area=str(stage.get("zone") or ""),
+        )
+
+    # ------------------------------------------------ 【task-219】能力缺口清单
+    def _gaps_load(self, rep: DayReport | None = None) -> None:
+        """懒加载本 run 的缺口清单（只影响提示词；坏文件整份丢弃、不崩、不参与判定）。"""
+        if self.gaps_loaded:
+            return
+        self.gaps_loaded = True
+        if self.gaps_path is None:
+            return
+        report: dict[str, Any] = {}
+        gaps, err = load_gaps_file(self.gaps_path, report=report)
+        if err:
+            self.gaps_rejected_note = err
+            if rep is not None:
+                rep.notes.append(f"缺口清单读失败（无害，只影响提示词）：{err}")
+            return
+        self.gaps = dict(gaps)
+        dropped = int(report.get("dropped") or 0)
+        if dropped and rep is not None:
+            rep.notes.append(f"缺口清单有 {dropped} 条坏记录被丢弃（无害）")
+
+    def _gaps_merge(self, rows: Iterable[tuple[tuple[int, int], str, str, str]],
+                    rep: DayReport) -> None:
+        """把本阶段的 `(格, 原因码, kind, 需要的工具)` 并进清单（跨日累积、本 run 内持久）。"""
+        self._gaps_load(rep)
+        day_txt = rep.day_key_text if hasattr(rep, "day_key_text") else (
+            f"{rep.day_key[0]} {rep.day_key[1]} {rep.day_key[2]}" if rep.day_key else "")
+        changed = False
+        for tile, reason, kind, tool in rows:
+            key = f"{kind or 'unknown'}|{tool or ''}|{reason}"
+            item = self.gaps.get(key)
+            if item is None:
+                item = {"kind": kind or "unknown", "tool": tool or "", "reason": reason,
+                        "count": 0, "first_seen": day_txt, "last_seen": day_txt,
+                        "sample_tiles": [], "src": "agentfarm"}
+                self.gaps[key] = item
+            item["count"] = int(item.get("count") or 0) + 1
+            item["last_seen"] = day_txt
+            samples = item.setdefault("sample_tiles", [])
+            pair = [int(tile[0]), int(tile[1])]
+            if pair not in samples and len(samples) < GAPS_SAMPLE_TILES:
+                samples.append(pair)
+            changed = True
+        if changed:
+            self.gaps_dirty = True
+
+    def _gaps_flush(self, rep: DayReport) -> None:
+        """日终落盘（原子写）。失败只记 notes：缺口清单只影响提示词，绝不影响当天判定。"""
+        self._gaps_load(rep)
+        if self.gaps_path is None:
+            return
+        if not self.gaps_dirty:
+            return
+        if len(self.gaps) > GAPS_MAX_ITEMS:
+            keep = sorted(self.gaps.values(),
+                          key=lambda it: (-int(it.get("count") or 0), str(it.get("last_seen") or "")))
+            self.gaps = {f"{it['kind']}|{it['tool']}|{it['reason']}": it for it in keep[:GAPS_MAX_ITEMS]}
+        report: dict[str, Any] = {}
+        err = save_gaps_file(self.gaps_path, self.gaps, report=report)
+        self.gaps_dirty = False
+        if err:
+            rep.notes.append(f"缺口清单写失败（无害，只影响提示词）：{err}")
+        else:
+            rep.notes.append(f"能力缺口清单已更新（{int(report.get('written') or 0)} 条，"
+                             f"只作提示、不进判定）")
+
+    def _gaps_brief_lines(self) -> tuple[str, ...]:
+        """【task-219】给 `Brief.recent_gaps` 的 ≤3 条提示（按次数降序；`src` 只认自己的）。"""
+        self._gaps_load()
+        if not self.gaps:
+            return ()
+        items = sorted(self.gaps.values(),
+                       key=lambda it: (-int(it.get("count") or 0), str(it.get("last_seen") or "")))
+        out: list[str] = []
+        for it in items[:GAPS_INJECT_MAX]:
+            kind = str(it.get("kind") or "?")
+            reason = str(it.get("reason") or "?")
+            tool = str(it.get("tool") or "")
+            need = f"（需要 {tool}）" if tool else ""
+            out.append(f"{int(it.get('count') or 0)} 次「{kind}」因{reason}没做成{need}"[:GAPS_TEXT_MAX_CHARS])
+        return tuple(out)
+
+    def _finish_intent_coverage(self, rep: DayReport) -> None:
+        """【task-219】日终收口：**当天计划过**的意图一条都不能少。
+
+        没进执行的（被政策改写/被更具体意图替代/换任务丢掉）在这里补一条对账：`superseded`
+        （被替代）或 `gated`（被门闸挡下、当天没有任何动作）。这是"不执行也要有记录"的最后
+        一道保险 —— 计划有、对账没有 = 缺陷（analyzer 判红）。
+        """
+        seen = {str(r.get("intent_id") or "") for r in self.intent_coverage}
+        for ident in sorted(self.intent_plans):
+            if ident in seen:
+                continue
+            plan = self.intent_plans.get(ident) or {}
+            reason = "superseded" if ident in self.intent_superseded else "gated"
+            self._record_intent(intent_id=ident, task=str(plan.get("task") or ""),
+                                reasons={reason: 1},
+                                note="计划过但没进执行（日终补记，原因见 reason 码）")
+        rep.intent_coverage = [dict(r) for r in self.intent_coverage]
 
     def _elapsed_minutes(self) -> float:
         return (self.now() - self.started) / 60.0
@@ -3224,6 +3466,8 @@ class LongRun:
             # 【task-82】把跨日教训库喂回提示词（空 ⇒ 不出现这一节；只读、只影响文本）。
             recent_lessons=render_lessons(self.lessons, max_items=LESSONS_INJECT_MAX,
                                           max_chars=LESSONS_INJECT_CHARS),
+            # 【task-219】把能力缺口清单喂回提示词（≤3 条/≤200 字符；只提示、不进判定）。
+            recent_gaps=self._gaps_brief_lines(),
             # 【task-168】工作量缺口：`None` 照实进提示词（渲染成「未观测到」），绝不当 0。
             live_crops=budget_live,
             water_capacity=budget_cap,
@@ -5199,6 +5443,8 @@ class LongRun:
         task = intent.task
         outcome = self._step_stage(task, obs, plot, rep)
         rep.outcomes.append(outcome.as_dict())
+        # 【task-219】阶段意图的执行对账直接从刚写下的阶段账本取（唯一数据源）。
+        self._record_stage_intent(intent, rep)
         self._journal("outcome", kind=task, terminal=outcome.terminal,
                       postcondition_met=outcome.postcondition_met, reason=outcome.reason,
                       detail=outcome.evidence)
@@ -5468,6 +5714,53 @@ class LongRun:
             except BridgeError:
                 return False
         return False
+
+    @staticmethod
+    def _tile_reason(key: tuple[int, int], steps: list[StepResult], *,
+                     stopped: str, obs: dict[str, Any]) -> str:
+        """【task-219】给"没做成的格"归一个**闭合集**原因码（`INTENT_REASON_CODES`）。
+
+        判据**只看观测里已有的东西**（步上的标记 / `blocked_by_tool` / 阶格 kind），
+        绝不猜：判不出来的写 `unknown_evidence`（它本身是合法码、但会让 gaps 里出现
+        "证据不足"，正是要暴露的缺陷形态）。优先级 = 越"具体且可行动"越靠前。
+        """
+        def _has(attr: str) -> bool:
+            return any(bool(getattr(s, attr, False)) for s in steps)
+
+        if _has("no_slot"):
+            return "no_slot"
+        if any(getattr(s, "blocked_by_tool", False) for s in steps):
+            return "tool_level"
+        if any(getattr(s, "unreachable", False) or getattr(s, "encircled", False)
+               for s in steps):
+            return "blocked_tile"
+        if _has("env_block"):
+            statuses = {str(getattr(s, "status", "") or "")
+                        for s in steps if getattr(s, "env_block", False)}
+            if statuses & {"ui_modal", "no_save"}:
+                return "blocked_modal"
+            return "world_stuck"
+        if _has("inconclusive"):
+            return "unknown_evidence"
+        if steps and all(getattr(s, "skipped", False) for s in steps):
+            tv = (FarmWorker.tiles_of(obs) or {}).get(key) or {}
+            kind = str(tv.get("kind") or "")
+            if kind in DEFERRED_KINDS:
+                return "deferred_capability"
+            return "gated"
+        if _has("failed"):
+            return "world_stuck"
+        # 一格请求都没发过（换片/预算/批量没收尾）：按阶段 stop 原因归类；判不出来如实写
+        # `unknown_evidence` —— 那正说明"这一格既没做、也没留下理由"，是要暴露的缺口。
+        if stopped == "budget":
+            return "budget"
+        if stopped in ("no_seed", "no_slot_dead", "gated"):
+            return "gated"
+        if stopped in ("blocked_modal", "no_slot"):
+            return "blocked_modal" if stopped == "blocked_modal" else "no_slot"
+        if stopped.startswith("no_route"):
+            return "blocked_tile"
+        return "unknown_evidence"
 
     @staticmethod
     def _stage_undone_cause(steps: list[StepResult], undone: list[tuple[int, int]]) -> str:
@@ -5809,6 +6102,33 @@ class LongRun:
                 if isinstance(item, dict):
                     opens.append({"target": list(s.tile) if s.tile else None, **item})
         attempted_steps = sum(1 for s in all_steps if s.attempted)
+        # 【task-219】瓦片级执行对账（**按瓦片不按 step**）：`assigned` 的格必须落进
+        # ok / failed / unexecuted 三者之一（不变式 `requested == ok + failed + unexecuted`），
+        # 且每个"没做成"的格都要有一个**闭合集**原因码（`INTENT_REASON_CODES`），集外码由
+        # analyzer 判红。这份账本**只留痕**：不改 checks、不动 `_leftover`、不做任何豁免。
+        assigned_set = {tuple(t) for t in assigned}
+        ok_tiles_set = {tuple(s.tile) for s in oks if s.tile} & assigned_set
+        bad_steps: dict[tuple[int, int], list[StepResult]] = {}
+        for s in all_steps:
+            if not s.tile or s.ok:
+                continue
+            key = tuple(s.tile)
+            if key in assigned_set:
+                bad_steps.setdefault(key, []).append(s)
+        failed_set = {k for k in bad_steps if k not in ok_tiles_set}
+        unexec_set = assigned_set - ok_tiles_set - failed_set
+        tile_reasons: dict[str, int] = {}
+        reason_rows: list[tuple[tuple[int, int], str, str, str]] = []
+        tmap_now = FarmWorker.tiles_of(obs)
+        for key in sorted(failed_set | unexec_set):
+            steps_here = bad_steps.get(key) or []
+            reason = self._tile_reason(key, steps_here, stopped=stopped, obs=obs)
+            tile_reasons[reason] = tile_reasons.get(reason, 0) + 1
+            tv = tmap_now.get(key) or {}
+            kind = str(tv.get("kind") or "")
+            tool = str(getattr(steps_here[0], "tool_need", "") or "") if steps_here else ""
+            reason_rows.append((key, reason, kind, tool))
+        self._gaps_merge(reason_rows, rep)
         rep.stages.append({
             "stage": task, "tiles": 0 if not all_steps else len({s.tile for s in all_steps if s.tile}),
             "ok": len(oks), "skipped": len(skipped), "failed": len(failed),
@@ -5829,6 +6149,13 @@ class LongRun:
             "encircled_tiles": [list(t) for t in encircled_tiles],
             "encircled_leftover": encircled_in_left,
             "attempted": attempted_steps,
+            # 【task-219】瓦片级对账（三分类 + 闭合集原因码；`reasons` 只对"没做成"的格计数，
+            # 恒有 `Σ reasons.count == failed_tiles + unexecuted_tiles`）
+            "requested_tiles": len(assigned_set),
+            "ok_tiles": len(ok_tiles_set),
+            "failed_tiles": len(failed_set),
+            "unexecuted_tiles": len(unexec_set),
+            "reasons": dict(tile_reasons),
             # 【task-78 NIT-1】上界基数：发起过动作、且**不是** `encircled` 的步数。
             # `attempted` 一字不动（原始证据计数），豁免上界改用它做分母（fail-closed）。
             "bound_basis": sum(1 for s in all_steps if s.attempted and not s.encircled),
@@ -5999,11 +6326,12 @@ class LongRun:
                 elif not zone_name or zone_name not in zones:
                     reason = f"观测里找不到田区「{zone_name or '(空)'}」"
                 if reason:
-                    verdicts.append({"task": task, "verdict": "cancel", "reason": reason})
+                    verdicts.append({"intent_id": self._intent_id(intent), "task": task,
+                                     "verdict": "cancel", "reason": reason})
                 else:
                     kept.append(intent)
-                    verdicts.append({"task": task, "verdict": "keep", "targets": 1,
-                                     "zone": zone_name})
+                    verdicts.append({"intent_id": self._intent_id(intent), "task": task,
+                                     "verdict": "keep", "targets": 1, "zone": zone_name})
                 continue
             if task not in STAGE_ACTION:
                 kept.append(intent)          # review / sleep 之类不按"有没有目标格"判
@@ -6011,13 +6339,16 @@ class LongRun:
             tiles = [] if far else self._stage_tiles(task, obs, plot)
             if tiles:
                 kept.append(intent)
-                verdicts.append({"task": task, "verdict": "keep", "targets": len(tiles)})
+                verdicts.append({"intent_id": self._intent_id(intent), "task": task,
+                                 "verdict": "keep", "targets": len(tiles)})
             elif far:
                 kept.append(intent)
-                verdicts.append({"task": task, "verdict": "unknown",
+                verdicts.append({"intent_id": self._intent_id(intent), "task": task,
+                                 "verdict": "unknown",
                                  "reason": f"作业区离玩家 {walk_dist} 格，观测看不见，先走过去再看"})
             else:
-                verdicts.append({"task": task, "verdict": "cancel",
+                verdicts.append({"intent_id": self._intent_id(intent), "task": task,
+                                 "verdict": "cancel",
                                  "reason": f"「{self.zone_name or '当前作业区'}」看得见却没有一格可动目标"})
         return kept, verdicts
 
@@ -6106,7 +6437,11 @@ class LongRun:
             if task == "reduce_scope":
                 # 【task-168】规模取舍：先把该区成熟作物收掉，再记账认输、把该区从目标池剔除。
                 # 判定一个字不动（`checks`/`plot_pending`/`assigned_undone` 照旧算未完成）。
-                acted = self._shed_scope(str(intent.area_hint or ""), obs, rep) or acted
+                # 【task-219】每条意图都要有执行对账：认输没成 ⇒ `gated`（今天已认输/上限/区不可见）。
+                shed_ok = self._shed_scope(str(intent.area_hint or ""), obs, rep)
+                acted = shed_ok or acted
+                self._record_intent(intent, task=task, executed_steps=1 if shed_ok else 0,
+                                    reasons={} if shed_ok else {"gated": 1})
                 obs = self._snap()
                 continue
             hint = str(intent.area_hint or "")
@@ -6120,6 +6455,7 @@ class LongRun:
 
             if task == "review":
                 self._review(obs, rep)
+                self._record_intent(intent, task=task, executed_steps=1)
                 continue
             if task in ("sleep", "recover_stamina"):
                 allow, code, text = self.sleep_guard(obs)
@@ -6127,8 +6463,12 @@ class LongRun:
                     rep.notes.append(f"否决 {task}：{text}")
                     self._journal("intent_vetoed", task=task, reason=text)
                     self._say(f"  · 否决 {task}：{text}")
+                    self._record_intent(intent, task=task, reasons={"gated": 1}, note=text)
                     continue
                 rep.ended_by, rep.ended_reason = self._do_sleep(obs, rep, f"{code}:{text}")
+                self._record_intent(
+                    intent, task=task, executed_steps=1,
+                    reasons={"world_stuck": 1} if rep.ended_by == "sleep_failed" else {})
                 return True
             if task == "wait_for_save":
                 st = self.worker.load_save()
@@ -6136,9 +6476,14 @@ class LongRun:
                 rep.notes.append(f"读档：{st.reason}")
                 self._journal("load_save", ok=st.ok, reason=st.reason)
                 acted = acted or st.ok
+                self._record_intent(intent, task=task, executed_steps=1 if st.ok else 0,
+                                    reasons={} if st.ok else {"world_stuck": 1}, note=st.reason)
                 continue
             if task == "ship":
-                acted = self._ship_loot(obs, rep) or acted
+                shipped = self._ship_loot(obs, rep)
+                acted = shipped or acted
+                self._record_intent(intent, task=task, executed_steps=1 if shipped else 0,
+                                    reasons={} if shipped else {"no_target": 1})
                 obs = self._snap()
                 continue
             if task in STAGE_ACTION:
@@ -6147,6 +6492,8 @@ class LongRun:
                 continue
             self._journal("intent_unknown", task=task)
             rep.notes.append(f"未知意图 {task}（跳过）")
+            self._record_intent(intent, task=task, reasons={"unknown_evidence": 1},
+                                note="未知意图（执行层不认识这个 task）")
         return acted
 
     def _ship_loot(self, obs: dict[str, Any], rep: DayReport) -> bool:
@@ -6492,6 +6839,15 @@ class LongRun:
         self.review_done_today = False
         self.no_target = set()
         self.no_target_global = set()
+        # 【task-219】意图执行对账的日级状态：`intent_id` 里的 seq 每天从 1 开始
+        # （id 形如 `spring13#01`；跨日续跑的旧 id 由 analyzer 当 `carried_over` 看）。
+        self.intent_seq = 0
+        self.intent_ids = {}
+        self.intent_plans = {}
+        self.intent_coverage = []
+        self.intent_superseded = set()
+        self.intent_day = f"{rep.day_key[1]}{rep.day_key[2]}"
+        self._gaps_load(rep)
         # 【task-49】跨片地的"今天还没做完"记账 + 回头看的次数上限，每天清零。
         self.leftover_targets = set()
         self.unreachable_day = set()
@@ -6712,9 +7068,13 @@ class LongRun:
 
             brief = self._plot_brief(obs, plot)
             decision = self.planner.decide(self.state, brief)
+            # 【task-219】先把"计划"记下来（`intent_id` 按对象身份缓存，执行侧复用同一个 id；
+            # 不新增事件名，挂在既有 `decision` 行的 `plans` 字段里）。
+            plans = self._plan_intents(decision)
             self._journal("decision", day=list(rep.day_key), boundary=decision.boundary,
                           source=decision.source, llm=decision.llm_called,
                           intents=[i.as_dict() for i in decision.intents],
+                          plans=plans,
                           problems=list(decision.problems), fallback=decision.fallback_reason,
                           # 单独一个布尔位：截断是**配置问题**（该调大 token 预算），
                           # 和网络/校验失败混在一个字符串里事后分不清（task-9）。
@@ -6739,10 +7099,23 @@ class LongRun:
             if policy_note:
                 self._journal("policy", note=policy_note,
                               intents=[i.task for i in decision.intents])
+            # 【task-219】政策层可能补出**新的**意图对象（must 意图）；补记它们的计划，
+            # 保证每条意图都有 `intent_id` + `source/boundary`（已有 id 的对象不会重复记）。
+            self._plan_intents(decision)
             # **校验关口**（用户 m02591）：能继续就继续，做不了就取消，全取消才谈收工
             kept, verdicts = self._verify_intents(decision.intents, obs, plot)
             if verdicts:
                 self._journal("intent_verdict", zone=self.zone_name, verdicts=verdicts)
+            # 【task-219】被校验取消/判不准的意图也要留执行对账（P0-3：cancel ⇒ `no_target`；
+            # unknown ⇒ `unknown_evidence`；判不准但继续跑的由阶段/动作自己记账）。
+            for v in verdicts:
+                verdict = str(v.get("verdict") or "")
+                if verdict not in ("cancel", "unknown"):
+                    continue
+                reason = "no_target" if verdict == "cancel" else "unknown_evidence"
+                self._record_intent(intent_id=str(v.get("intent_id") or ""),
+                                    task=str(v.get("task") or ""),
+                                    reasons={reason: 1}, note=str(v.get("reason") or ""))
             if llm_decision[0]:
                 counts = {"keep": 0, "unknown": 0, "cancel": 0}
                 for _v in verdicts:
@@ -6871,6 +7244,11 @@ class LongRun:
                 self._journal("no_intents", zone=self.zone_name, note=note)
                 rep.ended_by, rep.ended_reason = self._do_sleep(obs, rep, "no_work")
                 break
+            # 【task-219】政策/换任务/兜底之后仍没进执行的计划意图：日终按 `superseded` 归因
+            # （"被政策改写/被更具体意图替代"），绝不因为没记就消失。
+            kept_ids = {self._intent_id(i) for i in decision.intents}
+            self.intent_superseded |= {p["intent_id"] for p in plans
+                                       if p["intent_id"] not in kept_ids}
             acted = self._execute(decision, obs, plot, rep)
             if rep.ended_by:
                 break
@@ -7290,6 +7668,10 @@ class LongRun:
         # 【task-82】日终把今天的**客观教训**并进跨日教训库（`<journal>-lessons.json`）。
         # 只读账本写事实；`hint` 来自今晚收工复盘（没有 ⇒ 空）。读/写失败都只记一笔，
         # 绝不影响 `rep` 的任何判定字段。
+        # 【task-219】意图对账收口 + 能力缺口清单落盘：**都在 day_end 之前**，且都只写
+        # 账本/提示词（不进 `rep.checks`、不改 `verified`、不做豁免）。
+        self._finish_intent_coverage(rep)
+        self._gaps_flush(rep)
         self._lessons_flush(rep)
         self._journal("day_end", **rep.as_dict())
         return rep

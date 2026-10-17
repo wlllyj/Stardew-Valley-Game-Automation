@@ -39,19 +39,22 @@ from agentfarm.farmwork import (  # noqa: E402
     harvest_tool, player_free_slots, seed_items, tile_ready,
 )
 from agentfarm.longrun import (  # noqa: E402
-    CLEARABLE_KINDS, DEFAULT_LLM_MAX_TOKENS, ENDED_BY_EVENT, ENDED_BY_MODAL, FAR_DRY_MAX_TRIES,
-    FAR_DRY_OPEN_MAX, FAR_DRY_REFILL_MAX,
-    FRONTIER_CLEAR_MAX, JUSTIFIED_END_REASONS, MAX_BUY_TRIES_PER_DAY, MAX_ENV_ATTEMPTS,
+    ACTIONLESS_TASKS, CLEARABLE_KINDS, DEFAULT_LLM_MAX_TOKENS, ENDED_BY_EVENT, ENDED_BY_MODAL,
+    FAR_DRY_MAX_TRIES, FAR_DRY_OPEN_MAX, FAR_DRY_REFILL_MAX,
+    FRONTIER_CLEAR_MAX, INTENT_REASON_CODES, JUSTIFIED_END_REASONS, MAX_BUY_TRIES_PER_DAY,
+    MAX_ENV_ATTEMPTS,
     MAX_STUCK_FLUSH, MAX_TILE_ATTEMPTS, PLOT_EXHAUSTED_BURST, READY_FAR_MAX_TRIES,
     SLOT_RELIEF_MAX, SLOT_RESERVE, TREE_CLEAR_MAX_PER_DAY,
     DayReport, LongRun,
     _till_blocked_by, is_justified_end, plot_observe,
 )
-from agentfarm.planner import (DECISION_LINE_MAX_CHARS, DECISIONS_KEPT, LESSONS_MAX, LESSON_SRC,
+from agentfarm.planner import (DECISION_LINE_MAX_CHARS, DECISIONS_KEPT, GAPS_INJECT_MAX,
+                               GAPS_MAX_ITEMS, GAPS_SCHEMA, LESSONS_MAX, LESSON_SRC,
                                REVIEW_MAX_TOKENS, REVIEW_RETRY_MAX_TOKENS,
                                BoundaryPlanner, Brief,
                                TaskIntent, deterministic_plan, find_coordinate_like,
-                               load_scope_file, make_lesson, render_lessons, save_scope_file,
+                               load_gaps_file, load_scope_file, make_lesson, render_lessons,
+                               save_gaps_file, save_scope_file,
                                save_lessons_file)  # noqa: E402
 
 #: 【task-59】收工复盘与边界决策**共用同一个 LLM seam**，靠 system 提示词里的固定短语分辨
@@ -1458,8 +1461,12 @@ class TestIntentBackstop(unittest.TestCase):
         # harvest 是**全场级**任务 ⇒ 取消一次就当天不再要（换片地也不该重问）
         self.assertIn("harvest", run.no_target_global)
         verdicts = [e for e in run.entries if e["event"] == "intent_verdict"][0]["verdicts"]
-        self.assertEqual(verdicts[0], {"task": "harvest", "verdict": "cancel",
-                                       "reason": verdicts[0]["reason"]})
+        # 【task-219】verdict 多了一个 `intent_id`（意图执行对账的键，形如 `<day>#<seq>`）；
+        # 其余字段/语义一字未变（这里仍旧断言"这条 harvest 被判取消 + 有 reason"）。
+        self.assertRegex(str(verdicts[0].get("intent_id") or ""), r"^\S+#\d+$")
+        self.assertEqual({k: v for k, v in verdicts[0].items() if k != "intent_id"},
+                         {"task": "harvest", "verdict": "cancel",
+                          "reason": verdicts[0]["reason"]})
         self.assertTrue(any(e["event"] == "policy_fallback" for e in run.entries), run.entries)
         self.assertGreaterEqual(len(w.dirt), 1, ("取消之后必须换任务真干活", run.entries))
 
@@ -10603,6 +10610,204 @@ class TestTask218TreeClearing(unittest.TestCase):
                          "真清掉的格必须进逐格证据（真 FarmWorker 走假桥）")
         self.assertIsNone(stage["blocker_drop"],
                           "观测里没有 farm.blockers ⇒ info 是 None，不当 0（P0-1）")
+
+
+class TestTask219IntentCoverage(unittest.TestCase):
+    """task-219：LLM 的每个意图都要有**执行对账**；没执行必须有原因码；能力缺口次日可见。
+
+    背景（用户 m18972）：「以后要避免这种情况发生，不执行大模型的策略要记录和找到问题」。
+    本卡只留痕：**不改 checks、不动 `_leftover`、不做任何豁免**（判定口径一个字不动）。
+    """
+
+    def _run(self, w: FakeWorld, planner=None):
+        """用**默认** `FakeClient`+`FakeWorker`（`run.run()` 会按工厂重建，
+        真 `FarmWorker` 需要桥侧的 `buy`/`sell` 一整套，假世界只实现了执行层假件）。"""
+        extra = {"planner": planner} if planner is not None else {}
+        return make_run(w, target_days=1, max_days=1, **extra)
+
+    @staticmethod
+    def _real_worker(run: LongRun, w: FakeWorld) -> FarmWorker:
+        """需要**真** `farmwork` 逻辑（阶段账本/逐格原因码）时用它挂到 run 上。"""
+        client = FakeClient(w)
+        worker = FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+        run.client = client
+        run.worker = worker
+        return worker
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list:
+        return [e for e in run.entries if e.get("event") == name]
+
+    @staticmethod
+    def _plot(*tiles: tuple[int, int]) -> dict:
+        return {"zone": "field_se", "label": "field_se",
+                "anchor": list(tiles[0]), "tiles": [list(t) for t in tiles]}
+
+    def test_every_planned_intent_gets_a_coverage_record(self):
+        """计划有、对账没有 = 缺陷（analyzer 判红）⇒ 日终必须把缺口补平。"""
+        w = FakeWorld(weeds=0, seeds=10, money=500)     # 有种子 ⇒ 会真的干一天活
+        run = self._run(w)
+        code = run.run()
+        self.assertEqual(code, 0, run.logs)
+        rep = run.days[0]
+        planned = [p["intent_id"] for e in self._events(run, "decision")
+                   for p in (e.get("plans") or [])]
+        self.assertTrue(planned, "本卡要求每次决策都记 plans")
+        covered = {r["intent_id"] for r in rep.intent_coverage}
+        self.assertEqual(set(planned) - covered, set(), "有意图没有执行对账")
+        # day_end 必须把这份账本原样带出去（analyzer 只读 journal）
+        day_end = self._events(run, "day_end")[-1]
+        self.assertIn("intent_coverage", day_end)
+        self.assertEqual(len(day_end["intent_coverage"]), len(rep.intent_coverage))
+
+    def test_canceled_intent_is_recorded_with_no_target(self):
+        """P0-3：校验取消 ⇒ `no_target`（不再用会被误读的 `cancelled_by_verify`）。"""
+        w = FakeWorld(weeds=0, seeds=10, money=500)
+        run = self._run(w, planner=FakePlanner(
+            TaskIntent("harvest", "tiles.ripe", "收成熟的", "ripe>0")))
+        self.assertEqual(run.run(), 0, run.logs)
+        rep = run.days[0]
+        canceled = [r for r in rep.intent_coverage
+                    if r["task"] == "harvest" and r["reasons"]]
+        self.assertTrue(canceled, rep.intent_coverage)
+        rec = canceled[0]
+        self.assertEqual(rec["reasons"], {"no_target": 1})
+        self.assertTrue(rec["reasons_are_intent_level"],
+                        "一格都没分下去 ⇒ 原因是意图级的（瓦片不变式不适用）")
+        self.assertEqual(set(rec["reasons"]) - set(INTENT_REASON_CODES), set())
+
+    def test_stage_coverage_satisfies_the_tile_invariant(self):
+        """瓦片口径：`requested == ok + failed + unexecuted` 且 Σ reasons 对上后者。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        run = self._run(w)
+        self._real_worker(run, w)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        run._step_stage("clear_area", w.obs(), self._plot((60, 10), (61, 10)), rep)
+        stage = rep.stages[-1]
+        self.assertEqual(stage["requested_tiles"],
+                         stage["ok_tiles"] + stage["failed_tiles"] + stage["unexecuted_tiles"])
+        self.assertEqual(sum(stage["reasons"].values()),
+                         stage["failed_tiles"] + stage["unexecuted_tiles"],
+                         "每个没做成的格都必须有一个原因码（没有 = 缺陷）")
+        self.assertLessEqual(set(stage["reasons"]), set(INTENT_REASON_CODES))
+    def test_every_coverage_record_uses_the_closed_reason_set(self):
+        w = FakeWorld(weeds=0, seeds=10, money=500)
+        run = self._run(w)
+        self.assertEqual(run.run(), 0, run.logs)
+        for rec in run.days[0].intent_coverage:
+            self.assertEqual(set(rec["reasons"]) - set(INTENT_REASON_CODES), set(), rec)
+            self.assertNotIn("bad_reasons", rec, "集外原因码会被 analyzer 判红")
+
+    def test_actionless_tasks_are_exempt_from_the_reason_rule(self):
+        """`sleep`/`review`/`wait_for_save`/`recover_stamina` 没有"目标格"，不要求原因码。"""
+        self.assertIn("review", ACTIONLESS_TASKS)
+        w = FakeWorld(weeds=0, seeds=10, money=500)
+        run = self._run(w)
+        self._real_worker(run, w)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        run._execute(SimpleNamespace(intents=[TaskIntent("review", "", "先想想", "always")]),
+                     w.obs(), self._plot((60, 10)), rep)
+        self.assertEqual(len(rep.stages), 0)
+        rec = [r for r in run.intent_coverage if r["task"] == "review"]
+        self.assertTrue(rec, run.intent_coverage)
+        self.assertTrue(rec[0]["actionless"])
+        self.assertEqual(rec[0]["reasons"], {}, "actionless 意图不要求原因码")
+
+    def test_gaps_file_accumulates_and_shows_up_in_the_next_brief(self):
+        """能力缺口：跨日累积、本 run 内持久、次日进简报（只提示、不进判定）。"""
+        w = FakeWorld(weeds=0, seeds=10, money=500)
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / "run.jsonl"
+            run = self._run(w)
+            run.journal_path = journal
+            run.gaps_path = journal.with_name("run-gaps.json")
+            rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+            run._gaps_merge([((60, 10), "tool_level", "stump", "axe"),
+                             ((60, 10), "tool_level", "stump", "axe")], rep)
+            run._gaps_flush(rep)
+            self.assertTrue(run.gaps_path.exists(), "缺口清单必须落盘")
+            got, err = load_gaps_file(run.gaps_path)
+            self.assertEqual(err, "")
+            self.assertEqual(len(got), 1)
+            item = list(got.values())[0]
+            self.assertEqual(item["count"], 2)
+            self.assertEqual(item["sample_tiles"], [[60, 10]])
+            self.assertEqual(item["src"], "agentfarm")
+            # 次日简报里看得到（≤3 条、≤200 字符；不新增事件名）
+            gaps = run._gaps_brief_lines()
+            self.assertEqual(len(gaps), 1)
+            self.assertIn("stump", gaps[0])
+            self.assertIn("axe", gaps[0])
+            self.assertIn(gaps[0], Brief(recent_gaps=gaps).situation_text())
+            # 再并一次 ⇒ 跨日累积（不是覆盖）
+            run2 = self._run(w)
+            run2.gaps_path = run.gaps_path
+            run2._gaps_merge([((61, 10), "tool_level", "stump", "axe")], rep)
+            run2._gaps_flush(rep)
+            got2, _ = load_gaps_file(run.gaps_path)
+            self.assertEqual(list(got2.values())[0]["count"], 3)
+
+    def test_gaps_never_change_checks_or_verified(self):
+        """gaps 只提示：同一世界里"有没有缺口清单"必须给出**逐字相同**的判定。"""
+        days = []
+        for with_gaps in (False, True):
+            w = FakeWorld(weeds=0, seeds=10, money=500)
+            run = self._run(w)
+            if with_gaps:
+                with tempfile.TemporaryDirectory() as tmp:
+                    run.gaps_path = Path(tmp) / "run-gaps.json"
+                    rep0 = DayReport(day_key=("spring", 1, 8), started_at=0.0)
+                    run._gaps_merge([((60, 10), "tool_level", "stump", "axe")], rep0)
+                    run._gaps_flush(rep0)
+                    self.assertEqual(run.run(), 0, run.logs)
+                    days.append(run.days[0])
+            else:
+                self.assertEqual(run.run(), 0, run.logs)
+                days.append(run.days[0])
+        without, with_ = days
+        self.assertEqual(with_.checks, without.checks, "gaps 不许改 checks")
+        self.assertEqual(with_.verified, without.verified)
+        self.assertEqual(with_.ended_by, without.ended_by)
+        self.assertEqual(GAPS_INJECT_MAX >= 1 and GAPS_MAX_ITEMS >= 1, True)
+
+
+    def test_day_end_flushes_the_gaps_file_automatically(self):
+        """日终必须**自动**落盘缺口清单（不许只靠测试手工调 `_gaps_flush`）。"""
+        w = FakeWorld(weeds=0, seeds=10, money=500)
+        run = self._run(w)
+        calls = []
+        original = run._gaps_flush
+
+        def spy(rep):
+            calls.append(rep)
+            return original(rep)
+
+        run._gaps_flush = spy
+        self.assertEqual(run.run(), 0, run.logs)
+        self.assertTrue(calls, "日终没调用 `_gaps_flush` ⇒ 缺口清单永远不落盘")
+
+    def test_gaps_brief_lines_are_capped(self):
+        """进简报的缺口条数必须 ≤`GAPS_INJECT_MAX`（提示词预算，不许把整份清单塞进去）。"""
+        w = FakeWorld(weeds=0, seeds=10, money=500)
+        run = self._run(w)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        rows = [((60 + i, 10), "tool_level", f"kind{i}", "axe")
+                for i in range(GAPS_INJECT_MAX + 3)]
+        run._gaps_merge(rows, rep)
+        self.assertEqual(len(run._gaps_brief_lines()), GAPS_INJECT_MAX)
+
+    def test_tile_reason_never_leaves_the_closed_set(self):
+        """`_tile_reason` 的兜底也必须是**合法码**：判不出证据 ⇒ `unknown_evidence`。"""
+        key = (60, 10)
+        inconclusive = StepResult(action="clear", tile=key, ok=False, code="failed",
+                                  inconclusive=True)
+        self.assertEqual(LongRun._tile_reason(key, [inconclusive], stopped="", obs={}),
+                         "unknown_evidence")
+        silent = StepResult(action="clear", tile=key, ok=False, code="")
+        reason = LongRun._tile_reason(key, [silent], stopped="", obs={})
+        self.assertEqual(reason, "unknown_evidence")
+        self.assertIn(reason, INTENT_REASON_CODES)
 
 
 if __name__ == "__main__":  # pragma: no cover
