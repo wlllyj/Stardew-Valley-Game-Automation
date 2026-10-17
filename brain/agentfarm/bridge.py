@@ -36,7 +36,20 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.37"   # v0.7.37：A′ 叫停后的 P0 收口批次 —— Mod 侧
+MOD_VERSION_EXPECTED = "0.7.38"   # v0.7.38：0.7.37 白名单事故 + F3 取回死锁的补救批次 —— Mod 侧
+                                  # ①新增 `SkillCatalog.cs` 单一数据源：`Skills.Create` 的每个 case 名
+                                  #   必须登记，`BridgeHost` 的 known 判定与 `IsLongTaskSkill` 语义
+                                  #   全部从这张表派生（0.7.37 装机版漏登记 7 个新技能 ⇒ 全回
+                                  #   `unknown_skill` 的**永久护栏**）（task-216）；
+                                  # ②C# 自检 +7 断言：Catalog 与 `Skills.Create` 的 case 集合**双向相等**、
+                                  #   `ToolUpgradeRules.Select` 的「同 kind + tier==tierBefore+1」与
+                                  #   「多命中必须拒绝」（task-216 GAP-2）。
+                                  # 脑侧同批（非 Mod）：`_tool_upgrade_due` 的「紧急农活」闸门**只拦 upgrade**、
+                                  # `pickup` 一律放行（F3 取回死锁）；`due=False` 的等待日必留
+                                  # `tool_upgrade_skipped{reason:"wait"|"need_slot"}`；B1e（只扣钱等级 0→0）
+                                  # /B2b（取回后背包没工具）不得判 ok（task-216）。
+                                  # --- 历史 ---
+                                  # v0.7.37：A′ 叫停后的 P0 收口批次 —— Mod 侧
                                   # ①`FarmView.readyTiles[]`（熟作物坐标，与 `readyCrops` 同源同扫描、
                                   #   上限 64、按 (y,x)、`readyTilesTruncated`）（task-199）；
                                   # ②`upgrade_tool`/`pickup_tool` 技能（铁匠铺 `ClintUpgrade` 闭环，

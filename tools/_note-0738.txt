@@ -1,0 +1,7 @@
+v0.7.38：0.7.37 白名单事故与 F3 取回死锁的补救批次（Mod 侧 = 技能名单一数据源护栏；脑侧 = 取回不被紧急农活闸门挡死）
+- Mod `SkillCatalog.cs`（新增，单一只读数据源）：`Skills.Create` 的每个 `case` 名必须在目录里登记，`BridgeHost` 的 `known` 判定与 `IsLongTaskSkill` 语义全部改为从这一张表派生 —— 0.7.37 事故（`KnownSkills` 白名单漏登记 `debug_dump`/`add_missed_recipes`/`upgrade_tool`/`pickup_tool`/`craft_item`/`place_object`/`machine` ⇒ 全部回 `unknown_skill`）的**永久护栏**。
+- Mod C# 自检新增 7 条断言：Catalog 与 `Skills.Create` 的 case 集合**双向相等**（新增技能漏登记/登记了没实现都会红）、`IsLongTaskSkill` 按「是否可能跨 tick」判定、`ToolUpgradeRules.Select` 的「同 kind 且 tier 必须 = tierBefore+1」与「多命中必须拒绝」（task-216 收口 GAP-2）。
+- 脑侧 `longrun._tool_upgrade_due`（task-216 F3）：**「紧急农活」闸门只拦 `upgrade`，`pickup` 一律放行** —— 修掉「水壶在铁匠铺、窗口内有一格干苗 ⇒ 想取回被闸门挡死、苗又因没壶浇不了」的自死锁。
+- 脑侧留痕（task-216 通道⑤）：`due=False` 的等待日也必须留一条 `tool_upgrade_skipped{reason:"wait"|"need_slot"}`（原来 `_maybe_tool_upgrade` 根本不被调用 ⇒ 账本里 0 条、docstring 说谎）。
+- 脑侧判据收紧（task-216 NUT）：只扣钱而等级 `0→0` 不得判 `ok`（B1e）；取回后背包里没有对应工具不得判 `ok`（B2b）。
+- 冻结硬前置：`tests` 全量 `PYTHONUTF8=1` 0 红（`Ran 1055 / OK`）；`check-release --expect 0.7.38` 六项全绿。
