@@ -40,7 +40,8 @@ import agentfarm.longrun as LR                   # noqa: E402
 import agentfarm.planner as PL                   # noqa: E402
 import agentfarm.farmwork as FW                  # noqa: E402
 
-JOURNALS = ROOT / "scratch" / "_t185_j"
+WORKSPACE = Path(__file__).resolve().parents[1]
+JOURNALS = WORKSPACE / "scratch" / "_t185_j"        # 产物永远落在真仓库 scratch/，不污染快照树
 PASS = 0
 FAIL = 0
 SKIP = 0
@@ -169,6 +170,8 @@ def tool_run(journal: Path, *, days: int = 1) -> tuple[int, str]:
     """工具侧必须走 **CLI**（进程内 load/build_days/report 会给真账本也返回 problems=[]）。"""
     tool = ROOT / "tools" / "verify-run3.py"
     if not tool.exists():
+        tool = WORKSPACE / "tools" / "verify-run3.py"
+    if not tool.exists():
         return -1, "no tool"
     proc = subprocess.run([sys.executable, str(tool), "--journal", str(journal),
                            "--days", str(days)],
@@ -177,14 +180,30 @@ def tool_run(journal: Path, *, days: int = 1) -> tuple[int, str]:
 
 
 def forge(src: Path, dst: Path, *, patch_day_end: dict | None = None,
-          drop_events: tuple[str, ...] = ()) -> Path:
+          drop_events: tuple[str, ...] = (), add_events: list[dict] | None = None,
+          which: str = "all") -> Path:
+    """拿一本真账本改 day_end 字段 / 删事件 / 插事件（工具侧伪造通道）。
+
+    `which`：`all` / `first` / `last` —— 改哪一天的 day_end。
+    `add_events` 插在该日 day_end **之前**（`scope_shed` 事件要与该日同 session 才被认）。
+    """
     rows = [json.loads(ln) for ln in src.read_text(encoding="utf-8").splitlines() if ln.strip()]
-    out = []
-    for r in rows:
+    idx = [i for i, r in enumerate(rows) if r.get("event") == "day_end"]
+    target = None
+    if (patch_day_end or add_events) and idx:
+        target = {"all": None, "first": idx[0], "last": idx[-1]}[which]
+    out: list[dict] = []
+    for i, r in enumerate(rows):
         if r.get("event") in drop_events:
             continue
-        if r.get("event") == "day_end" and patch_day_end:
-            r.update(patch_day_end)
+        if r.get("event") == "day_end":
+            hit = bool(patch_day_end or add_events) and (target is None or i == target)
+            if hit:
+                if add_events:
+                    pos = len(out)
+                    out[pos:pos] = add_events
+                if patch_day_end:
+                    r.update(patch_day_end)
         out.append(r)
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in out) + "\n",
@@ -241,12 +260,14 @@ def case_A2() -> None:
     check("A2 journal scope_shed 有 zone/tiles/reason",
           bool(sh) and all(k in sh[-1] for k in ("zone", "tiles", "reason", "deficit")),
           str(sh[-1:] if sh else []))
-    rec = rep.scope_shed.get(z0) or {}
-    check("A2 day_end.scope_shed 带 zone 记录（tiles/live_crops_at_shed/reason/since_day）",
-          all(k in rec for k in ("tiles", "live_crops_at_shed", "reason", "since_day")), str(rec))
+    snap = rep.scope_shed if isinstance(rep.scope_shed, dict) else {}
+    check("A2 day_end.scope_shed 是当次认输快照（zone/tiles/reason/live_crops/deficit/since_day）",
+          snap.get("zone") == z0 and all(k in snap for k in ("zone", "tiles", "reason", "live_crops",
+                                                            "deficit", "since_day")),
+          str(snap))
     check("A2 认输格数 = 该区观测格数",
-          rep.scope_shed_tiles == ztiles and int(rec.get("tiles") or 0) == ztiles,
-          f"rep={rep.scope_shed_tiles} rec={rec.get('tiles')} zone={ztiles}")
+          rep.scope_shed_tiles == ztiles and int(snap.get("tiles") or 0) == ztiles,
+          f"rep={rep.scope_shed_tiles} snap={snap.get('tiles')} zone={ztiles}")
     check("A2 认输格 ⊆ 目标池剔除集（_shed_tile_set）",
           len(run._shed_tile_set()) == ztiles, str(len(run._shed_tile_set())))
     dry = [t for t, v in w.crops.items() if not v.get("watered")]
@@ -291,10 +312,14 @@ def case_A4() -> None:
     check("A4 shed 不进 checks", not any("scope" in k or "shed" in k for k in (rep.checks or {})),
           str(list((rep.checks or {}).keys())))
     live_now = run._shed_live_crops()
-    rec = rep.scope_shed.get(z0) or {}
-    check("A4 _shed_live_crops 只为 int 记录扣减",
-          live_now == (rec.get("live_crops_at_shed") if isinstance(rec.get("live_crops_at_shed"), int) else 0),
-          f"{live_now} vs {rec.get('live_crops_at_shed')}")
+    live_rec = sum(max(0, int(z.get("live_crops_at_shed") or 0)) for z in run.shed_zones.values()
+                   if isinstance(z.get("live_crops_at_shed"), int)
+                   and not isinstance(z.get("live_crops_at_shed"), bool))
+    check("A4 `_shed_live_crops` = 认输记录里 live_crops_at_shed 之和（只认 int）",
+          live_now == live_rec and live_now > 0, f"{live_now} vs {live_rec}")
+    run.shed_zones[z0]["live_crops_at_shed"] = "unknown"
+    check("A4 记录里 live_crops_at_shed 不是 int ⇒ 扣减归 0（不许凭认输抹掉『还有活』）",
+          run._shed_live_crops() == 0, str(run._shed_live_crops()))
 
 
 def case_B1() -> None:
@@ -401,6 +426,14 @@ def case_R1() -> None:
     check("R1 写 scope_released",
           any(e.get("reason") == "zone_has_no_unwatered_crops" for e in events(run, "scope_released")),
           str(events(run, "scope_released")[-1:]))
+    # NIT-1 证据：释放不改 day_end 快照 ⇒ 快照仍自称认输 N 格，而实时剔除集已空
+    check("R1 释放后 day_end 快照仍自称认输（快照与实时状态不一致 = NIT-1）",
+          int(rep.scope_shed_tiles) > 0 and not run._shed_tile_set(),
+          f"rep.scope_shed_tiles={rep.scope_shed_tiles} live_shed={len(run._shed_tile_set())}")
+    info("NIT-1（非阻塞，报 Lead）",
+         "释放后 `rep.scope_shed_tiles` 不归零；工具对『scope_shed_tiles>0 + verified=true』判 problem "
+         "⇒ 雨天「先认输、后来雨浇好了并释放」的诚实账本可能被误判；修法：释放时同步扣减快照，"
+         "或工具侧把同日的 scope_released 认作对冲")
 
 
 def case_X1() -> None:
@@ -416,15 +449,34 @@ def case_X1() -> None:
     check("X1 scope 文件已落盘", bool(path) and Path(path).exists(), str(path))
     if not path or not Path(path).exists():
         return
+    on_disk = json.loads(Path(path).read_text(encoding="utf-8"))
+    zones_raw = on_disk.get("zones") if isinstance(on_disk.get("zones"), dict) else {}
+    disk_tiles = sum(int((v or {}).get("tiles") or 0) for v in zones_raw.values())
     fresh = mk(world(200), journal=JOURNALS / "x1b.jsonl")
     fresh.scope_path = Path(path)
     fresh._scope_load()
     loaded_tiles = sum(len(v) for v in fresh.shed_zone_tiles.values())
-    on_disk = json.loads(Path(path).read_text(encoding="utf-8"))
-    disk_tiles = sum(int((v or {}).get("tiles") or 0) for v in (on_disk.get("zones") or {}).values()) \
-        if isinstance(on_disk.get("zones"), dict) else -1
-    info("X1 载入后的累计计数", f"shed_zone_tiles 合计={loaded_tiles} 文件自述 tiles 合计={disk_tiles}")
-    finding("F-X1 重启后 `shed_zone_tiles` 为空 ⇒ 34% 累计上界只在单进程内成立",
+    info("X1 载入后的累计计数",
+         f"shed_zone_tiles 合计={loaded_tiles} 文件自述 tiles 合计={disk_tiles} "
+         f"载入区={sorted(fresh.shed_zones)}")
+    check("X1 重启后 `shed_zone_tiles` 被灌回（不归零）",
+          loaded_tiles == disk_tiles and loaded_tiles > 0,
+          f"loaded={loaded_tiles} disk={disk_tiles}")
+    check("X1 重启后 `shed_zones` 仍在（粘性记忆跨进程）", z0 in fresh.shed_zones,
+          str(sorted(fresh.shed_zones)))
+    # 上界跨进程仍成立：小农场 cap=68，已用 50 + 新 50 > 68 ⇒ 必须 refused{cap}
+    obs2 = world(200).obs()
+    names2 = zone_names(fresh, obs2)
+    other = next((n for n in names2 if n != z0), None)
+    if other is None:
+        return info("X1 没有第二个区可试", str(names2))
+    ok = fresh._shed_scope(other, obs2, rep_for(day=11))
+    check("X1 重启后累计上界仍生效（已用 50 + 新 50 > 68 ⇒ 拒绝）", ok is False,
+          f"ok={ok} refused={events(fresh, 'scope_shed_refused')[-1:]}")
+    check("X1 拒绝理由 = cap",
+          any(e.get("reason") == "cap" for e in events(fresh, "scope_shed_refused")),
+          str(events(fresh, "scope_shed_refused")[-1:]))
+    finding("F-X1 重启后 `shed_zone_tiles` 为空 ⇒ 34% 累计上界只在单进程内成立（已修则不复现）",
             loaded_tiles == 0 and disk_tiles > 0,
             f"loaded={loaded_tiles} disk={disk_tiles}")
 
@@ -432,7 +484,10 @@ def case_X1() -> None:
 def case_T1() -> None:
     """工具侧：新字段/事件是否被认（缺 ⇒ INFO/finding，不算 FAIL）。"""
     print("== T1 工具侧对 scope_shed 的认知（INFO）==")
-    tool = (ROOT / "tools" / "verify-run3.py").read_text(encoding="utf-8")
+    tool = ROOT / "tools" / "verify-run3.py"
+    if not tool.exists():
+        tool = WORKSPACE / "tools" / "verify-run3.py"
+    tool = tool.read_text(encoding="utf-8")
     if "scope_shed" in tool:
         check("T1 tools/verify-run3.py 认 scope_shed（day_end 白名单）", True)
     else:
@@ -446,34 +501,104 @@ def case_T1() -> None:
             "缺桶 ⇒ 全量会漂移红（task-165/160 同类）")
 
 
-def case_T2() -> None:
-    """工具侧伪造：真账本里把 `scope_shed` 写大 / 与 journal 不一致 ⇒ 工具判决如何。"""
-    print("== T2 工具侧伪造 scope_shed ==")
+BASE_LEDGER = ROOT / "logs" / "longrun-3day-llm-run9c.jsonl"
+if not BASE_LEDGER.exists():                     # 快照树不含 gitignore 的 logs/
+    BASE_LEDGER = WORKSPACE / "logs" / "longrun-3day-llm-run9c.jsonl"
+
+
+def case_A6() -> None:
+    """免罚额度通道：认输后守卫仍要为**别的**活保留理由（不许对全农场闭嘴）。"""
+    print("== A6 C-b：认输会不会让守卫对别处也闭嘴 ==")
     A = api()
     if A["shed_one"] is None:
-        return skip("T2", "task-168 未交付")
-    w, run, obs, z0, ztiles = _shed_setup(200, tag="t2")
+        return skip("A6", "task-168 未交付")
+    w, run, obs, z0, ztiles = _shed_setup(200, tag="a6")
+    rep = rep_for()
+    before = list(run.work_reasons(obs))
+    run._shed_scope(z0, obs, rep)
+    after = list(run.work_reasons(obs))
+    info("A6 守卫理由", f"before={len(before)} after={len(after)} :: {after[:3]}")
+    check("A6 认输后守卫仍为'还有活'保留理由（别处还有未浇活苗）", bool(after), f"after={after}")
+    farm_reasons = [r for r in after
+                    if "格作物没浇水" in r or "格耕地空着" in r or "干作物" in r]
+    check("A6 农场级『还有 N 格活苗/耕地』理由仍在（认输只扣该区，不许一次扣光）",
+          bool(farm_reasons), f"farm_reasons={farm_reasons} after={after}")
+    check("A6 守卫与 unfinished 一致（不因认输把当天判没活）",
+          bool(run._unfinished_work(obs)) == bool(after), f"after={after}")
+
+
+def case_A6b() -> None:
+    """C-b 深一层：人回室内后，farm 级干作物理由必须只扣认输区（1e9 变异杀手）。"""
+    print("== A6b C-b：农场级理由只扣认输区、不许一次扣光 ==")
+    A = api()
+    if A["shed_one"] is None:
+        return skip("A6b", "task-168 未交付")
+    w, run, obs, z0, ztiles = _shed_setup(200, tag="a6b")
     rep = rep_for()
     run._shed_scope(z0, obs, rep)
-    run.entry("day_end", day=("summer", 10, 1)) if hasattr(run, "entry") else None
-    base = JOURNALS / "t2.jsonl"
+    w.revealed = False                      # 回室内：窗口空，只剩 farm 级读数
+    w.location = "FarmHouse"
+    w.is_outdoor_farm = False
+    w.player_tile = [5, 5]
+    reasons = list(run.work_reasons(w.obs()))
+    dry_reasons = [r for r in reasons if "格干作物" in r]
+    info("A6b 室内守卫理由", f"{reasons}")
+    check("A6b 人回室内后仍有 farm 级干作物理由（认输区之外还有 150 格没浇）",
+          bool(dry_reasons), f"reasons={reasons}")
+    check("A6b 理由里的格数 = farm 干作物 − 认输区活苗（150，不是 0）",
+          any("150" in r for r in dry_reasons), f"dry_reasons={dry_reasons}")
+
+
+def case_T3() -> None:
+    """工具侧交叉（Lead 的 task-168 口径核对）：自述 vs journal 逐条、认输却自称 VERIFIED。"""
+    print("== T3 工具侧交叉核对（verify-run3）==")
+    base = BASE_LEDGER
     if not base.exists():
-        return skip("T2", "夹具没写出账本")
-    rc0, out0 = tool_run(base)
-    info("T2 真账本工具判决", f"rc={rc0} " + " ".join(out0.splitlines()[:3]))
-    forged = forge(base, JOURNALS / "t2_forged.jsonl",
-                   patch_day_end={"scope_shed": {"fake_zone": {"tiles": 9999, "reason": "伪造"}},
-                                  "scope_shed_tiles": 9999})
-    rc1, out1 = tool_run(forged)
-    info("T2 伪造账本工具判决", f"rc={rc1} " + " ".join(out1.splitlines()[:3]))
-    finding("F-T2 工具不核对 `scope_shed` 留痕（伪造 9999 格不改变判决）",
-            rc0 == rc1, f"rc 真={rc0} 伪={rc1}")
+        return skip("T3", "缺基准账本 logs/longrun-3day-llm-run9c.jsonl")
+    rc0, out0 = tool_run(base, days=3)
+    verdict0 = "VERIFIED" if "VERIFIED" in out0 else "?"
+    info("T3 基准账本（run9c 旧口径，无 scope_shed 字段）", f"rc={rc0} verdict={verdict0}")
+    ev = [{"event": "scope_shed", "t": 1200.0, "zone": "field_ne", "tiles": 5,
+           "live_crops": 20, "water_capacity": 129, "deficit": 71, "reason": "伪造"}]
+    # (a) 账本自称认输但 journal 无事件 ⇒ 认输量对不上
+    a = forge(base, JOURNALS / "t3a.jsonl",
+              patch_day_end={"scope_shed_tiles": 7,
+                             "scope_shed": {"fake": {"tiles": 7, "reason": "伪造"}}},
+              which="last")
+    rca, outa = tool_run(a, days=3)
+    check("T3a 账本自称认输 7 格而 journal 无 scope_shed ⇒ problem（认输量对不上）",
+          rca != 0 and "认输量对不上" in outa, f"rc={rca}")
+    # (b) journal 有事件而账本缺字段 ⇒ 缺失≠通过
+    b = forge(base, JOURNALS / "t3b.jsonl", patch_day_end={}, add_events=ev, which="last")
+    rcb, outb = tool_run(b, days=3)
+    check("T3b journal 有 scope_shed 而账本没写 scope_shed_tiles ⇒ problem（缺失 ≠ 通过）",
+          rcb != 0 and "没写 scope_shed_tiles" in outb,
+          f"rc={rcb} :: " + " / ".join(ln for ln in outb.splitlines() if "scope_shed" in ln)[:400])
+    # (c) 自述与 journal 一致 ⇒ 只作 info，不改判决
+    c = forge(base, JOURNALS / "t3c.jsonl",
+              patch_day_end={"scope_shed_tiles": 5, "scope_shed": {"field_ne": {"tiles": 5}}},
+              add_events=ev, which="last")
+    rcc, outc = tool_run(c, days=3)
+    check("T3c 自述与 journal 一致 ⇒ 不因此判红（与基准同码）",
+          "认输量对不上" not in outc and "没写 scope_shed_tiles" not in outc and rcc == rc0,
+          f"rc={rcc} 基准={rc0}")
+    # (d) 认输 + 自称 VERIFIED ⇒ 自相矛盾
+    d = forge(base, JOURNALS / "t3d.jsonl",
+              patch_day_end={"scope_shed_tiles": 5, "scope_shed": {"field_ne": {"tiles": 5}}},
+              add_events=ev, which="last")
+    rcd, outd = tool_run(d, days=3)
+    check("T3d 认输 5 格却自称 VERIFIED ⇒ problem（scope_shed 与 verified 自相矛盾）",
+          "却自称 VERIFIED" in outd, f"rc={rcd} verdict={'VERIFIED' if 'VERIFIED' in outd else '?'}")
+    # 与脑侧同向：对不上/矛盾类判红；一致类与基准同码（基准 rc=1 来自 run9c 别的历史问题，与 scope_shed 无关）
+    check("T3e 四条伪账本与脑侧同向（a/b/d 判红、c 与基准同码）",
+          rca != 0 and rcb != 0 and rcd != 0 and rcc == rc0,
+          f"rc a/b/c/d={rca}/{rcb}/{rcc}/{rcd} 基准={rc0}")
 
 
 CASES = {
     "P1": case_P1, "A2": case_A2, "A3": case_A3, "A4": case_A4,
     "B1": case_B1, "B2": case_B2, "A7": case_A7, "R1": case_R1,
-    "X1": case_X1, "T1": case_T1, "T2": case_T2,
+    "X1": case_X1, "T1": case_T1, "T3": case_T3, "A6": case_A6, "A6b": case_A6b,
 }
 
 
