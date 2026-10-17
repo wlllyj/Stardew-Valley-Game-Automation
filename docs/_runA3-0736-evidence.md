@@ -40,7 +40,7 @@
 - `day_start` 5 条：fall 12/13/14/15/16（t=0.12/180.58/279.97/397.71/544.12）。`day_start` 记录的 `final` 为空，钱要看 `buy/sell` 记录：fall 14 开局钱 **2898g**、fall 16 开局钱 **2798g**。
 - 事件计数（账本 454 条）：`harvest_gave_up` **80**、`decision` 48、`intent_verdict` 48、`policy` 39、`outcome` 36、`stage_stop_named` 22（**harvest 20** / water_area 2）、`stage_shortfall` 22、`plot` 16、`sell` 16、`water_far` 8、`goto_farm` 7、`sleep` 4、`day_end` 4、`buy` 3、`modal_dismissed` 3、`surplus_sell` 1、`cannot_afford` 1、`refill` 1。
 
-## §3 外部证据（**SMAPI 窗口待冻结**，现在只给只读计数）
+## §3 外部证据（**SMAPI 窗口已时点冻结** + 游戏已优雅退出）
 
 **存档四条**
 
@@ -50,7 +50,7 @@
 | **叫停后（现盘）** | **4333057 / 08:46:42.979** | **29261 / 08:46:42.980** | 4312426 / 08:44:16.580 | 29258 / 08:44:16.582 |
 
 - 轮询期间另见到 `4285980 / 08:40:45`、`4277814 / 08:42:23` 两代（存档只保留两代，中间各次 size 不可恢复）。**大小有涨有落属正常**（内容变化，不是损坏）。
-- **SMAPI 窗口（只读计数、未冻结）**：`%APPDATA%\StardewValley\ErrorLogs\SMAPI-latest.txt` **仍在被游戏继续写**（读时 262118 B / 3371 行；其 SHA256 随写入变化，**不作为冻结证据**）。按时间戳切窗 `08:37:40–08:46:52`（命中 2952 行）→
+- **SMAPI 窗口（冻结前的只读计数）**：`%APPDATA%\StardewValley\ErrorLogs\SMAPI-latest.txt` **当时仍在被游戏继续写**（读时 262118 B / 3371 行；其 SHA256 随写入变化，**不作为冻结证据**）。按时间戳切窗 `08:37:40–08:46:52`（命中 2952 行）→
 
 | 计数项 | 窗口内 |
 |---|---|
