@@ -208,3 +208,31 @@ $env:T190_ROOT = "$PWD\scratch\_t190_pre189"                    # 期望 PASS=27
 
 - 只写 `docs\_review-task186-188-189.md` + `scratch/`；未碰 `brain/`、`mod/`、`tools/`、`tests/`、`logs/`、`docs\00-开发日志.md`、任务板；未跑真机、未装机、未 bump。
 - 深挖入口：`scratch\_t190_probe.py`（35 条断言 + 1 条发现记录）、`scratch\_t190_mutate.py`（12 条变异，拷贝 `brain+tests+mod+docs`）。
+
+---
+
+## §9 追加 delta 复核（task-192 = `1246cdd`）
+
+卡 task-190 的三条追加项（"释放认输区时同步扣减当天认输记账"落地后复验）。探针 `scratch\_t192_delta.py`（复用 `scratch\_t185_probe.py` 的夹具、`forge()` 与 `tool_run()`；16 条断言，`T185_ROOT` 可切树）。
+
+### 9.1 命令与读数
+
+```powershell
+& $py -W error::SyntaxWarning scratch\_t192_delta.py          # HEAD = 1246cdd ⇒ PASS=16 FAIL=0 SKIP=0
+$env:T185_ROOT="$PWD\scratch\_t192_pre"                        # 1246cdd^ = 3f3a5c0（488 文件）
+& $py -W error::SyntaxWarning scratch\_t192_delta.py          # ⇒ PASS=6 FAIL=6
+```
+
+留档：`scratch\_t192_delta_v1.txt`（post）、`scratch\_t192_delta_pre.txt`（pre）。
+
+### 9.2 三条 delta 逐条
+
+| # | 卡面要求 | 实测（HEAD = `1246cdd`） | pre 树（`1246cdd^`） |
+|---|---|---|---|
+| ① | 释放后不许当天同区再认输；**累计上界不许因释放归零** | D1d 释放后 `shed_ever_tiles` 不归零；D3a 同区再认输被 `already_today` 拦；D3b 累计量抬到 `cap−1`（`cap=68` / workable=200）⇒ 换区认输被 `cap` 拦；D3c 对照清零后同一请求成功 | D1 直接 `AttributeError: 'LongRun' object has no attribute 'shed_ever_tiles'`（累计量机制不存在）；D3b 停在 `already_today`、D3c `allowed=False` ⇒ 上界通道不可达 |
+| ② | 净额与工具 `3ccc29b` 一致（`journal 毛 − 释放 = 账本末态`） | D4e 干净释放（6−6=0，账本 0）⇒ 不判「认输量对不上」；D4f 6−2=4 而账本 0 ⇒ problem；D4g 一致 4 ⇒ 与基准同码 | 工具口径已存在 ⇒ D4e/f/g 同样通过；但 pre 树脑侧写的是**毛**（不扣释放）⇒ 真跑时账本与工具净额会不一致（本项修的是脑侧写数口径） |
+| ③ | 部分释放 6→2 ⇒ 末态 4 | D2b `scope_released.tiles=2` / `shed_tiles_remaining=4` / `rep.scope_shed_tiles=4`；D2 用真流程（释放时仍持有 2 格）⇒ 末态 = 毛 − 2，快照留 `released_tiles=2` | D2b `末态=6 rel={tiles:2, remaining:None}`（只记释放量、末态不扣）；D2c 快照仍 `tiles:50`、无 `released_tiles` |
+
+### 9.3 结论
+
+三条 delta 全部符合；pre→post 由 6 条通过升至 16 条通过，FAIL→PASS 证据齐。**不影响 §6 的 0.7.36 冻结判定（仍为"可以据此冻结"）。**
