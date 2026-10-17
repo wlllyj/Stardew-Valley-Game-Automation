@@ -7,7 +7,9 @@
 
 | # | 卡 | 内容 | 状态 |
 |---|---|---|---|
-| 1 | task-218 | 树纳入清障（普通树 0 级斧可砍）+ **护栏 A 意图-执行覆盖矩阵** + **护栏 B `farm.blockers` 未降判红** + 片地优先/体力预算/桩与圆木 backlog | dev-coder 在制 |
+| 1 | task-218 | 树纳入清障（普通树 0 级斧可砍）+ **护栏 A 意图-执行覆盖矩阵（端到端 6 层）** + **护栏 B 逐格/逐 kind 清障判据** + 片地优先/体力预算/桩与圆木 backlog | dev-coder 在制 |
+
+> ⚠ 涉及护栏 A/B 与 §8 的实现细节**一律以 `docs\_0.7.39-p0-patches.md` 为准**（源自 task-225 设计对抗评审的 4 项 P0 + 1 项工具分工，覆盖本文件与卡面旧表述）。
 | 2 | task-222 | Mod `debug_dump` 支持 1.6 强类型资产（`trigger_actions`/`objects`/`big_craftables`/`machines`，泛型反射 + 每表 fail-closed）+ 观测 `knownCraftingRecipes`（三态） | dev-coder 排队（218 之后） |
 | 3 | task-223 结果 | Furnace 配方合法授予路径定案（`docs/_il-furnace-unlock.md`）；**若结论需要 Mod 侧合法触发入口，则按需加一张卡再进本批** | log-analyst 在制 |
 | 4 | task-219 | **意图-执行对账闭环**（`User said (m18972)`）：每个 LLM 意图 `intent_execution` 记录 + 固定原因码 + `<journal>-gaps.json` 缺口清单 + `Brief.recent_gaps` 次日可见 | 待派 |
@@ -27,13 +29,22 @@
 8. `python -m agentfarm goto Farm`（需 `PYTHONPATH=<repo>\brain`）⇒ 记 hop1/耗时。
 9. `python tools\preflight.py --expect 0.7.39 --save-baseline logs\run-check-0739-baseline.json` ⇒ 四项全绿。
 
-**装机后必做的真机烟雾（条目 077 的教训，硬性）**：任取一个本批**新增只读技能**（0.7.39 用 `debug_dump table=trigger_actions`）发一次请求，断言**不得回 `unknown_skill`**；失败 ⇒ 立刻停手回滚判红。
+**装机后必做的真机烟雾（条目 077 的教训，硬性；2026-10-18 按 task-225 §6 升级为 7 步）**：
+1. `debug_dump table=crafting_recipes key=Furnace` ⇒ 不得回 `unknown_skill`，且 `matchedCount>=1`（验 Mod 白名单与 dump 双通道）；
+2. `debug_dump table=trigger_actions` ⇒ 能读（task-222 的目标；若仍 `InvalidCastException` 则本批 smoke 判红、回炉）；
+3. 单技能砍树：对一棵 `kind=="tree"` 的格发 `use_tool(axe)` ⇒ 观测里该格必须从 `tree` 变 `stump`（或消失），且 `StepResult.after` 带 before/after kind；
+4. 跑 **1 个游戏日**的 `tools\run-longrun.py --days 1` ⇒ `day_end.intent_coverage` 出现、`<journal>-gaps.json` 生成；
+5. 该日 `day_end.stages[]` 里 `clear_area` 的每个 ok 步都有 `cleared_tiles`/kind 变化（P0-1 逐格判据活）；
+6. 该日跨日落盘**六串 6/6 配对**（`tools\compare-runs.py` 或 `scratch/runA-tools.py` 系列复核）；
+7. `tools\analyze-longrun.py --days 1` 判 §8 无「意图 executed_steps==0 且无原因码」；`tools\verify-run3.py` 对 §8 只出 info（P0-5 分工）。
+**全部 7 步通过才允许起 A″/B″**；任一步失败 ⇒ 停手、回滚、判红。
 
 ## §3 判据
 
 - **通用**：`docs/_run10-criteria.md` 全部条款 + `docs/_run6-criteria.md` 尾部窗口口径；两侧工具（`tools/verify-run3.py`、`tools/analyze-longrun.py`）同向；缺失 ≠ 通过；口径变更须过独立对抗验收。
-- **护栏 A（意图-执行覆盖）**：`OBSTACLE_KINDS ∪ CLUMP_KINDS` 每一类，要么能产出可执行目标，要么登记在 `DEFERRED_KINDS` 且简报如实写"暂不支持"；有一条两头都不在 ⇒ 判红。
-- **护栏 B（清障有效性）**：`clear_area` 有 ok 步但当天 `farm.blockers` 未下降 ⇒ 该阶段判 incomplete（不得 VERIFIED）。
+- **护栏 A（意图-执行覆盖）**：`OBSTACLE_KINDS ∪ CLUMP_KINDS` 每一类，**端到端 6 层**（planner → `_plot_brief` → `_stage_tiles` → `clear()` → `_plot_has_work` → `_apply_policy`）都要么能产出可执行目标，要么登记在 `DEFERRED_KINDS` 且简报如实写"暂不支持"；另须 `SKIP_KINDS ⊆ DEFERRED_KINDS` + `DEFERRED_KINDS` 键集合快照（当前只许 `{fruitTree,bush}`）+ 注册表漂移测试 + tiles 缺失/截断时 fail-closed announce。有一条两头都不在 ⇒ 判红。
+- **护栏 B（清障有效性）**：`clear_area` 的每个 ok 步必须给出该格 `cleared_tiles` 或 kind 变化（`tree→stump` 记 progress **不算红**）；**farm 级聚合只作 info、不进判红**（`farm.blockers` 在观测里不存在，见 P0-1）；if farm 计数由 task-222 补上，仅作趋势参考。
+- **工具分工（P0-5）**：§8 意图对账**由 `tools/analyze-longrun.py` 判红**（读 `day_end` 全量 dict）；`tools/verify-run3.py` 对 §8 **只出 info**（day_end 白名单 `tools/verify-run3.py:290-324` 不扩）；能力缺口 ≠ hard failure、不进 `_leftover`/`checks`。
 - **意图对账（task-219）**：LLM 给出的每个意图都必须有 `intent_execution` 记录；`executed_steps==0` 必须有原因码；原因码属能力缺口 ⇒ 进 `gaps.json` 且次日简报可见。
 - **零回归**：既有 1055+ 单测 0 红；账本矩阵（green/run2/run7/runA-0732/run9b/run9c/run9d）rc 与旧判决不变。
 

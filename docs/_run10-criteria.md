@@ -86,14 +86,27 @@
 2. `intent_execution{intent_id, task, requested_tiles, executed_steps, ok_steps, unexecuted_tiles, reasons:{code:count}}` —— 该意图被换掉或当天收尾时记一条。
 3. `day_end.intent_coverage[]` —— 当天所有意图的执行对账汇总；**不新增 checks 键**。
 
-### 8.2 固定原因码枚举（闭合集，出现集外值 ⇒ 判红）
+### 8.2 固定原因码枚举（闭合集，出现集外值 ⇒ 判红；2026-10-18 按 task-225 评审修订）
 
-`no_target` / `deferred_capability` / `tool_level` / `budget` / `blocked_tile` / `blocked_modal` / `no_slot` / `world_stuck` / `cancelled_by_verify` / `gated`。
+`no_target` / `unknown_evidence` / `superseded` / `deferred_capability` / `tool_level` / `budget` / `blocked_tile` / `blocked_modal` / `no_slot` / `world_stuck` / `gated` / `failed`。
 
-- `no_target` 必须附证据（`_stage_tiles==[]` 且窗口/农场计数支持"确实没有"），空口 `no_target` 不算；
+- **`no_target`** 必须附证据 `{stage_tiles_empty: true, obs_seq | counts 快照}`；`tiles` 缺失/截断/证据不可用 ⇒ **禁止裸用**，改用 `unknown_evidence`；
+- **`unknown_evidence`**（新）：观测不可用/被截断/字段缺失导致判不了 —— 这是"没证据"，不是"没目标"；
+- **`superseded`**（新）：策略层改写/合并意图（`_apply_policy`）导致该意图未执行 —— 与 verify 的 `cancel` 分开（cancel 归 `no_target`，unknown 归 `unknown_evidence`）；
+- **`failed`**（新）：执行了但真实失败（`tool_ineffective`/`sow_failed`/`no_seed`/中途体力耗尽等）—— 必须有**完备映射表**（单一数据源 + 漂移测试），映射不到的 step 状态码 ⇒ 判红（漏码即缺陷）；
 - `deferred_capability` 必须同时在 `DEFERRED_KINDS` 且**简报如实写"暂不支持 + 缺什么能力"**；只登记不告知 ⇒ 判红（这是"合法偷懒"的唯一出口，必须留证据）；
 - `budget` / `gated` 属策略性延后：**不进 hard failure**，但必须在 gaps/次日简报可见；
 - 一个意图可以有多条原因码（按环节累计），但**不许 0 条**。
+
+### 8.2b 计数单位与不变式（瓦片制）
+
+- `requested_tiles = ok_tiles + failed_tiles + unexecuted_tiles`；
+- `Σ reasons.count = failed_tiles + unexecuted_tiles`（`reasons.count` 明确按**瓦片数**计，不按 step 数）；
+- 对不上 ⇒ 判红（账目不可信）。
+
+### 8.2c ACTIONLESS 白名单
+
+`sleep` / `review` / `wait_for_save` / `recover_stamina` 这类**无动作意图**在 `_verify_intents`（`brain/agentfarm/longrun.py:5924-5926`）不产生 verdict ⇒ 必须显式列入 `ACTIONLESS_TASKS`，否则 §8.3.2 会**每天误报**。不在白名单的任务一律按有动作意图对账。
 
 ### 8.3 analyzer 判红（task-220 验收必须覆盖）
 
@@ -113,3 +126,35 @@
 
 - 目标 1（指定作业区清空）：护栏 A/B（task-218）保证"说得出、做得到"；本节保证"做不到必须说清楚"。
 - 目标 2（策略闭环）：`intent_coverage` + gaps 是"结果校验 → 据结果优化"的**事实基座**；没有它，L0–L5 里的 L3（决策受教训影响）无法取证。
+
+## 9. `clear_area` 有效性口径（task-218 固化，0.7.39 起）
+
+> 起因：`User said (m18938)`「树已经多到影响种植了，先升级斧子砍树」+ `User said (m18962)`「脑侧从来没砍过树」。旧实现 `farmwork.SKIP_KINDS` 把 `tree` 静默跳过，而简报把树算进 `blockers` ⇒ LLM 一直要求清障、实现层一直不砍。task-218 起普通树可砍（0 级斧），但"砍"必须可验收。
+
+### 9.1 能力覆盖（护栏 A）
+
+`planner.OBSTACLE_KINDS ∪ farmwork.CLUMPS_KINDS` 里每一类必须满足二者之一：
+
+1. **可执行**：只含该类障碍的合成观测喂 `farmwork.clear()` 能产出 ≥1 个动作（或明确 skip 原因）；
+2. **显式登记**：在 `planner.DEFERRED_KINDS` 里登记"理由 + 缺什么能力"，且 `Brief.situation_text()` 如实写「<kind> 存在但暂不支持清理（原因）」。
+
+**静默跳过不允许**：登记了却不告知 = 判红；漏登记某 kind ⇒ 覆盖矩阵测试必须红。当前登记：`fruitTree`（砍掉会毁果树产出，需玩家确认）、`bush`（留浆果，归余力多清）。
+
+### 9.2 有效性（护栏 B）
+
+`clear_area` 阶段记录里：
+
+- `blocker_drop = farm.blockers(阶段开始) − farm.blockers(阶段结束)`（farm 证据不可用 ⇒ `null`，**不许当 0**）；
+- 有 `ok` 步、却**既没有目标格障碍消失、`blocker_drop` 也不为正**、且不是预算/工具挡下 ⇒ `stopped="incomplete"`、`met=False`，并记一条 `stage_stop_named`（带 `blocker_drop`）。
+
+**"挥过刀"不算清障有效，判据是"目标格障碍消失"或"farm.blockers 真降"。** 这项只收紧"有效性"的如实记账，**不新增 `checks` 键、不改 `_leftover`/`JUSTIFIED_END_REASONS` 语义**。
+
+### 9.3 体力预算（树是唯一受日预算约束的清障对象）
+
+- `TREE_CLEAR_MAX_PER_DAY=2`，且 `体力 − 浇水预备 > TREE_STAMINA_ESTIMATE(100)` 才准砍；
+- 预算挡下的树：不进目标池、不算"还有活"、不算 leftover（延后 ≠ 未完成），**不记 hard failure**；
+- 每天至多一条 `deferred_by_budget{task:"clear_area_tree"}`（**复用既有事件名**，不新增桶）。
+
+### 9.4 与目标 1 的关系
+
+"大模型指定的作业区清空"（task-151 rev5）要求区内障碍证据链；本节给出 `clear_area` 侧的"有效 = 障碍消失"判据，二者必须同口径，否则又会出现"账上说清完了、地里还有树"。
