@@ -489,6 +489,39 @@ class BridgeClientTest(unittest.TestCase):
             BridgeClient().load_save(timeout_ms=60000)
         self.assertEqual(ctx.exception.status, "precondition_failed")
 
+    # ---------- task-213：Mod 内省面（Furnace 配方取证通道） ----------
+    def test_debug_dump_request_shape(self) -> None:
+        """debug_dump：table 必发；key/limit 只在显式给出时才出现（请求最小化）。"""
+        c = BridgeClient()
+        c.debug_dump("crafting_recipes", timeout_ms=30000)
+        body = FakeBridgeHandler.last_body
+        self.assertEqual(body["skill"], "debug_dump")
+        self.assertEqual(body["args"], {"table": "crafting_recipes"})
+        self.assertEqual(body["timeout_ms"], 30000)
+
+        c.debug_dump("Data/CraftingRecipes", key="Furnace", limit=20, timeout_ms=45000)
+        args = FakeBridgeHandler.last_body["args"]
+        self.assertEqual(args["table"], "Data/CraftingRecipes")  # 归一在 Mod 侧做，客户端原样转发
+        self.assertEqual(args["key"], "Furnace")
+        self.assertEqual(args["limit"], 20)
+        self.assertEqual(FakeBridgeHandler.last_body["timeout_ms"], 45000)
+
+    def test_debug_dump_failure_surfaces_status(self) -> None:
+        """表名不认识 / 读表失败：Mod 报 table_unknown / load_failed，脑必须显式失败。"""
+        for status in ("table_unknown", "load_failed"):
+            FakeBridgeHandler.exec_status = status
+            with self.assertRaises(BridgeError) as ctx:
+                BridgeClient().debug_dump("no_such_table", timeout_ms=30000)
+            self.assertEqual(ctx.exception.status, status)
+
+    def test_add_missed_recipes_sends_no_args(self) -> None:
+        """add_missed_recipes：没有参数（Mod 用反射调 Farmer.AddMissedMailAndRecipes 一次）。"""
+        BridgeClient().add_missed_recipes(timeout_ms=60000)
+        body = FakeBridgeHandler.last_body
+        self.assertEqual(body["skill"], "add_missed_recipes")
+        self.assertNotIn("args", body)   # 空 args 不发，保持请求最小
+        self.assertEqual(body["timeout_ms"], 60000)
+
     # ---------- 失败路径（旧方案的教训：失败必须显式） ----------
     def test_unauthorized_surfaces_reason(self) -> None:
         self.bridge_json.write_text(json.dumps({"schema": "agentfarm-bridge/1", "port": self.port,

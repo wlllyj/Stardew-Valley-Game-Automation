@@ -992,6 +992,37 @@ namespace AgentFarm.Bridge
         /// 与 <see cref="AnswerIndex"/> 互斥；失败语义同上（fail-closed，不许退回自动挑）。
         /// </summary>
         [JsonPropertyName("answerText")] public string AnswerText { get; set; }
+
+        // ------------------------------------------------------------------
+        //  0.7.39（task-213）新增：`debug_dump` 的只读内省参数
+        //
+        //  为什么需要：Furnace 配方缺失卡住了整条机器链，而 `Data/CraftingRecipes`
+        //  与 `Data/TriggerActions` 都在打包 xnb 里、在仓库里读不到 ⇒ 只能由 Mod 在
+        //  **真机运行时**把游戏自己加载的表读出来。参数只有三个，且全部只读。
+        // ------------------------------------------------------------------
+
+        /// <summary>
+        /// <c>debug_dump</c> 专用：要读的**表名**（见 <see cref="DumpRules.Tables"/>：
+        /// <c>crafting_recipes</c> / <c>cooking_recipes</c> / <c>trigger_actions</c> /
+        /// <c>mail</c> / <c>machines</c> / <c>objects</c> / <c>big_craftables</c>）。
+        ///
+        /// 【纪律】表名先经 <see cref="DumpRules.NormalizeTable"/> 归一；不认识的表 ⇒
+        /// `status="table_unknown"` 并列出支持的表，**绝不**猜一个相近的表去读。
+        /// </summary>
+        [JsonPropertyName("table")] public string Table { get; set; }
+
+        /// <summary>
+        /// <c>debug_dump</c> 专用：可选**键过滤**。给了它 ⇒ 只回 `matched`（精确/子串两桶，
+        /// 精确优先），`entries` 为空；不给 ⇒ 回前 `limit` 条 `entries`。
+        /// 例：`key="Furnace"` 查 <c>crafting_recipes</c> 里的熔炉配方。
+        /// </summary>
+        [JsonPropertyName("key")] public string Key { get; set; }
+
+        /// <summary>
+        /// <c>debug_dump</c> 专用：最多回多少条（默认 200、上限 2000、下限 1）。
+        /// 【硬要求】不许无界返回 —— 表可能有几千条，回执会撑爆 HTTP。
+        /// </summary>
+        [JsonPropertyName("limit")] public int? Limit { get; set; }
     }
 
     /// <summary>
@@ -1195,6 +1226,71 @@ namespace AgentFarm.Bridge
         /// 失败时也给 ⇒ 脑能看清"这件工具到底在不在售"，而不是靠猜。【可选字段】
         /// </summary>
         [JsonPropertyName("offers")] public UpgradeOfferView[] Offers { get; set; }
+
+        // ------------------------------------------------------------------
+        //  0.7.39（task-213）新增：`debug_dump` / `add_missed_recipes` 的回执
+        //
+        //  【形状约定】`entries`/`matched` 都是 `[key, value]` 的**二维字符串数组**，
+        //  不是对象数组 —— 这样 Python 侧无需按动态键解析，且顺序稳定（按 key Ordinal 排序）。
+        //  【全局约定不变】这些字段不适用时保持 null ⇒ 序列化省略 ⇒ 其它技能回执形状不变。
+        // ------------------------------------------------------------------
+
+        /// <summary>
+        /// <c>debug_dump</c> 专用：实际读的表（**归一后的规范名**，不是请求里的原文）。
+        /// 【可选字段】null 时序列化省略 ⇒ 其它技能回执形状不变。
+        /// </summary>
+        [JsonPropertyName("table")] public string Table { get; set; }
+
+        /// <summary><c>debug_dump</c> 专用：该表的总条数（不受 limit 影响）。【可选字段】</summary>
+        [JsonPropertyName("count")] public int? Count { get; set; }
+
+        /// <summary><c>debug_dump</c> 专用：<c>entries</c> 是否被截断（总条数 &gt; 返回条数）。【可选字段】</summary>
+        [JsonPropertyName("truncated")] public bool? Truncated { get; set; }
+
+        /// <summary>
+        /// <c>debug_dump</c> 专用：前 `limit` 条（不给 key 时）—— 每项 `[key, valueString]`。
+        /// 给了 key 时本字段为空数组（只回 <see cref="Matched"/>）。【可选字段】
+        /// </summary>
+        [JsonPropertyName("entries")] public string[][] Entries { get; set; }
+
+        /// <summary>
+        /// <c>debug_dump</c> 专用：给了 key 时的命中项（每项 `[key, valueString]`）。
+        /// 没给 key 时为 null（序列化省略）。【可选字段】
+        /// </summary>
+        [JsonPropertyName("matched")] public string[][] Matched { get; set; }
+
+        /// <summary>
+        /// <c>debug_dump</c> 专用：key 匹配方式 —— <c>"exact"</c>（忽略大小写的精确命中优先）/
+        /// <c>"substring"</c>（子串命中）/ <c>"none"</c>（没命中）。没给 key 时为 null。【可选字段】
+        /// </summary>
+        [JsonPropertyName("matchMode")] public string MatchMode { get; set; }
+
+        /// <summary><c>debug_dump</c> 专用：key 命中的总条数（截断前）。【可选字段】</summary>
+        [JsonPropertyName("matchedCount")] public int? MatchedCount { get; set; }
+
+        /// <summary><c>debug_dump</c> 专用：<c>matched</c> 是否被截断。【可选字段】</summary>
+        [JsonPropertyName("matchedTruncated")] public bool? MatchedTruncated { get; set; }
+
+        /// <summary>
+        /// <c>add_missed_recipes</c> 专用：补发**新增**的 crafting 配方键（排序后的差集）。
+        /// 空数组 = 调过了但一条都没加（这是**有效信息**，不是失败）。【可选字段】
+        /// </summary>
+        [JsonPropertyName("craftingRecipesAdded")] public string[] CraftingRecipesAdded { get; set; }
+
+        /// <summary><c>add_missed_recipes</c> 专用：补发新增的 cooking 配方键。【可选字段】</summary>
+        [JsonPropertyName("cookingRecipesAdded")] public string[] CookingRecipesAdded { get; set; }
+
+        /// <summary><c>add_missed_recipes</c> 专用：补发新增的邮件键（`mailReceived` 差集）。【可选字段】</summary>
+        [JsonPropertyName("mailAdded")] public string[] MailAdded { get; set; }
+
+        /// <summary>
+        /// <c>add_missed_recipes</c> 专用：调用**前**三类集合的计数
+        /// （键：<c>crafting_recipes</c>/<c>cooking_recipes</c>/<c>mail</c>）。【可选字段】
+        /// </summary>
+        [JsonPropertyName("beforeCounts")] public Dictionary<string, int> BeforeCounts { get; set; }
+
+        /// <summary><c>add_missed_recipes</c> 专用：调用**后**三类集合的计数。【可选字段】</summary>
+        [JsonPropertyName("afterCounts")] public Dictionary<string, int> AfterCounts { get; set; }
     }
 
     /// <summary>

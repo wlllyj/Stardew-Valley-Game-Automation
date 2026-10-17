@@ -936,6 +936,54 @@ class BridgeClient:
         """
         return self.exec_skill("pickup_tool", timeout_ms=timeout_ms)
 
+    def debug_dump(
+        self,
+        table: str,
+        *,
+        key: str | None = None,
+        limit: int | None = None,
+        timeout_ms: int = 30000,
+    ) -> dict[str, Any]:
+        """**只读内省游戏自己加载的数据表**（`debug_dump`，Mod ≥ 0.7.39，task-213）。
+
+        `table`：`crafting_recipes` / `cooking_recipes` / `trigger_actions` / `mail` /
+        `machines` / `objects` / `big_craftables`（也接受别名与资产路径写法，
+        归一在 Mod 侧 `DumpRules.NormalizeTable`；不认识的表 ⇒ `status="table_unknown"`）。
+        `key`：可选的**键过滤** —— 给了它 ⇒ 只回 `matched`（`[key, value]` 对，精确优先、
+        否则子串，`matchMode` 标注），`entries` 为空；不给 ⇒ 回前 `limit` 条 `entries`。
+        `limit`：默认 200、上限 2000（Mod 侧钳制，**不许无界返回整张表**）。
+
+        回执形状：`{ok, status, skill, table, count, truncated, entries, matched,
+        matchMode, matchedCount, matchedTruncated, reason}` —— `entries`/`matched` 都是
+        `[[key, valueString], ...]`，value 是 Mod 反射渲染的一行字符串（复杂对象带类型名与字段）。
+
+        【为什么存在】Furnace 配方缺失卡住机器链，而 `Data/CraftingRecipes` 在打包 xnb 里
+        仓库读不到 ⇒ 只能真机运行时内省（`docs\\_il-furnace-recipe.md`）。**只读**，不改世界。
+        失败状态码：`table_unknown` / `load_failed`（异常原文在 reason）/ `error`。
+        """
+        args: dict[str, Any] = {"table": str(table)}
+        if key is not None:
+            args["key"] = str(key)
+        if limit is not None:
+            args["limit"] = int(limit)
+        return self.exec_skill("debug_dump", args, timeout_ms=timeout_ms)
+
+    def add_missed_recipes(self, *, timeout_ms: int = 30000) -> dict[str, Any]:
+        """**调一次游戏自己的补发入口**（`add_missed_recipes`，Mod ≥ 0.7.39，task-213）。
+
+        内部 = 反射调 `Farmer.AddMissedMailAndRecipes()`，**只调一次**（绝不循环）。
+        回执给**前后差分**：`craftingRecipesAdded` / `cookingRecipesAdded` / `mailAdded`
+        （排序后的新增键）+ `beforeCounts` / `afterCounts`（键：`crafting_recipes` /
+        `cooking_recipes` / `mail`）。
+
+        ⚠️ **它会写玩家字典**（这是游戏自己的补发逻辑）。所以：
+          * 只在**真机取证/修复**时调用，不进常规日循环；
+          * 空数组 = 调过了但一条都没加（**有效信息**，不是失败）；
+          * 方法不存在 ⇒ `status="not_available"`（不猜替代、不自己写表）；
+          * 抛异常 ⇒ `status="error"`，reason 注明"**可能已写了一半**"。
+        """
+        return self.exec_skill("add_missed_recipes", timeout_ms=timeout_ms)
+
     def quit_game(self, *, timeout_ms: int = 3000) -> dict[str, Any]:
         """让**游戏自己退出**（quit_game，Mod ≥ 0.7.0）。
 

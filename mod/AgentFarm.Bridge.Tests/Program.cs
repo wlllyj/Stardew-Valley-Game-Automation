@@ -257,6 +257,49 @@ namespace AgentFarm.Bridge.Tests
                   && ToolUpgradeRules.SameKind("wateringcan", "can"),
                   "wateringcan/watering_can 归一化成 can");
 
+            // ==============================================================
+            //  task-213：Mod 内省面（Furnace 配方取证通道）的纯规则行为断言
+            // ==============================================================
+            Console.WriteLine("DumpRules 行为断言（task-213）");
+
+            Check("t213_table_normalization",
+                  DumpRules.NormalizeTable("CraftingRecipes") == "crafting_recipes"
+                  && DumpRules.NormalizeTable("Data/CraftingRecipes") == "crafting_recipes"
+                  && DumpRules.NormalizeTable("  CRAFTING-RECIPES ") == "crafting_recipes"
+                  && DumpRules.NormalizeTable("triggeractions") == "trigger_actions"
+                  && DumpRules.NormalizeTable("BigCraftables") == "big_craftables"
+                  && DumpRules.NormalizeTable("no_such_table") == "",
+                  "表名归一：别名/大小写/连字符/资产路径都归一；不认识 ⇒ 空串（fail-closed，禁止猜表）");
+
+            Check("t213_limit_clamped",
+                  DumpRules.ClampLimit(null) == DumpRules.LimitDefault
+                  && DumpRules.ClampLimit(0) == 1
+                  && DumpRules.ClampLimit(-5) == 1
+                  && DumpRules.ClampLimit(50) == 50
+                  && DumpRules.ClampLimit(5000) == DumpRules.LimitMax,
+                  "limit 钳制：null⇒200、<1⇒1、>2000⇒2000（不许无界返回整张表）");
+
+            Check("t213_match_kind",
+                  DumpRules.MatchKind("Furnace", "furnace") == 1
+                  && DumpRules.MatchKind("Furnace", "FURN") == 2
+                  && DumpRules.MatchKind("Furnace", "Charcoal") == 0,
+                  "key 匹配：精确（忽略大小写）优先于子串；不中 ⇒ 0");
+
+            List<string> added = DumpRules.DiffAdded(
+                new[] { "Wood", "Stone", "Furnace" },
+                new[] { "Stone", "Furnace", "Charcoal Kiln", "Bee House" });
+            Check("t213_diff_added_sorted",
+                  added.Count == 2 && added[0] == "Bee House" && added[1] == "Charcoal Kiln",
+                  "差集只给新增项并按序数排序（before 里已有的 Furnace 不算新增）");
+
+            string described = DumpRules.Describe(new Dictionary<string, int> { ["a"] = 1, ["b"] = 2 });
+            string describedLong = DumpRules.Describe(new string('x', 50), 10);
+            Check("t213_describe_and_truncate",
+                  described.Contains("a=1") && described.Contains("b=2")
+                  && describedLong.StartsWith("xxxxxxxxxx") && describedLong.Contains("truncated")
+                  && DumpRules.Describe(null) == "null",
+                  "值渲染：字典 ⇒ {k=v}；超长截断并标注原长；null ⇒ \"null\"（不许抛）");
+
             Console.WriteLine(_failed == 0
                 ? $"OK {_total} 断言全部通过"
                 : $"FAILED {_failed} 条断言不通过（共 {_total} 条）");

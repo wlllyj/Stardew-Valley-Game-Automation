@@ -41,6 +41,9 @@
          ⇒ 同样直接编译同一份源码。判据本体留在吃游戏类型的 ToolUpgradeSkill 里就只能做
          源码文本断言（task-182 的 GAP-1 教训：文本断言逃逸了行为变异）。 -->
     <Compile Include="..\AgentFarm.Bridge\ToolUpgradeRules.cs" />
+    <!-- task-213：内省面（表名归一 / limit 钳制 / key 匹配 / 差集 / 值渲染）是纯逻辑
+         ⇒ 同样直接编译同一份源码跑行为断言（Furnace 配方取证的判据必须行为化）。 -->
+    <Compile Include="..\AgentFarm.Bridge\DumpRules.cs" />
   </ItemGroup>
 
 </Project>

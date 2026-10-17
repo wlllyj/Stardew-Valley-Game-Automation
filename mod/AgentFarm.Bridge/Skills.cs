@@ -96,9 +96,25 @@ namespace AgentFarm.Bridge
                 case "upgrade_tool":
                 case "pickup_tool":
                     return ClampUpgradeTimeout(timeoutMs);
+                // 【task-213】只读内省（debug_dump 读整张 Data 表）与一次补发调用：
+                // 表可能几千条、反射遍历要时间，8s 太紧；上限 60s（不许无界）
+                case "debug_dump":
+                case "add_missed_recipes":
+                    return ClampDumpTimeout(timeoutMs);
                 default:
                     return ClampTimeout(timeoutMs);
             }
+        }
+
+        /// <summary>【task-213】内省/补发的时间预算：默认 30s、上限 60s。</summary>
+        public static int ClampDumpTimeout(int? timeoutMs)
+        {
+            const int def = 30000;
+            const int max = 60000;
+            int v = timeoutMs ?? def;
+            if (v < TimeoutMinMs) v = TimeoutMinMs;
+            if (v > max) v = max;
+            return v;
         }
 
         /// <summary>【task-205】铁匠铺升级/取回的时间预算：默认 60s、上限 90s（跨 tick 等菜单）。</summary>
@@ -424,6 +440,22 @@ namespace AgentFarm.Bridge
                 case "pickup_tool":
                     return new ToolPickupSkill(req, world, monitor).Step;
 
+                // 【task-213】Mod 只读内省面（Furnace 配方缺失卡住机器链的取证通道）：
+                //
+                //   * `debug_dump`：把游戏自己加载的 Data 表（`Data/CraftingRecipes`、
+                //     `Data/TriggerActions` 等）读出来，**带 key 过滤 + limit 上限**，
+                //     复杂值反射逐字段转成字符串（不打新依赖）。单 tick、只读。
+                //   * `add_missed_recipes`：调一次游戏自己的 `Farmer.AddMissedMailAndRecipes()`，
+                //     回执给前后差分（`crafting_recipes_added` / `cooking_recipes_added` / `mail_added`）。
+                //     ⚠️ 它**会写玩家字典**（这是游戏自己的补发逻辑，卡面允许），但**只准调一次**、
+                //     不许循环；方法不存在 ⇒ `not_available`（不猜替代、不自己写表）。
+                //
+                // 两者都是单 tick 同步技能 ⇒ **不**加入 BridgeHost.IsLongTaskSkill。
+                case "debug_dump":
+                    return new DebugDumpSkill(req, world, monitor).Step;
+                case "add_missed_recipes":
+                    return new AddMissedRecipesSkill(req, world, monitor).Step;
+
                 default:
                     // 未实现的技能：合法请求但还没有实现（区别于 unknown_skill）。
                     return () => new ExecResponse
@@ -433,7 +465,7 @@ namespace AgentFarm.Bridge
                         Skill = skill,
                         Reason = $"技能“{skill}”尚未实现（已实现：noop、move_to、move_to_location、"
                                + "dismiss_modal、load_save、quit_game、interact、use_tool、select_item、plant、"
-                               + "sleep、buy、sell、upgrade_tool、pickup_tool）",
+                               + "sleep、buy、sell、upgrade_tool、pickup_tool、debug_dump、add_missed_recipes）",
                     };
             }
         }
