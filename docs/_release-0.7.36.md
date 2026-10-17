@@ -83,3 +83,11 @@
 - 五文件指纹：`longrun.py C326DD1E1358EA15` / `farmwork.py FA6BD05CCAB9DF25` / `bridge.py 968D1D227A293B1A` / `dll D6699BD057C51CE7` / `manifest 6578C42574237AA8`（只比这五个 + argv，不比 HEAD）。
 - 已发 machine-runner：四件复测（`interact` 与 `use_tool` 两条路出数 / `use_tool` 回执两键 / loot 逐 qid 对账 / 不可收格不被洗成成功）+ 纪律（先腾一格背包、不 `load_save`、`worldSeq` 不是成功信号、收尾优雅退游戏）。
 - **后续**：task-191 四条全绿 ⇒ 起 **task-113（A′/B′，各 5 天）**；`docs\_run10-criteria.md` §5 的测量规则（`worldSeq` 不是成功信号）已生效。
+
+### 5.5 task-191 真机复测结果（2026-10-17，machine-runner）
+- 交付 **`eb93c13`**（2 文件 +495：`docs\_run10-harvest-verify-0736.md` 131 行 + `scratch\_t191_probe.py`）。**卡面写的是 `docs\_run10d-verify-0736.md`，实际交付名以我 GO 消息里允许的 `_run10-harvest-verify-0736.md` 为准**（已在消息中确认接受，不再改名重提）。
+- **四条判据全绿 = PASS**：①两条路都出数（`interact` 样本格 `(60,29)`：脑 `ok=True`、Mod `acted=true/actedEvidence="ready"`、`ready_flipped`+`loot {'270':1}`；`use_tool` 同类镰刀格 `(60,30)`：脑 `ok=True`、Mod `acted=true/actedEvidence="tile"`、`crop_gone`+`ready_flipped`+`loot`+`worldSeq` 前进）；②**R1 闭合**（`use_tool` 成功路径两键都在）；③loot 逐 qid 与白名单内实测精确一致，`loot_waits 1` 真机生效；④fail-closed：不可收格 ⇒ `skipped`、背包满 ⇒ `failed`，**两者零触桥**。
+- **口径差异（已接受，不当作已覆盖）**：判据④卡面写「`ready=false` ⇒ 脑侧 `code=failed`」，实际 0.7.36 返回更早更保守的 `skipped`；「Mod 回执 `acted=false` 且脑侧 `failed`」这一形态**真机没造出来**（脑侧先拦），已在 `docs\_run10-harvest-verify-0736.md` §9 如实留痕。
+- **两条新残留立案（0.7.37，跑批期不动 brain/mod）**：**task-195** = 原始 `use_tool` 路径的 `actedEvidence` 是**聚合口径**（对目标格描述可错）且无脑侧守卫时**破坏性**（实测连带清 4 格含未成熟作物）；**task-196** = 非白名单附带掉落（镰刀顺带割草 `Moss +1`）未计入 `loot`/`affected_tiles`。
+- **收尾按 m02833**：`stop-game.py` rc=0 ⇒ 进程 0 / `bridge.json` 已删 / 17890 仅 TIME_WAIT / 存档四条逐字未变；SMAPI 窗口退出后复制 `logs\run10d-smapi-window.txt`（77360 B / SHA256 `38282A5CEDFAAD0CA91614B9103029247D181B3C90DAF795FD0423CE815A7031` / `BYTE_IDENTICAL=True`）。世界改动只存内存、退出即回滚 ⇒ 样本 `(60,29)` 与 12 行满背包在存档里原样保留。
+- **下一关**：等 task-194（analyzer 读 task-192 新字段）落地 ⇒ Lead 放行 **task-113（A′/B′，各 5 天）**。
