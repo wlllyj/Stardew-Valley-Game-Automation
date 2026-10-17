@@ -1,5 +1,33 @@
 # 接续清单 · 2026-10-11 收工时点（明天从这里开始）
 
+## 0j. 2026-10-17 11:10 · **用户要求暂停（`m18188`「可以先暂停，稍后再重新启动」）—— 0.7.37 批次停在中途**
+
+**停点一句话**：**HEAD `f2e72e3`（task-202 收口，全量 `Ran 992 / OK` 零红）**；工作树里有 **task-199 的在制 WIP**（Mod 半已完成并自测通过、brain 半 5 绿 1 红、farmwork 三态用例未写）+ deputy 的 `docs/_review-0.7.37.md`(untracked) 与 `scratch/_t200_*`。**没有提交任何半成品**（Lead 决定：不留 wip 提交，等 199 完整了再按卡提交）。
+
+**0.7.37 批次状态（6 卡 + 1 验收）**
+| 卡 | 状态 |
+|---|---|
+| **task-198** 背包满/腾格回路 | ✅ 已交付 `62e9089` 并经 deputy **PASS-WITH-NITS（无阻塞）**：冻结树 pre `6 PASS/15 FAIL` → post `24 PASS/0 FAIL`；A′ 原型 `198f-1..8` 全绿；7 变异净杀 **10/4/2/1/2/3/1 与自报 100% 相符**；`_leftover` 在 `inventory_blocked` 日**无洗白**（N1 剩 7 格/N2 剩 8 格，`no_unmet_stages=False`、`failed_steps=0`、`verified=False`）。唯一 NIT：`stages[].env_block` 把同轮 `no_slot` 步数全累计（N1 21/N2 24），易误读 ⇒ 后续 journal 区分 `no_slot` 与其它 env 挡路（非阻塞）。 |
+| **task-202** analyzer 收 3 事件 | ✅ `f2e72e3`（4 文件 +359/−2）：`Ran 992 / OK` **0 红**；真实差集是 **8 名**（3 个 task-198 事件 + 5 个 `ready_far*` WIP 名）；旧账本 rc/红数一字未变、`#无法判定` 每本 +5（新增探针按「缺失⇒无法判定」如实报，**Lead 裁定保留**）。 |
+| **task-199** Mod `farm.readyTiles` + 脑走过去 | 🟡 **约 90%**。Mod 半**已完成并验证**（`Contracts.cs`/`FarmScan.cs`/新增 `TileListRules.cs`/C# 测试：`dotnet build` **0 警 0 错**、C# 自检 **31 断言全过**）；brain 半功能写完（`farmwork.farm_ready_tiles` 三态、`longrun` 的 `_ready_far_*` 六件套/`_walk_far_tile(purpose=)`/`work_reasons`+`sleep_guard` 的 `gave_up_ready` 口径/日循环接线）；**最后一步小修未验证**（`ready_far_blocked` 改成「每格当天认输只记一条」）⇒ 现存 1 红：`tests.test_longrun.TestTask199ReadyFar::test_unreachable_far_ready_is_bounded_and_silences_the_guard`（同格记了 2 条）。`tests/test_farmwork.py` 的三态/文本契约用例**未写**。 |
+| task-195 / 196 / 193 / 197 | ⏸ 未开工（Mod 证据绑目标格 / 脑侧连带掉落分栏 / sell 白名单收窄 / 编码硬化）。 |
+| **task-200** deputy 独立对抗验收 | 🟡 滚动中：报告已写 §1（A 段读数）+ §2（task-198 全段）+ §6（197 基线），§3/§4/§5/§7 占位。 |
+
+**环境**：Mod **0.7.36 已装机**（dll 202752 B）；游戏**已优雅退出**（进程 0、桥不在），存档 `Wahaha_450799035` = **第1年 秋 17 日 清晨 / 4364545 B / `2026-10-17 09:01:33.716`**（A″ 就从这里读档）；全量单测 **992 OK**（HEAD `f2e72e3`，**带 `PYTHONUTF8=1`**）。
+
+**明天开工顺序（Lead 串行放行）**
+1. **dev-coder（唯一 brain/Mod 写者）**：① 跑 `python -m unittest tests.test_longrun.TestTask199ReadyFar -v` 确认那处小修生效（该条应转绿）；② 补 `tests/test_farmwork.py` 的 `farm_ready_tiles` 三态 + `FarmScan.cs` 文本契约用例；③ ≥3 变异（报实测杀数）；④ 全量（带 `PYTHONUTF8`）0 红；⑤ 单提交 task-199 并报 `git show --stat`。**Mod 半已完成，不许再改 `mod/` 的其它部分。**
+2. **Lead**：复核 199 → 依次放行 **195（Mod）→ 196（brain）→ 193（brain）→ 197（tests）**（单写者串行；195 改 `mod/`，196/193 改 `brain/`+`tests/`）。
+3. **deputy-lead**：每卡交付后在 `git archive` 冻结树上做正式 pre/post + 变异实测（照 198 的模板；`scratch/_t200_*` 已就绪）。
+4. 全绿 ⇒ Lead **冻结 0.7.37**（九步照 `docs/_release-0.7.37.md` §2；`tools/_note-0737.txt` 已在库需补 198/199 条目）⇒ 装机 ⇒ `goto Farm` ⇒ `preflight --save-baseline logs/runA4-0737-baseline.json` ⇒ **task-113 的 A″（0.7.37，5 天）** ⇒ 教训库字节拷贝 ⇒ **B″（5 天）** ⇒ `tools/compare-runs.py` 的 **L0–L5** 对照。
+
+**判据要点（别忘）**：`docs/_release-0.7.37.md` §3 已把「**A′ 原型复现**」写成 198 的冻结硬判据（出现 `slot_relief`/`inventory_blocked`、且**不得**出现 `stuck:…守卫仍说还有活`、`no_hard_failures` 不得因 `no_slot` 为 false）；`docs/_run10-criteria.md` §5 记「`worldSeq` 不是成功信号」、§6 记三条 0.7.37 起的口径（背包满不算硬失败 / 守卫"还有活"必须落到可执行目标 / sell 白名单两通道）。
+
+**目标不变**（`User said (m15155)`）：①农场全部清理 + 钱在作物再投资与工具升级间平衡（验收 = 完成一次完整清理）；②连续 5 个游戏日全自主 + 大模型策略生成/结果校验/据结果优化（验收 = 5 日 VERIFIED + 每日 ≥2 份独立观测 + 落盘六串 + L0–L5 对照）。**goal 已 `paused`（rev15）**，用户说「重新启动」时再 resume。
+
+---
+
+
 > 本文是**收工快照**，只写"明天开工要用的东西"。`docs\_resume-prompt.md` 是 P2 时代的三步恢复法（仍然有效：单测 → `deploy-mod.py` → `run-plot.py`），但它的状态表已过期，以本文为准。
 > 目标不变：**P3 ⑥ —— 端到端自主完成「清障 → 开垦 → 播种 → 浇水」，连续 3 个游戏日无人工介入**（判据一律用 `observe?detail=full` 的 `tiles[]`/`inventory[]`/`money` 差分，回执不算证据）。
 
