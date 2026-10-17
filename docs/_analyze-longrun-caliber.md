@@ -1199,4 +1199,10 @@ python scratch\_mk_refused.py                                               # �
 python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
 python -m unittest tests.test_analyze_longrun  # 当前 231 OK（task-207 + 工具升级全链 6 条）
 python -m unittest discover -s tests           # 当前 Ran 1032 tests / OK（0 红）
+python scratch\_t194_undec.py                   # task-207 完成读数（HEAD 导出 vs 新版，六账本并排）：
+                                               #   rc/红数**一字未变** —— runA 1/117、runB 1/84、run9 1/84、
+                                               #   run9b 1/45、run9c 0/0、run9d 1/29（verify-run3 同向，run9c 为
+                                               #   已知授权不同向）；#无法判定 每本 **+7** = task-207 新增 6 条探针
+                                               #   + 1 条专行，旧账本对这些事件 0 命中 ⇒ 按「缺失 ⇒【无法判定】
+                                               #   （缺失 ≠ 0）」如实报出，不是判据变化
 ```
