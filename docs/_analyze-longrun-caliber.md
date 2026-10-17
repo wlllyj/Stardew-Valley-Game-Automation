@@ -993,6 +993,49 @@ git grep -n "ReadySource\|GetHarvestMethod" -- mod/AgentFarm.Bridge/
 python tools\analyze-longrun.py --journal logs\longrun-runA-0732.jsonl --days 6 | rg "可收来源"
 ```
 
+## 3.29 规模取舍 `scope_*`（task-168，task-187 收录）
+
+**背景**：task-168 让大脑在「今天浇不完」时**主动认输一个田区**（策略性取舍，不是够不着），
+并把认输记录写到 `<journal>-scope.json` 跨日粘住。机械枚举实捕 **9 个**新事件名（卡面列了 7 个，
+实际多出 `scope_save_failed` / `scope_harvest_failed`）：
+
+| 事件 | brain 位置 | 字段 | 语义 |
+|---|---|---|---|
+| `scope_shed` | `brain/agentfarm/longrun.py:1242` | zone/tiles/live_crops/water_capacity/deficit/target_tiles/harvested_steps/reason | **策略性认输** |
+| `scope_shed_refused` | `:1192-1221` | zone/reason ∈ not_on_farm/no_farm_evidence/no_deficit/already_today/zone_not_visible/cap（cap 另带 shed_tiles/this_zone/cap_tiles/farm_workable） | **如实不认输** |
+| `scope_released` | `:1142` | zone/reason ∈ zone_has_no_unwatered_crops/farm_deficit_zero/tiles/live_crops_now | 撤销认输 |
+| `scope_harvest` / `scope_harvest_failed` | `:1162` / `:1169` | zone/tiles/targets ≤6；error | 认输前把该区成熟作物收掉（收成不因放弃而烂掉） |
+| `scope_loaded` / `scope_saved` / `scope_save_failed` / `scope_rejected` | `:1024-1041` | path/zones/written/error/reason | 持久层（只影响跨日记忆） |
+| `day_end.scope_shed` / `scope_shed_tiles` | `DayReport.as_dict` `:585-586` | dict / int | 当日认输快照（`{zone:{since_day,tiles,live_crops_at_shed,reason}}`） |
+
+**口径红线（防洗白）**：brain 把认输区从目标池与守卫理由里扣掉，但 **`_leftover` 一字不改**
+（`brain/agentfarm/longrun.py:1045-1049`）⇒ 认输格**仍留在会计里** ⇒ `no_unmet_stages=false`、
+`watered_outdoor` 照旧挂 ⇒ 当天**如实不 VERIFIED**；上界双保险（一天 ≤1 区
+`SCOPE_SHED_MAX_PER_DAY = 1`、累计 ≤34% `SCOPE_SHED_MAX_FRACTION = 0.34`）⇒ 不可能是"永久免罚额度"。
+
+**本工具**：`scope_*` 全部**只作 info、不进 checks、不进 rc**（`tools\verify-run3.py` 目前对
+`scope_shed*` 全盲，Lead 会另补核对 —— analyzer 侧只需语义不自相矛盾）。头部新增 `规模取舍:` 行 +
+建议 0s-4；唯一可证伪 ⚠：**出现 `scope_shed` 却自称 VERIFIED**（互斥组合 ⇒ 人工核对，判红会与
+checks 反向）；另两条诊断 ⚠：有认输事件但 `day_end` 没有 `scope_shed` 快照、以及认输前收成抛异常
+或记录写不进去/被拒收。缺事件 ⇒ `<缺失>` +【无法判定】（**缺失 ≠ 0**，绝不当『没认输过』或
+『都做完了』通过）。
+
+**单测**：`tests/test_analyze_longrun.py::TestScopeShedAccounting` 7 条 —— 9 个事件都有桶且不落未映射 /
+info 全可见且不进 rc / 认输+VERIFIED ⇒ ⚠ 但 rc 仍 0 / 无 day_end 快照 ⇒ ⚠ / 有快照 ⇒ 计数 /
+缺事件 ⇒ `<缺失>` +【无法判定】 / `FIELD_PROBES` 覆盖新探针。
+
+**读数**：`py_compile -W error::SyntaxWarning` RC=0；`tests.test_analyze_longrun` **214 OK**（+7）；
+全量 `discover -s tests` **Ran 931 tests / OK（0 红）**。旧账本回归（`scratch\_t172_matrix.py`）：
+run A 1(117)、run B 1(84)、run9d 1(29)、run9c 0(0)、run9b 1(45)、run9 1(84) —— **判决与计数一字未变**
+（只多头部 `规模取舍: <缺失>` 行 +【无法判定】行）；run A 实跑确认 rc=1、red=117。
+
+**grep 配方**：
+
+```
+git grep -n "_journal(\"scope_" -- brain/agentfarm/longrun.py
+python tools\analyze-longrun.py --journal logs\longrun-runA-0732.jsonl --days 6 | rg "规模取舍"
+```
+
 ## 4. 复核命令
 
 ```
@@ -1006,6 +1049,6 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run9d.jsonl --da
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
 python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
-python -m unittest tests.test_analyze_longrun  # 当前 207 OK（task-179 + `readySource` 三态 7 条）
-python -m unittest discover -s tests           # 当前 Ran 911 tests / OK（0 红）
+python -m unittest tests.test_analyze_longrun  # 当前 214 OK（task-187 + `scope_*` 规模取舍 7 条）
+python -m unittest discover -s tests           # 当前 Ran 931 tests / OK（0 红）
 ```

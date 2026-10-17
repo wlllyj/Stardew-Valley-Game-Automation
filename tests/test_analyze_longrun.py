@@ -3989,5 +3989,126 @@ class TestCropReadySource(unittest.TestCase):
         self.assertEqual((rep["red"] or {}).get("total"), 0)
 
 
+class TestScopeShedAccounting(unittest.TestCase):
+    """task-187（dev task-168 规模取舍）：`scope_*` 事件的桶 / 呈现 / 可证伪 ⚠。
+
+    口径红线：`scope_shed` 是**策略性取舍、不是豁免额度** —— brain 把它从目标池与守卫理由里扣掉，
+    但 `_leftover` 一字不改、认输格仍留在会计里 ⇒ 当天照样如实不 VERIFIED。
+    ⇒ 本工具的 ⚠「有 `scope_shed` 却自称 VERIFIED」**只警告、绝不进 rc**（判决权在
+    `checks.no_unmet_stages` / `checks.watered_outdoor`）；缺事件 = 旧账本 ⇒【无法判定】（缺失 ≠ 0）。
+    """
+
+    SHED_EVENTS = [
+        {"event": "scope_loaded", "t": 1.0, "path": "logs/x-scope.json", "zones": ["field_nw"]},
+        {"event": "scope_shed", "t": 20.0, "zone": "field_nw", "tiles": 21,
+         "live_crops": 14, "water_capacity": 9, "deficit": 5, "target_tiles": 21,
+         "harvested_steps": 2, "reason": "今天有 5 格活苗浇不完 ⇒ 主动放弃 field_nw"},
+        {"event": "scope_shed_refused", "t": 21.0, "zone": "field_ne", "reason": "already_today",
+         "limit": 1},
+        {"event": "scope_shed_refused", "t": 22.0, "zone": "field_se", "reason": "cap",
+         "shed_tiles": 21, "this_zone": 30, "cap_tiles": 40, "farm_workable": 118},
+        {"event": "scope_released", "t": 23.0, "zone": "field_sw",
+         "reason": "zone_has_no_unwatered_crops", "tiles": 3, "live_crops_now": 0},
+        {"event": "scope_harvest", "t": 24.0, "zone": "field_nw", "tiles": 1,
+         "targets": [[60, 29]]},
+        {"event": "scope_saved", "t": 900.0, "path": "logs/x-scope.json", "zones": 1, "written": 1},
+    ]
+
+    def _day(self, day, *, extra=(), scope_end=None):
+        nxt = [day[0], day[1], day[2] + 1]
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": True,
+                  "watered_outdoor": True}
+        end = {"event": "day_end", "t": 950.0, "day": day, "ended_by": "sleep",
+               "ended_reason": "night", "verified": True, "checks": checks,
+               "stages": [{"stage": "water_area", "ok": 9, "skipped": 0, "failed": 0,
+                           "env_block": 0, "inconclusive": 0, "stopped": None, "leftover": 0}],
+               "ok_steps": 9, "skipped_steps": 0, "failed_steps": 0, "notes": [],
+               "final": final(nxt),
+               "final_water": {"t": 949.0, "location": "Farm", "tiles": 84, "crops": 31,
+                               "dry": 0, "scope": "farm"}}
+        if scope_end is not None:
+            end.update(scope_end)
+        return [day_start(day), *extra, end]
+
+    def _report(self, events, name, *, days=1):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_ledger(tmp, name, events)
+            return report_for(path, days=days)
+
+    def test_events_have_buckets_and_are_not_unmapped(self):
+        checks = [
+            ("scope_shed", "scope_sheds"), ("scope_shed_refused", "scope_shed_refusals"),
+            ("scope_released", "scope_releases"), ("scope_harvest", "scope_harvests"),
+            ("scope_harvest_failed", "scope_harvest_failures"), ("scope_loaded", "scope_loads"),
+            ("scope_saved", "scope_saves"), ("scope_save_failed", "scope_save_failures"),
+            ("scope_rejected", "scope_rejections"),
+        ]
+        for ev_name, bucket in checks:
+            self.assertEqual(mod.EVENT_BUCKETS.get(ev_name), bucket, ev_name)
+            self.assertIn(bucket, mod.NEW_EVENT_BUCKETS, bucket)
+        rep = self._report(self._day([1, "fall", 9], extra=self.SHED_EVENTS), "t187_buckets.jsonl")
+        self.assertEqual(sorted((rep.get("unmapped_events") or {}).keys()), [],
+                         "新事件必须全部有桶、不许静默丢弃")
+
+    def test_shed_info_is_visible_and_not_red(self):
+        rep = self._report(self._day([1, "fall", 9], extra=self.SHED_EVENTS), "t187_info.jsonl")
+        ss = rep["scope_shed"]
+        self.assertTrue(ss["has_events"])
+        self.assertEqual(ss["shed_events"], 1)
+        self.assertEqual(ss["shed_tiles"], 21)
+        self.assertEqual(ss["shed_zones"], ["field_nw"])
+        self.assertEqual(ss["refused_events"], 2)
+        self.assertEqual(ss["refused_reasons"], {"already_today": 1, "cap": 1})
+        self.assertEqual(ss["released_events"], 1)
+        self.assertEqual(ss["harvest_events"], 1)
+        self.assertEqual(ss["harvest_targets"], 1)
+        self.assertEqual(ss["load_events"], 1)
+        self.assertEqual(ss["saved_events"], 1)
+        text = mod.render_text(rep, 50)
+        self.assertIn("规模取舍: 主动认输 1 区次", text)
+        self.assertIn("scope_shed` **只作 info、不进 checks**", text)
+        self.assertEqual(rep["red"]["total"], 0, "scope_* 一律 info ⇒ 不进 rc")
+
+    def test_shed_with_verified_is_warning_not_red(self):
+        rep = self._report(self._day([1, "fall", 9], extra=self.SHED_EVENTS), "t187_warn.jsonl")
+        ss = rep["scope_shed"]
+        self.assertEqual(ss["warn_verified_with_shed_lines"], [3])
+        text = mod.render_text(rep, 50)
+        self.assertIn("有 `scope_shed` 却自称 VERIFIED", text)
+        self.assertEqual(rep["red"]["total"], 0, "⚠ 只警告、绝不进 rc")
+
+    def test_shed_without_day_end_snapshot_is_warning(self):
+        rep = self._report(self._day([1, "fall", 9], extra=self.SHED_EVENTS), "t187_nosnap.jsonl")
+        self.assertEqual(rep["scope_shed"]["day_end_shed_days"], 0)
+        self.assertTrue(rep["scope_shed"]["warn_shed_without_day_end"])
+        self.assertIn("day_end 没有 `scope_shed` 快照", mod.render_text(rep, 50))
+
+    def test_day_end_snapshot_is_counted(self):
+        rep = self._report(self._day(
+            [1, "fall", 9], extra=self.SHED_EVENTS,
+            scope_end={"scope_shed": {"field_nw": {"tiles": 21, "live_crops_at_shed": 14}},
+                       "scope_shed_tiles": 21}), "t187_snap.jsonl")
+        self.assertEqual(rep["scope_shed"]["day_end_shed_days"], 1)
+        self.assertFalse(rep["scope_shed"]["warn_shed_without_day_end"])
+
+    def test_missing_scope_events_is_undecidable_not_pass(self):
+        rep = self._report(self._day([1, "fall", 9]), "t187_old.jsonl")
+        self.assertFalse(rep["scope_shed"]["has_events"])
+        blob = " ".join(rep.get("undecidable") or [])
+        self.assertIn("没有任何 task-168 的 `scope_*` 事件", blob)
+        self.assertIn("缺失 ≠ 0", blob)
+        self.assertIn("规模取舍: <缺失>", mod.render_text(rep, 50))
+        self.assertEqual(rep["red"]["total"], 0, "缺失 ⇒【无法判定】，既不判红也不判通过")
+
+    def test_field_probes_cover_scope_keys(self):
+        probes = {p for _, p, _ in mod.FIELD_PROBES}
+        for probe in ("live_crops_at_shed", "scope_shed_tiles", "scope_shed",
+                      "scope_shed_refused", "scope_released", "scope_harvest",
+                      "scope_harvest_failed", "scope_loaded", "scope_saved",
+                      "scope_save_failed", "scope_rejected"):
+            self.assertIn(probe, probes, probe)
+
+
 if __name__ == "__main__":
     unittest.main()

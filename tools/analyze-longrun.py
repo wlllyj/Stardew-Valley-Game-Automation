@@ -173,6 +173,15 @@
     这两名零命中，判红会两边反向）；只一条可证伪 ⚠（不进 rc）：当天自称 `no_work` 却存在工具门槛
     封格 ⇒ 人工核对「真敲不动 vs 工具够却判不出」。旧账本 ⇒ `<缺失>` +【无法判定】（缺失 ≠ 0）；
     `min_level` 缺失 ⇒【无法判定】等级，绝不默认 0 级。
+  * 规模取舍（task-168，task-187 收录）：`scope_shed` = **策略性取舍、不是豁免额度** —— brain 把认输区
+    从目标池/守卫理由里扣掉，但 `_leftover` 一字不改、认输格仍留在会计里 ⇒ 当天如实不 VERIFIED
+    （上界：一天 ≤1 区、累计 ≤34% 可作业格）。`scope_shed_refused`（reason ∈ not_on_farm/
+    no_farm_evidence/no_deficit/already_today/zone_not_visible/cap）= 如实不认输；`scope_released`
+    = 撤销认输；`scope_loaded`/`scope_saved`/`scope_save_failed`/`scope_rejected` = 持久层动作
+    （只影响跨日记忆，不改当天判定）；`scope_harvest`/`scope_harvest_failed` = 认输前把该区成熟作物
+    收掉（收成不因放弃而烂掉）。本工具全列 info（头部 `规模取舍` 行 + 建议 0s-4），**一律不进 rc**；
+    唯一可证伪 ⚠：**出现 `scope_shed` 却自称 VERIFIED**（防洗白通道被打开，人工核对）。旧账本缺
+    这些事件 ⇒ `<缺失>` +【无法判定】（缺失 ≠ 0，绝不当『没认输过』或『都做完了』通过）。
   * 事件映射不许漂移（Lead m02395）：brain 里 `_journal("<name>"` 的**每个**事件名都要在
     `EVENT_BUCKETS` 里有桶（结构性事件 `day_start`/`day_end`/`finish` 除外，见 `STRUCTURAL_EVENTS`）；
     账本里出现没桶的事件 ⇒ 报告头部逐条点名（名字×次数+行号）+ 建议 0a，**绝不静默丢弃**。
@@ -490,6 +499,35 @@ FIELD_PROBES = [
     ("exec.acted", "exec_acted",
      "task-170：skill 回执新增 `acted`（`mod\\AgentFarm.Bridge\\Skills.cs:237-241`："
      "`Ok = err == null && acted`）⇒ task-3 那次「回执只保证没抛异常」的坑在 0.7.33 后应可见"),
+    # task-187（dev task-168 规模取舍）：`scope_*` 系列 —— 认输/释放/持久层/拒绝/认输前收成。
+    #   语义红线：`scope_shed` 是**策略性取舍、不是豁免额度** —— brain 把它从目标池与守卫理由里扣掉，
+    #   但 `_leftover` 一字不改、认输格仍留在会计里 ⇒ 当天如实不 VERIFIED（认输 ≠ 做完了）。
+    ("day_end.scope_shed", "live_crops_at_shed",
+     "当天**主动认输**的田区快照（task-168：`{zone: {since_day,tiles,live_crops_at_shed,reason}}`）"
+     "⇒ 只作 info、不进 checks；认输格仍在会计里"),
+    ("day_end.scope_shed_tiles", "scope_shed_tiles",
+     "当天认输格数合计（task-168；与 `event:scope_shed.tiles` 互检）"),
+    ("event:scope_shed", "scope_shed",
+     "逐区主动认输（task-168：zone/tiles/live_crops/water_capacity/deficit/target_tiles/"
+     "harvested_steps/reason）⇒ **策略性取舍、不是豁免额度**（上界：一天 ≤1 区、累计 ≤34% 可作业格）"),
+    ("event:scope_shed_refused", "scope_shed_refused",
+     "认输被拒（task-168：reason ∈ not_on_farm/no_farm_evidence/no_deficit/already_today/"
+     "zone_not_visible/cap；cap 另带 shed_tiles/this_zone/cap_tiles/farm_workable）⇒ **如实不认输**"),
+    ("event:scope_released", "scope_released",
+     "撤销认输（task-168：zone/reason ∈ zone_has_no_unwatered_crops/farm_deficit_zero/tiles/"
+     "live_crops_now）⇒ 该区重新进目标池与守卫理由"),
+    ("event:scope_harvest", "scope_harvest",
+     "认输前先把该区成熟作物收掉（task-168：zone/tiles/targets ≤6）—— 收成不因放弃而烂掉"),
+    ("event:scope_harvest_failed", "scope_harvest_failed",
+     "认输前收成抛异常（task-168：zone/error）⇒ 只影响这次收成，不改变认输结果"),
+    ("event:scope_loaded", "scope_loaded",
+     "跨日认输记录被读入（task-168：path/zones）⇒ 只影响目标池/守卫理由，不影响任何 checks"),
+    ("event:scope_saved", "scope_saved",
+     "跨日认输记录写回成功（task-168：path/zones/written）⇒ 只影响跨日记忆"),
+    ("event:scope_save_failed", "scope_save_failed",
+     "跨日认输记录写不进去（task-168：path/error）⇒ 只影响跨日记忆，绝不改变当天判定"),
+    ("event:scope_rejected", "scope_rejected",
+     "认输记录整份不可信被拒收（task-168：path/reason）⇒ 本次当作没认输过（拒收是正确行为）"),
     ("event:decision", "decision_memory",
      "决策史条数（task-58 的 `Brief.recent_decisions` 注入 = 账本里 `decision` 事件数；每条还补了 "
      "terminal/leftover/unreachable/refused/where 具名田区，**无坐标**）⇒ 头部`决策:`行已给总数；"
@@ -764,6 +802,16 @@ EVENT_BUCKETS = {
     "harvest_gave_up": "harvest_gave_ups",
     "surplus_sell": "surplus_sells",
     "surplus_sell_skip": "surplus_sell_skips",
+    # task-187（dev task-168）：规模取舍 —— 认输/释放/持久层/拒绝/认输前收成（一律 info、不进 checks）
+    "scope_shed": "scope_sheds",
+    "scope_shed_refused": "scope_shed_refusals",
+    "scope_released": "scope_releases",
+    "scope_harvest": "scope_harvests",
+    "scope_harvest_failed": "scope_harvest_failures",
+    "scope_loaded": "scope_loads",
+    "scope_saved": "scope_saves",
+    "scope_save_failed": "scope_save_failures",
+    "scope_rejected": "scope_rejections",
     # task-84：日级死苗汇总（`dead_crops_summary`，只在 `dead_crops>0` 且状态 ok 时写一条）。
     "dead_crops_summary": "dead_crops_summaries",
     # task-102（`9b09735`）：**背包空格死锁**的三个新事件（run8 day 2/12/13）—— 都不是失败：
@@ -873,6 +921,10 @@ NEW_EVENT_BUCKETS = (
     "stuck_flushes", "stuck_flush_skips", "stuck_flush_resnap_failures",
     # task-55/task-91：盈余材料换种子钱（钱次日 NewDay 结算；skips/below_keep 都不是失败）
     "surplus_sells", "surplus_sell_skips",
+    # task-187（dev task-168）：规模取舍 `scope_*` 桶名
+    "scope_sheds", "scope_shed_refusals", "scope_releases", "scope_harvests",
+    "scope_harvest_failures", "scope_loads", "scope_saves", "scope_save_failures",
+    "scope_rejections",
     # task-172：收获如实放弃（不是豁免分子；一眼看出"今天放了 N 格没收"）
     "harvest_gave_ups",
     # task-84：死苗汇总（一眼看出"还有 N 格枯死、其中 M 格没浇、今天认输 K 格"）
@@ -2918,6 +2970,25 @@ def build_advice(report, top=8):
                     "缺键 ⇒ 旧 Mod 形态，镰刀类作物到底走 `interact` 还是工具路径无法判定",
             "lines": (cr.get("harvest_method_missing_lines") or [])[:12],
         })
+    # 0s-4) task-187（dev task-168）：规模取舍 —— 认输是策略性取舍，**不是豁免额度**（⚠ 不进 rc）
+    ss0 = report.get("scope_shed") or {}
+    if ss0.get("warn_verified_with_shed_lines"):
+        advice.append({
+            "text": f"主动认输片区却自称 VERIFIED ×{len(ss0['warn_verified_with_shed_lines'])}："
+                    "brain 的防洗白设计是「认输格留在会计里 ⇒ `no_unmet_stages=false`、"
+                    "`watered_outdoor` 照旧挂」；出现这个互斥组合 ⇒ 人工核对"
+                    "（task-168 对抗验收要打的正是『scope_shed 变免罚额度』这条通道）",
+            "lines": (ss0.get("warn_verified_with_shed_lines") or [])[:6],
+        })
+    elif ss0.get("has_events") and (ss0.get("harvest_failed_lines") or ss0.get("save_failed_lines")
+                                    or ss0.get("rejected_lines")):
+        advice.append({
+            "text": "规模取舍的持久层/收成路径有异常（认输记录写不进去、被拒收，或认输前收成抛异常）："
+                    "只影响跨日记忆与这次收成，**不改变当天判定**；但连续出现说明 scope 文件不可用",
+            "lines": (ss0.get("harvest_failed_lines") or [])[:3]
+                     + (ss0.get("save_failed_lines") or [])[:3]
+                     + (ss0.get("rejected_lines") or [])[:3],
+        })
     # 0c) 环境挡路 / 没拿到结论（task-22 记账）
     env = report.get("env_inconclusive") or {}
     if env.get("env_fail_events"):
@@ -3193,6 +3264,13 @@ def build_undecidable(rows, sessions, prelude, report):
         out.append("本账本没有 `tiles[].readySource`（task-176）：**无法判定·旧 Mod** —— "
                    "`ready` 到底是游戏 `HoeDirt.readyForHarvest()` 判的还是字段兜底猜的分不清"
                    "（task-173 的 FAIL 正是这样被掩盖的）；**缺失 ≠ 0、更绝不因此判通过**")
+    # task-187（dev task-168）：规模取舍 `scope_*` 是否落账 —— 缺失 ≠ 0（旧账本没有这些事件）。
+    _scope_ev = [1 for _ln, ev in rows if str(ev.get("event") or "").startswith("scope_")]
+    if rows and not _scope_ev:
+        out.append("本账本没有任何 task-168 的 `scope_*` 事件（`scope_shed`/`scope_shed_refused`/"
+                   "`scope_released`/`scope_loaded`/`scope_saved`/`scope_save_failed`/"
+                   "`scope_rejected`/`scope_harvest`/`scope_harvest_failed`）：无法判定当时是否出现过"
+                   "「主动认输片区」—— **缺失 ≠ 0，绝不当『没认输过』或『都做完了』通过**")
     # task-111：复盘/教训库的证据是否存在（缺失 ⇒【无法判定】，绝不因此判通过、也不判红）
     _lr_ev = [ev for _ln, ev in rows
               if ev.get("event") in ("review_llm", "review_llm_failed", "lessons",
@@ -4728,6 +4806,72 @@ def build_report(rows, path, args, bad_lines):
         crop_ready["note"] = ("账本层没有 ripeCrops/readyCrops（`day_end.final.farm` 白名单 "
                               "brain longrun.py:1690-1692 不含）⇒ 只能记【无法判定】；"
                               "要判定请用 observe?detail=full 的 farm.readyCrops 采样")
+    # task-187（dev task-168）：规模取舍 `scope_*` —— 认输是**策略性取舍、不是豁免额度**：
+    #   brain 把认输区从目标池/守卫理由里扣掉，但 `_leftover` 一字不改 ⇒ 认输格仍留在会计里，
+    #   当天照样如实不 VERIFIED。这里只做呈现 + 可证伪 ⚠（**不进 rc**），判定权仍在 checks。
+    scope_shed = {
+        "has_events": False, "shed_events": 0, "shed_lines": [], "shed_zones": [],
+        "shed_tiles": 0, "live_crops": 0, "deficit": [], "water_capacity": [],
+        "harvested_steps": 0, "refused_events": 0, "refused_lines": [],
+        "refused_reasons": {}, "released_events": 0, "released_lines": [],
+        "released_reasons": {}, "harvest_events": 0, "harvest_lines": [],
+        "harvest_targets": 0, "harvest_failed_lines": [], "load_events": 0,
+        "load_lines": [], "saved_events": 0, "save_failed_lines": [],
+        "rejected_lines": [], "day_end_shed_days": 0,
+        "warn_verified_with_shed_lines": [], "warn_shed_without_day_end": False,
+    }
+    for _ln, _ev in rows:
+        _sn = str(_ev.get("event") or "")
+        if not _sn.startswith("scope_"):
+            continue
+        scope_shed["has_events"] = True
+        if _sn == "scope_shed":
+            scope_shed["shed_events"] += 1
+            scope_shed["shed_lines"].append(_ln)
+            _sz = str(_ev.get("zone") or "")
+            if _sz and _sz not in scope_shed["shed_zones"]:
+                scope_shed["shed_zones"].append(_sz)
+            scope_shed["shed_tiles"] += as_int(_ev.get("tiles"))
+            scope_shed["live_crops"] += as_int(_ev.get("live_crops"))
+            scope_shed["harvested_steps"] += as_int(_ev.get("harvested_steps"))
+            if _ev.get("deficit") is not None:
+                scope_shed["deficit"].append(as_int(_ev.get("deficit"), None))
+            if _ev.get("water_capacity") is not None:
+                scope_shed["water_capacity"].append(as_int(_ev.get("water_capacity"), None))
+            _slab, _sdi = _lr_day_of(_ln)
+            if 0 <= _sdi < len(days) and days[_sdi].get("verified") is True:
+                if _ln not in scope_shed["warn_verified_with_shed_lines"]:
+                    scope_shed["warn_verified_with_shed_lines"].append(_ln)
+        elif _sn == "scope_shed_refused":
+            scope_shed["refused_events"] += 1
+            scope_shed["refused_lines"].append(_ln)
+            _rr = str(_ev.get("reason") or "<缺失>")
+            scope_shed["refused_reasons"][_rr] = scope_shed["refused_reasons"].get(_rr, 0) + 1
+        elif _sn == "scope_released":
+            scope_shed["released_events"] += 1
+            scope_shed["released_lines"].append(_ln)
+            _rz = str(_ev.get("reason") or "<缺失>")
+            scope_shed["released_reasons"][_rz] = scope_shed["released_reasons"].get(_rz, 0) + 1
+        elif _sn == "scope_harvest":
+            scope_shed["harvest_events"] += 1
+            scope_shed["harvest_lines"].append(_ln)
+            scope_shed["harvest_targets"] += as_int(_ev.get("tiles"))
+        elif _sn == "scope_harvest_failed":
+            scope_shed["harvest_failed_lines"].append(_ln)
+        elif _sn == "scope_loaded":
+            scope_shed["load_events"] += 1
+            scope_shed["load_lines"].append(_ln)
+        elif _sn == "scope_saved":
+            scope_shed["saved_events"] += 1
+        elif _sn == "scope_save_failed":
+            scope_shed["save_failed_lines"].append(_ln)
+        elif _sn == "scope_rejected":
+            scope_shed["rejected_lines"].append(_ln)
+    _de_scope = [_ln for _ln, _ev in rows
+                 if _ev.get("event") == "day_end" and "scope_shed" in _ev]
+    scope_shed["day_end_shed_days"] = len(_de_scope)
+    scope_shed["warn_shed_without_day_end"] = bool(
+        scope_shed["shed_events"] and not _de_scope)
     sleep_ok = sum(1 for _, ev in rows if ev.get("event") == "sleep" and ev.get("ok"))
     sleep_failed = sum(1 for _, ev in rows if ev.get("event") == "sleep" and not ev.get("ok"))
     blocked_by_action = {}
@@ -4812,6 +4956,7 @@ def build_report(rows, path, args, bad_lines):
         # task-172：收获如实放弃（不是豁免分子）+ 「看着熟 vs 真能收」对账
         "harvest_gave_up": harvest_gave_up,
         "crop_ready": crop_ready,
+        "scope_shed": scope_shed,
         "stamina_budget": stamina_budget,
         "tool_gate": tool_gate,
         # task-134 B：分配额口径（阶段没做完 / 日级 unmet / 诚实上限 deferred；均 info、不判红）
@@ -5309,6 +5454,11 @@ MAPPING_TEXT = [
      "`verified=true`）⇒ 核对「延后是否只在体力 ≤ water_reserve **且** 有浇水债时生效」"
      "（task-163 红线）；②同日有延后但 `stamina_budget` 没有浇水债（`live_crops<=0`/`dry<=0`）"
      "⇒ 延后可能变成免罚额度。旧账本/旧日缺字段 ⇒ `<缺失>` +【无法判定】（缺失 ≠ 0）"),
+    ("event:scope_shed / scope_shed_refused / scope_released / scope_loaded / scope_saved / scope_save_failed / scope_rejected / scope_harvest / scope_harvest_failed + day_end.scope_shed (task-168/task-187)",
+     "规模取舍：**策略性认输、不是豁免额度** —— brain 把认输区从目标池/守卫理由扣掉，"
+     "但 `_leftover` 一字不改 ⇒ 认输格仍留在会计里、当天如实不 VERIFIED；"
+     "本工具全列 info（认输/被拒原因/撤销/认输前收成/持久层），唯一 ⚠ 是"
+     "『有 `scope_shed` 却自称 VERIFIED』（不进 rc）；缺事件 ⇒【无法判定】（缺失 ≠ 0）"),
     ("event:blocked_by_tool / blocked_by_tool_summary (task-20/task-164)",
      "信息项：**诚实跳过、不是失败、不判红、不进 rc** —— clump（树桩/大木头/巨石/陨石…）的工具"
      "等级或种类不够（或 `toolOk` 判不出 ⇒ fail-closed 不挥）时，**动手之前**就封格（0 次 "
@@ -5722,6 +5872,30 @@ def render_text(report, top):
             + (f"  ⚠ harvestMethod 键缺失的行 {cr.get('harvest_method_missing_lines', [])[:6]}"
                "（task-176：该键必须**无条件存在**）"
                if cr.get("harvest_method_missing_lines") else ""))
+    # task-187（dev task-168）：规模取舍 —— 认输是**策略性取舍、不是豁免额度**（不进 checks、不进 rc）。
+    ss = report.get("scope_shed") or {}
+    if not ss.get("has_events"):
+        add("规模取舍: <缺失>（本账本没有任何 task-168 的 `scope_*` 事件 ⇒ 无法判定当时是否出现过"
+            "「主动认输片区」—— 缺失 ≠ 0，绝不当『没认输过』或『都做完了』通过）")
+    else:
+        _ssz = "、".join(ss.get("shed_zones") or []) or "<无>"
+        _srr = "、".join(f"{k}×{v}" for k, v in list((ss.get("refused_reasons") or {}).items())[:5]) or "<无>"
+        add(f"规模取舍: 主动认输 {ss.get('shed_events')} 区次 / 累计 {ss.get('shed_tiles')} 格（区 {_ssz}）；"
+            f"认输被拒 {ss.get('refused_events')} 次（{_srr}）；撤销认输 {ss.get('released_events')} 次；"
+            f"认输前收成 {ss.get('harvest_events')} 区（{ss.get('harvest_targets')} 格）；"
+            f"持久层 load {ss.get('load_events')} / saved {ss.get('saved_events')}；"
+            "口径：`scope_shed` **只作 info、不进 checks**，认输格仍留在会计里 ⇒ 当天如实不 VERIFIED"
+            + (f"  ⚠ 有 `scope_shed` 却自称 VERIFIED：行 {ss.get('warn_verified_with_shed_lines', [])[:6]}"
+               "（防洗白通道被打开，人工核对）"
+               if ss.get("warn_verified_with_shed_lines") else "")
+            + ("  ⚠ 有认输事件但 day_end 没有 `scope_shed` 快照（当日认输快照没落账 ⇒ 只能看事件）"
+               if ss.get("warn_shed_without_day_end") else "")
+            + (f"  ⚠ 认输前收成抛异常：行 {ss.get('harvest_failed_lines', [])[:6]}"
+               if ss.get("harvest_failed_lines") else "")
+            + (f"  ⚠ 认输记录写不进去：行 {ss.get('save_failed_lines', [])[:6]}"
+               if ss.get("save_failed_lines") else "")
+            + (f"  ⚠ 认输记录整份被拒收：行 {ss.get('rejected_lines', [])[:6]}"
+               if ss.get("rejected_lines") else ""))
     # task-157：够不着 ⇒ 有界开路（`water_far_open`）后重试同一格；开路后仍站不到 ⇒ `water_far_blocked`。
     # 两者都**不是失败**：开路成功也**不等于**浇上水；当天达不达标由 `checks.watered_outdoor` 说话。
     if wf.get("has_open_events"):
