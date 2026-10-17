@@ -85,6 +85,16 @@ __all__ = [
     "harvest_tool",
     "tool_missing_reason",
     "tool_presence",
+    "tool_being_upgraded",
+    "tool_upgrade_days_left",
+    "tool_suspended_stages",
+    "tool_tier",
+    "tools_of",
+    "UPGRADE_KINDS",
+    "UPGRADE_PRICES",
+    "UPGRADE_TRADE_ITEMS",
+    "UPGRADE_TRADE_COUNTS",
+    "UPGRADE_SUSPENDS",
 ]
 
 #: 需要"用工具清掉"的障碍（`use_tool(auto)` 会自己挑斧/镐/镰并失败换工具）。
@@ -340,6 +350,87 @@ def tool_presence(player: dict[str, Any]) -> dict[str, bool]:
         for want in ("axe", "pickaxe", "hoe", "can", "scythe"):
             votes.setdefault(want, []).append(any(_item_is_tool(it, want) for it in items))
     return {want: any(vs) for want, vs in votes.items()}
+
+
+#: 【task-205】铁匠铺升级链的**脑侧**知识表。
+#:
+#: ⚠️ 纪律：这些数字**只用于规划/前置判断**（"够不够钱、要不要跑一趟"）；
+#: 真正的价格与材料**一律以 Mod 回执里的货架条目为准**（`ExecResponse.price/tradeItem/tradeCount`）
+#: —— 名义价 ≠ 实扣价，脑不许拿硬编码去对账（见 `docs/_il-tool-upgrade.md`）。
+UPGRADE_KINDS = ("axe", "pickaxe", "hoe", "can", "pan")
+UPGRADE_PRICES = {0: 2000, 1: 5000, 2: 10000, 3: 25000}
+UPGRADE_TRADE_ITEMS = {0: "(O)334", 1: "(O)335", 2: "(O)336", 3: "(O)337"}
+UPGRADE_TRADE_COUNTS = {0: 5, 1: 5, 2: 5, 3: 5}
+
+#: 在途升级会**暂时失去**哪件工具 ⇒ 对应阶段暂停（否则整段白试、把当天记成 stuck）。
+#: 斧/镐升级只影响清障（树/石），锄影响开垦，壶影响浇水；pan/钓鱼竿不影响农务。
+UPGRADE_SUSPENDS = {
+    "hoe": ("till_area",),
+    "can": ("water_area",),
+    "axe": ("clear_area",),
+    "pickaxe": ("clear_area",),
+}
+
+
+def tools_of(obs: dict[str, Any]) -> list[dict[str, Any]]:
+    """`player.tools.tools[]`（每件工具的 `kind` / `upgradeLevel`）；读不到 ⇒ `[]`。
+
+    【为什么单独一条】`tool_presence()` 只回答"有没有"，升级链要回答"**哪一级**"。
+    数据源 = task-155 批契约（`Contracts.ToolsView.tools`），旧 Mod 没有 ⇒ 空表（fail-closed：
+    调用方看到空表就不该发起升级）。
+    """
+    player = obs.get("player") if isinstance(obs.get("player"), dict) else {}
+    tools = player.get("tools")
+    rows = tools.get("tools") if isinstance(tools, dict) else None
+    return [row for row in (rows or []) if isinstance(row, dict)]
+
+
+def tool_being_upgraded(obs: dict[str, Any]) -> dict[str, Any] | None:
+    """正在 Clint 那里升级的工具（`player.toolBeingUpgraded`）；没有在途 ⇒ `None`。"""
+    player = obs.get("player") if isinstance(obs.get("player"), dict) else {}
+    being = player.get("toolBeingUpgraded")
+    return being if isinstance(being, dict) and being else None
+
+
+def tool_upgrade_days_left(obs: dict[str, Any]) -> int | None:
+    """`player.toolUpgradeDaysLeft`（0 = 做完了可取回）；读不到 ⇒ `None`。
+
+    ⚠️ 读不到时**不许当 0**（那会让脑去取一件还没做好的工具，白跑）。
+    """
+    player = obs.get("player") if isinstance(obs.get("player"), dict) else {}
+    days = player.get("toolUpgradeDaysLeft")
+    if isinstance(days, bool) or not isinstance(days, int):
+        return None
+    return int(days)
+
+
+def tool_tier(obs: dict[str, Any], kind: str) -> int:
+    """某类工具当前的升级等级（0 = 初始）；**读不到 ⇒ -1**（fail-closed，调用方不许据此升级）。
+
+    优先读 `player.tools.tools[]`（每件工具一条，含 `upgradeLevel`）；旧 Mod 没有该数组 ⇒ -1。
+    """
+    want = str(kind or "").strip().lower()
+    if want == "wateringcan":
+        want = "can"
+    for row in tools_of(obs):
+        if str(row.get("kind") or "").strip().lower() != want:
+            continue
+        level = row.get("upgradeLevel")
+        if isinstance(level, bool) or not isinstance(level, int):
+            return -1
+        return int(level)
+    return -1
+
+
+def tool_suspended_stages(obs: dict[str, Any]) -> set[str]:
+    """在途升级期间要暂停的阶段集合（如锄在升级 ⇒ 停止 `till_area`）。"""
+    being = tool_being_upgraded(obs)
+    if not being:
+        return set()
+    kind = str(being.get("kind") or "").strip().lower()
+    if kind == "wateringcan":
+        kind = "can"
+    return set(UPGRADE_SUSPENDS.get(kind, ()))
 
 
 def tool_missing_reason(player: dict[str, Any], want: str) -> str:
@@ -3153,6 +3244,163 @@ class FarmWorker:
                     + (f"；回执={r.receipt}" if r.receipt else ""))
         return r
 
+
+    # ------------------------------------------------------------------ 工具升级（task-205）
+    def upgrade_tool(self, which: str, *, timeout_ms: int = 60000,
+                     shop_location: str = "Blacksmith") -> StepResult:
+        """在铁匠铺升级店买下 `which` 这件工具的**下一级**（task-205）。
+
+        判据 = **观测差分**（回执只是声明，`docs/_il-tool-upgrade.md` §3）：
+          * `player.toolBeingUpgraded` 由空变为某件工具（买下即换）；
+          * 或该种工具 `tools[].upgradeLevel` 变大；
+          * 或钱确实少了。
+        任一观测到 ⇒ 动作真的发生了；全不命中 ⇒ `purchase_no_effect`。
+
+        ⚠️ 前置（脑侧先判；Mod 侧还会 fail-closed 再判一遍）：
+          * **没有在途升级** —— 否则游戏先扣钱+扣锭、`actionWhenPurchased` 见"已在升级"
+            直接 false 且**不回滚**（白扣 2000g + 5 锭）；
+          * 人在 `Blacksmith`（脑侧先 `ensure_location`）；
+          * 钱/材料够 —— 这里只做"要不要跑一趟"的粗判，**真价真材料以回执为准**。
+        """
+        r = StepResult(action="upgrade_tool")
+        obs = self.snap()
+        kind = str(which or "").strip().lower()
+        if kind == "wateringcan":
+            kind = "can"
+        player = self.player_of(obs)
+        tier_before = tool_tier(obs, kind)
+        trade_item = UPGRADE_TRADE_ITEMS.get(tier_before, "") if tier_before >= 0 else ""
+        being_before = tool_being_upgraded(obs)
+        r.before = {
+            "money": self.money(obs),
+            "tier": tier_before,
+            "being": (being_before or {}).get("name"),
+            "days_left": tool_upgrade_days_left(obs),
+            "trade_item": trade_item or None,
+            "trade_have": _count_item(player, trade_item) if trade_item else None,
+            "location": self.location_of(obs).get("name"),
+        }
+        if kind not in UPGRADE_KINDS:
+            r.code, r.reason = "failed", f"「{which}」不能升级：铁匠铺只认 {UPGRADE_KINDS}（镰刀不在其中）"
+            return r
+        if being_before:
+            r.code = "failed"
+            r.reason = (f"已经有工具在升级（{(being_before or {}).get('name')}）；"
+                        "此时买 = 钱和锭当场扣掉、工具不升级（游戏不回滚）⇒ 先取回在途那把")
+            return r
+        if self.location_of(obs).get("name") != shop_location:
+            mv = self.ensure_location(shop_location, timeout_ms=30000)
+            if not mv.ok:
+                r.code, r.reason, r.receipt = "failed", f"去不了 {shop_location}：{mv.reason}", mv.receipt
+                return r
+            obs = self.snap()
+        res: dict[str, Any] = {}
+        try:
+            res = self.c.upgrade_tool(kind, timeout_ms=timeout_ms) or {}
+        except BridgeError as exc:
+            r.receipt = _receipt(exc)
+            r.status = _exc_status(exc)
+        else:
+            r.status = str(res.get("status") or "") if isinstance(res, dict) else ""
+        after = self.snap()
+        money_after = self.money(after)
+        being_after = tool_being_upgraded(after)
+        tier_after = tool_tier(after, kind)
+        price = int(res.get("price") or 0) if isinstance(res, dict) else 0
+        trade_item_after = str(res.get("tradeItem") or trade_item or "")
+        trade_have_after = _count_item(self.player_of(after), trade_item_after) if trade_item_after else None
+        r.after = {
+            "money": money_after,
+            "money_delta": r.before["money"] - money_after,
+            "price": price or None,
+            "money_delta_matches_price": (r.before["money"] - money_after) == price if price > 0 else None,
+            "tier": tier_after,
+            "being": (being_after or {}).get("name"),
+            "days_left": tool_upgrade_days_left(after),
+            "trade_item": trade_item_after or None,
+            "trade_have": trade_have_after,
+        }
+        appeared = being_after is not None and being_before is None
+        tier_up = tier_after >= 0 and tier_before >= 0 and tier_after > tier_before
+        money_down = money_after < r.before["money"]
+        if appeared or tier_up or money_down:
+            r.ok = True
+            r.reason = (f"已买下升级：{kind} 等级 {tier_before}→{tier_after}"
+                        f"；钱 {r.before['money']}→{money_after}（条目价 {price or '未报'}"
+                        f"，差 {r.after['money_delta']}）"
+                        f"；在途={r.after['being'] or '(空)'}，daysLeft={r.after['days_left']}"
+                        + ("；⚠ 钱差≠条目价（名义价≠实扣价，按观测记账）"
+                           if r.after["money_delta_matches_price"] is False else ""))
+            return r
+        r.code = "failed"
+        r.reason = (f"买了但观测上什么都没变：钱 {r.before['money']}→{money_after}，"
+                    f"在途={(being_after or {}).get('name') or '(空)'}，等级 {tier_before}→{tier_after}"
+                    + (f"；回执={r.receipt}" if r.receipt else ""))
+        return r
+
+    def pickup_tool(self, *, home: str = "Blacksmith", timeout_ms: int = 30000) -> StepResult:
+        """取回升级完成的工具（task-205）。
+
+        判据 = 观测差分：`toolBeingUpgraded` 清空，或背包里同种工具 +1。
+        前置：`toolBeingUpgraded != null`、`daysLeft <= 0`、**背包 ≥1 空格**、人在 Blacksmith。
+        """
+        r = StepResult(action="pickup_tool")
+        obs = self.snap()
+        being = tool_being_upgraded(obs)
+        days = tool_upgrade_days_left(obs)
+        kind = str((being or {}).get("kind") or "")
+        tier_before = tool_tier(obs, kind) if kind else -1
+        free, free_status = player_free_slots(self.player_of(obs))
+        r.before = {
+            "being": (being or {}).get("name"),
+            "days_left": days,
+            "tier": tier_before,
+            "free_slots": free if free_status == "ok" else None,
+            "location": self.location_of(obs).get("name"),
+        }
+        if not being:
+            r.code = "skipped"
+            r.reason = "没有工具在 Clint 那里升级（toolBeingUpgraded 为空）—— 没什么可取回的"
+            return r
+        if days is None:
+            r.code = "failed"
+            r.reason = "读不到 toolUpgradeDaysLeft ⇒ 无法判断做没做好（fail-closed，不许猜）"
+            return r
+        if days > 0:
+            r.code = "skipped"
+            r.reason = f"还在升级：daysLeft={days}（等它变 0 再来取回）"
+            return r
+        if free_status == "ok" and free <= 0:
+            r.code = "no_slot"
+            r.reason = ("背包没有空格：Clint 的 pickup 分支见 freeSpotsInInventory()<=0 只会说"
+                        "「背包满了」，工具拿不回来（先腾格再来）")
+            return r
+        if self.location_of(obs).get("name") != home:
+            mv = self.ensure_location(home, timeout_ms=30000)
+            if not mv.ok:
+                r.code, r.reason, r.receipt = "failed", f"去不了 {home}：{mv.reason}", mv.receipt
+                return r
+            obs = self.snap()
+        try:
+            res = self.c.pickup_tool(timeout_ms=timeout_ms)
+        except BridgeError as exc:
+            r.receipt = _receipt(exc)
+            r.status = _exc_status(exc)
+        else:
+            r.status = str(res.get("status") or "") if isinstance(res, dict) else ""
+        after = self.snap()
+        being_after = tool_being_upgraded(after)
+        tier_after = tool_tier(after, kind) if kind else -1
+        r.after = {"being": (being_after or {}).get("name"), "days_left": tool_upgrade_days_left(after),
+                   "tier": tier_after}
+        if being_after is None or (tier_after >= 0 and tier_before >= 0 and tier_after > tier_before):
+            r.ok = True
+            r.reason = (f"已取回「{(being or {}).get('name')}」：在途清空，等级 {tier_before}→{tier_after}")
+            return r
+        r.code = "failed"
+        r.reason = (f"取回没生效：toolBeingUpgraded 仍为 {(being_after or {}).get('name') or '(空)'}，"
+                    f"等级 {tier_before}→{tier_after}" + (f"；回执={r.receipt}" if r.receipt else ""))
+        return r
 
     def load_save(self, save: str | None = None) -> StepResult:
         r = StepResult(action="load_save")

@@ -496,7 +496,12 @@ namespace AgentFarm.Bridge
         private static bool IsLongTaskSkill(string skill)
             => skill == "move_to" || skill == "move_to_location" || skill == "load_save"
             || skill == "use_tool" || skill == "plant" || skill == "sleep" || skill == "buy"
-            || skill == "dismiss_modal";
+            || skill == "dismiss_modal"
+            // 【task-205】铁匠铺升级：`Utility.TryOpenShopMenu("ClintUpgrade",...)` 之后要等
+            // `Game1.activeClickableMenu` 变成 `ShopMenu` 才能选条目/买（菜单不是同 tick 挂上的）。
+            // ⚠️ 不能漏这一条：漏了就成了"技能以为有 60 秒、调度器 8 秒就把 null 交回网络线程"
+            // （条目 013 那类半途而废）。取回 `pickup_tool` 是单 tick，不在此列。
+            || skill == "upgrade_tool";
 
         private HttpResponse ServeExec(HttpRequest req)
         {

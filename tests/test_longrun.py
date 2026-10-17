@@ -161,6 +161,14 @@ class FakeWorld:
         #: 假世界默认 `None`（旧口径：一次调用就关掉队首、只回 `ok`）。
         self.dismiss_receipt: dict | None = None
         self.scythe = scythe
+        #: 【task-205】`player.tools.tools[]`（每件工具的 `kind`/`upgradeLevel`）。默认三件 0 级
+        #: （与背包里的 Axe/Hoe/WateringCan 对齐）；`{}` = 旧 Mod（没有该数组 ⇒ `tool_tier()` 一律 -1）。
+        self.tool_tiers: dict[str, int] = {"axe": 0, "hoe": 0, "can": 0}
+        #: 【task-205】在途升级 / 剩余天数（None ⇒ 观测里没有这个键，fail-closed）。
+        self.being_upgraded: dict | None = None
+        self.tool_upgrade_days_left: int | None = None
+        self.upgrade_calls: list[str] = []
+        self.pickup_calls = 0
         self.inventory = [
             {"slot": 0, "id": "Axe", "qualifiedId": "(T)Axe", "name": "Axe", "stack": 1, "isTool": True},
             {"slot": 1, "id": "Hoe", "qualifiedId": "(T)Hoe", "name": "Hoe", "stack": 1, "isTool": True},
@@ -225,6 +233,13 @@ class FakeWorld:
             "player": {"name": "测试员", "location": self.location, "tile": list(self.player_tile), "facing": 2,
                        "stamina": self.stamina, "maxStamina": self.max_stamina, "money": self.money,
                        "isInBed": self.is_in_bed, "inventory": [dict(i) for i in self.inventory],
+                       # 【task-205】升级链的数据面（task-155 批契约）：读不到就整键缺失。
+                       "tools": {"tools": [{"kind": str(k), "upgradeLevel": int(v), "name": str(k)}
+                                           for k, v in self.tool_tiers.items()]} if self.tool_tiers else {},
+                       **({"toolBeingUpgraded": dict(self.being_upgraded)}
+                          if self.being_upgraded is not None else {}),
+                       **({"toolUpgradeDaysLeft": int(self.tool_upgrade_days_left)}
+                          if self.tool_upgrade_days_left is not None else {}),
                        # 【task-102】`inventoryCount` = 背包**容量**（真机 `WorldSnapshot.cs:260`
                        # 读 `p.Items.Count`）；空格 = `inventoryCount - len(inventory)`。
                        "inventoryCount": self.inventory_capacity,
@@ -718,6 +733,30 @@ class FakeWorker:
 
     def buy(self, item, count=10, *, shop="SeedShop", timeout_ms=25000):
         st = self.w.buy(item, count, shop)
+        self.steps.append(st)
+        return st
+
+    def upgrade_tool(self, which, *, timeout_ms=60000):
+        """【task-205】假执行层：照真机链路改世界（钱/锭扣掉、等级+1、在途出现）。"""
+        kind = str(which)
+        self.w.upgrade_calls.append(kind)
+        tier = int(self.w.tool_tiers.get(kind, 0))
+        self.w.money -= 2000
+        self.w.tool_tiers[kind] = tier + 1
+        self.w.being_upgraded = {"kind": kind, "name": kind, "qualifiedId": f"(T){kind}"}
+        self.w.tool_upgrade_days_left = 2
+        st = StepResult("upgrade_tool", ok=True,
+                        reason=f"已买下升级：{kind} {tier}→{tier + 1} 级（2 天后取回）",
+                        after={"tier": tier + 1, "being": kind, "days_left": 2})
+        self.steps.append(st)
+        return st
+
+    def pickup_tool(self, *, home="Blacksmith", timeout_ms=30000):
+        self.w.pickup_calls += 1
+        self.w.being_upgraded = None
+        self.w.tool_upgrade_days_left = 0
+        st = StepResult("pickup_tool", ok=True, reason="已取回升级完成的工具",
+                        after={"being": None, "days_left": 0})
         self.steps.append(st)
         return st
 
@@ -10086,6 +10125,188 @@ class TestTask199ReadyFar(unittest.TestCase):
         skips = self._events(run, "ready_far_skipped")
         self.assertEqual(len(skips), 1)
         self.assertEqual(skips[0]["reason"], "bag_full")
+
+
+class TestTask205ToolUpgradePlan(unittest.TestCase):
+    """【task-205】铁匠铺升级链的**日级**编排：计划选择、暂停阶段、每天一次、守卫收口。
+
+    真机链路（`docs/_il-tool-upgrade.md`）：买下即扣钱+扣锭并换工具（`toolBeingUpgraded`，
+    `daysLeft=2`），两天后第二步取回。脑侧纪律：
+
+      * **取回优先于新升级**（在途时再买 = 白扣钱锭且不回滚）；
+      * 工具不在身上 ⇒ 依赖它的阶段返回空池、并且**不许**拿"有作物没浇水"钉住守卫；
+      * 升级是收益不是救火 ⇒ 有没浇的活苗/可收的熟作物时先干农活；
+      * 每天最多一次（失败原因当天不会自己变好），每次尝试/跳过都有 journal。
+    """
+
+    def _run(self, w=None):
+        w = w if w is not None else FakeWorld()
+        run = make_run(w)
+        run.worker = FakeWorker(w)
+        run.client = FakeClient(w)
+        return run, w
+
+    def _rep(self):
+        return DayReport(day_key=("spring", 1, 9), started_at=0.0)
+
+    def _events(self, run, name):
+        return [e for e in run.entries if e["event"] == name]
+
+    def _plot(self, tiles):
+        return {"anchor": list(tiles[0]), "tiles": [list(t) for t in tiles],
+                "zone": "", "label": "", "size": 5}
+
+    def test_plan_is_none_without_upgrade_metadata(self):
+        """旧 Mod（没有 `tools.tools[]`）⇒ `tool_tier()==-1` ⇒ 不猜、不升级（fail-closed）。"""
+        run, w = self._run()
+        w.tool_tiers = {}
+        self.assertIsNone(run._tool_upgrade_plan(w.obs()))
+
+    def test_plan_upgrades_when_money_and_bars_are_enough(self):
+        run, w = self._run()
+        w.money = 3000
+        w.inventory.append({"slot": 6, "id": "334", "qualifiedId": "(O)334",
+                            "name": "Copper Bar", "stack": 5, "isTool": False})
+        plan = run._tool_upgrade_plan(w.obs())
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan["action"], "upgrade")
+        self.assertEqual(plan["kind"], "axe")      # `UPGRADE_KINDS` 的第一件
+        self.assertEqual(plan["tier"], 0)
+        self.assertEqual(plan["price"], 2000)
+        self.assertEqual(plan["trade_have"], 5)
+
+    def test_plan_waits_while_the_upgrade_is_in_progress(self):
+        run, w = self._run()
+        w.being_upgraded = {"kind": "axe", "name": "Axe"}
+        w.tool_upgrade_days_left = 2
+        plan = run._tool_upgrade_plan(w.obs())
+        self.assertEqual(plan["action"], "wait")
+
+    def test_plan_reads_missing_days_left_as_fail_closed(self):
+        run, w = self._run()
+        w.being_upgraded = {"kind": "axe", "name": "Axe"}
+        w.tool_upgrade_days_left = None            # 键缺失 ⇒ 不许当 0
+        plan = run._tool_upgrade_plan(w.obs())
+        self.assertEqual(plan["action"], "wait")
+        self.assertIn("fail-closed", plan["reason"])
+
+    def test_plan_picks_up_when_days_left_is_zero(self):
+        run, w = self._run()
+        w.being_upgraded = {"kind": "axe", "name": "Axe"}
+        w.tool_upgrade_days_left = 0
+        plan = run._tool_upgrade_plan(w.obs())
+        self.assertEqual(plan["action"], "pickup")
+
+    def test_pickup_needs_a_free_slot_first(self):
+        run, w = self._run()
+        w.inventory_capacity = 12
+        w.inventory = [{"slot": i, "id": "388", "qualifiedId": "(O)388",
+                        "name": "Wood", "stack": 1, "isTool": False} for i in range(12)]
+        w.being_upgraded = {"kind": "axe", "name": "Axe"}
+        w.tool_upgrade_days_left = 0
+        plan = run._tool_upgrade_plan(w.obs())
+        self.assertEqual(plan["action"], "need_slot")
+
+    def test_suspended_stage_has_no_tiles(self):
+        """锄在升级 ⇒ `till_area` 一格目标都拿不出来（工具不在身上，不是没活）。"""
+        run, w = self._run()
+        w.dirt = {(60, 10)}
+        w.tillable = {(60, 10), (61, 10)}
+        obs = w.obs()
+        plot = self._plot([(60, 10), (61, 10)])
+        self.assertTrue(run._stage_tiles("till_area", obs, plot))
+        w.being_upgraded = {"kind": "hoe", "name": "Hoe"}
+        obs = w.obs()
+        self.assertEqual(run._stage_tiles("till_area", obs, plot), [])
+
+    def test_guard_is_silent_about_watering_while_the_can_is_being_upgraded(self):
+        run, w = self._run()
+        w.dirt = {(60, 10)}
+        w.crops = {(60, 10): {"ripe": False, "watered": False}}
+        w.being_upgraded = {"kind": "can", "name": "Watering Can"}
+        reasons = run.work_reasons(w.obs())
+        self.assertFalse([r for r in reasons if "没浇水" in r], reasons)
+
+    def test_maybe_upgrade_runs_at_most_once_per_day(self):
+        run, w = self._run()
+        w.money = 3000
+        w.inventory.append({"slot": 6, "id": "334", "qualifiedId": "(O)334",
+                            "name": "Copper Bar", "stack": 5, "isTool": False})
+        rep = self._rep()
+        first = run._maybe_tool_upgrade(w.obs(), rep)
+        self.assertTrue(first)
+        self.assertEqual(w.upgrade_calls, ["axe"])
+        self.assertEqual(run.tool_upgrade_tried, 1)
+        self.assertFalse(run._maybe_tool_upgrade(w.obs(), rep))
+        self.assertEqual(len(w.upgrade_calls), 1)
+        self.assertEqual(len(self._events(run, "upgrade_tool")), 1)
+
+    def test_due_is_false_while_urgent_farm_work_exists(self):
+        """有可收熟作物 ⇒ 先干农活，不去跑铁匠铺的腿。"""
+        run, w = self._run()
+        w.money = 3000
+        w.inventory.append({"slot": 6, "id": "334", "qualifiedId": "(O)334",
+                            "name": "Copper Bar", "stack": 5, "isTool": False})
+        w.dirt = {(60, 10)}
+        w.crops = {(60, 10): {"ripe": True, "watered": True}}
+        self.assertFalse(run._tool_upgrade_due(w.obs()))
+        w.crops = {(60, 10): {"ripe": False, "watered": False}}
+        self.assertFalse(run._tool_upgrade_due(w.obs()))   # 没浇的活苗同样优先
+        w.crops = {}
+        self.assertTrue(run._tool_upgrade_due(w.obs()))
+
+    def test_blocked_work_is_logged_once_while_suspended(self):
+        run, w = self._run()
+        w.being_upgraded = {"kind": "hoe", "name": "Hoe"}
+        w.tool_upgrade_days_left = 2
+        rep = self._rep()
+        self.assertFalse(run._maybe_tool_upgrade(w.obs(), rep))   # wait ⇒ 不动手
+        self.assertFalse(run._maybe_tool_upgrade(w.obs(), rep))
+        blocked = self._events(run, "tool_upgrade_blocked_work")
+        self.assertEqual(len(blocked), 1, "暂停阶段每天只记一条")
+        self.assertEqual(blocked[0]["stages"], ["till_area"])
+        self.assertEqual(len(self._events(run, "tool_upgrade_skipped")), 1)
+
+    def test_a_day_upgrades_the_tool_before_settling(self):
+        """端到端：田里没活、但钱+锭够 ⇒ 这一天**先跑铁匠铺**再收工（守卫不许直接睡掉）。
+
+        这条钉的是 `sleep_guard` 与主循环的接线：铁匠铺动作不是农活、不进 `work_reasons`，
+        不单独放行的话"只想升级"的一天会在 `_preconditions` 之前被 `no_work` 睡过去。
+        """
+        w = FakeWorld(weeds=0, seeds=0, money=3000)
+        w.inventory.append({"slot": 6, "id": "334", "qualifiedId": "(O)334",
+                            "name": "Copper Bar", "stack": 5, "isTool": False})
+        run = make_run(w, target_days=1, max_days=1)
+        run.client = FakeClient(w)
+        run.worker = FakeWorker(w)
+        run.max_steps = 40
+        run.run()
+        self.assertEqual(w.upgrade_calls, ["axe"], "这一天应该跑过一次升级")
+        ups = self._events(run, "upgrade_tool")
+        self.assertEqual(len(ups), 1)
+        self.assertTrue(ups[0]["ok"])
+        self.assertEqual(w.tool_tiers["axe"], 1)
+        self.assertIsNotNone(w.being_upgraded)
+        # 这一天同时还有播种活（买种子/开垦），可能先撞 `max_steps` 预算 ⇒ 收尾原因不作断言，
+        # 这条用例钉的是"升级没被 no_work 睡过去、而且发生在收工之前"。
+        self.assertIn(run.days[0].ended_by, ("sleep", "budget"))
+
+    def test_a_day_picks_up_the_finished_tool(self):
+        """取回优先：在途 + daysLeft=0 ⇒ 这一天先取回，而不是再买一把。"""
+        w = FakeWorld(weeds=0, seeds=0, money=3000)
+        w.inventory.append({"slot": 6, "id": "334", "qualifiedId": "(O)334",
+                            "name": "Copper Bar", "stack": 5, "isTool": False})
+        w.being_upgraded = {"kind": "axe", "name": "Axe"}
+        w.tool_upgrade_days_left = 0
+        w.tool_tiers = {"axe": 1, "hoe": 0, "can": 0}
+        run = make_run(w, target_days=1, max_days=1)
+        run.client = FakeClient(w)
+        run.worker = FakeWorker(w)
+        run.max_steps = 40
+        run.run()
+        self.assertEqual(w.pickup_calls, 1)
+        self.assertEqual(w.upgrade_calls, [], "取回优先，不许在途再买（会白扣钱锭）")
+        self.assertIsNone(w.being_upgraded)
 
 
 if __name__ == "__main__":  # pragma: no cover

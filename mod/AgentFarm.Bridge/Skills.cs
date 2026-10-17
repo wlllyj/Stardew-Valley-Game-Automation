@@ -91,9 +91,25 @@ namespace AgentFarm.Bridge
                 // 默认 8s 会把"游戏正在存档"判成超时（上限 120s）
                 case "dismiss_modal":
                     return ShippingMenuDismissSkill.ClampBudget(timeoutMs);
+                // 【task-205】铁匠铺升级：跨 tick 等 `ShopMenu` 挂上 + 菜单交互，合法地慢；
+                // 上限 90s（不能让 8s 默认值把"菜单还没挂上"判成超时）
+                case "upgrade_tool":
+                case "pickup_tool":
+                    return ClampUpgradeTimeout(timeoutMs);
                 default:
                     return ClampTimeout(timeoutMs);
             }
+        }
+
+        /// <summary>【task-205】铁匠铺升级/取回的时间预算：默认 60s、上限 90s（跨 tick 等菜单）。</summary>
+        public static int ClampUpgradeTimeout(int? timeoutMs)
+        {
+            const int def = 60000;
+            const int max = 90000;
+            int v = timeoutMs ?? def;
+            if (v < TimeoutMinMs) v = TimeoutMinMs;
+            if (v > max) v = max;
+            return v;
         }
 
         /// <summary>
@@ -388,6 +404,26 @@ namespace AgentFarm.Bridge
                 case "sell":
                     return new ShipSkill(req, world, monitor).Step;
 
+                // 【task-205】铁匠铺升级链（依据 docs/_il-tool-upgrade.md / task-204）：
+                //
+                //   * `upgrade_tool`：跨 tick —— 开店 `Utility.TryOpenShopMenu("ClintUpgrade",...)`
+                //     → 等 `ShopMenu` 挂上 → 在菜单实例的 `itemPriceAndStock` 里选**唯一**条目
+                //     （kind + tier==当前+1；不唯一 ⇒ `tool_not_offered`，reason 列在售表）
+                //     → 自检钱/锭/`readOnly` → 反射 `tryToPurchaseItem(item, null, 1, 0, 0)`。
+                //     ⚠️ 买前必堵 `toolBeingUpgraded != null`：游戏的 `actionWhenPurchased` 见"已在升级"
+                //     返回 false **且不回滚** ⇒ 钱和锭当场白扣（IL §2.2）。`readOnly == true`（电话查价）
+                //     同理会只扣钱不升级 ⇒ 一律 fail-closed、一个子不扣。
+                //   * `pickup_tool`：单 tick —— 调 `GameLocation.blacksmith(...)` 的 pickup 分支
+                //     （`toolBeingUpgraded != null && daysLeft <= 0 && freeSpotsInInventory() > 0`
+                //     + 人在 Blacksmith）。工具拿不回来时 Clint 只说 Clint_NoInventorySpace，不扣钱。
+                //
+                // 两者都必须加入 BridgeHost.IsLongTaskSkill 的**跨 tick**集合（等菜单）。
+                // 判据一律观测差分（钱差 / 锭差 / `toolBeingUpgraded` 出现 / 背包同种工具 +1）。
+                case "upgrade_tool":
+                    return new ToolUpgradeSkill(req, world, monitor).Step;
+                case "pickup_tool":
+                    return new ToolPickupSkill(req, world, monitor).Step;
+
                 default:
                     // 未实现的技能：合法请求但还没有实现（区别于 unknown_skill）。
                     return () => new ExecResponse
@@ -396,7 +432,8 @@ namespace AgentFarm.Bridge
                         Status = "not_implemented",
                         Skill = skill,
                         Reason = $"技能“{skill}”尚未实现（已实现：noop、move_to、move_to_location、"
-                               + "dismiss_modal、load_save、quit_game、interact、use_tool、select_item、plant、sleep、buy、sell）",
+                               + "dismiss_modal、load_save、quit_game、interact、use_tool、select_item、plant、"
+                               + "sleep、buy、sell、upgrade_tool、pickup_tool）",
                     };
             }
         }

@@ -44,11 +44,13 @@ from typing import Any, Callable, Iterable, Mapping
 from .bridge import MOD_VERSION_EXPECTED, BridgeClient, BridgeError
 from .farmwork import (CLUMP_KINDS, ENV_BLOCK_STATUSES, FRONTIER_KINDS, PATH_STAMINA_ALLOWANCE,
                        SEED_KEEP_FACTOR, STAGE_ACTION, STAMINA_COST_CLEAR, STAMINA_COST_SOW,
-                       STAMINA_COST_TILL, STAMINA_COST_WATER, FarmWorker, StageResult, StepResult,
+                       STAMINA_COST_TILL, STAMINA_COST_WATER, UPGRADE_KINDS, UPGRADE_PRICES,
+                       UPGRADE_TRADE_ITEMS, FarmWorker, StageResult, StepResult,
                        buy_count_for, farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles,
                        farm_ready_tiles,
                        is_seed_offer, pick_seed_offer, player_free_slots, seed_items,
-                       surplus_sell_plan, tile_ready, till_blocked_by)
+                       surplus_sell_plan, tile_ready, till_blocked_by,
+                       tool_being_upgraded, tool_suspended_stages, tool_tier, tool_upgrade_days_left)
 from .planner import (DECISIONS_KEPT, LESSONS_INJECT_CHARS, LESSONS_INJECT_MAX, BoundaryPlanner, Brief,
                       PlannerState, TaskIntent, TaskOutcome, decision_line, deterministic_plan,
                       load_lessons_file, load_scope_file, make_lesson, prune_lessons, render_lessons,
@@ -202,6 +204,23 @@ READY_FAR_MAX_TRIES = 2
 #:
 #: 与 `FAR_DRY_OPEN_MAX` 同样的有界理由；开路成功**不等于**收下来了（逐格判据说了算）。
 READY_FAR_OPEN_MAX = 2
+
+#: 【task-205】铁匠铺升级链：**每天最多试几次**（升级或取回都算一次）。
+#:
+#: 为什么要界：升级要跑一趟 Blacksmith（`ensure_location` 可能失败），取回还要等 `daysLeft` 归零；
+#: 不设上限就会每天每轮都去试一遍（白跑 + journal 噪声）。一天一次足够 —— 升级本身是
+#: 2000g 级的大动作，失败原因（没钱/没锭/条目不在售）当天不会自己变好。
+TOOL_UPGRADE_MAX_PER_DAY = 1
+
+#: 【task-205】在途升级期间暂停的阶段（工具不在身上 ⇒ 那些阶段一格都干不成）。
+#:
+#: 与 `farmwork.UPGRADE_SUSPENDS` 同口径；留一份在这里是为了"没有在途状态也要能读"。
+TOOL_UPGRADE_SUSPENDED: dict[str, tuple[str, ...]] = {
+    "hoe": ("till_area",),
+    "can": ("water_area",),
+    "axe": ("clear_area",),
+    "pickaxe": ("clear_area",),
+}
 
 #: 【task-157】`cause` 里区分"warp 图上根本没路"（Mod 的 `unreachable_no_route`）与一般"够不着"。
 #: 判据只看回执/reason 原文；命中 ⇒ `cause="no_route"`，否则 `"unreachable"`。
@@ -989,6 +1008,15 @@ class LongRun:
         #: 一格动作都没做的刹车）。与上面按墙钟 1 秒归零的窗口不同：这是确定性上界 ——
         #: 只要世界一直没变化就一直累加，一旦真有进展就清零。
         self.no_progress_cycles = 0
+        #: 【task-205】钢铁匠铺升级链的日级状态（每日重置）：
+        #:  * `tool_upgrade_tried` —— 今天是否已经试过一次（升级/取回都算；上界
+        #:    `TOOL_UPGRADE_MAX_PER_DAY`）。失败原因（没钱/没锭/条目不在售）当天不会自己变好；
+        #:  * `tool_upgrade_skipped_noted` —— "为什么今天没升级"每天只 journal 一次（防刷屏）。
+        self.tool_upgrade_tried = 0
+        self.tool_upgrade_skipped_noted = False
+        #: 【task-205】升级**做完等取回**期间：`tool_upgrade_blocked_work` 每天一条，
+        #: 记"哪些阶段因为工具不在身上而暂停"（不是失败，是如实记账）。
+        self.tool_upgrade_blocked_noted = False
 
     # ------------------------------------------------------------------ 小工具
 
@@ -3435,6 +3463,11 @@ class LongRun:
         local = [tuple(t) for t in plot["tiles"]]
         pool: list[tuple[int, int]]
         limit = self.per_stage_tiles
+        # 【task-205】工具在 Clint 那里升级 ⇒ 依赖它的阶段今天一格都干不成（工具不在身上）。
+        # 返回空池是**如实**的：`_leftover` 照旧报没做完，守卫不再被"还有活"钉死
+        # （`_maybe_tool_upgrade` 每天记一条 `tool_upgrade_blocked_work`，日终能看清原因）。
+        if task in self._tool_suspended_stages(obs):
+            return []
         # 【task-158】预算闸门（只拦 `clear_area`/`till_area`/`plant_area`，且在算目标之前）：
         # 体力不够浇完剩下的活苗 ⇒ 今天不再开新活。返回空池是**如实**的（leftover 照旧由
         # `_leftover` 报），日终 `crops_watered` 该 false 就 false —— 绝不新增可洗白键。
@@ -3603,6 +3636,11 @@ class LongRun:
         shed = self._shed_tile_set()
         if shed:
             unwatered = [t for t in unwatered if t not in shed]
+        # 【task-205】壶在 Clint 那里升级 ⇒ "有作物没浇水"**不是今天能做的事**（工具不在身上）：
+        # 这条理由会把守卫钉死一整天（`_stage_tiles("water_area")` 被暂停返回空池、
+        # 决策只能 `review`）⇒ 不进理由；原因由 `tool_upgrade_blocked_work` 记一次。
+        if "water_area" in self._tool_suspended_stages(obs):
+            unwatered = []
         if unwatered:
             reasons.append(f"有 {len(unwatered)} 格作物没浇水")
         # 【task-170 ②】"还有熟作物"这条理由**不许被今天已经证明收不到的格子钉住**：
@@ -4034,6 +4072,10 @@ class LongRun:
         # 【task-84】与 `work_reasons` 同口径：只有**活苗**才算"该浇水"。
         unwatered = [t for t, v in tmap.items()
                      if v.get("crop") and not v.get("watered") and not v.get("dead")]
+        # 【task-205】壶在 Clint 那里升级 ⇒ 浇不了：这条 keep_working 会把守卫钉死一整天
+        # （`_stage_tiles("water_area")` 已暂停返回空池）。原因由 `tool_upgrade_blocked_work` 记。
+        if "water_area" in self._tool_suspended_stages(obs):
+            unwatered = []
         if unwatered:
             can, why = self._can_water(obs)
             if can and tod < 2500 and stam >= self.water_min_stamina:
@@ -4138,6 +4180,10 @@ class LongRun:
             # 【task-149 C】走到这里说明"没活"有**独立证据**：farm 证据齐备（否则上一段
             # fail-closed 已经给了理由）、窗口与农场口径都没给出任何活。日终 checks 用
             # `zero_action_evidenced` 拦住"0 动作却 VERIFIED"的假绿灯。
+            # 【task-205】田里没活、但今天还有工具升级/取回要做 ⇒ 也不算收工（先跑一趟铁匠铺）。
+            # 铁匠铺动作不进 `work_reasons`（它不是农活），所以必须在这里单独放行。
+            if self._tool_upgrade_due(obs):
+                return False, "keep_working", "今天还有一件工具升级/取回要做（铁匠铺），先做完再收工"
             self.no_work_evidence_ok = True
             return True, "no_work", "确实找不到可做的活（地里的活干完了、也没法/没必要买种子）"
         return False, "keep_working", "；".join(reasons)
@@ -4475,6 +4521,145 @@ class LongRun:
         else:
             rep.ended_by, rep.ended_reason = "inventory_blocked", f"inventory_blocked:{why}"
         return rep.ended_by
+
+    def _tool_upgrade_plan(self, obs: dict[str, Any]) -> dict[str, Any] | None:
+        """【task-205】今天该不该去铁匠铺：返回 `{"action": "pickup"|"upgrade", ...}` 或 None。
+
+        优先级（**取回优先于新升级**：在途时再买会白扣钱锭，且工具不在身上）：
+
+          1. 有在途 + `daysLeft <= 0` + 背包有空格 ⇒ `pickup`（工具做完了，取回来才能继续用）；
+          2. 有在途 + `daysLeft > 0` ⇒ None（还在做，等，别买）；
+          3. 无在途 ⇒ 找一件"当前等级 < 3 且钱够、材料够"的工具 ⇒ `upgrade`；
+          4. 都没有 ⇒ None。
+
+        ⚠️ 价格/材料用脑侧 `UPGRADE_PRICES`/`UPGRADE_TRADE_ITEMS` 做**粗判**（决定要不要跑一趟），
+        真正的数字由 Mod 从货架条目读（名义价 ≠ 实扣价）。`tool_tier == -1`（旧 Mod 没给
+        `tools[].upgradeLevel`）⇒ 一律不升级（fail-closed，不许猜等级）。
+        """
+        being = tool_being_upgraded(obs)
+        days = tool_upgrade_days_left(obs)
+        free, free_status = player_free_slots(FarmWorker.player_of(obs))
+        if being:
+            if days is None:
+                return {"action": "wait", "reason": "读不到 toolUpgradeDaysLeft（fail-closed，不买）",
+                        "being": being.get("name")}
+            if days > 0:
+                return {"action": "wait", "reason": f"还在升级：daysLeft={days}",
+                        "being": being.get("name"), "days_left": days}
+            if free_status == "ok" and free <= 0:
+                return {"action": "need_slot", "reason": "升级做完了但背包没有空格（pickup 拿不回来）",
+                        "being": being.get("name"), "free_slots": free}
+            return {"action": "pickup", "being": being.get("name"), "days_left": days,
+                    "free_slots": free if free_status == "ok" else None}
+        money = FarmWorker.money(obs)
+        player = FarmWorker.player_of(obs)
+        for kind in UPGRADE_KINDS:
+            tier = tool_tier(obs, kind)
+            if tier < 0 or tier >= 3:
+                continue
+            price = UPGRADE_PRICES.get(tier, 0)
+            trade = UPGRADE_TRADE_ITEMS.get(tier, "")
+            need = 5
+            have = sum(int(it.get("stack") or 0) for it in (player.get("inventory") or [])
+                       if str(it.get("qualifiedId") or "") == trade) if trade else 0
+            if money >= price and have >= need:
+                return {"action": "upgrade", "kind": kind, "tier": tier,
+                        "price": price, "trade_item": trade, "trade_have": have, "trade_need": need,
+                        "money": money}
+        return None
+
+    def _tool_suspended_stages(self, obs: dict[str, Any]) -> set[str]:
+        """【task-205】在途升级期间要暂停的阶段（工具不在身上 ⇒ 那阶段一格都干不成）。"""
+        return tool_suspended_stages(obs)
+
+    def _maybe_tool_upgrade(self, obs: dict[str, Any], rep: DayReport) -> bool:
+        """【task-205】今天最多一次的铁匠铺动作（升级或取回）。
+
+        * 每天最多 `TOOL_UPGRADE_MAX_PER_DAY` 次；没做成也记一次（原因当天不会自己变好）；
+        * 在途期间被暂停的阶段：journal 一条 `tool_upgrade_blocked_work`（如实记账，不是失败）；
+        * 判据全靠 `FarmWorker.upgrade_tool()/pickup_tool()` 的**观测差分**；回执只是声明。
+
+        返回 True ⇒ 真的动了世界（调用方 `continue` 重新观测）。
+        """
+        assert self.worker is not None
+        suspended = self._tool_suspended_stages(obs)
+        if suspended and not self.tool_upgrade_blocked_noted:
+            self.tool_upgrade_blocked_noted = True
+            self._journal("tool_upgrade_blocked_work", stages=sorted(suspended),
+                          being=(tool_being_upgraded(obs) or {}).get("name"),
+                          note="工具在 Clint 那里升级，相关阶段暂停（不是失败，是工具不在身上）")
+            rep.notes.append(f"工具升级中，暂停阶段：{'/'.join(sorted(suspended))}")
+        if self.tool_upgrade_tried >= TOOL_UPGRADE_MAX_PER_DAY:
+            return False
+        plan = self._tool_upgrade_plan(obs)
+        if plan is None:
+            if not self.tool_upgrade_skipped_noted:
+                self.tool_upgrade_skipped_noted = True
+                self._journal("tool_upgrade_skipped",
+                              reason="没有可做的升级（钱/材料不够，或工具等级读不到，或已满级）",
+                              money=FarmWorker.money(obs))
+            return False
+        action = plan.get("action")
+        if action in ("wait", "need_slot"):
+            if not self.tool_upgrade_skipped_noted:
+                self.tool_upgrade_skipped_noted = True
+                self._journal("tool_upgrade_skipped", reason=plan.get("reason"),
+                              action=action, being=plan.get("being"),
+                              days_left=plan.get("days_left"), free_slots=plan.get("free_slots"))
+            return False
+        self.tool_upgrade_tried += 1
+        if action == "pickup":
+            st = self.worker.pickup_tool()
+            self._actions += 1
+            self._journal("pickup_tool", ok=st.ok, code=st.code, reason=st.reason,
+                          receipt=st.receipt, before=st.before, after=st.after)
+            rep.notes.append(("取回工具成功：" if st.ok else "取回工具失败：") + st.reason)
+            self._say(("  · " if st.ok else "  × ") + ("取回工具：" + st.reason))
+            if st.ok:
+                self.farm_actions_today += 1
+            return bool(st.ok)
+        kind = str(plan.get("kind") or "")
+        st = self.worker.upgrade_tool(kind)
+        self._actions += 1
+        self._journal("upgrade_tool", ok=st.ok, code=st.code, reason=st.reason,
+                      receipt=st.receipt, tool=kind, before=st.before, after=st.after)
+        rep.notes.append(("升级工具成功：" if st.ok else "升级工具失败：") + st.reason)
+        self._say(("  · " if st.ok else "  × ") + ("升级工具：" + st.reason))
+        if st.ok:
+            self.farm_actions_today += 1
+        return bool(st.ok)
+
+    def _tool_upgrade_due(self, obs: dict[str, Any]) -> bool:
+        """【task-205】"现在该不该去铁匠铺"的守卫（真正的执行在 `_maybe_tool_upgrade`）。
+
+        三条门槛（缺一条都不跑）：
+
+          1. 今天还没试过（`TOOL_UPGRADE_MAX_PER_DAY`）、worker 在；
+          2. **紧急农活优先**：窗口里还有没浇的活苗、或还有可收的熟作物 ⇒ 先干农活
+             （升级是收益，不是救火；run A′ 的教训：把一天花在跑腿上最亏）；
+          3. `_tool_upgrade_plan` 给出了可执行动作（`upgrade`/`pickup`）。
+
+        注意：`wait`/`need_slot`/`None` 都不算"该去"（`_maybe_tool_upgrade` 里仍会留痕）。
+        """
+        if self.worker is None or self.tool_upgrade_tried >= TOOL_UPGRADE_MAX_PER_DAY:
+            return False
+        tmap = FarmWorker.tiles_of(obs)
+        for tv in tmap.values():
+            if not tv.get("crop") or tv.get("dead"):
+                continue
+            if not tv.get("watered"):
+                return False
+            if tile_ready(tv):
+                return False
+        plan = self._tool_upgrade_plan(obs)
+        if plan is None:
+            return False
+        if plan.get("action") not in ("upgrade", "pickup"):
+            return False
+        # 背包状态读不到 ⇒ 不冒进（pickup 需要空格、upgrade 的锭也在背包里）
+        if player_free_slots(FarmWorker.player_of(obs))[1] != "ok":
+            return False
+        return True
 
     def _snap_or(self, obs: dict[str, Any]) -> dict[str, Any]:
         """重新取快照，失败就退回旧观测（腾格后的决策不该因为一次观察失败而崩）。"""
@@ -6088,6 +6273,10 @@ class LongRun:
         self.ready_far_causes = {}
         self.ready_far_not_on_farm = False
         self.ready_far_bag_noted = False
+        # 【task-205】铁匠铺升级链的日级计数每日重置（升级/取回一天最多试一次）。
+        self.tool_upgrade_tried = 0
+        self.tool_upgrade_skipped_noted = False
+        self.tool_upgrade_blocked_noted = False
         # 【task-42】新的一天 ⇒ 清空出货白名单：昨天收获的东西昨天该出就出了，
         # 今天再拿白名单去卖会变成"卖一件不存在的东西"（`sellable_slots` 找不到就不动，但语义要干净）。
         if self.worker is not None:
@@ -6192,6 +6381,11 @@ class LongRun:
             # 本轮（`_ensure_plot`/`decide`/`_verify_intents` 都要看得见刚到手的那批种子，
             # 否则 `plant_area` 会被算成"没有可动目标"而当天封格）。
             obs = self._preconditions(obs, rep)
+            # 【task-205】铁匠铺升级/取回：**每天最多一次**，放在"种子/腾格摆正"之后、
+            # "开新地"之前。`_tool_upgrade_due` 会先检查"没有紧急农活"（没浇的活苗/可收的
+            # 熟作物优先）⇒ 升级是收益、不是救火。真动过世界（upgrade/pickup 成功）就重新观测。
+            if self._tool_upgrade_due(obs) and self._maybe_tool_upgrade(obs, rep):
+                continue
             # 【task-50】窗口外那 1 格干作物（run5 三天 `farm.dryCrops` 恒剩 1 的病灶）：
             # Mod 的 `farm.dryTiles` 给了坐标 ⇒ **走过去浇**，别因为它不在窗口里就判 `no_work`。
             # 每格每天最多 `FAR_DRY_MAX_TRIES` 次；两次都不成会进"认输"集合，之后

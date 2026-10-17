@@ -140,6 +140,21 @@ class MiniWorld:
         #: 真机里它是**容量**（腾出一格后仍读 12），空槽必须用 `inventory[]` 行数算。
         self.inventory_capacity: int | None = (
             None if inventory_capacity is None else int(inventory_capacity))
+        # ---- task-205：铁匠铺升级链 ----
+        #: `player.tools.tools[]` 里的等级（`{kind: upgradeLevel}`）；空 ⇒ 观测里没有该数组
+        #: （旧 Mod 语义 ⇒ `tool_tier()` 一律 -1、`_tool_upgrade_plan` fail-closed 不升级）。
+        self.tool_tiers: dict[str, int] = {}
+        #: `player.toolBeingUpgraded`（在途升级的工具）；None ⇒ 观测里没有这个键。
+        self.being_upgraded: dict | None = None
+        #: `player.toolUpgradeDaysLeft`；None ⇒ 观测里没有这个键（fail-closed，不许当 0）。
+        self.upgrade_days_left: int | None = None
+        self.upgrade_calls: list[dict] = []      # 每次 `upgrade_tool` 请求的 tool/timeout_ms
+        self.pickup_calls = 0
+        #: "ok" = 真升级（钱/锭扣掉、`toolBeingUpgraded` 出现、tier+1）；
+        #: "no_effect" = 回执 ok 但世界一动不动（真机 task-173 的假 ok）；
+        #: 其它非空值 ⇒ 抛 `BridgeError(status=...)`（如 `no_money`/`no_trade_item`）。
+        self.upgrade_mode = "ok"
+        self.pickup_mode = "ok"
 
     # ---- 观测 ----
     def obs(self) -> dict:
@@ -150,6 +165,17 @@ class MiniWorld:
                                       for i in self.inventory]}
         if self.tools is not None:
             player["tools"] = dict(self.tools)
+        # 【task-205】`ToolsView.tools[]`（每件工具的 kind/upgradeLevel）—— 与上面旧的
+        # `tools{}` 布尔表**并存**：`tool_presence` 读旧的，升级链读新的。
+        if self.tool_tiers:
+            tools_block = dict(self.tools) if isinstance(self.tools, dict) else {}
+            tools_block["tools"] = [{"kind": str(k), "upgradeLevel": int(v), "name": str(k)}
+                                    for k, v in self.tool_tiers.items()]
+            player["tools"] = tools_block
+        if self.being_upgraded is not None:
+            player["toolBeingUpgraded"] = dict(self.being_upgraded)
+        if self.upgrade_days_left is not None:
+            player["toolUpgradeDaysLeft"] = int(self.upgrade_days_left)
         if self.inventory_capacity is not None:
             # 真机它是**容量**（不是空槽数）—— 判满必须数 `inventory` 行数（task-181 必修 3）。
             player["inventoryCount"] = int(self.inventory_capacity)
@@ -466,6 +492,41 @@ class MiniBridge:
     def buy(self, item, count=1, *, shop="SeedShop", timeout_ms=None):
         """`buy`（task-67）：真桥失败时抛 `BridgeError`，**回执原文（含货架清单）在 `payload`**。"""
         return self.w.do_buy(item, count)
+
+    def upgrade_tool(self, tool, *, timeout_ms=None):
+        """`upgrade_tool`（task-205）：真桥失败抛 `BridgeError(status=...)`；成功回执带价格/材料。"""
+        self.w.upgrade_calls.append({"tool": str(tool), "timeout_ms": timeout_ms})
+        if self.w.upgrade_mode and self.w.upgrade_mode not in ("ok", "no_effect"):
+            raise BridgeError(f"升级失败（{self.w.upgrade_mode}）", status=str(self.w.upgrade_mode))
+        kind = str(tool)
+        tier = int(self.w.tool_tiers.get(kind, 0))
+        price = {0: 2000, 1: 5000, 2: 10000, 3: 25000}.get(tier, 2000)
+        trade = {0: "(O)334", 1: "(O)335", 2: "(O)336", 3: "(O)337"}.get(tier, "(O)334")
+        receipt = {"ok": True, "status": "ok", "tool": kind, "tierBefore": tier,
+                   "tierAfter": tier + 1, "price": price, "tradeItem": trade,
+                   "tradeCount": 5, "moneyBefore": self.w.money,
+                   "moneyAfter": self.w.money - price,
+                   "reason": f"已买下升级：{kind} → {tier + 1} 级（2 天后取回）"}
+        if self.w.upgrade_mode == "no_effect":
+            # 真机 task-173 的形态：回执全绿，世界一个字节没变。
+            return receipt
+        self.w.money -= price
+        self.w.tool_tiers[kind] = tier + 1
+        self.w.being_upgraded = {"kind": kind, "name": kind, "qualifiedId": f"(T){kind}"}
+        self.w.upgrade_days_left = 2
+        return receipt
+
+    def pickup_tool(self, *, timeout_ms=None):
+        """`pickup_tool`（task-205）：取回时清掉在途状态（工具已在买下时换过）。"""
+        self.w.pickup_calls += 1
+        if self.w.pickup_mode and self.w.pickup_mode not in ("ok", "no_effect"):
+            raise BridgeError(f"取回失败（{self.w.pickup_mode}）", status=str(self.w.pickup_mode))
+        receipt = {"ok": True, "status": "ok", "reason": "工具已取回"}
+        if self.w.pickup_mode == "no_effect":
+            return receipt
+        self.w.being_upgraded = None
+        self.w.upgrade_days_left = 0
+        return receipt
 
 
 TOOLS_WITH_SCYTHE = {"axe": True, "pickaxe": True, "hoe": True, "wateringCan": True,
@@ -2831,6 +2892,103 @@ class TestTask199ModContract(unittest.TestCase):
         src = (REPO_ROOT / "mod" / "AgentFarm.Bridge.Tests"
                / "AgentFarm.Bridge.Tests.csproj").read_text(encoding="utf-8")
         self.assertIn("TileListRules.cs", src)
+
+
+class TestTask205ToolUpgrade(unittest.TestCase):
+    """【task-205】铁匠铺升级链的脑侧判据：观测差分、fail-closed、白扣钱防护。
+
+    真机链路（`docs/_il-tool-upgrade.md`）：钱/锭在买下时扣、工具当场换（`toolBeingUpgraded`
+    = 升级副本、`daysLeft=2`），两天后**第二步**才取回。所以这里钉四类行为：
+
+      1. 升级成功 = 观测到"在途出现 / 等级变大 / 钱变少"任一（回执只是声明）；
+      2. 回执说成了但世界没变 ⇒ `failed`（真机 task-173 的假 ok 形态）；
+      3. 在途时再买 ⇒ 一次请求都不发（游戏会白扣钱锭且不回滚）；
+      4. 取回的三种前置（daysLeft>0 / 没空格 / 没在途）分别 skipped/no_slot/skipped。
+    """
+
+    def _world(self, **kw) -> MiniWorld:
+        kw.setdefault("money", 3000)
+        w = MiniWorld(**kw)
+        w.tool_tiers = {"axe": 0, "hoe": 0, "can": 0}
+        w.location_name = "Blacksmith"      # 默认已到铁匠铺（省掉 ensure_location 的 move）
+        return w
+
+    def test_upgrade_success_is_judged_by_observation(self):
+        w = self._world(inventory_capacity=12)
+        w.inventory = [{"slot": 0, "id": "334", "qualifiedId": "(O)334",
+                        "name": "Copper Bar", "stack": 5, "isTool": False}]
+        st = make_worker(w).upgrade_tool("axe")
+        self.assertTrue(st.ok, st.reason)
+        self.assertEqual(len(w.upgrade_calls), 1)
+        self.assertEqual(w.upgrade_calls[0]["tool"], "axe")
+        self.assertEqual(st.after["tier"], 1)
+        self.assertEqual(st.after["being"], "axe")
+        self.assertEqual(st.after["days_left"], 2)
+        self.assertEqual(st.after["money_delta"], 2000)
+        self.assertTrue(st.after["money_delta_matches_price"])
+
+    def test_ok_receipt_without_world_change_is_failed(self):
+        w = self._world()
+        w.upgrade_mode = "no_effect"
+        st = make_worker(w).upgrade_tool("axe")
+        self.assertFalse(st.ok)
+        self.assertEqual(st.code, "failed")
+        self.assertIn("什么都没变", st.reason)
+
+    def test_already_upgrading_sends_no_request(self):
+        w = self._world()
+        w.being_upgraded = {"kind": "hoe", "name": "Hoe", "qualifiedId": "(T)Hoe"}
+        w.upgrade_days_left = 1
+        st = make_worker(w).upgrade_tool("axe")
+        self.assertFalse(st.ok)
+        self.assertEqual(w.upgrade_calls, [])          # 一个请求都不许发（白扣钱防护）
+        self.assertIn("已经有工具在升级", st.reason)
+
+    def test_non_upgradable_kind_is_rejected_before_any_request(self):
+        w = self._world()
+        st = make_worker(w).upgrade_tool("scythe")
+        self.assertFalse(st.ok)
+        self.assertEqual(w.upgrade_calls, [])
+        self.assertIn("不能升级", st.reason)
+
+    def test_missing_tier_metadata_makes_trade_item_unknown(self):
+        """旧 Mod 没有 `tools.tools[]` ⇒ `tool_tier()==-1`（fail-closed），不猜等级/材料。"""
+        w = MiniWorld(money=3000)
+        w.location_name = "Blacksmith"
+        st = make_worker(w).upgrade_tool("axe")
+        self.assertEqual(st.before["tier"], -1)
+        self.assertIsNone(st.before["trade_item"])
+
+    def test_pickup_skips_while_still_working(self):
+        w = self._world()
+        w.being_upgraded = {"kind": "axe", "name": "Axe"}
+        w.upgrade_days_left = 2
+        st = make_worker(w).pickup_tool()
+        self.assertFalse(st.ok)
+        self.assertEqual(st.code, "skipped")
+        self.assertEqual(w.pickup_calls, 0)
+        self.assertIn("还在升级", st.reason)
+
+    def test_pickup_requires_a_free_slot(self):
+        w = self._world()
+        w.inventory_capacity = 12
+        w.inventory = [{"slot": i, "id": "388", "qualifiedId": "(O)388",
+                        "name": "Wood", "stack": 1, "isTool": False} for i in range(12)]
+        w.being_upgraded = {"kind": "axe", "name": "Axe"}
+        w.upgrade_days_left = 0
+        st = make_worker(w).pickup_tool()
+        self.assertFalse(st.ok)
+        self.assertEqual(st.code, "no_slot")
+        self.assertEqual(w.pickup_calls, 0)
+
+    def test_pickup_success_clears_the_pending_upgrade(self):
+        w = self._world(inventory_capacity=12)
+        w.being_upgraded = {"kind": "axe", "name": "Axe"}
+        w.upgrade_days_left = 0
+        st = make_worker(w).pickup_tool()
+        self.assertTrue(st.ok, st.reason)
+        self.assertEqual(w.pickup_calls, 1)
+        self.assertIsNone(st.after["being"])
 
 
 if __name__ == "__main__":  # pragma: no cover

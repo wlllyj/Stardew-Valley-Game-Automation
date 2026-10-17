@@ -891,6 +891,51 @@ class BridgeClient:
             args["sellWhitelist"] = [str(x) for x in whitelist]
         return self.exec_skill("sell", args, timeout_ms=timeout_ms)
 
+    def upgrade_tool(self, tool: str, *, timeout_ms: int = 60000) -> dict[str, Any]:
+        """**在铁匠铺升级店买下某件工具的下一级**（`upgrade_tool`，Mod ≥ 0.7.38，task-205）。
+
+        `tool`：工具种类 —— `axe` / `pickaxe` / `hoe` / `can` / `pan`（镰刀不能升级：游戏的
+        `Tool.actionWhenPurchased` 只认这五类，见 `docs\\_il-tool-upgrade.md` §2.2）。
+
+        Mod 侧的链路（全部是游戏自己的函数，`Utility.TryOpenShopMenu("ClintUpgrade","Clint",true)`
+        → 等 `ShopMenu` → 在菜单实例的 `itemPriceAndStock` 里按 kind + tier==当前+1 **唯一**选条目
+        → 自检钱/锭/`readOnly` → 反射 `tryToPurchaseItem(item, null, 1, 0, 0)`）。
+        **买前必须由脑保证"没有在途升级"**（`toolBeingUpgraded == null`）：游戏的
+        `actionWhenPurchased` 见"已在升级"直接返回 false **且不回滚** ⇒ 钱和 5 条锭当场白扣。
+
+        ⚠️ **等级在买下时就换**：`player.toolBeingUpgraded` = 升级后的副本、`daysLeftForToolUpgrade = 2`、
+        旧工具离包。取回是**另一件事**（`pickup_tool`）。所以升级期间 hoe/can 相关阶段必须暂停
+        （脑侧 `farmwork.tool_being_upgraded()` / `tool_upgrade_days_left()`）。
+
+        **判据是观测差分，回执只是声明**：`player.money` 少了多少、锭少了几个、
+        `player.toolBeingUpgraded` 是否出现、`player.tools[].upgradeLevel` 是否变化。
+        失败状态码：`already_upgrading` / `still_working` / `read_only` / `no_money` /
+        `no_trade_item` / `tool_not_offered`（附在售表 `offers`）/ `shop_unavailable` /
+        `purchase_no_effect` / `tool_missing` / `bad_args`。
+        """
+        return self.exec_skill(
+            "upgrade_tool",
+            {"tool": str(tool)},
+            timeout_ms=timeout_ms,
+            http_timeout=timeout_ms / 1000.0 + 12.0,
+        )
+
+    def pickup_tool(self, *, timeout_ms: int = 30000) -> dict[str, Any]:
+        """**取回升级完成的工具**（`pickup_tool`，Mod ≥ 0.7.38，task-205）。
+
+        前置（Mod 侧 fail-closed，脑侧也要先判）：
+          * `player.toolBeingUpgraded != null`（没有在途 ⇒ `nothing_to_pickup`）；
+          * `player.daysLeftForToolUpgrade <= 0`（还在做 ⇒ `still_working`）；
+          * **背包 ≥1 空格**（`freeSpotsInInventory() <= 0` ⇒ 只会听到 Clint 的
+            `Clint_NoInventorySpace`，工具拿不回来 ⇒ `no_slot`；不扣钱，但白跑）；
+          * 人在 `Blacksmith` 店里（`GameLocation.blacksmith(...)` 只认当前地点的 Clint）。
+
+        实现 = 调游戏自己的 `GameLocation.blacksmith(...)` 的 pickup 分支（不是对话，
+        也不是 `answerDialogueAction`）。**判据是观测差分**：`toolBeingUpgraded` 清空 +
+        背包里同种工具 +1（`inventoryAdded`）。
+        """
+        return self.exec_skill("pickup_tool", timeout_ms=timeout_ms)
+
     def quit_game(self, *, timeout_ms: int = 3000) -> dict[str, Any]:
         """让**游戏自己退出**（quit_game，Mod ≥ 0.7.0）。
 

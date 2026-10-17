@@ -37,6 +37,10 @@
     <Compile Include="..\AgentFarm.Bridge\TileListRules.cs" />
     <!-- task-208：`dismiss_modal` 的显式应答选择（下标/文本子串/歧义）是纯逻辑 ⇒ 同样直接编译。 -->
     <Compile Include="..\AgentFarm.Bridge\AnswerRules.cs" />
+    <!-- task-205：铁匠铺升级链的判据（买前自检顺序 / 条目唯一选择 / 证据优先级）是纯逻辑
+         ⇒ 同样直接编译同一份源码。判据本体留在吃游戏类型的 ToolUpgradeSkill 里就只能做
+         源码文本断言（task-182 的 GAP-1 教训：文本断言逃逸了行为变异）。 -->
+    <Compile Include="..\AgentFarm.Bridge\ToolUpgradeRules.cs" />
   </ItemGroup>
 
 </Project>

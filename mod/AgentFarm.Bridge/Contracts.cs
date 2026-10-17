@@ -1142,6 +1142,90 @@ namespace AgentFarm.Bridge
         /// 【可选字段】null 时序列化省略 ⇒ 其它技能回执形状不变。
         /// </summary>
         [JsonPropertyName("chosenAnswer")] public string ChosenAnswer { get; set; }
+
+        // ------------------------------------------------------------------
+        //  0.7.38（task-205）新增：铁匠铺升级/取回的回执
+        //
+        //  依据 `docs/_il-tool-upgrade.md`（task-204）。脑侧必须能对账四件事：
+        //    * 买的是哪件工具、买前/买后等级（升级**在买下时**就换，不是取回时）；
+        //    * 条目自己的价格与材料（名义价 ≠ 实扣价，所以还要 moneyBefore/After 对账）；
+        //    * 在途升级状态（`toolBeingUpgraded` + `daysLeft`）—— 脑据此暂停 hoe/can 相关阶段；
+        //    * 整张在售表（`offers`），失败时脑能看清"到底有没有这件工具的条目"。
+        // ------------------------------------------------------------------
+
+        /// <summary><c>upgrade_tool</c> / <c>pickup_tool</c> 专用：工具种类（axe/pickaxe/hoe/can/pan）。【可选字段】</summary>
+        [JsonPropertyName("tool")] public string Tool { get; set; }
+
+        /// <summary><c>upgrade_tool</c> 专用：买之前的 <c>Tool.UpgradeLevel</c>。【可选字段】</summary>
+        [JsonPropertyName("tierBefore")] public int? TierBefore { get; set; }
+
+        /// <summary><c>upgrade_tool</c> / <c>pickup_tool</c> 专用：动作后的等级（观测值）。【可选字段】</summary>
+        [JsonPropertyName("tierAfter")] public int? TierAfter { get; set; }
+
+        /// <summary><c>upgrade_tool</c> 专用：条目自己的价格（游戏货架价，不是脑硬编码）。【可选字段】</summary>
+        [JsonPropertyName("price")] public int? Price { get; set; }
+
+        /// <summary><c>upgrade_tool</c> 专用：材料 <c>QualifiedItemId</c>（如 <c>(O)334</c> 铜锭）。【可选字段】</summary>
+        [JsonPropertyName("tradeItem")] public string TradeItem { get; set; }
+
+        /// <summary><c>upgrade_tool</c> 专用：材料数量。【可选字段】</summary>
+        [JsonPropertyName("tradeCount")] public int? TradeCount { get; set; }
+
+        /// <summary><c>upgrade_tool</c> 专用：买之前 / 之后的钱（观测真值，用于"钱差 == 价格"对账）。【可选字段】</summary>
+        [JsonPropertyName("moneyBefore")] public int? MoneyBefore { get; set; }
+        [JsonPropertyName("moneyAfter")] public int? MoneyAfter { get; set; }
+
+        /// <summary>
+        /// <c>upgrade_tool</c> / <c>pickup_tool</c> 专用：在途升级的工具名
+        /// （<c>player.toolBeingUpgraded</c>；为 null ⇒ 没有在途）。【可选字段】
+        /// </summary>
+        [JsonPropertyName("toolBeingUpgraded")] public string ToolBeingUpgraded { get; set; }
+
+        /// <summary>
+        /// <c>upgrade_tool</c> / <c>pickup_tool</c> 专用：<c>player.daysLeftForToolUpgrade</c>
+        /// （0 = 做完了、可取回；2 = 刚买下）。【可选字段】
+        /// </summary>
+        [JsonPropertyName("daysLeft")] public int? DaysLeft { get; set; }
+
+        /// <summary><c>pickup_tool</c> 专用：背包里同种工具数量变化（取回成功 ⇒ +1）。【可选字段】</summary>
+        [JsonPropertyName("inventoryAdded")] public int? InventoryAdded { get; set; }
+
+        /// <summary>
+        /// <c>upgrade_tool</c> 专用：开店那一刻 `ClintUpgrade` 的在售条目（全部工具条目）。
+        /// 失败时也给 ⇒ 脑能看清"这件工具到底在不在售"，而不是靠猜。【可选字段】
+        /// </summary>
+        [JsonPropertyName("offers")] public UpgradeOfferView[] Offers { get; set; }
+    }
+
+    /// <summary>
+    /// `ClintUpgrade` 在售表里的一条工具升级条目（协议 0.7.38 / task-205）。
+    /// 全部字段都是**游戏真值**（`ShopMenu.itemPriceAndStock` 的条目），不解析、不猜。
+    /// </summary>
+    internal sealed class UpgradeOfferView
+    {
+        /// <summary>`QualifiedItemId`（如 `(T)UpgradeAxe` 之类的游戏条目 id）。</summary>
+        [JsonPropertyName("id")] public string Id { get; set; }
+
+        /// <summary>展示名。</summary>
+        [JsonPropertyName("name")] public string Name { get; set; }
+
+        /// <summary>工具种类（axe/pickaxe/hoe/can/pan/…）。</summary>
+        [JsonPropertyName("kind")] public string Kind { get; set; }
+
+        /// <summary>条目上的 <c>Tool.UpgradeLevel</c>（语义未定 ⇒ 脑/Mod 都不硬信，靠价格+材料兜底匹配）。</summary>
+        [JsonPropertyName("tier")] public int Tier { get; set; }
+
+        /// <summary>价格（g）。</summary>
+        [JsonPropertyName("price")] public int Price { get; set; }
+
+        /// <summary>材料 `QualifiedItemId`（可能为 null = 不收材料）。</summary>
+        [JsonPropertyName("tradeItem")] public string TradeItem { get; set; }
+
+        /// <summary>材料数量（不收材料时为 null）。</summary>
+        [JsonPropertyName("tradeCount")] public int? TradeCount { get; set; }
+
+        /// <summary>库存（游戏给的剩余量）。</summary>
+        [JsonPropertyName("stock")] public int Stock { get; set; }
     }
 
     /// <summary>

@@ -176,6 +176,87 @@ namespace AgentFarm.Bridge.Tests
                   noQuestion.Status == AnswerRules.StatusNoQuestion && noQuestion.Index == -1,
                   "empty responses must fail with no_question");
 
+            // ---------------- task-205：铁匠铺升级链判据（ToolUpgradeRules，纯函数） ----------------
+            // 依据 docs/_il-tool-upgrade.md（task-204）。这些是**行为**断言：
+            // 买错条目/漏堵"已在升级"/漏堵 readOnly 都是真机白扣钱（钱+5 条锭当场扣掉、工具不升级）。
+            var offers = new List<UpgradeOfferInput>
+            {
+                new UpgradeOfferInput("(T)CopperAxe", "Copper Axe", "axe", 1, 2000, "(O)334", 5, 0),
+                new UpgradeOfferInput("(T)CopperHoe", "Copper Hoe", "hoe", 1, 2000, "(O)334", 5, 0),
+            };
+
+            UpgradePickResult axePick = ToolUpgradeRules.Select(offers, "axe", 0);
+            Check("t205_unique_offer_is_selected",
+                  axePick.Index == 0 && axePick.Status == ToolUpgradeRules.StatusOk,
+                  "kind=axe, tier 0→1 应唯一选中第一条");
+
+            UpgradePickResult wrongTier = ToolUpgradeRules.Select(offers, "axe", 1);
+            Check("t205_wrong_tier_fails_closed",
+                  wrongTier.Index == -1 && wrongTier.Status == ToolUpgradeRules.StatusToolNotOffered
+                  && wrongTier.Note.Contains("在售"),
+                  "tier 1→2 不该命中 tier==1 的条目；失败 reason 要列在售表");
+
+            var duplicate = new List<UpgradeOfferInput> { offers[0], offers[0] };
+            UpgradePickResult dupPick = ToolUpgradeRules.Select(duplicate, "axe", 0);
+            Check("t205_duplicate_offers_fail_closed",
+                  dupPick.Index == -1 && dupPick.Status == ToolUpgradeRules.StatusToolNotOffered,
+                  "同 kind 同 tier 两条 ⇒ 不唯一 ⇒ 必须 fail-closed（不许猜）");
+
+            Check("t205_already_upgrading_blocks",
+                  ToolUpgradeRules.Precheck(
+                      new UpgradePrecheck(true, 0, 5, false, 99999, 2000, 99, 5), false)
+                  == ToolUpgradeRules.StatusAlreadyUpgrading,
+                  "toolBeingUpgraded != null ⇒ 买会白扣钱锭 ⇒ 必须堵");
+
+            Check("t205_still_working_blocks",
+                  ToolUpgradeRules.Precheck(
+                      new UpgradePrecheck(false, 2, 5, false, 99999, 2000, 99, 5), false)
+                  == ToolUpgradeRules.StatusStillWorking,
+                  "daysLeft > 0 ⇒ 还在升级，不能买");
+
+            Check("t205_read_only_blocks",
+                  ToolUpgradeRules.Precheck(
+                      new UpgradePrecheck(false, 0, 5, true, 99999, 2000, 99, 5), false)
+                  == ToolUpgradeRules.StatusReadOnly,
+                  "电话查价店 readOnly=true ⇒ 只扣钱不升级 ⇒ 必须堵");
+
+            Check("t205_no_money_blocks",
+                  ToolUpgradeRules.Precheck(
+                      new UpgradePrecheck(false, 0, 5, false, 100, 2000, 99, 5), false)
+                  == ToolUpgradeRules.StatusNoMoney,
+                  "钱 < 条目价 ⇒ no_money（别让别人替你猜价格）");
+
+            Check("t205_no_trade_item_blocks",
+                  ToolUpgradeRules.Precheck(
+                      new UpgradePrecheck(false, 0, 5, false, 99999, 2000, 2, 5), false)
+                  == ToolUpgradeRules.StatusNoTradeItem,
+                  "锭不够（2 < 5）⇒ no_trade_item");
+
+            Check("t205_ok_when_everything_sufficient",
+                  ToolUpgradeRules.Precheck(
+                      new UpgradePrecheck(false, 0, 5, false, 2000, 2000, 5, 5), false) == "",
+                  "钱恰好够 + 材料恰好够 + 无在途 + 非 readOnly ⇒ 放行");
+
+            Check("t205_pickup_requires_free_slot",
+                  ToolUpgradeRules.Precheck(
+                      new UpgradePrecheck(false, 0, 0, false, 0, 0, 0, 0), true)
+                  == ToolUpgradeRules.StatusNoSlot,
+                  "取回必须 ≥1 空格（blacksmith() 的 pickup 分支 freeSpotsInInventory() <= 0 ⇒ 拿不到）");
+
+            Check("t205_evidence_priority",
+                  ToolUpgradeRules.Evidence(true, true, true, true) == ToolUpgradeRules.EvidenceToolBeingUpgraded
+                  && ToolUpgradeRules.Evidence(false, true, true, true) == ToolUpgradeRules.EvidenceTradeItem
+                  && ToolUpgradeRules.Evidence(false, false, true, true) == ToolUpgradeRules.EvidenceMoney
+                  && ToolUpgradeRules.Evidence(false, false, false, true) == ToolUpgradeRules.EvidenceInventory
+                  && ToolUpgradeRules.Evidence(false, false, false, false) == null
+                  && !ToolUpgradeRules.Acted(null),
+                  "证据优先级：在途 > 材料 > 钱 > 背包；全不命中 ⇒ null（必须判 acted=false）");
+
+            Check("t205_kind_normalization",
+                  ToolUpgradeRules.NormalizeKind("WateringCan") == "can"
+                  && ToolUpgradeRules.SameKind("wateringcan", "can"),
+                  "wateringcan/watering_can 归一化成 can");
+
             Console.WriteLine(_failed == 0
                 ? $"OK {_total} 断言全部通过"
                 : $"FAILED {_failed} 条断言不通过（共 {_total} 条）");
