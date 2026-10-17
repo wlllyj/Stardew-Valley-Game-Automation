@@ -46,10 +46,45 @@ internal static class Probe
         DumpAll("StardewValley.GameData.Tools.ToolData");
         DumpAll("StardewValley.GameData.Tools.ToolUpgradeData");
 
+        // Q1：入口方法的真实可见性（blacksmith / performAction / answerDialogueAction）
+        DumpNamed("StardewValley.GameLocation",
+            "blacksmith", "performAction", "answerDialogueAction", "checkAction", "createQuestionDialogue");
+
+        // Q1/Q2：商店库存构造（tool upgrade 条目怎么变成 ISalable 的）
+        DumpAll("StardewValley.Internal.ShopBuilder");
+
+        // Q3/Q5：库存条目的价格/材料字段（task-205 要从 itemPriceAndStock 读预期值）
+        DumpTypesContaining("Stock");
+        DumpTypesContaining("ItemStock");
+
         // Q7：ResourceClump 的类型区分与等级门槛
         DumpNamed("StardewValley.TerrainFeatures.ResourceClump",
             ".ctor", "parentSheetIndex", "health", "width", "height", "performToolAction",
             "ResourceClumpType", "GetData", "resourceClumpIndex");
+    }
+
+    private static void DumpTypesContaining(string fragment)
+    {
+        try
+        {
+            Assembly asm = Assembly.LoadFrom(Path.Combine(GameDir, "Stardew Valley.dll"));
+            foreach (Type t in asm.GetTypes().Where(x => x.FullName != null && x.FullName.Contains(fragment))
+                         .OrderBy(x => x.FullName))
+            {
+                Console.WriteLine("=== [type] " + t.FullName + " : " + t.BaseType + " ===");
+                foreach (MemberInfo m in t.GetMembers(BindingFlags.Public | BindingFlags.NonPublic
+                            | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly)
+                         .OrderBy(m => m.MemberType.ToString()).ThenBy(m => m.Name))
+                {
+                    Console.WriteLine("  " + Describe(m));
+                }
+                Console.WriteLine();
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("=== [type] " + fragment + " EX " + ex.GetType().Name + ": " + ex.Message);
+        }
     }
 
     private static void DumpAll(string fullName)
