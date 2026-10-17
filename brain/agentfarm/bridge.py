@@ -36,7 +36,20 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.36"   # v0.7.36：收获证据面收口（task-186/188/189）——Mod 侧
+MOD_VERSION_EXPECTED = "0.7.37"   # v0.7.37：A′ 叫停后的 P0 收口批次 —— Mod 侧
+                                  # ①`FarmView.readyTiles[]`（熟作物坐标，与 `readyCrops` 同源同扫描、
+                                  #   上限 64、按 (y,x)、`readyTilesTruncated`）（task-199）；
+                                  # ②`upgrade_tool`/`pickup_tool` 技能（铁匠铺 `ClintUpgrade` 闭环，
+                                  #   买前自检 `toolBeingUpgraded==null && daysLeft==0 && !readOnly`，
+                                  #   取回需 ≥1 空格）（task-205）；
+                                  # ③`dismiss_modal` 显式应答 `answerIndex`/`answerText`（互斥、fail-closed、
+                                  #   绝不回退自动 Yes）（task-208）；
+                                  # ④内省面 `debug_dump`（7 张数据表）+ `add_missed_recipes`
+                                  #   （反射 `Farmer.AddMissedMailAndRecipes()`，前后差分）（task-213）。
+                                  # 脑侧同批：`no_slot` 阻塞类 + `slot_relief` 收敛 + 诚实
+                                  # `inventory_blocked`（task-198）；`ready_far` 走位族（task-199）；
+                                  # 工具升级策略（task-205）；analyzer 收 4 新事件（task-207）。
+# v0.7.36：收获证据面收口（task-186/188/189）——Mod 侧
                                   # ①`use_tool`（含镰刀类作物）回执补 `acted` + `actedEvidence`，
                                   #   与 `interact` 同一套跨观测证据口径、**fail-closed**（证据不可得 ⇒
                                   #   `acted=false`，不允许 true）；②该证据提取抽成共享方法，
