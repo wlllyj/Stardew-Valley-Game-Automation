@@ -300,6 +300,55 @@ namespace AgentFarm.Bridge.Tests
                   && DumpRules.Describe(null) == "null",
                   "值渲染：字典 ⇒ {k=v}；超长截断并标注原长；null ⇒ \"null\"（不许抛）");
 
+            // ==============================================================
+            //  task-210：机器链契约（objects 台账的排序/截断/三态）纯规则断言
+            // ==============================================================
+            Console.WriteLine("TileListRules 台账断言（task-210）");
+
+            var unsorted = new List<int[]>
+            {
+                new[] { 3, 2 }, new[] { 1, 5 }, new[] { 1, 2 }, new[] { 7, 1 },
+            };
+            bool truncatedSorted;
+            int[] sortedIndices = TileListRules.OrderAndTruncateIndices(unsorted, 64, out truncatedSorted);
+            Check("t210_object_list_indices_sorted_y_then_x",
+                  sortedIndices.Length == 4 && !truncatedSorted
+                  && sortedIndices[0] == 3 && sortedIndices[1] == 2
+                  && sortedIndices[2] == 0 && sortedIndices[3] == 1,
+                  "台账顺序：先 y 再 x（下标映射回原列表，行对象不会错位）");
+
+            bool truncatedStrict;
+            int[] cappedIndices = TileListRules.OrderAndTruncateIndices(unsorted, 2, out truncatedStrict);
+            bool truncatedLoose;
+            int[] allIndices = TileListRules.OrderAndTruncateIndices(unsorted, 4, out truncatedLoose);
+            Check("t210_object_list_indices_truncated",
+                  cappedIndices.Length == 2 && truncatedStrict
+                  && allIndices.Length == 4 && !truncatedLoose,
+                  "台账上限：超过 max 只留前 max 条并置 truncated（未超 ⇒ truncated=false）");
+
+            bool truncatedNull;
+            int[] nullIndices = TileListRules.OrderAndTruncateIndices(null, 64, out truncatedNull);
+            Check("t210_object_list_null_is_fail_closed",
+                  nullIndices.Length == 0 && truncatedNull,
+                  "source == null ⇒ 空 + truncated=true（\"没拿到\"≠\"没有放置物\"，三态可辨）");
+
+            var malformed = new List<int[]>
+            {
+                new[] { 5, 5 }, null, new[] { 9 }, new[] { 6, 4 },
+            };
+            bool truncatedMalformed;
+            int[] malformedIndices = TileListRules.OrderAndTruncateIndices(malformed, 64, out truncatedMalformed);
+            Check("t210_object_list_skips_malformed",
+                  malformedIndices.Length == 2 && !truncatedMalformed
+                  && malformedIndices[0] == 3 && malformedIndices[1] == 0,
+                  "残缺条目（null / 长度<2）跳过，只遍历合法行（下标仍指原列表）");
+
+            bool truncatedZero;
+            int[] zeroIndices = TileListRules.OrderAndTruncateIndices(unsorted, 0, out truncatedZero);
+            Check("t210_object_list_max_zero_gives_nothing",
+                  zeroIndices.Length == 0 && truncatedZero,
+                  "max<=0 ⇒ 一条不给且如实置 truncated（不许悄悄返回全部）");
+
             Console.WriteLine(_failed == 0
                 ? $"OK {_total} 断言全部通过"
                 : $"FAILED {_failed} 条断言不通过（共 {_total} 条）");

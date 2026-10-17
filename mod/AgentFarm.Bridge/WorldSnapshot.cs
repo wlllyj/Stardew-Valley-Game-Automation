@@ -544,6 +544,15 @@ namespace AgentFarm.Bridge
                     v.RefillTilesTruncated = refillTruncated;
                 }
                 catch { v.RefillTiles = System.Array.Empty<int[]>(); }
+
+                // 【task-210】objects 逐条台账（机器链挑格用；上限 64、按 (y,x) 排序）
+                try
+                {
+                    bool objectListTruncated;
+                    v.ObjectList = ReadObjectList(loc, out objectListTruncated);
+                    v.ObjectListTruncated = objectListTruncated ? true : (bool?)null;
+                }
+                catch { v.ObjectList = System.Array.Empty<ObjectEntryView>(); }
             }
 
             return v;
@@ -586,6 +595,18 @@ namespace AgentFarm.Bridge
                         var p = new Microsoft.Xna.Framework.Point((int)kv.Key.X, (int)kv.Key.Y);
                         var t = new TileView { Tile = new[] { p.X, p.Y }, Kind = "object", Tool = "none" };
                         try { t.ObjId = kv.Value?.ItemId; } catch { }
+                        // 【task-210】机器状态（只有真机器才填；非机器三个字段保持 null）
+                        try
+                        {
+                            HeldObjectView held;
+                            bool? readyForHarvest;
+                            int? minutesUntilReady;
+                            ReadMachineMeta(kv.Value, out held, out readyForHarvest, out minutesUntilReady);
+                            t.HeldObject = held;
+                            t.ReadyForHarvest = readyForHarvest;
+                            t.MinutesUntilReady = minutesUntilReady;
+                        }
+                        catch { }
                         try
                         {
                             StardewValley.Object o = kv.Value;
@@ -672,6 +693,107 @@ namespace AgentFarm.Bridge
             for (int i = 0; i < all.Count && list.Count < MaxTiles; i++) list.Add(all[i].Value);
 
             return list.ToArray();
+        }
+
+        /// <summary>
+        /// 【task-210】读一格的机器状态。三态：**null = 不是机器 / 读不到**，不是 false/0。
+        ///
+        /// 判"是不是机器"用游戏自己的 `Object.GetMachineData()`（task-211 IL 定案 public）；
+        /// 拿到 `MachineData` 才继续读 `heldObject`（NetRef）/ `readyForHarvest`（**NetBool 字段**）/
+        /// `MinutesUntilReady`（int 属性）。三个量各自 try/catch：读不到的保持 null
+        /// （`readyForHarvest == null` 与 `== false` 是两件事，脑侧不许混）。
+        /// </summary>
+        private static void ReadMachineMeta(StardewValley.Object o,
+                                            out HeldObjectView held,
+                                            out bool? readyForHarvest,
+                                            out int? minutesUntilReady)
+        {
+            held = null;
+            readyForHarvest = null;
+            minutesUntilReady = null;
+            if (o == null) return;
+
+            // 非机器（箱子/杂草/石头/掉落物…）⇒ 三个字段都保持 null；GetMachineData 异常同样按"不是机器"。
+            try { if (o.GetMachineData() == null) return; } catch { return; }
+
+            try
+            {
+                StardewValley.Object h = o.heldObject?.Value;
+                if (h != null)
+                {
+                    held = new HeldObjectView
+                    {
+                        Id = h.QualifiedItemId,
+                        Name = h.DisplayName,
+                        Stack = h.Stack,
+                    };
+                }
+            }
+            catch { }
+            try { readyForHarvest = o.readyForHarvest?.Value; } catch { }
+            try { minutesUntilReady = o.MinutesUntilReady; } catch { }
+        }
+
+        /// <summary>
+        /// 【task-210】`location.objects` 的逐条台账（仅 `detail=full`）。
+        ///
+        /// 与 `tiles[]` 的分工：`tiles[]` 是作战视图（按离玩家距离、上限 400、objects+地形混合）；
+        /// 这张台账只含 `objects`，**按 (y, x) 升序**、上限 **64** 条，带机器状态，
+        /// 专供机器链（挑熔炉格 / 投料 / 取货）。排序与截断复用 `TileListRules`（唯一一份实现）。
+        ///
+        /// 三态：字段缺键（旧 Mod / summary）≠ 空数组 + `truncated=true`（没拿到 / 读失败）
+        /// ≠ 空数组 + `truncated=false`（确实没有放置物）。
+        /// </summary>
+        private static ObjectEntryView[] ReadObjectList(GameLocation loc, out bool truncated)
+        {
+            const int MaxObjects = 64;
+            truncated = false;
+            if (loc == null)
+            {
+                truncated = true;   // "没拿到地点" ≠ "没有放置物"
+                return System.Array.Empty<ObjectEntryView>();
+            }
+
+            var rows = new List<ObjectEntryView>();
+            var positions = new List<int[]>();
+            try
+            {
+                if (loc.objects != null)
+                {
+                    foreach (KeyValuePair<Microsoft.Xna.Framework.Vector2, StardewValley.Object> kv
+                             in loc.objects.Pairs)
+                    {
+                        var row = new ObjectEntryView { Tile = new[] { (int)kv.Key.X, (int)kv.Key.Y } };
+                        StardewValley.Object o = kv.Value;
+                        try { row.ObjId = o?.ItemId; } catch { }
+                        try { row.Name = o?.DisplayName; } catch { }
+                        try { row.BigCraftable = o?.bigCraftable?.Value; } catch { }
+                        try
+                        {
+                            HeldObjectView held;
+                            bool? ready;
+                            int? minutes;
+                            ReadMachineMeta(o, out held, out ready, out minutes);
+                            row.HeldObject = held;
+                            row.ReadyForHarvest = ready;
+                            row.MinutesUntilReady = minutes;
+                        }
+                        catch { }
+                        rows.Add(row);
+                        positions.Add(row.Tile);
+                    }
+                }
+            }
+            catch
+            {
+                truncated = true;
+                return System.Array.Empty<ObjectEntryView>();   // fail-closed：不确定就不给半截台账
+            }
+
+            int[] indices = TileListRules.OrderAndTruncateIndices(positions, MaxObjects, out truncated);
+            var result = new ObjectEntryView[indices.Length];
+            for (int i = 0; i < indices.Length; i++) result[i] = rows[indices[i]];
+            return result;
         }
 
         /// <summary>离玩家当前格多远的曼哈顿距离（读不到玩家时给一个很大的值，让它们排在最后）。</summary>

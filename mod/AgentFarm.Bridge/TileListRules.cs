@@ -49,27 +49,73 @@ namespace AgentFarm.Bridge
                     ordered.Add(item);
                 }
 
-                ordered.Sort((a, b) => a[1] != b[1] ? a[1] - b[1] : a[0] - b[0]);
-                truncated = false;
-                if (max <= 0)
-                {
-                    truncated = ordered.Count > 0;
-                    tiles = new int[0][];
-                    return;
-                }
-
-                if (ordered.Count > max)
-                {
-                    truncated = true;
-                    ordered = ordered.GetRange(0, max);
-                }
-
-                tiles = ordered.ToArray();
+                int[] indices = OrderAndTruncateIndices(ordered, max, out truncated);
+                var result = new int[indices.Length][];
+                for (int i = 0; i < indices.Length; i++) result[i] = ordered[indices[i]];
+                tiles = result;
             }
             catch
             {
                 tiles = new int[0][];
                 truncated = true;
+            }
+        }
+
+        /// <summary>
+        /// 【task-210】**按同样的 (y, x) 排序 + 上限截断**，但返回的是"原列表下标"。
+        ///
+        /// 为什么需要：`location.objects` 的逐条清单不是纯坐标，每行还带机器状态
+        /// （`objId`/`heldObject`/`readyForHarvest`/`minutesUntilReady`）。
+        /// 为了不让"排序 + 截断"这段判据出现第二份实现（两份必然漂移），
+        /// 这里只算**下标顺序**，调用方照下标取自己的行对象。
+        ///
+        /// 口径与 <see cref="OrderAndTruncate"/> 完全一致：先 y 再 x；`max &lt;= 0` ⇒ 一条不给、
+        /// `truncated = 条目数 &gt; 0`；`source == null` / 异常 ⇒ 空 + `truncated = true`
+        /// （"没拿到" ≠ "没有"）；残缺条目（null / 长度 &lt; 2）跳过（其下标不会出现）。
+        /// </summary>
+        public static int[] OrderAndTruncateIndices(List<int[]> source, int max, out bool truncated)
+        {
+            try
+            {
+                truncated = false;
+                if (source == null)
+                {
+                    truncated = true;
+                    return new int[0];
+                }
+
+                var pairs = new List<KeyValuePair<int, int[]>>();
+                for (int i = 0; i < source.Count; i++)
+                {
+                    int[] item = source[i];
+                    if (item == null || item.Length < 2) continue;
+                    pairs.Add(new KeyValuePair<int, int[]>(i, item));
+                }
+
+                pairs.Sort((a, b) => a.Value[1] != b.Value[1]
+                    ? a.Value[1] - b.Value[1]
+                    : a.Value[0] - b.Value[0]);
+
+                if (max <= 0)
+                {
+                    truncated = pairs.Count > 0;
+                    return new int[0];
+                }
+
+                if (pairs.Count > max)
+                {
+                    truncated = true;
+                    pairs = pairs.GetRange(0, max);
+                }
+
+                var result = new int[pairs.Count];
+                for (int i = 0; i < pairs.Count; i++) result[i] = pairs[i].Key;
+                return result;
+            }
+            catch
+            {
+                truncated = true;
+                return new int[0];
             }
         }
     }

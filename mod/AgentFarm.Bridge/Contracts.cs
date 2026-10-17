@@ -361,6 +361,21 @@ namespace AgentFarm.Bridge
 
         /// <summary>`refillTiles[]` 是否因为超过上限被截断（null/false = 完整）。</summary>
         [JsonPropertyName("refillTilesTruncated")] public bool? RefillTilesTruncated { get; set; }
+
+        /// <summary>
+        /// **task-210 新增（仅 `detail=full`）**：`location.objects` 的**逐条台账**（机器/放置物）。
+        ///
+        /// 为什么必须有：在此之前 `objects` **只有计数**，脑无法回答"哪一格是熔炉、里面有没有货、
+        /// 还有几分钟"——机器链（放置/投料/取货）一步都走不了。
+        ///
+        /// 口径：只含 `objects`（不含 terrainFeatures）；按 **(y, x) 升序**；上限 **64** 条；
+        /// 超出置 `objectListTruncated=true`（**计数仍以 `objects` 为准**，台账只是"看得见的那部分"）。
+        /// 三态可辨：字段缺键（旧 Mod / summary）≠ `null`（读不到）≠ `[]`（确实没有放置物）。
+        /// </summary>
+        [JsonPropertyName("objectList")] public ObjectEntryView[] ObjectList { get; set; }
+
+        /// <summary>`objectList[]` 是否被截断（null/false = 完整；读不到时也为 true）。</summary>
+        [JsonPropertyName("objectListTruncated")] public bool? ObjectListTruncated { get; set; }
     }
 
     /// <summary>浇水壶视图（快照 v0.7.21 新增）。见 <see cref="PlayerView.WateringCan"/>。</summary>
@@ -434,6 +449,62 @@ namespace AgentFarm.Bridge
         [JsonPropertyName("separateWallets")] public bool SeparateWallets { get; set; }
     }
 
+    /// <summary>
+    /// 【task-210】机器里正在处理/已产出的物品（`Object.heldObject.Value` 的视图）。
+    ///
+    /// 只回答"是什么、几个"；**坐标在外层行对象上**（本结构不重复带坐标，避免两份坐标漂移）。
+    /// 三态可辨：字段缺键（旧 Mod / 非机器）、`null`（机器但当前空手 = 没有 held）、有值。
+    /// </summary>
+    internal sealed class HeldObjectView
+    {
+        /// <summary>`Item.QualifiedItemId`（例 `(O)334` 铜锭）。读不到 ⇒ null。</summary>
+        [JsonPropertyName("id")] public string Id { get; set; }
+
+        /// <summary>`Item.DisplayName`（诊断用）。读不到 ⇒ null。</summary>
+        [JsonPropertyName("name")] public string Name { get; set; }
+
+        /// <summary>`Item.Stack`。读不到 ⇒ null（**不许写 0**）。</summary>
+        [JsonPropertyName("stack")] public int? Stack { get; set; }
+    }
+
+    /// <summary>
+    /// 【task-210】`location.objects` 的**逐条台账行**（仅 `detail=full`，见 `location.objectList`）。
+    ///
+    /// 与 `tiles[]` 的分工（两张表可以不一致，别混用）：
+    ///   * `tiles[]` = **作战视图**：按离玩家距离排序、上限 400、objects + terrainFeatures 混在一起；
+    ///   * `objectList[]` = **台账**：只含 `objects`，按 (y, x) 排序、上限 64、带机器状态。
+    /// 机器链（craft 后放置、投料、取货）挑格子用台账；清理/开垦/种植仍看 `tiles[]`。
+    /// </summary>
+    internal sealed class ObjectEntryView
+    {
+        /// <summary>格坐标 `[x, y]`（按 (y, x) 升序排列）。</summary>
+        [JsonPropertyName("tile")] public int[] Tile { get; set; }
+
+        /// <summary>`Item.ItemId`（例 `114`；机器/箱子等）。读不到 ⇒ null。</summary>
+        [JsonPropertyName("objId")] public string ObjId { get; set; }
+
+        /// <summary>`Item.DisplayName`（诊断用）。读不到 ⇒ null。</summary>
+        [JsonPropertyName("name")] public string Name { get; set; }
+
+        /// <summary>`Object.bigCraftable.Value`（大件 = 放下去的家具/机器）。读不到 ⇒ null。</summary>
+        [JsonPropertyName("bigCraftable")] public bool? BigCraftable { get; set; }
+
+        /// <summary>机器里当前的东西（空 ⇒ 字段缺键或 null，见 <see cref="HeldObjectView"/>）。</summary>
+        [JsonPropertyName("heldObject")] public HeldObjectView HeldObject { get; set; }
+
+        /// <summary>
+        /// `Object.readyForHarvest.Value`（`NetBool` 字段，不是方法）。
+        /// **null = 判不了 / 不是机器**；`false` 是"确实是机器但没好"。
+        /// </summary>
+        [JsonPropertyName("readyForHarvest")] public bool? ReadyForHarvest { get; set; }
+
+        /// <summary>
+        /// `Object.MinutesUntilReady`（游戏自己的"还要几分钟"）。读不到 / 非机器 ⇒ null。
+        /// ⚠️ 数值只是**游戏内分钟**，不等于墙钟；机器时间只在游戏时间推进时走。
+        /// </summary>
+        [JsonPropertyName("minutesUntilReady")] public int? MinutesUntilReady { get; set; }
+    }
+
     /// <summary>单格清单项（快照 v0.7.4 / `agentfarm-world/6` 新增，仅 `detail=full`）。</summary>
     internal sealed class TileView
     {
@@ -494,6 +565,26 @@ namespace AgentFarm.Bridge
 
         /// <summary>`objects` 里那一项的 `ItemId`（没有则为 null）。</summary>
         [JsonPropertyName("objId")] public string ObjId { get; set; }
+
+        // ---- 【task-210】机器状态（只有 `kind="object"` 且该格是机器时才填）----
+        //
+        //  数据面全部问游戏自己（`Object.GetMachineData()` 判"是不是机器"然后读
+        //  `heldObject`/`readyForHarvest`/`MinutesUntilReady`），不硬编码任何 id/分钟数。
+        //  非机器（箱子/杂草/石头…）三个字段都保持 null ⇒ 脑不会把箱子当熔炉。
+
+        /// <summary>
+        /// 机器里当前的东西（`Object.heldObject.Value`）。**null = 没有 / 不是机器**（见 `HeldObjectView`）。
+        /// </summary>
+        [JsonPropertyName("heldObject")] public HeldObjectView HeldObject { get; set; }
+
+        /// <summary>
+        /// `Object.readyForHarvest.Value`（**NetBool 字段**，不是方法；task-211 IL 定案）。
+        /// **null = 判不了 / 不是机器**；`false` = 确实是机器但还没好。
+        /// </summary>
+        [JsonPropertyName("readyForHarvest")] public bool? ReadyForHarvest { get; set; }
+
+        /// <summary>`Object.MinutesUntilReady`（游戏内分钟；只在游戏时间推进时走）。null = 判不了 / 非机器。</summary>
+        [JsonPropertyName("minutesUntilReady")] public int? MinutesUntilReady { get; set; }
 
         /// <summary>`terrainFeatures` 里那一项的类型名（没有则为 null）。</summary>
         [JsonPropertyName("feature")] public string Feature { get; set; }
@@ -1023,6 +1114,14 @@ namespace AgentFarm.Bridge
         /// 【硬要求】不许无界返回 —— 表可能有几千条，回执会撑爆 HTTP。
         /// </summary>
         [JsonPropertyName("limit")] public int? Limit { get; set; }
+
+        // ---- 【task-210】机器链的额外参数（`item` 复用上面的通用字段）----
+
+        /// <summary>
+        /// <c>machine</c> 专用动作：`"feed"`（把 <see cref="Item"/> 投进 <see cref="Tile"/> 的机器）
+        /// 或 `"collect"`（取机器的产物）。缺省/其它值 ⇒ `bad_args`（fail-closed，不许猜动作）。
+        /// </summary>
+        [JsonPropertyName("action")] public string Action { get; set; }
     }
 
     /// <summary>
@@ -1291,6 +1390,38 @@ namespace AgentFarm.Bridge
 
         /// <summary><c>add_missed_recipes</c> 专用：调用**后**三类集合的计数。【可选字段】</summary>
         [JsonPropertyName("afterCounts")] public Dictionary<string, int> AfterCounts { get; set; }
+
+        // ---- 【task-210】机器链回执（craft_item / place_object / machine）----
+        //
+        //  全部是**观测到的真值**，不是参数回显；判据在脑侧一律走观测差分，
+        //  这些字段只是让账本可审计（"到底造了什么、放在哪、投了什么、机器里现在是什么"）。
+
+        /// <summary><c>craft_item</c> 专用：实际命中的**已学会配方键**（规范大小写）。【可选字段】</summary>
+        [JsonPropertyName("recipe")] public string Recipe { get; set; }
+
+        /// <summary><c>craft_item</c> 专用：造出来的物品 qualifiedId（例 `(BC)114`）。【可选字段】</summary>
+        [JsonPropertyName("craftedQid")] public string CraftedQid { get; set; }
+
+        /// <summary><c>place_object</c> 专用：放下去的物体 qualifiedId。【可选字段】</summary>
+        [JsonPropertyName("objectQid")] public string ObjectQid { get; set; }
+
+        /// <summary><c>place_object</c> 专用：观测到"目标格上真的出现了这个物体"。【可选字段】</summary>
+        [JsonPropertyName("placed")] public bool? Placed { get; set; }
+
+        /// <summary><c>place_object</c> 专用：观测到"背包里那件恰好 −1"（游戏入口扣的，不是我们扣的）。【可选字段】</summary>
+        [JsonPropertyName("consumed")] public bool? Consumed { get; set; }
+
+        /// <summary><c>machine</c> 专用：`"feed"` / `"collect"`（回显本次动作，供账本）。【可选字段】</summary>
+        [JsonPropertyName("machineAction")] public string MachineAction { get; set; }
+
+        /// <summary><c>machine</c> 专用：动作**之后**机器里的东西（空 ⇒ null）。【可选字段】</summary>
+        [JsonPropertyName("heldObject")] public HeldObjectView HeldObject { get; set; }
+
+        /// <summary><c>machine</c> 专用：动作之后 `readyForHarvest.Value`。【可选字段】</summary>
+        [JsonPropertyName("machineReady")] public bool? MachineReady { get; set; }
+
+        /// <summary><c>machine</c> 专用：动作之后 `MinutesUntilReady`。【可选字段】</summary>
+        [JsonPropertyName("minutesUntilReady")] public int? MinutesUntilReady { get; set; }
     }
 
     /// <summary>
