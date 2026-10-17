@@ -236,3 +236,7 @@ $env:T185_ROOT="$PWD\scratch\_t192_pre"                        # 1246cdd^ = 3f3a
 ### 9.3 结论
 
 三条 delta 全部符合；pre→post 由 6 条通过升至 16 条通过，FAIL→PASS 证据齐。**不影响 §6 的 0.7.36 冻结判定（仍为"可以据此冻结"）。**
+
+### 9.4 冻结后的 hash 口径补注（口径差，非缺陷）
+
+`§1` 的 SHA256 读数取自 `3f3a5c0`（task-192 落地**前**）。task-192（`1246cdd`）改了 `brain/agentfarm/longrun.py` ⇒ 0.7.36 冻结提交 `7ad5f6b` 上该文件 SHA256 前 16 = **`C326DD1E1358EA15`**（本 §9 的探针读数即在此内容上取得）；其余五个文件与 §1 逐字一致（`farmwork.py FA6BD05CCAB9DF25`、`test_farmwork.py 7C503EC1AEB4CF9A`、`UseToolSkill.cs 0163D54BDE2ED462`、`Skills.cs 548E233BFC44BA27`、`Tests/Program.cs F2F280F292876F53`）。装机产物独立复核（只读）：`mod\AgentFarm.Bridge\bin\Release\AgentFarm.Bridge.dll` **202752 B**（SHA256 前 16 `D6699BD057C51CE7`）、`mod\AgentFarm.Bridge\manifest.json` **53261 B** / `"Version": "0.7.36"`、`brain/agentfarm/bridge.py` `MOD_VERSION_EXPECTED = "0.7.36"`（冻结提交 diff 逐行核过：`0.7.35` → `0.7.36`）。
