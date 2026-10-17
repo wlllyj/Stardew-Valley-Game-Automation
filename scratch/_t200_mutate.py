@@ -211,6 +211,28 @@ reg("m213c_rule_limit_ignored", "213", "?", "csharp",
       "            if (v > LimitMax) v = LimitMax;",
       "            if (v > LimitMax) v = LimitMax + 1;")],
     "规则层 limit 上限失效 ⇒ C# 自检 t213_limit_clamped 应变红（证明自检能杀规则层回归）")
+# ===== task-216（0.7.38 delta）：F3 放行 / 等待日留痕 / GAP-2 tier 判据 =====
+reg("m238a_no_pickup_early_return", "216", "?", "unittest:tests.test_longrun.TestTask216ToolUpgradeDeadlockAndJournal",
+    [("brain/agentfarm/longrun.py",
+      '        if action == "pickup":\n            return True',
+      '        if action == "pickup":\n            pass')],
+    "F3 放行①被去掉（pickup 又受紧急农活闸门）⇒ 至少 test_pickup_outranks_other_urgent_work 应变红")
+reg("m238b_no_skipped_journal", "216", "?", "unittest:tests.test_longrun.TestTask216ToolUpgradeDeadlockAndJournal",
+    [("brain/agentfarm/longrun.py",
+      '        if not self._tool_upgrade_due(obs):\n            if not self.tool_upgrade_skipped_noted:',
+      '        if False:\n            if not self.tool_upgrade_skipped_noted:')],
+    "通道⑤留痕被去掉（due=False 日不写 tool_upgrade_skipped）⇒ wait/need_slot 两条用例应变红")
+reg("m238c_tier_not_enforced", "216", "?", "csharp",
+    [("mod/AgentFarm.Bridge/ToolUpgradeRules.cs",
+      "if (offers[i].Tier != tierBefore + 1) continue;",
+      "if (false) continue;")],
+    "GAP-2：Select 的 tier==tierBefore+1 判据失效 ⇒ C# 自检 t205_wrong_tier_fails_closed 应变红")
+reg("m238d_urgent_ignores_suspended", "216", "?", "unittest:tests.test_longrun.TestTask216ToolUpgradeDeadlockAndJournal",
+    [("brain/agentfarm/longrun.py",
+      '        if "water_area" not in suspended:',
+      "        if True:                              # mutant: 忽略暂停阶段")
+     ],
+    "F3 放行②被去掉（紧急农活不再排除被在途工具暂停的阶段）⇒ test_urgent_farm_work_ignores_suspended_stages_but_keeps_ripe_crops 应变红")
 
 
 def sh(cmd: list[str], cwd: Path, env: dict[str, str] | None = None, timeout: int = 1800):
