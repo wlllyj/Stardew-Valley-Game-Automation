@@ -4,6 +4,8 @@
 > 诚实边界（**必须与结论一起写**）：本机制是「会话内记忆 + 提示词反馈」（每次调用留痕 + 夜间复盘 notes + 跨日教训库），**不是权重更新、不是在线训练**。没有下面的 A→B 对照证据，**不许**写"自我进化已实现"。
 
 ## 0. 设定（**2026-10-17 修订：A/B 都改到 0.7.32 同一构建**）
+
+> ⚠️ **本节已过时**：现行 A/B = **0.7.35 上的 A′/B′**（`logs\longrun-runA2-0735.jsonl` / `…runB2-0735.jsonl`，task-113 rev11）。下面 0.7.32 的具体路径/文件名只作历史记录；**§1 的五条判定与 §2 反混淆、§5 测量规则仍然有效**。
 - **run A = 累积轮 = `logs\longrun-runA.jsonl`**（**0.7.32**、5 天、`--days 5 --max-minutes 240 --max-days 12`）：跑完后把 `…-runA-lessons.json` **原样拷**成 `…-runB-lessons.json`（记拷贝时刻 + 两侧 SHA256）。
 - **A 的初始教训库允许"继承历史"**（本轮裁定）：可以把 run9d（0.7.31）的 `logs\longrun-3day-llm-run9d-lessons.json`（3712 B / SHA256 `2C4BA15FB…`，以实际台账为准）**原样复制**为 A 的初始库，理由 = 教训库本来就是跨日/跨轮持久的知识；**代价与纪律**：①A 与 B 必须是**同一份 0.7.32 构建**（sidecar 四要素逐字对齐，只有 journal 路径不同）；②复制时刻 + 两侧 SHA256 双向记账并写进 `docs\_runB-evidence.md` §1；③报告里如实写"库里有几条来自 run9d、几条是 A 自己新产出的"；④若用户要求"从零积累"，则 A 必须自己在 0.7.32 上跑到库非空（L0 只认"库非空"，不区分来源，但来源必须公开）。
 - **run B = 对照轮 = `logs\longrun-runB.jsonl`**（同 0.7.32、同 5 天、同存档线的下一段）：同一 Mod、同一 brain，**唯一差异 = 注入的教训/笔记/决策史**（路径由 `--journal` 自动推导，没有新增开关）；两份 sidecar 的 `argv` 必须逐字对齐（除 journal 路径）。
@@ -38,3 +40,10 @@
 ## 4. 与主目标的关系
 - 主目标（用户 2026-10-17 改定**目标 2**）以 **run A（0.7.32，5 天）的小尾巴连续 5 个游戏日 VERIFIED + 四腿 + 经济闭环** 为准；历史轮只作诊断：run9（0/3）、run9b（首个整天全绿但尾部 0/3）、run9c（诊断性 3/3，含假达标日）、run9d（0/5，落盘 8/8 但两条结构性病灶 ⇒ task-157/158 修）。演进（L0–L5）是**同一目标里的能力项**，仍**不得**用"学到教训"替代达标判定，也不得用达标替代演进证据。
 - 若 run A 达标而 run B 因世界条件退化而未达标，按 L4 如实记录，不掩盖、不重跑刷分（重跑必须写明是第几次、为什么）。
+
+## 5. 测量规则（**2026-10-17 task-184 真机复测后固化**）
+> 现行 A/B 已改到 **0.7.35 上的 A′/B′**（`logs\longrun-runA2-0735.jsonl` / `…runB2-0735.jsonl`，见 task-113 rev11）；上文 §0 的 0.7.32 行只作历史。**L0–L5 的判定逻辑不变**，但下面两条测量规则**必须遵守**：
+
+1. **`worldSeq` 不是成功信号（R3）**：真机实测 `interact` 路径收获成功时 `worldSeq 60→60`（**不推进**；Mod 回执也如实写 60→60），而 `use_tool` 一次挥动 `65→67`。⇒ **任何判据都不许拿 `worldSeq` 前进当"动作成功"的证据**。成功证据只认这四类：①目标格 `ready` 由 `true→false`（或 `readySource` 变化）；②背包**逐 qid 计数**增加（对得上 `affected_tiles` 的 gained）；③`farm.readyCrops` 下降；④对照观测的 `TileSig` 变化。**失败的判据也不许用 `worldSeq` 未动**（否则会把失败判成功或反之）。
+2. **回执 `ok` 仍不等于世界变了**（族里第三次教训）：`interact`/`use_tool` 都必须以「跨观测证据」为准（task-182 的 `acted`/`actedEvidence`，Mod 侧 `use_tool` 见 task-188 补齐）。报告中若出现「回执 ok 但世界未变」必须单列，不许并进成功计数。
+3. **落盘/跨日口径**：跨日 ≠ 落盘（有 `displayedShippedItems` 时 `ShippingMenu` 会推迟 `SaveGameMenu`）；六串配对（`Synchronizing 'NewDay'` / `before save` / `SaveGame.Save() called` / `Saving without compression` / `completed` / `after save, starting <day>`）**必须成组出现**，缺组即如实写【无法判定】，不许按"存档 mtime 没变"直接判失败或通过。
