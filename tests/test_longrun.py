@@ -9392,5 +9392,191 @@ class TestTask168ScopeShed(unittest.TestCase):
         self.assertEqual(len(self._events(run, "scope_released")), 1)
 
 
+class TestTask192ScopeReleaseAccounting(unittest.TestCase):
+    """【task-192】释放认输区必须**同步扣减当天的认输记账**（`day_end.scope_shed*` = 日终末态）。
+
+    病灶（deputy task-185 NIT-1，`docs/_review-task168.md`，commit bd50814）：`_release_zone`
+    只写 `scope_released{zone,reason,tiles}`，不重置 `self.scope_shed_tiles_today`、也不更新
+    `rep.scope_shed` ⇒ `day_end.scope_shed_tiles` 记的是"今天曾经认输过多少格"。于是雨天
+    「先认输 → 雨把该区浇好 → 释放 → 当天其余活全做完」这种**诚实日**，末态仍挂
+    `scope_shed_tiles>0`，被 `tools/verify-run3.py` 按「scope_shed − scope_released 净额」判 problem。
+
+    本类盯四件事：
+      * 释放 ⇒ 当天记账扣掉该区**释放时仍持有**的格数（下限 0）、`rep.scope_shed` 同步到末态；
+      * `scope_released` 保持 `zone/reason/tiles`（工具侧对账口径）+ 新增 `shed_tiles_remaining`；
+      * 跨天：昨天认输的区今天释放时**不许**把今天的记账扣成负数（今天本来就没认输过）；
+      * 护栏不放宽：本 run 累计量 `shed_ever_tiles` 释放**不清** ⇒ 「认输→释放→再认输」仍被
+        34% 上界拦住，且该量随 `<journal>-scope.json` 跨进程回来。
+
+    变异实测（`scratch/_t192_mutate.py`，brain+tests 拷临时目录，跑完已删；基线 6/6 绿）：
+      * m192a（`_release_zone` 不扣 `scope_shed_tiles_today`）杀 **5**：
+        `test_partial_release_keeps_the_remainder` /
+        `test_release_clears_the_days_shed_accounting` /
+        `test_release_refuses_a_second_shed_same_day` /
+        `test_released_zone_still_counts_against_the_cumulative_cap` /
+        `test_shed_ever_survives_release_and_restart`（末态还挂着"曾认输"的格数）；
+      * m192b（释放时把累计量 `shed_ever_tiles` 一起清）杀 **3**：
+        `test_release_clears_the_days_shed_accounting` /
+        `test_released_zone_still_counts_against_the_cumulative_cap` /
+        `test_shed_ever_survives_release_and_restart`（"认输→释放→再认输"绕过 34% 上界）；
+      * m192c（`scope_released` 丢掉 `shed_tiles_remaining`）杀 **3**：
+        `test_partial_release_keeps_the_remainder` /
+        `test_release_clears_the_days_shed_accounting` /
+        `test_yesterday_shed_is_not_charged_to_today`（工具侧人读/对账面）。
+    """
+
+    _events = staticmethod(TestTask168ScopeShed._events)
+    _plot = staticmethod(TestTask168ScopeShed._plot)
+    _rep = staticmethod(TestTask168ScopeShed._rep)
+    _world = staticmethod(TestTask168ScopeShed._world)
+    _run_with = TestTask168ScopeShed._run_with
+
+    def _shed(self, run, obs, rep) -> tuple[str, int]:
+        """真认输一个区（走六步护栏），返回 `(zone, 认输格数)`。"""
+        zone = run._zones(obs)[0].name
+        self.assertTrue(run._shed_scope(zone, obs, rep))
+        return zone, len(run.shed_zone_tiles[zone])
+
+    @staticmethod
+    def _water_everything(w: FakeWorld) -> dict:
+        """把窗口里所有活苗标成已浇 ⇒ 该区"收敛"（释放条件）。"""
+        w.crops = {t: dict(c, watered=True) for t, c in w.crops.items()}
+        return w.obs()
+
+    def test_release_clears_the_days_shed_accounting(self):
+        w = self._world()                      # dry=150 ⇒ deficit>0，会认输
+        run = self._run_with(w)
+        obs = w.obs()
+        rep = self._rep()
+        zone, shed_n = self._shed(run, obs, rep)
+        self.assertGreater(shed_n, 0)
+        self.assertEqual(rep.scope_shed_tiles, shed_n)
+        self.assertEqual(rep.scope_shed.get("zone"), zone)
+
+        obs2 = self._water_everything(w)       # 雨把该区浇好了 ⇒ 释放
+        run._release_scope_if_converged(obs2, rep)
+        self.assertEqual(rep.scope_shed_tiles, 0)          # 日终末态：没有区还处于认输态
+        self.assertEqual(rep.scope_shed, {})
+        self.assertEqual(run.scope_shed_tiles_today, 0)
+        self.assertEqual(run.shed_zones, {})
+        self.assertEqual(run.shed_zone_tiles, {})
+        rel = self._events(run, "scope_released")
+        self.assertEqual(len(rel), 1)
+        # 工具侧口径：`tiles` = 本次释放格数（毛），`shed_tiles_remaining` = 当天记账余额
+        self.assertEqual(rel[0]["zone"], zone)
+        self.assertTrue(str(rel[0]["reason"]))
+        self.assertEqual(rel[0]["tiles"], shed_n)
+        self.assertEqual(rel[0]["shed_tiles_remaining"], 0)
+        # 累计量**不**因释放而清（34% 上界的依据）
+        self.assertEqual(run.shed_ever_tiles.get(zone), shed_n)
+
+    def test_partial_release_keeps_the_remainder(self):
+        """6 格认输 → 释放时只持有 2 格（其余已被收获摘掉）⇒ 当天记账剩 4。"""
+        w = self._world(watered=True)          # 该区已收敛 ⇒ 直接走释放
+        run = self._run_with(w)
+        obs = w.obs()
+        rep = self._rep()
+        zone = run._zones(obs)[0].name
+        tiles = sorted(run._zone_observed_tiles(zone, obs))
+        self.assertGreaterEqual(len(tiles), 3)
+        shed_n = len(tiles)
+        run.shed_zones = {zone: {"since_day": [1, "spring", 8], "tiles": shed_n,
+                                 "live_crops_at_shed": shed_n, "reason": "昨天浇不完"}}
+        run.shed_zone_tiles = {zone: set(tiles)}
+        run.shed_ever_tiles = {zone: shed_n}
+        run.scope_shed_tiles_today = shed_n
+        rep.scope_shed = {"zone": zone, "tiles": shed_n, "reason": "昨天浇不完"}
+        rep.scope_shed_tiles = shed_n
+        run.shed_zone_tiles[zone] = set(tiles[:2])   # 其余 4 格被收获/清掉，已不在认输态
+
+        run._release_scope_if_converged(obs, rep)
+        self.assertEqual(rep.scope_shed_tiles, shed_n - 2)
+        self.assertEqual(rep.scope_shed.get("tiles"), shed_n - 2)
+        rel = self._events(run, "scope_released")[0]
+        self.assertEqual(rel["tiles"], 2)
+        self.assertEqual(rel["shed_tiles_remaining"], shed_n - 2)
+
+    def test_yesterday_shed_is_not_charged_to_today(self):
+        """昨天认输的区今天释放：今天没认输过 ⇒ 末态 0（不许扣成负数）。"""
+        w = self._world(watered=True)
+        run = self._run_with(w)
+        obs = w.obs()
+        rep = self._rep()
+        zone = run._zones(obs)[0].name
+        tiles = sorted(run._zone_observed_tiles(zone, obs))
+        run.shed_zones = {zone: {"since_day": [1, "spring", 7], "tiles": len(tiles),
+                                 "live_crops_at_shed": len(tiles), "reason": "前天浇不完"}}
+        run.shed_zone_tiles = {zone: set(tiles)}
+        run.shed_ever_tiles = {zone: len(tiles)}
+        self.assertEqual(run.scope_shed_tiles_today, 0)      # 今天还没认输过
+        self.assertEqual(rep.scope_shed, {})
+
+        run._release_scope_if_converged(obs, rep)
+        self.assertEqual(rep.scope_shed_tiles, 0)
+        self.assertEqual(rep.scope_shed, {})
+        self.assertEqual(run.scope_shed_tiles_today, 0)      # 下限 0：无负数
+        self.assertEqual(self._events(run, "scope_released")[0]["shed_tiles_remaining"], 0)
+
+    def test_release_refuses_a_second_shed_same_day(self):
+        """护栏不放宽：释放之后当天仍不许对同一区再次认输（`already_today`）。"""
+        w = self._world()
+        run = self._run_with(w)
+        obs = w.obs()
+        rep = self._rep()
+        zone, _n = self._shed(run, obs, rep)
+        obs2 = self._water_everything(w)
+        run._release_scope_if_converged(obs2, rep)
+        self.assertEqual(rep.scope_shed_tiles, 0)
+        self.assertTrue(run.scope_shed_today)                # 释放**不**重置"今天认输过"
+        self.assertFalse(run._shed_scope(zone, obs2, self._rep()))
+        self.assertIn("already_today",
+                      [e["reason"] for e in self._events(run, "scope_shed_refused")])
+
+    def test_released_zone_still_counts_against_the_cumulative_cap(self):
+        """护栏不放宽：释放过的区仍占 34% 累计额度 ⇒ 换区再认输被 `cap` 拦住。"""
+        w = self._world()
+        run = self._run_with(w)
+        obs = w.obs()
+        rep = self._rep()
+        zone, shed_n = self._shed(run, obs, rep)
+        obs2 = self._water_everything(w)
+        run._release_scope_if_converged(obs2, rep)
+        self.assertEqual(rep.scope_shed_tiles, 0)
+        # 同一进程内重置"每日"护栏 = 跨到新的一天（`shed_ever_tiles` 每日**不**重置）
+        run.scope_shed_today = False
+        run.scope_shed_tiles_today = 0
+        other = [z.name for z in run._zones(obs2) if z.name != zone][0]
+        self.assertFalse(run._shed_scope(other, obs2, self._rep()))
+        refused = [e for e in self._events(run, "scope_shed_refused") if e.get("reason") == "cap"]
+        self.assertEqual(len(refused), 1)
+        self.assertGreaterEqual(refused[0]["shed_tiles"], shed_n)
+        self.assertGreaterEqual(run.shed_ever_tiles.get(zone, 0), shed_n)
+
+    def test_shed_ever_survives_release_and_restart(self):
+        """释放会 flush 一次 ⇒ `shed_ever`（本 run 累计）必须随文件跨进程回来。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            jp = str(Path(tmp) / "run.jsonl")
+            w = self._world()
+            run = self._run_with(w, journal_path=jp)
+            self.assertIsNotNone(run.scope_path)
+            obs = w.obs()
+            rep = self._rep()
+            zone, shed_n = self._shed(run, obs, rep)
+            obs2 = self._water_everything(w)
+            run._release_scope_if_converged(obs2, rep)
+            self.assertEqual(rep.scope_shed_tiles, 0)
+            raw = json.loads(Path(run.scope_path).read_text(encoding="utf-8"))
+            self.assertEqual(raw.get("zones"), {})           # 释放后当前认输集为空
+            self.assertEqual(raw.get("shed_ever"), {zone: shed_n})
+
+            run2 = self._run_with(self._world(), journal_path=jp)
+            run2._scope_load()
+            self.assertGreaterEqual(run2.shed_ever_tiles.get(zone, 0), shed_n)
+            loaded = self._events(run2, "scope_loaded")
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0]["shed_ever_total"],
+                             sum(run2.shed_ever_tiles.values()))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

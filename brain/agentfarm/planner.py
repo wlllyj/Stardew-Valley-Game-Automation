@@ -1004,6 +1004,11 @@ def load_scope_file(path: Any,
     schema 不符 / JSON 坏 / 条目字段类型错 ⇒ **整份丢弃**并把原因回填 `report["reason"]`
     （调用方记 `scope_rejected` 后照常跑）。
 
+    【task-192】可选的 `shed_ever`（本 run **曾经**认输过的每区格数）不随返回值走，而是回填
+    `report["shed_ever"]`：释放会把区从 `zones` 里摘掉，只看 `zones` 的话"认输→释放→再认输"
+    就能绕过累计 34% 上界 ⇒ 这一份累计量必须单独持久化。它不合法时**整份拒收**（`bad_shed_ever`），
+    与其它字段同一纪律；旧文件没这个键 ⇒ `report["shed_ever"]` 为 `{}`，调用方按当前认输集兜底。
+
     【信任边界（照 `load_lessons_file`）】这是磁盘上的外部文件：**绝不让它决定判定**。
     只用来"跨日记住今天主动放弃了哪个区"，任何一处不合 schema 就整份不认 —— 宁可当天重新
     评估（可能又认输一次、如实留痕），也不拿一个可疑文件当免罚依据。
@@ -1075,17 +1080,34 @@ def load_scope_file(path: Any,
         out[name] = {"since_day": item.get("since_day"), "tiles": tiles,
                      "live_crops_at_shed": live, "reason": reason,
                      "tile_list": tuple(tile_list)}
+    ever_raw = raw.get("shed_ever")
+    if ever_raw is not None:
+        if not isinstance(ever_raw, Mapping):
+            if report is not None:
+                report["reason"] = "bad_shed_ever"
+            return {}
+        for name, count in ever_raw.items():
+            if (not isinstance(name, str) or not name
+                    or not isinstance(count, int) or isinstance(count, bool) or count < 0):
+                if report is not None:
+                    report["reason"] = "bad_shed_ever"
+                return {}
     if report is not None:
         report["zones"] = len(out)
+        report["shed_ever"] = dict(ever_raw) if isinstance(ever_raw, Mapping) else {}
     return out
 
 
 def save_scope_file(path: Any, zones: Mapping[str, Mapping[str, Any]], *,
-                    journal_stem: str = "", report: dict[str, Any] | None = None) -> str:
+                    journal_stem: str = "", report: dict[str, Any] | None = None,
+                    ever: Mapping[str, Any] | None = None) -> str:
     """原子写规模取舍记录（task-168）。**绝不抛**：成功 ⇒ `""`，失败 ⇒ 原因串。
 
     先写 `.tmp` 再 `replace`（与 `save_lessons_file` 同一纪律）：中途崩掉不会留下半截 JSON
     —— 半截文件下次会被 `load_scope_file` 整份拒收，等于把"主动放弃"的记忆静默清空。
+
+    `ever`（【task-192】本 run 曾经认输过的每区格数）随文件一起落盘：释放会把区从 `zones`
+    里摘掉，但累计 34% 上界必须记住它，否则"认输 → 释放 → 再认输"就能无限认输。
     """
     payload: dict[str, Any] = {"schema": SCOPE_SCHEMA, "journal": str(journal_stem or "")}
     clean: dict[str, dict[str, Any]] = {}
@@ -1101,8 +1123,18 @@ def save_scope_file(path: Any, zones: Mapping[str, Mapping[str, Any]], *,
                           if isinstance(t, (list, tuple)) and len(t) == 2],
         }
     payload["zones"] = clean
+    ever_clean: dict[str, int] = {}
+    for name, count in (ever or {}).items():
+        try:
+            n = int(count)
+        except Exception:  # noqa: BLE001 - 坏条目就丢掉这一条，不影响落盘
+            continue
+        if isinstance(name, str) and name and n >= 0:
+            ever_clean[name] = n
+    payload["shed_ever"] = ever_clean
     if report is not None:
         report["written"] = len(clean)
+        report["ever"] = len(ever_clean)
     try:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)

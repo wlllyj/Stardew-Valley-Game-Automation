@@ -500,7 +500,10 @@ class DayReport:
     stamina_calibration: dict[str, Any] = field(default_factory=dict)
     #: 【task-168】当天**主动认输**的田区（`scope_shed` journal 的同名快照）：
     #: `{zone: {"since_day","tiles","live_crops_at_shed","reason"}}`；`scope_shed_tiles` 是当天
-    #: 认输的格数合计。**只作 info**：不新增 `checks` 键、不扣 `plot_pending`/`assigned_undone`
+    #: 认输的格数合计。**【task-192】语义 = 日终末态**："日终仍处于认输态多少格"，不是"今天曾经
+    #: 认输过多少格" —— 被释放的区在 `_release_zone` 里扣减（`scope_released` 记释放动作；本 run
+    #: 累计量在 `<journal>-scope.json` 的 `shed_ever`，34% 上界看它、释放不清）。
+    #: **只作 info**：不新增 `checks` 键、不扣 `plot_pending`/`assigned_undone`
     #: （认输格仍算未完成 ⇒ 当天如实不 VERIFIED）。
     scope_shed: dict[str, Any] = field(default_factory=dict)
     scope_shed_tiles: int = 0
@@ -752,6 +755,11 @@ class LongRun:
         self.shed_zones: dict[str, dict[str, Any]] = {}
         #: 认输区里"放弃时点"的格坐标 → 目标池/守卫按它剔除（不靠重算窗口，防窗口漂移）。
         self.shed_zone_tiles: dict[str, set[tuple[int, int]]] = {}
+        #: 【task-192】**本 run 曾经**认输过的每区格数（区被释放也**不**清、每日**不**重置）
+        #: —— 34% 累计上界的真正依据。只看 `shed_zones`（当前认输集）的话，
+        #: "认输 → 释放 → 再认输"就能把上界洗回 0，等于给自己发永久免罚额度。
+        #: 随 `<journal>-scope.json` 的 `shed_ever` 持久化，换 run 不继承（与教训库同纪律）。
+        self.shed_ever_tiles: dict[str, int] = {}
         self.scope_loaded = False
         #: 当天是否已认输过一个区 / 当天认输的格数 / 当天是否已因超上界被拒（journal 去重）。
         self.scope_shed_today = False
@@ -1023,6 +1031,16 @@ class LongRun:
             # "整 run 累计 ≤ 农场可作业格 34%"立刻归零（deputy 实测：文件自述 50、载入后 0）。
             loaded = {tuple(t) for t in (item.get("tile_list") or ()) if len(tuple(t)) == 2}
             self.shed_zone_tiles[name] = loaded
+        # 【task-192】累计量单独灌回：`shed_ever` 记住"曾经认输过"的区（含已释放的），
+        # 34% 上界靠它而不是"当前认输集"。旧文件（task-192 之前）没有这个键 ⇒ 用当前认输集
+        # 的格数当**下界**兜底（宁可从严；绝不因为缺字段就放宽上界）。
+        ever = report.get("shed_ever") if isinstance(report, dict) else None
+        if not isinstance(ever, Mapping) or not ever:
+            ever = {name: int(item.get("tiles") or 0) for name, item in self.shed_zones.items()}
+        for name, count in ever.items():
+            key = str(name)
+            self.shed_ever_tiles[key] = max(int(self.shed_ever_tiles.get(key) or 0),
+                                            max(0, int(count)))
         reason = str(report.get("reason") or "")
         if reason:
             self._journal("scope_rejected", path=str(self.scope_path), reason=reason,
@@ -1031,8 +1049,10 @@ class LongRun:
         self._journal("scope_loaded", path=str(self.scope_path), zones=sorted(self.shed_zones),
                       tiles_total=loaded_total,
                       tile_counts={k: len(v) for k, v in sorted(self.shed_zone_tiles.items())},
+                      shed_ever_total=sum(int(v) for v in self.shed_ever_tiles.values()),
                       note="跨日粘住的认输片区（只影响目标池/守卫理由，不影响任何 checks）；"
-                           "tiles_total 是对账用的载入格数")
+                           "tiles_total 是当前认输集的对账格数、shed_ever_total 是本 run 累计"
+                           "（含已释放区，34% 上界看的是它）")
 
     def _scope_flush(self, rep: DayReport) -> None:
         """把当前认输记录写回 `<journal>-scope.json`（原子写）。失败只留痕，绝不影响当天。"""
@@ -1048,13 +1068,14 @@ class LongRun:
             zones_out[name] = row
         err = save_scope_file(self.scope_path, zones_out,
                               journal_stem=(self.journal_path.stem if self.journal_path else ""),
-                              report=report)
+                              report=report, ever=self.shed_ever_tiles)
         if err:
             self._journal("scope_save_failed", path=str(self.scope_path), error=err,
                           note="认输记录写不进去 ⇒ 只影响跨日记忆，不影响今天的判定")
         else:
             self._journal("scope_saved", path=str(self.scope_path), zones=len(self.shed_zones),
-                          written=int(report.get("written") or 0))
+                          written=int(report.get("written") or 0),
+                          shed_ever_total=sum(int(v) for v in self.shed_ever_tiles.values()))
 
     def _shed_tile_set(self) -> set[tuple[int, int]]:
         """所有认输片区里"放弃掉的格子"的并集（目标池/守卫理由按它剔除；`_leftover` 不动）。"""
@@ -1152,11 +1173,39 @@ class LongRun:
 
     def _release_zone(self, zone_name: str, reason: str, rep: DayReport, *,
                       live: int | None = None) -> None:
+        """【task-168 释放 / task-192 记账】撤销一个认输区。
+
+        `day_end.scope_shed_tiles` / `scope_shed` 的语义是**日终末态**（"日终仍处于认输态
+        多少格"），不是"今天曾经认输过多少格"：雨天「先认输 → 雨浇好 → 释放 → 其余活做完」
+        是诚实日，若末态还挂着 `scope_shed_tiles>0`，`tools/verify-run3.py` 会误判成
+        needs_review。所以释放必须把该区**释放时仍持有**的格数从当天记账里扣掉
+        （被 `_harvest_zone` 摘掉的格本来就已经不在认输态里，天然不计）。
+
+        `shed_ever_tiles`（本 run 累计）**不**因释放而清 —— 那是 34% 上界的依据，
+        否则"认输 → 释放 → 再认输"能无限认输。`scope_released.tiles` 仍按工具侧口径
+        = 本次释放的格数（毛），另加 `shed_tiles_remaining` 便于人读。
+        """
         item = self.shed_zones.pop(zone_name, {}) or {}
-        tiles = len(self.shed_zone_tiles.pop(zone_name, set()) or ())
+        held = self.shed_zone_tiles.pop(zone_name, set()) or set()
+        # 释放量优先用"释放时仍持有的格清单"；旧文件只有计数（没有 tile_list）时退回 `item["tiles"]`。
+        tiles = len(held) or int(item.get("tiles") or 0)
+        if tiles:
+            self.scope_shed_tiles_today = max(0, int(self.scope_shed_tiles_today) - int(tiles))
+        rep.scope_shed_tiles = int(self.scope_shed_tiles_today)
+        if str(rep.scope_shed.get("zone") or "") == zone_name:
+            left = max(0, int(rep.scope_shed.get("tiles") or 0) - int(tiles))
+            if left:
+                rep.scope_shed["tiles"] = left
+                rep.scope_shed["released_tiles"] = (int(rep.scope_shed.get("released_tiles") or 0)
+                                                    + int(tiles))
+            else:
+                rep.scope_shed = {}
         self._journal("scope_released", zone=zone_name, reason=reason, tiles=tiles,
-                      live_crops_now=live,
-                      note="认输撤销（粘但可释放）⇒ 该区重新进目标池与守卫理由")
+                      live_crops_now=live, shed_tiles_remaining=int(self.scope_shed_tiles_today),
+                      note="认输撤销（粘但可释放）⇒ 该区重新进目标池与守卫理由；`tiles` = 本次"
+                           "释放格数（工具侧按『毛−释放=净』对账），`shed_tiles_remaining` = 当天"
+                           "认输记账余额。`day_end.scope_shed*` 记的是日终末态；本 run 累计量在"
+                           "`<journal>-scope.json` 的 `shed_ever`（释放不清 ⇒ 上界不放宽）")
         rep.notes.append(f"撤销认输：{zone_name}（{reason}）")
         self._scope_flush(rep)
 
@@ -1227,9 +1276,11 @@ class LongRun:
                           note="该区在观测里一格都看不见 ⇒ 判不了，不认输")
             return False
         # 累计上界：农场里"可作业格"总数（观测口径）——拿不到就不认输（宁可不做，也不越界）。
+        # 【task-192】`already` 取**本 run 曾经认输过**的累计格数（含已释放的区）：
+        # 只看当前认输集的话，"认输 → 释放 → 再认输"能把上界洗回 0（护栏不放宽）。
         farm_workable = len(self._farm_workable_tiles(obs))
         cap_tiles = int(max(0.0, SCOPE_SHED_MAX_FRACTION * farm_workable))
-        already = sum(int(z.get("tiles") or 0) for z in self.shed_zones.values())
+        already = sum(int(v) for v in self.shed_ever_tiles.values())
         if cap_tiles <= 0 or already + len(tiles) > cap_tiles:
             if not self.scope_cap_refused_today:
                 self.scope_cap_refused_today = True
@@ -1250,6 +1301,10 @@ class LongRun:
             "reason": reason,
         }
         self.shed_zone_tiles[zone_name] = set(tiles)
+        # 【task-192】累计量：本 run 曾经认输过的格数（释放/每日重置都不清）⇒ 34% 上界不因
+        # "认输 → 释放 → 再认输"而放宽（取 `max`：同一区重复认输只记它最大的一次占用）。
+        self.shed_ever_tiles[zone_name] = max(int(self.shed_ever_tiles.get(zone_name) or 0),
+                                              len(tiles))
         self.scope_shed_today = True
         self.scope_shed_tiles_today += len(tiles)
         # 【task-168】`day_end.scope_shed{zone,tiles,reason}`：只记**今天那一次**认输
