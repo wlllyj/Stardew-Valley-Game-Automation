@@ -56,4 +56,24 @@ task-177 在 0.7.34 上对固定样本 `(60,29)` 复测，**排掉了三个混�
 
 ## 5. 执行记录（逐步追加）
 
-- 待填。
+### 5.1 冻结（2026-10-17）
+
+- note：`tools\_note-0735.txt`（首串 `v0.7.35`；含 task-182 的 Mod 三条 + task-181 脑侧 + task-168 规模取舍）。
+- `python tools\_bump-mod-version.py 0.7.35 --note-file tools\_note-0735.txt` ⇒ manifest `0.7.34 → 0.7.35`。
+- `brain/agentfarm/bridge.py:39` ⇒ `MOD_VERSION_EXPECTED = "0.7.35"`（注释补 v0.7.35 四条；v0.7.34 及更早标为历史）。
+- `dotnet build .\mod\AgentFarm.Bridge\AgentFarm.Bridge.csproj -c Release --nologo --no-incremental` ⇒ **0 警告 0 错误**；dll **199168 B** / manifest **51090 B**。
+- 冻结提交 **`630e594`**；`python tools\check-release.py --expect 0.7.35` ⇒ **六项全绿**（`Ran 945 tests / OK`、工作树干净）。
+- 本批还含 Lead 侧工具改动：`tools\verify-run3.py` 补 `scope_shed` 口径核对（账本 `scope_shed_tiles` vs journal `scope_shed` 逐条对账；「认输却自称 VERIFIED」= 硬矛盾；`scope_shed` 快照缺失 ⇒ problem）+ 4 条单测（`Ran 69 tests / OK`），旧账本矩阵 rc 不变。
+
+### 5.2 装机与基线（2026-10-17）
+
+- `python tools\deploy-mod.py --no-quit` ⇒ **0.7.34 → 0.7.35**（dll 199168 / manifest 51090），桥 `modVersion=0.7.35 port=17890`，自动读档 `Wahaha_450799035`（FarmHouse (9,9)）。
+- `python -m agentfarm goto Farm` ⇒ ok，`hop1 source=[3,12] landing=[64,15]` **7623ms**。
+- `python tools\preflight.py --expect 0.7.35 --save-baseline logs\run10c-baseline.json` ⇒ **✅ 可以起跑**。
+- 基线读数：第1年 **秋12日 06:00 rain** / `Farm(64,15)` / 体力 **247.2/270** / 钱 **0g** / 种子 `Wheat Seeds ×1` / `crops 102` / `unwateredCrops 2` / `dryCrops 0` / `farmScanSeq 9` / `waterLeft 27` / `tillableCount 120` / `tileCount 400 truncated` / 无模态 / `worldAdvancing true`。**无操作员预置**。
+- 五文件指纹（A′ 起跑前锚）：`longrun.py D5F8F98D16AC8451…`、`farmwork.py E89DBB3C78DFFF12…`、`bridge.py 3FAEBC363BF92D4E…`、`dll 5925F3660AB5613E…`、`manifest 24877328542B956C…`。
+
+### 5.3 放行（2026-10-17）
+
+- **task-184**（0.7.35 同格复测 `(60,29)` + Scythe 对照格多格 loot）已派 machine-runner（rev3, in_progress）。
+- 后续链：task-184 PASS ⇒ **task-113 A′/B′**（5 日长跑 ×2、字节拷贝教训库、argv 只差 `--journal`）⇒ 三向验收 + L0–L5。
