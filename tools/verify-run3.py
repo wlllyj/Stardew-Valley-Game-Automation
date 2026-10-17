@@ -446,14 +446,20 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
     # `docs/_analyze-longrun-caliber.md` §3.29）。旧账本（task-168 之前）没有该字段也没有该事件
     # ⇒ 两边都缺时**不表态**（缺失≠通过，但也不许因此把历史账本翻红）。
     shed_by_day: dict[tuple[str, Any], list[dict[str, Any]]] = {}
+    released_by_day: dict[tuple[str, Any], list[dict[str, Any]]] = {}
     _cur_key4: tuple[str, Any] | None = None
     for r in rows:
         if r.get("event") == "day_start":
             _cur_key4 = (day_key(r), r.get("_lineno"))
             continue
-        if _cur_key4 is None or r.get("event") != "scope_shed":
+        if _cur_key4 is None:
             continue
-        shed_by_day.setdefault(_cur_key4, []).append(r)
+        _ev4 = r.get("event")
+        if _ev4 == "scope_shed":
+            shed_by_day.setdefault(_cur_key4, []).append(r)
+        elif _ev4 == "scope_released":
+            # 释放（`_release_zone`）：该区当天已不再认输 ⇒ 末态认输量要扣掉它。
+            released_by_day.setdefault(_cur_key4, []).append(r)
 
     # 0. 时间轴自洽（deputy-lead `docs/_verify-run3-limits.md` 盲区 B2）：t 回退只记信息项。
     #    理由：t 是 longrun 自己的 time.time() 读数，系统时钟回拨（NTP）会让真长跑也"回退"，
@@ -767,30 +773,43 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
         # VERIFIED ⇒ 自相矛盾（认输格仍留在会计里、当天如实不 VERIFIED）。
         shed_events = shed_by_day.get(sess) or []
         shed_self_tiles = sum(int(e.get("tiles") or 0) for e in shed_events)
+        # 释放口径（deputy-lead `docs/_review-task168.md` NIT-1，Lead 2026-10-17）：`_release_zone`
+        # 释放该区后，认输格回到会计里 ⇒ 末态认输量 = 认输 − 释放。`day_end.scope_shed_tiles`
+        # 记的是**末态**，所以对账要用净值；只用毛值会把「先认输、下雨后浇好并释放」的诚实日误判。
+        released_events = released_by_day.get(sess) or []
+        released_tiles = sum(int(e.get("tiles") or 0) for e in released_events)
+        shed_net_tiles = max(0, shed_self_tiles - released_tiles)
         shed_field_raw = end_stats.get("scope_shed_tiles")
         shed_field = int(shed_field_raw) if isinstance(shed_field_raw, (int, float)) else None
         shed_snapshot = end_stats.get("scope_shed")
-        if shed_field is None and shed_self_tiles:
+        if shed_field is None and shed_net_tiles:
             problems.append(
-                f"[{name}] journal 里有 {len(shed_events)} 次 scope_shed（共 {shed_self_tiles} 格）"
-                "而账本没写 scope_shed_tiles ⇒ 账目不可信（缺失 ≠ 通过）"
+                f"[{name}] journal 里有 {len(shed_events)} 次 scope_shed（毛 {shed_self_tiles} 格，"
+                f"扣释放 {released_tiles} 格后净 {shed_net_tiles} 格）而账本没写 scope_shed_tiles"
+                " ⇒ 账目不可信（缺失 ≠ 通过）"
             )
         elif shed_field is not None:
-            if shed_self_tiles != shed_field:
+            if shed_net_tiles != shed_field:
                 problems.append(
-                    f"[{name}] scope_shed 自述 {shed_field} 格 vs journal 自算 {shed_self_tiles} 格"
-                    "（认输量对不上 ⇒ 账目不可信）"
+                    f"[{name}] scope_shed 自述 {shed_field} 格 vs journal 自算净 {shed_net_tiles} 格"
+                    f"（认输毛 {shed_self_tiles} 格 − 释放 {released_tiles} 格；认输量对不上 ⇒ 账目不可信）"
                 )
             if shed_field:
                 zones = "、".join(sorted({str(e.get("zone") or "?") for e in shed_events})) or "（journal 未记区名）"
                 snap = "有" if isinstance(shed_snapshot, dict) and shed_snapshot else "缺失"
+                rel_note = f"；当天释放 {released_tiles} 格（{len(released_events)} 次）" if released_events else ""
                 infos.append(
                     f"[{name}] 规模取舍：主动认输 {shed_field} 格（{zones}）—— 只作 info"
-                    f"（认输格仍留在会计里、当天如实不 VERIFIED）；day_end.scope_shed 快照={snap}"
+                    f"（认输格仍留在会计里、当天如实不 VERIFIED）{rel_note}；day_end.scope_shed 快照={snap}"
                 )
-                if d["verified"] is True:
+                if d["verified"] is True and not released_events:
                     problems.append(
                         f"[{name}] 认输 {shed_field} 格却自称 VERIFIED（scope_shed 与 verified 自相矛盾）"
+                    )
+                if d["verified"] is True and released_events:
+                    infos.append(
+                        f"[{name}] 认输后又释放（毛 {shed_self_tiles} 格 → 净 {shed_field} 格）且自称 VERIFIED"
+                        "（释放后格数回到会计里、若仍自洽则允许，只作 info）"
                     )
                 if checks.get("watered_outdoor") is True:
                     infos.append(

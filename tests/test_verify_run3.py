@@ -1129,5 +1129,36 @@ class TestVerifyRun3(unittest.TestCase):
         self.assertFalse(any("scope_shed" in p for p in s["problems"]), s["problems"])
 
 
+    def _shed_released_rows(self, *, tiles=6, released=6, zone="field_ne",
+                            ledger_tiles=None, verified=True):
+        """认输后又释放：journal 有 `scope_shed` + `scope_released`；账本写**末态**净格数。"""
+        rows = self._shed_rows(tiles=tiles, zone=zone, write_field=False, verified=verified)
+        rows.insert(2, {"event": "scope_released", "t": 60.0, "zone": zone,
+                        "reason": "下雨把该区浇好了", "tiles": released, "_lineno": 1})
+        end = next(r for r in rows if r.get("event") == "day_end")
+        net = tiles if ledger_tiles is None else ledger_tiles
+        end["scope_shed_tiles"] = net
+        if net:
+            end["scope_shed"] = {zone: {"tiles": net, "since_day": [1, "spring", 10]}}
+        return rows
+
+    def test_shed_then_released_same_day_is_not_flagged(self):
+        """认输 6 格后当天又释放 6 格（末态 0）且自称 VERIFIED ⇒ 不算矛盾（NIT-1 回归）。"""
+        rows = self._shed_released_rows(tiles=6, released=6, ledger_tiles=0, verified=True)
+        ok, s = self.check(rows, days=0)
+        self.assertFalse(any("scope_shed" in p for p in s["problems"]), s["problems"])
+
+    def test_partial_release_is_checked_against_net(self):
+        """部分释放：账本必须写净格数（6−2=4）；写成毛格数 6 ⇒ 账目不可信。"""
+        good = self._shed_released_rows(tiles=6, released=2, ledger_tiles=4, verified=False)
+        ok, s = self.check(good, days=0)
+        self.assertFalse(any("scope_shed" in p for p in s["problems"]), s["problems"])
+        bad = self._shed_released_rows(tiles=6, released=2, ledger_tiles=6, verified=False)
+        ok, s = self.check(bad, days=0)
+        self.assertTrue(
+            any("scope_shed" in p and "自算净 4 格" in p for p in s["problems"]), s["problems"]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
