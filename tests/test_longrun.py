@@ -10309,5 +10309,132 @@ class TestTask205ToolUpgradePlan(unittest.TestCase):
         self.assertIsNone(w.being_upgraded)
 
 
+class TestTask216ToolUpgradeDeadlockAndJournal(unittest.TestCase):
+    """【task-216】task-205 的两条运行级缺陷（deputy task-206，`docs/_review-task205.md`）。
+
+    * **F3 自死锁**：水壶在 Clint 那里（`water_area` 被暂停）⇒ 窗口里那些"未浇的活苗"
+      现在根本浇不了；旧守卫把它们当"先干农活"的理由 ⇒ `pickup` 永远等不到 ⇒ 天天 `stuck`。
+      修法两条都做：①`pickup` 一律放行；②算紧急农活时排除被暂停阶段。
+    * **必修 4**：`wait`/`need_slot` 日 `due=False`，旧实现只在 `due=True` 时才调
+      `_maybe_tool_upgrade` ⇒ 那些天 `tool_upgrade_skipped` **一条都没有**（docstring 与账本不符）。
+    """
+
+    def _run(self, w=None):
+        w = w if w is not None else FakeWorld()
+        run = make_run(w)
+        run.worker = FakeWorker(w)
+        run.client = FakeClient(w)
+        return run, w
+
+    def _rep(self):
+        return DayReport(day_key=("spring", 1, 9), started_at=0.0)
+
+    def _events(self, run, name):
+        return [e for e in run.entries if e["event"] == name]
+
+    def test_pickup_is_not_blocked_by_crops_the_missing_can_cannot_water(self):
+        """F3 核心：壶不在身上 ⇒ 未浇活苗不算"现在能干的活" ⇒ 取回必须放行。"""
+        run, w = self._run()
+        w.dirt = {(60, 10)}
+        w.crops = {(60, 10): {"ripe": False, "watered": False}}
+        w.being_upgraded = {"kind": "can", "name": "Watering Can"}
+        w.tool_upgrade_days_left = 0
+        obs = w.obs()
+        self.assertTrue(run._tool_upgrade_due(obs), "F3：pickup 不许被'未浇苗'挡住（那些苗浇不了正是壶不在）")
+        self.assertTrue(run._maybe_tool_upgrade(obs, self._rep()))
+        self.assertEqual(w.pickup_calls, 1)
+        self.assertIsNone(w.being_upgraded)
+        self.assertTrue(self._events(run, "pickup_tool")[0]["ok"])
+
+    def test_pickup_outranks_other_urgent_work(self):
+        """`pickup` 永远优先（Lead m19153 硬约束）：即使窗口里有**真能干的**紧急农活。
+
+        与 F3 是两个独立修法，必须各有一条用例各自钉住：
+          * F3 用例（壶在途 + 未浇苗）靠"排除被暂停阶段"就能过；
+          * 这条靠"pickup 一律放行"——斧在途（`clear_area` 暂停，但浇水没暂停）+ 未浇苗 ⇒
+            仍然先去取回。只做其中一条修法，对应的另一条用例会红（变异 m216a 就靠这条杀）。
+        """
+        run, w = self._run()
+        w.dirt = {(60, 10)}
+        w.crops = {(60, 10): {"ripe": False, "watered": False}}   # 真能浇的活苗
+        w.being_upgraded = {"kind": "axe", "name": "Axe"}
+        w.tool_upgrade_days_left = 0
+        obs = w.obs()
+        self.assertTrue(run._urgent_farm_work(obs, run._tool_suspended_stages(obs)),
+                        "前提：这时**确实**有紧急农活（没浇的苗，浇水没被暂停）")
+        self.assertTrue(run._tool_upgrade_due(obs), "pickup 不许被任何农活理由挡住")
+        self.assertTrue(run._maybe_tool_upgrade(obs, self._rep()))
+        self.assertEqual(w.pickup_calls, 1)
+
+    def test_new_upgrade_still_yields_to_urgent_farm_work(self):
+        """闸门只对 pickup 放行：新升级是收益、不是救火。"""
+        run, w = self._run()
+        w.money = 3000
+        w.inventory.append({"slot": 6, "id": "334", "qualifiedId": "(O)334",
+                            "name": "Copper Bar", "stack": 5, "isTool": False})
+        w.dirt = {(60, 10)}
+        w.crops = {(60, 10): {"ripe": False, "watered": False}}
+        obs = w.obs()
+        self.assertFalse(run._tool_upgrade_due(obs))
+        self.assertFalse(run._maybe_tool_upgrade(obs, self._rep()))
+        self.assertEqual(w.upgrade_calls, [])
+
+    def test_urgent_farm_work_ignores_suspended_stages_but_keeps_ripe_crops(self):
+        run, w = self._run()
+        w.dirt = {(60, 10)}
+        w.crops = {(60, 10): {"ripe": False, "watered": False}}
+        obs = w.obs()
+        self.assertEqual(run._urgent_farm_work(obs, set()), ["有 1 格作物没浇水"])
+        # 壶被暂停 ⇒ 这条不算（否则就是 F3 的死锁源头）
+        self.assertEqual(run._urgent_farm_work(obs, {"water_area"}), [])
+        # 熟作物不会被暂停口径吞掉（收获用镰刀/徒手，与壶无关）
+        w.crops = {(60, 10): {"ripe": True, "watered": False}}
+        self.assertEqual(run._urgent_farm_work(w.obs(), {"water_area"}), ["有 1 格作物熟了"])
+
+    def test_wait_day_still_logs_one_skipped_with_reason(self):
+        """必修 4：在途未完成（wait）的这一天，账本必须有一条带 `which`/`reason` 的跳过。"""
+        run, w = self._run()
+        w.being_upgraded = {"kind": "axe", "name": "Axe"}
+        w.tool_upgrade_days_left = 2
+        rep = self._rep()
+        self.assertFalse(run._maybe_tool_upgrade(w.obs(), rep))
+        self.assertFalse(run._maybe_tool_upgrade(w.obs(), rep))   # 同一天第二次：不重复记
+        skipped = self._events(run, "tool_upgrade_skipped")
+        self.assertEqual(len(skipped), 1, f"每天一条，实得 {len(skipped)}")
+        self.assertEqual(skipped[0]["which"], "wait")
+        self.assertIn("wait", str(skipped[0]["reason"]))
+        self.assertTrue(any("工具升级今天没去" in n for n in rep.notes))
+
+    def test_need_slot_day_logs_honestly_and_does_not_pickup(self):
+        run, w = self._run()
+        w.inventory_capacity = 12
+        w.inventory = [{"slot": i, "id": "388", "qualifiedId": "(O)388",
+                        "name": "Wood", "stack": 1, "isTool": False} for i in range(12)]
+        w.being_upgraded = {"kind": "axe", "name": "Axe"}
+        w.tool_upgrade_days_left = 0
+        self.assertFalse(run._maybe_tool_upgrade(w.obs(), self._rep()))
+        self.assertEqual(w.pickup_calls, 0, "没有空格 ⇒ 一步都不许发（游戏会吞回执）")
+        skipped = self._events(run, "tool_upgrade_skipped")
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["which"], "need_slot")
+        self.assertIn("空格", str(skipped[0]["reason"]))
+
+    def test_a_day_with_the_can_in_clint_goes_and_picks_it_up(self):
+        """端到端（主循环接线）：壶在途 days=0 + 田里有没浇的苗 ⇒ 这一天会去取回，不许 stuck。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.dirt = {(60, 10), (61, 10)}
+        w.crops = {(60, 10): {"ripe": False, "watered": False},
+                   (61, 10): {"ripe": False, "watered": False}}
+        w.being_upgraded = {"kind": "can", "name": "Watering Can"}
+        w.tool_upgrade_days_left = 0
+        run = make_run(w, target_days=1, max_days=1)
+        run.client = FakeClient(w)
+        run.worker = FakeWorker(w)
+        run.max_steps = 40
+        run.run()
+        self.assertEqual(w.pickup_calls, 1, "F3：这一天必须去取回水壶")
+        self.assertNotIn("stuck", str(run.days[0].ended_by), "取回后不许还以 stuck 收尾")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

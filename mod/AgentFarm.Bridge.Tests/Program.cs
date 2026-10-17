@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Text.RegularExpressions;
 using AgentFarm.Bridge;
 
 namespace AgentFarm.Bridge.Tests
@@ -201,6 +203,48 @@ namespace AgentFarm.Bridge.Tests
             Check("t205_duplicate_offers_fail_closed",
                   dupPick.Index == -1 && dupPick.Status == ToolUpgradeRules.StatusToolNotOffered,
                   "同 kind 同 tier 两条 ⇒ 不唯一 ⇒ 必须 fail-closed（不许猜）");
+
+            // ---- 【task-216 GAP-2】条目选择的三条边界（deputy m206h 变异此前 0 杀）----
+            // ① tier 必须**正好** +1：0→2 不许选中（买错档 = 白扣钱锭）
+            var jumpTier = new List<UpgradeOfferInput>
+            {
+                new UpgradeOfferInput("(T)SteelAxe", "Steel Axe", "axe", 2, 5000, "(O)335", 5, 0),
+            };
+            UpgradePickResult tierJump = ToolUpgradeRules.Select(jumpTier, "axe", 0);
+            Check("t216_tier_must_be_exactly_plus_one",
+                  tierJump.Index == -1 && tierJump.Status == ToolUpgradeRules.StatusToolNotOffered,
+                  "tier 0→2 不连续 ⇒ 不许买（必须正好 = 当前+1）");
+
+            // ② kind 不匹配：只有 hoe 的条目时问 axe ⇒ tool_not_offered
+            var onlyHoe = new List<UpgradeOfferInput>
+            {
+                new UpgradeOfferInput("(T)CopperHoe", "Copper Hoe", "hoe", 1, 2000, "(O)334", 5, 0),
+            };
+            UpgradePickResult wrongKind = ToolUpgradeRules.Select(onlyHoe, "axe", 0);
+            Check("t216_kind_mismatch_fails_closed",
+                  wrongKind.Index == -1 && wrongKind.Status == ToolUpgradeRules.StatusToolNotOffered,
+                  "kind 必须相同：只有 hoe 条目时问 axe ⇒ tool_not_offered");
+
+            // ③ 多档在售时只认 +1 那条（不许选到更高档）
+            var twoTiers = new List<UpgradeOfferInput>
+            {
+                new UpgradeOfferInput("(T)CopperAxe", "Copper Axe", "axe", 1, 2000, "(O)334", 5, 0),
+                new UpgradeOfferInput("(T)SteelAxe", "Steel Axe", "axe", 2, 5000, "(O)335", 5, 0),
+            };
+            UpgradePickResult exactTier = ToolUpgradeRules.Select(twoTiers, "axe", 0);
+            Check("t216_exact_tier_wins_among_several",
+                  exactTier.Index == 0 && exactTier.Status == ToolUpgradeRules.StatusOk,
+                  "在售多档时只认 tier==当前+1 的那一条（不许选更高档）");
+
+            // ④ kind 归一（wateringcan/watering_can → can），否则永远 tool_not_offered
+            var canOffer = new List<UpgradeOfferInput>
+            {
+                new UpgradeOfferInput("(T)CopperCan", "Copper Watering Can", "can", 1, 2000, "(O)334", 5, 0),
+            };
+            UpgradePickResult canPick = ToolUpgradeRules.Select(canOffer, "wateringcan", 0);
+            Check("t216_kind_alias_is_normalized",
+                  canPick.Index == 0 && canPick.Status == ToolUpgradeRules.StatusOk,
+                  "wateringcan 必须归一成 can 再比对（否则永远选不到水壶升级）");
 
             Check("t205_already_upgrading_blocks",
                   ToolUpgradeRules.Precheck(
@@ -404,10 +448,171 @@ namespace AgentFarm.Bridge.Tests
                   && MachineRules.HasRoom(new List<ObjectSlotInput> { bag[0], null }, "(O)378", 500), // 有空格
                   "能不能放：同 qid 叠有余量或有空格 ⇒ true；叠会溢出且无空格 ⇒ false");
 
+            // ==============================================================
+            // 【task-216 / 0.7.38 结构性护栏】技能名单一数据源 + 源码文本双向校验
+            //
+            // 0.7.37 装机版（063351d）真机事故：`Skills.Create` 里加了 7 个 case，但
+            // `Skills.KnownSkills` 白名单没跟上 ⇒ `BridgeHost.ServeExec` 在进主线程**之前**
+            // 就把请求拒成 `unknown_skill`，Create 的 case 永远没机会跑（机器链/升级链/内省面全废）。
+            // 人工"两张表要同步"的纪律已经失败过一次 ⇒ 现在白名单/长任务表都从 `SkillCatalog`
+            // 派生，并由这几条断言在**每次 build** 时校验"派生关系没被改回手写"。
+            // ==============================================================
+            Check("t216_catalog_lists_are_clean",
+                  SkillCatalog.Executable.Length > 0 && SkillCatalog.Planned.Length > 0
+                  && NoDuplicates(SkillCatalog.Executable) && NoDuplicates(SkillCatalog.Planned)
+                  && NoDuplicates(SkillCatalog.LongTask)
+                  && SkillCatalog.Executable.Length + SkillCatalog.Planned.Length == SkillCatalog.Known.Count,
+                  "技能表：Executable/Planned/LongTask 无重复、Known = 两者并集（集合大小对得上）");
+
+            Check("t216_known_and_longtask_semantics",
+                  SkillCatalog.IsKnown("machine") && SkillCatalog.IsKnown("harvest")   // 已实现 + 规划中
+                  && !SkillCatalog.IsKnown("no_such_skill") && !SkillCatalog.IsKnown("")
+                  && SkillCatalog.IsKnown("debug_dump") && SkillCatalog.IsKnown("add_missed_recipes")
+                  && SkillCatalog.IsKnown("upgrade_tool") && SkillCatalog.IsKnown("pickup_tool")
+                  && SkillCatalog.IsKnown("craft_item") && SkillCatalog.IsKnown("place_object")
+                  // 长任务判据 = "handler 可能跨 tick 返回 null"（`MainThreadDispatcher.RunOne`）：
+                  // 只有 upgrade_tool 要等 ShopMenu；单 tick 技能标长任务只会白占长任务槽位。
+                  && SkillCatalog.IsLongTask("upgrade_tool") && !SkillCatalog.IsLongTask("debug_dump")
+                  && !SkillCatalog.IsLongTask("add_missed_recipes") && !SkillCatalog.IsLongTask("pickup_tool")
+                  && !SkillCatalog.IsLongTask("craft_item") && !SkillCatalog.IsLongTask("place_object")
+                  && !SkillCatalog.IsLongTask("machine"),
+                  "Known 覆盖全部已实现/规划中技能；LongTask 只含真正跨 tick 的（upgrade_tool ∈，debug_dump ∉）");
+
+            // ---- 遍历 `Skills.Create` 的 `case` 字面量：必须与 Executable **双向相等** ----
+            string repoRoot = FindRepoRoot();
+            string skillsPath = repoRoot == null ? null : Path.Combine(repoRoot, "mod", "AgentFarm.Bridge", "Skills.cs");
+            string bridgeHostPath = repoRoot == null ? null : Path.Combine(repoRoot, "mod", "AgentFarm.Bridge", "BridgeHost.cs");
+            Check("t216_source_files_are_readable",
+                  skillsPath != null && File.Exists(skillsPath) && bridgeHostPath != null && File.Exists(bridgeHostPath),
+                  "找不到仓库根/源码文件（自检必须能在 build 后读到 Skills.cs / BridgeHost.cs；"
+                  + "从 bin 目录向上找含 mod/AgentFarm.Bridge/Skills.cs 的目录）。repoRoot=" + (repoRoot ?? "<null>"));
+
+            var createCases = skillsPath != null && File.Exists(skillsPath)
+                ? CaseLiteralsInMethod(File.ReadAllText(skillsPath), "public static Func<object> Create(")
+                : new List<string>();
+            var catalogExec = new List<string>(SkillCatalog.Executable);
+            Check("t216_create_cases_match_catalog",
+                  createCases.Count > 0 && SameSet(createCases, catalogExec),
+                  "Skills.Create 的 case 字面量必须与 SkillCatalog.Executable 双向相等（正向=每个 case 都在表里，"
+                  + "反向=表里每个名字都有 case）。实得 case=[" + string.Join(",", createCases)
+                  + "] 缺 case=[" + string.Join(",", OnlyIn(catalogExec, createCases))
+                  + "] 多 case=[" + string.Join(",", OnlyIn(createCases, catalogExec)) + "]");
+
+            var plannedWithCase = new List<string>(SkillCatalog.Planned);
+            plannedWithCase.RemoveAll(n => createCases.Contains(n));
+            var plannedOverlap = new List<string>();
+            foreach (string n in SkillCatalog.Planned)
+            {
+                if (createCases.Contains(n)) plannedOverlap.Add(n);
+            }
+            Check("t216_planned_skills_have_no_case",
+                  plannedWithCase.Count == SkillCatalog.Planned.Length,
+                  "规划中的技能（Planned）不许偷偷有 case：必须先从 Planned 搬到 Executable（实得重叠=["
+                  + string.Join(",", plannedOverlap) + "]）");
+
+            // ---- 两个"消费方"必须是委托，不许再抄一份手写名单 ----
+            string skillsText = skillsPath != null && File.Exists(skillsPath) ? File.ReadAllText(skillsPath) : "";
+            string hostText = bridgeHostPath != null && File.Exists(bridgeHostPath) ? File.ReadAllText(bridgeHostPath) : "";
+            Check("t216_consumers_delegate_to_catalog",
+                  skillsText.Contains("IsKnownSkill(string skill) => SkillCatalog.IsKnown(skill)")
+                  && hostText.Contains("IsLongTaskSkill(string skill) => SkillCatalog.IsLongTask(skill)"),
+                  "Skills.IsKnownSkill / BridgeHost.IsLongTaskSkill 必须委托给 SkillCatalog（不许回到手写名单）；"
+                  + "0.7.37 事故的根因就是白名单手写且没同步");
+
+            Check("t216_longtask_is_subset_of_executable",
+                  SkillCatalog.LongTask.Length > 0 && OnlyIn(new List<string>(SkillCatalog.LongTask), catalogExec).Count == 0,
+                  "LongTask 必须是 Executable 的子集（长任务里出现没实现的名字 ⇒ 永远拿不到结果）");
+
             Console.WriteLine(_failed == 0
                 ? $"OK {_total} 断言全部通过"
                 : $"FAILED {_failed} 条断言不通过（共 {_total} 条）");
             return _failed == 0 ? 0 : 1;
+        }
+
+        // ==================================================================
+        //  结构性护栏的辅助函数（纯文本/集合运算，零游戏依赖）
+        // ==================================================================
+
+        private static bool NoDuplicates(string[] names)
+        {
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (string n in names)
+            {
+                if (string.IsNullOrWhiteSpace(n) || !seen.Add(n)) return false;
+            }
+            return true;
+        }
+
+        private static bool SameSet(List<string> a, List<string> b)
+            => OnlyIn(a, b).Count == 0 && OnlyIn(b, a).Count == 0;
+
+        private static List<string> OnlyIn(List<string> a, List<string> b)
+        {
+            var result = new List<string>();
+            var other = new HashSet<string>(b, StringComparer.Ordinal);
+            foreach (string n in a)
+            {
+                if (!other.Contains(n)) result.Add(n);
+            }
+            result.Sort(StringComparer.Ordinal);
+            return result;
+        }
+
+        /// <summary>从 bin 目录向上找仓库根（含 `mod/AgentFarm.Bridge/Skills.cs` 的目录）。</summary>
+        private static string FindRepoRoot()
+        {
+            DirectoryInfo dir;
+            try { dir = new DirectoryInfo(AppContext.BaseDirectory); }
+            catch { return null; }
+            for (int i = 0; i < 12 && dir != null; i++)
+            {
+                string candidate = Path.Combine(dir.FullName, "mod", "AgentFarm.Bridge", "Skills.cs");
+                if (File.Exists(candidate)) return dir.FullName;
+                dir = dir.Parent;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// 抽出某个方法体里所有 `case "字面量":` 的名字。
+        ///
+        /// 为什么用文本扫描：`Skills.cs` 吃 Stardew 类型，自检工程（零依赖）没法引用它，
+        /// 只能当源码看 —— 这与仓库里既有的"文字契约"纪律一致（Python 盯 `Skills.cs` 也是这么做的）。
+        /// 方法体的界定：从签名所在行往后，找到下一条**行首恰好 8 空格**的
+        /// `public/private/internal static` 成员声明（`case` 都在 switch 里缩进更深，不会误判）。
+        /// </summary>
+        private static List<string> CaseLiteralsInMethod(string text, string signatureMarker)
+        {
+            var names = new List<string>();
+            if (string.IsNullOrEmpty(text)) return names;
+            string[] lines = text.Split('\n');
+            int start = -1;
+            for (int i = 0; i < lines.Length; i++)
+            {
+                if (lines[i].Contains(signatureMarker)) { start = i; break; }
+            }
+            if (start < 0) return names;
+            int end = lines.Length;
+            for (int i = start + 1; i < lines.Length; i++)
+            {
+                string trimmed = lines[i].TrimEnd('\r');
+                if ((trimmed.StartsWith("        public static ") || trimmed.StartsWith("        private static ")
+                     || trimmed.StartsWith("        internal static ")) && !trimmed.StartsWith("        //"))
+                {
+                    end = i;
+                    break;
+                }
+            }
+            var rx = new Regex("case\\s+\"([a-z_]+)\"\\s*:", RegexOptions.CultureInvariant);
+            for (int i = start; i < end; i++)
+            {
+                foreach (Match m in rx.Matches(lines[i]))
+                {
+                    names.Add(m.Groups[1].Value);
+                }
+            }
+            names.Sort(StringComparer.Ordinal);
+            return names;
         }
     }
 }

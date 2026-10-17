@@ -48,6 +48,12 @@
          能不能再放一件）⇒ 同样直接编译同一份源码跑行为断言。技能本体吃游戏类型，
          判据留在技能里就只能做源码文本断言（task-182 GAP-1 教训）。 -->
     <Compile Include="..\AgentFarm.Bridge\MachineRules.cs" />
+    <!-- task-216 / 0.7.38 结构性护栏：技能名的唯一权威表（KnownSkills 与 IsLongTaskSkill
+         都从它派生）。0.7.37 装机版的事故是"Create 加了 case、KnownSkills 白名单没跟上 ⇒
+         请求在进主线程前就被拒成 unknown_skill"。本工程编译同一份源码，并读 Skills.cs /
+         BridgeHost.cs 的源码文本做**双向**校验（`t216_create_cases_match_catalog`
+         与 `t216_consumers_delegate_to_catalog`）⇒ 以后每次 build 都自动防再犯。 -->
+    <Compile Include="..\AgentFarm.Bridge\SkillCatalog.cs" />
   </ItemGroup>
 
 </Project>

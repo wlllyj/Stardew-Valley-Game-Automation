@@ -496,7 +496,7 @@ class MiniBridge:
     def upgrade_tool(self, tool, *, timeout_ms=None):
         """`upgrade_tool`（task-205）：真桥失败抛 `BridgeError(status=...)`；成功回执带价格/材料。"""
         self.w.upgrade_calls.append({"tool": str(tool), "timeout_ms": timeout_ms})
-        if self.w.upgrade_mode and self.w.upgrade_mode not in ("ok", "no_effect"):
+        if self.w.upgrade_mode and self.w.upgrade_mode not in ("ok", "no_effect", "money_only"):
             raise BridgeError(f"升级失败（{self.w.upgrade_mode}）", status=str(self.w.upgrade_mode))
         kind = str(tool)
         tier = int(self.w.tool_tiers.get(kind, 0))
@@ -510,6 +510,11 @@ class MiniBridge:
         if self.w.upgrade_mode == "no_effect":
             # 真机 task-173 的形态：回执全绿，世界一个字节没变。
             return receipt
+        if self.w.upgrade_mode == "money_only":
+            # 【task-216 NUT B1e】只扣钱、等级不动（回执仍声称 tierAfter=tier+1）
+            # ⇒ 脑侧必须按等级差/在途出现判失败，绝不许"钱扣了就算成功"。
+            self.w.money -= price
+            return receipt
         self.w.money -= price
         self.w.tool_tiers[kind] = tier + 1
         self.w.being_upgraded = {"kind": kind, "name": kind, "qualifiedId": f"(T){kind}"}
@@ -519,10 +524,18 @@ class MiniBridge:
     def pickup_tool(self, *, timeout_ms=None):
         """`pickup_tool`（task-205）：取回时清掉在途状态（工具已在买下时换过）。"""
         self.w.pickup_calls += 1
-        if self.w.pickup_mode and self.w.pickup_mode not in ("ok", "no_effect"):
+        if self.w.pickup_mode and self.w.pickup_mode not in ("ok", "no_effect", "clear_only"):
             raise BridgeError(f"取回失败（{self.w.pickup_mode}）", status=str(self.w.pickup_mode))
         receipt = {"ok": True, "status": "ok", "reason": "工具已取回"}
         if self.w.pickup_mode == "no_effect":
+            return receipt
+        if self.w.pickup_mode == "clear_only":
+            # 【task-216 NUT B2b】在途清空、但背包里**没有**这种工具（产物丢了/观测丢）
+            # ⇒ 脑侧必须按"背包出现该工具"判失败。
+            kind_gone = str((self.w.being_upgraded or {}).get("kind") or "")
+            self.w.being_upgraded = None
+            self.w.upgrade_days_left = 0
+            self.w.tool_tiers.pop(kind_gone, None)
             return receipt
         self.w.being_upgraded = None
         self.w.upgrade_days_left = 0
@@ -2933,7 +2946,10 @@ class TestTask205ToolUpgrade(unittest.TestCase):
         st = make_worker(w).upgrade_tool("axe")
         self.assertFalse(st.ok)
         self.assertEqual(st.code, "failed")
-        self.assertIn("什么都没变", st.reason)
+        # 【task-216 B1e】只有回执 ok、世界没变 ⇒ failed；措辞点明"观测上没升级"，
+        # 而不是笼统的"什么都没变"（钱被扣但等级没动是最危险的假绿形态）。
+        self.assertIn("买了但观测上没升级", st.reason)
+        self.assertIn("0→0", st.reason)
 
     def test_already_upgrading_sends_no_request(self):
         w = self._world()
@@ -2989,6 +3005,35 @@ class TestTask205ToolUpgrade(unittest.TestCase):
         self.assertTrue(st.ok, st.reason)
         self.assertEqual(w.pickup_calls, 1)
         self.assertIsNone(st.after["being"])
+
+    # ---- 【task-216】deputy task-206 的两条 NUT：只扣钱 / 只清在途，都不许当成功 ----
+
+    def test_money_only_upgrade_is_not_success(self):
+        """NUT B1e：钱被扣了、等级 0→0、在途也没出现 ⇒ 不许判 ok（灾难性假绿）。"""
+        w = self._world(inventory_capacity=12)
+        w.upgrade_mode = "money_only"
+        before_money = w.money
+        st = make_worker(w).upgrade_tool("axe")
+        self.assertFalse(st.ok, "只扣钱没升级的形态绝不许判成功")
+        self.assertEqual(st.code, "failed")
+        self.assertEqual(w.money, before_money - 2000, "钱确实被扣了（世界变化，但不是升级）")
+        self.assertEqual(w.tool_tiers["axe"], 0)
+        self.assertIsNone(w.being_upgraded)
+        self.assertIn("买了但观测上没升级", st.reason)
+        self.assertIn("只扣了钱", st.reason)
+
+    def test_pickup_that_clears_pending_but_loses_the_tool_is_not_success(self):
+        """NUT B2b：在途清空了、但背包里没多出工具 ⇒ 不许判 ok（产物丢了也是失败）。"""
+        w = self._world(inventory_capacity=12)
+        w.being_upgraded = {"kind": "axe", "name": "Axe"}
+        w.upgrade_days_left = 0
+        w.pickup_mode = "clear_only"
+        st = make_worker(w).pickup_tool()
+        self.assertFalse(st.ok, "在途清空 ≠ 取回成功：必须观测到背包出现该工具")
+        self.assertEqual(st.code, "failed")
+        self.assertIsNone(st.after["being"])
+        self.assertFalse(st.after["tool_back"])
+        self.assertIn("背包没多出工具", st.reason)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -4589,23 +4589,27 @@ class LongRun:
                           being=(tool_being_upgraded(obs) or {}).get("name"),
                           note="工具在 Clint 那里升级，相关阶段暂停（不是失败，是工具不在身上）")
             rep.notes.append(f"工具升级中，暂停阶段：{'/'.join(sorted(suspended))}")
+        plan = self._tool_upgrade_plan(obs)
+        action = (plan or {}).get("action")
+        # 【task-216 必修 4】`due=False` 的那一天也必须留一条 `tool_upgrade_skipped{which,reason}`：
+        # 旧写法只在 `_tool_upgrade_due()==True` 时才调本函数 ⇒ wait/need_slot 日一条留痕都没有，
+        # docstring 却声称会留痕（deputy 实测 0 条）。现在 `_run_day` 每轮无条件调用、这里按天去重。
+        if not self._tool_upgrade_due(obs):
+            if not self.tool_upgrade_skipped_noted:
+                self.tool_upgrade_skipped_noted = True
+                reason = self._tool_upgrade_skip_reason(obs, plan)
+                self._journal("tool_upgrade_skipped", which=action or None, reason=reason,
+                              action=action, being=(plan or {}).get("being"),
+                              days_left=(plan or {}).get("days_left"),
+                              free_slots=(plan or {}).get("free_slots"),
+                              money=FarmWorker.money(obs),
+                              suspended=sorted(suspended) or None)
+                rep.notes.append(f"工具升级今天没去：{reason}")
+            return False
         if self.tool_upgrade_tried >= TOOL_UPGRADE_MAX_PER_DAY:
             return False
-        plan = self._tool_upgrade_plan(obs)
-        if plan is None:
-            if not self.tool_upgrade_skipped_noted:
-                self.tool_upgrade_skipped_noted = True
-                self._journal("tool_upgrade_skipped",
-                              reason="没有可做的升级（钱/材料不够，或工具等级读不到，或已满级）",
-                              money=FarmWorker.money(obs))
-            return False
-        action = plan.get("action")
-        if action in ("wait", "need_slot"):
-            if not self.tool_upgrade_skipped_noted:
-                self.tool_upgrade_skipped_noted = True
-                self._journal("tool_upgrade_skipped", reason=plan.get("reason"),
-                              action=action, being=plan.get("being"),
-                              days_left=plan.get("days_left"), free_slots=plan.get("free_slots"))
+        # due 为真时 action 必是 upgrade/pickup（`_tool_upgrade_due` 已保证），这里再兜一层
+        if action not in ("upgrade", "pickup"):
             return False
         self.tool_upgrade_tried += 1
         if action == "pickup":
@@ -4629,37 +4633,72 @@ class LongRun:
             self.farm_actions_today += 1
         return bool(st.ok)
 
+    def _urgent_farm_work(self, obs: dict[str, Any], suspended: set[str]) -> list[str]:
+        """【task-216 F3】窗口里"**现在就能干**"的紧急农活（被在途工具暂停的阶段不算）。
+
+        为什么必须排除 `suspended`：水壶在 Clint 那里升级 ⇒ `water_area` 被暂停 ⇒ 窗口里那些
+        "未浇的活苗"**现在根本浇不了**；如果还拿它们当"先干农活"的理由，`pickup` 就永远被挡住
+        ⇒ 自死锁（deputy task-206 F3 实测：2 天 `pickup_calls=0`、天天 `stuck`）。
+        """
+        out: list[str] = []
+        tmap = FarmWorker.tiles_of(obs)
+        if "water_area" not in suspended:
+            unwatered = [t for t, tv in tmap.items()
+                         if tv.get("crop") and not tv.get("dead") and not tv.get("watered")]
+            if unwatered:
+                out.append(f"有 {len(unwatered)} 格作物没浇水")
+        ripe = [t for t, tv in tmap.items()
+                if tv.get("crop") and not tv.get("dead") and tile_ready(tv)]
+        if ripe:
+            out.append(f"有 {len(ripe)} 格作物熟了")
+        return out
+
     def _tool_upgrade_due(self, obs: dict[str, Any]) -> bool:
         """【task-205】"现在该不该去铁匠铺"的守卫（真正的执行在 `_maybe_tool_upgrade`）。
 
-        三条门槛（缺一条都不跑）：
+        门槛（缺一条都不跑）：
 
           1. 今天还没试过（`TOOL_UPGRADE_MAX_PER_DAY`）、worker 在；
-          2. **紧急农活优先**：窗口里还有没浇的活苗、或还有可收的熟作物 ⇒ 先干农活
-             （升级是收益，不是救火；run A′ 的教训：把一天花在跑腿上最亏）；
-          3. `_tool_upgrade_plan` 给出了可执行动作（`upgrade`/`pickup`）。
+          2. `_tool_upgrade_plan` 给出了可执行动作（`upgrade`/`pickup`）；
+          3. 背包状态读得到（pickup 需要空格、upgrade 的锭也在背包里）；
+          4. **紧急农活优先** —— 但**【task-216 F3】只拦 `upgrade`，`pickup` 一律放行**：
+             在途工具不在身上，被它暂停的阶段本来就干不成；取回是"把工具拿回来"的救火动作，
+             不是收益性跑腿。另：算紧急农活时要**排除被在途工具暂停的阶段**
+             （`_urgent_farm_work`），否则"水壶在途 + 未浇苗"会互相锁死。
 
         注意：`wait`/`need_slot`/`None` 都不算"该去"（`_maybe_tool_upgrade` 里仍会留痕）。
         """
         if self.worker is None or self.tool_upgrade_tried >= TOOL_UPGRADE_MAX_PER_DAY:
             return False
-        tmap = FarmWorker.tiles_of(obs)
-        for tv in tmap.values():
-            if not tv.get("crop") or tv.get("dead"):
-                continue
-            if not tv.get("watered"):
-                return False
-            if tile_ready(tv):
-                return False
         plan = self._tool_upgrade_plan(obs)
-        if plan is None:
-            return False
-        if plan.get("action") not in ("upgrade", "pickup"):
+        action = (plan or {}).get("action")
+        if action not in ("upgrade", "pickup"):
             return False
         # 背包状态读不到 ⇒ 不冒进（pickup 需要空格、upgrade 的锭也在背包里）
         if player_free_slots(FarmWorker.player_of(obs))[1] != "ok":
             return False
-        return True
+        if action == "pickup":
+            return True                          # 【F3】取回一律放行
+        return not self._urgent_farm_work(obs, self._tool_suspended_stages(obs))
+
+    def _tool_upgrade_skip_reason(self, obs: dict[str, Any],
+                                  plan: dict[str, Any] | None) -> str:
+        """【task-216 必修 4】`due=False` 时如实写"今天为什么没去铁匠铺"（每天一条）。"""
+        if self.worker is None:
+            return "没有 worker"
+        if self.tool_upgrade_tried >= TOOL_UPGRADE_MAX_PER_DAY:
+            return f"今天已经试过 {self.tool_upgrade_tried} 次（上限 {TOOL_UPGRADE_MAX_PER_DAY}）"
+        if plan is None:
+            return "没有可做的升级（钱/材料不够，或工具等级读不到，或已满级）"
+        action = plan.get("action")
+        if action in ("wait", "need_slot"):
+            return f"{action}：{plan.get('reason') or '（计划只给了动作、没给原因）'}"
+        if player_free_slots(FarmWorker.player_of(obs))[1] != "ok":
+            return "读不到背包空格（fail-closed，不冒进）"
+        urgent = self._urgent_farm_work(obs, self._tool_suspended_stages(obs))
+        if urgent:
+            return "先干紧急农活：" + "；".join(urgent)
+        return "未知原因（due=False 但复盘没归类，请查账）"
 
     def _snap_or(self, obs: dict[str, Any]) -> dict[str, Any]:
         """重新取快照，失败就退回旧观测（腾格后的决策不该因为一次观察失败而崩）。"""
@@ -6382,9 +6421,12 @@ class LongRun:
             # 否则 `plant_area` 会被算成"没有可动目标"而当天封格）。
             obs = self._preconditions(obs, rep)
             # 【task-205】铁匠铺升级/取回：**每天最多一次**，放在"种子/腾格摆正"之后、
-            # "开新地"之前。`_tool_upgrade_due` 会先检查"没有紧急农活"（没浇的活苗/可收的
-            # 熟作物优先）⇒ 升级是收益、不是救火。真动过世界（upgrade/pickup 成功）就重新观测。
-            if self._tool_upgrade_due(obs) and self._maybe_tool_upgrade(obs, rep):
+            # "开新地"之前。`_tool_upgrade_due` 决定"该不该去"：`upgrade` 要等紧急农活做完，
+            # **`pickup` 一律放行**（【task-216 F3】在途工具不在身上，被它暂停的阶段本来就干不成）。
+            # 【task-216 必修 4】这里**无条件调用**（不只 due 为真时）：`_maybe_tool_upgrade` 内部
+            # 在 `due=False` 时也会按天留一条 `tool_upgrade_skipped{which,reason}`，否则 wait/
+            # need_slot 日一条留痕都没有（docstring 与账本对不上，deputy 实测 0 条）。
+            if self._maybe_tool_upgrade(obs, rep):
                 continue
             # 【task-50】窗口外那 1 格干作物（run5 三天 `farm.dryCrops` 恒剩 1 的病灶）：
             # Mod 的 `farm.dryTiles` 给了坐标 ⇒ **走过去浇**，别因为它不在窗口里就判 `no_work`。

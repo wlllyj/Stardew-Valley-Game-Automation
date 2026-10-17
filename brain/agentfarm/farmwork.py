@@ -3321,9 +3321,12 @@ class FarmWorker:
             "trade_have": trade_have_after,
         }
         appeared = being_after is not None and being_before is None
-        tier_up = tier_after >= 0 and tier_before >= 0 and tier_after > tier_before
+        # 【task-216 必修 5 / B1e】"只扣钱、等级 0→0"不许判 ok（deputy 实测过一条只扣钱的路径）。
+        # 买下升级的**唯一正确观测**：等级正好 +1，或 `toolBeingUpgraded` 出现（买下即换）。
+        # `money_down` 只能作为**辅助线索**，单独出现 ⇒ failed（并如实写明"只扣钱没升级"）。
+        tier_next = tier_before >= 0 and tier_after == tier_before + 1
         money_down = money_after < r.before["money"]
-        if appeared or tier_up or money_down:
+        if appeared or tier_next:
             r.ok = True
             r.reason = (f"已买下升级：{kind} 等级 {tier_before}→{tier_after}"
                         f"；钱 {r.before['money']}→{money_after}（条目价 {price or '未报'}"
@@ -3333,8 +3336,9 @@ class FarmWorker:
                            if r.after["money_delta_matches_price"] is False else ""))
             return r
         r.code = "failed"
-        r.reason = (f"买了但观测上什么都没变：钱 {r.before['money']}→{money_after}，"
-                    f"在途={(being_after or {}).get('name') or '(空)'}，等级 {tier_before}→{tier_after}"
+        r.reason = (f"买了但观测上没升级：等级 {tier_before}→{tier_after}（要求正好 +1 或在途出现），"
+                    f"在途={(being_after or {}).get('name') or '(空)'}，钱 {r.before['money']}→{money_after}"
+                    + ("；⚠ 只扣了钱、等级没动 ⇒ 不许当成功" if money_down else "")
                     + (f"；回执={r.receipt}" if r.receipt else ""))
         return r
 
@@ -3391,15 +3395,25 @@ class FarmWorker:
         after = self.snap()
         being_after = tool_being_upgraded(after)
         tier_after = tool_tier(after, kind) if kind else -1
+        tool_back = any(
+            str(row.get("kind") or "").strip().lower() == kind
+            for row in tools_of(after)) if kind else False
         r.after = {"being": (being_after or {}).get("name"), "days_left": tool_upgrade_days_left(after),
-                   "tier": tier_after}
-        if being_after is None or (tier_after >= 0 and tier_before >= 0 and tier_after > tier_before):
+                   "tier": tier_after, "tool_back": tool_back}
+        # 【task-216 必修 5 / B2b】取回成功必须**两条同时成立**：
+        #   ①`toolBeingUpgraded` 清空（Clint 那边真交付了）；
+        #   ②背包里真的出现了这种工具（`tools[].kind` 匹配）。
+        # 只清空在途、背包没工具 ⇒ 产物不见了/观测丢了 ⇒ failed（deputy NUT B2b 实测）。
+        if being_after is None and tool_back:
             r.ok = True
-            r.reason = (f"已取回「{(being or {}).get('name')}」：在途清空，等级 {tier_before}→{tier_after}")
+            r.reason = (f"已取回「{(being or {}).get('name')}」：在途清空、背包里出现该工具，"
+                        f"等级 {tier_before}→{tier_after}")
             return r
         r.code = "failed"
-        r.reason = (f"取回没生效：toolBeingUpgraded 仍为 {(being_after or {}).get('name') or '(空)'}，"
-                    f"等级 {tier_before}→{tier_after}" + (f"；回执={r.receipt}" if r.receipt else ""))
+        r.reason = (f"取回没生效：toolBeingUpgraded={(being_after or {}).get('name') or '(空)'}、"
+                    f"背包里同名工具={'有' if tool_back else '没有'}、等级 {tier_before}→{tier_after}"
+                    + ("；⚠ 在途已清空但背包没多出工具 ⇒ 不许当成功" if being_after is None and not tool_back else "")
+                    + (f"；回执={r.receipt}" if r.receipt else ""))
         return r
 
     # ------------------------------------------------------------------ 机器链（task-210）

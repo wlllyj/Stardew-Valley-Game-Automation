@@ -451,7 +451,9 @@ namespace AgentFarm.Bridge
                 //     （`toolBeingUpgraded != null && daysLeft <= 0 && freeSpotsInInventory() > 0`
                 //     + 人在 Blacksmith）。工具拿不回来时 Clint 只说 Clint_NoInventorySpace，不扣钱。
                 //
-                // 两者都必须加入 BridgeHost.IsLongTaskSkill 的**跨 tick**集合（等菜单）。
+                // 两者的**跨 tick**归属见 `SkillCatalog.LongTask`：
+                //   * `upgrade_tool`：跨 tick（要等 `ShopMenu` 挂上）⇒ 长任务；
+                //   * `pickup_tool`：单 tick（直接调 `blacksmith(...)` 的 pickup 分支）⇒ **不**是长任务。
                 // 判据一律观测差分（钱差 / 锭差 / `toolBeingUpgraded` 出现 / 背包同种工具 +1）。
                 case "upgrade_tool":
                     return new ToolUpgradeSkill(req, world, monitor).Step;
@@ -784,22 +786,17 @@ namespace AgentFarm.Bridge
             };
         }
 
-        /// <summary>已知技能名（用于区分 unknown_skill 与 not_implemented）。</summary>
-        private static readonly HashSet<string> KnownSkills = new HashSet<string>(StringComparer.Ordinal)
-        {
-            // 已实现（⚠️ 必须与 `Skills.Create` 的 case 逐字同步：`BridgeHost.ServeExec` 在
-            // 进主线程之前就按这张表把不认识的技能一律 `unknown_skill` 拒掉。
-            // task-205/213/210 的真机事故教训：Create 里加了 case 但忘了这里 ⇒ 装机后才炸。）
-            "noop", "move_to", "dismiss_modal", "move_to_location", "load_save", "quit_game", "interact", "use_tool",
-            "select_item", "plant", "sleep", "buy", "sell",
-            "upgrade_tool", "pickup_tool", "debug_dump", "add_missed_recipes",
-            "craft_item", "place_object", "machine",
-            // 架构 §5.3 规划中（返回 not_implemented，便于“脑”一次性看清缺口）
-            "exit_building", "harvest",
-            "pickup_debris", "collect_machine", "refill_watering_can", "talk",
-        };
-
-        public static bool IsKnownSkill(string skill) => skill != null && KnownSkills.Contains(skill);
+        /// <summary>
+        /// 认识这个技能名吗（用于区分 `unknown_skill` 与 `not_implemented`）。
+        ///
+        /// ⚠️ 数据源已经**搬到** <see cref="SkillCatalog"/>（0.7.37 真机事故的结构性修复）：
+        /// 旧版这里是一张手写 `HashSet`，与 `Skills.Create` 的 `case` 靠人工同步 ——
+        /// `063351d` 装机版就是"Create 加了 7 个 case、这里没跟上"⇒ 请求在 `BridgeHost.ServeExec`
+        /// 进主线程之前就被拒成 `unknown_skill`，Create 的 case 永远没机会跑。
+        /// 现在白名单由 `SkillCatalog.Known` 派生，并且自检工程每次 build 用文本断言校验
+        /// `Create` 的 case 字面量与 `SkillCatalog.Executable` 双向一致。
+        /// </summary>
+        public static bool IsKnownSkill(string skill) => SkillCatalog.IsKnown(skill);
 
         // ==================================================================
         //  move_to（当前地点内走一格）

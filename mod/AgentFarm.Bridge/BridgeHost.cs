@@ -474,34 +474,19 @@ namespace AgentFarm.Bridge
         /// <summary>
         /// 哪些技能是**跨 tick 长任务**（Handler 会在"还没走完"时返回 null，由调度器下个 tick 继续调用）。
         ///
-        /// 【里程碑 B】move_to_location 与 move_to 共用 <see cref="StepMover"/> 状态机，同样跨 tick：
-        /// 忘了把它加进来，症状会立刻变成"第一跳刚发起就把 null 交给网络线程"，
-        /// 也就是条目 013 那类"接口报 ok、实际半途而废"的翻版。
+        /// 【task-216 / 0.7.38 结构性护栏】名单与判据已**搬到** `SkillCatalog.LongTask`
+        /// （单一数据源 + 自检工程每次 build 用源码文本断言双向校验）。这里只委托，不再手写名字：
+        /// 0.7.37 的真机事故就是"`Create` 加了 case、`KnownSkills` 白名单没跟上"，教训是
+        /// **任何靠人工同步的两张表都必须合并或加断言**（白名单更致命：请求在进主线程之前就被拒）。
         ///
-        /// 【里程碑 C】load_save 同理：发起读档后要每 tick 等世界变可读，必须在这里。
-        ///
-        /// 【P3 步骤③】use_tool 也是：挥动 → 等 `player.UsingTool` 落回 false → 再看目标格 —— 天然跨 tick。
-        ///
-        /// 【P3 步骤⑤/⑥】sleep 也是：这一 tick 只把"睡觉"发起出去，之后每 tick 等
-        /// `Game1.Date.TotalDays` 变大（跨日要淡黑 + 存档 + 换天，可能好几十秒）。
-        ///
-        /// buy 也是：`Utility.TryOpenShopMenu` 之后要等 `Game1.activeClickableMenu` 变成 `ShopMenu`
-        /// 才能买（菜单不是同 tick 就挂上的）。买完是同 tick 返回终态。
-        ///
-        /// 【task-129】dismiss_modal 也是：遇到 `ShippingMenu`/存档菜单时要跨 tick ——
-        /// 反射 `okClicked()`（或点 okButton）之后**什么都不做**，等游戏自己把
-        /// 「出货 → 日切保存 → 换天」走完（约十几秒）。普通模态仍是单 tick 返回终态，
-        /// 所以只是"这一类任务被允许跨 tick"，不会让短模态白占预算。
+        /// 历史上必须在这里的：`move_to_location`/`move_to`（`StepMover` 状态机）、`load_save`
+        /// （等世界可读）、`use_tool`（等 `UsingTool` 落回 false）、`sleep`（跨日淡黑+存档+换天）、
+        /// `buy`（等 `ShopMenu` 挂上）、`dismiss_modal`（等存档菜单十几秒）、`upgrade_tool`
+        /// （等 `ClintUpgrade` 菜单挂上，task-205）。
+        /// ⚠️ 漏标的后果：技能以为有 60 秒、调度器在首个 tick 就把 null 交回网络线程
+        /// （条目 013 那类"接口报 ok、实际半途而废"）。
         /// </summary>
-        private static bool IsLongTaskSkill(string skill)
-            => skill == "move_to" || skill == "move_to_location" || skill == "load_save"
-            || skill == "use_tool" || skill == "plant" || skill == "sleep" || skill == "buy"
-            || skill == "dismiss_modal"
-            // 【task-205】铁匠铺升级：`Utility.TryOpenShopMenu("ClintUpgrade",...)` 之后要等
-            // `Game1.activeClickableMenu` 变成 `ShopMenu` 才能选条目/买（菜单不是同 tick 挂上的）。
-            // ⚠️ 不能漏这一条：漏了就成了"技能以为有 60 秒、调度器 8 秒就把 null 交回网络线程"
-            // （条目 013 那类半途而废）。取回 `pickup_tool` 是单 tick，不在此列。
-            || skill == "upgrade_tool";
+        private static bool IsLongTaskSkill(string skill) => SkillCatalog.IsLongTask(skill);
 
         private HttpResponse ServeExec(HttpRequest req)
         {
