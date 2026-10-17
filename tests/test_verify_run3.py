@@ -1085,6 +1085,49 @@ class TestVerifyRun3(unittest.TestCase):
         self.assertTrue(any("与自算不一致" in p and "leftover=12" in p for p in s["problems"]),
                         s["problems"])
 
+    # ------------------------------------------- task-168 规模取舍（`scope_shed`）口径
+    def _shed_rows(self, *, tiles=6, zone="field_ne", write_field=True, verified=False):
+        """造一个「当天认输了 N 格」的账本：journal 有 `scope_shed` 事件，账本按需写字段。"""
+        rows = green_rows(days=1)
+        rows.insert(1, {"event": "scope_shed", "t": 50.0, "zone": zone, "tiles": tiles,
+                        "live_crops": 40, "reason": "水预算不够：今天浇不完 40 株活苗",
+                        "note": "本区认输，明天再补", "_lineno": 1})
+        end = next(r for r in rows if r.get("event") == "day_end")
+        end["verified"] = verified
+        if write_field:
+            end["scope_shed_tiles"] = tiles
+            end["scope_shed"] = {zone: {"tiles": tiles, "since_day": [1, "spring", 10]}}
+        return rows
+
+    def test_scope_shed_without_ledger_field_is_caught(self):
+        """journal 里认输过而账本没写 `scope_shed_tiles` ⇒ 账目不可信（缺失≠通过）。"""
+        rows = self._shed_rows(write_field=False)
+        ok, s = self.check(rows, days=0)
+        self.assertTrue(
+            any("scope_shed" in p and "账本没写 scope_shed_tiles" in p for p in s["problems"]),
+            s["problems"],
+        )
+
+    def test_scope_shed_while_verified_is_a_contradiction(self):
+        """认输过却自称 VERIFIED ⇒ 自相矛盾（认输格仍留在会计里、当天如实不 VERIFIED）。"""
+        rows = self._shed_rows(verified=True)
+        ok, s = self.check(rows, days=0)
+        self.assertTrue(any("认输 6 格却自称 VERIFIED" in p for p in s["problems"]), s["problems"])
+
+    def test_scope_shed_self_consistent_day_is_info_only(self):
+        """如实认输（账本有字段、journal 对得上、当天 verified=false）⇒ 只作 info、不加问题。"""
+        rows = self._shed_rows(verified=False)
+        ok, s = self.check(rows, days=0)
+        self.assertFalse(any("scope_shed" in p for p in s["problems"]), s["problems"])
+        self.assertTrue(any("规模取舍：主动认输 6 格" in i for i in s["infos"]), s["infos"])
+
+    def test_legacy_ledger_without_scope_shed_is_not_flagged(self):
+        """task-168 之前的旧账本（既无事件也无字段）⇒ 不表态，历史判决不许翻案。"""
+        ok, s = self.check(green_rows())
+        self.assertTrue(ok, s.get("problems"))
+        self.assertFalse(any("规模取舍" in i for i in s["infos"]), s["infos"])
+        self.assertFalse(any("scope_shed" in p for p in s["problems"]), s["problems"])
+
 
 if __name__ == "__main__":
     unittest.main()

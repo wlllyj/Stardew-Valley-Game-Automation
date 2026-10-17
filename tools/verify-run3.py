@@ -317,6 +317,10 @@ def build_days(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "plot_pending",
                     "plot_pending_by_kind",
                     "deferred_tiles",
+                    # task-168（规模取舍）：日级快照 + 认输格数（自述，必须与 journal
+                    # `scope_shed` 逐条对上；认输格仍留在会计里 ⇒ 当天如实不 VERIFIED）。
+                    "scope_shed",
+                    "scope_shed_tiles",
                 )
             }
             fin_key = day_key({"final": cur["final"]}) if cur["final"] else "?"
@@ -435,6 +439,21 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
             frontier_by_day.setdefault(_cur_key3, []).append(bool(r.get("acted")))
         else:
             neighbor_by_day[_cur_key3] = neighbor_by_day.get(_cur_key3, 0) + 1
+
+    # task-168（Lead 2026-10-17）：规模取舍 `scope_shed`（策略性认输）的口径核对。认输是**如实**、
+    # 不是豁免额度：`day_end.scope_shed_tiles` 是自述，必须与 journal `scope_shed` 事件对得上；
+    # 且认输过的日子**不得**自称 VERIFIED（与 analyzer 侧同一条 ⚠，见
+    # `docs/_analyze-longrun-caliber.md` §3.29）。旧账本（task-168 之前）没有该字段也没有该事件
+    # ⇒ 两边都缺时**不表态**（缺失≠通过，但也不许因此把历史账本翻红）。
+    shed_by_day: dict[tuple[str, Any], list[dict[str, Any]]] = {}
+    _cur_key4: tuple[str, Any] | None = None
+    for r in rows:
+        if r.get("event") == "day_start":
+            _cur_key4 = (day_key(r), r.get("_lineno"))
+            continue
+        if _cur_key4 is None or r.get("event") != "scope_shed":
+            continue
+        shed_by_day.setdefault(_cur_key4, []).append(r)
 
     # 0. 时间轴自洽（deputy-lead `docs/_verify-run3-limits.md` 盲区 B2）：t 回退只记信息项。
     #    理由：t 是 longrun 自己的 time.time() 读数，系统时钟回拨（NTP）会让真长跑也"回退"，
@@ -742,6 +761,42 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
             )
         if d["verified"] is False:
             problems.append(f"[{name}] day_end verified=false")
+
+        # task-168：规模取舍（`scope_shed`）—— 认输只作 info，但两条不许含糊：
+        # ①账本自述 vs journal 逐条对不上 ⇒ 账目不可信（缺失≠通过）；②认输过的日子自称
+        # VERIFIED ⇒ 自相矛盾（认输格仍留在会计里、当天如实不 VERIFIED）。
+        shed_events = shed_by_day.get(sess) or []
+        shed_self_tiles = sum(int(e.get("tiles") or 0) for e in shed_events)
+        shed_field_raw = end_stats.get("scope_shed_tiles")
+        shed_field = int(shed_field_raw) if isinstance(shed_field_raw, (int, float)) else None
+        shed_snapshot = end_stats.get("scope_shed")
+        if shed_field is None and shed_self_tiles:
+            problems.append(
+                f"[{name}] journal 里有 {len(shed_events)} 次 scope_shed（共 {shed_self_tiles} 格）"
+                "而账本没写 scope_shed_tiles ⇒ 账目不可信（缺失 ≠ 通过）"
+            )
+        elif shed_field is not None:
+            if shed_self_tiles != shed_field:
+                problems.append(
+                    f"[{name}] scope_shed 自述 {shed_field} 格 vs journal 自算 {shed_self_tiles} 格"
+                    "（认输量对不上 ⇒ 账目不可信）"
+                )
+            if shed_field:
+                zones = "、".join(sorted({str(e.get("zone") or "?") for e in shed_events})) or "（journal 未记区名）"
+                snap = "有" if isinstance(shed_snapshot, dict) and shed_snapshot else "缺失"
+                infos.append(
+                    f"[{name}] 规模取舍：主动认输 {shed_field} 格（{zones}）—— 只作 info"
+                    f"（认输格仍留在会计里、当天如实不 VERIFIED）；day_end.scope_shed 快照={snap}"
+                )
+                if d["verified"] is True:
+                    problems.append(
+                        f"[{name}] 认输 {shed_field} 格却自称 VERIFIED（scope_shed 与 verified 自相矛盾）"
+                    )
+                if checks.get("watered_outdoor") is True:
+                    infos.append(
+                        f"[{name}] 认输了 {shed_field} 格但 checks.watered_outdoor=true"
+                        "（供复核：认输格是否被算作「已浇」）"
+                    )
 
         # task-68 信息项（不改结论）：被围住 vs 真不可达要分得开；开路证据与"零动作收工"要看得见。
         self_enc = enc_by_day.get(sess) or set()
