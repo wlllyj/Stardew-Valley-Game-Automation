@@ -136,6 +136,46 @@ namespace AgentFarm.Bridge.Tests
                   clean.Length == 1 && clean[0][0] == 1 && clean[0][1] == 2 && !cleanFlag,
                   "残缺坐标没被跳过");
 
+            // 【task-208】显式应答选择规则（`AnswerRules`，纯逻辑行为断言）。
+            // 铁匠铺升级要"选第几个/选哪一句"，指错了必须失败 —— 绝不许悄悄退回自动挑 Yes。
+            string[] answerTexts = { "Yes", "No", "Upgrade" };
+            string[] answerKeys = { "yes", "no", "upgrade" };
+
+            AnswerRules.AnswerPick byIndex = AnswerRules.Pick(2, null, answerTexts, answerKeys);
+            Check("t208_index_hit", byIndex.Status == AnswerRules.StatusFound && byIndex.Index == 2,
+                  "index 2 did not resolve to the third option");
+
+            AnswerRules.AnswerPick byText = AnswerRules.Pick(null, "UPGR", answerTexts, answerKeys);
+            Check("t208_text_hit_is_case_insensitive_substring",
+                  byText.Status == AnswerRules.StatusFound && byText.Index == 2,
+                  "case-insensitive substring match failed");
+
+            AnswerRules.AnswerPick missing = AnswerRules.Pick(null, "sell", answerTexts, answerKeys);
+            Check("t208_missing_text_fails_closed",
+                  missing.Status == AnswerRules.StatusNotFound && missing.Index == -1
+                  && missing.Note != null && missing.Note.Contains("Upgrade"),
+                  "unknown text must fail with choice_not_found and list the options (no fallback)");
+
+            AnswerRules.AnswerPick ambiguous = AnswerRules.Pick(null, "e", answerTexts, answerKeys);
+            Check("t208_ambiguous_text_fails_closed",
+                  ambiguous.Status == AnswerRules.StatusAmbiguous && ambiguous.Index == -1,
+                  "multiple matches must fail with choice_ambiguous");
+
+            AnswerRules.AnswerPick autoPick = AnswerRules.Pick(null, null, answerTexts, answerKeys);
+            Check("t208_no_explicit_args_keeps_old_behavior",
+                  autoPick.Status == AnswerRules.StatusAuto && autoPick.Index == -1,
+                  "no args must yield auto (old behaviour), not a guessed option");
+
+            AnswerRules.AnswerPick both = AnswerRules.Pick(1, "No", answerTexts, answerKeys);
+            Check("t208_index_and_text_are_mutually_exclusive",
+                  both.Status == AnswerRules.StatusAmbiguous && both.Index == -1,
+                  "index + text together must be rejected");
+
+            AnswerRules.AnswerPick noQuestion = AnswerRules.Pick(0, null, new string[0], new string[0]);
+            Check("t208_no_options_is_no_question",
+                  noQuestion.Status == AnswerRules.StatusNoQuestion && noQuestion.Index == -1,
+                  "empty responses must fail with no_question");
+
             Console.WriteLine(_failed == 0
                 ? $"OK {_total} 断言全部通过"
                 : $"FAILED {_failed} 条断言不通过（共 {_total} 条）");

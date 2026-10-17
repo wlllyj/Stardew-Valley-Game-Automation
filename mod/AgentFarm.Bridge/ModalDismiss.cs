@@ -25,6 +25,12 @@ namespace AgentFarm.Bridge
         /// 只看"菜单没了"就会把这种永久停摆报成成功 —— 这是无人值守最怕的失败形态。
         /// </summary>
         public bool WorldResumed = true;
+
+        /// <summary>
+        /// 【task-208】实际选中项的文本（审计用；没有选中任何选项时为 null）。
+        /// 旧行为（自动挑否）也会填；fail-closed 的失败路径不填。
+        /// </summary>
+        public string ChosenAnswer;
     }
 
     /// <summary>
@@ -84,13 +90,47 @@ namespace AgentFarm.Bridge
             "no", "cancel", "close", "never", "否", "不", "取消",
         };
 
-        /// <summary>主线程调用：关闭当前模态。绝不抛异常。</summary>
+        /// <summary>主线程调用：关闭当前模态（**旧行为**：提问时自动挑否/最后一项）。绝不抛异常。</summary>
         public static ModalDismissResult Dismiss()
         {
+            return Dismiss(null, null);
+        }
+
+        /// <summary>
+        /// 主线程调用：关闭当前模态；给了 <paramref name="answerIndex"/> 或
+        /// <paramref name="answerText"/> 时**按显式应答**（task-208）。
+        ///
+        /// 【语义】两个参数都不给 ⇒ 与 <see cref="Dismiss()"/> 逐字相同（自动挑否/最后一项）。
+        /// 给了 ⇒ 只在「当前是提问对话框且有可选项」时生效；否则 fail-closed：
+        /// `no_question` / `choice_not_found` / `choice_ambiguous` 都会如实失败，
+        /// **绝不**退回自动挑 Yes（铁匠铺升级、职业选择这类不可逆决定不允许猜）。
+        /// </summary>
+        public static ModalDismissResult Dismiss(int? answerIndex, string answerText)
+        {
+            bool explicitChoice = answerIndex.HasValue || !string.IsNullOrWhiteSpace(answerText);
             try
             {
                 IClickableMenu menu = null;
                 try { menu = Game1.activeClickableMenu; } catch { }
+
+                // ---- 显式应答（task-208）----
+                // 前置判据先做完：没有模态 / 不是对话 ⇒ no_question（不去碰别的模态）。
+                if (explicitChoice)
+                {
+                    string request = AnswerRules.DescribeRequest(answerIndex, answerText);
+                    if (menu == null)
+                    {
+                        return Finish(false, AnswerRules.StatusNoQuestion,
+                            $"指定了对话应答（{request}），但当前没有打开的模态 ⇒ 不猜、不退回自动挑 Yes");
+                    }
+                    if (!(menu is DialogueBox dlg))
+                    {
+                        return Finish(false, AnswerRules.StatusNoQuestion,
+                            $"指定了对话应答（{request}），但当前模态是 {menu.GetType().Name}（不是提问对话框）"
+                            + " ⇒ 不猜、不退回自动挑 Yes");
+                    }
+                    return DismissDialogueExplicit(dlg, answerIndex, answerText);
+                }
 
                 // ---- 情况 3：没有模态 ----
                 if (menu == null)
@@ -182,7 +222,73 @@ namespace AgentFarm.Bridge
                 ? $"已关闭对话框（选“{chosenText}”：{answerNote}{closeNote}）"
                 : $"已关闭对话（{answerNote}{closeNote}）";
 
-            return Finish(true, "ok", $"{head}：“{question}”{convention}");
+            ModalDismissResult auto = Finish(true, "ok", $"{head}：“{question}”{convention}");
+            // 【task-208】审计字段：旧行为也如实报出"实际选了哪一项"（非提问时为空）。
+            auto.ChosenAnswer = string.IsNullOrEmpty(chosenText) ? null : chosenText;
+            return auto;
+        }
+
+        /// <summary>
+        /// 【task-208】按**显式应答**关掉一个提问对话框：命中后仍只走游戏自己的
+        /// `answerDialogue(Response)`（`AnswerWith`），然后按状态正确的顺序关框。
+        ///
+        /// 【fail-closed】指定了却对不上（没有可选项 / 找不到 / 多命中）⇒ 如实失败，
+        /// **绝不**退回 `DismissDialogue` 的"自动挑否"——那是替人做决定。
+        /// </summary>
+        private static ModalDismissResult DismissDialogueExplicit(
+            DialogueBox box, int? answerIndex, string answerText)
+        {
+            string question = null;
+            try { question = box.getCurrentString(); } catch { }
+
+            Response[] responses = null;
+            try { responses = box.responses; } catch { }
+
+            bool isQuestion = false;
+            try { isQuestion = box.isQuestion; } catch { }
+
+            string request = AnswerRules.DescribeRequest(answerIndex, answerText);
+
+            if (!isQuestion || responses == null || responses.Length == 0)
+            {
+                return Finish(false, AnswerRules.StatusNoQuestion,
+                    $"指定了对话应答（{request}），但当前对话框不是提问/没有可选项"
+                    + $"（isQuestion={isQuestion}，responses={(responses == null ? 0 : responses.Length)}）"
+                    + " ⇒ 不猜、不退回自动挑 Yes");
+            }
+
+            var texts = new string[responses.Length];
+            var keys = new string[responses.Length];
+            for (int i = 0; i < responses.Length; i++)
+            {
+                Response item = responses[i];
+                try { texts[i] = item?.responseText; } catch { texts[i] = null; }
+                try { keys[i] = item?.responseKey; } catch { keys[i] = null; }
+            }
+
+            AnswerRules.AnswerPick pick = AnswerRules.Pick(answerIndex, answerText, texts, keys);
+
+            if (pick.Status != AnswerRules.StatusFound)
+            {
+                string status = pick.Status == AnswerRules.StatusNoQuestion
+                    ? AnswerRules.StatusNoQuestion
+                    : pick.Status;
+                return Finish(false, status,
+                    $"显式应答失败（{request}）：{pick.Note}；对话框原文：“{question}”"
+                    + " ⇒ 不猜、不退回自动挑 Yes");
+            }
+
+            Response chosen = responses[pick.Index];
+            string chosenText = texts[pick.Index] ?? keys[pick.Index] ?? "";
+            if (string.IsNullOrEmpty(chosenText)) chosenText = chosen?.responseKey ?? "";
+
+            string answerNote = AnswerWith(chosen);
+            string closeNote = CloseDialogueBox(box);
+
+            ModalDismissResult result = Finish(true, "ok",
+                $"已关闭对话框（显式选「{chosenText}」（{pick.Note}）：{answerNote}{closeNote}）：“{question}”");
+            result.ChosenAnswer = string.IsNullOrEmpty(chosenText) ? null : chosenText;
+            return result;
         }
 
         /// <summary>

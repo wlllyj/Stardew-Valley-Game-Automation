@@ -972,6 +972,26 @@ namespace AgentFarm.Bridge
         /// （Mod 直接拒绝），避免"上游 bug 把种子/工具卖了"。
         /// </summary>
         [JsonPropertyName("sellWhitelist")] public string[] SellWhitelist { get; set; }
+
+        /// <summary>
+        /// <c>dismiss_modal</c> 专用（task-208）：要应答的选项**0 基下标**（对应 `ui.dialogueResponses[]`
+        /// 的顺序）。与 <see cref="AnswerText"/> 互斥。
+        ///
+        /// 【纪律】两个都不给 ⇒ **完全保持旧行为**（自动挑否/最后一项），一行不许改；
+        /// 给了但指错 ⇒ 必须失败（`choice_not_found` / `choice_ambiguous` / `no_question`），
+        /// **绝不许悄悄退回自动挑 Yes** —— 那等于替人做了不可逆决定（铁匠铺升级、职业选择都是这类）。
+        /// 命中后仍只走游戏自己的 `answerDialogue(Response)`（见 `ModalDismiss.AnswerWith`），
+        /// 禁止注入确认键（Enter/Space 经 `Options.actionButton` 会变成点 (0,0)，睡觉链踩过）。
+        /// </summary>
+        [JsonPropertyName("answerIndex")] public int? AnswerIndex { get; set; }
+
+        /// <summary>
+        /// <c>dismiss_modal</c> 专用（task-208）：按**文本子串**匹配要应答的选项
+        /// （大小写不敏感；**唯一命中**才算成功，多命中 ⇒ `choice_ambiguous`）。
+        /// 先看 `responseText`（给玩家看的文字），再看 `responseKey`（程序化 ID）。
+        /// 与 <see cref="AnswerIndex"/> 互斥；失败语义同上（fail-closed，不许退回自动挑）。
+        /// </summary>
+        [JsonPropertyName("answerText")] public string AnswerText { get; set; }
     }
 
     /// <summary>
@@ -1115,6 +1135,13 @@ namespace AgentFarm.Bridge
         /// 非终态（还在等）时不写。【可选字段】null 时序列化省略。
         /// </summary>
         [JsonPropertyName("menuGone")] public bool? MenuGone { get; set; }
+
+        /// <summary>
+        /// <c>dismiss_modal</c> 专用（task-208）：**实际选中项**的文本（审计用）。
+        /// 旧行为（自动挑否）也会填；没有选中任何选项（无对话 / 非对话模态 / fail-closed）时为 null。
+        /// 【可选字段】null 时序列化省略 ⇒ 其它技能回执形状不变。
+        /// </summary>
+        [JsonPropertyName("chosenAnswer")] public string ChosenAnswer { get; set; }
     }
 
     /// <summary>

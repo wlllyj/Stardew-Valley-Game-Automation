@@ -315,26 +315,37 @@ namespace AgentFarm.Bridge
                     // 这两类改走跨 tick 的 wait-only 技能（反射 okClicked() / 点 okButton，然后只等）；
                     // 其它模态仍走原来的单 tick `ModalDismiss.Dismiss()`。
                     // ⇒ 同时必须把 "dismiss_modal" 加进 BridgeHost.IsLongTaskSkill。
-                    if (ShippingMenuDismissSkill.Applies())
-                        return new ShippingMenuDismissSkill(req, world, monitor).Step;
-
-                    // 单 tick 完成的短任务：不返回 null，所以不会被当成跨 tick 长任务。
-                    return () =>
+                    //
+                    // 【task-208】给了 answerIndex / answerText 时走"显式应答"：这时**不**接管
+                    // 出货/存档菜单（ModalDismiss 会以 no_question fail-closed 返回），
+                    // 因为"选第几个选项"对这两类菜单没有语义。
                     {
-                        ModalDismissResult r = ModalDismiss.Dismiss();
-                        return new ExecResponse
+                        int? answerIndex = req?.Args?.AnswerIndex;
+                        string answerText = req?.Args?.AnswerText;
+                        bool explicitAnswer = answerIndex.HasValue
+                                              || !string.IsNullOrWhiteSpace(answerText);
+                        if (!explicitAnswer && ShippingMenuDismissSkill.Applies())
+                            return new ShippingMenuDismissSkill(req, world, monitor).Step;
+
+                        // 单 tick 完成的短任务：不返回 null，所以不会被当成跨 tick 长任务。
+                        return () =>
                         {
-                            // 注意：Ok 与 Status 都由 ModalDismiss 定；世界没恢复时它是
-                            // ok=false + status="world_stuck"，绝不当成普通成功。
-                            Ok = r.Ok,
-                            Status = r.Status,
-                            Skill = "dismiss_modal",
-                            Reason = r.Reason,
-                            Schema = ExecSchema,
-                            WorldResumed = r.WorldResumed,
-                            ElapsedMs = 0,
+                            ModalDismissResult r = ModalDismiss.Dismiss(answerIndex, answerText);
+                            return new ExecResponse
+                            {
+                                // 注意：Ok 与 Status 都由 ModalDismiss 定；世界没恢复时它是
+                                // ok=false + status="world_stuck"，绝不当成普通成功。
+                                Ok = r.Ok,
+                                Status = r.Status,
+                                Skill = "dismiss_modal",
+                                Reason = r.Reason,
+                                Schema = ExecSchema,
+                                WorldResumed = r.WorldResumed,
+                                ChosenAnswer = r.ChosenAnswer,
+                                ElapsedMs = 0,
+                            };
                         };
-                    };
+                    }
 
                 // 【P3 步骤⑤/⑥】`sleep`：**睡到第二天早上** —— 无人值守连续多日的唯一正路。
                 //

@@ -35,6 +35,8 @@
     <Compile Include="..\AgentFarm.Bridge\ClumpRules.cs" />
     <!-- task-199：坐标列表的排序/截断是纯逻辑 ⇒ 自检工程直接编译同一份源码跑行为断言。 -->
     <Compile Include="..\AgentFarm.Bridge\TileListRules.cs" />
+    <!-- task-208：`dismiss_modal` 的显式应答选择（下标/文本子串/歧义）是纯逻辑 ⇒ 同样直接编译。 -->
+    <Compile Include="..\AgentFarm.Bridge\AnswerRules.cs" />
   </ItemGroup>
 
 </Project>
