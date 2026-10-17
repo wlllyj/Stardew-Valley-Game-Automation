@@ -36,7 +36,15 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.34"   # v0.7.34：harvest 三处 Mod 硬缺陷（task-173 真机事故）——
+MOD_VERSION_EXPECTED = "0.7.35"   # v0.7.35：再生作物收获的因果链修正（task-177 真机）——
+                                  # ①`Skills.interact` 的 `acted` 改由**跨观测证据**推导（TileSig /
+                                  #   目标格 `ready` true→false / `farm.readyCrops` 下降 / 背包逐 qid
+                                  #   栈数增加），全不命中才 `false`；②`ExecResponse.actedEvidence`
+                                  #   明写证据来源；③`CropMeta` 把 `forageCrop && whichForageCrop==null`
+                                  #   判成"判不了"；④新增零依赖 C# 自检工程 `mod/AgentFarm.Bridge.Tests`。
+                                  # 脑侧同批（非 Mod）：task-181 harvest 观测差分四择一 + 逐 qid loot；
+                                  # task-168 规模取舍 `reduce_scope`（认输区仍留在会计里、当天不 VERIFIED）。
+                                  # v0.7.34（历史）：harvest 三处 Mod 硬缺陷（task-173 真机事故）——
                                   # ①`harvestMethod` 正解 = public 无参 `Crop.GetHarvestMethod()`
                                   #   （1.6.15 根本没有 `Crop.HarvestMethod` 字段）；键**无条件输出**
                                   #   （`JsonIgnoreCondition.Never`，读不到写 null）；
