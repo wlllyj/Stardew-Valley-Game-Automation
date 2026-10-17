@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- task-223 只读探针：用游戏自带的 MonoGame ContentManager 解 XNB，离线读
+       Data/CraftingRecipes、Data/mail、Data/TriggerActions 等；不启游戏、不写任何游戏文件。 -->
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <PlatformTarget>x64</PlatformTarget>
+    <Nullable>disable</Nullable>
+    <AssemblyName>T223Xnb</AssemblyName>
+    <RootNamespace>T223Xnb</RootNamespace>
+    <OutputType>Exe</OutputType>
+    <GenerateProgramFile>false</GenerateProgramFile>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <GamePath Condition="'$(GamePath)' == ''">D:\Program Files (x86)\Steam\steamapps\common\Stardew Valley</GamePath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="StardewValley">
+      <HintPath>$(GamePath)\Stardew Valley.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="StardewValley.GameData">
+      <HintPath>$(GamePath)\StardewValley.GameData.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MonoGame.Framework">
+      <HintPath>$(GamePath)\MonoGame.Framework.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="xTile">
+      <HintPath>$(GamePath)\xTile.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>
