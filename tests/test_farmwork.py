@@ -2436,5 +2436,120 @@ class TestTask181HarvestEvidence(unittest.TestCase):
         self.assertEqual(worker.harvested, {}, "只动计数、没进背包 ⇒ 白名单必须是空的")
 
 
+class TestTask186MissingTileAndWhitelistBinding(unittest.TestCase):
+    """task-186：收口三处受限假阳面（deputy `cbce266` / `docs/_review-task181-182.md` 的 F1/F3/F5）。
+
+    真机来源 = task-177 真机复测（`docs/_run10-harvest-verify-0734.md`）与 task-183 复核。
+
+    ① **F1（最重要）**：动作后**观测缺格**曾被当成"`crop` 消失 ⇒ 成功" —— 这是新的假绿通道。
+       只在"该格确实出现在动作后的观测里"时才允许走"crop 消失"这一路；缺格 ⇒ 该路**不可用**
+       （另外三路照旧），reason 写明"该格不在观测窗口里"。**同一原则扩到 `ready`/`readySource`
+       两路**：缺格时 `(tv or {})` 给 `None`，旧写法会把"没看见"读成"翻转了/来源变了"，
+       那与"crop 消失"是同一条通道（卡面要求的用例"缺格 + 其余三路全否 ⇒ failed"正是靠这条才成立）。
+    ② **F3/NIT-4**：`_loot_delta` 让**任何**进背包的物品都进 `sell` 白名单 ⇒ 可能误卖无关物品。
+       白名单必须绑在"与目标格变化相关"的收获上（有格子级证据），只靠背包差分不算。
+    ③ **F5**：`readyCrops` 判不了（缺字段 / `-1`）时不许再写"没下降"，要写"无法判定"。
+
+    变异预期（`scratch/_t186_mutate.py`，brain + tests 一起拷临时目录，跑完已删；**实测**）：
+    基线 4/4 绿；**m186a**（`crop_gone` 去掉 `tile_seen` 前置）杀 **2** 条；
+    **m186b**（`ready_flipped`/`source_changed` 去掉 `tile_seen`）杀 **2** 条；
+    **m186c**（白名单改回"有 gained 就加"）杀 **1** 条（缺格但真涨那条）。
+    """
+
+    def _worker(self, w: MiniWorld, bridge_cls=MiniBridge) -> FarmWorker:
+        return FarmWorker(bridge_cls(w), log=lambda _s: None, pause=lambda _s: None)
+
+    @staticmethod
+    def _crop(tile=(62, 15), **kw) -> dict:
+        rec = {"tile": list(tile), "kind": "dirt", "feature": "HoeDirt", "crop": "270",
+               "ripe": True, "ready": True, "harvestMethod": "Grab",
+               "regrowsAfterHarvest": True, "watered": True, "standable": True,
+               "actionable": True}
+        rec.update(kw)
+        return rec
+
+    @staticmethod
+    def _drop_record(w: MiniWorld, tile) -> None:
+        """模拟"动作后这一格不在观测窗口里了"（比 crop 消失更极端：整格看不见）。"""
+        for r in list(w.records):
+            if tuple(r["tile"]) == tuple(tile):
+                w.records.remove(r)
+
+    # ---- ① F1：缺格 + 其余三路全否 ⇒ 必须 failed（不许把"没看见"当"没了"）----
+    def test_missing_tile_after_the_action_is_not_evidence_by_itself(self):
+        w = MiniWorld(records=[self._crop()])
+
+        class _GoneBridge(MiniBridge):
+            def interact(self, tile=None, *, timeout_ms=None):
+                TestTask186MissingTileAndWhitelistBinding._drop_record(self.w, tile)
+                return {"ok": True, "status": "ok", "acted": True}   # Mod 自称动手了
+
+        st = self._worker(w, _GoneBridge).harvest((62, 15))
+        self.assertFalse(st.ok, st.reason)
+        self.assertIn("不在动作后的观测窗口里", st.reason)
+        after = st.after or {}
+        self.assertIs(after.get("tile_seen"), False)
+        self.assertIs(after.get("not_seen"), True)
+        self.assertIs(after.get("whitelist_bound"), False)
+
+    # ---- ② F3：缺格但背包真涨 ⇒ 步骤仍成功，但这批 qid **不许**进白名单 ----
+    def test_missing_tile_with_real_loot_still_succeeds_but_never_whitelists(self):
+        w = MiniWorld(records=[self._crop()])
+
+        class _GoneButLootBridge(MiniBridge):
+            def interact(self, tile=None, *, timeout_ms=None):
+                TestTask186MissingTileAndWhitelistBinding._drop_record(self.w, tile)
+                self.w.inventory.append({"slot": 9, "id": "270", "qualifiedId": "(O)270",
+                                         "name": "Corn", "stack": 1, "isTool": False})
+                return {"ok": True, "status": "ok", "acted": True}
+
+        worker = self._worker(w, _GoneButLootBridge)
+        st = worker.harvest((62, 15))
+        self.assertTrue(st.ok, st.reason)                 # 只有背包差分 ⇒ 仍算收获成功
+        self.assertIn("没有格子级证据", st.reason)
+        self.assertIn("不进出货白名单", st.reason)
+        after = st.after or {}
+        self.assertEqual(after.get("loot"), {"(O)270": 1})
+        self.assertEqual(after.get("loot_whitelisted"), [])
+        self.assertIs(after.get("whitelist_bound"), False)
+        self.assertEqual(worker.harvested, {}, "没有格子级证据 ⇒ 白名单必须是空的（防误卖）")
+
+    # ---- ③ F3 正例：有格子级证据（ready 翻转）⇒ 才允许进白名单 ----
+    def test_tile_level_evidence_binds_the_sell_whitelist(self):
+        w = MiniWorld(records=[self._crop()])
+
+        class _RegrowBridge(MiniBridge):
+            def interact(self, tile=None, *, timeout_ms=None):
+                for r in self.w.records:
+                    if tuple(r["tile"]) == tuple(tile):
+                        r["ready"] = False
+                self.w.inventory.append({"slot": 9, "id": "270", "qualifiedId": "(O)270",
+                                         "name": "Corn", "stack": 1, "isTool": False})
+                return {"ok": True, "status": "ok", "acted": False}
+
+        worker = self._worker(w, _RegrowBridge)
+        st = worker.harvest((62, 15))
+        self.assertTrue(st.ok, st.reason)
+        after = st.after or {}
+        self.assertIs(after.get("tile_seen"), True)
+        self.assertIs(after.get("whitelist_bound"), True)
+        self.assertEqual(after.get("loot_whitelisted"), ["(O)270"])
+        self.assertEqual(worker.harvested, {"(O)270": 1})
+
+    # ---- ④ F5：readyCrops 判不了 ⇒ 文案必须说"无法判定"，不许说"没下降" ----
+    def test_unavailable_ready_crops_says_it_could_not_be_judged(self):
+        w = MiniWorld(records=[self._crop()])          # farm 为空 ⇒ readyCrops 读取不可用
+
+        class _NothingBridge(MiniBridge):
+            def interact(self, tile=None, *, timeout_ms=None):
+                return {"ok": True, "status": "ok", "acted": False}
+
+        st = self._worker(w, _NothingBridge).harvest((62, 15))
+        self.assertFalse(st.ok, st.reason)
+        self.assertIn("farm.readyCrops 无法判定", st.reason)
+        self.assertNotIn("readyCrops 2→1 没下降", st.reason)
+        self.assertNotIn("没下降", st.reason)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

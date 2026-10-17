@@ -5127,6 +5127,13 @@ class LongRun:
         * 每一件都 journal 一条 `sell`（`before`/`after` 全是观测真值），失败如实带 reason 回去。
         """
         assert self.worker is not None
+        # 【task-186 F3/NIT-4】卖之前先把白名单的**来源与核对结果**算出来：白名单 = 今天亲手收获
+        # 且**有格子级证据**（crop 消失 / ready 翻转 / readySource 变化 / 受影响格）的 qid；
+        # 只有背包差分、没有格子级证据的那批已经在 `farmwork.harvest()` 里被挡在白名单外
+        # （它仍算收获成功，只是不进白名单 —— 防误卖与本次动作无关的物品）。
+        # 刻意**不新增事件名**：把来源与数量加进既有的 `sell` 事件（task-134 的教训：加字段安全、
+        # 新增事件名会让 analyzer 的机械枚举漂移）。
+        whitelist = sorted(getattr(self.worker, "harvested", None) or {})
         steps = self.worker.sell_loot(timeout_ms=self.sell_timeout_ms)
         if not steps:
             return False
@@ -5135,7 +5142,9 @@ class LongRun:
             self._journal("sell", ok=st.ok, code=st.code,
                           slot=before.get("slot"), qid=before.get("qid"),
                           stack=before.get("stack"), before=st.before, after=st.after,
-                          reason=st.reason, receipt=st.receipt)
+                          reason=st.reason, receipt=st.receipt,
+                          whitelist=whitelist, whitelist_count=len(whitelist),
+                          whitelist_source="harvest_tile_bound_gained")
         self._actions += len(steps)
         good = [s for s in steps if s.ok]
         bad = [s for s in steps if not s.ok]

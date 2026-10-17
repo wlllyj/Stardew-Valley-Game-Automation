@@ -2284,11 +2284,16 @@ class FarmWorker:
              其余走 `interact`（游戏 `checkAction` → `HoeDirt.performUseAction` → `Crop.harvest`）。
           4. **成功判据 = 下列任一成立**（每条都必须来自动作前后的**观测差分**；Mod 的 `acted`
              只是线索、不算证据 —— task-177 真机里 Mod 报 `no_action` 而那格其实收成了）：
-             a) 该格 `crop` 键消失 / 为 null；
-             b) 该格 `ready` 由 `true` 变 `false`（或 `readySource` 变化）；
+             a) 该格**确实出现在动作后的观测里**、且 `crop` 键消失 / 为 null
+                （task-186 F1：观测缺格 ⇒ 这一路**不可用**，否则"没看见"会被当成"没了"= 假绿）；
+             b) 该格**确实出现在动作后的观测里**、且 `ready` 由 `true` 变 `false`
+                （或 `readySource` 变化）—— 缺格时 `ready`/`readySource` 也给 `None`，
+                同样按"这一路不可用"处理，不许把"没看见"读成"翻转了"；
              c) 背包逐 qualifiedId 差值里出现的该作物物品（**一次动作可能收多格**，见必修 2）；
              d) `farm.readyCrops` 下降。
              四条全不成立 ⇒ `failed`。`reason` 写清命中了哪几条。
+              只有 (c) 成立、没有任何格子级证据（a/b）时步骤仍算成功，但**这批 qid 不进
+              `sell` 白名单**（task-186 F3/NIT-4：白名单必须绑在"与目标格变化相关"的收获上）。
           5. **再生作物**（`regrowsAfterHarvest == true`）收后 `crop` 对象保留、阶段重置 ⇒
              旧判据（只看 crop 消失）系统性假阴性，这正是 run A/B"同日同格 284 次 0 成功"的根因。
         """
@@ -2346,24 +2351,47 @@ class FarmWorker:
         obs = self.snap()
         tv = self.tile_view(obs, tile)
         inv_after = self._inventory_counts(self.player_of(obs))
+        # 【task-186 F1】"crop 消失"这一路**只在动作后真的看见这一格**时才可用。
+        # 旧写法 `not (tv or {}).get("crop")` 把"该格根本没出现在动作后的观测里"（走出 400 格窗口、
+        # 观测截断、模态挡住没取到 tiles）也算成"作物没了 ⇒ 收获成功" —— 这是一条**假绿通道**。
+        # 缺格 ⇒ 这一路不可用（其余三路照旧），既不把真成功判失败、也不制造新的假绿。
+        tile_seen = tv is not None
+        not_seen_note = ("" if tile_seen else
+                         "该格不在动作后的观测窗口里（观测缺格）⇒「crop 消失」这一路不可用，"
+                         "无法据此判成功")
         # 【task-181 必修 1】四选一证据（全部来自动作前后的观测差分）：
-        crop_gone = not (tv or {}).get("crop")
+        crop_gone = tile_seen and not (tv or {}).get("crop")
         ready_after = (tv or {}).get("ready")
-        ready_flipped = (ready_before is True and ready_after is not True)
-        source_changed = (ready_source_before != (tv or {}).get("readySource"))
+        # 【task-186 F1 的同一原则】`ready` / `readySource` 两路**也必须看见这一格**才算数：
+        # 缺格时 `(tv or {})` 会给 `None`，旧写法会把"没看见"读成"ready 翻转了 / 来源变了" ——
+        # 那和"crop 消失"是同一条假绿通道（卡面要求的用例正是"缺格 + 其余三路全否 ⇒ failed"）。
+        ready_flipped = bool(tile_seen and ready_before is True and ready_after is not True)
+        source_changed = bool(tile_seen and ready_source_before != (tv or {}).get("readySource"))
         gained = self._loot_delta(inv_before, inv_after)
         ready_crops_after = self._ready_crops_count(obs)
         ready_dropped = (isinstance(ready_crops_before, int) and isinstance(ready_crops_after, int)
                          and ready_crops_after < ready_crops_before)
         # 【task-181 必修 2】一次动作可能收多格 ⇒ 用"前后 ready 格集合差分"推断受影响格；
-        # 推不出就如实写 unknown（不许编）。
-        affected = sorted(ready_tiles_before - self._ready_crop_tiles(obs))
-        r.after = {**(self.tile_essence(tv) or {}), "loot": gained, "harvested": gained,
-                   "affected_tiles": [list(t) for t in affected] if affected else "unknown"}
-        if gained:
+        # 推不出就如实写 unknown（不许编）。【task-186】只把**动作后仍然看得见**的格算进来：
+        # 从窗口里消失的格不认领（"没看见"不等于"它变了"），它们由 `tile_seen`/`not_seen` 单独交代。
+        affected = sorted(t for t in (ready_tiles_before - self._ready_crop_tiles(obs))
+                          if self.tile_view(obs, t) is not None)
+        # 【task-186 F3/NIT-4】出货白名单必须与"本次动作的**格子级**证据"捆绑：
+        # 只凭背包差分（可能是别人顺手捡的、别的系统给的）不能证明 qid 与目标格有关 ⇒ 不入白名单。
+        # 这**不是**放宽 `sell`（不卖工具/武器/种子/建材的红线一字不动），而是收紧它的输入。
+        tile_level_evidence = bool(crop_gone or ready_flipped or source_changed or affected)
+        whitelisted: list[str] = []
+        if gained and tile_level_evidence:
             # 【task-42】出货白名单的唯一真源 = 逐 qualifiedId 背包差分（回执不算证据）。
             for qid, n in gained.items():
                 self.harvested[qid] = self.harvested.get(qid, 0) + int(n)
+            whitelisted = sorted(gained)
+        r.after = {**(self.tile_essence(tv) or {}), "loot": gained, "harvested": gained,
+                   "affected_tiles": [list(t) for t in affected] if affected else "unknown",
+                   "loot_whitelisted": whitelisted, "whitelist_bound": bool(tile_level_evidence),
+                   "tile_seen": tile_seen}
+        if not tile_seen:
+            r.after["not_seen"] = True
         evidence: list[str] = []
         if crop_gone:
             evidence.append("该格 crop 已消失")
@@ -2382,8 +2410,13 @@ class FarmWorker:
                          else "；受影响格：unknown")
             if not crop_gone and (ready_flipped or source_changed):
                 r.reason += "；再生作物：crop 对象保留、阶段重置（旧判据只看 crop 消失 ⇒ 假阴性）"
+            if gained and not whitelisted:
+                r.reason += ("；⚠ 背包有新增但**只有背包差分、没有格子级证据** ⇒ 这批 qid "
+                             "不进出货白名单（防误卖与本次动作无关的物品）")
             if not gained:
                 r.reason += "；⚠ 背包没有新增物品（收货可能丢了，不能出货）"
+            if not tile_seen:
+                r.reason += f"；{not_seen_note}"
             return r
         r.code = "failed"
         _mark_status(r, status)     # 渐黑/模态 ⇒ 不封格、不占配额；超时 ⇒ 不封格但占配额
@@ -2393,10 +2426,19 @@ class FarmWorker:
             r.reason = (f"收获请求回「走不到」（{status}）：没有落脚点/没算出路径 ⇒ 不算硬失败；"
                         f"作物还在；{r.receipt}")
             return r
+        # 【task-186 F5】`readyCrops` 判不了时不许写"没下降"（那是**断言了一个没测到的量**）。
+        if ready_crops_before is None or ready_crops_after is None:
+            ready_note = "farm.readyCrops 无法判定（字段缺失/该 Mod 版本不提供）"
+        elif ready_crops_before < 0 or ready_crops_after < 0:
+            ready_note = (f"farm.readyCrops 无法判定（读数 {ready_crops_before}→{ready_crops_after}，"
+                          "缺字段时记 -1）")
+        else:
+            ready_note = f"farm.readyCrops {ready_crops_before}→{ready_crops_after} 没下降"
         self_note = ("；Mod 回执说没有真的动手（acted=False —— 只是线索、不是判据；"
                      "task-177 真机里它对再生作物误报过 no_action）") if acted is False else ""
         r.reason = (f"游戏口径可收但四条判据全不成立（交互/挥镰后世界没变；作物还在、ready 没翻转、"
-                    f"背包没有新增物品、farm.readyCrops 没下降）"
+                    f"背包没有新增物品、{ready_note}）"
+                    f"{f'；{not_seen_note}' if not_seen_note else ''}"
                     f"{f'；Mod status={status}' if status else ''}"
                     f"{self_note}"
                     f"{f'；{r.receipt}' if r.receipt else ''}")

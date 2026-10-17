@@ -170,3 +170,18 @@ dotnet run --project .\mod\AgentFarm.Bridge.Tests\AgentFarm.Bridge.Tests.csproj 
 ## §11 越界
 
 只写 `docs/_review-task181-182.md`、`scratch/_t183_probe.py`、`scratch/_t183_mutate.py`（+ `scratch/_t183_*` 输出 txt）与临时副本目录 `scratch/_t183_mut/`（跑完自删）。未碰游戏/桥、未 deploy、未改任务板与开发日志；生产代码只读（变异全部在副本里做，已核对工作树 `brain/`/`mod/` 无需恢复）。
+
+---
+
+## §12 task-186 收口记录（dev-coder，2026-10-17）
+
+task-186 按本文件的 F1/F3/F5 三条必修与 NIT-4 收尾，落地如下（详细读数见 task-186 交付消息）：
+
+| 条目 | 处理 | 落点 |
+| --- | --- | --- |
+| **F1** 动作后观测缺格被当"crop 消失 ⇒ 成功" | 只在**该格确实出现在动作后观测里**时才允许走"crop 消失"这一路；**同一原则扩到 `ready`/`readySource` 两路**（缺格时 `(tv or {})` 给 `None`，旧写法会把"没看见"读成"翻转了/来源变了"，与 crop 路是同一条假绿通道）；`affected` 只认动作后**仍看得见**的格 | `brain/agentfarm/farmwork.py` `harvest()` 判据段 |
+| **F3 / NIT-4** 白名单污染 | 白名单改为绑定"与目标格变化相关"的收获：**只有背包差分、没有格子级证据**（crop 消失 / ready 翻转 / readySource 变化 / 受影响格）的那批 qid **不进** `worker.harvested`（步骤仍算收获成功）；`sell` 事件新增 `whitelist` / `whitelist_count` / `whitelist_source` 三个**字段**（刻意不新增事件名，避免 analyzer 机械枚举漂移） | `farmwork.py` 白名单累加 + `longrun.py` `_ship_loot` |
+| **F5** 措辞诚实 | `readyCrops` 缺失 ⇒ "farm.readyCrops 无法判定（字段缺失/该 Mod 版本不提供）"；读数 `< 0` ⇒ 同样写"无法判定（读数 x→y）"；只有两边都是非负 `int` 才写"x→y 没下降" | `farmwork.py` 失败文案 |
+| **NIT-2 ＝ F4**（仅 `readySource` 标签变化即判成功） | **有意口径，不修**：卡面必修 2 的判据 b) 明文包含"或 `readySource` 变化"（task-177 真机里 `readySource` 由 `game` 变 `fields` 正是收获发生的信号之一）。本文件 §7 的 NIT-2 行保留为记录，**不视为待修**；若将来要更严，按该行的备选方案（降为加分说明）另开卡 | 本文档 |
+
+变异实测（`scratch/_t186_mutate.py`，brain+tests 一起拷临时目录，跑完已删）：基线 4/4 绿；`m186a`（`crop_gone` 去掉 `tile_seen`）杀 2、`m186b`（`ready`/`readySource` 两路去掉 `tile_seen`）杀 2、`m186c`（白名单改回"有 gained 就加"）杀 1。
