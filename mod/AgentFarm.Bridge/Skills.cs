@@ -123,8 +123,14 @@ namespace AgentFarm.Bridge
                 // 【P3 步骤③】用工具对某一格动手（砍树枝/敲石头/割草/锄地/浇水）。
                 // 跨 tick 长任务：挥动 → 等 player.UsingTool 落回 false → 看目标格清没清 → 没清再挥。
                 // ⇒ BridgeHost 的 isLongTask 判据必须包含它（见 BridgeHost.IsLongTaskSkill）。
+                //
+                // 【task-188 必修 1（R1）】回执**必须**与 `interact` 一样带 `acted` + `actedEvidence`：
+                // 0.7.35 只有 `interact` 有跨观测证据，`use_tool` 没有 ⇒ 镰刀类收获（走工具路）的
+                // 判据(2)无法满足（task-184 真机 R1）。这里不重写技能，而是在 **exec 层包一层**
+                // 跨观测快照：起手前拍一张、终态再拍一张，按同一套四类证据判 `acted`（见
+                // `ActedEvidenceOf`）；证据判不出来（快照失败）⇒ `acted=false`，fail-closed。
                 case "use_tool":
-                    return new UseToolSkill(req, world, monitor).Step;
+                    return WithActedEvidence(new UseToolSkill(req, world, monitor).Step, req);
 
                 // 【P3 步骤④】选物品（短任务）与播种（跨 tick 长任务，BridgeHost.IsLongTaskSkill 也要加）
                 case "select_item":
@@ -264,11 +270,8 @@ namespace AgentFarm.Bridge
                                             && readyCropsAfter < readyCropsBefore;
                         bool inventoryGrew = InventoryGrew(invBefore, invAfter);
 
-                        string evidence = null;
-                        if (tileChanged) evidence = "tile";
-                        else if (readyFlipped || readySourceChanged) evidence = "ready";
-                        else if (readyDropped) evidence = "readyCrops";
-                        else if (inventoryGrew) evidence = "inventory";
+                        string evidence = ActedEvidenceOf(tileChanged, readyFlipped, readySourceChanged,
+                                                          readyDropped, inventoryGrew);
 
                         // 拿不准（快照失败）⇒ 不算证据；全都不命中 ⇒ false + no_action
                         // （宁可让人来核，也不许自述成功）。
@@ -514,6 +517,149 @@ namespace AgentFarm.Bridge
                 if (pair.Value > was) return true;
             }
             return false;
+        }
+
+        // ==================================================================
+        //  【task-188 必修 1】跨观测证据：`interact` 与 `use_tool` 共用同一套判据与快照
+        // ==================================================================
+
+        /// <summary>
+        /// 【task-182 必修 1 / task-188 必修 1】四类证据的**唯一判定分支**（`interact` 与 `use_tool` 共用）。
+        /// 口径：格子级优先、全局面垫底；全不命中 ⇒ null（fail-closed）。
+        ///
+        /// ⚠️ 两处必须同源：本方法（文字契约：`tests/test_longrun.py::TestTask182ActedEvidenceAndRules`
+        /// 逐字盯 `Skills.cs`）与纯函数 `ClumpRules.ActedEvidence`（行为契约：`mod/AgentFarm.Bridge.Tests`
+        /// 真跑断言）。改一处必须同时改另一处 —— 行为断言抓不到"只改了文字的那一半"。
+        /// </summary>
+        private static string ActedEvidenceOf(bool tileChanged, bool readyFlipped, bool readySourceChanged,
+                                              bool readyDropped, bool inventoryGrew)
+        {
+            string evidence = null;
+            if (tileChanged) evidence = "tile";
+            else if (readyFlipped || readySourceChanged) evidence = "ready";
+            else if (readyDropped) evidence = "readyCrops";
+            else if (inventoryGrew) evidence = "inventory";
+            return evidence;
+        }
+
+        /// <summary>【task-188 必修 1】跨观测快照：起手前后各拍一张，喂给 `ActedEvidenceOf`。
+        /// 四类证据复用 task-182 的**同一批取数函数**（`TileSig`/`TileReady`/`ReadyCropCount`/
+        /// `InventoryStacks`），不另抄一份。</summary>
+        private readonly struct ActedSnapshot
+        {
+            public readonly string Sig;
+            public readonly bool? Ready;
+            public readonly string ReadySource;
+            public readonly int ReadyCrops;
+            public readonly Dictionary<string, int> Inv;
+
+            public ActedSnapshot(string sig, bool? ready, string readySource, int readyCrops,
+                                 Dictionary<string, int> inv)
+            {
+                this.Sig = sig; this.Ready = ready; this.ReadySource = readySource;
+                this.ReadyCrops = readyCrops; this.Inv = inv;
+            }
+        }
+
+        private static ActedSnapshot TakeActedSnapshot(int x, int y)
+        {
+            var readyInfo = TileReady(x, y);
+            return new ActedSnapshot(TileSig(x, y), readyInfo.Ready, readyInfo.Source,
+                                     ReadyCropCount(), InventoryStacks());
+        }
+
+        /// <summary>【task-188 必修 1】两张快照 ⇒ 证据名 + 人可读的探针文本。
+        /// **快照拿不到的那一条不算命中**（`null` ⇒ `ClumpRules.ActedEvidence` 不当真），fail-closed。</summary>
+        private static string EvidenceBetween(ActedSnapshot before, ActedSnapshot after, out string probeText)
+        {
+            bool? tileChanged = (before.Sig != null && after.Sig != null)
+                ? (bool?)!string.Equals(before.Sig, after.Sig, StringComparison.Ordinal)
+                : null;
+            bool? readyFlipped = (before.Ready.HasValue && after.Ready.HasValue)
+                ? (bool?)(before.Ready.Value && !after.Ready.Value)
+                : null;
+            bool? readySourceChanged = (before.ReadySource != null && after.ReadySource != null)
+                ? (bool?)!string.Equals(before.ReadySource, after.ReadySource, StringComparison.Ordinal)
+                : null;
+            bool? readyDropped = (before.ReadyCrops >= 0 && after.ReadyCrops >= 0)
+                ? (bool?)(after.ReadyCrops < before.ReadyCrops)
+                : null;
+            bool? inventoryGrew = InventoryGrew(before.Inv, after.Inv);
+
+            probeText =
+                $"acted 证据：tileChanged={FmtBool(tileChanged)}；"
+                + $"ready={FmtBool(before.Ready)}→{FmtBool(after.Ready)}，"
+                + $"readySource[{before.ReadySource ?? "?"} → {after.ReadySource ?? "?"}]（changed={FmtBool(readySourceChanged)}）；"
+                + $"readyCrops[{before.ReadyCrops} → {after.ReadyCrops}]（dropped={FmtBool(readyDropped)}）；"
+                + $"inventoryGrew={FmtBool(inventoryGrew)}";
+            return ClumpRules.ActedEvidence(tileChanged, readyFlipped, readySourceChanged, readyDropped, inventoryGrew);
+        }
+
+        private static string FmtBool(bool? v) => v.HasValue ? (v.Value ? "true" : "false") : "?";
+
+        /// <summary>【task-188 必修 1】证据目标格：`args.tile` 优先；省略时用"玩家面朝的那一格"
+        /// （与 `UseToolSkill.Begin()` 的解析规则一致）。</summary>
+        private static void ResolveActedTarget(ExecRequest req, out int x, out int y)
+        {
+            x = 0; y = 0;
+            int[] tile = req?.Args?.Tile;
+            if (tile != null && tile.Length >= 2) { x = tile[0]; y = tile[1]; return; }
+            try
+            {
+                Farmer who = Game1.player;
+                if (who == null) return;
+                x = who.TilePoint.X; y = who.TilePoint.Y;
+                switch (who.FacingDirection)
+                {
+                    case 0: y--; break;
+                    case 1: x++; break;
+                    case 2: y++; break;
+                    default: x--; break;
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 【task-188 必修 1】给"会改世界的跨 tick 技能"包一层跨观测证据：
+        /// 第一次被调用前拍 before（此时还没起手），终态再拍 after，按同一套四类证据填
+        /// `Acted`/`ActedEvidence`。
+        ///
+        /// **fail-closed**：证据为空而技能自称 `Ok=true` ⇒ 降级成 `Ok=false`/`status="no_action"`
+        /// （与 `interact` 同一条纪律：宁可让人来核，也不许自述成功）；其余状态码
+        /// （`timeout`/`tool_ineffective`/`precondition_failed`/`unreachable`/…）**原样保留**
+        /// —— 它们是脑侧已有的分类口径，不许在这里被改写。
+        /// </summary>
+        private static Func<object> WithActedEvidence(Func<object> inner, ExecRequest req)
+        {
+            int tx = int.MinValue, ty = int.MinValue;
+            ActedSnapshot before = default;
+            bool captured = false;
+            return () =>
+            {
+                if (!captured)
+                {
+                    ResolveActedTarget(req, out tx, out ty);
+                    before = TakeActedSnapshot(tx, ty);
+                    captured = true;
+                }
+                object raw = inner();
+                if (raw == null) return null;
+                if (raw is ExecResponse resp)
+                {
+                    ActedSnapshot after = TakeActedSnapshot(tx, ty);
+                    string evidence = EvidenceBetween(before, after, out string probeText);
+                    resp.Acted = ClumpRules.Acted(evidence);
+                    resp.ActedEvidence = evidence;
+                    if (resp.Ok && !resp.Acted.Value)
+                    {
+                        resp.Ok = false;
+                        resp.Status = "no_action";
+                    }
+                    resp.Reason = (resp.Reason ?? "") + "；" + probeText;
+                }
+                return raw;
+            };
         }
 
         /// <summary>已知技能名（用于区分 unknown_skill 与 not_implemented）。</summary>

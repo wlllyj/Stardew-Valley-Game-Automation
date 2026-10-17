@@ -20,9 +20,11 @@ namespace AgentFarm.Bridge.Tests
     internal static class Program
     {
         private static int _failed;
+        private static int _total;
 
         private static void Check(string name, bool ok, string detail)
         {
+            _total++;
             if (ok)
             {
                 Console.WriteLine("  ok  " + name);
@@ -74,9 +76,43 @@ namespace AgentFarm.Bridge.Tests
             Check("fields_path_still_works_after_the_game_branch", okFallback,
                   "兜底路径被提前 return 短路了（m178b 形态：fail-closed 过头）");
 
+            // ---- task-188 必修 1：`acted` 的跨观测证据判据（与 Skills.ActedEvidenceOf 同源）------
+            // ① 世界真的变了 ⇒ 有证据（acted=true）且证据名非空；
+            Check("t188_world_change_yields_evidence",
+                  ClumpRules.Acted(ClumpRules.ActedEvidence(true, null, null, null, null)),
+                  "有世界变化却判成没动手（会把成功误报成 acted=false）");
+            Check("t188_evidence_name_is_tile",
+                  ClumpRules.ActedEvidence(true, false, false, false, false) == "tile",
+                  "tile 证据没落名");
+            // ② 全不命中 ⇒ 没证据（acted=false，fail-closed）；
+            Check("t188_no_change_yields_no_evidence",
+                  !ClumpRules.Acted(ClumpRules.ActedEvidence(false, false, false, false, false)),
+                  "什么都没变却给了证据（假 acted ⇒ task-173 的谎报形态）");
+            // ③ 证据拿不到（快照失败 = null）⇒ 也不许算 acted（判不出来 ≠ true）；
+            Check("t188_unknown_snapshots_are_not_acted",
+                  !ClumpRules.Acted(ClumpRules.ActedEvidence(null, null, null, null, null)),
+                  "快照拿不到却算 acted=true");
+            // 优先级：格子级 > ready > readyCrops > inventory（全命中取最强者）
+            Check("t188_priority_tile_first",
+                  ClumpRules.ActedEvidence(true, true, true, true, true) == "tile",
+                  "优先级错：应取 tile");
+            Check("t188_priority_ready_over_readyCrops",
+                  ClumpRules.ActedEvidence(false, true, false, true, true) == "ready",
+                  "优先级错：应取 ready");
+            Check("t188_priority_readyCrops_over_inventory",
+                  ClumpRules.ActedEvidence(false, false, false, true, true) == "readyCrops",
+                  "优先级错：应取 readyCrops");
+            Check("t188_inventory_is_the_last_resort",
+                  ClumpRules.ActedEvidence(false, false, false, false, true) == "inventory",
+                  "inventory 弱证据没兜住");
+            // readySource 变化单独也算格子级 ready 证据（再生作物唯一会动的那条）
+            Check("t188_ready_source_change_is_ready_evidence",
+                  ClumpRules.ActedEvidence(false, false, true, false, false) == "ready",
+                  "readySource 变化没算证据");
+
             Console.WriteLine(_failed == 0
-                ? "OK 18 断言全部通过"
-                : $"FAILED {_failed} 条断言不通过");
+                ? $"OK {_total} 断言全部通过"
+                : $"FAILED {_failed} 条断言不通过（共 {_total} 条）");
             return _failed == 0 ? 0 : 1;
         }
     }

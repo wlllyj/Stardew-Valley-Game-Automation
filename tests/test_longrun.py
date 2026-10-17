@@ -9071,6 +9071,99 @@ class TestTask182ClumpRulesBehaviour(unittest.TestCase):
         self.assertIn("OK", proc.stdout)
 
 
+class TestTask188UseToolActed(unittest.TestCase):
+    """【task-188】`use_tool` 也要带跨观测证据（R1）+ 原物文案不许空（R4）。
+
+    来源：task-184 真机复测（`docs\\_run10-harvest-verify-0735.md`）R1/R4。
+    0.7.35 只有 `interact` 有跨观测证据 ⇒ **镰刀类收获**（走 `use_tool` 工具路径，task-170）
+    的回执里没有 `acted`/`actedEvidence`，脑侧拿不到线索；而 R4 更直白：真机回执印出
+    `该格原本是 （空）` —— 那格明明长着草（草是**地形特征**，`loc.objects` 里没有条目 ⇒ 旧写法
+    `ObjectIdAt` 恒 null）。
+
+    本类只管**契约与结构**；"判据行为对不对"由 `TestTask182ClumpRulesBehaviour` 真跑 C# 断言
+    （task-188 的 `ClumpRules.ActedEvidence`/`Acted` 已并入那份自检工程，18 → **26** 条断言）。
+
+    变异实测（`scratch/_t188_mutate.py`：`brain/`+`tests/`+`mod/` 一起拷临时目录，跑完已删）：
+      * 基线：C# 自检 rc=0 / `OK 26 断言全部通过`，本类 rc=0；
+      * **m188a**（纯函数 `ActedEvidence` 恒返回 `"tile"` ⇒ acted 恒 true）⇒ C# 自检杀 **7** 条；
+      * **m188b**（纯函数恒返回 `null` ⇒ actedEvidence 恒空）⇒ C# 自检杀 **8** 条；
+      * **m188c**（wrapper 里 `resp.Acted = true`）⇒ 本类杀 1；
+      * **m188d**（wrapper 里不落 `ActedEvidence`）⇒ 本类杀 1；
+      * **m188e**（R4 退回 `（空）` 文案）⇒ 本类杀 1。
+    """
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def _src(self, name: str) -> str:
+        return (self.ROOT / "mod" / "AgentFarm.Bridge" / name).read_text(encoding="utf-8")
+
+    # ---------------------------------------------------------------- R1：exec 层包一层证据
+    def test_use_tool_is_wrapped_with_the_shared_evidence_probe(self):
+        skills = self._src("Skills.cs")
+        self.assertIn("WithActedEvidence(new UseToolSkill(req, world, monitor).Step, req)", skills,
+                      "`use_tool` 必须在 exec 层包上跨观测证据（否则镰刀类收获拿不到 acted）")
+        self.assertIn("private static Func<object> WithActedEvidence(Func<object> inner, ExecRequest req)", skills)
+        # 起手前拍 before、终态拍 after：两处都要有（少一处就退化成"永远没证据"）
+        self.assertIn("before = TakeActedSnapshot(tx, ty);", skills)
+        self.assertIn("ActedSnapshot after = TakeActedSnapshot(tx, ty);", skills)
+
+    def test_wrapper_is_fail_closed_and_never_uses_err_as_acted(self):
+        skills = self._src("Skills.cs")
+        self.assertIn("resp.Acted = ClumpRules.Acted(evidence);", skills)
+        self.assertIn("resp.ActedEvidence = evidence;", skills)
+        # 证据为空而技能自称 ok ⇒ 降级；不许把 `err == null`（"没抛异常"）当动手
+        self.assertIn("if (resp.Ok && !resp.Acted.Value)", skills)
+        self.assertIn('resp.Status = "no_action";', skills)
+        self.assertNotIn("resp.Acted = err == null", skills)
+        self.assertNotIn("Acted = true", skills)
+
+    def test_both_paths_share_one_decision_function_and_one_pure_mirror(self):
+        skills = self._src("Skills.cs")
+        rules = self._src("ClumpRules.cs")
+        # `interact` 与 `use_tool` 共用同一个判定分支（`ActedEvidenceOf`）……
+        self.assertIn("string evidence = ActedEvidenceOf(tileChanged, readyFlipped, readySourceChanged,", skills)
+        self.assertIn("return ClumpRules.ActedEvidence(tileChanged, readyFlipped, readySourceChanged, "
+                      "readyDropped, inventoryGrew);", skills)
+        # ……而文字契约的那份必须与纯函数逐字同源（纯函数才是行为断言的对象）
+        for line in ('if (tileChanged) evidence = "tile";',
+                     'else if (readyFlipped || readySourceChanged) evidence = "ready";',
+                     'else if (readyDropped) evidence = "readyCrops";',
+                     'else if (inventoryGrew) evidence = "inventory";'):
+            self.assertIn(line, skills)
+        for line in ('if (tileChanged == true) return "tile";',
+                     'if (readyFlipped == true || readySourceChanged == true) return "ready";',
+                     'if (readyDropped == true) return "readyCrops";',
+                     'if (inventoryGrew == true) return "inventory";',
+                     "return null;",
+                     "internal static bool Acted(string evidence) => !string.IsNullOrEmpty(evidence);"):
+            self.assertIn(line, rules)
+
+    # ---------------------------------------------------------------- R4：原物文案不许空
+    def test_original_tile_text_is_described_not_blank(self):
+        use_tool = self._src("UseToolSkill.cs")
+        # 旧写法：只报 objId，地形特征格（草/杂草/树/资源堆）会印成 `（空）`
+        self.assertNotIn('(this._objIdBefore ?? "（空）")', use_tool)
+        self.assertIn("该格原本是 {this.OriginalText()}", use_tool)
+        self.assertIn("this._whatBefore = DescribeTile(target);", use_tool,
+                      "起手**之前**就要拍描述（起手后地形特征可能已经没了）")
+        self.assertIn("private static string DescribeTile(Point p)", use_tool)
+        for marker in ("空（既没有物体也没有地形特征）", "地形特征「", "未知（读不到当前地点）"):
+            self.assertIn(marker, use_tool, f"R4 文案缺少如实描述：{marker}")
+
+    # ---------------------------------------------------------------- 行为断言已并入自检工程
+    def test_csharp_selftest_covers_the_new_rules(self):
+        program = (self.ROOT / "mod" / "AgentFarm.Bridge.Tests" / "Program.cs").read_text(encoding="utf-8")
+        for name in ("t188_world_change_yields_evidence",
+                     "t188_no_change_yields_no_evidence",
+                     "t188_unknown_snapshots_are_not_acted",
+                     "t188_priority_tile_first",
+                     "t188_ready_source_change_is_ready_evidence"):
+            self.assertIn(name, program)
+        # 断言条数由计数器给出（不再写死 18）—— 新增断言必须真的被跑到
+        self.assertIn('$"OK {_total} 断言全部通过"', program)
+        self.assertIn("_total++;", program)
+
+
 class TestTask168ScopeShed(unittest.TestCase):
     """【task-168】规模取舍（`reduce_scope`）：把"一天浇不完"如实变成"主动放弃一个田区"。
 

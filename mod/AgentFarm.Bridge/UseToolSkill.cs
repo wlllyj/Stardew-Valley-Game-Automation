@@ -66,6 +66,7 @@ namespace AgentFarm.Bridge
         private string _toolUsed;        // 实际用的那件物品名（回执要报出来）
         private string _wantedKind;      // 当前在试哪一类工具（hoe/can/axe/…）；Done() 按它选判据
         private string _objIdBefore;     // 动手前该格的 objId（没有则 null）
+        private string _whatBefore;      // 【task-188 必修 2】动手前该格的**如实描述**（物体/地形特征/空）
         private bool _sawUsingTool;      // 是否至少观察到一次"正在用工具"
         private bool _deferredByFade;    // 渐黑/过场挡住起手 ⇒ Step() 报可重试状态（不是挥不动）
 
@@ -116,7 +117,7 @@ namespace AgentFarm.Bridge
             {
                 Ok = true, Status = "ok", Skill = "use_tool",
                 Reason = $"已用「{this._toolUsed}」对 {StepMover.FormatTile(this._target)} 动手 {this._swings} 次"
-                       + $"（起手={this.StartedText()}），该格原本是 {(this._objIdBefore ?? "（空）")}，{what}"
+                       + $"（起手={this.StartedText()}），该格原本是 {this.OriginalText()}，{what}"
                        + "（请用 observe 的 tiles[] 复核）",
                 Schema = Skills.ExecSchema, ElapsedMs = elapsedMs,
                 WorldSeqBefore = this._seqBefore, WorldSeqAfter = this._world?.WorldSeq,
@@ -291,6 +292,10 @@ namespace AgentFarm.Bridge
             catch { this._toolUsed = "?"; }
 
             try { this._objIdBefore = ObjectIdAt(target); } catch { }
+            // 【task-188 必修 2（R4）】回执里"该格原本是 …"必须如实：旧写法只报 `ObjectIdAt`，
+            // 而杂草/草/树/资源堆是**地形特征**（没有 objId）⇒ 真机出现过 `该格原本是 （空）`
+            // （那一格明明长着草）。这里在**起手之前**拍一张描述，取不到也写"未知"，绝不留空括号。
+            try { this._whatBefore = DescribeTile(target); } catch { this._whatBefore = "未知（描述失败）"; }
 
             this.Swing();
             return null;
@@ -669,6 +674,71 @@ namespace AgentFarm.Bridge
 
         /// <summary>回执里报"这次到底起手了没有"（镰刀被输入门闸挡住时会是"否"）。</summary>
         private string StartedText() => this._sawUsingTool ? "是" : "否";
+
+        /// <summary>【task-188 必修 2（R4）】"该格原本是 …"的取值：优先用起手前拍的如实描述；
+        /// 没拍到（理论不可达，描述函数自己兜了"未知"）也绝不留空括号。</summary>
+        private string OriginalText()
+        {
+            if (!string.IsNullOrWhiteSpace(this._whatBefore)) return this._whatBefore;
+            if (!string.IsNullOrWhiteSpace(this._objIdBefore)) return $"物体(id={this._objIdBefore})";
+            return "未知（起手前没能拍到这一格的内容）";
+        }
+
+        /// <summary>
+        /// 【task-188 必修 2（R4）】起手前"这一格原本是什么"的如实描述（物体 → 地形特征 → 空）。
+        ///
+        /// 为什么不能只看 `ObjectIdAt`：杂草（`Weeds`）、草（`Grass`）、树（`Tree`）、资源堆
+        /// （`ResourceClump`）都是**地形特征**，`loc.objects` 里没有条目 ⇒ objId 为 null ⇒
+        /// 旧文案印出 `该格原本是 （空）`（task-184 真机 R4）。这里按真实内容写，
+        /// 顺带把耕地/作物（工法、是否可收）也写清楚，方便事后对账。
+        /// </summary>
+        private static string DescribeTile(Point p)
+        {
+            try
+            {
+                var loc = Game1.currentLocation;
+                if (loc == null) return "未知（读不到当前地点）";
+                var v = new Vector2(p.X, p.Y);
+
+                StardewValley.Object o = null;
+                bool hasObj = false;
+                try { hasObj = loc.objects != null && loc.objects.TryGetValue(v, out o) && o != null; } catch { }
+
+                StardewValley.TerrainFeatures.TerrainFeature tf = null;
+                bool hasTf = false;
+                try { hasTf = loc.terrainFeatures != null && loc.terrainFeatures.TryGetValue(v, out tf) && tf != null; } catch { }
+
+                if (!hasObj && !hasTf) return "空（既没有物体也没有地形特征）";
+
+                var sb = new System.Text.StringBuilder();
+                if (hasObj)
+                    sb.Append("物体「").Append(o.DisplayName ?? o.Name ?? "?").Append("」(id=").Append(o.ItemId).Append(')');
+                if (hasObj && hasTf) sb.Append(" + ");
+                if (hasTf)
+                {
+                    sb.Append("地形特征「").Append(tf.GetType().Name).Append("」");
+                    var hd = tf as StardewValley.TerrainFeatures.HoeDirt;
+                    if (hd != null)
+                    {
+                        bool watered = false;
+                        try { watered = hd.isWatered(); } catch { }
+                        sb.Append(watered ? "（已浇水）" : "（未浇水）");
+                        if (hd.crop != null)
+                        {
+                            string method = "?";
+                            try { method = CropMeta.HarvestMethodOf(hd.crop) ?? "?"; } catch { }
+                            string ready = "?";
+                            try { ready = CropMeta.Ready(hd, hd.crop).Value?.ToString() ?? "?"; } catch { }
+                            sb.Append("，上面有作物（工法=").Append(method).Append("，可收=").Append(ready).Append('）');
+                        }
+                    }
+                    else if (tf is StardewValley.TerrainFeatures.Grass) sb.Append("（草：多刀地形特征）");
+                    else if (tf is StardewValley.TerrainFeatures.ResourceClump) sb.Append("（资源堆：需对应工具/等级）");
+                }
+                return sb.ToString();
+            }
+            catch { return "未知（描述失败）"; }
+        }
 
         /// <summary>屏幕正在渐黑/过场？`pressUseToolButton` 的第一道门卫就是 `get_fadeToBlack`：
         /// `IL_001C: call Boolean get_fadeToBlack(); IL_0021: brfalse.s IL_0025; IL_0023: ldc.i4.0; ret`

@@ -56,5 +56,37 @@ namespace AgentFarm.Bridge
                 return (false, "fields");                                                    // 采集形态 2
             return (true, "fields");
         }
+
+        /// <summary>
+        /// 【task-188 必修 1】`acted` 的跨观测证据**判据本体**（纯函数，`interact` 与 `use_tool` 同源）。
+        ///
+        /// 四类证据，**格子级优先、全局面垫底**（与 `Skills.interact` 自 task-182 起的口径逐条一致）：
+        ///   * `"tile"`       = 目标格 `TileSig`（格内逐字段签名）变了；
+        ///   * `"ready"`      = 目标格 `ready` true→false，或 `readySource` 变化（再生作物唯一会动的那条）；
+        ///   * `"readyCrops"` = 整场 `farm.readyCrops` 下降；
+        ///   * `"inventory"`  = 背包逐 qid 栈数增加（**弱证据**：同 tick 别的系统也可能改背包 ⇒ 垫底）；
+        ///   * 全不命中（含"快照拿不到"= null）⇒ <c>null</c> —— **fail-closed**：判不出来就不许算 acted。
+        ///
+        /// 参数用 `bool?`：`null` 表示"这条证据的观测拿不到"（例如 `TileSig` 快照失败、`readyCrops`
+        /// 读不到时的 -1）⇒ 一律**不当命中**，绝不拿"没观测到"冒充"没变化"的反面。
+        /// 为什么抽成纯函数：见类注释（task-182 GAP-1）；行为断言在 `mod/AgentFarm.Bridge.Tests`。
+        /// </summary>
+        internal static string ActedEvidence(
+            bool? tileChanged,
+            bool? readyFlipped,
+            bool? readySourceChanged,
+            bool? readyDropped,
+            bool? inventoryGrew)
+        {
+            if (tileChanged == true) return "tile";
+            if (readyFlipped == true || readySourceChanged == true) return "ready";
+            if (readyDropped == true) return "readyCrops";
+            if (inventoryGrew == true) return "inventory";
+            return null;
+        }
+
+        /// <summary>【task-188 必修 1】`acted` 的唯一规则：**有证据才为 true**。
+        /// 它替掉旧口径 `err == null`（只要没抛异常就算动手 ⇒ task-173 的"回执谎报"）。</summary>
+        internal static bool Acted(string evidence) => !string.IsNullOrEmpty(evidence);
     }
 }
