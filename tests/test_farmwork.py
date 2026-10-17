@@ -699,11 +699,31 @@ class TestClearKeepsJudgement(unittest.TestCase):
         self.assertEqual(w.calls, [])
         self.assertEqual((r.code, r.proven_inert), ("skipped", True))
 
-    def test_tree_is_skipped_as_wrong_tool_kind(self):
+    def test_tree_is_cleared_with_the_axe_multiple_swings(self):
+        """【task-218】树不再是"工具不对就跳过"：普通树 0 级斧可砍 ⇒ 真去砍、多刀到 kind 变化。
+
+        判据是**观测差分**（`kind` 离开 tree，或砍倒成桩 = kind 变成 stump 也算 progress），
+        不是"挥过刀"；成功步的 `after` 必须自带 before/after kind（护栏 B 靠它逐格判）。
+        """
         w = MiniWorld(records=[{"tile": [60, 10], "kind": "tree"}],
+                      inventory=INV_WITH_SCYTHE, tools=TOOLS_WITH_SCYTHE)
+        w.swings_needed[(60, 10)] = 3            # 斧头砍 3 刀后倒成树桩
+        w.result[(60, 10)] = "stump"
+        r = make_worker(w).clear((60, 10))
+        self.assertTrue(r.ok, r.reason)
+        self.assertEqual(len(w.calls), 3)
+        self.assertEqual([c[1] for c in w.calls], ["axe", "axe", "axe"])
+        self.assertEqual(r.after["kind_before"], "tree")
+        self.assertEqual(r.after["kind_after"], "stump")
+        self.assertTrue(r.after["cleared"])
+
+    def test_fruit_tree_is_deferred_with_an_honest_reason(self):
+        """【task-218 护栏 A】果树不砍，但**必须**给出"暂不支持清理"的理由（绝不静默跳过）。"""
+        w = MiniWorld(records=[{"tile": [60, 10], "kind": "fruitTree"}],
                       inventory=INV_WITH_SCYTHE, tools=TOOLS_WITH_SCYTHE)
         r = make_worker(w).clear((60, 10))
         self.assertEqual((r.code, w.calls), ("skipped", []))
+        self.assertIn("果树不当障碍处理", r.reason)
 
 
 class TestClearSwingsUntilKindChanges(unittest.TestCase):
@@ -2329,16 +2349,21 @@ class TestTask20ToolGatedClumps(unittest.TestCase):
         self.assertEqual(w.calls, [])
         self.assertNotIn("pickaxe", r.reason)
 
-    def test_tool_ok_true_clump_is_still_skipped_and_inert(self):
-        """`toolOk=true` 的 clump 仍整类 `skipped` + `proven_inert`（不许用 `auto` 去撞）。"""
-        w = MiniWorld(records=[self._clump_rec(self.TARGET, tool_ok=True)])
+    def test_tool_ok_true_clump_is_cleared_with_the_target_tool(self):
+        """【task-218】`toolOk=true` ⇒ **真去敲**，工具由 `clumpTarget.tool` 决定（不再是整类跳过）。
+
+        旧口径（task-20）"工具够也不主动撞、整类 `proven_inert`"正是把 LLM 的 `clear_area`
+        悄悄缩小的那些层之一（0.7.39 P0-2 点名）。现在够格就挥、多刀到 kind 变化。
+        """
+        w = MiniWorld(records=[self._clump_rec(self.TARGET, tool="pickaxe", min_level=2,
+                                              tool_ok=True)])
+        w.swings_needed[self.TARGET] = 2          # 镐敲 2 下清掉
         r = make_worker(w).clear(self.TARGET)
-        self.assertEqual(r.code, "skipped")
-        self.assertIs(r.proven_inert, True, "工具够也不主动撞：用哪把由 Mod 挑")
+        self.assertTrue(r.ok, r.reason)
         self.assertIs(r.blocked_by_tool, False)
-        self.assertEqual(w.calls, [], "整类跳过 ⇒ 一次都不挥")
-        self.assertIn("R2", r.reason)
-        self.assertIn("auto", r.reason)
+        self.assertEqual([c[1] for c in w.calls], ["pickaxe", "pickaxe"])
+        self.assertTrue(r.after["cleared"])
+        self.assertNotEqual(r.after["kind_before"], r.after["kind_after"])
 
     def test_missing_target_is_fail_closed(self):
         """`clumpTarget` 缺失 / `toolOk` 缺失 ⇒ 【无法判定】+ 不挥（不许默认斧头、不许默认 0）。"""

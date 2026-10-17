@@ -44,7 +44,8 @@ from typing import Any, Callable, Iterable, Mapping
 from .bridge import MOD_VERSION_EXPECTED, BridgeClient, BridgeError
 from .farmwork import (CLUMP_KINDS, ENV_BLOCK_STATUSES, FRONTIER_KINDS, PATH_STAMINA_ALLOWANCE,
                        SEED_KEEP_FACTOR, STAGE_ACTION, STAMINA_COST_CLEAR, STAMINA_COST_SOW,
-                       STAMINA_COST_TILL, STAMINA_COST_WATER, UPGRADE_KINDS, UPGRADE_PRICES,
+                       STAMINA_COST_TILL, STAMINA_COST_WATER, TREE_KIND, TREE_STAMINA_ESTIMATE,
+                       UPGRADE_KINDS, UPGRADE_PRICES,
                        UPGRADE_TRADE_ITEMS, FarmWorker, StageResult, StepResult,
                        buy_count_for, farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles,
                        farm_ready_tiles,
@@ -73,6 +74,16 @@ __all__ = ["DayReport", "LongRun", "plot_observe"]
 #: 用锄头/镰刀**真的清得掉**的障碍。树/果树/资源堆/灌木不在里面：
 #: `farmwork.SKIP_KINDS` 会跳过它们（"先用斧头砍"），把它们算成"活"会让这一天永远做不完。
 ACTIONABLE_KINDS = ("weed", "twig", "stone", "grass")
+
+#: 【task-218】清障**能力覆盖**的种类：老四类 + 普通树（0 级斧可砍）+ 够格的 clump 一族
+#: （`_tool_blocked_tv` 会把 `toolOk` 不是 true 的 clump 挡在外面）。
+#: 刻意**不并进 `ACTIONABLE_KINDS`**：后者还用于"这块地有没有活/要不要回来"的老判据，
+#: 而树要额外受日级体力预算约束（`_tree_budget_left`）——混在一起会让预算挡下的树把守卫钉死。
+CLEARABLE_KINDS = ACTIONABLE_KINDS + (TREE_KIND,) + CLUMP_KINDS
+
+#: 【task-218 ④】一天最多砍几棵树。一棵树 ~10 体力/刀 × 8–12 刀 ≈ 100 体力（`TREE_STAMINA_ESTIMATE`），
+#: 砍多了必然漏浇 ⇒ 再加一条"剩余体力够不够砍一棵"的门槛；**浇水/收获永远优先**。
+TREE_CLEAR_MAX_PER_DAY = 2
 
 
 def _tool_blocked_tv(tv: Mapping[str, Any] | None) -> bool:
@@ -410,8 +421,13 @@ def plot_observe(obs: dict[str, Any], tiles: Iterable[tuple[int, int]], *,
         key = (int(xy[0]), int(xy[1]))
         if key not in keep or key in drop:
             continue
-        if not t.get("crop") and str(t.get("kind") or "") not in ACTIONABLE_KINDS + ("dirt",):
-            # 树/放置物等：既不进 blockers 计数，也不进 plantable 计数
+        if not t.get("crop") and str(t.get("kind") or "") not in CLEARABLE_KINDS + ("dirt",):
+            # 【task-218 / 0.7.39 P0-2 第 5 层】这里原来只放 `ACTIONABLE_KINDS + ("dirt")`，
+            # 把树/资源堆整类丢出局部简报 ⇒ `counts["blockers"]` 永远不含它们 ⇒ 策略层
+            # 看着"没有障碍"、模型也不会提；而 `_stage_tiles` 现在**能**清它们 ⇒ 简报与执行
+            # 能力必须同口径：能清的（`CLEARABLE_KINDS`）一律保留计数。
+            # 果树/灌木/放置物仍丢弃（它们是 `DEFERRED_KINDS`/`NOT_CLEARABLE_KINDS`，
+            # 由 `Brief.deferred_kinds` 的公告承担"如实告知"那一半）。
             continue
         rows.append(t)
     loc["tiles"] = rows
@@ -993,6 +1009,10 @@ class LongRun:
         self.slot_relief_noted: set[int] = set()
         self.inventory_blocked_today = False
         self.inventory_blocked_noted = False
+        #: 【task-218】今天砍倒了几棵树 + 预算挡下时"每天只记一次"的 note 标记。
+        #: 每日重置；判据见 `_tree_budget_left()`（日上限 + 浇水预备线，绝不为砍树漏浇）。
+        self.trees_cleared_today = 0
+        self.tree_budget_noted = False
         #: 【task-114 NIT-1】撞上 `no_inventory_space` 那一刻的**真实观测**（空格/种子/钱），
         #: 供当晚教训的 `evidence` 引用 —— 教训里绝不许写死"空格=0"这类常量。
         self.buy_no_space_facts: dict[str, Any] = {}
@@ -2799,6 +2819,59 @@ class LongRun:
             out.update(tiles)
         return out
 
+    @staticmethod
+    def _farm_count(obs: dict[str, Any], key: str) -> int | None:
+        """farm 级计数（`blockers`/`crops`/...）的**唯一安全读法**：拿不到 ⇒ `None`。
+
+        fail-closed 纪律：证据不可用/字段缺失/类型不对时**绝不返回 0** —— "没观测到"
+        与"计数为 0"是两件事（把未知当 0 会造出假 VERIFIED，task-96 的教训）。
+        """
+        farm = obs.get("farm")
+        if not isinstance(farm, Mapping):
+            return None
+        if farm.get("loaded") is False or farm.get("complete") is not True:
+            return None
+        raw = farm.get(key)
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            return None
+        return int(raw)
+
+    def _tree_budget_left(self, obs: dict[str, Any]) -> bool:
+        """【task-218 ④】今天还能不能砍树。两条都要满足：
+
+          * 今天砍倒的树 < `TREE_CLEAR_MAX_PER_DAY`；
+          * `体力 − 浇水预备 > TREE_STAMINA_ESTIMATE`（`_stamina_budget()` 的同一份真值）
+            ⇒ **绝不为砍树漏浇**（用户目标：作物先伺候完）。
+
+        预算挡下的树：不进 `_stage_tiles` 目标池、不算"还有活"（`_plot_has_work`）、
+        也不进 `_leftover`（"今天不做 ≠ 该做没做"），**不记 hard failure**。
+        每天记一次 `rep.notes`（**不发新事件名**：analyzer 的机械枚举会因此漂移）。
+        """
+        # 整个 `clear_area` 已经被体力预算拦下时**不再单独留痕**（避免同一天两套
+        # `deferred_by_budget` 语义打架，也避免已有用例的期望集合被无谓污染）。
+        if self._budget_defer_reason("clear_area", obs):
+            return False
+        if int(self.trees_cleared_today or 0) >= int(TREE_CLEAR_MAX_PER_DAY):
+            if not self.tree_budget_noted:
+                self.tree_budget_noted = True
+                self._journal("deferred_by_budget", task="clear_area_tree",
+                              why=f"今天已砍 {self.trees_cleared_today} 棵（上限 "
+                                  f"{TREE_CLEAR_MAX_PER_DAY}）",
+                              note="只因**砍树预算**而不做；不算硬失败、不进 leftover")
+            return False
+        b = self._stamina_budget(obs)
+        stam = float(b.get("stamina") or 0.0)
+        reserve = float(b.get("water_reserve") or 0.0)
+        if (stam - reserve) <= float(TREE_STAMINA_ESTIMATE):
+            if not self.tree_budget_noted:
+                self.tree_budget_noted = True
+                self._journal("deferred_by_budget", task="clear_area_tree",
+                              why=(f"体力 {stam:g} − 浇水预备 {reserve:g} ≤ 砍一棵树的估算 "
+                                   f"{TREE_STAMINA_ESTIMATE:g}"),
+                              note="浇水优先，绝不为砍树漏浇；不算硬失败、不进 leftover")
+            return False
+        return True
+
     def _deferred_scan(self, task: str, obs: dict[str, Any]) -> list[tuple[int, int]]:
         """【task-163】还没挑作业区时，用观测直接扫出"这个任务今天有多少格没做完"。
 
@@ -2808,8 +2881,11 @@ class LongRun:
         tmap = FarmWorker.tiles_of(obs)
         tillable = FarmWorker.tillable_of(obs)
         if task == "clear_area":
+            # 【task-218】树要按日预算收窄（预算挡下的树不算"该做没做"）。
+            tree_ok = self._tree_budget_left(obs)
             return sorted(t for t, v in tmap.items()
-                          if str(v.get("kind") or "") in ACTIONABLE_KINDS)
+                          if str(v.get("kind") or "") in ACTIONABLE_KINDS
+                          or (tree_ok and str(v.get("kind") or "") == TREE_KIND))
         if task == "till_area":
             if not self._seed_outlook(obs)[2]:
                 return []
@@ -2931,6 +3007,15 @@ class LongRun:
                 continue
             kind = str(tv.get("kind") or "")
             if kind in ACTIONABLE_KINDS and "clear_area" not in deferred:
+                return True
+            # 【task-218】树也算"这片地有活"（LLM 一直这么理解，旧实现却在 `clear()` 里静默跳过）；
+            # 但受日级砍树预算约束 —— 预算挡下时不算活，否则守卫会被"砍不完的树"钉死一整天。
+            if (kind == TREE_KIND and "clear_area" not in deferred
+                    and not _tool_blocked_tv(tv) and self._tree_budget_left(obs)):
+                return True
+            # 够格的 clump 一族（toolOk == true）同样算活；toolOk false/null ⇒ 能力缺口、不算活。
+            if (kind in CLUMP_KINDS and "clear_area" not in deferred
+                    and not _tool_blocked_tv(tv)):
                 return True
             if (t in tillable and can_plant and not _till_blocked_by(tv)
                     and "till_area" not in deferred):
@@ -3501,11 +3586,35 @@ class LongRun:
             pool = [t for t, v in tmap.items() if v.get("crop") and v.get("dead")]
         elif task == "clear_area":
             # 【task-20】防御性过滤：`toolOk == false`（明确不够格）或判不了的 clump 一族
-            # **不进"可清目标"**。当前 `ACTIONABLE_KINDS` 本来就不含 clump 一族（所以这层现在
-            # 是冗余的），但口径要显式钉住：只要哪天清障池扩到 clump，也不能把敲不动的格子选进来。
-            pool = [t for t in local
-                    if str((tmap.get(t) or {}).get("kind") or "") in ACTIONABLE_KINDS
-                    and not _tool_blocked_tv(tmap.get(t))]
+            # **不进"可清目标"**（`_tool_blocked_tv` 是唯一权威判据）。
+            # 【task-218】能力覆盖扩到 `CLEARABLE_KINDS`：普通树（0 级斧可砍）+ 够格的 clump 一族。
+            # 树另受两道约束：
+            #   ① 日级体力预算（`_tree_budget_left`：浇水/收获永远优先，绝不为砍树漏浇）；
+            #   ② **片地优先**（范围 ③）：先砍落在本片地内/边界一圈的树，再按到片地锚点的距离
+            #      —— 玩家→片地之间那几格也在观测窗口里，距离排序天然把它们排在前面。
+            tree_ok = self._tree_budget_left(obs)
+            anchor = tuple(plot.get("anchor") or (local[0] if local else (0, 0)))
+            if local:
+                xs = [t[0] for t in local]
+                ys = [t[1] for t in local]
+                zone = {(x, y) for x in range(min(xs) - 1, max(xs) + 2)
+                        for y in range(min(ys) - 1, max(ys) + 2)}
+            else:
+                zone = set()
+            tree_cands = [(t, v) for t, v in tmap.items()
+                          if str(v.get("kind") or "") == TREE_KIND and not _tool_blocked_tv(v)]
+            tree_cands.sort(key=lambda item: (0 if item[0] in zone else 1,
+                                              _dist(item[0], anchor), item[0][1], item[0][0]))
+            trees: list[tuple[int, int]] = []
+            if tree_ok:
+                room = max(0, int(TREE_CLEAR_MAX_PER_DAY) - int(self.trees_cleared_today or 0))
+                trees = [t for t, _v in tree_cands[:room]]
+            # 非树障碍仍**只取片地内**（旧口径不变）：老四类 debris + 够格的 clump 一族。
+            non_tree = [t for t in local
+                        if (str((tmap.get(t) or {}).get("kind") or "") in ACTIONABLE_KINDS
+                            or str((tmap.get(t) or {}).get("kind") or "") in CLUMP_KINDS)
+                        and not _tool_blocked_tv(tmap.get(t))]
+            pool = trees + non_tree
         elif task == "till_area":
             # 以**观测**为准判"能不能锄"：Mod 的 `tillable[]` 会含"有未知特征"的假阳性格
             # （真机 (73,25) 一带，锄 16 下白烧 60+ 体力，用户 m01804）。
@@ -3587,8 +3696,19 @@ class LongRun:
             # 窗口里还有枯死作物 ⇒ 这一阶段就没做完（清不掉的那些由 `_step_stage` 单独报数）。
             return [t for t, v in tmap.items() if v.get("crop") and v.get("dead")]
         if task == "clear_area":
-            return [t for t in local
-                    if str((tmap.get(t) or {}).get("kind") or "") in ACTIONABLE_KINDS]
+            # 【task-218】与 `_stage_tiles` 同口径：清障能力覆盖扩到树 + 够格的 clump 一族
+            # （`_tool_blocked_tv` 把 toolOk 不为 true 的 clump 挡在外面 —— 那是**能力缺口**，
+            # 由 `blocked_by_tool` / `clump_blocked_backlog` 单独留痕，不算"该做而没做"）。
+            # 被**日级砍树预算**挡下的树也不算 leftover（与 task-163 的"延后 ≠ 未完成"同族）；
+            # 但 `self.blocked`（今天试过干不动）照旧**不排除** —— task-9 铁律。
+            tree_ok = self._tree_budget_left(obs)
+            out = [t for t in local
+                   if (str((tmap.get(t) or {}).get("kind") or "") in ACTIONABLE_KINDS
+                       or str((tmap.get(t) or {}).get("kind") or "") in CLUMP_KINDS)
+                   and not _tool_blocked_tv(tmap.get(t))]
+            if tree_ok:
+                out += [t for t, v in tmap.items() if str(v.get("kind") or "") == TREE_KIND]
+            return sorted(set(out))
         if task == "till_area":
             # task-15 §②（修法 A）：**种子闸门必须与 `_stage_tiles` 同口径**。
             # 没种子又买不起时，锄地是纯烧体力（`_stage_tiles` 已经把目标掐成空），
@@ -4553,6 +4673,17 @@ class LongRun:
                     "free_slots": free if free_status == "ok" else None}
         money = FarmWorker.money(obs)
         player = FarmWorker.player_of(obs)
+        # 【task-218 ⑥】**升级选型看缺口**：先数"工具够不着 ⇒ 今天挥不了"的格子按所需工具分组
+        # （斧/镐），谁堵得多先升谁 —— 用户 m18938「先升级斧子砍树」正是这个判据给出的结论，
+        # 依据进 journal（`upgrade_tool.blocked_counts`），不靠拍脑袋。
+        blocked_counts: dict[str, int] = {}
+        for _t, tv in (FarmWorker.tiles_of(obs) or {}).items():
+            if not _tool_blocked_tv(tv):
+                continue
+            need = str(tv.get("tool") or "")
+            if need in ("axe", "pickaxe"):
+                blocked_counts[need] = blocked_counts.get(need, 0) + 1
+        candidates: list[dict[str, Any]] = []
         for kind in UPGRADE_KINDS:
             tier = tool_tier(obs, kind)
             if tier < 0 or tier >= 3:
@@ -4563,10 +4694,17 @@ class LongRun:
             have = sum(int(it.get("stack") or 0) for it in (player.get("inventory") or [])
                        if str(it.get("qualifiedId") or "") == trade) if trade else 0
             if money >= price and have >= need:
-                return {"action": "upgrade", "kind": kind, "tier": tier,
-                        "price": price, "trade_item": trade, "trade_have": have, "trade_need": need,
-                        "money": money}
-        return None
+                candidates.append({"action": "upgrade", "kind": kind, "tier": tier,
+                                   "price": price, "trade_item": trade, "trade_have": have,
+                                   "trade_need": need, "money": money,
+                                   "blocked": int(blocked_counts.get(kind, 0))})
+        if not candidates:
+            return None
+        candidates.sort(key=lambda c: (-int(c.get("blocked") or 0),
+                                       UPGRADE_KINDS.index(str(c.get("kind")))))
+        plan = candidates[0]
+        plan["blocked_counts"] = dict(blocked_counts)
+        return plan
 
     def _tool_suspended_stages(self, obs: dict[str, Any]) -> set[str]:
         """【task-205】在途升级期间要暂停的阶段（工具不在身上 ⇒ 那阶段一格都干不成）。"""
@@ -4626,7 +4764,9 @@ class LongRun:
         st = self.worker.upgrade_tool(kind)
         self._actions += 1
         self._journal("upgrade_tool", ok=st.ok, code=st.code, reason=st.reason,
-                      receipt=st.receipt, tool=kind, before=st.before, after=st.after)
+                      receipt=st.receipt, tool=kind, before=st.before, after=st.after,
+                      blocked_counts=plan.get("blocked_counts"),
+                      note="【task-218 ⑥】选这件工具的依据 = 被工具等级挡住的格子按所需工具分组")
         rep.notes.append(("升级工具成功：" if st.ok else "升级工具失败：") + st.reason)
         self._say(("  · " if st.ok else "  × ") + ("升级工具：" + st.reason))
         if st.ok:
@@ -5161,13 +5301,25 @@ class LongRun:
                 # 且**不产生任何"还有活"的守卫理由**（否则一块敲不动的巨石会让人永远收不了工）。
                 self.blocked[key] = f"{s.action} 工具不够格：{s.reason[:80]}"
                 tool_blocked_marked += 1
+                need_tool = str(getattr(s, "tool_need", "") or "")
+                # 【task-218 ⑤】`clump_blocked_backlog`：每格每天一条**可升级跟进**的账
+                # （带 `tile/tool/minLevel/currentLevel`），供升级选型与次日复核；
+                # 只作证据，不进硬失败、不进任何豁免、不产生守卫理由。
+                # ⚠️ 刻意**不新增事件名**：语义折进既有 `blocked_by_tool` 的 `backlog: true`
+                # + `current_level` 字段（新增事件名会让 analyzer 的机械枚举漂移、全量变红；
+                # task-218 验收要求 0 红）。要独立事件名得先走 Lead 的 analyzer 卡。
+                try:
+                    current_level = tool_tier(obs, need_tool) if need_tool else -1
+                except Exception:      # pragma: no cover - 观测异常时不猜
+                    current_level = -1
                 self._journal("blocked_by_tool", tile=list(key), action=s.action, stage=stage,
-                              zone=self.zone_name,
+                              zone=self.zone_name, backlog=True,
                               kind=str(((FarmWorker.tiles_of(after_obs) or {}).get(key)
                                         or (FarmWorker.tiles_of(before_obs) or {}).get(key)
                                         or {}).get("kind") or "未知"),
-                              need=str(getattr(s, "tool_need", "") or ""),
+                              need=need_tool,
                               min_level=getattr(s, "tool_min_level", None),
+                              current_level=(current_level if current_level >= 0 else None),
                               reason=s.reason[:200],
                               note="工具等级/种类不够（或观测判不出）⇒ 今天不再挥这格："
                                    "0 次 use_tool、不算硬失败、不进 unreachable/refused 豁免；"
@@ -5430,6 +5582,16 @@ class LongRun:
             # 【task-102】"今天真的动过农场"的计数：只数**发出去过**的格子动作
             # （`skipped` 是"judged before acting"，不算动作 ⇒ 0 动作的日子不许拿去睡觉）。
             self.farm_actions_today += sum(1 for s in res.steps if s.tile and not s.skipped)
+            # 【task-218 ④】砍倒一棵树 = `clear` 成功且该格 kind 从 `tree` 变成别的
+            # （Mod 对 `Tree` 一律报 kind="tree"，砍倒成桩仍报 tree ⇒ 只有"离开 tree"才算砍倒）。
+            # 日级预算 `_tree_budget_left` 靠这个计数收口（浇水/收获永远优先）。
+            trees_now = sum(
+                1 for s in res.steps
+                if s.ok and s.tile and str(getattr(s, "action", "") or "") == "clear"
+                and str((s.before or {}).get("kind") or "") == TREE_KIND
+                and str((s.after or {}).get("kind") or "") != TREE_KIND)
+            if trees_now:
+                self.trees_cleared_today += trees_now
             # **每轮就封格 + 记发起次数**（不是等阶段跑完）：
             # 撞到 `budget` 会 continue 再跑一轮，而 `_stage_tiles` 是每轮现算的 ——
             # 若等到阶段结束才 `_mark_blocked`，同一格注定干不动的格子会在后续每一轮
@@ -5549,6 +5711,45 @@ class LongRun:
         # 另一条（task-9）：`leftover` **含被封格的格子**，所以"只剩干不动的格子"时 met=False ——
         # 封格只免掉重试，不许把失败洗成成功。
         met = bool(all_steps) and not leftover
+        # 【task-218 ⑧ 护栏 B / 0.7.39 P0-1 修订】清障有效性**逐格判**：
+        # `farm.blockers` 在观测里根本不存在（FarmView 没有 weeds/stones/trees 计数，
+        # 那是 task-222 才补的）⇒ 不许把它当主判据。逐个 `ok` 步看该格 kind 是否真的变了：
+        # `tree→stump` 记 progress（砍倒成桩不算红）、weed/stone/twig 消失算真 progress。
+        # 有 ok 步却**一格都没变**、又没有"判不了"的步 ⇒ 该阶段如实 `incomplete`。
+        # farm 级聚合（若将来有）只作 info，**不进判红条件**。
+        cleared_tiles: list[tuple[int, int]] = []
+        blocker_drop: int | None = None
+        unclear_steps = 0
+        if task == "clear_area":
+            for s in all_steps:
+                if not (s.ok and s.tile):
+                    continue
+                before_kind = str((s.before or {}).get("kind") or "")
+                after_kind = str((s.after or {}).get("kind_after")
+                                 or (s.after or {}).get("kind") or "")
+                if not before_kind or not after_kind:
+                    unclear_steps += 1
+                    continue
+                if after_kind != before_kind:
+                    cleared_tiles.append((int(s.tile[0]), int(s.tile[1])))
+            b0 = self._farm_count(obs, "blockers")
+            b1 = self._farm_count(fresh, "blockers")
+            if b0 is not None and b1 is not None:
+                blocker_drop = int(b0) - int(b1)      # 只作 info（没有这个字段就是 None）
+            budget_or_tool = (bool(self._budget_defer_reason("clear_area", obs))
+                              or not self._tree_budget_left(obs))
+            ok_steps = [s for s in all_steps if s.ok]
+            if ok_steps and not cleared_tiles and not unclear_steps and not budget_or_tool:
+                # 有成功步却一格没变 ⇒ 这个阶段**事实上没做成**：`stopped` 一律改写成
+                # `incomplete`（哪怕 runner 报了 `done`/`budget` —— 判据是逐格证据）。
+                stopped = "incomplete"
+                self._journal("stage_stop_named", stage=task, zone=self.zone_name,
+                              cause=stopped, assigned=len(assigned),
+                              assigned_undone=assigned_undone, cleared_tiles=0,
+                              codes=sorted({str(getattr(s, "code", "") or "") for s in all_steps}),
+                              note="【task-218 护栏 B / P0-1】有成功步但没有任何一格的 kind 变化 ⇒ "
+                                   "如实 incomplete（「挥过刀」不算清障有效；不依赖观测里不存在的 "
+                                   "farm.blockers；不许被 no_work/VERIFIED 洗白）")
         # 【task-198】`no_slot`（背包满）**不是"这一格没做成"**：它是全局阻塞，`farmwork` 侧
         # 已经把它归进 env 桶（`StepResult.env_block`），这里必须同样从硬失败里排除 ——
         # 否则 run A′ 的 45 条同句失败会一路算进 `stage.failed`/`day.failed_steps`/
@@ -5638,6 +5839,10 @@ class LongRun:
             # 是 `bound_basis`）。
             "engaged": sum(1 for s in all_steps if s.attempted and s.stood),
             "stopped": stopped, "leftover": len(leftover),
+            # 【task-218 ⑧ / 0.7.39 P0-1】逐格清障证据：真正发生 kind 变化的格子（坐标）。
+            # 护栏 B 的判据就是这份清单非空；`blocker_drop` 只是 farm 级 info（字段不存在 ⇒ None）。
+            "cleared_tiles": [list(t) for t in cleared_tiles],
+            "blocker_drop": blocker_drop,
             # 【task-134 B】`assigned` = 这一阶段分下去的格数；`assigned_undone` = 其中没做成、
             # 也没按规跳过的格数。日级 `no_unmet_stages` 从 task-134 起看 `assigned_undone`
             # （`leftover` 仍是"片区还剩多少格"，作为 `plot_pending` 落账、供守卫/换片/resume 用）。
@@ -6270,6 +6475,9 @@ class LongRun:
         self.slot_relief_noted = set()
         self.inventory_blocked_today = False
         self.inventory_blocked_noted = False
+        # 【task-218】砍树日预算：每天清零（日上限 + 浇水预备线，见 `_tree_budget_left`）。
+        self.trees_cleared_today = 0
+        self.tree_budget_noted = False
         # 【task-122】两种退化形态的当日计数，每天清零（只喂教训库，不参与判定）。
         self.plot_exhausted_today = 0
         self.midway_leftover_today = 0

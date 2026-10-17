@@ -63,7 +63,7 @@ __all__ = [
     "TERMINAL_VERIFIED", "TERMINAL_NEEDS_REVIEW", "TERMINAL_STATES",
     "classify_outcome", "TaskOutcome",
     # 数据
-    "OBSTACLE_KINDS", "Brief", "TaskIntent", "PlannerState", "PlannerDecision",
+    "OBSTACLE_KINDS", "DEFERRED_KINDS", "capability_gaps", "Brief", "TaskIntent", "PlannerState", "PlannerDecision",
     # 校验
     "INTENT_FIELDS", "allowed_area_hints", "find_coordinate_like", "validate_intent",
     "parse_intents", "extract_json",
@@ -1228,8 +1228,52 @@ def decision_line(
 #: 需要清掉的障碍种类（`tiles[].kind`）
 OBSTACLE_KINDS: tuple[str, ...] = ("weed", "twig", "stone", "tree", "fruitTree", "clump", "grass", "bush")
 
+#: 【task-218 护栏 A】`OBSTACLE_KINDS` 里**显式说明性跳过**的种类 → 理由 + 缺什么能力。
+#:
+#: 结构性护栏（`tests/` 里的意图-执行对账用例）会遍历 `OBSTACLE_KINDS ∪ CLUMP_KINDS`：
+#: 每一类要么能被 `farmwork.clear()` 真的产出可执行目标，要么必须登记在这里 ——
+#: 登记了还要在简报里如实说"暂时清不了 + 原因"。**绝不允许静默跳过**
+#: （旧实现把 `tree` 放在 `farmwork.SKIP_KINDS` 里，LLM 看到"树算阻塞"、它也确实输出
+#: `clear_area`，实现层却悄悄跳过 ⇒ 十几年轮没人砍树，用户 m18938/m18962 因此发问）。
+DEFERRED_KINDS: dict[str, str] = {
+    "fruitTree": "果树不当障碍处理（砍掉会毁掉果树产出；需要玩家确认才动）",
+    "bush": "灌木暂不当障碍清理（会掉浆果，留给余力多清阶段）",
+}
+
+
+def capability_gaps(
+    *,
+    obstacle_kinds: Iterable[str] = OBSTACLE_KINDS,
+    clearable_kinds: Iterable[str] | None = None,
+    deferred_kinds: Iterable[str] | None = None,
+    not_clearable_kinds: Iterable[str] | None = None,
+) -> list[str]:
+    """【task-218 护栏 A / 0.7.39 P0-2】列出"意图层说要清、实现层却没人认领"的 kind。
+
+    判据（每一类必须落进三桶之一，**绝不允许静默跳过**）：
+
+    * `clearable_kinds` —— 实现层真能产出可执行目标（`farmwork.clear()` 会挥）；
+    * `deferred_kinds` —— 明确"暂不支持"，且简报会如实公告"<kind> 存在但暂不支持清理（原因）"；
+    * `not_clearable_kinds` —— 设计上就不该动（放置物/机器等）。
+
+    返回的 kind 名单就是缺口；测试里"故意漏登记某 kind"必须让这份名单非空。
+    """
+    clearable = set(clearable_kinds if clearable_kinds is not None else ())
+    deferred = set(deferred_kinds if deferred_kinds is not None else DEFERRED_KINDS)
+    not_clearable = set(not_clearable_kinds if not_clearable_kinds is not None else ())
+    gaps: list[str] = []
+    for kind in obstacle_kinds:
+        if kind in clearable or kind in deferred or kind in not_clearable:
+            continue
+        gaps.append(str(kind))
+    return sorted(gaps)
+
 _EMPTY_COUNTS: dict[str, int] = {
     "weeds": 0, "twigs": 0, "stones": 0, "trees": 0, "grass": 0, "bush": 0,
+    # 【task-218 / 0.7.39 P0-1】旧口径把 tree/fruitTree/clump 全塞进 `trees`，
+    # 于是"树多到挡种植"和"果树/树桩"在简报里是一个数字 ⇒ 模型无法分辨该不该砍。
+    # 拆成独立桶（观测 `farm` 段没有这些计数时保持 0，不猜）。
+    "fruit_trees": 0, "clumps": 0,
     "blockers": 0, "dirt": 0, "plantable": 0, "crops": 0, "ripe": 0, "dead": 0,
     "unwatered_crops": 0, "wet_crops": 0, "tillable": 0,
 }
@@ -1309,6 +1353,11 @@ class Brief:
     #: 【task-168】各田区的（未浇活苗格数, 该区格数）——确定性"认输哪一个区"的代理指标。
     #: 同样由控制器注入；直接调 `from_observe()` 时恒空 ⇒ 不提议认输（fail-closed）。
     area_facts: tuple[tuple[str, int, int], ...] = ()
+    #: 【task-218 护栏 A】当前观测里**存在但暂不支持清理**的障碍种类（`DEFERRED_KINDS` 的键）。
+    #: 由 `from_observe()` 从 `tiles[].kind` 算出（`tiles` 缺失时恒空，因为 summary 快照分不清
+    #: 果树/灌木）。它进简报核心字段 ⇒ 模型能看见"这棵树/灌木我知道，但今天清不了（原因）"，
+    #: 而不是以为"没有障碍"或反复输出清不掉的任务。
+    deferred_kinds: tuple[str, ...] = ()
 
     # ---- 派生量（确定性策略用） ----
     @property
@@ -1352,6 +1401,10 @@ class Brief:
         else:
             lines.append(f"water_budget: live_crops={self.live_crops} "
                          f"water_capacity={self.water_capacity} water_deficit={self.water_deficit}")
+        # 【task-218 护栏 A】暂不支持清理的种类必须在**核心字段**里如实出现（不是可选节）：
+        # 模型据此知道"这格我看见了，但今天动不了 + 为什么"，而不是以为没活或反复提清不掉的任务。
+        for kind in self.deferred_kinds:
+            lines.append(f"{kind} 存在但暂不支持清理（{DEFERRED_KINDS.get(kind, '原因未登记')}）")
         return lines
 
     def decisions_text(self) -> str:
@@ -1447,18 +1500,25 @@ class Brief:
         tiles_present = bool(tiles)
         kind_key = {
             "weed": "weeds", "twig": "twigs", "stone": "stones", "tree": "trees",
-            "fruitTree": "trees", "clump": "trees", "grass": "grass", "bush": "bush",
+            "fruitTree": "fruit_trees", "grass": "grass", "bush": "bush",
         }
+        # 【task-218 / 0.7.39 P0-1】clump 一族（Mod 会按 parentSheetIndex 报具体 kind）
+        # 单列一桶，且**它们是障碍** ⇒ 计入 `blockers`（旧口径只认 kind=="clump"，漏了桩/巨石）。
+        clump_kinds = ("clump", "stump", "log", "boulder", "rockPile", "greenRain")
         if tiles_present:
             for tile in tiles:
                 if not isinstance(tile, Mapping):
                     continue
                 kind = tile.get("kind")
-                key = kind_key.get(kind)
-                if key:
-                    counts[key] += 1
-                if kind in OBSTACLE_KINDS:
+                if kind in clump_kinds:
+                    counts["clumps"] += 1
                     counts["blockers"] += 1
+                else:
+                    key = kind_key.get(kind)
+                    if key:
+                        counts[key] += 1
+                    if kind in OBSTACLE_KINDS:
+                        counts["blockers"] += 1
                 if kind == "dirt":
                     counts["dirt"] += 1
                 if tile.get("plantable"):
@@ -1488,7 +1548,10 @@ class Brief:
             counts["stones"] = int(farm.get("stones") or 0)
             counts["twigs"] = int(farm.get("twigs") or 0)
             counts["trees"] = int(farm.get("trees") or 0)
-            counts["blockers"] = counts["weeds"] + counts["stones"] + counts["twigs"] + counts["trees"]
+            counts["fruit_trees"] = int(farm.get("fruitTrees") or 0)
+            counts["clumps"] = int(farm.get("clumps") or 0)
+            counts["blockers"] = (counts["weeds"] + counts["stones"] + counts["twigs"]
+                                  + counts["trees"] + counts["fruit_trees"] + counts["clumps"])
             counts["dirt"] = int(farm.get("hoeDirt") or 0)
             counts["crops"] = int(farm.get("crops") or 0)
 
@@ -1525,6 +1588,17 @@ class Brief:
 
         stamina = player.get("stamina")
         max_stamina = player.get("maxStamina")
+        # 【task-218 护栏 A / 0.7.39 P0-2⑤】"暂不支持清理"的种类必须**如实公告**，
+        # 绝不静默跳过：
+        #   * 逐格观测里出现了哪类 ⇒ 只公告哪类（精确）；
+        #   * `tiles` 缺失（summary 快照）或**被截断** ⇒ 我们看不见全部窗口 ⇒
+        #     fail-closed 公告**全部**已知不可清类（宁可多说一句，也不许让模型以为"没这种活"）。
+        deferred: list[str] = []
+        if tiles_present:
+            present_kinds = {str(t.get("kind") or "") for t in tiles if isinstance(t, Mapping)}
+            deferred = [k for k in DEFERRED_KINDS if k in present_kinds]
+        if not tiles_present or location.get("tilesTruncated"):
+            deferred = list(DEFERRED_KINDS)
         return cls(
             location=str(location.get("name") or ""),
             is_farm=bool(location.get("isOutdoorFarm")),
@@ -1546,6 +1620,7 @@ class Brief:
             areas=tuple(str(a) for a in areas if a),
             area_lines=tuple(str(a) for a in area_lines if a),
             sellable=int(sellable or 0),
+            deferred_kinds=tuple(deferred),
         )
 
 

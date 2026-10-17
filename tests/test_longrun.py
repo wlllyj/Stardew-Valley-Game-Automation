@@ -39,11 +39,11 @@ from agentfarm.farmwork import (  # noqa: E402
     harvest_tool, player_free_slots, seed_items, tile_ready,
 )
 from agentfarm.longrun import (  # noqa: E402
-    DEFAULT_LLM_MAX_TOKENS, ENDED_BY_EVENT, ENDED_BY_MODAL, FAR_DRY_MAX_TRIES,
+    CLEARABLE_KINDS, DEFAULT_LLM_MAX_TOKENS, ENDED_BY_EVENT, ENDED_BY_MODAL, FAR_DRY_MAX_TRIES,
     FAR_DRY_OPEN_MAX, FAR_DRY_REFILL_MAX,
     FRONTIER_CLEAR_MAX, JUSTIFIED_END_REASONS, MAX_BUY_TRIES_PER_DAY, MAX_ENV_ATTEMPTS,
     MAX_STUCK_FLUSH, MAX_TILE_ATTEMPTS, PLOT_EXHAUSTED_BURST, READY_FAR_MAX_TRIES,
-    SLOT_RELIEF_MAX, SLOT_RESERVE,
+    SLOT_RELIEF_MAX, SLOT_RESERVE, TREE_CLEAR_MAX_PER_DAY,
     DayReport, LongRun,
     _till_blocked_by, is_justified_end, plot_observe,
 )
@@ -821,11 +821,15 @@ class TestPlotObserve(unittest.TestCase):
     def test_clips_to_plot_and_drops_unactionable(self):
         w = FakeWorld(weeds=0)
         obs = w.obs()
-        # 塞一棵树进去：它不是"活"（farmwork 会跳过它），不该进局部简报
+        # 【task-218】树**能清**了（普通树 0 级斧可砍）⇒ 局部简报必须保留它，
+        # 否则第 5 层又一次把意图缩小（旧行为：树被丢掉 ⇒ blockers 不含树 ⇒ 策略看不见）。
         obs["location"]["tiles"].append({"tile": [60, 10], "kind": "tree", "standable": False})
+        obs["location"]["tiles"].append({"tile": [60, 11], "kind": "fruitTree",
+                                         "standable": False})
         local = plot_observe(obs, [(60, 10), (60, 11)])
         kinds = {tuple(t["tile"]): t["kind"] for t in local["location"]["tiles"]}
-        self.assertEqual(kinds, {})                      # 树被丢掉、空格子本来就不在 tiles 里
+        self.assertEqual(kinds, {(60, 10): "tree"},
+                         "能清的树保留；不能清的果树丢弃（由 DEFERRED_KINDS 公告承担告知）")
         self.assertEqual(len(local["location"]["tillable"]), 2)
         self.assertFalse(local["location"]["tilesTruncated"])
 
@@ -10434,6 +10438,171 @@ class TestTask216ToolUpgradeDeadlockAndJournal(unittest.TestCase):
         run.run()
         self.assertEqual(w.pickup_calls, 1, "F3：这一天必须去取回水壶")
         self.assertNotIn("stuck", str(run.days[0].ended_by), "取回后不许还以 stuck 收尾")
+
+
+class TestTask218TreeClearing(unittest.TestCase):
+    """task-218：树是**真障碍**（LLM 也一直这么看），实现层必须真的去砍。
+
+    背景（用户 m18938/m18962）：`planner.OBSTACLE_KINDS` 含 `tree`、`Brief.counts["blockers"]`
+    也算树 ⇒ 模型确实输出 `clear_area`，但 `farmwork.SKIP_KINDS` 把树静默跳过 ⇒
+    "意图被实现层悄悄缩小"，十几轮没人砍过树。本卡把 tree 移出 SKIP_KINDS、加多刀判据、
+    加日预算（`TREE_CLEAR_MAX_PER_DAY`，浇水/收获永远优先），并给护栏 A/B 的结构性用例。
+    """
+
+    def _run(self, w: FakeWorld):
+        client = FakeClient(w)
+        worker = FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+        run = make_run(w, client_factory=lambda: client, worker_factory=lambda c: worker)
+        run.worker = worker
+        run.client = client
+        return run
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list:
+        return [e for e in run.entries if e.get("event") == name]
+
+    @staticmethod
+    def _plot(*tiles: tuple[int, int]) -> dict:
+        return {"zone": "field_se", "label": "field_se",
+                "anchor": list(tiles[0]), "tiles": [list(t) for t in tiles]}
+
+    def test_tree_is_a_clear_area_target(self):
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "tree"
+        run = self._run(w)
+        obs = w.obs()
+        plot = self._plot((60, 10), (61, 10))
+        self.assertIn((60, 10), run._stage_tiles("clear_area", obs, plot),
+                      "树必须进 clear_area 目标池（旧实现静默跳过）")
+        self.assertTrue(run._plot_has_work(obs, [tuple(t) for t in plot["tiles"]]),
+                        "树挡着这块地 ⇒ 不能说「没活」")
+
+    def test_tree_is_clearable_kind_but_fruit_tree_is_not(self):
+        self.assertIn("tree", CLEARABLE_KINDS)
+        self.assertNotIn("fruitTree", CLEARABLE_KINDS)   # 果树走 DEFERRED_KINDS
+
+    def test_tree_budget_caps_daily_tree_clearing(self):
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "tree"
+        w.blockers[(61, 10)] = "weed"
+        run = self._run(w)
+        run.trees_cleared_today = TREE_CLEAR_MAX_PER_DAY
+        tiles = run._stage_tiles("clear_area", w.obs(), self._plot((60, 10), (61, 10)))
+        self.assertNotIn((60, 10), tiles, "树的日预算用满 ⇒ 今天不再列树")
+        self.assertIn((61, 10), tiles, "非树清障不受树的日预算影响")
+
+    def test_tree_budget_uses_the_existing_deferred_event_once(self):
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = self._run(w)
+        run.trees_cleared_today = TREE_CLEAR_MAX_PER_DAY
+        self.assertFalse(run._tree_budget_left(w.obs()))
+        self.assertFalse(run._tree_budget_left(w.obs()))
+        ev = self._events(run, "deferred_by_budget")
+        self.assertEqual(len(ev), 1, "每天一条（复用既有事件名，不新增 analyzer 桶）")
+        self.assertEqual(ev[0]["task"], "clear_area_tree")
+        self.assertIn("不算硬失败", ev[0]["note"])
+
+    def test_guardrail_b_ok_without_kind_change_is_incomplete(self):
+        """护栏 B（P0-1 逐格版）：有 ok 步、kind 却一格没变 ⇒ 该阶段如实 incomplete。"""
+
+        class _FakeSuccessClear(FakeWorker):
+            def run_stage(self, stage, tiles, *, min_stamina=0.0, max_steps=12):
+                t = list(tiles)[0]
+                return StageResult(stage=stage, steps=[StepResult(
+                    action="clear", tile=(int(t[0]), int(t[1])), ok=True, code="ok",
+                    reason="假成功（世界没变）",
+                    before={"kind": "weed"}, after={"kind": "weed", "kind_after": "weed"})],
+                    stopped="done")
+
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        run = self._run(w)
+        run.worker = _FakeSuccessClear(w)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        out = run._step_stage("clear_area", w.obs(), self._plot((60, 10)), rep)
+        stage = rep.stages[-1]
+        self.assertEqual(stage["cleared_tiles"], [])
+        self.assertEqual(stage["stopped"], "incomplete", "挥过刀不算清障有效")
+        self.assertFalse(out.postcondition_met)
+        ev = self._events(run, "stage_stop_named")
+        self.assertEqual(len(ev), 1, ev)
+        self.assertEqual(ev[0]["cause"], "incomplete")
+        self.assertEqual(ev[0]["cleared_tiles"], 0)
+
+    def test_guardrail_b_tree_to_stump_counts_as_progress(self):
+        """`tree→stump` = 真 progress（砍倒成桩），不许判红。"""
+
+        class _FakeTreeSwing(FakeWorker):
+            def run_stage(self, stage, tiles, *, min_stamina=0.0, max_steps=12):
+                t = list(tiles)[0]
+                return StageResult(stage=stage, steps=[StepResult(
+                    action="clear", tile=(int(t[0]), int(t[1])), ok=True, code="ok",
+                    reason="砍倒成桩",
+                    before={"kind": "tree"}, after={"kind": "stump", "kind_after": "stump"})],
+                    stopped="done")
+
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "tree"
+        run = self._run(w)
+        run.worker = _FakeTreeSwing(w)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        run._step_stage("clear_area", w.obs(), self._plot((60, 10)), rep)
+        stage = rep.stages[-1]
+        self.assertEqual(stage["cleared_tiles"], [[60, 10]])
+        self.assertNotEqual(stage["stopped"], "incomplete")
+        self.assertEqual(self._events(run, "stage_stop_named"), [])
+
+    def test_clearable_kinds_are_targets_end_to_end(self):
+        """端到端矩阵（0.7.39 P0-2①）：每类可清障碍 观测 → 简报 → 目标池 都被认领。
+
+        这是护栏 A 的"实现层真认领"半边：只要某类进了 `CLEARABLE_KINDS`，
+        就必须能从合成观测一路走到 `_stage_tiles("clear_area")` 的目标池里。
+        """
+        cases = (("weed", "hoe"), ("twig", "axe"), ("stone", "pickaxe"),
+                 ("tree", "axe"), ("grass", "scythe"),
+                 ("stump", "axe"), ("boulder", "pickaxe"))
+        for kind, tool in cases:
+            with self.subTest(kind=kind):
+                w = FakeWorld(weeds=0, seeds=0, money=0)
+                w.blockers[(60, 10)] = kind
+                if kind in ("stump", "boulder"):
+                    w.clump_meta[(60, 10)] = {
+                        "clumpKind": kind, "clumpTarget": {"tool": tool, "minLevel": 1},
+                        "toolOk": True}
+                run = self._run(w)
+                obs = w.obs()
+                plot = self._plot((60, 10), (61, 10))
+                brief = run._plot_brief(obs, plot)
+                self.assertGreater(brief.counts["blockers"], 0, f"{kind} 必须在简报里算障碍")
+                self.assertIn((60, 10), run._stage_tiles("clear_area", obs, plot),
+                              f"{kind} 必须能被 clear_area 认领")
+
+    def test_fruit_tree_present_keeps_out_of_targets_but_is_announced(self):
+        """果树：不进目标池，但必须出现在简报的"暂不支持"公告里（绝不静默）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "fruitTree"
+        run = self._run(w)
+        obs = w.obs()
+        plot = self._plot((60, 10), (61, 10))
+        self.assertNotIn((60, 10), run._stage_tiles("clear_area", obs, plot))
+        brief = run._plot_brief(obs, plot)
+        self.assertIn("fruitTree", brief.deferred_kinds)
+        self.assertIn("fruitTree 存在但暂不支持清理", brief.situation_text())
+
+    def test_stage_ledger_carries_per_tile_evidence(self):
+        """阶段账本必须带 `cleared_tiles`（逐格证据）与 `blocker_drop`（farm 级 info）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        run = self._run(w)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        run._step_stage("clear_area", w.obs(), self._plot((60, 10)), rep)
+        stage = rep.stages[-1]
+        self.assertIn("cleared_tiles", stage)
+        self.assertIn("blocker_drop", stage)
+        self.assertEqual(stage["cleared_tiles"], [[60, 10]],
+                         "真清掉的格必须进逐格证据（真 FarmWorker 走假桥）")
+        self.assertIsNone(stage["blocker_drop"],
+                          "观测里没有 farm.blockers ⇒ info 是 None，不当 0（P0-1）")
 
 
 if __name__ == "__main__":  # pragma: no cover

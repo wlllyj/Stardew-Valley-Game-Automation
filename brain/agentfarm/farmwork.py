@@ -47,6 +47,8 @@ __all__ = [
     "KIND_TOOL",
     "MAX_CLEAR_SWINGS",
     "MAX_DEAD_SWINGS",
+    "MAX_TREE_SWINGS",
+    "NOT_CLEARABLE_KINDS",
     "PATH_STAMINA_ALLOWANCE",
     "SEED_KEEP_FACTOR",
     "SEED_NAME_HINTS",
@@ -61,6 +63,8 @@ __all__ = [
     "SURPLUS_MIN_UNIT_PRICE",
     "SURPLUS_MONEY_FACTOR",
     "TILE_INERT_STATUSES",
+    "TREE_KIND",
+    "TREE_STAMINA_ESTIMATE",
     "UNREACHABLE_CODE",
     "UNREACHABLE_HINTS",
     "UNREACHABLE_STATUSES",
@@ -100,14 +104,31 @@ __all__ = [
 #: 需要"用工具清掉"的障碍（`use_tool(auto)` 会自己挑斧/镐/镰并失败换工具）。
 DEBRIS_KINDS = ("weed", "twig", "stone")
 
-#: 这些格子**不该用锄头动**（要么先砍/先敲，要么根本不是地）——跳过并写明原因。
+#: 【task-218 / 0.7.39 P0-2】**能力缺口类**：这些 kind 明确"暂不支持清理"，理由必须同时登记
+#: 在 `planner.DEFERRED_KINDS`（简报要如实写"<kind> 存在但暂不支持清理（原因）"）。
+#: 护栏 A 的断言：`set(SKIP_KINDS) <= set(planner.DEFERRED_KINDS)`，**绝不静默跳过**。
 SKIP_KINDS = {
-    "tree": "树（先用斧头砍）",
-    "fruitTree": "果树",
-    "clump": "资源堆（先用镐敲）",
-    "bush": "灌木",
-    "object": "放置物/机器（不该动）",
+    "fruitTree": "果树不当障碍处理（砍掉会毁掉果树产出；需要玩家确认才动）",
+    "bush": "灌木（暂不当障碍清理：会掉浆果，留给余力多清阶段）",
 }
+
+#: 【task-218 / 0.7.39 P0-2】**不该动**类（不是能力缺口，是设计决定）：这些格子即使观测到
+#: 也不会被清；**不进** `DEFERRED_KINDS`（它们不是"想做但没能力"），也不进障碍简报计数。
+NOT_CLEARABLE_KINDS = {
+    "object": "放置物/机器（不该动）",
+    "clump": "资源堆（走 `CLUMP_KINDS` 的 `toolOk` 门；这条只是兜底，正常到不了）",
+}
+
+#: 【task-218】普通树的 kind 与"砍到消失"的每格刀数上限。
+#: 一棵大树 = 斧头 ~8–12 刀砍倒 + 树桩再 3–4 刀才把 `Tree` 特征彻底移除；
+#: 观测里 `kind` 一直是 `"tree"`（Mod `WorldSnapshot` 对 `Tree` 一律写 `kind="tree"`，
+#: 砍倒成桩不改变 kind）⇒ 判据只能是"**kind 离开 tree**"，不能是"挥过刀"。
+TREE_KIND = "tree"
+MAX_TREE_SWINGS = 16
+
+#: 【task-218 ④】一棵树的大致体力成本（斧头 ~10 体力/刀 × 8–12 刀）。
+#: 日级预算用它做保守估计：**浇水/收获优先，绝不为砍树漏浇**（`longrun._stage_tiles`）。
+TREE_STAMINA_ESTIMATE = 100.0
 
 #: 草：锄头锄不出耕地（真机实测跳过原因），但**该用镰刀割掉**——"清理农场障碍"包含它。
 GRASS_KIND = "grass"
@@ -274,7 +295,8 @@ DEFAULT_SEED_HINTS = ("seed", "种子")
 
 #: 每种障碍"一次挥动该用哪件工具"（与 Mod `UseToolSkill.BuildPlan` 的种类首选**同源**；
 #: 真机实证：杂草→锄头、树枝→斧头、石头→镐、草→镰刀）。`clear()` 用的就是这个映射。
-KIND_TOOL = {"weed": "hoe", "twig": "axe", "stone": "pickaxe", GRASS_KIND: "scythe"}
+KIND_TOOL = {"weed": "hoe", "twig": "axe", "stone": "pickaxe", GRASS_KIND: "scythe",
+             TREE_KIND: "axe"}
 
 #: `player.tools{}` 的布尔位 → 脑里的工具名（v0.7.x 起观测里就有，比翻背包名字准）。
 #: ⚠️ 这里**没有 scythe 位**：Mod 的 `WorldSnapshot.ReadTools` 只把 `MeleeWeapon` 记进 `weapon`，
@@ -1849,12 +1871,17 @@ class FarmWorker:
         """清掉这一格的障碍。**先判后动**：判据说现在干不了就一次都不挥。
 
         顺序：观测 kind →
-          * 树/果树/资源堆/灌木/放置物：`skipped`（不该用锄头/镰刀动，写清原因）；
+          * 果树/资源堆/灌木/放置物：`skipped`（不该用锄头/镰刀动，写清原因；
+            果树那一句与 `planner.DEFERRED_KINDS` 逐字同源，护栏 A 会核）；
           * 有作物 / 缺这类障碍要用的工具：`skipped`（**不动手**，判据写进 `reason`）；
           * weed/twig/stone：`use_tool(auto)` 清（Mod 自己挑斧/镐/锄、失败换工具），
             判据 = 该格 kind 不再属于 DEBRIS_KINDS；
           * grass：`use_tool(scythe)` 割（**有作物绝不动手**——镰刀会连作物一起割掉），
-            判据 = 该格 kind **不再是 grass**。
+            判据 = 该格 kind **不再是 grass**；
+          * tree【task-218】：`use_tool(auto)` 砍（斧），多刀，判据 = kind **离开 tree**；
+          * clump 一族且 `toolOk == true`【task-218】：用 `clumpTarget.tool` 指定的工具砍/敲，
+            多刀，判据 = kind **离开这一类**；`toolOk == false` 仍拦下（不够格）、
+            `null` 仍 fail-closed 不挥。
 
         【为什么要连挥到上限】草是**多刀**地形特征：普通镰刀一刀只把 `Grass.numberOfWeeds` 减 1
         （金镰刀 2），只有减到 0 才移除特征（`MAX_CLEAR_SWINGS = 4`，IL 证据见
@@ -1917,21 +1944,29 @@ class FarmWorker:
                             f"**0 次 use_tool**、不白烧体力；今天不再试这格")
                 return r
             if tool_ok is True:
-                r.code, r.proven_inert = "skipped", True
-                r.reason = (f"{kind} 整类跳过（R2）：观测说工具够（{need}），但**不用 `auto` 去撞**"
-                            f"—— 用哪把、挥几下由 Mod 自己挑；这一格今天不指望清掉")
+                # 【task-218 护栏 A】工具够格 ⇒ **必须真的去动它**。
+                # 旧实现（task-20/R2）是"整类跳过、`proven_inert`、当天不指望清掉"，
+                # 结果 `OBSTACLE_KINDS ∪ CLUMP_KINDS` 里有一类**永远产生不了可执行目标**
+                # （`_stage_tiles("clear_area")` 的池子不含 clump 一族）⇒ 用户看到的
+                # "能力够却从不动手"。现在落到下面的统一清障循环：用 `clumpTarget.tool`
+                # 指明的工具多刀（树桩 3–4 刀 / 巨石 8–12 刀），判据 = kind 离开这一类。
+                r.tool_need = need
+            else:
+                r.code = "skipped"
+                r.blocked_by_tool = True
+                r.reason = (f"【无法判定】工具够不够（clumpTarget={tgt!r}、toolOk={tool_ok!r}）"
+                            f"⇒ fail-closed 不挥：不许默认斧头、不许默认 0 级；今天不再试这格")
                 return r
-            r.code = "skipped"
-            r.blocked_by_tool = True
-            r.reason = (f"【无法判定】工具够不够（clumpTarget={tgt!r}、toolOk={tool_ok!r}）"
-                        f"⇒ fail-closed 不挥：不许默认斧头、不许默认 0 级；今天不再试这格")
-            return r
         if kind in SKIP_KINDS:
             r.code, r.reason = "skipped", SKIP_KINDS[kind]
             return r
+        if kind in NOT_CLEARABLE_KINDS:
+            r.code, r.reason = "skipped", NOT_CLEARABLE_KINDS[kind]
+            return r
 
         want_grass = kind == GRASS_KIND
-        if kind not in DEBRIS_KINDS and not want_grass:
+        multi = kind == TREE_KIND or kind in CLUMP_KINDS
+        if kind not in DEBRIS_KINDS and not want_grass and not multi:
             r.ok, r.code = True, "already"
             r.reason = f"没有需要清的障碍（kind={kind or '未知'}）"
             return r
@@ -1941,7 +1976,14 @@ class FarmWorker:
             return r
 
         # ---- 先判后动：判据全部来自观测，动手之前就能拦下 ----
-        want = KIND_TOOL.get(kind, "auto")
+        # 【task-218】树的工具是斧；clump 一族按观测给的 `clumpTarget.tool`（不在已知工具表 ⇒ auto）。
+        if kind == TREE_KIND:
+            want = "axe"
+        elif kind in CLUMP_KINDS:
+            want = str(((tv or {}).get("clumpTarget") or {}).get("tool") or "")
+            want = want if want in TOOL_FLAG else "auto"
+        else:
+            want = KIND_TOOL.get(kind, "auto")
         miss = tool_missing_reason(self.player_of(obs), want)
         if miss:
             r.code = "skipped"
@@ -1954,14 +1996,17 @@ class FarmWorker:
         if not self._ensure_reachable(tile, r):
             return r
 
-        tool = "scythe" if want_grass else "auto"
+        # 【task-218】多刀类（树 / 够格的 clump）用 `MAX_TREE_SWINGS`：树要砍倒+清桩，
+        # 巨石要连敲；草仍是 `MAX_CLEAR_SWINGS=4`。判据一律"**kind 离开这一类**"。
+        cap = MAX_TREE_SWINGS if multi else MAX_CLEAR_SWINGS
+        tool = want if multi else ("scythe" if want_grass else "auto")
         traces: list[str] = []
         statuses: list[str] = []    # 每次请求的 Mod status（进 after，供事后复核）
         conclusive = False          # Mod 说"这一格挥不动"（换遍工具/前置条件不成立）
         env_block = ""              # Mod 说"现在整个环境不让动手"
         unreach = ""                # 【task-52】Mod 说"这一格走不到"（A* 没算出路径）
         swung = False               # 至少有一次请求**真的挥出去了**（回执 ok 但世界没变）
-        for i in range(1, MAX_CLEAR_SWINGS + 1):
+        for i in range(1, cap + 1):
             status = ""
             try:
                 res = self.c.use_tool(tile, tool=tool, timeout_ms=15000)
@@ -1977,14 +2022,31 @@ class FarmWorker:
                 statuses.append(status)
             obs = self.snap()
             tv = self.tile_view(obs, tile)
-            r.after = self.tile_essence(tv)
+            # 【0.7.39 P0-1】`after` **始终是 dict**：格子在观测里消失（真清掉了）时
+            # `tile_essence(None)` 会给 None ⇒ 护栏 B 就丢了"before/after kind"证据。
+            # 消失本身是强证据（`kind_after="none"`），必须留下。
+            essence = self.tile_essence(tv)
+            r.after = dict(essence) if isinstance(essence, dict) else {}
             kind_now = str((tv or {}).get("kind") or "")
+            after_kind = kind_now or ("none" if tv is None else "")
             traces.append(f"第{i}次请求→{kind_now or '未知'}")
-            gone = (kind_now not in DEBRIS_KINDS) if not want_grass else (kind_now != GRASS_KIND)
+            if want_grass:
+                gone = kind_now != GRASS_KIND
+            elif kind == TREE_KIND:
+                # 【task-218】树：砍倒成桩**不改变 kind**（Mod 对 `Tree` 一律写 "tree"），
+                # 只有连桩一起清掉、`Tree` 特征消失后 kind 才会离开 ⇒ 判据就是这一句。
+                gone = kind_now != TREE_KIND
+            elif kind in CLUMP_KINDS:
+                gone = kind_now not in CLUMP_KINDS or kind_now != kind
+            else:
+                gone = kind_now not in DEBRIS_KINDS
             if gone:
                 r.ok = True
-                if isinstance(r.after, dict):
-                    r.after = {**r.after, "requests": i, "statuses": list(statuses)}
+                # 【task-218 / 0.7.39 P0-1】成功步必须**自带该格的 before/after kind**：
+                # 护栏 B 的判据是"逐格 kind 真的变了"（tree→stump 也算 progress），
+                # 不是"挥过刀"、也不依赖观测里根本不存在的 `farm.blockers`。
+                r.after = {**r.after, "kind_before": kind, "kind_after": after_kind,
+                           "cleared": True, "requests": i, "statuses": list(statuses)}
                 r.reason = (f"已清掉（kind {kind or '未知'} → {kind_now or '未知'}；"
                             f"{'、'.join(traces)}）")
                 return r
@@ -2041,8 +2103,9 @@ class FarmWorker:
         r.code = "skipped"
         r.proven_inert = True
         if isinstance(r.after, dict):
-            r.after = {**r.after, "requests": i, "statuses": list(statuses)}
-        why = "Mod 回「工具全无效」" if conclusive else f"连挥 {MAX_CLEAR_SWINGS} 刀"
+            r.after = {**r.after, "kind_before": kind, "kind_after": after_kind,
+                       "cleared": False, "requests": i, "statuses": list(statuses)}
+        why = "Mod 回「工具全无效」" if conclusive else f"连挥 {cap} 刀"
         r.reason = (f"{why}（{tool}）这格还是 {kind_now or '未知'}"
                     f"⇒ 判据「kind 离开 {kind or '未知'}」未满足"
                     f"（{'、'.join(traces)}；回执 {r.receipt or '无'}）；{_work_context(obs)}")
@@ -2202,6 +2265,9 @@ class FarmWorker:
             return r
         if kind in SKIP_KINDS:
             r.code, r.reason = "skipped", SKIP_KINDS[kind]
+            return r
+        if kind in NOT_CLEARABLE_KINDS:
+            r.code, r.reason = "skipped", NOT_CLEARABLE_KINDS[kind]
             return r
         if kind == GRASS_KIND:
             r.code, r.reason = "skipped", "草（先用镰刀割掉；锄头锄不出耕地）"

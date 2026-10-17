@@ -1574,5 +1574,76 @@ class TestTask136ReviewMaterial(unittest.TestCase):
         self.assertNotIn("[模型自述·未验证]", P.render_lessons([dropped], max_chars=2000))
 
 
+class Task218CapabilityGuards(unittest.TestCase):
+    """task-218 护栏 A（0.7.39 P0-2）：意图层说要清的种类，实现层必须**认领或如实登记**。
+
+    病灶：`OBSTACLE_KINDS` 含 `tree`、简报把树算阻塞 ⇒ LLM 一直输出 `clear_area`，
+    而 `farmwork.SKIP_KINDS` 把树静默跳过 ⇒ 十几轮没人砍树（用户 m18938/m18962）。
+    结构性护栏 = 登记表互相对账 + 故意漏登记必须红 + 简报 fail-closed 公告。
+    """
+
+    @staticmethod
+    def _brief(obs: dict) -> P.Brief:
+        return P.Brief.from_observe(obs)
+
+    def test_skip_kinds_is_subset_of_deferred_kinds(self):
+        from agentfarm import farmwork as F
+        self.assertLessEqual(set(F.SKIP_KINDS), set(P.DEFERRED_KINDS),
+                             "`SKIP_KINDS` 的每个 kind 都必须在 `DEFERRED_KINDS` 里登记理由")
+
+    def test_deferred_kinds_snapshot(self):
+        self.assertEqual(set(P.DEFERRED_KINDS), {"fruitTree", "bush"},
+                         "登记表是**声明面**：新增一条必须显式改这份快照，并写清缺什么能力")
+
+    def test_capability_gaps_covers_every_obstacle_kind(self):
+        from agentfarm import farmwork as F
+        from agentfarm import longrun as L
+        kinds = tuple(P.OBSTACLE_KINDS) + tuple(F.CLUMP_KINDS)
+        self.assertEqual(
+            P.capability_gaps(obstacle_kinds=kinds, clearable_kinds=L.CLEARABLE_KINDS,
+                              deferred_kinds=P.DEFERRED_KINDS,
+                              not_clearable_kinds=F.NOT_CLEARABLE_KINDS),
+            [], "每一类障碍都必须落进 clearable / deferred / not_clearable 之一")
+
+    def test_deliberately_unregistered_kind_is_red(self):
+        from agentfarm import farmwork as F
+        from agentfarm import longrun as L
+        kinds = tuple(P.OBSTACLE_KINDS) + tuple(F.CLUMP_KINDS) + ("mysteryTree",)
+        gaps = P.capability_gaps(obstacle_kinds=kinds, clearable_kinds=L.CLEARABLE_KINDS,
+                                 deferred_kinds=P.DEFERRED_KINDS,
+                                 not_clearable_kinds=F.NOT_CLEARABLE_KINDS)
+        self.assertEqual(gaps, ["mysteryTree"], "故意漏登记一个 kind ⇒ 护栏必须报红")
+
+    def test_deferred_kind_present_is_announced_in_brief(self):
+        text = self._brief({"location": {"tiles": [
+            {"tile": [60, 10], "kind": "fruitTree"}]}}).situation_text()
+        self.assertIn("fruitTree 存在但暂不支持清理", text)
+        self.assertIn("果树不当障碍处理", text)
+
+    def test_deferred_kinds_announced_fail_closed_without_tiles(self):
+        """summary 快照（没有逐格 tiles）⇒ 看不见窗口也必须公告全部已知不可清类。"""
+        text = self._brief({"location": {},
+                            "farm": {"loaded": True, "complete": True}}).situation_text()
+        for kind in P.DEFERRED_KINDS:
+            self.assertIn(f"{kind} 存在但暂不支持清理", text)
+
+    def test_deferred_kinds_announced_when_tiles_are_truncated(self):
+        obs = {"location": {"tiles": [{"tile": [60, 10], "kind": "weed"}],
+                            "tilesTruncated": True}}
+        self.assertEqual(set(self._brief(obs).deferred_kinds), set(P.DEFERRED_KINDS))
+
+    def test_kind_counts_are_split_not_all_called_trees(self):
+        """P0-1 顺手修：tree / fruitTree / clump 不许再挤进同一个 `trees` 桶。"""
+        brief = self._brief({"location": {"tiles": [
+            {"tile": [60, 10], "kind": "tree"},
+            {"tile": [61, 10], "kind": "fruitTree"},
+            {"tile": [62, 10], "kind": "stump"},
+        ]}})
+        self.assertEqual(brief.counts["trees"], 1)
+        self.assertEqual(brief.counts["fruit_trees"], 1)
+        self.assertEqual(brief.counts["clumps"], 1)
+        self.assertEqual(brief.counts["blockers"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()
