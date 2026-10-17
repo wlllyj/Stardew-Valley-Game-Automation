@@ -4110,5 +4110,120 @@ class TestScopeShedAccounting(unittest.TestCase):
             self.assertIn(probe, probes, probe)
 
 
+class TestScopeTerminalAccounting(unittest.TestCase):
+    """task-194（dev task-192）：`scope_*` 末态记账（释放扣减 / `shed_ever` 释放不清）。
+
+    口径：`day_end.scope_shed*` = **日终末态**（当天毛认输 − 当天释放）；毛−释放 ≠ 末态 ⇒ ⚠ info
+    （**不进 rc**）；三个新字段（`scope_released.shed_tiles_remaining`、
+    `scope_loaded.shed_ever_total`、`scope_saved.shed_ever_total`）缺失 ⇒【无法判定】（缺失 ≠ 0，
+    六本旧账本据此不翻红）。
+    """
+
+    def _events(self, *, gross=21, released=3, remaining=18, terminal=None, ever=21,
+                with_new_fields=True, with_scope=True):
+        day = [1, "fall", 26]
+        evs = [day_start(day)]
+        if with_scope:
+            evs.append({"event": "scope_shed", "t": 20.0, "zone": "field_nw", "tiles": gross,
+                        "live_crops": 14, "water_capacity": 9, "deficit": 5,
+                        "harvested_steps": 0, "reason": "今天有 5 格活苗浇不完"})
+            rel = {"event": "scope_released", "t": 30.0, "zone": "field_nw",
+                   "reason": "farm_deficit_zero", "tiles": released, "live_crops_now": 0}
+            load = {"event": "scope_loaded", "t": 1.5, "path": "logs/x-scope.json",
+                    "zones": ["field_nw"], "tiles_total": gross}
+            saved = {"event": "scope_saved", "t": 900.0, "path": "logs/x-scope.json",
+                     "zones": 1, "written": 1}
+            if with_new_fields:
+                rel["shed_tiles_remaining"] = remaining
+                load["shed_ever_total"] = ever
+                saved["shed_ever_total"] = ever
+            evs += [load, rel, saved]
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": True,
+                  "watered_outdoor": True}
+        end = {"event": "day_end", "t": 950.0, "day": day, "ended_by": "sleep",
+               "ended_reason": "night", "verified": True, "checks": checks,
+               "stages": [{"stage": "water_area", "ok": 9, "skipped": 0, "failed": 0,
+                           "env_block": 0, "inconclusive": 0, "stopped": None, "leftover": 0}],
+               "ok_steps": 9, "skipped_steps": 0, "failed_steps": 0, "notes": [],
+               "final": final([1, "fall", 27]),
+               "final_water": {"t": 949.0, "location": "Farm", "tiles": 84, "crops": 31,
+                               "dry": 0, "scope": "farm"}}
+        if with_scope:
+            _tiles = gross - released if terminal is None else terminal
+            end["scope_shed"] = {"field_nw": {"tiles": _tiles, "live_crops_at_shed": 14}}
+            end["scope_shed_tiles"] = _tiles
+        evs.append(end)
+        return evs
+
+    def _report(self, events, name):
+        with tempfile.TemporaryDirectory() as tmp:
+            return report_for(write_ledger(tmp, name, events), days=1)
+
+    def test_new_fields_are_probed_and_visible(self):
+        rep = self._report(self._events(), "t194_ok.jsonl")
+        ss = rep["scope_shed"]
+        self.assertEqual(ss["released_remaining"], [18], "释放后的当天余额")
+        self.assertEqual(ss["shed_ever_loaded"], [21])
+        self.assertEqual(ss["shed_ever_saved"], [21])
+        self.assertEqual(ss["warn_terminal_mismatch_lines"], [], "毛−释放=末态 ⇒ 不该报 ⚠")
+        self.assertEqual(rep["red"]["total"], 0)
+        text = mod.render_text(rep, 50)
+        self.assertIn("末态口径（释放已扣减）", text)
+        self.assertIn("累计 `shed_ever`（释放不清）载入 [21] / 写回 [21]", text)
+        blob = " ".join(rep.get("undecidable") or [])
+        self.assertNotIn("event:scope_released.shed_tiles_remaining", blob,
+                         "字段在 ⇒ 不该报【无法判定】")
+
+    def test_terminal_mismatch_is_warning_not_red(self):
+        rep = self._report(self._events(gross=21, released=3, remaining=18, terminal=21),
+                           "t194_bad.jsonl")
+        ss = rep["scope_shed"]
+        self.assertTrue(ss["warn_terminal_mismatch_lines"], "有 scope_released 却没下降 ⇒ ⚠")
+        self.assertEqual(ss["warn_terminal_mismatch_days"], [rep["days"][-1]["label"]])
+        self.assertEqual(rep["red"]["total"], 0, "末态对不上只记 ⚠、**绝不进 rc**")
+        self.assertIn("末态与毛−释放对不上", mod.render_text(rep, 50))
+
+    def test_missing_new_fields_is_undecidable_not_red(self):
+        rep = self._report(self._events(with_new_fields=False), "t194_oldfields.jsonl")
+        blob = " ".join(rep.get("undecidable") or [])
+        self.assertIn("event:scope_released.shed_tiles_remaining", blob)
+        self.assertIn("event:scope_loaded.shed_ever_total", blob)
+        self.assertIn("event:scope_saved.shed_ever_total", blob)
+        self.assertEqual(rep["scope_shed"]["released_remaining"], [])
+        self.assertIn("累计 `shed_ever` <缺失>", mod.render_text(rep, 50))
+        self.assertEqual(rep["red"]["total"], 0, "缺新字段 ⇒【无法判定】，不翻红")
+
+    def test_old_ledger_without_scope_is_undecidable_not_red(self):
+        rep = self._report(self._events(with_scope=False), "t194_noscope.jsonl")
+        self.assertFalse(rep["scope_shed"]["has_events"])
+        self.assertEqual(rep["red"]["total"], 0)
+        self.assertIn("规模取舍: <缺失>", mod.render_text(rep, 50))
+
+    def test_release_of_carried_zone_is_not_a_mismatch(self):
+        """隔天释放前一天的区：`scope_shed_tiles` 当天是 0 ⇒ 不该误报「对不上」。"""
+        events = [day_start([1, "fall", 26]),
+                  {"event": "scope_released", "t": 30.0, "zone": "field_nw",
+                   "reason": "zone_has_no_unwatered_crops", "tiles": 7,
+                   "live_crops_now": 0, "shed_tiles_remaining": 0},
+                  {"event": "scope_shed", "t": 20.0, "zone": "field_ne", "tiles": 4,
+                   "live_crops": 2, "water_capacity": 1, "deficit": 1, "reason": "浇不完"}]
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True, "no_unmet_stages": True,
+                  "watered_outdoor": True}
+        events.append({"event": "day_end", "t": 950.0, "day": [1, "fall", 26], "ended_by": "sleep",
+                       "ended_reason": "night", "verified": True, "checks": checks,
+                       "stages": [], "ok_steps": 4, "skipped_steps": 0, "failed_steps": 0,
+                       "notes": [], "final": final([1, "fall", 27]),
+                       "scope_shed": {"field_ne": {"tiles": 4, "live_crops_at_shed": 2}},
+                       "scope_shed_tiles": 4,
+                       "final_water": {"t": 949.0, "location": "Farm", "tiles": 84, "crops": 31,
+                                       "dry": 0, "scope": "farm"}})
+        rep = self._report(events, "t194_carried.jsonl")
+        self.assertEqual(rep["scope_shed"]["warn_terminal_mismatch_lines"], [],
+                         "释放的是前一天的区 ⇒ 不参与当天扣减（4 == 4）")
+        self.assertEqual(rep["red"]["total"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

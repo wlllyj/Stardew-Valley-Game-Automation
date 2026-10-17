@@ -1036,6 +1036,48 @@ git grep -n "_journal(\"scope_" -- brain/agentfarm/longrun.py
 python tools\analyze-longrun.py --journal logs\longrun-runA-0732.jsonl --days 6 | rg "规模取舍"
 ```
 
+## 3.30 规模取舍的「末态口径」（task-192 字段，task-194 收录）
+
+**背景**：task-192（`1246cdd`）把 `day_end.scope_shed*` 的语义从「今天曾认输多少格」改成
+**日终末态**：当天撤销/释放过的格会从中扣掉（部分释放留余额），并新增三个字段用于对账：
+
+| 来源 | 键 | 含义 |
+|---|---|---|
+| `scope_released` | `shed_tiles_remaining` | 释放后该区**还剩**多少格仍在认输账上 |
+| `scope_loaded` / `scope_saved` | `shed_ever_total` | `<journal>-scope.json` 顶层 `shed_ever` 的总格数（**释放不清**，用于看累计） |
+| `day_end.scope_shed{zone}` | `released_tiles` | 该区当天被释放掉的格数 |
+
+**本工具怎么用**（`tools/analyze-longrun.py`）：
+- 头部 `规模取舍:` 行按末态读 `day_end.scope_shed_tiles`，并额外写 `累计 shed_ever（释放不清）载入 [...] / 写回 [...]`；
+  缺字段一律 `<缺失>`（**缺失 ≠ 0**）。
+- **末态对账 ⚠**：对每个有 `scope_shed` 的 `day_end`，取 `末态 = day_end.scope_shed_tiles`、
+  `毛 − 释放 = Σ(当天 scope_shed.tiles) − Σ(当天被释放、且 zone 当天在账上的 tiles)`；
+  两者不等 ⇒ 一条 ⚠（不进 rc）。**释放「昨天就带着」的区不算当天扣减**（否则会误报，
+  见单测 `test_release_of_carried_zone_keeps_terminal_balance`）。
+- 与 `tools\verify-run3.py`（Lead `3ccc29b` 已做净额核对）**同向**：本工具也只给可见性/⚠，不判红。
+
+**顺手修的旧 bug（task-194，影响面已量化）**：`FIELD_PROBES` 的三元组布局是
+`(打印标签, 探针串, 释义)`；历史上「子字段探针」写成 `("event:名字.键", "蛇形标签", …)`，
+而 `build_undecidable` 只按 **探针串** 判断 ⇒ 拿蛇形标签去整本 JSON 找字符串、**恒判缺失**
+（事件在、键也在也会报「本账本没有…：无法判定」）。现在统一：探针串或标签任一带
+`名字.键` 形态，就真去该事件里找键。**该修复只减少【无法判定】文案条数，不改 rc / 红数**
+（六账本实测：rc/red 一字未变，`#undecidable` 95→83、99→88、107→104、107→104、102→93、93→80；
+对账脚本 `scratch\_t194_undec.py`）。
+
+**单测**：`tests/test_analyze_longrun.py::TestScopeTerminalAccounting` 5 条 —— 新字段有 `FIELD_PROBES`
+且不报误判缺失 / 末态与「毛−释放」对不上 ⇒ ⚠ 且 rc=0 / 新字段缺失 ⇒ 三条【无法判定】+ `<缺失>` /
+旧账本无 `scope_*` ⇒ `<缺失>` + rc=0 / 释放**跨日带着**的区 ⇒ 不误报。
+
+**读数**：`py_compile -W error::SyntaxWarning` RC=0；`tests.test_analyze_longrun` **219 OK**（+5）；
+全量 `discover -s tests` **Ran 970 tests / OK（0 红）**。
+
+**grep 配方**：
+
+```
+git grep -n "shed_tiles_remaining\|shed_ever_total\|released_tiles" -- brain/agentfarm/longrun.py
+python tools\analyze-longrun.py --journal logs\longrun-runA-0732.jsonl --days 6 | rg "规模取舍|末态"
+```
+
 ## 4. 复核命令
 
 ```
@@ -1049,6 +1091,6 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run9d.jsonl --da
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
 python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
-python -m unittest tests.test_analyze_longrun  # 当前 214 OK（task-187 + `scope_*` 规模取舍 7 条）
-python -m unittest discover -s tests           # 当前 Ran 931 tests / OK（0 红）
+python -m unittest tests.test_analyze_longrun  # 当前 219 OK（task-194 + 末态口径/子字段探针修复 5 条）
+python -m unittest discover -s tests           # 当前 Ran 970 tests / OK（0 红）
 ```

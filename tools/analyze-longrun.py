@@ -180,7 +180,13 @@
     = 撤销认输；`scope_loaded`/`scope_saved`/`scope_save_failed`/`scope_rejected` = 持久层动作
     （只影响跨日记忆，不改当天判定）；`scope_harvest`/`scope_harvest_failed` = 认输前把该区成熟作物
     收掉（收成不因放弃而烂掉）。本工具全列 info（头部 `规模取舍` 行 + 建议 0s-4），**一律不进 rc**；
-    唯一可证伪 ⚠：**出现 `scope_shed` 却自称 VERIFIED**（防洗白通道被打开，人工核对）。旧账本缺
+    唯一可证伪 ⚠：**出现 `scope_shed` 却自称 VERIFIED**（防洗白通道被打开，人工核对）。
+    **【task-194 / dev task-192】记账口径**：`day_end.scope_shed_tiles` 是**日终末态**（当天毛认输 −
+    当天释放 = 末态；释放是 `_release_zone`，`rep.scope_shed[zone]["tiles"]` 留余额 + `released_tiles`），
+    **不是"今天曾经认输过多少格"**；累计量 `shed_ever` 在 `<journal>-scope.json` 里、**释放不清、每日不重置**
+    ⇒ 34% 上界跨日跨进程成立（"认输→释放→再认输"会被 `already_today`/`cap` 拦）。
+    多一条可证伪 ⚠：当天有 `scope_released` 而末态没跟着下降（毛−释放 ≠ 末态）⇒「末态与毛−释放对不上」，
+    仍**不进 rc**；三个新字段缺失 ⇒【无法判定】（缺失 ≠ 0，旧账本据此不翻红）。旧账本缺
     这些事件 ⇒ `<缺失>` +【无法判定】（缺失 ≠ 0，绝不当『没认输过』或『都做完了』通过）。
   * 事件映射不许漂移（Lead m02395）：brain 里 `_journal("<name>"` 的**每个**事件名都要在
     `EVENT_BUCKETS` 里有桶（结构性事件 `day_start`/`day_end`/`finish` 除外，见 `STRUCTURAL_EVENTS`）；
@@ -524,6 +530,14 @@ FIELD_PROBES = [
      "跨日认输记录被读入（task-168：path/zones）⇒ 只影响目标池/守卫理由，不影响任何 checks"),
     ("event:scope_saved", "scope_saved",
      "跨日认输记录写回成功（task-168：path/zones/written）⇒ 只影响跨日记忆"),
+    # task-194（dev task-192）：末态记账 —— `day_end.scope_shed*` 是**日终末态**（释放已扣减）；
+    #   累计量在 `<journal>-scope.json` 的 `shed_ever`（释放不清、每日不重置 ⇒ 34% 上界跨日成立）。
+    ("event:scope_released.shed_tiles_remaining", "scope_released_shed_tiles_remaining",
+     "释放后**当天认输记账余额**（task-192：= 释放后的末态格数；同事件 `tiles` 是本次释放的毛格数）"),
+    ("event:scope_loaded.shed_ever_total", "scope_loaded_shed_ever_total",
+     "读回跨日记录时本 run **累计**认输格数（task-192：`shed_ever` 释放不清、每日不重置，34% 上界看它）"),
+    ("event:scope_saved.shed_ever_total", "scope_saved_shed_ever_total",
+     "写回成功时本 run 累计认输格数（task-192：与 load 对账，只许增长不许回落）"),
     ("event:scope_save_failed", "scope_save_failed",
      "跨日认输记录写不进去（task-168：path/error）⇒ 只影响跨日记忆，绝不改变当天判定"),
     ("event:scope_rejected", "scope_rejected",
@@ -2970,8 +2984,17 @@ def build_advice(report, top=8):
                     "缺键 ⇒ 旧 Mod 形态，镰刀类作物到底走 `interact` 还是工具路径无法判定",
             "lines": (cr.get("harvest_method_missing_lines") or [])[:12],
         })
-    # 0s-4) task-187（dev task-168）：规模取舍 —— 认输是策略性取舍，**不是豁免额度**（⚠ 不进 rc）
     ss0 = report.get("scope_shed") or {}
+    # 0s-4a) task-194（dev task-192）：末态与毛−释放对不上（⚠ info，不进 rc）
+    if ss0.get("warn_terminal_mismatch_lines"):
+        advice.append({
+            "text": f"末态与毛−释放对不上 ×{len(ss0['warn_terminal_mismatch_lines'])}："
+                    "`day_end.scope_shed_tiles` 是**日终末态**（释放已扣减，task-192），但当天有 "
+                    "`scope_released` 而末态没跟着下降 ⇒ 先核 brain 的 `shed_tiles_remaining`/"
+                    "`released_tiles` 与工具侧净额口径（⚠ info，**不进 rc**）",
+            "lines": (ss0.get("warn_terminal_mismatch_lines") or [])[:6],
+        })
+    # 0s-4) task-187（dev task-168）：规模取舍 —— 认输是策略性取舍，**不是豁免额度**（⚠ 不进 rc）
     if ss0.get("warn_verified_with_shed_lines"):
         advice.append({
             "text": f"主动认输片区却自称 VERIFIED ×{len(ss0['warn_verified_with_shed_lines'])}："
@@ -3184,8 +3207,21 @@ def build_undecidable(rows, sessions, prelude, report):
     names = set(ev.get("event") for _, ev in rows)
     blob = "\n".join(json.dumps(ev, ensure_ascii=False) for _, ev in rows)
     for label, probe, meaning in FIELD_PROBES:
+        _spec = None
         if probe.startswith("event:"):
-            absent = probe.split(":", 1)[1] not in names
+            _spec = probe.split(":", 1)[1]
+        elif label.startswith("event:") and "." in label:
+            # task-194：老写法把子字段探针写成 `("event:名字.键", "蛇形标签", …)`（第二项不含 `event:`）
+            # ⇒ 以前只会拿"蛇形标签"去整本 JSON 里找字符串，恒判缺失、事件与键都在也被误报。
+            # 这里统一改成按 `<事件名>.<键>` 真去事件里找键。
+            _spec = label.split(":", 1)[1]
+        if _spec is not None:
+            if "." in _spec:
+                _evname, _field = _spec.split(".", 1)
+                _hits = [ev for _, ev in rows if ev.get("event") == _evname]
+                absent = (not _hits) or (not any(_field in ev for ev in _hits))
+            else:
+                absent = _spec not in names
         elif probe == "final_water":
             # task-36：以 day_end 的键为准（整本都没有 ⇒ 单列"本账本没有该字段"）
             ends = [ev for _, ev in rows if ev.get("event") == "day_end"]
@@ -4819,6 +4855,12 @@ def build_report(rows, path, args, bad_lines):
         "load_lines": [], "saved_events": 0, "save_failed_lines": [],
         "rejected_lines": [], "day_end_shed_days": 0,
         "warn_verified_with_shed_lines": [], "warn_shed_without_day_end": False,
+        # task-194（dev task-192）：末态记账 —— 释放扣减 / 累计 `shed_ever`（释放不清、每日不重置）。
+        "released_remaining": [], "released_remaining_missing_lines": [],
+        "shed_ever_loaded": [], "shed_ever_saved": [], "shed_ever_missing_lines": [],
+        "day_shed_tiles": {}, "day_shed_zones": {}, "day_released_tiles": {},
+        "day_released_zones": {}, "day_end_terminal_lines": [],
+        "warn_terminal_mismatch_lines": [], "warn_terminal_mismatch_days": [],
     }
     for _ln, _ev in rows:
         _sn = str(_ev.get("event") or "")
@@ -4839,6 +4881,10 @@ def build_report(rows, path, args, bad_lines):
             if _ev.get("water_capacity") is not None:
                 scope_shed["water_capacity"].append(as_int(_ev.get("water_capacity"), None))
             _slab, _sdi = _lr_day_of(_ln)
+            scope_shed["day_shed_tiles"][_sdi] = (scope_shed["day_shed_tiles"].get(_sdi, 0)
+                                                  + as_int(_ev.get("tiles")))
+            if _sz:
+                scope_shed["day_shed_zones"].setdefault(_sdi, set()).add(_sz)
             if 0 <= _sdi < len(days) and days[_sdi].get("verified") is True:
                 if _ln not in scope_shed["warn_verified_with_shed_lines"]:
                     scope_shed["warn_verified_with_shed_lines"].append(_ln)
@@ -4852,6 +4898,19 @@ def build_report(rows, path, args, bad_lines):
             scope_shed["released_lines"].append(_ln)
             _rz = str(_ev.get("reason") or "<缺失>")
             scope_shed["released_reasons"][_rz] = scope_shed["released_reasons"].get(_rz, 0) + 1
+            _rlab, _rdi = _lr_day_of(_ln)
+            _rtiles = as_int(_ev.get("tiles"))
+            scope_shed["day_released_tiles"][_rdi] = (scope_shed["day_released_tiles"].get(_rdi, 0)
+                                                      + _rtiles)
+            _rzname = str(_ev.get("zone") or "")
+            if _rzname:
+                _rzmap = scope_shed["day_released_zones"].setdefault(_rdi, {})
+                _rzmap[_rzname] = _rzmap.get(_rzname, 0) + _rtiles
+            if "shed_tiles_remaining" in _ev:
+                scope_shed["released_remaining"].append(
+                    as_int(_ev.get("shed_tiles_remaining"), None))
+            else:
+                scope_shed["released_remaining_missing_lines"].append(_ln)
         elif _sn == "scope_harvest":
             scope_shed["harvest_events"] += 1
             scope_shed["harvest_lines"].append(_ln)
@@ -4861,8 +4920,16 @@ def build_report(rows, path, args, bad_lines):
         elif _sn == "scope_loaded":
             scope_shed["load_events"] += 1
             scope_shed["load_lines"].append(_ln)
+            if "shed_ever_total" in _ev:
+                scope_shed["shed_ever_loaded"].append(as_int(_ev.get("shed_ever_total"), None))
+            else:
+                scope_shed["shed_ever_missing_lines"].append(_ln)
         elif _sn == "scope_saved":
             scope_shed["saved_events"] += 1
+            if "shed_ever_total" in _ev:
+                scope_shed["shed_ever_saved"].append(as_int(_ev.get("shed_ever_total"), None))
+            else:
+                scope_shed["shed_ever_missing_lines"].append(_ln)
         elif _sn == "scope_save_failed":
             scope_shed["save_failed_lines"].append(_ln)
         elif _sn == "scope_rejected":
@@ -4872,6 +4939,26 @@ def build_report(rows, path, args, bad_lines):
     scope_shed["day_end_shed_days"] = len(_de_scope)
     scope_shed["warn_shed_without_day_end"] = bool(
         scope_shed["shed_events"] and not _de_scope)
+    # task-194（dev task-192）：末态对账 —— `day_end.scope_shed*` 是**日终末态**（释放已扣减）。
+    #   规则：当天 `scope_shed` 毛格数 − 当天「释放的正是当天认输过的区」的毛格数 == 末态；不等 ⇒ ⚠ info。
+    #   隔天释放（区是前一天认输的）不参与扣减，否则会把 carried 区误判成"对不上"。
+    for _ln, _ev in rows:
+        if _ev.get("event") != "day_end" or "scope_shed" not in _ev:
+            continue
+        _term = as_int(_ev.get("scope_shed_tiles"), None)
+        if _term is None:
+            continue
+        scope_shed["day_end_terminal_lines"].append(_ln)
+        _tlab, _tdi = _lr_day_of(_ln)
+        _gross = int(scope_shed["day_shed_tiles"].get(_tdi, 0))
+        _relmap = scope_shed["day_released_zones"].get(_tdi) or {}
+        _shedz = scope_shed["day_shed_zones"].get(_tdi) or set()
+        _matched = sum(int(v) for _z, v in _relmap.items() if _z in _shedz)
+        if _relmap and int(_term) != max(0, _gross - _matched):
+            if _ln not in scope_shed["warn_terminal_mismatch_lines"]:
+                scope_shed["warn_terminal_mismatch_lines"].append(_ln)
+            if _tlab not in scope_shed["warn_terminal_mismatch_days"]:
+                scope_shed["warn_terminal_mismatch_days"].append(_tlab)
     sleep_ok = sum(1 for _, ev in rows if ev.get("event") == "sleep" and ev.get("ok"))
     sleep_failed = sum(1 for _, ev in rows if ev.get("event") == "sleep" and not ev.get("ok"))
     blocked_by_action = {}
@@ -5880,16 +5967,27 @@ def render_text(report, top):
     else:
         _ssz = "、".join(ss.get("shed_zones") or []) or "<无>"
         _srr = "、".join(f"{k}×{v}" for k, v in list((ss.get("refused_reasons") or {}).items())[:5]) or "<无>"
-        add(f"规模取舍: 主动认输 {ss.get('shed_events')} 区次 / 累计 {ss.get('shed_tiles')} 格（区 {_ssz}）；"
-            f"认输被拒 {ss.get('refused_events')} 次（{_srr}）；撤销认输 {ss.get('released_events')} 次；"
+        add(f"规模取舍: 主动认输 {ss.get('shed_events')} 区次 / {ss.get('shed_tiles')} 格"
+            "（**末态口径（释放已扣减）**；"
+            f"区 {_ssz}）；"
+            f"认输被拒 {ss.get('refused_events')} 次（{_srr}）；撤销认输 {ss.get('released_events')} 次"
+            f"（释放 {sum(ss.get('day_released_tiles', {}).values())} 格）；"
             f"认输前收成 {ss.get('harvest_events')} 区（{ss.get('harvest_targets')} 格）；"
             f"持久层 load {ss.get('load_events')} / saved {ss.get('saved_events')}；"
-            "口径：`scope_shed` **只作 info、不进 checks**，认输格仍留在会计里 ⇒ 当天如实不 VERIFIED"
+            + (f"累计 `shed_ever`（释放不清）载入 {ss.get('shed_ever_loaded')} / 写回"
+               f" {ss.get('shed_ever_saved')}"
+               if (ss.get("shed_ever_loaded") or ss.get("shed_ever_saved")) else
+               "累计 `shed_ever` <缺失>（旧账本 ⇒【无法判定】，缺失 ≠ 0）")
+            + "；口径：`scope_shed` **只作 info、不进 checks**，认输格仍留在会计里 ⇒ 当天如实不 VERIFIED"
             + (f"  ⚠ 有 `scope_shed` 却自称 VERIFIED：行 {ss.get('warn_verified_with_shed_lines', [])[:6]}"
                "（防洗白通道被打开，人工核对）"
                if ss.get("warn_verified_with_shed_lines") else "")
             + ("  ⚠ 有认输事件但 day_end 没有 `scope_shed` 快照（当日认输快照没落账 ⇒ 只能看事件）"
                if ss.get("warn_shed_without_day_end") else "")
+            + (f"  ⚠ 末态与毛−释放对不上：行 {ss.get('warn_terminal_mismatch_lines', [])[:6]}"
+               "（当天有 `scope_released` 却 `day_end.scope_shed_tiles` 没跟着下降 ⇒ 先核"
+               " brain 的 `shed_tiles_remaining`/`released_tiles` 与工具侧净额对账口径；⚠ info，不进 rc）"
+               if ss.get("warn_terminal_mismatch_lines") else "")
             + (f"  ⚠ 认输前收成抛异常：行 {ss.get('harvest_failed_lines', [])[:6]}"
                if ss.get("harvest_failed_lines") else "")
             + (f"  ⚠ 认输记录写不进去：行 {ss.get('save_failed_lines', [])[:6]}"
