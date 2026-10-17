@@ -44,6 +44,10 @@
     <!-- task-213：内省面（表名归一 / limit 钳制 / key 匹配 / 差集 / 值渲染）是纯逻辑
          ⇒ 同样直接编译同一份源码跑行为断言（Furnace 配方取证的判据必须行为化）。 -->
     <Compile Include="..\AgentFarm.Bridge\DumpRules.cs" />
+    <!-- task-210：机器链的纯规则（配方名解析 / 背包找物 / 投料取货分类 / 证据优先级 /
+         能不能再放一件）⇒ 同样直接编译同一份源码跑行为断言。技能本体吃游戏类型，
+         判据留在技能里就只能做源码文本断言（task-182 GAP-1 教训）。 -->
+    <Compile Include="..\AgentFarm.Bridge\MachineRules.cs" />
   </ItemGroup>
 
 </Project>

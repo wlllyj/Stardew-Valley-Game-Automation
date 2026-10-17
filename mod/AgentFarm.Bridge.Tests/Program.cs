@@ -349,6 +349,61 @@ namespace AgentFarm.Bridge.Tests
                   zeroIndices.Length == 0 && truncatedZero,
                   "max<=0 ⇒ 一条不给且如实置 truncated（不许悄悄返回全部）");
 
+            // ==============================================================
+            //  task-210：机器链的纯规则断言（配方解析 / 背包找物 / 机器分类 / 证据优先级）
+            // ==============================================================
+            Console.WriteLine("MachineRules 机器链断言（task-210）");
+
+            string recipeExact = MachineRules.ResolveRecipeKey(new[] { "Furnace", "Chest", "Torch" }, "Furnace");
+            string recipeCase = MachineRules.ResolveRecipeKey(new[] { "Furnace" }, "furnace");
+            string recipeUnknown = MachineRules.ResolveRecipeKey(new[] { "Furnace" }, "NotARecipe");
+            string recipeAmbiguous = MachineRules.ResolveRecipeKey(new[] { "Furnace", "furnace" }, "FURNACE");
+            string recipeFuzzyForbidden = MachineRules.ResolveRecipeKey(new[] { "Furnace" }, "Furn");
+            Check("t210_recipe_resolution",
+                  recipeExact == "Furnace" && recipeCase == "Furnace"
+                  && recipeUnknown == "" && recipeAmbiguous == "" && recipeFuzzyForbidden == "",
+                  "配方名解析：精确 > 忽略大小写 > 找不到/歧义 ⇒ 空串（不做模糊猜测，fail-closed）");
+
+            var bag = new List<ObjectSlotInput>
+            {
+                new ObjectSlotInput { Index = 0, QualifiedId = "(O)378", ItemId = "378", Name = "Copper Ore", Stack = 12, MaxStack = 999, IsObject = true },
+                new ObjectSlotInput { Index = 1, QualifiedId = "(BC)114", ItemId = "114", Name = "Furnace", Stack = 1, MaxStack = 999, IsObject = true },
+                new ObjectSlotInput { Index = 2, QualifiedId = "(T)Axe", ItemId = "Axe", Name = "Axe", Stack = 1, IsObject = false },
+            };
+            int slotQid = MachineRules.FindObjectSlot(bag, "(BC)114");
+            int slotItemId = MachineRules.FindObjectSlot(bag, "378");
+            int slotName = MachineRules.FindObjectSlot(bag, "furn");
+            int slotMissing = MachineRules.FindObjectSlot(bag, "(O)999");
+            int slotTool = MachineRules.FindObjectSlot(bag, "Axe");
+            Check("t210_find_object_slot",
+                  slotQid == 1 && slotItemId == 0 && slotName == 1 && slotMissing == -1 && slotTool == -1,
+                  "背包找物：qualifiedId > ItemId > 名字子串（忽略大小写）；找不到 ⇒ -1；工具类不算 Object");
+
+            string feedOk = MachineRules.ClassifyFeed(true, false);
+            string feedFull = MachineRules.ClassifyFeed(true, true);
+            string feedNotMachine = MachineRules.ClassifyFeed(false, false);
+            string collectOk = MachineRules.ClassifyCollect(true, true);
+            string collectNotReady = MachineRules.ClassifyCollect(true, false);
+            Check("t210_machine_classification",
+                  feedOk == "ok" && feedFull == "already_full" && feedNotMachine == "no_machine"
+                  && collectOk == "ok" && collectNotReady == "not_ready",
+                  "机器分类：投料前查已满、取货前查就绪；非机器一律 no_machine（都不白白调 checkAction）");
+
+            string evHeld = MachineRules.Evidence(true, true, true);
+            string evReady = MachineRules.Evidence(false, true, true);
+            string evInv = MachineRules.Evidence(false, false, true);
+            string evNone = MachineRules.Evidence(false, false, false);
+            Check("t210_machine_evidence_priority",
+                  evHeld == "heldObject" && evReady == "ready" && evInv == "inventory" && evNone == null
+                  && MachineRules.Acted(evHeld) && !MachineRules.Acted(evNone),
+                  "证据优先级 heldObject > ready > inventory；全不命中 ⇒ null（绝不凭返回值自称成功）");
+
+            Check("t210_has_room",
+                  MachineRules.HasRoom(bag, "(O)378", 3)                 // 同 qid 叠未满
+                  && !MachineRules.HasRoom(new List<ObjectSlotInput> { bag[0] }, "(O)378", 990)  // 叠会溢出
+                  && MachineRules.HasRoom(new List<ObjectSlotInput> { bag[0], null }, "(O)378", 500), // 有空格
+                  "能不能放：同 qid 叠有余量或有空格 ⇒ true；叠会溢出且无空格 ⇒ false");
+
             Console.WriteLine(_failed == 0
                 ? $"OK {_total} 断言全部通过"
                 : $"FAILED {_failed} 条断言不通过（共 {_total} 条）");

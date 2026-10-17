@@ -3402,6 +3402,226 @@ class FarmWorker:
                     f"等级 {tier_before}→{tier_after}" + (f"；回执={r.receipt}" if r.receipt else ""))
         return r
 
+    # ------------------------------------------------------------------ 机器链（task-210）
+    @staticmethod
+    def _qid_variants(item: str) -> list[str]:
+        """把 `"(BC)114"` / `"114"` 这类写法归一成可比较的几种（去/留类型前缀）。
+
+        为什么需要：Mod 的 `TileView.objId` 是 **ItemId**（`"114"`），而脑侧习惯写
+        qualifiedId（`"(BC)114"`）—— 两边直接比会永远不相等（真假失败）。
+        """
+        raw = str(item or "").strip()
+        out: list[str] = [raw] if raw else []
+        if ")" in raw:
+            tail = raw.rsplit(")", 1)[1].strip()
+            if tail and tail not in out:
+                out.append(tail)
+        return out
+
+    @classmethod
+    def _count_in_map(cls, counts: dict[str, int], item: str) -> int:
+        return sum(int(counts.get(v, 0)) for v in cls._qid_variants(item))
+
+    def craft_item(self, recipe: str, *, timeout_ms: int = 30000) -> StepResult:
+        """制作一件物品（task-210，熔炉是第一个用例）。判据 = **背包观测差分**（回执只是声明）。
+
+        只走游戏制作品原语链（Mod 侧 `CraftSkill`：`mightCraft` → `createItem` → 先自检空格 →
+        `consumeIngredients` → `addItemToInventoryBool`）；脑侧不猜材料/价格，也**不手写**扣料造物。
+
+        判据：回执给的 `craftedQid` 在背包差分里变多；回执没给 qid ⇒ 退回"背包总件数变多且逐 qid 有新增"。
+        全不命中 ⇒ `failed`（材料可能已被扣、产物可能没进包 ⇒ 由 reason 如实说明，不做二次动作）。
+        """
+        r = StepResult(action="craft_item")
+        obs = self.snap()
+        inv_before = self._inventory_counts(self.player_of(obs))
+        total_before = sum(inv_before.values())
+        r.before = {"items": total_before, "kinds": len(inv_before)}
+        res: dict[str, Any] = {}
+        try:
+            raw = self.c.exec_skill("craft_item", {"item": recipe}, timeout_ms=timeout_ms)
+            res = raw if isinstance(raw, dict) else {}
+            r.status = str(res.get("status") or "")
+        except BridgeError as exc:
+            r.receipt, r.status = _receipt(exc), _exc_status(exc)
+        after = self.snap()
+        inv_after = self._inventory_counts(self.player_of(after))
+        gained = self._loot_delta(inv_before, inv_after)
+        total_after = sum(inv_after.values())
+        qid = str(res.get("craftedQid") or "")
+        r.after = {"items": total_after, "gained": gained, "crafted_qid": qid or None}
+        if qid and self._count_in_map(gained, qid) > 0:
+            r.ok = True
+            r.reason = f"制作成功：{recipe} ⇒ {qid} × {self._count_in_map(gained, qid)}（背包观测差分）"
+            return r
+        if not qid and total_after > total_before and gained:
+            r.ok = True
+            r.reason = (f"制作成功：{recipe} ⇒ 背包 {total_before}→{total_after} 件"
+                        f"（回执没给 craftedQid，按逐 qid 新增核对：{gained}）")
+            return r
+        r.code = "failed"
+        r.reason = (f"制作没生效：背包件数 {total_before}→{total_after}、逐 qid 新增={gained or '无'}"
+                    f"（回执 craftedQid={qid or '未给'}、status={r.status or '未给'}）"
+                    + (f"；回执={r.receipt}" if r.receipt else ""))
+        return r
+
+    def place_object(self, item: str, tile: tuple[int, int], *,
+                     timeout_ms: int = 30000) -> StepResult:
+        """把背包里的可放置物（熔炉 `(BC)114`）放到 `tile`（task-210）。
+
+        判据 = **观测差分**（`Utility.tryToPlaceItem` 的返回值不可信：非家具放置失败也 return true）：
+          * 目标格上出现了该物体（`tile.objId` 由空变为匹配的 ItemId）；
+          * 背包里那件恰好 −1（游戏自己扣的，脑侧**绝不**补扣）。
+        放上去了但没扣 ⇒ `failed` 如实报（不补扣）；扣了但没放上去 ⇒ `failed` 如实报（不补放）。
+        """
+        r = StepResult(action="place_object", tile=tile)
+        obs = self.snap()
+        player = self.player_of(obs)
+        inv_before = self._inventory_counts(player)
+        have_before = self._count_in_map(inv_before, item)
+        tv_before = self.tile_view(obs, tile) or {}
+        r.before = {"have": have_before, "tile_obj": tv_before.get("objId"), "kind": tv_before.get("kind")}
+        if tv_before.get("objId") or tv_before.get("kind") in ("object",):
+            r.code = "tile_occupied"
+            r.reason = (f"目标格 ({tile[0]},{tile[1]}) 上已经有放置物"
+                        f"（objId={tv_before.get('objId') or tv_before.get('kind')}）⇒ 换个空格")
+            return r
+        if have_before <= 0:
+            r.code = "no_object"
+            r.reason = f"背包里找不到要放的「{item}」（qualifiedId/ItemId/名字子串都试过）"
+            return r
+        res: dict[str, Any] = {}
+        try:
+            raw = self.c.exec_skill("place_object", {"item": item, "tile": [tile[0], tile[1]]},
+                                    timeout_ms=timeout_ms)
+            res = raw if isinstance(raw, dict) else {}
+            r.status = str(res.get("status") or "")
+        except BridgeError as exc:
+            r.receipt, r.status = _receipt(exc), _exc_status(exc)
+        after = self.snap()
+        inv_after = self._inventory_counts(self.player_of(after))
+        have_after = self._count_in_map(inv_after, item)
+        tv_after = self.tile_view(after, tile) or {}
+        obj_after = str(tv_after.get("objId") or "")
+        variants = [v.lower() for v in self._qid_variants(item)]
+        placed = bool(obj_after) and obj_after.lower() in variants
+        consumed = have_after == have_before - 1
+        r.after = {"have": have_after, "tile_obj": obj_after or None, "placed": placed, "consumed": consumed}
+        if placed and consumed:
+            r.ok = True
+            r.reason = (f"已把「{item}」放到 ({tile[0]},{tile[1]})：观测到格子上出现该物体、背包 −1"
+                        f"（游戏入口回执 status={r.status or '未给'} 不采信）")
+            return r
+        if consumed and not placed:
+            r.code = "failed"
+            r.reason = (f"背包 −1 但 ({tile[0]},{tile[1]}) 上没出现「{item}」⇒ 请人工复核："
+                        "不自己补扣、不自己补放")
+            return r
+        if placed and not consumed:
+            r.code = "failed"
+            r.reason = (f"格子上出现物体但背包没减（{have_before}→{have_after}）⇒ 游戏入口没扣，"
+                        "**不自己补扣**（补扣会多扣）")
+            return r
+        r.code = "failed"
+        r.reason = (f"放置没生效：格子上没有「{item}」、背包也没减（{have_before}→{have_after}）"
+                    + (f"；回执={r.receipt}" if r.receipt else ""))
+        return r
+
+    def machine(self, tile: tuple[int, int], action: str, *, item: str | None = None,
+                timeout_ms: int = 30000) -> StepResult:
+        """机器投料/取货（task-210，熔炉是第一个用例）。判据 = **跨观测差分**。
+
+        * 投料（`action="feed"`）：材料在背包里逐 qid 减少 **或** 机器 `heldObject` 变化；
+        * 取货（`action="collect"`）：机器 `heldObject` 清空/变化、`readyForHarvest` 翻转
+          **或** 背包逐 qid 增加。
+
+        Mod 侧只走游戏自己的 `checkAction`（内部自带"探测干跑 + 真做"防双扣），
+        所以脑侧**不做**任何扣材料/加产物的补账。
+        """
+        r = StepResult(action="machine", tile=tile)
+        act = str(action or "").strip().lower()
+        obs = self.snap()
+        player = self.player_of(obs)
+        inv_before = self._inventory_counts(player)
+        tv_before = self.tile_view(obs, tile) or {}
+        held_before = tv_before.get("heldObject") if isinstance(tv_before.get("heldObject"), dict) else None
+        ready_before = tv_before.get("readyForHarvest")
+        r.before = {"objId": tv_before.get("objId"), "held": held_before,
+                    "ready": ready_before, "minutes": tv_before.get("minutesUntilReady"),
+                    "have": self._count_in_map(inv_before, item) if item else None}
+        if act not in ("feed", "collect"):
+            r.code = "failed"
+            r.reason = f"action 只能是 feed / collect（收到「{action}」）"
+            return r
+        if not tv_before.get("objId"):
+            r.code = "no_machine"
+            r.reason = f"({tile[0]},{tile[1]}) 上没有放置物 ⇒ 不是机器"
+            return r
+        if held_before is None and ready_before is None and tv_before.get("minutesUntilReady") is None:
+            r.code = "no_machine"
+            r.reason = (f"({tile[0]},{tile[1]}) 上的物体没有机器元数据（heldObject/readyForHarvest/"
+                        "minutesUntilReady 都缺）⇒ 不是机器（fail-closed，不猜）")
+            return r
+        if act == "feed":
+            if held_before is not None:
+                r.code = "already_full"
+                r.reason = (f"机器里已有东西（heldObject={held_before.get('name') or held_before.get('id')}）"
+                            "⇒ 等它产出并取货后再投料")
+                return r
+            if not item:
+                r.code = "no_object"
+                r.reason = "投料必须给 item（要投进去的物品：qualifiedId / ItemId / 名字子串）"
+                return r
+            if self._count_in_map(inv_before, item) <= 0:
+                r.code = "no_object"
+                r.reason = f"背包里找不到投料「{item}」"
+                return r
+        if act == "collect" and ready_before is not True:
+            r.code = "not_ready"
+            r.reason = (f"机器还没产出（readyForHarvest={ready_before}、"
+                        f"minutesUntilReady={tv_before.get('minutesUntilReady')}）⇒ 现在取不到东西")
+            return r
+        args: dict[str, Any] = {"action": act, "tile": [tile[0], tile[1]]}
+        if item:
+            args["item"] = item
+        try:
+            raw = self.c.exec_skill("machine", args, timeout_ms=timeout_ms)
+            res = raw if isinstance(raw, dict) else {}
+            r.status = str(res.get("status") or "")
+        except BridgeError as exc:
+            r.receipt, r.status = _receipt(exc), _exc_status(exc)
+        after = self.snap()
+        inv_after = self._inventory_counts(self.player_of(after))
+        tv_after = self.tile_view(after, tile) or {}
+        held_after = tv_after.get("heldObject") if isinstance(tv_after.get("heldObject"), dict) else None
+        ready_after = tv_after.get("readyForHarvest")
+        gained = self._loot_delta(inv_before, inv_after)
+        lost = {qid: int(n) - int(inv_after.get(qid, 0)) for qid, n in inv_before.items()
+                if int(inv_after.get(qid, 0)) < int(n)}
+        held_changed = (held_before or {}) != (held_after or {})
+        ready_flipped = ready_before != ready_after
+        evidence = ""
+        if held_changed:
+            evidence = "heldObject"
+        elif ready_flipped:
+            evidence = "ready"
+        elif gained or lost:
+            evidence = "inventory"
+        r.after = {"held": held_after, "ready": ready_after,
+                   "minutes": tv_after.get("minutesUntilReady"),
+                   "gained": gained or None, "lost": lost or None, "evidence": evidence or None}
+        if evidence:
+            r.ok = True
+            word = "投料" if act == "feed" else "取货"
+            r.reason = (f"{word}成功：观测到世界变化（证据={evidence}；heldObject "
+                        f"{(held_before or {}).get('id') or '空'}→{(held_after or {}).get('id') or '空'}，"
+                        f"ready {ready_before}→{ready_after}，新增={gained or '无'}，减少={lost or '无'}）")
+            return r
+        r.code = "failed"
+        r.reason = (f"{(('投料' if act == 'feed' else '取货'))}没有生效：heldObject/ready/背包逐 qid 计数"
+                    f"都没有变化（heldObject={(held_after or {}).get('id') or '空'}，ready={ready_after}）"
+                    + (f"；回执={r.receipt}" if r.receipt else ""))
+        return r
+
     def load_save(self, save: str | None = None) -> StepResult:
         r = StepResult(action="load_save")
         try:

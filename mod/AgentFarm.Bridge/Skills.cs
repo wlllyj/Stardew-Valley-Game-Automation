@@ -101,6 +101,13 @@ namespace AgentFarm.Bridge
                 case "debug_dump":
                 case "add_missed_recipes":
                     return ClampDumpTimeout(timeoutMs);
+                // 【task-210】机器链三个技能都是单 tick 同步的（`checkAction`/`tryToPlaceItem` 不跨 tick），
+                // 但 `place_object`/`machine` 里带反射与背包扫描，给 30s 上限足够、8s 也够用；
+                // 统一按"短技能"给 30s 默认，避免被 8s 默认值误杀（上限 60s，不许无界）
+                case "craft_item":
+                case "place_object":
+                case "machine":
+                    return ClampMachineTimeout(timeoutMs);
                 default:
                     return ClampTimeout(timeoutMs);
             }
@@ -108,6 +115,17 @@ namespace AgentFarm.Bridge
 
         /// <summary>【task-213】内省/补发的时间预算：默认 30s、上限 60s。</summary>
         public static int ClampDumpTimeout(int? timeoutMs)
+        {
+            const int def = 30000;
+            const int max = 60000;
+            int v = timeoutMs ?? def;
+            if (v < TimeoutMinMs) v = TimeoutMinMs;
+            if (v > max) v = max;
+            return v;
+        }
+
+        /// <summary>【task-210】机器链（craft_item/place_object/machine）的时间预算：默认 30s、上限 60s。</summary>
+        public static int ClampMachineTimeout(int? timeoutMs)
         {
             const int def = 30000;
             const int max = 60000;
@@ -456,6 +474,29 @@ namespace AgentFarm.Bridge
                 case "add_missed_recipes":
                     return new AddMissedRecipesSkill(req, world, monitor).Step;
 
+                // 【task-210】机器链（熔炉是第一个用例；依据 docs/_il-machine-chain.md / task-211）：
+                //
+                //   * `craft_item`：只走游戏制作品原语链 —— `new CraftingRecipe(key)` →
+                //     `doesFarmerHaveIngredientsInInventory(null)` → `createItem()` →
+                //     **先自检空格** → `consumeIngredients(null)` → `addItemToInventoryBool(...)`。
+                //     ⚠️ 1.6.15 **没有** `CraftingRecipe.Craft(...)`；也**不要**走
+                //     `CraftingPage.clickCraftingRecipe`（private，"先扣材料、产物挂光标"）。
+                //   * `place_object`：只走 `Utility.tryToPlaceItem(loc, obj, px, py)`（游戏自己扣物品）；
+                //     ⚠️ 该函数返回值不可信（非家具放置失败也 return true）⇒ 判据必须是观测
+                //     （格子上出现物体 + 背包 −1），绝不自补扣。
+                //   * `machine`：投料/取货都走 `GameLocation.checkAction(...)`（游戏自己的 drop-in /
+                //     pickup 分支）。⚠️ 投料读的是 `who.CurrentItem`（必须先把材料选到快捷栏）；
+                //     `checkAction` 内部自带"探测干跑 + 真做"与 `ignoreItemConsumptionThisFrame` 防双扣
+                //     ⇒ **绝不要**自己调 `performObjectDropInAction` 再自己扣材料。
+                //   三者都是单 tick 同步技能 ⇒ **不**加入 BridgeHost.IsLongTaskSkill。
+                //   判据一律跨观测差分（heldObject / readyForHarvest / 背包逐 qid 计数）。
+                case "craft_item":
+                    return new CraftSkill(req, world, monitor).Step;
+                case "place_object":
+                    return new PlaceObjectSkill(req, world, monitor).Step;
+                case "machine":
+                    return new MachineSkill(req, world, monitor).Step;
+
                 default:
                     // 未实现的技能：合法请求但还没有实现（区别于 unknown_skill）。
                     return () => new ExecResponse
@@ -465,7 +506,8 @@ namespace AgentFarm.Bridge
                         Skill = skill,
                         Reason = $"技能“{skill}”尚未实现（已实现：noop、move_to、move_to_location、"
                                + "dismiss_modal、load_save、quit_game、interact、use_tool、select_item、plant、"
-                               + "sleep、buy、sell、upgrade_tool、pickup_tool、debug_dump、add_missed_recipes）",
+                               + "sleep、buy、sell、upgrade_tool、pickup_tool、debug_dump、add_missed_recipes、"
+                               + "craft_item、place_object、machine）",
                     };
             }
         }
@@ -745,9 +787,13 @@ namespace AgentFarm.Bridge
         /// <summary>已知技能名（用于区分 unknown_skill 与 not_implemented）。</summary>
         private static readonly HashSet<string> KnownSkills = new HashSet<string>(StringComparer.Ordinal)
         {
-            // 已实现
+            // 已实现（⚠️ 必须与 `Skills.Create` 的 case 逐字同步：`BridgeHost.ServeExec` 在
+            // 进主线程之前就按这张表把不认识的技能一律 `unknown_skill` 拒掉。
+            // task-205/213/210 的真机事故教训：Create 里加了 case 但忘了这里 ⇒ 装机后才炸。）
             "noop", "move_to", "dismiss_modal", "move_to_location", "load_save", "quit_game", "interact", "use_tool",
             "select_item", "plant", "sleep", "buy", "sell",
+            "upgrade_tool", "pickup_tool", "debug_dump", "add_missed_recipes",
+            "craft_item", "place_object", "machine",
             // 架构 §5.3 规划中（返回 not_implemented，便于“脑”一次性看清缺口）
             "exit_building", "harvest",
             "pickup_debris", "collect_machine", "refill_watering_can", "talk",
