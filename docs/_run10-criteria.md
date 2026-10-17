@@ -75,3 +75,41 @@
 - L0 ✅（6 条；`count>=1` True）；L1 ✅（**4/6** 命中，run B **70 次决策调用**，另 2 次 review 不计入）；L2 ✅（**6 条可比信号**：harvest leftover 79→71、plant_area 1→0、till_area 1→0、stage_incomplete@harvest 79→71、`dead_crops_blocking` 4→0、water_area 4→1；**旧版曾打三行 `0→0 ✅ 减少` 的假阳性**）；L4 ✅（尾部 runA=0 → runB=0；新增非硬 check `zero_action_evidenced` 只作附注）；L3 全部 0 次旁证；L5 =「**不足以判定自我进化**（L3：没有任何决策受影响的旁证）；且 run B 尾部连续 VERIFIED 0 < 3 天」。
 - 单测：`tests.test_compare_runs` **34 OK**（原 23 + 新增 11）；全量 `discover -s tests` **Ran 1055 / OK（0 红）**。
 - **A″/B″ 提醒**：现行 A″/B″（`runA2/runB2-0735`）的 `-llm.jsonl` sidecar 在本机**缺失** ⇒ 对其跑 L1 会得到"读不到留痕"（预期路径缺失 ≠ 没注入）；Lead 重跑前需补齐 sidecar，否则 L1 只能标【无法判定】。
+
+## 8. 意图-执行对账口径（2026-10-18 固化，`User said (m18972)`，0.7.39 起生效）
+
+> 起因：LLM 明确要求 `clear_area`（简报里树就是障碍），而实现层 `SKIP_KINDS` 静默跳过树 —— **没有任何一条判据发现"意图被无声缩水"**，这个缺口活了十几轮。本节把"每个 LLM 意图都必须有执行对账"固化成判据；实现卡 = task-219（brain）、task-220（analyzer）。
+
+### 8.1 数据形状（只有这三样，别再加新事件名）
+
+1. `intent_plan{intent_id, task, area_hint, source(deterministic|llm), boundary, at}` —— 决策落地时每个意图一条（可挂在现有 `decision` 行上，加字段）。
+2. `intent_execution{intent_id, task, requested_tiles, executed_steps, ok_steps, unexecuted_tiles, reasons:{code:count}}` —— 该意图被换掉或当天收尾时记一条。
+3. `day_end.intent_coverage[]` —— 当天所有意图的执行对账汇总；**不新增 checks 键**。
+
+### 8.2 固定原因码枚举（闭合集，出现集外值 ⇒ 判红）
+
+`no_target` / `deferred_capability` / `tool_level` / `budget` / `blocked_tile` / `blocked_modal` / `no_slot` / `world_stuck` / `cancelled_by_verify` / `gated`。
+
+- `no_target` 必须附证据（`_stage_tiles==[]` 且窗口/农场计数支持"确实没有"），空口 `no_target` 不算；
+- `deferred_capability` 必须同时在 `DEFERRED_KINDS` 且**简报如实写"暂不支持 + 缺什么能力"**；只登记不告知 ⇒ 判红（这是"合法偷懒"的唯一出口，必须留证据）；
+- `budget` / `gated` 属策略性延后：**不进 hard failure**，但必须在 gaps/次日简报可见；
+- 一个意图可以有多条原因码（按环节累计），但**不许 0 条**。
+
+### 8.3 analyzer 判红（task-220 验收必须覆盖）
+
+1. 有 `intent_plan` 而**无** `intent_execution` ⇒ 红（对账缺失）；
+2. `executed_steps==0` 且 `reasons` 为空 ⇒ 红（无声缩水）；
+3. `reasons` 含集外码 ⇒ 红；
+4. `deferred_capability` 而 `<journal>-gaps.json` 无对应条目 ⇒ 红（缺口没落盘）；
+5. `DEFERRED_KINDS` 里的 kind 出现可执行目标却一次都没执行 ⇒ 红（该取消的登记没取消）；
+6. 同 (kind, reason) 连续 **≥3 天**出现在 gaps 且无修复卡 ⇒ **⚠**（Lead 复核，不自动判红）；
+7. 旧账本没有这些字段 ⇒ 【无法判定】（缺失 ≠ 通过，也不许当失败）。
+
+### 8.4 次日可见（只提示，不豁免）
+
+`Brief.recent_gaps` 最多 3 条、总长 ≤200 字符，渲染在核心行之后；**裁剪优先级：核心 > 教训 > 决策史 > 复盘 > gaps（最先裁）**。gaps 只影响提示词，**不进 `checks`、不做豁免额度、不改 `_leftover`**（沿用 `scope_shed` 的"裁撤 ≠ 免罚"口径）。
+
+### 8.5 与"目标 1/2"的关系
+
+- 目标 1（指定作业区清空）：护栏 A/B（task-218）保证"说得出、做得到"；本节保证"做不到必须说清楚"。
+- 目标 2（策略闭环）：`intent_coverage` + gaps 是"结果校验 → 据结果优化"的**事实基座**；没有它，L0–L5 里的 L3（决策受教训影响）无法取证。
