@@ -1,5 +1,35 @@
 # 接续清单 · 2026-10-11 收工时点（明天从这里开始）
 
+## 0m. 2026-10-18 00:45 · **第三次暂停（`m18976`「找个合适的时机暂停，明天再继续」）—— 0.7.38 冻结的全部内容已就绪，只差 Lead 走九步**
+
+**停点一句话**：**HEAD `6caf229`**（`task-217`：compare-runs 判据修正），**全量 `PYTHONUTF8=1` = `Ran 1055 / OK`（0 红）**；工作树只剩 deputy 的两份 task-200 探针 `M scratch/_t200_mutate.py`、`M scratch/_t200_probe.py`（不是任何人的在制源码）；**无游戏进程、无 `bridge.json`**；装机 Mod = **0.7.37**（**已知白名单缺陷，别直接拿它跑新技能**）；**goal 仍 `paused`（rev22，disarmed，roundsStarted 44）**，用户说「继续」时在 UI 里 resume 一次。
+
+**今晚落地的六张卡**（都有提交与独立读数）
+| 卡 | 提交 | 一句话 |
+|---|---|---|
+| task-205 铁匠铺升级链 | `8ee33cb` | `upgrade_tool`/`pickup_tool` + 脑侧策略；真机验收被材料阻塞 |
+| task-207 analyzer 收 4 事件 | `b016322` + `530a65e` | 全量归零；六账本 rc/红数不变、`#无法判定` 各 +7（缺失≠0） |
+| task-208 显式对话应答 | `dadd356` | `answerIndex`/`answerText`，fail-closed，绝不回退自动 Yes |
+| task-213 Mod 内省面 | `a0a0a4d` | `debug_dump`（7 张表）+ `add_missed_recipes`（前后差分） |
+| **task-216 F3 + 结构护栏** | **`fd1b88d`** | 取回死锁两条修法 + 白名单事故的**永久护栏**（`SkillCatalog.cs` 单一数据源 + 7 条自检断言，含「Create 的 case 与表双向相等」） |
+| task-217 compare-runs 判据 | `6caf229` | L2 假阳性修复（`0→0` 不再报"减少"）、L1 分母排除 review、L5 门禁补 L3、恒退码 rc=2 |
+| task-214 内省真机取证 | `3e7b6e8` | **BLOCKED**（0.7.37 的 `KnownSkills` 漏 7 个新技能 ⇒ `unknown_skill`），证据链完整、待 0.7.38 复跑 |
+| task-206 / task-215 | `f252202` / `e86c829` | 206 = **FAIL**（F3，已由 216 修）；215 = compare-runs 审计（发现 L2 造假，已由 217 修） |
+
+**明天的开工顺序（严格按序）**
+1. **Lead：冻结 0.7.38**（`docs/_release-0.7.37.md` 同款九步；内容 = `fd1b88d` 的 task-216 + SkillCatalog 护栏 + 白名单修复；**不含 task-210**）→ `note-0738` 首串 `v0.7.38` → bump manifest → `bridge.py:39 MOD_VERSION_EXPECTED="0.7.38"` → build 0/0 → 冻结提交 → `check-release --expect 0.7.38` 六绿 → `deploy-mod --no-quit` → `goto Farm` → `preflight --save-baseline logs/run10f-baseline.json` → **重新算五文件 SHA256 发 machine-runner**（不要用 0.7.37 的旧指纹：冻结后 brain 文件变过）。
+2. **machine-runner：task-214 复跑**（第一发只读验活 = `debug_dump --table crafting_recipes --key Furnace`，不报 `unknown_skill` 即分发通）→ ②`trigger_actions` → ③`add_missed_recipes` **一次** → ④复核配方是否入字典；出 `docs/_run10-furnace-probe.md`。之后若材料到位，再按 `docs/_upgrade-protocol.md` 做铜斧真机验收。
+3. **dev-coder（等冻结装机后）**：**task-218**（树纳入清障 + 护栏 A 意图-执行覆盖矩阵 + 护栏 B blockers 未降判红）→ **task-219**（意图-执行对账闭环，`User said (m18972)` 直接指令）→ **task-220**（analyzer 收 gaps，派 log-analyst）→ **task-210**（机器链：熔炉→铜锭，进 0.7.39）。
+4. **deputy-lead**：先把它那两份 `scratch/_t200_*` 提交；task-200 的报告按 0.7.37 冻结树（`063351d`）收口即可（**不必**为 0.7.38 重做——216 已由 206/216 自己的读数覆盖）；之后接 task-218 的对抗验收。
+
+**两个已修但要记住的事故**
+- **0.7.37 白名单事故**：冻结只跑了 `check-release`，没跑「技能分发烟雾测试」⇒ 装机版对 `debug_dump`/`upgrade_tool`/`craft_item` 等全回 `unknown_skill`。永久修复 = `SkillCatalog.cs` 单一数据源 + 双向文本断言（每次 build 都跑）。**以后每批冻结后加一条真机烟雾**：任取一个新技能发一次只读请求，看是不是 `not_implemented`/`ok` 而不是 `unknown_skill`。
+- **昏睡罚金 ×3**：游戏挂着无人管 ⇒ 2:00 强制昏睡扣 10% 金币（−279 / −251 / −226g，现钱 **2042g**）。**纪律**：游戏只要开着就必须有脑在跑，跑完立刻 `tools/stop-game.py`；装机/等待期间一律不挂游戏。
+
+**其他状态**：存档主档 `4383128 B / 2026-10-17 23:38:17.154`（秋 20 日，钱 2042g）；0.7.37 五文件名（**明天重算**）仅供参考：longrun `5D13B16D…`、farmwork `EB41BF86…`、bridge `40D1A2B3…`、dll `C1470B01…`、manifest `87094344…`。新卡：**task-218**（树+护栏）、**task-219**（意图对账）、**task-220**（analyzer gaps）。
+
+---
+
 ## 0l. 2026-10-17 21:22 · **第二次暂停（`m18621`「不好意思，还得暂停一下，需要更新dsh」）—— 停点未变，多了一张待开工卡**
 
 **停点与 §0k 完全相同**：**HEAD `a113fe7`，工作树干净**，无游戏进程、无桥；goal 仍 `paused`（rev17）。所有队友 inactive（dev-coder / log-analyst / machine-runner / deputy-lead / planner-dev）。
