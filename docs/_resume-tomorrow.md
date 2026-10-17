@@ -1,5 +1,24 @@
 # 接续清单 · 2026-10-11 收工时点（明天从这里开始）
 
+## 0l. 2026-10-17 21:22 · **第二次暂停（`m18621`「不好意思，还得暂停一下，需要更新dsh」）—— 停点未变，多了一张待开工卡**
+
+**停点与 §0k 完全相同**：**HEAD `a113fe7`，工作树干净**，无游戏进程、无桥；goal 仍 `paused`（rev17）。所有队友 inactive（dev-coder / log-analyst / machine-runner / deputy-lead / planner-dev）。
+
+**本次只多做了一件事**：建了 **task-213**（无 owner，`pending`，ready）= Mod 内省面 `debug_dump`（数据表：crafting_recipes/cooking_recipes/trigger_actions/mail/machines/objects/big_craftables，带 key/limit 与 fail-closed）+ `add_missed_recipes`（反射调 `Farmer.AddMissedMailAndRecipes()`，回执给 before/after 差分与 `crafting_recipes_added`）+ 脑侧薄包装 + `scratch/_t213_probe.py` 真机探针；C# 纯规则自检 ≥4 断言；**属于 0.7.37 冻结内容**。
+
+**为什么它排在冻结前**：Furnace 配方问题离线只能收到「条件串在打包 xnb 里读不到」（`docs/_il-furnace-recipe.md`）⇒ 用一次真机内省一锤定音：`debug_dump crafting_recipes key=Furnace` 拿配方串、`debug_dump trigger_actions` 拿触发器原文、再 `add_missed_recipes` 看是否补发。若补发成功 ⇒ 升级链的配方阻塞当场解除（走游戏自己的补发方法，不算造假）。
+
+**恢复后的开工顺序（取代 §0k 的同项）**
+1. **dev-coder**：task-213（先 `debug_dump`、后 `add_missed_recipes`）→ 报 build/C#/全量读数。
+2. **log-analyst**：task-207（analyzer 收 task-205 的 4 事件）⇒ 全量应回 `1026/OK` 零红。
+3. **deputy-lead**：task-206（task-205 对抗验收）+ task-200（本批 5 卡冻结树验收）。
+4. **Lead**：全绿 ⇒ 冻结 **0.7.37**（`docs/_release-0.7.37.md` §2；note 文件补 199/208/205 + 213 两个内省技能）⇒ 装机 ⇒ `goto Farm` ⇒ `preflight` ⇒ **machine-runner 跑 task-213 真机探针**（Furnace 一锤定音）。
+5. 之后：task-210 机器链 → `docs/_upgrade-protocol.md` 的铜斧升级真机验收 → task-113 的 A″/B″ 五天跑。
+
+**其余一切以 §0k 为准**（两处硬阻塞、0.7.37 五卡状态、目标 m15155、判据要点、今天的昏睡扣钱教训）。
+
+---
+
 ## 0k. 2026-10-17 12:52 · **用户要求暂停（`m18566`「暂停吧，后续再启动」）—— 0.7.37 批次最后一卡停在 WIP**
 
 **停点一句话**：**HEAD `8ee33cb`（`wip(task-205): 工具升级/取回闭环`，12 文件 +2102/−4，未 bump/未部署/未写 completed）**；`brain/`、`mod/`、`tests/` **干净**；树上只剩 deputy 的报告 + 各人的 `scratch/` 探针。**goal 已 `paused`（rev17，disarmed）**，用户说「启动」时再 resume。游戏**已优雅退出**，存档 = 第1年 秋 20 日（`4417241 B`）。
