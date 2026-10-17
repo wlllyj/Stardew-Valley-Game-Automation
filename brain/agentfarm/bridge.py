@@ -36,7 +36,17 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.35"   # v0.7.35：再生作物收获的因果链修正（task-177 真机）——
+MOD_VERSION_EXPECTED = "0.7.36"   # v0.7.36：收获证据面收口（task-186/188/189）——Mod 侧
+                                  # ①`use_tool`（含镰刀类作物）回执补 `acted` + `actedEvidence`，
+                                  #   与 `interact` 同一套跨观测证据口径、**fail-closed**（证据不可得 ⇒
+                                  #   `acted=false`，不允许 true）；②该证据提取抽成共享方法，
+                                  #   `mod/AgentFarm.Bridge.Tests` 增加 use_tool 三态行为断言（26 断言）；
+                                  # ③`use_tool` 失败文案不再把原物渲染成空（task-188 = R1/R4）。
+                                  # 脑侧同批（非 Mod）：task-186 收获缺格不得当成功 + loot 对账 +
+                                  # sell 白名单收窄；task-189 loot 记账 = 逐 qid 背包差 + 有界确认轮
+                                  # （`LOOT_CONFIRM_TRIES=2 × 0.35s`）；task-192 释放认输区时同步扣减
+                                  # 当天 `day_end.scope_shed*`（日终末态）+ 累计量 `shed_ever` 持久化。
+                                  # v0.7.35（历史）：再生作物收获的因果链修正（task-177 真机）——
                                   # ①`Skills.interact` 的 `acted` 改由**跨观测证据**推导（TileSig /
                                   #   目标格 `ready` true→false / `farm.readyCrops` 下降 / 背包逐 qid
                                   #   栈数增加），全不命中才 `false`；②`ExecResponse.actedEvidence`
