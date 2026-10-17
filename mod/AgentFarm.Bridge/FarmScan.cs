@@ -40,6 +40,15 @@ namespace AgentFarm.Bridge
         /// </summary>
         public const int DryTilesMax = 64;
 
+        /// <summary>
+        /// 【task-199】`farm.readyTiles` 的坐标上限（与 <see cref="DryTilesMax"/> 同量级）。
+        ///
+        /// 为什么也限 64：脑侧一次只做一个"最近"的目标、走到一格的墙钟预算有限；给太多坐标
+        /// 只会让脑侧挑花眼/超时。超出 ⇒ 截断并置 `readyTilesTruncated=true`（计数仍以
+        /// `readyCrops` 为准，脑侧不许把截断后的列表当"全部"）。
+        /// </summary>
+        public const int ReadyTilesMax = 64;
+
         // ---- 游戏内 ID 常量（1.6.x 的 ItemId 风格字符串）----
         private static readonly HashSet<string> MachineIds = new HashSet<string>(StringComparer.Ordinal)
         {
@@ -75,6 +84,9 @@ namespace AgentFarm.Bridge
         /// <summary>本轮扫到的干作物格坐标（task-50；发布时排序 + 截断）。</summary>
         private readonly List<int[]> _dryTiles = new List<int[]>();
 
+        /// <summary>本轮扫到的**可收熟作物**格坐标（task-199；与 `ReadyCrops` 同一次扫描、同一判据）。</summary>
+        private readonly List<int[]> _readyTiles = new List<int[]>();
+
         private FarmView _acc = NewAccumulator();
         private FarmView _published;         // 最近一次完整结果（网络线程只读）
         private DateTime _publishedAtUtc = DateTime.MinValue;
@@ -109,6 +121,7 @@ namespace AgentFarm.Bridge
             _terrain = new List<KeyValuePair<Microsoft.Xna.Framework.Vector2, TerrainFeature>>();
             _objects = new List<KeyValuePair<Microsoft.Xna.Framework.Vector2, SObject>>();
             _dryTiles.Clear();
+            _readyTiles.Clear();
             _acc = NewAccumulator();
         }
 
@@ -219,6 +232,7 @@ namespace AgentFarm.Bridge
                 _acc.Complete = true;
                 _acc.ScanSeq = worldSeq;
                 PublishDryTiles();
+                PublishReadyTiles();
                 Volatile.Write(ref _published, _acc);
                 _publishedAtUtc = DateTime.UtcNow;
                 ResetCycle();
@@ -234,25 +248,41 @@ namespace AgentFarm.Bridge
         /// </summary>
         private void PublishDryTiles()
         {
-            try
+            PublishTiles(_dryTiles, DryTilesMax, (tiles, truncated) =>
             {
-                var ordered = new List<int[]>(_dryTiles);
-                ordered.Sort((a, b) => a[1] != b[1] ? a[1] - b[1] : a[0] - b[0]);
-                bool truncated = false;
-                if (ordered.Count > DryTilesMax)
-                {
-                    truncated = true;
-                    ordered = ordered.GetRange(0, DryTilesMax);
-                }
-
-                _acc.DryTiles = ordered.ToArray();
+                _acc.DryTiles = tiles;
                 _acc.DryTilesTruncated = truncated;
-            }
-            catch
+            });
+        }
+
+        /// <summary>
+        /// 把本轮扫到的**可收熟作物**格坐标排序 + 截断后写进待发布的 <see cref="_acc"/>（task-199）。
+        ///
+        /// 与 <see cref="PublishDryTiles"/> 共用同一个 <see cref="PublishTiles"/>：
+        /// 排序规则（先 `y` 再 `x`）、上限截断、异常时"空数组 + truncated=true"全部一致
+        /// —— 卡面要求 `readyTiles` 与 `dryTiles` 同一份缓存/同一个 `scanSeq`，不许两套口径。
+        /// </summary>
+        private void PublishReadyTiles()
+        {
+            PublishTiles(_readyTiles, ReadyTilesMax, (tiles, truncated) =>
             {
-                _acc.DryTiles = new int[0][];
-                _acc.DryTilesTruncated = true;
-            }
+                _acc.ReadyTiles = tiles;
+                _acc.ReadyTilesTruncated = truncated;
+            });
+        }
+
+        /// <summary>
+        /// 坐标列表的公共发布逻辑：排序（y,x 升序）→ 超过 <paramref name="max"/> 截断 → 赋值。
+        ///
+        /// 任何异常都不许影响统计发布：退回空数组 + `truncated=true`（不确定就说不确定）。
+        /// 【task-199】排序/截断本体搬到 `TileListRules`（纯函数、零游戏类型依赖）⇒
+        /// `mod/AgentFarm.Bridge.Tests` 能对它跑**行为**断言（与 `ClumpRules` 同一套做法）。
+        /// </summary>
+        private static void PublishTiles(List<int[]> source, int max,
+                                         Action<int[][], bool> assign)
+        {
+            TileListRules.OrderAndTruncate(source, max, out int[][] tiles, out bool truncated);
+            assign(tiles, truncated);
         }
 
         private void AccumulateTerrain(KeyValuePair<Microsoft.Xna.Framework.Vector2, TerrainFeature> entry)
@@ -290,7 +320,13 @@ namespace AgentFarm.Bridge
                     // 就是拿它当"可收"判据的后果（`docs\_il-harvest-path.md`）。
                     try
                     {
-                        if (CropMeta.Ready(dirt, crop).Value == true) _acc.ReadyCrops++;
+                        if (CropMeta.Ready(dirt, crop).Value == true)
+                        {
+                            _acc.ReadyCrops++;
+                            // 【task-199】同一判据、同一次扫描同时产出坐标：窗口外熟作物的
+                            // "看得到坐标"是 run A′ fall 13 空转的直接解药（与 dryTiles 同族）。
+                            _readyTiles.Add(new[] { (int)entry.Key.X, (int)entry.Key.Y });
+                        }
                     }
                     catch { }
                     try

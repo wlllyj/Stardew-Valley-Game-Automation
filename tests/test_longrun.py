@@ -42,7 +42,8 @@ from agentfarm.longrun import (  # noqa: E402
     DEFAULT_LLM_MAX_TOKENS, ENDED_BY_EVENT, ENDED_BY_MODAL, FAR_DRY_MAX_TRIES,
     FAR_DRY_OPEN_MAX, FAR_DRY_REFILL_MAX,
     FRONTIER_CLEAR_MAX, JUSTIFIED_END_REASONS, MAX_BUY_TRIES_PER_DAY, MAX_ENV_ATTEMPTS,
-    MAX_STUCK_FLUSH, MAX_TILE_ATTEMPTS, PLOT_EXHAUSTED_BURST, SLOT_RELIEF_MAX, SLOT_RESERVE,
+    MAX_STUCK_FLUSH, MAX_TILE_ATTEMPTS, PLOT_EXHAUSTED_BURST, READY_FAR_MAX_TRIES,
+    SLOT_RELIEF_MAX, SLOT_RESERVE,
     DayReport, LongRun,
     _till_blocked_by, is_justified_end, plot_observe,
 )
@@ -116,6 +117,11 @@ class FakeWorld:
         #: 想测**证据不可用**就显式赋 `None` / `{}` / `{"complete": False}` / `{"loaded": False}`；
         #: 想要一份**与世界状态一致**的真实扫描必须显式调 `self.farm_scan()`。
         self.farm: dict | None = _EMPTY_FARM_SCAN
+        #: 【task-199】"窗口外"的地块：`{格: tiles[] 记录}`，**只有当玩家站到它 3 格以内时**
+        #: 才出现在观测 `location.tiles[]` 里（模拟真桥"观测以玩家为中心"）。
+        #: `FakeWorld` 的 25 格主网格永远在窗口内，所以"窗口外熟作物"只能用这里造；
+        #: `farm.readyTiles` 要显式写进 `self.farm`（默认 `_EMPTY_FARM_SCAN` 没有该键 ⇒ 旧 Mod 语义）。
+        self.far_tiles: dict[tuple[int, int], dict] = {}
         self.seq = 1
         self.sleeps = 0
         self.refills = 0
@@ -206,6 +212,11 @@ class FakeWorld:
                 tv.update({"plantable": True, "watered": False})
             tiles.append(tv)
         free = sorted(self.tillable - self.dirt - set(self.blockers))
+        # 【task-199】窗口外的地块：只有玩家走到 3 格以内才看得见（真桥观测以玩家为中心）。
+        _pt = self.player_tile
+        for _t, _rec in sorted(self.far_tiles.items()):
+            if max(abs(_t[0] - _pt[0]), abs(_t[1] - _pt[1])) <= 3:
+                tiles.append(dict(_rec, tile=list(_t)))
         return {
             "ok": True, "status": "ok", "schema": "agentfarm-world/6",
             "worldSeq": self.seq, "hasSaveLoaded": True,
@@ -9925,6 +9936,156 @@ class TestTask198InventoryDay(unittest.TestCase):
                 self.assertNotEqual(rep.ended_by, "stuck", rep.ended_reason)
                 self.assertNotIn("守卫仍说还有活", rep.ended_reason)
                 self.assertIn(rep.ended_by, ("inventory_blocked", "sleep"))
+
+
+class _UnwalkableReadyClient(FakeClient):
+    """【task-199】窗口外熟作物"走不到"的假桥：`move_to`/`use_tool` 都抛 `unreachable`。
+
+    于是 `_walk_far_tile` 的开路也开不成（清障同样抛）⇒ 走不到、当天有界认输。
+    """
+
+    def move_to(self, x, y, *, timeout_ms=None, allow_bed=None):
+        raise BridgeError("假世界：寻路无法到达", status="unreachable")
+
+    def use_tool(self, tile, *, tool=None, timeout_ms=None):
+        raise BridgeError("假世界：四邻都站不过去", status="unreachable")
+
+
+class TestTask199ReadyFar(unittest.TestCase):
+    """task-199：窗口外熟作物（`farm.readyTiles`）⇒ 走过去收；走不到如实 `ready_far_blocked`。
+
+    病灶（run A′ fall 13）：`farm.readyCrops` 是农场级计数、窗口只有半径 ~14，窗口外的熟作物
+    **没坐标** ⇒ 守卫拿计数当"还有活"，一整天换片地空转，最后
+    `stuck:同一秒连发 5 次换片都没有目标`。本类钉死四条：
+    缺字段 fail-closed / 有坐标就走过去收成 / 走不到有界认输且守卫闭嘴 / 与窗口口径去重。
+    """
+
+    FAR = (80, 30)
+
+    def _world(self, *, ready: int = 1, tiles_status: str = "ok"):
+        w = FakeWorld(seeds=0, money=0, weeds=0)
+        coords = [(80 + i, 30) for i in range(max(ready, 1))]
+        for t in coords[:ready]:
+            w.crops[t] = {"ripe": True, "ready": True, "watered": True}
+            w.far_tiles[t] = {"kind": "dirt", "feature": "HoeDirt", "standable": True,
+                              "actionable": True, "crop": "24", "ripe": True, "ready": True,
+                              "readySource": "game", "harvestMethod": "Grab",
+                              "watered": True, "dead": False, "plantable": False}
+        farm = {"loaded": True, "complete": True, "crops": ready, "ripeCrops": ready,
+                "readyCrops": ready, "deadCrops": 0, "dryCrops": 0, "dryDeadCrops": 0,
+                "unwateredCrops": 0, "hoeDirt": ready, "emptyDirt": 0}
+        if tiles_status != "unavailable":
+            farm["readyTiles"] = [[t[0], t[1]] for t in coords[:ready]]
+            farm["readyTilesTruncated"] = (tiles_status == "truncated")
+        w.farm = farm
+        return w
+
+    def _run(self, w, *, client_cls=FakeClient):
+        run = make_run(w)
+        run.worker = FarmWorker(client_cls(w), log=lambda *_: None, pause=lambda *_: None)
+        return run
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list[dict]:
+        return [e for e in run.entries if e["event"] == name]
+
+    @staticmethod
+    def _rep() -> DayReport:
+        return DayReport(day_key=("spring", 1, 9), started_at=0.0)
+
+    def test_missing_ready_tiles_fails_closed_and_keeps_the_guard(self):
+        """旧 Mod 没有 `readyTiles` ⇒ fail-closed：不判"没熟作物"、不动、守卫照旧说有活。"""
+        w = self._world(ready=1, tiles_status="unavailable")
+        run = self._run(w)
+        rep = self._rep()
+        before_tile = list(w.player_tile)
+        self.assertFalse(run._harvest_far_ready(w.obs(), rep))
+        self.assertEqual(list(w.player_tile), before_tile, "没有坐标 ⇒ 不许白走一趟")
+        self.assertEqual(len(self._events(run, "ready_far_unavailable")), 1)
+        self.assertFalse(self._events(run, "ready_far"))
+        reasons = run.work_reasons(w.obs())
+        self.assertTrue(any("熟作物" in r for r in reasons), reasons)
+        self.assertTrue(any("旧 Mod" in r or "fail-closed" in r for r in reasons), reasons)
+        self.assertEqual(len(w.crops), 1, "fail-closed 不许动手")
+
+    def test_far_ready_is_walked_to_and_harvested(self):
+        """有坐标 ⇒ 走过去收下来（判据 = `harvest()` 的四选一观测差分，不是回执）。"""
+        w = self._world(ready=1, tiles_status="ok")
+        run = self._run(w)
+        rep = self._rep()
+        self.assertTrue(run._harvest_far_ready(w.obs(), rep))
+        ready_events = self._events(run, "ready_far")
+        self.assertEqual(len(ready_events), 1)
+        self.assertTrue(ready_events[0]["ok"])
+        self.assertTrue(ready_events[0]["walked"])
+        self.assertEqual(ready_events[0]["tile"], [self.FAR[0], self.FAR[1]])
+        self.assertNotIn(self.FAR, w.crops, "作物必须真的被收走（观测差分）")
+        self.assertEqual(run.farm_actions_today, 1)
+        self.assertEqual(list(w.player_tile), [self.FAR[0], self.FAR[1] - 1],
+                         "必须先走到目标格四邻之一")
+
+    def test_unreachable_far_ready_is_bounded_and_silences_the_guard(self):
+        """走不到 ⇒ 有界认输（`ready_far_blocked`）+ 守卫闭嘴 + `gave_up_ready` 如实收尾。
+
+        这条直接钉死 run A′ fall 13：**绝不许**变成"还有熟作物"却永远拿不出目标的空转。
+        """
+        w = self._world(ready=1, tiles_status="ok")
+        run = self._run(w, client_cls=_UnwalkableReadyClient)
+        rep = self._rep()
+        self.assertFalse(run._harvest_far_ready(w.obs(), rep))
+        self.assertFalse(run._harvest_far_ready(w.obs(), rep))
+        self.assertIn(self.FAR, run.ready_far_given_up)
+        self.assertEqual(len(self._events(run, "ready_far_blocked")), 1)
+        self.assertEqual(run.ready_far_tries.get(self.FAR), READY_FAR_MAX_TRIES)
+        reasons = run.work_reasons(w.obs())
+        self.assertFalse(any("熟作物" in r for r in reasons), reasons)
+        allow, code, text = run.sleep_guard(w.obs())
+        self.assertTrue(allow)
+        self.assertEqual(code, "gave_up_ready")
+        self.assertIn("已放弃当天", text)
+        self.assertFalse(is_justified_end("sleep", f"{code}:{text}"),
+                         "gave_up_ready 不在诚实上限白名单 ⇒ 当天不许 VERIFIED")
+
+    def test_truncated_ready_tiles_are_reported_once(self):
+        """坐标被 64 条上限截断 ⇒ 如实记 `ready_far_truncated`（一天一次），不当"全部"。"""
+        w = self._world(ready=2, tiles_status="truncated")
+        w.farm["readyTiles"] = []          # 截断到一条都不剩（最坏形态）
+        run = self._run(w)
+        rep = self._rep()
+        self.assertFalse(run._harvest_far_ready(w.obs(), rep))
+        self.assertFalse(run._harvest_far_ready(w.obs(), rep))
+        self.assertEqual(len(self._events(run, "ready_far_truncated")), 1)
+        self.assertEqual(w.farm["readyCrops"], 2, "截断时总数仍以 readyCrops 为准")
+
+    def test_window_ready_tile_is_not_counted_as_far(self):
+        """`readyTiles` 里同时含窗口内的格子 ⇒ 去重，不当"窗口外"重复跑一趟。"""
+        w = self._world(ready=1, tiles_status="ok")
+        w.dirt = {(62, 10)}
+        w.crops[(62, 10)] = {"ripe": True, "ready": True, "watered": True}
+        w.farm["readyTiles"] = [[62, 10], [80, 30]]
+        w.farm["readyCrops"] = 2
+        run = self._run(w)
+        far, status = run._ready_far_tiles(w.obs())
+        self.assertEqual(status, "ok")
+        self.assertEqual(far, [self.FAR], "窗口内 (62,10) 不许被当窗口外")
+
+    def test_bag_full_does_not_walk_for_far_ready(self):
+        """背包堵住 ⇒ 不为窗口外熟作物白走一趟（`no_slot` 是全局阻塞，交给日级腾格）。"""
+        w = self._world(ready=1, tiles_status="ok")
+        tool_rows = [{"slot": 0, "id": "Axe", "qualifiedId": "(T)Axe", "name": "Axe",
+                      "stack": 1, "isTool": True}]
+        w.inventory = tool_rows + [{"slot": i, "id": "388", "qualifiedId": "(O)388",
+                                    "name": "Wood", "stack": 99, "isTool": False}
+                                   for i in range(1, w.inventory_capacity)]
+        run = self._run(w)
+        rep = self._rep()
+        before_tile = list(w.player_tile)
+        self.assertFalse(run._harvest_far_ready(w.obs(), rep))
+        self.assertEqual(list(w.player_tile), before_tile)
+        self.assertEqual(run.ready_far_tries, {}, "背包堵住不消耗该格尝试次数")
+        skips = self._events(run, "ready_far_skipped")
+        self.assertEqual(len(skips), 1)
+        self.assertEqual(skips[0]["reason"], "bag_full")
 
 
 if __name__ == "__main__":  # pragma: no cover

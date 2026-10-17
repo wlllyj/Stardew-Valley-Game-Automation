@@ -46,6 +46,7 @@ from .farmwork import (CLUMP_KINDS, ENV_BLOCK_STATUSES, FRONTIER_KINDS, PATH_STA
                        SEED_KEEP_FACTOR, STAGE_ACTION, STAMINA_COST_CLEAR, STAMINA_COST_SOW,
                        STAMINA_COST_TILL, STAMINA_COST_WATER, FarmWorker, StageResult, StepResult,
                        buy_count_for, farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles,
+                       farm_ready_tiles,
                        is_seed_offer, pick_seed_offer, player_free_slots, seed_items,
                        surplus_sell_plan, tile_ready, till_blocked_by)
 from .planner import (DECISIONS_KEPT, LESSONS_INJECT_CHARS, LESSONS_INJECT_MAX, BoundaryPlanner, Brief,
@@ -189,6 +190,18 @@ FAR_DRY_REFILL_MAX = 2
 #: 开路本身有界（≤4 次清障/次），再乘 2 仍是常数；开完立刻**重试同一格**（同一次 try 之内，
 #: 不额外消耗该格的 `FAR_DRY_MAX_TRIES` 额度）。
 FAR_DRY_OPEN_MAX = 2
+
+#: 【task-199】窗口外熟作物：同一格一天最多试几次（一次 = 走过去 + 收一下）。
+#:
+#: 与 `FAR_DRY_MAX_TRIES` 同口径：第一次多半是寻路抖动，第二次还不行就认账 ——
+#: 记 `ready_far_blocked`（逐格、含 `walked`/`opens`/`cleared`）并当天不再试它，
+#: **不许**让"农场口径还有熟作物"变成守卫的无限空转理由（run A′ fall 13 的病灶）。
+READY_FAR_MAX_TRIES = 2
+
+#: 【task-199】窗口外那格"走不到"时，**同一格一天最多**朝它开几次路（复用 `_walk_far_tile`）。
+#:
+#: 与 `FAR_DRY_OPEN_MAX` 同样的有界理由；开路成功**不等于**收下来了（逐格判据说了算）。
+READY_FAR_OPEN_MAX = 2
 
 #: 【task-157】`cause` 里区分"warp 图上根本没路"（Mod 的 `unreachable_no_route`）与一般"够不着"。
 #: 判据只看回执/reason 原文；命中 ⇒ `cause="no_route"`，否则 `"unreachable"`。
@@ -897,6 +910,24 @@ class LongRun:
         self.water_far_not_on_farm = False
         # 本日是否已经播报过"旧 Mod 没给 dryTiles 坐标"（一天只提醒一次，不刷屏）。
         self.far_dry_unavailable_noted = False
+        #: 【task-199】窗口外熟作物（`farm.readyTiles`）：每格每天最多 `READY_FAR_MAX_TRIES` 次；
+        #: 试满仍收不下来 ⇒ `ready_far_given_up`（当天不再试它，逐格 journal `ready_far_blocked`），
+        #: 于是守卫不再被"农场口径还有熟作物"钉住（run A′ fall 13 一整天换片地空转的病灶）。
+        self.ready_far_tries: dict[tuple[int, int], int] = {}
+        self.ready_far_given_up: set[tuple[int, int]] = set()
+        #: 【task-199】每一格当天朝它开过几次路（上界 `READY_FAR_OPEN_MAX`；与浇水那套分开记账）。
+        self.ready_far_opens: dict[tuple[int, int], int] = {}
+        #: 本日是否已经播报过"旧 Mod 没给 readyTiles 坐标"（fail-closed 退回老行为，一天提醒一次）。
+        self.ready_far_unavailable_noted = False
+        #: 本日是否已经播报过"readyTiles 被上限截断"（截断时坐标不是全部 ⇒ 如实记一次）。
+        self.ready_far_truncated_noted = False
+        #: 【task-199】每格的失败**因由**（`unreachable`/`no_route`/`not_ready`/`truncated`/…）：
+        #: 收尾文案必须分因（task-133 的教训：把"壶空"写成"够不着"会误导验收）。
+        self.ready_far_causes: dict[tuple[int, int], str] = {}
+        #: 【task-199】当天"人在室内 ⇒ 窗口外熟作物没去收"（一天只试一次回农场，回不去留痕）。
+        self.ready_far_not_on_farm = False
+        #: 【task-199】当天是否已经播报过"背包堵住 ⇒ 窗口外熟作物先不走去收"（一天一次）。
+        self.ready_far_bag_noted = False
         # 【task-67】今天"买不到合适种子"的结论（"" = 还没确认；否则是 `no_seed_for_sale` 或
         # `cannot_afford`）。run6 死锁：夏季买不到硬编码的春季 `472`，而 `work_reasons` 里
         # "没种子但钱够 ⇒ 该去买"这条**永不可满足**的理由把守卫钉死，3 轮零变化 ⇒ 天天 `stuck`。
@@ -1934,19 +1965,27 @@ class LongRun:
                              + ("；不再试这一格" if tile in self.far_dry_given_up else ""))
         return True
 
-    def _walk_far_tile(self, tile: tuple[int, int]
+    def _walk_far_tile(self, tile: tuple[int, int], *, purpose: str = "water"
                        ) -> tuple[bool, str, list[dict[str, Any]]]:
-        """走到窗口外那一格旁边；**站不到就先有界开路再重试同一格**（task-157）。
+        """走到窗口外那一格旁边；**站不到就先有界开路再重试同一格**（task-157 / task-199）。
 
-        返回 `(walked, note, cleared)`。开路次数**按格**计（`FAR_DRY_OPEN_MAX`/天），
+        返回 `(walked, note, cleared)`。开路次数**按格**计（`FAR_DRY_OPEN_MAX`/天；
+        `task-199` 的收获路用 `READY_FAR_OPEN_MAX`，两套额度**分开记账**，互不偷用），
         每次开路复用 `farmwork.FarmWorker.open_way`（它自己上限 `MAX_OPEN_ACTIONS` 次清障，
         且清完会复核 `stand_next_to`）；清掉的每一格都计入当天农场动作
         （`farm_actions_today`）——那是真动手，不是"没活"。
 
-        忠实性：开路成功 **不等于** 浇上了水（调用方的逐格判据说了算）；
+        忠实性：开路成功 **不等于** 浇上了水/收下来了（调用方的逐格判据说了算）；
         worker 没有 `open_way`（假 worker / 旧实现）时**不假装开了路**，如实写进 note。
+
+        `purpose` 只影响**记账与 journal 事件名**（`water_far_open` / `ready_far_open`），
+        走路逻辑本身只有这一份（卡面硬要求：不许造第三套 walker）。
         """
         assert self.worker is not None
+        is_ready = purpose != "water"
+        opens = self.ready_far_opens if is_ready else self.far_dry_opens
+        open_limit = READY_FAR_OPEN_MAX if is_ready else FAR_DRY_OPEN_MAX
+        event = "ready_far_open" if is_ready else "water_far_open"
         walked, note = True, ""
         try:
             walked = bool(self.worker.stand_next_to(tile, timeout_ms=30000))
@@ -1957,14 +1996,14 @@ class LongRun:
         if walked:
             return True, note, []
 
-        used = int(self.far_dry_opens.get(tile, 0))
-        if used >= FAR_DRY_OPEN_MAX:
-            return False, (note + f"；当天为这一格开路已用满额度（{used}/{FAR_DRY_OPEN_MAX}）"), []
+        used = int(opens.get(tile, 0))
+        if used >= open_limit:
+            return False, (note + f"；当天为这一格开路已用满额度（{used}/{open_limit}）"), []
         opener = getattr(self.worker, "open_way", None)
         if opener is None:
             return False, (note + "；worker 不支持开路（无 open_way）⇒ 不开路，按走不到如实记"), []
 
-        self.far_dry_opens[tile] = used + 1
+        opens[tile] = used + 1
         code, cleared, open_notes = "", [], []
         err = ""
         try:
@@ -1977,13 +2016,13 @@ class LongRun:
         if cleared:
             self._actions += len(cleared)
             self.farm_actions_today += len(cleared)
-        self._journal("water_far_open", tile=list(tile), code=str(code or ""),
-                      attempt=self.far_dry_opens[tile], limit=FAR_DRY_OPEN_MAX,
+        self._journal(event, tile=list(tile), code=str(code or ""),
+                      attempt=opens[tile], limit=open_limit,
                       cleared_count=len(cleared), cleared=cleared[:8],
                       notes=[str(n)[:120] for n in (open_notes or [])][:6] or ([err] if err else []),
-                      note="【task-157】窗口外那一格走不到 ⇒ 先清挡路邻格（复用 `open_way`，"
-                           "每次 ≤`MAX_OPEN_ACTIONS` 次清障、每格每天 ≤2 轮）再重试同一格；"
-                           "开路成功**不等于**浇上了水")
+                      note="【task-157/199】窗口外那一格走不到 ⇒ 先清挡路邻格（复用 `open_way`，"
+                           "每次 ≤`MAX_OPEN_ACTIONS` 次清障、每格每天有界轮数）再重试同一格；"
+                           "开路成功**不等于**浇上了水/收下来了")
         if code == "ok":
             # `open_way` 内部已经复核过 `stand_next_to` 通过 ⇒ 现在站得到这一格旁。
             return True, "开路后已站到目标旁（open_way 内部复核 stand_next_to 通过）", cleared
@@ -1992,6 +2031,243 @@ class LongRun:
         hint = "；".join(str(n)[:120] for n in (open_notes or [])[:4])
         return False, (note + f"；已开路 {len(cleared)} 格仍未通（{code or err or 'unknown'}）"
                        + (f"；{hint}" if hint else "")), cleared
+
+    # ---------------------------------------------------------------- 窗口外熟作物（task-199）
+
+    @staticmethod
+    def _ready_far_outside(obs: dict[str, Any]) -> tuple[list[tuple[int, int]], str]:
+        """Mod 报了坐标、但**不在玩家观测窗口里**的熟作物格（含已认输的）。
+
+        与 `_ready_far_tiles` 的区别同浇水那套：这里**不过滤** `ready_far_given_up`，
+        因为收尾/理由文案必须点名坐标（run A′ fall 13 的 `stuck:` 原文里只有计数、没有坐标，
+        验收根本没法查是哪几格）。
+        """
+        tiles, status = farm_ready_tiles(obs)
+        if status == "unavailable":
+            return [], status
+        visible = FarmWorker.tiles_of(obs)
+        return [t for t in tiles if t not in visible], status
+
+    def _ready_far_tiles(self, obs: dict[str, Any]) -> tuple[list[tuple[int, int]], str]:
+        """**玩家窗口之外、今天还没认输**的熟作物格（task-199，= 行动口径）。
+
+        返回 `(还没认输的格, 状态)`；状态 `"ok"` / `"truncated"` / `"unavailable"`。
+        `"unavailable"`（旧 Mod / 证据不可信）时返回空列表，调用方**绝不许**当成
+        "没有窗口外熟作物"——守卫必须退回老行为（fail-closed）。
+        """
+        outside, status = self._ready_far_outside(obs)
+        if status == "unavailable":
+            return [], status
+        return [t for t in outside if t not in self.ready_far_given_up], status
+
+    def _ready_far_give_up_cause_text(self) -> str:
+        """窗口外熟作物"认输"的因由短语（收尾/守卫文案共用，避免两处口径漂移）。"""
+        causes = {self.ready_far_causes.get(t, "") for t in self.ready_far_given_up}
+        causes.discard("")
+        if not causes:
+            return "当天没收到（原因见 journal `ready_far`）"
+        if causes == {"unreachable"}:
+            return "坐标都够不着（已试有界开路仍站不过去）"
+        if causes == {"truncated"}:
+            return ("`farm.readyTiles` 被截断（>64 格）⇒ 坐标不完整，这一格判不了"
+                    "——**不是「够不着」**")
+        if causes == {"no_evidence"}:
+            return "缺证据（`farm.readyTiles` 不可用，判不了这一格）——**不是「够不着」**"
+        if causes == {"not_ready"}:
+            return "走到了也没收下来（回执不算证据；逐格判据见 journal `ready_far`）"
+        if causes == {"bag_full"}:
+            return "背包满 ⇒ 收不进来（先腾格，不是够不着）"
+        return "有的够不着、有的收了没成（逐格因由见 journal `ready_far` 的 code）"
+
+    def _ready_far_where(self, obs: dict[str, Any]) -> str:
+        """收尾/守卫文案里的"窗口外熟作物在哪"（含坐标；认输的也点名并分清因由）。"""
+        outside, status = self._ready_far_outside(obs)
+        if status == "unavailable" or not outside:
+            return ""
+        given = [t for t in outside if t in self.ready_far_given_up]
+        mark = ""
+        if given and len(given) == len(outside):
+            mark = f"；其中 {len(given)} 格已放弃当天（{self._ready_far_give_up_cause_text()}）"
+        elif given:
+            mark = f"；其中一部分已放弃当天（{self._ready_far_give_up_cause_text()}）"
+        return (f"，其中 {len(outside)} 格在玩家窗口之外（Mod 报的坐标 "
+                f"{[list(t) for t in outside[:3]]}{mark}）")
+
+    def _ready_far_reason(self, obs: dict[str, Any], ready_f: int) -> str:
+        """窗口外熟作物的"还有活"理由（带坐标；给守卫/`work_reasons` 共用）。"""
+        far, status = self._ready_far_tiles(obs)
+        where = self._ready_far_where(obs)
+        if far:
+            return f"农场口径还有 {ready_f} 格熟作物{where} ⇒ 先走过去收"
+        if status == "unavailable":
+            return (f"农场口径还有 {ready_f} 格熟作物，但 farm.readyTiles 不可用（旧 Mod / "
+                    "farm 证据不可信）⇒ 不许判「没活」，按老行为继续干（会以 stuck 如实收尾）")
+        if where:
+            return (f"农场口径还有 {ready_f} 格熟作物{where} ⇒ 想收但没收成"
+                    f"（{self._ready_far_give_up_cause_text()}；不再重试）")
+        return f"农场口径还有 {ready_f} 格熟作物（窗口里看不到坐标）"
+
+    def _ready_far_all_given_up(self, obs: dict[str, Any]) -> bool:
+        """窗口外的熟作物**全部**已认输且坐标可信（task-199）。
+
+        用途：`work_reasons`/`sleep_guard` 不再把"够不着/收不下来的熟格"当"还有活"
+        （run A′ fall 13：守卫拿 `farm.readyCrops` 当理由，一整天换片地空转，最后
+        `stuck:同一秒连发 5 次换片都没有目标`）。当天改由 `stuck`/`gave_up` 一类理由如实收尾。
+        """
+        outside, status = self._ready_far_outside(obs)
+        if status == "unavailable" or not outside:
+            return False
+        return all(t in self.ready_far_given_up for t in outside)
+
+    def _harvest_far_ready(self, obs: dict[str, Any], rep: DayReport) -> bool:
+        """走过去收一格"窗口外"的熟作物（task-199）。返回 `True` = 本轮真动了一次手。
+
+        有界性：每格一天最多 `READY_FAR_MAX_TRIES` 次；试满就进 `ready_far_given_up` +
+        逐格 journal `ready_far_blocked`，当天不再试它 —— 于是 `_ready_far_tiles` 变空，
+        守卫不再被"农场口径还有熟作物"钉住（**绝不允许**变成"同一秒连发 5 次换片"的空转）。
+
+        判据：`FarmWorker.harvest()` 自己的四选一观测差分（crop 消失 / ready 翻转 /
+        readySource 变化 / 背包逐 qid 新增）；这里**不另立判据**，也不把 Mod 回执当证据。
+
+        `no_slot`（背包满）是**全局阻塞**、不是这一格的错 ⇒ 不消耗该格尝试次数，
+        交给 task-198 的日级 `_slot_relief` 回路（腾出格子后下一轮再来）。
+        """
+        assert self.worker is not None
+        far, status = self._ready_far_tiles(obs)
+        if not far:
+            if status == "unavailable" and not self.ready_far_unavailable_noted:
+                farm = obs.get("farm") or {}
+                self.ready_far_unavailable_noted = True
+                self._journal("ready_far_unavailable", complete=farm.get("complete"),
+                              loaded=farm.get("loaded"), readyCrops=farm.get("readyCrops"),
+                              note="farm 说还有熟作物，但没有 readyTiles 坐标（旧 Mod / 证据不可信）"
+                                   "⇒ fail-closed：不判「没熟作物」、按老行为继续干")
+            if status == "truncated" and not self.ready_far_truncated_noted:
+                farm = obs.get("farm") or {}
+                self.ready_far_truncated_noted = True
+                self._journal("ready_far_truncated", readyTilesTruncated=True,
+                              readyCrops=farm.get("readyCrops"),
+                              note="farm.readyTiles 被 64 条上限截断 ⇒ 坐标不是全部，"
+                                   "当天只处理已知坐标；总数以 farm.readyCrops 为准")
+            return False
+        if not self._is_farm(obs):
+            # 人不在户外农场 ⇒ 一天只试着回去一次（复用 task-104 那套"清模态 + ensure_location"），
+            # 回不去不扣额度、不认输，只如实留痕（否则每轮都发注定失败的 goto_farm）。
+            if self.ready_far_not_on_farm:
+                return False
+            obs = self._goto_farm_for_water(obs, rep)
+            if not self._is_farm(obs):
+                self.ready_far_not_on_farm = True
+                self._journal("ready_far_skipped", reason="not_on_farm",
+                              tiles=[list(t) for t in far[:6]], count=len(far),
+                              where=self._ready_far_where(obs),
+                              note="窗口外还有熟作物，但人不在户外农场 ⇒ 不消耗该格当日额度、"
+                                   "不进 given_up；先回农场再说")
+                return False
+            far, status = self._ready_far_tiles(obs)
+            if not far:
+                return False
+        pt = FarmWorker.player_tile(obs) or far[0]
+        tile = min(far, key=lambda t: (_dist(t, pt), t[1], t[0]))
+        # 【task-199 × task-198】背包堵住时**先别走过去**：`no_slot` 是全局阻塞，
+        # 收不进来跟这一格无关（走过去只会白跑，还会每轮重复走）。腾格交给日级回路。
+        free_slots, bag_need, bag_status = self._bag_state(obs)
+        if bag_status == "ok" and bag_need > 0:
+            if not self.ready_far_bag_noted:
+                self.ready_far_bag_noted = True
+                self._journal("ready_far_skipped", reason="bag_full",
+                              tiles=[list(t) for t in far[:6]], count=len(far),
+                              free_slots=free_slots, reserve=SLOT_RESERVE,
+                              note="【task-199】背包将满/已满 ⇒ 窗口外熟作物先不走去收："
+                                   "不消耗该格尝试次数、不认输；腾格由日级 `_slot_relief` 负责")
+            return False
+        before_farm = obs.get("farm") or {}
+        ready_before = int(before_farm.get("readyCrops") or 0)
+
+        walked, walk_note, opened = self._walk_far_tile(tile, purpose="ready")
+        st: StepResult | None = None
+        err = ""
+        if walked:
+            try:
+                st = self.worker.harvest(tile)
+            except BridgeError as exc:
+                err = str(exc)
+            except Exception as exc:                  # pragma: no cover
+                err = f"{type(exc).__name__}: {exc}"
+        # 背包满：全局阻塞，不是这一格的错 ⇒ 不消耗该格额度，交给日级腾格回路。
+        if st is not None and getattr(st, "no_slot", False):
+            self._journal("ready_far", tile=list(tile), ok=False, code=st.code,
+                          walked=bool(walked), try_=int(self.ready_far_tries.get(tile, 0)),
+                          limit=READY_FAR_MAX_TRIES, status=status,
+                          opens=self.ready_far_opens.get(tile, 0), opened_count=len(opened),
+                          reason=st.reason, receipt=st.receipt, given_up=False,
+                          note="【task-199】背包满 ⇒ 这是全局阻塞、不是这一格收不下来："
+                               "不消耗该格尝试次数，交给日级 `_slot_relief` 腾格后再收")
+            rep.notes.append(f"窗口外熟作物 {list(tile)} 这轮收不了：背包满（不算这一格的失败）")
+            return False
+
+        try:
+            after_obs = self._snap()
+        except BridgeError:
+            after_obs = obs
+        after_farm = after_obs.get("farm") or {}
+        ready_after = int(after_farm.get("readyCrops") or 0)
+        ok = bool(st.ok) if st is not None else False
+        code = (st.code if st is not None else ("unreachable" if not walked else "error"))
+        if ok:
+            self.ready_far_causes.pop(tile, None)
+            self.ready_far_tries[tile] = int(self.ready_far_tries.get(tile, 0)) + 1
+            self.farm_actions_today += 1
+            self._actions += 1
+            rep.notes.append(f"收了窗口外那格熟作物 {list(tile)}"
+                             f"（farm.readyCrops {ready_before}→{ready_after}）")
+            self._say(f"  · 收窗口外熟作物 {list(tile)}：{code}")
+        else:
+            if not walked:
+                blob = f"{walk_note} {err}"
+                self.ready_far_causes[tile] = ("no_route"
+                                               if any(h in blob for h in NO_ROUTE_HINTS)
+                                               else "unreachable")
+            elif status == "truncated":
+                self.ready_far_causes[tile] = "truncated"
+            elif status == "unavailable":
+                self.ready_far_causes[tile] = "no_evidence"
+            else:
+                self.ready_far_causes[tile] = "not_ready"
+            tries = int(self.ready_far_tries.get(tile, 0)) + 1
+            self.ready_far_tries[tile] = tries
+            if tries >= READY_FAR_MAX_TRIES:
+                self.ready_far_given_up.add(tile)
+            rep.notes.append(f"窗口外熟作物 {list(tile)} 没收成（第 {tries}/"
+                             f"{READY_FAR_MAX_TRIES} 次，因由 {self.ready_far_causes.get(tile, '未定')}）："
+                             f"{walk_note or err or (st.reason if st is not None else code)}"
+                             + ("；不再试这一格" if tile in self.ready_far_given_up else ""))
+        tries_now = int(self.ready_far_tries.get(tile, 0))
+        self._journal("ready_far", tile=list(tile), ok=ok, code=code, walked=bool(walked),
+                      try_=tries_now, limit=READY_FAR_MAX_TRIES, status=status,
+                      ready_before=ready_before, ready_after=ready_after,
+                      opens=self.ready_far_opens.get(tile, 0), opened_count=len(opened),
+                      cause=self.ready_far_causes.get(tile, ""),
+                      reason=(st.reason if st is not None else (walk_note or err)),
+                      receipt=(st.receipt if st is not None else err),
+                      given_up=bool(tile in self.ready_far_given_up),
+                      note="【task-199】窗口外熟作物：farm.readyTiles 给了坐标 ⇒ 走过去收"
+                           "（复用 `_walk_far_tile` 的走路/开路家族；判据 = `harvest()` 自己的"
+                           "四选一观测差分，Mod 回执不是证据）")
+        if not walked and not ok and tile in self.ready_far_given_up:
+            # 【task-199】只在这一格**当天认输**时记一条 `ready_far_blocked`（避免每轮刷屏）；
+            # 中间失败仍有逐次 `ready_far`（`walked=False` + `walk_note`）可查。
+            self._journal("ready_far_blocked", tile=list(tile),
+                          cause=self.ready_far_causes.get(tile, ""),
+                          attempts=tries_now, limit=READY_FAR_MAX_TRIES,
+                          opens=self.ready_far_opens.get(tile, 0),
+                          walked=False, cleared_count=len(opened),
+                          cleared_tiles=[[int(c.get("neighbour", [0, 0])[0]),
+                                          int(c.get("neighbour", [0, 0])[1])]
+                                         for c in opened[:8]],
+                          note="【task-199】有界开路之后仍然站不到这一格 ⇒ 如实记 blocked："
+                               "这一格**没收下来**（开路成功不等于收到手），当天不再试它")
+        return ok
 
     @staticmethod
     def _water_left_obs(obs: dict[str, Any]) -> int | None:
@@ -3424,8 +3700,18 @@ class LongRun:
             ripe_f_live = max(0, ripe_f - len(self.harvest_gave_up))
             if ripe_f_live > len(ripe):
                 ripe_work = True
+                # 【task-199】有 `readyTiles` 坐标时给**可执行**理由（"去 X 收"，带坐标）；
+                # 旧 Mod（`unavailable`）退回老文案（fail-closed，守卫照旧不判没活）；
+                # 坐标可信但**全部认输** ⇒ 不 append（收尾理由会点名坐标与因由）。
+                # 这条与 task-198 的 `bag_blocked` 门同族：拿不出行动的"还有活"不许进守卫理由。
                 if not bag_blocked:
-                    reasons.append(f"农场口径还有 {ripe_f_live} 格熟作物（当前窗口只看到 {len(ripe)} 格）")
+                    _far_ready, _far_status = self._ready_far_tiles(obs)
+                    if _far_status == "unavailable":
+                        reasons.append(f"农场口径还有 {ripe_f_live} 格熟作物（当前窗口只看到 "
+                                       f"{len(ripe)} 格；旧 Mod 没给 readyTiles 坐标 ⇒ "
+                                       "fail-closed，按老行为继续干）")
+                    elif _far_ready or not self._ready_far_all_given_up(obs):
+                        reasons.append(self._ready_far_reason(obs, ripe_f_live))
         # 【task-49】今天**已经见过、但还没做完**的格子（`_step_stage` 的 `leftover`）。
         # 换到别的片地之后，那些格子不在玩家窗口里 ⇒ 必须靠这份记账才知道"还有活"，
         # 否则就是 run5 的 `no_work` 早睡。已封格（`tool_ineffective` 一类）**不算** ——
@@ -3786,8 +4072,22 @@ class LongRun:
             # 永远钉在 `keep_working`（run B：`veto sleep 35`、整天 0 成功）。
             ripe_f = max(0, ripe_f - len(self.harvest_gave_up))
             if ripe_f > 0:
+                # 【task-199】与 `work_reasons` 同一口径：坐标可信就点名坐标；全部认输 ⇒
+                # 不再拿"农场口径还有熟作物"钉住守卫（run A′ fall 13：一整天换片地空转，
+                # 最后 `stuck:同一秒连发 5 次换片都没有目标`），改用 `gave_up_ready` 如实收尾
+                # （不在 `JUSTIFIED_END_REASONS` ⇒ `day_justified=False` ⇒ 当天不 VERIFIED）。
+                _far_ready, _far_status = self._ready_far_tiles(obs)
+                where_r = self._ready_far_where(obs)
+                if _far_status != "unavailable" and self._ready_far_all_given_up(obs):
+                    return True, "gave_up_ready", (
+                        f"农场口径还有 {ripe_f} 格熟作物{where_r}，"
+                        f"{self._ready_far_give_up_cause_text()}（已放弃当天，不再空转）"
+                        "——这不是「没活可做」，当天按 needs_review 如实收尾")
+                if _far_status == "unavailable":
+                    return False, "keep_working", (
+                        f"农场口径还有 {ripe_f} 格熟作物（当前窗口没盖到，别处还有活），先去收")
                 return False, "keep_working", (
-                    f"农场口径还有 {ripe_f} 格熟作物（当前窗口没盖到，别处还有活），先去收")
+                    f"农场口径还有 {ripe_f} 格熟作物{where_r}（当前窗口没盖到，别处还有活），先去收")
             if dry_f > 0:
                 can, why = self._can_water(obs)
                 # 【task-50】那一格干作物常常在玩家窗口之外：把 Mod 报的坐标写进理由，
@@ -5779,6 +6079,15 @@ class LongRun:
         self.far_dry_opens = {}                 # 【task-157】每日重置（开路额度和补水一样按天算）
         self.water_far_not_on_farm = False      # 【task-104】每日重置（理由后缀用）
         self.far_dry_unavailable_noted = False
+        # 【task-199】窗口外熟作物：尝试次数/认输/开路额度/播报标记全部每日重置。
+        self.ready_far_tries = {}
+        self.ready_far_given_up = set()
+        self.ready_far_opens = {}
+        self.ready_far_unavailable_noted = False
+        self.ready_far_truncated_noted = False
+        self.ready_far_causes = {}
+        self.ready_far_not_on_farm = False
+        self.ready_far_bag_noted = False
         # 【task-42】新的一天 ⇒ 清空出货白名单：昨天收获的东西昨天该出就出了，
         # 今天再拿白名单去卖会变成"卖一件不存在的东西"（`sellable_slots` 找不到就不动，但语义要干净）。
         if self.worker is not None:
@@ -5889,6 +6198,11 @@ class LongRun:
             # `_far_dry_tiles` 变空 ⇒ 守卫仍因 `farm.dryCrops>0` 不放行 ⇒ 当天以
             # `stuck:` 收尾并点名坐标（绝不洗成 `no_work`）。
             if self._water_far_dry(obs, rep):
+                continue
+            # 【task-199】窗口外的熟作物：`farm.readyTiles` 给了坐标 ⇒ 走过去收（复用同一套
+            # walker/开路家族）。走不到就认输并在 `work_reasons`/`sleep_guard` 里闭嘴，
+            # 绝不让"农场口径还有熟作物"变成"同一秒连发 5 次换片"的空转（run A′ fall 13）。
+            if self._harvest_far_ready(obs, rep):
                 continue
             plot = self._ensure_plot(obs, rep)
             if plot is None:

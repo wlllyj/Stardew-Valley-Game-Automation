@@ -110,6 +110,32 @@ namespace AgentFarm.Bridge.Tests
                   ClumpRules.ActedEvidence(false, false, true, false, false) == "ready",
                   "readySource 变化没算证据");
 
+            // 【task-199】`farm.readyTiles` 的坐标列表规则（排序 / 截断 / fail-closed）。
+            // 与 `readyCrops` 同源同扫描由 FarmScan 的同一分支保证（Python 侧文本契约断言），
+            // 这里断言的是**纯规则行为**（变异打在这几条上会红）。
+            var tiles = new List<int[]> { new[] { 5, 10 }, new[] { 61, 9 }, new[] { 60, 10 } };
+            TileListRules.OrderAndTruncate(tiles, 64, out int[][] ordered, out bool truncated);
+            Check("t199_sorted_by_y_then_x",
+                  ordered.Length == 3 && ordered[0][0] == 61 && ordered[0][1] == 9
+                  && ordered[1][0] == 5 && ordered[1][1] == 10
+                  && ordered[2][0] == 60 && ordered[2][1] == 10,
+                  "排序错：应先 y 再 x（升序）");
+            TileListRules.OrderAndTruncate(tiles, 2, out int[][] capped, out bool cappedFlag);
+            Check("t199_truncated_flag_when_over_limit",
+                  capped.Length == 2 && cappedFlag,
+                  "超过上限没截断或截断标志没置");
+            TileListRules.OrderAndTruncate(tiles, 64, out int[][] full, out bool fullFlag);
+            Check("t199_not_truncated_when_within_limit", full.Length == 3 && !fullFlag,
+                  "没超上限却置了 truncated");
+            TileListRules.OrderAndTruncate(null, 64, out int[][] none, out bool noneFlag);
+            Check("t199_null_source_is_fail_closed",
+                  none.Length == 0 && noneFlag, "null 源必须空数组 + truncated=true（不确定就说不确定）");
+            var dirty = new List<int[]> { new[] { 1, 2 }, new int[] { }, null, new[] { 3 } };
+            TileListRules.OrderAndTruncate(dirty, 64, out int[][] clean, out bool cleanFlag);
+            Check("t199_malformed_items_are_skipped",
+                  clean.Length == 1 && clean[0][0] == 1 && clean[0][1] == 2 && !cleanFlag,
+                  "残缺坐标没被跳过");
+
             Console.WriteLine(_failed == 0
                 ? $"OK {_total} 断言全部通过"
                 : $"FAILED {_failed} 条断言不通过（共 {_total} 条）");

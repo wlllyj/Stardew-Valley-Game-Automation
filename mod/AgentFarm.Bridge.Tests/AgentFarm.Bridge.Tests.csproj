@@ -33,6 +33,8 @@
     <Compile Include="Program.cs" />
     <!-- 判据本体：与 Mod 编译的是同一个文件（不是拷贝），变异打在哪，这里就红在哪。 -->
     <Compile Include="..\AgentFarm.Bridge\ClumpRules.cs" />
+    <!-- task-199：坐标列表的排序/截断是纯逻辑 ⇒ 自检工程直接编译同一份源码跑行为断言。 -->
+    <Compile Include="..\AgentFarm.Bridge\TileListRules.cs" />
   </ItemGroup>
 
 </Project>

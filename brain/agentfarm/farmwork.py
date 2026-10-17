@@ -69,6 +69,7 @@ __all__ = [
     "StageResult",
     "StepResult",
     "farm_dry_tiles",
+    "farm_ready_tiles",
     "farm_dead_crops",
     "farm_dry_dead_crops",
     "farm_empty_dirt",
@@ -807,6 +808,44 @@ def farm_dry_tiles(obs: dict[str, Any]) -> tuple[list[tuple[int, int]], str]:
             seen.add(t)
             out.append(t)
     return out, ("truncated" if farm.get("dryTilesTruncated") else "ok")
+
+
+def farm_ready_tiles(obs: dict[str, Any]) -> tuple[list[tuple[int, int]], str]:
+    """Mod 报的"可收熟作物"的格子坐标（`farm.readyTiles`，task-199）。
+
+    三态与 :func:`farm_dry_tiles` **逐字同源**：
+
+    * `"ok"` —— 坐标可信且**没有**被 64 条上限截断；
+    * `"truncated"` —— 超过 Mod 上限被截断（坐标可用，但**不许多浇/多收、也不许当成"全部"**；
+      总数以 `farm.readyCrops` 为准）；
+    * `"unavailable"` —— 旧 Mod 没有这个字段、字段是 `null`（本轮扫描失败），或 `farm` 证据
+      不可信（`complete != true` / `loaded == false`）：**绝不许据此判"没有熟作物"**。
+
+    为什么需要它（run A′ fall 13 的形态）：`farm.readyCrops` 是**农场级计数**，而脑侧目标池
+    来自玩家周围 400 格窗口（`location.tiles[]`，`tilesTruncated=true`）⇒ 窗口外的熟作物
+    **看不到也没坐标**，守卫却拿计数当"还有活" ⇒ 一整天换片地空转，最后
+    `stuck:同一秒连发 5 次换片都没有目标`。这是 task-50 给干作物补 `dryTiles` 的同一族缺口。
+
+    与窗口 `tiles[].ready` 的判据完全一致（Mod 侧 `CropMeta.Ready` 同一个分支产出），
+    调用方负责**去重**：窗口里已经看得见的格仍走 `tiles[]`，这里只补"窗口外"的。
+    """
+    farm = obs.get("farm") or {}
+    if farm.get("loaded") is False or farm.get("complete") is not True:
+        return [], "unavailable"
+    raw = farm.get("readyTiles")
+    if raw is None:
+        return [], "unavailable"
+    out: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for item in raw:
+        try:
+            t = (int(item[0]), int(item[1]))
+        except (TypeError, ValueError, IndexError, KeyError):
+            continue
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out, ("truncated" if farm.get("readyTilesTruncated") else "ok")
 
 
 def farm_dry_dead_crops(obs: dict[str, Any]) -> tuple[int, str]:

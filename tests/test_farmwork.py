@@ -28,6 +28,7 @@ from agentfarm.farmwork import (  # noqa: E402
     SURPLUS_MATERIAL_IDS, buy_count_for, farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles,
     farm_empty_dirt, is_seed_offer,
     is_unreachable, pick_seed_offer, player_free_slots, seed_offers_from, surplus_sell_plan,
+    farm_ready_tiles,
     till_blocked_by, tool_missing_reason, tool_presence,
 )
 
@@ -2752,6 +2753,84 @@ class TestTask198NoSlot(unittest.TestCase):
         self.assertIn("全局阻塞", st.reason)
         self.assertIn("腾格", st.reason)
         self.assertIn("不是这一格", st.reason)
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+class TestTask199FarmReadyTiles(unittest.TestCase):
+    """【task-199】`farm.readyTiles` 的三态判据（与 `farm_dry_tiles` 逐字同源）。
+
+    run A′ fall 13 的病灶：`farm.readyCrops` 只给**计数**，窗口外的熟作物没有坐标 ⇒
+    守卫拿计数当"还有活"、目标池却拿不出格子 ⇒ 一整天换片地空转
+    （`stuck:同一秒连发 5 次换片都没有目标`）。坐标字段就是这条通道的解药，
+    所以三态必须可辨：**"没给坐标"绝不等于"没有熟作物"**。
+    """
+
+    def _obs(self, farm: dict[str, object]) -> dict[str, object]:
+        return {"farm": farm}
+
+    def test_ok_returns_deduped_coordinates(self):
+        obs = self._obs({"loaded": True, "complete": True, "readyCrops": 2,
+                         "readyTiles": [[60, 10], [61, 10], [60, 10]]})
+        self.assertEqual(farm_ready_tiles(obs), ([(60, 10), (61, 10)], "ok"))
+
+    def test_truncated_is_reported_and_does_not_claim_to_be_all(self):
+        obs = self._obs({"loaded": True, "complete": True, "readyCrops": 99,
+                         "readyTiles": [[60, 10]], "readyTilesTruncated": True})
+        self.assertEqual(farm_ready_tiles(obs), ([(60, 10)], "truncated"))
+
+    def test_missing_field_or_bad_evidence_is_unavailable(self):
+        """旧 Mod（无字段）/ `null`（本轮扫描失败）/ 证据不可信 ⇒ `unavailable`，不是"空"。"""
+        cases = [
+            {},                                                     # 旧 Mod：整个键缺失
+            {"loaded": True, "complete": True},                     # 同上的常见形态
+            {"loaded": True, "complete": True, "readyTiles": None},  # 本轮扫描失败
+            {"loaded": False, "complete": True, "readyTiles": [[60, 10]]},
+            {"loaded": True, "complete": False, "readyTiles": [[60, 10]]},
+        ]
+        for farm in cases:
+            with self.subTest(farm=farm):
+                self.assertEqual(farm_ready_tiles(self._obs(farm)), ([], "unavailable"))
+
+    def test_malformed_items_are_skipped(self):
+        obs = self._obs({"loaded": True, "complete": True,
+                         "readyTiles": [[60, 10], [1], None, "x", [61, 10]]})
+        self.assertEqual(farm_ready_tiles(obs), ([(60, 10), (61, 10)], "ok"))
+
+
+class TestTask199ModContract(unittest.TestCase):
+    """【task-199】文字契约：坐标与计数必须**同一判据、同一分支**产出，三态键可辨。
+
+    仓库没有能引用游戏程序集的 C# 测试工程（见 `ClumpRules`/`TileListRules` 的注释），
+    所以"同源同扫描"这条要求在 Python 侧用源码文本契约钉住：改实现的人必须先改这里，
+    否则 `CropMeta.Ready` 一旦被拆成两处口径，run A′ 的空转就会以另一种形式回来。
+    """
+
+    def test_farmscan_emits_ready_count_and_tiles_in_the_same_branch(self):
+        src = (REPO_ROOT / "mod" / "AgentFarm.Bridge" / "FarmScan.cs").read_text(encoding="utf-8")
+        marker = "CropMeta.Ready(dirt, crop).Value == true"
+        self.assertIn(marker, src)
+        start = src.index(marker)
+        block = src[start:start + 600]
+        self.assertIn("_acc.ReadyCrops++;", block)
+        self.assertIn("_readyTiles.Add(", block)
+
+    def test_contracts_keep_the_three_states_distinguishable(self):
+        src = (REPO_ROOT / "mod" / "AgentFarm.Bridge" / "Contracts.cs").read_text(encoding="utf-8")
+        self.assertIn('[JsonPropertyName("readyTiles")]', src)
+        self.assertIn('[JsonPropertyName("readyTilesTruncated")]', src)
+        self.assertIn("JsonIgnoreCondition.Never", src)
+        self.assertRegex(
+            src,
+            r'JsonPropertyName\("readyTiles"\)\]\s*\n\s*\[JsonIgnore\(Condition = JsonIgnoreCondition\.'
+            r'Never\)\]\s*\n\s*public int\[\]\[\] ReadyTiles',
+        )
+
+    def test_self_test_project_compiles_the_pure_rules(self):
+        src = (REPO_ROOT / "mod" / "AgentFarm.Bridge.Tests"
+               / "AgentFarm.Bridge.Tests.csproj").read_text(encoding="utf-8")
+        self.assertIn("TileListRules.cs", src)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -742,6 +742,34 @@ namespace AgentFarm.Bridge
         /// </summary>
         [JsonPropertyName("dryTilesTruncated")] public bool? DryTilesTruncated { get; set; }
 
+        /// <summary>
+        /// **可收熟作物格的坐标**（`[[x, y], …]`）。坐标是**农场地图格坐标**，与 <see cref="ReadyCrops"/>
+        /// **同一次全场扫描、同一个 `scanSeq`、同一判据**（`CropMeta.Ready`，与逐格
+        /// `location.tiles[].ready` / `tiles[].readySource` 完全同源）。
+        ///
+        /// 【为什么需要】`readyCrops` 是农场级**计数**，而脑侧目标池来自玩家周围 400 格窗口
+        /// （`location.tiles[]`，`tilesTruncated=true`）⇒ 窗口外的熟作物既看不到也没坐标，
+        /// 守卫却拿 `readyCrops > 窗口熟格数` 当"还有活" ⇒ run A′ fall 13 一整天换片地空转、
+        /// 最后 `stuck:同一秒连发 5 次换片都没有目标`（task-199）。
+        /// 这是 task-50 给干作物补 `dryTiles` 的**同一族缺口**的补齐。
+        ///
+        /// 排序：先 `y` 再 `x`（与 <see cref="DryTiles"/> 一致、确定性、便于测试与人工核对）。
+        /// 上限 <see cref="FarmScanCache.ReadyTilesMax"/> = 64 条；超出时坐标截断并置
+        /// <see cref="ReadyTilesTruncated"/> = true（**计数仍以 <see cref="ReadyCrops"/> 为准**）。
+        /// **三态可辨**：字段缺失（旧 Mod）/ `null`（本轮扫描失败）/ 空数组（真的没有熟作物格）——
+        /// 所以这里用 `JsonIgnoreCondition.Never` 强制写出 `null`（全局默认是 WhenWritingNull）。
+        /// 只在 <see cref="Complete"/> == true 时可信。
+        /// </summary>
+        [JsonPropertyName("readyTiles")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+        public int[][] ReadyTiles { get; set; }
+
+        /// <summary>
+        /// <see cref="ReadyTiles"/> 是否因超过 64 条上限被截断。
+        /// **null = 旧 Mod 没有这个字段**（脑侧此时不许把"没给坐标"当成"没有熟作物"）。
+        /// </summary>
+        [JsonPropertyName("readyTilesTruncated")] public bool? ReadyTilesTruncated { get; set; }
+
         [JsonPropertyName("weeds")] public int Weeds { get; set; }
 
         /// <summary>
