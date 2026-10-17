@@ -101,7 +101,116 @@ reg("m198e_no_slot_check_disabled", "198", "?", "probe",
       "        if False:")],
     "【我的补充】满包判定失效（照常发请求）⇒ 198a-1 应变红")
 
-# ===== task-199 / 195 / 196 / 197 交付后逐条登记 =====
+# ===== task-199（作者自报 m199a 6 / m199b 1 / m199c 1 / m199d 1；**无变异脚本 = GAP**，
+#       以下按提交说明的描述自建复跑；基线树用 scratch/_t200_post199）=====
+reg("m199a_drop_ready_tiles", "199", 6, "suite",
+    [("brain/agentfarm/longrun.py",
+      "        tiles, status = farm_ready_tiles(obs)",
+      '        tiles, status = [], "unavailable"')],
+    "去掉 readyTiles 并集（窗口外熟作物永远没有坐标）⇒ 收不到/守卫退回老行为")
+reg("m199b_drop_fail_closed", "199", 1, "suite",
+    [("brain/agentfarm/longrun.py",
+      '        if status == "unavailable":\n'
+      '            return (f"农场口径还有 {ready_f} 格熟作物，但 farm.readyTiles 不可用（旧 Mod / "\n'
+      '                    "farm 证据不可信）⇒ 不许判「没活」，按老行为继续干（会以 stuck 如实收尾）")',
+      '        if status == "unavailable":\n'
+      '            return ""')],
+    "缺字段不再 fail-closed（把『没坐标』说成『没活』）")
+reg("m199c_given_up_into_guard", "199", 1, "suite",
+    [("brain/agentfarm/longrun.py",
+      "        return [t for t in outside if t not in self.ready_far_given_up], status",
+      "        return list(outside), status")],
+    "认输格重新进守卫理由（当天仍被钉住 ⇒ 空转）")
+reg("m199d_blocked_every_attempt", "199", 1, "suite",
+    [("brain/agentfarm/longrun.py",
+      "        if not walked and not ok and tile in self.ready_far_given_up:",
+      "        if not walked and not ok:")],
+    "每次失败都记 ready_far_blocked（留痕刷屏/口径失真）")
+reg("m199b2_all_given_up_on_unavailable", "199", 1, "unittest:tests.test_longrun.TestTask199ReadyFar",
+    [("brain/agentfarm/longrun.py",
+      '        outside, status = self._ready_far_outside(obs)\n'
+      '        if status == "unavailable" or not outside:\n'
+      '            return False\n'
+      '        return all(t in self.ready_far_given_up for t in outside)',
+      '        outside, status = self._ready_far_outside(obs)\n'
+      '        if status == "unavailable":\n'
+      '            return True\n'
+      '        if not outside:\n'
+      '            return False\n'
+      '        return all(t in self.ready_far_given_up for t in outside)')],
+    "【重建尝试 2】缺字段被当成『全认输』（fail-closed 丢掉）⇒ TestTask199ReadyFar 应变红")
+reg("m199b3_old_mod_field_not_fail_closed", "199", 1, "unittest:tests.test_farmwork.TestTask199FarmReadyTiles",
+    [("brain/agentfarm/farmwork.py",
+      '    raw = farm.get("readyTiles")\n'
+      '    if raw is None:\n'
+      '        return [], "unavailable"',
+      '    raw = farm.get("readyTiles")\n'
+      '    if raw is None:\n'
+      '        return [], "ok"')],
+    "【重建尝试 3】旧 Mod 缺 readyTiles 不再 fail-closed（说成『没有熟作物』）⇒ farmwork 三态用例应变红")
+reg("m199x_no_truncated_note", "199", "?", "probe",
+    [("brain/agentfarm/longrun.py",
+      '            if status == "truncated" and not self.ready_far_truncated_noted:',
+      "            if False:")],
+    "【我的补充】截断留痕失效 ⇒ 探针 199d-1b 应变红")
+reg("m199y_ready_far_tries_unbounded", "199", "?", "probe",
+    [("brain/agentfarm/longrun.py",
+      "            if tries >= READY_FAR_MAX_TRIES:\n                self.ready_far_given_up.add(tile)",
+      "            if False:\n                self.ready_far_given_up.add(tile)")],
+    "【我的补充】不认输 ⇒ 探针 199c-1/2 应变红（无界空转）")
+
+
+# ===== task-192 / 202 / 208 / 213（卡面未给变异数字 ⇒ 自报记 GAP，以下自建实测）=====
+reg("m192a_release_keeps_shed_accounting", "192", "?", "suite",
+    [("brain/agentfarm/longrun.py",
+      "        if tiles:\n"
+      "            self.scope_shed_tiles_today = max(0, int(self.scope_shed_tiles_today) - int(tiles))",
+      "        if tiles:\n"
+      "            pass")],
+    "释放不扣当天认输记账（task-192 根因）⇒ release 相关用例应变红")
+reg("m192b_release_clears_cumulative", "192", "?", "suite",
+    [("brain/agentfarm/longrun.py",
+      '        self._journal("scope_released", zone=zone_name, reason=reason, tiles=tiles,',
+      "        self.shed_ever_tiles.clear()\n"
+      '        self._journal("scope_released", zone=zone_name, reason=reason, tiles=tiles,')],
+    "释放时把本 run 累计认输量也清掉（绕过 34% 上界）⇒ 累计上界用例应变红")
+reg("m202a_inventory_blocked_bucket_key_typo", "202", "?", "unittest:tests.test_analyze_longrun",
+    [("tools/analyze-longrun.py",
+      '"inventory_blocked": "inventory_blockeds",',
+      '"inventory_blockedX": "inventory_blockeds",')],
+    "EVENT_BUCKETS 键写错（brain 的 inventory_blocked 变未映射）⇒ 漂移用例应变红")
+reg("m202b_inventory_blocked_bucket_value_only", "202", "?", "unittest:tests.test_analyze_longrun",
+    [("tools/analyze-longrun.py",
+      '("event:inventory_blocked", "inventory_blocked",',
+      '("event:inventory_blocked", "inventory_blockedX",')],
+    "只改桶值名、不改键 ⇒ 预期 0 杀（说明漂移测试只看键，不看桶值 ⇒ 覆盖边界）")
+reg("m208a_explicit_choice_disabled", "208", "?", "csharp",
+    [("mod/AgentFarm.Bridge/ModalDismiss.cs",
+      "bool explicitChoice = answerIndex.HasValue || !string.IsNullOrWhiteSpace(answerText);",
+      "bool explicitChoice = false;")],
+    "显式应答入口失效（退回自动挑 Yes）⇒ C# 自检 208 断言应变红")
+reg("m213a_dump_no_match_cap", "213", "?", "csharp",
+    [("mod/AgentFarm.Bridge/DebugDumpSkill.cs",
+      "int cap = Math.Min(matched.Count, Math.Min(limit, DumpRules.MatchMax));",
+      "int cap = matched.Count;")],
+    "debug_dump 的 matched 上限失效（无界回执）⇒ C# 自检应变红")
+reg("m213b_dump_no_limit", "213", "?", "csharp",
+    [("mod/AgentFarm.Bridge/DebugDumpSkill.cs",
+      "int take = Math.Min(all.Count, limit);",
+      "int take = all.Count;")],
+    "debug_dump 的 limit 失效（截断标志/上限失真）⇒ C# 自检应变红")
+reg("m208b_rule_index_hit_returns_999", "208", "?", "csharp",
+    [("mod/AgentFarm.Bridge/AnswerRules.cs",
+      "                if (idx >= 0 && idx < count)\n"
+      "                    return new AnswerPick { Index = idx, Status = StatusFound,",
+      "                if (idx >= 0 && idx < count)\n"
+      "                    return new AnswerPick { Index = 999, Status = StatusFound,")],
+    "规则层下标命中被改坏 ⇒ C# 自检 t208_index_hit 应变红（证明自检能杀规则层回归）")
+reg("m213c_rule_limit_ignored", "213", "?", "csharp",
+    [("mod/AgentFarm.Bridge/DumpRules.cs",
+      "            if (v > LimitMax) v = LimitMax;",
+      "            if (v > LimitMax) v = LimitMax + 1;")],
+    "规则层 limit 上限失效 ⇒ C# 自检 t213_limit_clamped 应变红（证明自检能杀规则层回归）")
 
 
 def sh(cmd: list[str], cwd: Path, env: dict[str, str] | None = None, timeout: int = 1800):
@@ -174,6 +283,7 @@ def main() -> int:
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--kind", default="", help="覆盖登记里的 kind（如 suite / probe）")
+    ap.add_argument("--card", default="", help="只跑某张卡的变异（如 199 / 198）")
     ap.add_argument("--check-anchors", action="store_true",
                     help="只校验每条变异的文本锚点在基线树里恰好命中 1 次（不建树、不跑）")
     a = ap.parse_args()
@@ -181,6 +291,8 @@ def main() -> int:
         base = (WS / a.base) if not Path(a.base).is_absolute() else Path(a.base)
         bad = 0
         for c in CASES:
+            if a.card and c["card"] != a.card:
+                continue
             for rel, old, _new in c["edits"]:
                 p = base / rel
                 n = p.read_text(encoding="utf-8").count(old) if p.exists() else -1
@@ -201,7 +313,7 @@ def main() -> int:
         raise SystemExit(f"基线树不存在：{base}（先跑 scratch\\_t200_trees.py）")
     MUT_ROOT.mkdir(parents=True, exist_ok=True)
     sel = [dict(c, kind=(a.kind or c["kind"])) for c in CASES
-           if not a.only or c["name"] == a.only]
+           if (not a.only or c["name"] == a.only) and (not a.card or c["card"] == a.card)]
     rows = []
     for c in sel:
         tree = build_mutant(c, base)

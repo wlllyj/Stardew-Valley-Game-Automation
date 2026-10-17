@@ -59,7 +59,7 @@ def has_198() -> bool:
 
 def has_199() -> bool:
     return FORCE or (marker("mod/AgentFarm.Bridge/Contracts.cs", "readyTiles")
-                     and marker("brain/agentfarm/farmwork.py", "ready_far_blocked"))
+                     and marker("brain/agentfarm/longrun.py", "ready_far_blocked"))
 
 
 def has_195() -> bool:
@@ -124,6 +124,7 @@ def case_a() -> None:
 
 # ---------------------------------------------------------------- task-198 夹具
 FW, LR, TL = T.FW, T.LR, T.TL
+FW_READY_TRIES = int(getattr(LR, "READY_FAR_MAX_TRIES", 2))
 
 
 def _bag_rows(w, used: int = 12, material: int = 0) -> None:
@@ -347,20 +348,269 @@ def case_198() -> None:
 
 
 # ---------------------------------------------------------------- task-199
+class ReadyWorld(TL.MyopicWorld):
+    """窗口半径 3 的农场；`farm` 块按**全农场**作物现算（readyCrops / readyTiles 同源）。
+
+    `mode`：`same` = 同源正常；`liar_empty` = 说还有熟作物但坐标给空（伪造不一致）；
+    `no_field` = 旧 Mod（没有 readyTiles 键，只剩 readyCrops）。
+    """
+
+    def __init__(self, *, radius: int = 3, mode: str = "same", **kw) -> None:
+        super().__init__(**kw)
+        self.radius = radius
+        self.mode = mode
+
+    def obs(self) -> dict:
+        obs = super().obs()
+        farm = dict(obs.get("farm") or {})
+        ready = sorted([t for t, c in self.crops.items() if c.get("ripe") and not c.get("dead")],
+                       key=lambda t: (t[1], t[0]))
+        farm.update({"loaded": True, "complete": True, "readyCrops": len(ready),
+                     "dryCrops": 0, "deadCrops": 0, "dryTiles": []})
+        if self.mode == "no_field":
+            farm.pop("readyTiles", None)
+            farm.pop("readyTilesTruncated", None)
+        else:
+            farm["readyTiles"] = [] if self.mode == "liar_empty" else [[int(x), int(y)] for x, y in ready]
+            farm["readyTilesTruncated"] = False
+        obs["farm"] = farm
+        return obs
+
+
+class FarWorker(TL.FakeWorker):
+    """只实现长跑需要的三个方法：`stand_next_to` / `open_way`(三元组) / `harvest`。"""
+
+    def __init__(self, world, *, reachable: bool = True) -> None:
+        super().__init__(world)
+        self.world = world
+        self.reachable = reachable
+        self.stand_calls: list[tuple[int, int]] = []
+        self.open_calls: list[tuple[int, int]] = []
+        self.harvest_calls: list[tuple[int, int]] = []
+
+    def stand_next_to(self, tile, timeout_ms: int = 15000) -> bool:       # noqa: ANN001
+        t = (int(tile[0]), int(tile[1]))
+        self.stand_calls.append(t)
+        if not self.reachable:
+            return False
+        self.world.player_tile = [t[0], t[1] + 1]
+        return True
+
+    def open_way(self, tile):                                             # noqa: ANN001
+        t = (int(tile[0]), int(tile[1]))
+        self.open_calls.append(t)
+        if not self.reachable:
+            return "exhausted", [], ["四邻都站不过去（探针桩）"]
+        return "ok", [], []
+
+    def harvest(self, tile):                                              # noqa: ANN001
+        t = (int(tile[0]), int(tile[1]))
+        self.harvest_calls.append(t)
+        if not self.reachable:
+            return FW.StepResult(action="harvest", tile=t, ok=False, code="unreachable",
+                                 reason="站不到这一格旁边（探针桩）")
+        if t not in self.world.crops:
+            return FW.StepResult(action="harvest", tile=t, ok=False, code="failed",
+                                 reason="这一格没有作物（探针桩）")
+        self.world.crops.pop(t, None)
+        return FW.StepResult(action="harvest", tile=t, ok=True, code="ok",
+                             reason="摘下来了（探针桩：世界差分）")
+
+
+def _ready_world(*, far: int = 1, near: int = 0, mode: str = "same",
+                 truncated: bool = False):
+    w = ReadyWorld(mode=mode, weeds=0, seeds=0)
+    near_t = [(61 + i, 11) for i in range(near)]
+    far_t = [(70 + i, 20) for i in range(far)]
+    for t in near_t + far_t:
+        w.dirt.add(t)
+        w.crops[t] = {"ripe": True, "watered": True, "dead": False}
+    w.player_tile = [60, 11]
+    if truncated:
+        # 让 obs 的 farm.readyTilesTruncated 为 true：子类里补一个开关
+        orig = w.obs
+
+        def _obs() -> dict:
+            o = orig()
+            (o.get("farm") or {})["readyTilesTruncated"] = True
+            return o
+        w.obs = _obs
+    return w, far_t
+
+
+def _mk199(w, tag: str, *, reachable: bool = True):
+    journal = J / f"{tag}.jsonl"
+    journal.unlink(missing_ok=True)
+    client = _Client(w)
+    worker = FarWorker(w, reachable=reachable)
+    run = TL.make_run(w, target_days=1, max_days=1,
+                      client_factory=lambda: client, worker_factory=lambda c: worker,
+                      journal_path=journal)
+    run.worker, run.client = worker, client
+    return run, worker
+
+
+def _md5_text(p) -> str:            # noqa: ANN001
+    return p.read_text(encoding="utf-8", errors="replace")
+
+
 def case_199() -> None:
-    print("== task-199：readyTiles 与 readyCrops 同源 + 走不到不空转 + 缺字段 fail-closed ==")
+    print("== task-199：readyTiles/readyCrops 同源 + 窗口外熟作物走路收 + 认输有界 + 缺字段 fail-closed ==")
     if not has_199():
         skip("199 全部通道", "task-199 未交付（缺 readyTiles / ready_far_blocked）")
         return
-    todo = [
-        "199a readyTiles 与 readyCrops 同源一致（伪造不一致 ⇒ 必须被拦/不可采信）",
-        "199b 窗口外熟作物有坐标 ⇒ 走过去收（harvest_far 系列留痕）",
-        "199c 走不到 ⇒ 如实 ready_far_blocked、当天有界（不许同秒连发换片 5 次 stuck）",
-        "199d 缺 readyTiles 字段 ⇒ fail-closed 老行为（不许凭空多出目标）",
-        "199e Mod 侧 C# 自检含 readyTiles/readyCrops 同源 + 截断标志断言",
-    ]
-    for t in todo:
-        skip(t, "待 task-199 交付后实现")
+    # ---- 199a-0 接口齐备（pre 树缺接口 ⇒ 整段按 FAIL 记，而不是抛异常当"无法判定"） ----
+    w0, _ = _ready_world(far=1, near=1)
+    run0, _ = _mk199(w0, "199a-cap")
+    miss_fw = [n for n in ("farm_ready_tiles",) if not hasattr(FW, n)]
+    miss_lr = [n for n in ("_ready_far_outside", "_ready_far_tiles", "_harvest_far_ready",
+                           "_ready_far_all_given_up", "_ready_far_reason") if not hasattr(run0, n)]
+    check("199a-0 接口齐备（farmwork.farm_ready_tiles + longrun ready_far 五件套）",
+          not miss_fw and not miss_lr, f"缺 farmwork={miss_fw} 缺 longrun={miss_lr}")
+    if miss_fw or miss_lr:
+        finding("199a-0 pre 树缺接口 ⇒ 199 通道全部 FAIL（不写成『无法判定』）", True,
+                f"缺={miss_fw + miss_lr}")
+        return
+    # ---- 199a 同源三态 / 窗口扣减 / 不一致 ----
+    w, far = _ready_world(far=1, near=1)
+    tiles, status = FW.farm_ready_tiles(w.obs())
+    check("199a-1 farm_ready_tiles 读 readyTiles（同源 ok 态，近+远两条坐标都在）",
+          status == "ok" and sorted(tiles) == sorted([(61, 11)] + far),
+          f"status={status} tiles={tiles}")
+    run, worker = _mk199(w, "199a-outside")
+    outside, st2 = run._ready_far_outside(w.obs())
+    check("199a-2 窗口扣减：只有窗口外那格留下（近处那格不算『窗口外』）",
+          sorted(outside) == sorted(far) and st2 == "ok",
+          f"outside={outside} status={st2} far={far}")
+    w_liar, far_liar = _ready_world(far=1, near=1, mode="liar_empty")
+    run_l, _ = _mk199(w_liar, "199a-liar")
+    reasons_l = run_l.work_reasons(w_liar.obs())
+    far_reasons = [r for r in reasons_l if ("readyTiles" in r or "窗口之外" in r or "窗口里" in r)]
+    finding("199a-3【候选 NIT】运行期不交叉校验 readyCrops 与 readyTiles（伪造『有熟作物但坐标为 0』不被拦，"
+            "只靠守卫给出不可执行理由 ⇒ 后果是有序收尾，不是假绿；卡面说要『拦』⇒ 未完全达成）",
+            True, f"outside={run_l._ready_far_outside(w_liar.obs())[0]} 守卫理由={far_reasons[:1]}")
+    w_nf, _ = _ready_world(far=1, mode="no_field")
+    run_nf, _ = _mk199(w_nf, "199a-nofield")
+    obs_nf = w_nf.obs()
+    moved_nf = run_nf._harvest_far_ready(obs_nf, LR.DayReport(day_key=("spring", 1, 6), started_at=0.0))
+    reasons_nf = run_nf.work_reasons(obs_nf)
+    check("199a-4 缺 readyTiles ⇒ unavailable + fail-closed 老文案（不许当『没有熟作物』）",
+          run_nf._ready_far_tiles(obs_nf)[1] == "unavailable" and moved_nf is False
+          and any("旧 Mod 没给 readyTiles 坐标" in r for r in reasons_nf),
+          f"status={run_nf._ready_far_tiles(obs_nf)[1]} moved={moved_nf} "
+          f"reasons={[r[:60] for r in reasons_nf if 'readyTiles' in r]}")
+    check("199a-5 缺字段时 sleep_guard fail-closed（keep_working，不许睡过去）",
+          run_nf.sleep_guard(obs_nf)[:2] == (False, "keep_working"),
+          f"guard={run_nf.sleep_guard(obs_nf)[0:2]}")
+
+    # ---- 199b 走过去收成的正路径 ----
+    w, far = _ready_world(far=1, near=0)
+    run, worker = _mk199(w, "199b")
+    rep = LR.DayReport(day_key=("spring", 1, 6), started_at=0.0)
+    moved = run._harvest_far_ready(w.obs(), rep)
+    ev = _events(run, "ready_far")
+    ok_ev = [e for e in ev if e.get("ok") is True]
+    check("199b-1 窗口外熟作物 ⇒ 真的走过去收（harvest 被调 + journal ready_far ok=True）",
+          moved is True and worker.harvest_calls == [far[0]] and len(ok_ev) == 1,
+          f"moved={moved} harvest_calls={worker.harvest_calls} ready_far={[e.get('ok') for e in ev]}")
+    if ok_ev:
+        e = ok_ev[0]
+        check("199b-2 journal 带 ready_before/ready_after 与坐标（可复核同源计数）",
+              int(e.get("ready_before", -1)) >= 1 and int(e.get("ready_after", -1)) == 0
+              and list(e.get("tile") or []) == list(far[0]),
+              f"ready_before={e.get('ready_before')} ready_after={e.get('ready_after')} tile={e.get('tile')}")
+    check("199b-3 收成计入 farm_actions_today（≥1）", int(run.farm_actions_today) >= 1,
+          f"farm_actions_today={run.farm_actions_today}")
+
+    # ---- 199c 走不到 ⇒ 有界 + 认输 + 守卫不再钉死 ----
+    w, far = _ready_world(far=1, near=0)
+    run, worker = _mk199(w, "199c", reachable=False)
+    rep = LR.DayReport(day_key=("spring", 1, 6), started_at=0.0)
+    r1 = run._harvest_far_ready(w.obs(), rep)
+    r2 = run._harvest_far_ready(w.obs(), rep)
+    tries = int(run.ready_far_tries.get(far[0], 0))
+    blocked = _events(run, "ready_far_blocked")
+    check("199c-1 走不到 ⇒ 每格 2 次后认输（ready_far_given_up + ready_far_blocked 恰好 1 条）",
+          r1 is False and r2 is False and tries == FW_READY_TRIES
+          and far[0] in run.ready_far_given_up and len(blocked) == 1,
+          f"r1={r1} r2={r2} tries={tries} given_up={sorted(run.ready_far_given_up)} blocked={len(blocked)}")
+    opens_before = len(worker.open_calls)
+    r3 = run._harvest_far_ready(w.obs(), rep)
+    guard = run.sleep_guard(w.obs())
+    reasons = run.work_reasons(w.obs())
+    check("199c-2 认输后不再试（第 3 次 False、不再开路、守卫改 gave_up_ready 而非 keep_working）",
+          r3 is False and len(worker.open_calls) == opens_before
+          and guard[:2] == (True, "gave_up_ready"),
+          f"r3={r3} opens {opens_before}→{len(worker.open_calls)} guard={guard[:2]}")
+    check("199c-3 认输理由如实带坐标与『已放弃/够不着』，且不出现『没活可做』",
+          "已放弃" in str(guard[2]) or "坐标" in str(guard[2]),
+          f"reason={str(guard[2])[:160]}")
+    check("199c-4 守卫不再被『窗口外熟作物』钉死（work_reasons 不再报该格）",
+          not [r for r in reasons if "窗口外" in r or "readyTiles" in r],
+          f"reasons={[r[:60] for r in reasons]}")
+    check("199b-4 收成上限有界：harvest 调用次数 ≤ 尝试上限",
+          len(worker.harvest_calls) <= FW_READY_TRIES,
+          f"harvest_calls={worker.harvest_calls}")
+
+    # ---- 199d 截断标志 + 工具/Mod 契约 ----
+    w, far = _ready_world(far=1, near=0, truncated=True)
+    run, _ = _mk199(w, "199d-trunc")
+    _tiles_t, st_t = FW.farm_ready_tiles(w.obs())
+    run._harvest_far_ready(w.obs(), LR.DayReport(day_key=("spring", 1, 6), started_at=0.0))
+    rf_ev = _events(run, "ready_far")
+    check("199d-1 readyTilesTruncated=true ⇒ status=truncated；有坐标时照常处理已知格并在逐次 ready_far 里标 status"
+          "（cause 只在失败时才有意义；不单独刷 truncated 事件）",
+          st_t == "truncated" and bool(rf_ev)
+          and rf_ev[-1].get("status") == "truncated",
+          f"status={st_t} rf={[(e.get('status'), e.get('cause'), e.get('ok')) for e in rf_ev]}")
+    w2, _ = _ready_world(far=0, near=0, truncated=True)
+    run2, _ = _mk199(w2, "199d-trunc-empty")
+    run2._harvest_far_ready(w2.obs(), LR.DayReport(day_key=("spring", 1, 6), started_at=0.0))
+    trunc_ev = _events(run2, "ready_far_truncated")
+    check("199d-1b 坐标为空 + 截断标志 ⇒ 单独留痕一次（『没拿到全部坐标 ≠ 没有熟作物』）",
+          len(trunc_ev) == 1, f"trunc_events={len(trunc_ev)}")
+    farm_src = _md5_text(ROOT / "mod/AgentFarm.Bridge/FarmScan.cs")
+    idx = farm_src.find("CropMeta.Ready(dirt, crop).Value == true")
+    window = farm_src[idx: idx + 600] if idx >= 0 else ""
+    check("199d-2【同源】FarmScan 同一 CropMeta.Ready 分支 600 字符内既有 ReadyCrops++ 又有 _readyTiles.Add(",
+          idx >= 0 and "_acc.ReadyCrops++" in window and "_readyTiles.Add(" in window,
+          f"idx={idx} window_has_crops={'_acc.ReadyCrops++' in window} has_tiles={'_readyTiles.Add(' in window}")
+    contracts = _md5_text(ROOT / "mod/AgentFarm.Bridge/Contracts.cs")
+    check("199d-3 Contracts readyTiles/readyTilesTruncated 三态可辨（JsonIgnoreCondition.Never）",
+          'JsonPropertyName("readyTiles")' in contracts
+          and 'JsonPropertyName("readyTilesTruncated")' in contracts
+          and contracts.count("JsonIgnoreCondition.Never") >= 2,
+          f"never={contracts.count('JsonIgnoreCondition.Never')}")
+    csproj = _md5_text(ROOT / "mod/AgentFarm.Bridge.Tests/AgentFarm.Bridge.Tests.csproj")
+    check("199d-4 C# 自检工程引用 TileListRules.cs（排序/截断可被测）",
+          "TileListRules.cs" in csproj, f"csproj 引用={[l.strip() for l in csproj.splitlines() if 'TileListRules' in l][:1]}")
+    rules = _md5_text(ROOT / "mod/AgentFarm.Bridge/TileListRules.cs")
+    check("199d-5 TileListRules 排序先 y 后 x + 排序异常 ⇒ 截断标志（没拿到扫描 ≠ 没有坐标）",
+          "OrderAndTruncate" in rules and "truncated = true" in rules
+          and ("Item2" in rules or "t[1]" in rules or "y" in rules),
+          f"len={len(rules)} has_trunc={('truncated = true' in rules)}")
+    ana = _md5_text(ROOT / "tools/analyze-longrun.py")
+    check("199d-6 analyzer 已收 ready_far 五个事件桶",
+          all(k in ana for k in ("ready_far", "ready_far_blocked", "ready_far_skipped",
+                                 "ready_far_truncated", "ready_far_unavailable")),
+          "缺桶 ⇒ 变异/分析会漂移" if not all(k in ana for k in ("ready_far", "ready_far_blocked")) else "ok")
+    v3 = _md5_text(ROOT / "tools/verify-run3.py")
+    finding("199a-6【候选 NIT】tools/verify-run3.py 无 readyTiles/ready_far 交叉校验闸门"
+            "（账本自称 VERIFIED 时不能从第四方复核『窗口外熟作物都收了』）",
+            True, f"hits={v3.count('readyTiles') + v3.count('ready_far')}")
+    # ---- 199e C# 自检实跑 ----
+    try:
+        import subprocess
+        proj = ROOT / "mod/AgentFarm.Bridge.Tests/AgentFarm.Bridge.Tests.csproj"
+        p = subprocess.run(["dotnet", "run", "--project", str(proj), "-c", "Release", "--nologo"],
+                           capture_output=True, text=True, timeout=600, cwd=str(ROOT))
+        out = (p.stdout or "") + (p.stderr or "")
+        fails = [ln for ln in out.splitlines() if ln.strip().startswith("FAIL")]
+        check("199e-1 C# 自检实跑 rc=0 且 FAIL 行 0（含 readyTiles 同源/截断断言）",
+              p.returncode == 0 and not fails,
+              f"rc={p.returncode} fails={fails[:2]} tail={out.strip().splitlines()[-1:]}")
+    except Exception as exc:                                   # noqa: BLE001
+        check("199e-1 C# 自检实跑 rc=0 且 FAIL 行 0", False, f"{type(exc).__name__}: {exc}")
 
 
 # ---------------------------------------------------------------- task-195
