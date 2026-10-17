@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "brain"))
 
 from agentfarm.bridge import BridgeError  # noqa: E402
 from agentfarm.farmwork import (  # noqa: E402
-    NEIGHBORS, FarmWorker, KIND_TOOL, LOOT_CONFIRM_TRIES, LOOT_CONFIRM_WAIT_S,
+    NEIGHBORS, NO_SLOT_CODE, FarmWorker, KIND_TOOL, LOOT_CONFIRM_TRIES, LOOT_CONFIRM_WAIT_S,
     MAX_CLEAR_SWINGS, StepResult as SR, StageResult,
     SURPLUS_MATERIAL_IDS, buy_count_for, farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles,
     farm_empty_dirt, is_seed_offer,
@@ -763,7 +763,9 @@ class TestClearSwingsUntilKindChanges(unittest.TestCase):
         self.assertEqual(mod_codes - (env | inert | incon), set(),
                          "bridge 通用码 + use_tool 的码必须被三类之一覆盖")
         self.assertEqual(incon, {"timeout", "error", "stale"})
-        self.assertEqual(env, {"no_save", "ui_modal", "world_fading", "busy"})
+        # 【task-198】`no_slot` 是**脑侧合成**的码（背包满，不是 Mod 的 status）：它与
+        # `busy`/`ui_modal` 同族，属于"现在整个环境不让动手" ⇒ 进 env 桶（不封格、不占配额）。
+        self.assertEqual(env, {"no_save", "ui_modal", "world_fading", "busy", "no_slot"})
         self.assertEqual(inert, {"tool_ineffective", "precondition_failed"})
         # 只有 timeout/error/stale 算"没结论"（Lead m01763 + task-28）：回执 ok / 缺 status /
         # 没见过的码都是**真实回应** ⇒ 世界没变就是"这一刀白挥"，走结论（封格）路径。
@@ -2391,6 +2393,12 @@ class TestTask181HarvestEvidence(unittest.TestCase):
         self.assertFalse(st.ok)
         self.assertEqual(st.code, "failed")
         self.assertIn("背包满", st.reason)
+        # 【task-198】它是**全局阻塞**（env 桶 + `no_slot` 标记），不是"这一格摘不下来"：
+        # 不封格、不占每格配额、不进 `harvest_gave_up`（真机 run A′ 的 59 次就是这么来的）。
+        self.assertTrue(st.env_block)
+        self.assertTrue(st.no_slot)
+        self.assertEqual(st.status, NO_SLOT_CODE)
+        self.assertFalse(st.proven_inert)
         self.assertEqual(w.harvests, [], "判满必须在**发请求之前**")
         self.assertTrue(w.records[0].get("crop"))
 
@@ -2693,6 +2701,57 @@ class TestTask189LootAccounting(unittest.TestCase):
         self.assertEqual(after.get("loot_whitelisted"), [])
         self.assertIn("不进出货白名单", st.reason)
         self.assertEqual(worker.harvested, {})
+
+
+class TestTask198NoSlot(unittest.TestCase):
+    """task-198：背包满（`no_slot`）是**全局阻塞**，不是"这一格摘不下来"。
+
+    run A′（`logs/longrun-runA3-0736.jsonl`）：45 条 harvest 同句失败（背包满）、
+    `harvest_gave_up` 59 次、`no_hard_failures=false` ⇒ 整天不可能 VERIFIED。
+    正确归类与 `busy`/`ui_modal` 同族（env_block）：不封格、不吃每格配额、不计 hard failure；
+    真正该界住它的是日级腾格回路（`longrun._slot_relief()`）。
+    """
+
+    def _crop(self) -> dict:
+        return {"tile": [60, 10], "kind": "dirt", "feature": "HoeDirt", "crop": "24",
+                "ripe": True, "ready": True, "watered": True, "dead": False, "standable": False}
+
+    @staticmethod
+    def _full_rows(n: int = 12) -> list[dict]:
+        return [{"slot": i, "id": "388", "qualifiedId": "(O)388", "name": "Wood",
+                 "stack": 99, "isTool": False} for i in range(n)]
+
+    def test_full_backpack_is_env_blocking_not_a_hard_failure(self):
+        w = MiniWorld(records=[self._crop()], inventory=self._full_rows(), inventory_capacity=12)
+        st = make_worker(w).harvest((60, 10))
+        self.assertFalse(st.ok)
+        self.assertEqual(st.code, "failed")
+        self.assertTrue(st.env_block, "背包满是环境/阻塞类，必须打 env_block")
+        self.assertTrue(st.no_slot, "必须打 no_slot，供日级腾格回路与账本区分")
+        self.assertEqual(st.status, NO_SLOT_CODE)
+        self.assertFalse(st.proven_inert, "没问过这一格能不能收 ⇒ 绝不许判它干不动")
+        self.assertFalse(st.inconclusive)
+        self.assertEqual(w.harvests, [], "满包判据必须在发请求之前")
+        d = st.as_dict()
+        self.assertTrue(d.get("env_block"))
+        self.assertTrue(d.get("no_slot"))
+        self.assertNotIn("proven_inert", d)
+
+    def test_no_slot_is_classified_as_environment_blocking(self):
+        """`_classify_status` 认得这个（脑侧合成）码 ⇒ `is_env_blocked()`/日级账本同一口径。"""
+        from agentfarm import farmwork as fw
+        self.assertEqual(fw._classify_status(NO_SLOT_CODE), (True, False))
+        self.assertIn(NO_SLOT_CODE, fw.ENV_BLOCK_STATUSES)
+        self.assertNotIn(NO_SLOT_CODE, fw.TILE_INERT_STATUSES)
+        self.assertNotIn(NO_SLOT_CODE, fw.INCONCLUSIVE_STATUSES)
+
+    def test_reason_points_at_the_global_cause(self):
+        """文案必须点明"全局阻塞、先腾格"，不许写成"这一格收不了"。"""
+        w = MiniWorld(records=[self._crop()], inventory=self._full_rows(), inventory_capacity=12)
+        st = make_worker(w).harvest((60, 10))
+        self.assertIn("全局阻塞", st.reason)
+        self.assertIn("腾格", st.reason)
+        self.assertIn("不是这一格", st.reason)
 
 
 if __name__ == "__main__":  # pragma: no cover

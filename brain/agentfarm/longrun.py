@@ -122,6 +122,20 @@ MAX_TILE_ATTEMPTS = 2
 #: 还挡着的，判定为"今天这个世界不适合干这格"，让它如实落到 `capped`/`needs_review`。
 MAX_ENV_ATTEMPTS = 2
 
+#: 【task-198】"腾格收敛回路"的日级上界：背包满不是某一格的属性（见 `farmwork.NO_SLOT_CODE`），
+#: 它是**全局**阻塞，得由日级策略来界住 —— "腾 N 格 → 再收"。
+#:
+#: run A′（`logs/longrun-runA3-0736.jsonl`）就是这个洞：背包满 ⇒ 45 条 harvest 同句失败、
+#: 59 次 `harvest_gave_up`、`no_hard_failures=false`，而 `sell`/`ship` 明明一直在跑 ——
+#: 缺的不是能力，而是"**先腾格再收**"的次序。回路每轮至少腾 1 格；用满本上限还腾不出
+#: （没有可卖/可出货的叠）⇒ 如实 `inventory_blocked` 收尾（不进 `JUSTIFIED_END_REASONS`）。
+SLOT_RELIEF_MAX = 3
+
+#: 【task-198】背包"低水位"：空槽 ≤ 这个数就**提前**腾格（而不是等 0 格才动）。
+#: 掉落/收获一次可能进多件（clear/till/water 的掉落也在填包），留 1 格余量能避免
+#: "刚腾出 1 格、收一件又满了"的抖振 —— 但**不会**因此多花请求：只在确实有可腾的叠时才动。
+SLOT_RESERVE = 1
+
 #: 【task-68】"一轮不许零动作"（Lead m06336）：当**本轮所有指定目标都够不着/被围住**、但世界里
 #: 仍有"可达 + 可清障"的格子（杂草/石头/树枝/草）时，至少清掉一格 —— 否则 idle 计数攒够 3 轮
 #: 就判 stuck、整天报废（run6 只跑 19 秒的直接原因之一）。
@@ -919,6 +933,16 @@ class LongRun:
         self.buy_no_space_noted = False
         self.slot_sold_today = False
         self.farm_actions_today = 0
+        #: 【task-198】"背包满 ⇒ 先腾格再收"的日级收敛状态（每日重置）：
+        #:  * `slot_relief_today` —— 今天已经执行了几轮腾格回路（上界 `SLOT_RELIEF_MAX`）；
+        #:  * `slot_relief_noted` —— 每个 `need` 数只 journal 一条（防刷屏）；
+        #:  * `inventory_blocked_today` —— 今天已经证明"腾不出格子"（没有可卖/可出货的叠）⇒
+        #:    守卫不许再拿"还有熟作物"当理由、收尾理由如实写 `inventory_blocked`；
+        #:    **它不是 hard failure**（no_slot 不算 failed），但当天也**不许**假 VERIFIED。
+        self.slot_relief_today = 0
+        self.slot_relief_noted: set[int] = set()
+        self.inventory_blocked_today = False
+        self.inventory_blocked_noted = False
         #: 【task-114 NIT-1】撞上 `no_inventory_space` 那一刻的**真实观测**（空格/种子/钱），
         #: 供当晚教训的 `evidence` 引用 —— 教训里绝不许写死"空格=0"这类常量。
         self.buy_no_space_facts: dict[str, Any] = {}
@@ -2571,6 +2595,11 @@ class LongRun:
         # 【task-168】认输片区里的格子**不算"还有活"**（主动放弃 ⇒ 守卫闭嘴）。
         # 注意这不影响会计：`_leftover`/`plot_pending`/`assigned_undone` 照旧把这些格算未完成。
         shed = self._shed_tile_set()
+        # 【task-198】背包满/将满时，"可收"**不算这片地还有活** —— 收不进来（`no_slot` 是
+        # 全局阻塞），拿它当选区/开工理由只会让日循环去撞同一堵墙（run A′ 的 45 条同句失败）。
+        # 注意只收窄"熟作物"这一路：没浇的作物（浇水不占格）与枯死作物（清死苗）照旧算活。
+        free_slots, bag_need, bag_status = self._bag_state(obs)
+        bag_blocked = self.inventory_blocked_today or (bag_status == "ok" and bag_need > 0)
         for t in tiles:
             if t in self.blocked or t in shed:
                 continue  # 今天已经证明"动了没用" / 今天已主动认输
@@ -2585,7 +2614,10 @@ class LongRun:
             if tv.get("crop"):
                 # 【task-170 ②】"可收"那半句要扣掉今天已证明收不到的格（`harvest_gave_up`）：
                 # 否则一格摘不到的作物会让"这片地还有活"永远成立 ⇒ 守卫 veto 收工。
-                if not tv.get("watered") or (tile_ready(tv) and t not in self.harvest_gave_up):
+                if not tv.get("watered"):
+                    return True
+                if (tile_ready(tv) and t not in self.harvest_gave_up
+                        and not bag_blocked):
                     return True
                 # 【task-51】枯死作物**也是活**：它占着耕地、挡着 `till`（`till_blocked_by` 见 crop 就拒），
                 # 不清掉就永远开不了这一格。run5 真机夏季 2 日：窗口 24 个作物里 23 个 `dead=True`
@@ -3306,7 +3338,17 @@ class LongRun:
                 and t not in self.harvest_gave_up and t not in self.blocked]
         if shed:
             ripe = [t for t in ripe if t not in shed]
-        if ripe:
+        # 【task-198】背包满/将满 ⇒ "还有熟作物"**不许**当"还能干活"的证据：
+        # 那时缺的不是目标、是空格。run A′ 的形态正是 45 条 harvest 因背包满被拒、
+        # `harvest_gave_up` 59 次、整天 `no_hard_failures=false`，而 `sell`/`ship` 一直在跑
+        # —— 守卫却拿"农场口径还有 N 格熟作物"把每一天钉在"先去收"上（最后 `stuck:` 报废）。
+        # 三态：①还能腾格 ⇒ 给一条**可执行**理由（先去腾格）；②今天已证明腾不出
+        # （`inventory_blocked_today`）⇒ 熟作物理由全部闭嘴，收尾理由如实写 `inventory_blocked`；
+        # ③背包不紧 ⇒ 原样。
+        free_slots, bag_need, bag_status = self._bag_state(obs)
+        bag_blocked = bag_status == "ok" and bag_need > 0
+        ripe_work = bool(ripe)
+        if ripe and not bag_blocked:
             reasons.append(f"有 {len(ripe)} 格作物熟了")
         seeds, money, can_plant = self._seed_outlook(obs)
         # 【task-163】当天被体力预算显式延后的任务不再算"还有活"：`clear_area`/`till_area`/
@@ -3347,7 +3389,9 @@ class LongRun:
                 reasons.append(f"人不在农场，但 farm 口径还有 {dry} 格干作物（先回去浇）")
             ripe_live = max(0, ripe - len(self.harvest_gave_up) - shed_live)
             if ripe_live > 0:
-                reasons.append(f"人不在农场，但 farm 口径还有 {ripe_live} 格熟作物（先回去收）")
+                ripe_work = True
+                if not bag_blocked:
+                    reasons.append(f"人不在农场，但 farm 口径还有 {ripe_live} 格熟作物（先回去收）")
         if plot_work is not None and "plant_area" not in deferred:
             # 【task-149 A】农场级"还有耕地/空地"来源（与人在不在农场无关）：
             # 雨天作物被浇好之后，run9c 只剩这一条能说明"地里还有活"。
@@ -3379,19 +3423,30 @@ class LongRun:
             # 【task-170 ②】farm 级熟作物数也要扣掉今天已判过、收不到的格（否则守卫被钉住）。
             ripe_f_live = max(0, ripe_f - len(self.harvest_gave_up))
             if ripe_f_live > len(ripe):
-                reasons.append(f"农场口径还有 {ripe_f_live} 格熟作物（当前窗口只看到 {len(ripe)} 格）")
+                ripe_work = True
+                if not bag_blocked:
+                    reasons.append(f"农场口径还有 {ripe_f_live} 格熟作物（当前窗口只看到 {len(ripe)} 格）")
         # 【task-49】今天**已经见过、但还没做完**的格子（`_step_stage` 的 `leftover`）。
         # 换到别的片地之后，那些格子不在玩家窗口里 ⇒ 必须靠这份记账才知道"还有活"，
         # 否则就是 run5 的 `no_work` 早睡。已封格（`tool_ineffective` 一类）**不算** ——
         # 那正是"这一格今天真干不动"的结论（反向用例：全部 leftover 都封了 ⇒ 允许 `no_work`）。
         pending = self._pending_work()
-        if pending:
+        # 【task-198 ②】背包满/将满时"跨片地遗留"也**不许**当"还能干活"的理由：那些格子要收/要装，
+        # 而背包堵住 ⇒ 唯一的可执行动作是腾格（见下面的 bag_blocked 分支）。`_leftover` 照旧
+        # 如实保留这些格（`no_unmet_stages` 不受影响）—— 语义是"不是没活，是背包堵住"。
+        if pending and not bag_blocked:
             reasons.append(f"今天早些时候还有 {len(pending)} 格没做完（跨片地，最近的是 "
                            f"{list(min(pending, key=lambda t: _dist(t, FarmWorker.player_tile(obs))))}）")
         for cand in self._plot_candidates(obs):
             if self._plot_has_work(obs, cand["tiles"]):
                 reasons.append(f"{cand.get('zone') or '附近'}还有地要清/开/种")
                 break
+        # 【task-198】背包满/将满且有熟作物要收 ⇒ 唯一可执行的"活"是**先腾格**。
+        # 今天已证明腾不出来（`inventory_blocked_today`）时**不 append** —— 守卫据此允许收工，
+        # 收尾理由由 `sleep_guard` 写成 `inventory_blocked`（诚实、非 hard failure、不假 VERIFIED）。
+        if bag_blocked and ripe_work and not self.inventory_blocked_today:
+            reasons.append(f"背包将满/已满（空格 {free_slots}，只有 {SLOT_RESERVE} 格余量）⇒ "
+                           f"先去出货/卖材料腾格，腾出空格才能收熟作物")
         return reasons
 
     def _pending_work(self) -> list[tuple[int, int]]:
@@ -3771,6 +3826,15 @@ class LongRun:
                 "不许判『没活可做』；先想办法回农场，回不去就按 stuck 如实收尾")
         reasons = self.work_reasons(obs)
         if not reasons:
+            # 【task-198】背包满 + 今天已证明腾不出格子 ⇒ 熟作物的理由已由 `work_reasons` 闭嘴，
+            # 但**不许**洗成 `no_work`：那不是"没活可做"，是"活被背包堵住、腾不出格"。
+            # 用 `inventory_blocked` 如实收尾（不在 `JUSTIFIED_END_REASONS` ⇒ `day_justified=False`
+            # ⇒ 当天 `verified=false`；`no_slot` 不是 failed ⇒ 不算 hard failure）。
+            if self.inventory_blocked_today:
+                free_slots, _need, _status = self._bag_state(obs)
+                return True, "inventory_blocked", (
+                    f"背包满（空格 {free_slots}）且今天已经腾不出格子（没有可出货/可卖的叠）⇒ "
+                    "熟作物收不进来；这不是「没活可做」，当天按 needs_review 如实收尾")
             # 【task-149 C】走到这里说明"没活"有**独立证据**：farm 证据齐备（否则上一段
             # fail-closed 已经给了理由）、窗口与农场口径都没给出任何活。日终 checks 用
             # `zero_action_evidenced` 拦住"0 动作却 VERIFIED"的假绿灯。
@@ -3956,9 +4020,172 @@ class LongRun:
                           reason=bad[0].reason, code=bad[0].code)
         return bool(good)
 
+    # ------------------------------------------------------------------ 背包/腾格（task-198）
+    def _ready_crop_count(self, obs: dict[str, Any]) -> int:
+        """下一批"能收"的熟作物格数（腾格回路的**需求估计**，不参与任何判据）。
+
+        取窗口里游戏口径 `ready` 的活苗格数与 farm 级 `readyCrops` 的**较大者**：
+        窗口外的熟作物看不到坐标（task-199 才给 `readyTiles`），但"还要不要腾格"只需要
+        一个数量级估计 —— 少算会漏腾（run A′ 的形态），多算最多多腾一格（有界，且
+        `_slot_relief` 每轮必须真腾 ≥1 格，不会空转）。
+        """
+        tmap = FarmWorker.tiles_of(obs)
+        window = sum(1 for t, tv in tmap.items()
+                     if tv.get("crop") and not tv.get("dead") and tile_ready(tv)
+                     and t not in self.harvest_gave_up and t not in self.blocked)
+        farm = obs.get("farm") or {}
+        if farm.get("complete") is True and farm.get("loaded") is not False:
+            total = farm.get("readyCrops")
+            if isinstance(total, int) and total > window:
+                return int(total)
+        return int(window)
+
+    def _bag_state(self, obs: dict[str, Any]) -> tuple[int, int, str]:
+        """背包空格行数、**是否到了该腾格的信号**（0/1）、以及空槽读数的状态。
+
+        【task-198 低水位语义】`need == 1` 当且仅当：
+
+          * 空格读数可用（`status == "ok"`；拿不到 ⇒ fail-closed 不冒进，同
+            `farmwork.player_free_slots` 的口径）；
+          * `free_slots <= SLOT_RESERVE` **且** 下一批可收的熟作物格数 **多于** 空格数。
+
+        为什么不是"`free == 0` 才腾"（旧口径，run A′ 病灶）：1 空格 + 多格熟作物时，
+        第一批收获就会撞 `no_slot`（收不进来），当天既没收成、又没留下可执行的腾格动作，
+        最后以"守卫说还有活却零进展"的 `stuck` 收尾。
+        为什么不是"`free <= SLOT_RESERVE` 就无条件腾"：只有 1 格熟作物时收一格正好用掉
+        那最后一格 —— 白腾一次纯属浪费（deputy 预检点名的边界）。
+        """
+        free_slots, status = player_free_slots(FarmWorker.player_of(obs))
+        if status != "ok":
+            return int(free_slots), 0, str(status)
+        free_slots = int(free_slots)
+        ready = self._ready_crop_count(obs)
+        need = 1 if (free_slots <= SLOT_RESERVE and ready > free_slots) else 0
+        return free_slots, need, str(status)
+
+    def _note_inventory_blocked(self, obs: dict[str, Any], rep: DayReport, *,
+                                free_slots: int, reason: str) -> None:
+        """【task-198】今天已经证明"腾不出格子"：记一次账，守卫从此不再拿熟作物当活。
+
+        语义边界（卡面硬要求）：
+          * `no_slot` 不是 hard failure（`farmwork` 里它是 env/阻塞类，不计 `failed_steps`）；
+          * 但当天也**不许**假 VERIFIED：`inventory_blocked` 不在 `JUSTIFIED_END_REASONS` 里
+            ⇒ `day_justified=False` ⇒ `verified=False`；
+          * 每天只 journal 一次（`inventory_blocked_noted`），不刷屏。
+        """
+        self.inventory_blocked_today = True
+        if self.inventory_blocked_noted:
+            return
+        self.inventory_blocked_noted = True
+        self._journal("inventory_blocked", free_slots=int(free_slots), reserve=SLOT_RESERVE,
+                      rounds=self.slot_relief_today, limit=SLOT_RELIEF_MAX, reason=reason,
+                      note="背包满且腾不出格子（没有可出货/可卖的叠）⇒ 当天如实收尾："
+                           "不算 hard failure（no_slot 不是 failed），但 verified=false；"
+                           "守卫不再把「还有熟作物」当还能干活的理由")
+        rep.notes.append(f"背包满且腾不出格子：{reason}")
+        self._say(f"  × 背包满且腾不出格子：{reason}")
+
+    def _slot_relief(self, obs: dict[str, Any], rep: DayReport) -> bool:
+        """【task-198】"腾格收敛回路"：背包满/将满时**先把格子腾出来**，再回去干活。
+
+        返回 True = 这一轮真的腾出了格子（调用方 `continue`，重新观测/决策）；
+        False = 不需要腾格，或腾不出来（已置 `inventory_blocked_today`，当天如实收尾）。
+
+        次序（每一层都留 journal）：
+          1. `_ship_loot()`：把**今天亲手收货、且绑格子证据**的成品放进出货箱 —— 最直接、
+             白名单最严的腾格方式（绝不"看到背包里有东西就卖"）；
+          2. 仍不够 ⇒ `_sell_surplus_for_slot()`：按 `surplus_sell_plan(need_slot=True)` 卖一叠
+             盈余材料（只走 `SURPLUS_MATERIAL_IDS` 白名单、每 id 留 K 件）；
+          3. 都腾不出来（没有可出货/可卖的叠）⇒ 记一次 `inventory_blocked`、置
+             `inventory_blocked_today`，当天不再白跑。
+
+        界（卡面硬要求）：每天最多 `SLOT_RELIEF_MAX` 轮、**每轮必须腾 ≥1 格**；
+        本轮腾 0 格 ⇒ 立刻判定"腾不出来"，绝不无限自旋。`no_slot` 本身不占每格配额
+        （见 `_count_attempts`），所以这条回路是它**唯一**的界。
+
+        为什么落在"掉落预算"上：`clear`/`till`/`water` 的掉落也会填包 —— 低水位（
+        `SLOT_RESERVE`）就提前腾格，能让腾格发生在这些动作**之前**，而不是等背包 0 格时
+        才发现收不进来（run A′ 的形态）。
+        """
+        assert self.worker is not None
+        free_slots, need, status = self._bag_state(obs)
+        if status != "ok" or need <= 0:
+            return False
+        if self.inventory_blocked_today:
+            return False
+        if self.slot_relief_today >= SLOT_RELIEF_MAX:
+            self._note_inventory_blocked(
+                obs, rep, free_slots=free_slots,
+                reason=f"腾格回路已用满 {SLOT_RELIEF_MAX} 轮，背包仍然满")
+            return False
+        self.slot_relief_today += 1
+        if need not in self.slot_relief_noted:
+            self.slot_relief_noted.add(need)
+            self._journal("slot_relief_noted", free_slots=int(free_slots), reserve=SLOT_RESERVE,
+                          round=self.slot_relief_today, limit=SLOT_RELIEF_MAX,
+                          note="背包到低水位 ⇒ collect/清障/浇水之前先腾格"
+                               "（掉落与收获也会填包，等 0 格才动会像 run A′ 那样收不进来）")
+        shipped = False
+        try:
+            shipped = self._ship_loot(obs, rep)
+        except Exception:                       # 出货失败绝不打断日循环（下一层再试）
+            shipped = False
+        if shipped:
+            obs = self._snap_or(obs)
+        if self._bag_state(obs)[1] > 0:
+            try:
+                if self._sell_surplus_for_slot(obs, rep):
+                    obs = self._snap_or(obs)
+            except Exception:                   # 卖货失败同样不打断（腾不出来会如实记账）
+                pass
+        after_slots = self._bag_state(obs)[0]
+        freed = max(0, int(after_slots) - int(free_slots))
+        self._journal("slot_relief", need=need, freed=freed, shipped=bool(shipped),
+                      freeSlots_before=int(free_slots), freeSlots_after=int(after_slots),
+                      round=self.slot_relief_today, max_rounds=SLOT_RELIEF_MAX,
+                      reserve=SLOT_RESERVE,
+                      note="腾出格子后重新决策（先腾格、再收/清/浇）；腾 0 格 ⇒ 立刻如实 "
+                           "inventory_blocked，不空转")
+        if freed >= 1:
+            rep.notes.append(f"腾格：空格 {free_slots} → {after_slots}"
+                             f"（第 {self.slot_relief_today} 轮）")
+            return True
+        self._note_inventory_blocked(
+            obs, rep, free_slots=after_slots,
+            reason="本轮腾格没有腾出任何格子（没有可出货/可卖的叠）")
+        return False
+
+    def _end_inventory_blocked(self, obs: dict[str, Any], rep: DayReport) -> str:
+        """【task-198】背包堵住 ⇒ 诚实收工：睡一觉让游戏日翻篇，但 `ended_by` 点名原因。
+
+        三处收尾口都要用它（`sleep_guard` 分支、作业区拿不出目标的出口、idle 3 轮出口）：
+        否则"背包满 + 多格熟作物"会被报成 `no_work`（假达标）或 `stuck`（误报卡死），
+        而真实情况是"不是没活，是背包堵住"。
+
+        语义边界：`inventory_blocked` **不在** `JUSTIFIED_END_REASONS` 里 ⇒ `day_justified=False`
+        ⇒ 当天如实不判 VERIFIED；`no_slot` 不是 hard failure（`failed_steps` 不计）⇒
+        `no_hard_failures` 仍为真。返回值 = 最终的 `ended_by`。
+        """
+        free_slots, _need, _status = self._bag_state(obs)
+        why = (f"背包满（空格 {free_slots}）且今天已经腾不出格子：不是没活、也不是 stuck —— "
+               f"是背包堵住（先去出货/卖材料腾格，明天再收）")
+        slept_by, slept_reason = self._do_sleep(obs, rep, f"inventory_blocked:{why}")
+        if slept_by == "sleep_failed":
+            rep.ended_by, rep.ended_reason = slept_by, slept_reason
+        else:
+            rep.ended_by, rep.ended_reason = "inventory_blocked", f"inventory_blocked:{why}"
+        return rep.ended_by
+
+    def _snap_or(self, obs: dict[str, Any]) -> dict[str, Any]:
+        """重新取快照，失败就退回旧观测（腾格后的决策不该因为一次观察失败而崩）。"""
+        try:
+            fresh = self._snap()
+        except Exception:
+            return obs
+        return fresh or obs
+
     def _preconditions(self, obs: dict[str, Any], rep: DayReport) -> dict[str, Any]:
         """把"种子/钱/背包空格"在本轮动手之前摆正，并返回**改动之后的观测**。
-
         【task-143】为什么必须返回观测：这个函数会**真的买种子**（`buy`）。调用方
         `_run_day` 原先继续拿**买入之前**的快照去 `_ensure_plot`/`decide`/`_verify_intents`，
         于是刚到手的那 10 粒种子在校验关口看不见 —— 配上 task-143 的
@@ -4494,6 +4721,13 @@ class LongRun:
             if not s.tile or not (s.failed or s.proven_inert):
                 continue
             key = tuple(s.tile)
+            if getattr(s, "no_slot", False):
+                # 【task-198】背包满 = **全局**阻塞（不是这一格的属性，也不是"没拿到结论"）：
+                # 既不占每格配额、也不进 `env_streak`（同一格连续 no_slot 本来就不该被限流）。
+                # 它由日级腾格收敛回路 `_slot_relief()` 界住（每天有界轮数，腾不出 ⇒
+                # 如实 `inventory_blocked` 收尾）—— 在这里再叠一层每格限流只会把它误判成
+                # `capped`（run A′ 的 59 次 `harvest_gave_up` 就是这么来的）。
+                continue
             if s.env_block:
                 streak = self.env_streak.get(key, 0) + 1
                 self.env_streak[key] = streak
@@ -4525,6 +4759,12 @@ class LongRun:
             if self.tile_attempts.get(key, 0) < MAX_TILE_ATTEMPTS:
                 continue
             if key in self.harvest_gave_up:
+                continue
+            # 【task-198】背包满（`no_slot`）不是"这一格摘不下来"：它连"能不能收"都还没问过，
+            # 全局一腾出格子当天就能收 ⇒ **绝不许**把它写进 `harvest_gave_up`（否则一天之后
+            # 守卫/目标池都把这格当成"今天放弃了"，而其实只是背包没空格）。
+            if any(getattr(x, "no_slot", False) for x in steps
+                   if x.tile and tuple(x.tile) == key):
                 continue
             self.harvest_gave_up.add(key)
             codes = sorted({str(getattr(s, "code", "") or "") for s in steps
@@ -4566,6 +4806,10 @@ class LongRun:
         codes = {str(getattr(s, "code", "") or "") for s in reached}
         if "need_refill" in codes:
             return "need_refill"
+        if any(getattr(s, "no_slot", False) for s in reached):
+            # 【task-198】背包满排在第一位：它是**全局**原因（不是这一格走不到/没种子），
+            # 阶段 `stopped` 必须让读者一眼看到"先腾格"，而不是被后面的分类掩盖。
+            return "no_slot"
         if any(getattr(s, "unreachable", False) for s in reached):
             return "unreachable"
         if "no_seed" in codes or "sow_failed" in codes:
@@ -4781,7 +5025,12 @@ class LongRun:
         # 另一条（task-9）：`leftover` **含被封格的格子**，所以"只剩干不动的格子"时 met=False ——
         # 封格只免掉重试，不许把失败洗成成功。
         met = bool(all_steps) and not leftover
-        failed_any = [s for s in all_steps if s.failed]
+        # 【task-198】`no_slot`（背包满）**不是"这一格没做成"**：它是全局阻塞，`farmwork` 侧
+        # 已经把它归进 env 桶（`StepResult.env_block`），这里必须同样从硬失败里排除 ——
+        # 否则 run A′ 的 45 条同句失败会一路算进 `stage.failed`/`day.failed_steps`/
+        # `no_hard_failures`，当天永远不可能 VERIFIED（卡面①的硬要求）。
+        failed_any = [s for s in all_steps
+                      if s.failed and not getattr(s, "no_slot", False)]
         # task-15 §④ 要求 2：日级硬失败只数**目标尚未完成**的失败。一次渐黑/一个弹窗之后
         # 重试做成的格子不算硬失败（`leftover` 里没有它 = 目标已达成）；`tile is None` 的步
         # （阶段级失败、没有具体格子）照旧算失败。
@@ -5492,6 +5741,11 @@ class LongRun:
         self.slot_sold_today = False
         self.farm_actions_today = 0
         self.buy_no_space_facts = {}
+        # 【task-198】腾格收敛回路的日级状态每天清零（上界是**每天** `SLOT_RELIEF_MAX` 轮）。
+        self.slot_relief_today = 0
+        self.slot_relief_noted = set()
+        self.inventory_blocked_today = False
+        self.inventory_blocked_noted = False
         # 【task-122】两种退化形态的当日计数，每天清零（只喂教训库，不参与判定）。
         self.plot_exhausted_today = 0
         self.midway_leftover_today = 0
@@ -5610,7 +5864,20 @@ class LongRun:
             allow, code, text = self.sleep_guard(obs)
             if allow:
                 rep.ended_by, rep.ended_reason = self._do_sleep(obs, rep, f"{code}:{text}")
+                # 【task-198】背包堵住导致的收工与 night/stamina 同形态（睡一觉让游戏日翻篇），
+                # 但 `ended_by` 必须点名**原因**：否则报告里只会看到 `sleep`，看报告的人分不清
+                # "干完了" 和 "背包堵住收工"。`is_justified_end()` 不认它 ⇒ 当天不判 VERIFIED。
+                if code == "inventory_blocked" and rep.ended_by == "sleep":
+                    rep.ended_by = "inventory_blocked"
+                    rep.ended_reason = f"inventory_blocked:{text}"
                 break
+
+            # 【task-198】背包满/将满 ⇒ **先腾格再收**（日级收敛回路，run A′ 的 45 条 harvest
+            # 全卡在"背包满"上：守卫一直说"还有熟作物"、collect 又全被拒）。腾出格子后
+            # `continue` 重新观测/决策；腾不出来时 `_slot_relief` 已置 `inventory_blocked_today`
+            # 并记 journal，守卫下一轮就会用 `inventory_blocked` 如实收尾（不假 VERIFIED）。
+            if self._slot_relief(obs, rep):
+                continue
 
             # 【task-143】`_preconditions` 会真的买种子 ⇒ 必须用它还回来的**改动后**观测继续
             # 本轮（`_ensure_plot`/`decide`/`_verify_intents` 都要看得见刚到手的那批种子，
@@ -5649,6 +5916,11 @@ class LongRun:
                             f"（frontier_clear {self.frontier_clears}/{FRONTIER_CLEAR_MAX}）")
                         self.idle_rounds = 0
                         continue
+                    # 【task-198】背包堵住时**不能**落成 `no_work`（那是假达标）或 `stuck`
+                    # （那是误报卡死）：这一天的真实结论是"背包堵住、今天腾不出来"。
+                    if self.inventory_blocked_today:
+                        self._end_inventory_blocked(obs, rep)
+                        break
                     why = ("no_work" if not reasons else
                            "stuck:守卫说还有活（" + "；".join(reasons)
                            + "）但没有任何作业区拿得出目标" + self._not_on_farm_suffix())
@@ -5859,6 +6131,13 @@ class LongRun:
                 self._journal("idle", rounds=self.idle_rounds, zone=self.zone_name,
                               intents=[i.task for i in decision.intents], acted=acted)
                 if self.idle_rounds >= 3:
+                    # 【task-198 ③】背包堵住导致的"零变化"**不是 stuck**：`_slot_relief` 每轮只
+                    # 腾 1 格、多格熟作物要好几轮 ⇒ 3 轮 idle 会先撞这里，把"背包堵住"误报成
+                    # `stuck`（deputy 的 198f-1..8 全是这个形态，A′ day13 原型）。先判
+                    # `inventory_blocked_today`：诚实收工、理由可执行、不算 hard failure。
+                    if self.inventory_blocked_today:
+                        self._end_inventory_blocked(obs, rep)
+                        break
                     # 【task-50】文案里补上"守卫为什么还说要干活"的**活证据**（含窗口外
                     # 干作物的坐标）。决策逻辑一个字没动，只是让 `ended_reason` 能点名到底
                     # 卡在哪一格 —— 卡面硬要求"干格不可达 ⇒ 当天 `stuck:` 且含坐标"。
@@ -6129,7 +6408,11 @@ class LongRun:
                 + f"（scope={water_info.get('scope')}、tiles={water_info.get('tiles')}、"
                   f"crops={water_info.get('crops')}、dry={water_info.get('dry')}）")
         rep.checks = {
-            "slept_by_us": rep.ended_by == "sleep",
+            # 【task-198】`inventory_blocked` 也是"我们睡下去让游戏日翻篇了"（`_do_sleep` 成功），
+            # 只是收尾原因写成了背包堵住 —— 所以 `slept_by_us` 必须为真，否则报告会说谎。
+            # 它**不会**因此算达标：`day_justified` 只认 `is_justified_end()` 的白名单，
+            # `inventory_blocked` 不在其中 ⇒ 当天如实不判 VERIFIED。
+            "slept_by_us": rep.ended_by in ("sleep", "inventory_blocked"),
             # task-11：被不可逆/不敢关的模态挡住（职业选择、存档超时）时，这一天**不算数**。
             # 用户 m03224 拍板了职业路线：宁可停下等人，也不静默丢档。
             "no_blocking_modal": rep.ended_by not in BLOCKING_ENDS,

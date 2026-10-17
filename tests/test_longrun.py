@@ -35,14 +35,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "brain"))
 from agentfarm.bridge import MOD_VERSION_EXPECTED, BridgeError  # noqa: E402
 from agentfarm.llm import LlmError  # noqa: E402
 from agentfarm.farmwork import (  # noqa: E402
-    MAX_CLEAR_SWINGS, FarmWorker, STAGE_ACTION, StepResult, StageResult, harvest_tool,
-    player_free_slots, seed_items, tile_ready,
+    MAX_CLEAR_SWINGS, NO_SLOT_CODE, FarmWorker, STAGE_ACTION, StepResult, StageResult,
+    harvest_tool, player_free_slots, seed_items, tile_ready,
 )
 from agentfarm.longrun import (  # noqa: E402
     DEFAULT_LLM_MAX_TOKENS, ENDED_BY_EVENT, ENDED_BY_MODAL, FAR_DRY_MAX_TRIES,
     FAR_DRY_OPEN_MAX, FAR_DRY_REFILL_MAX,
     FRONTIER_CLEAR_MAX, JUSTIFIED_END_REASONS, MAX_BUY_TRIES_PER_DAY, MAX_ENV_ATTEMPTS,
-    MAX_STUCK_FLUSH, MAX_TILE_ATTEMPTS, PLOT_EXHAUSTED_BURST, DayReport, LongRun,
+    MAX_STUCK_FLUSH, MAX_TILE_ATTEMPTS, PLOT_EXHAUSTED_BURST, SLOT_RELIEF_MAX, SLOT_RESERVE,
+    DayReport, LongRun,
     _till_blocked_by, is_justified_end, plot_observe,
 )
 from agentfarm.planner import (DECISION_LINE_MAX_CHARS, DECISIONS_KEPT, LESSONS_MAX, LESSON_SRC,
@@ -9576,6 +9577,354 @@ class TestTask192ScopeReleaseAccounting(unittest.TestCase):
             self.assertEqual(len(loaded), 1)
             self.assertEqual(loaded[0]["shed_ever_total"],
                              sum(run2.shed_ever_tiles.values()))
+
+
+class _SlotReliefWorker(FakeWorker):
+    """`FakeWorker` + 出货通道（task-198）：只有这里能把格子**真的**从背包里搬走。
+
+    基线 `FakeWorker` 没有 `sell`/`sell_loot`（那是桥的技能），而 `_slot_relief()` 的第一招
+    就是 `_ship_loot()` ⇒ 清单用例必须显式给一个"搬得动"的假执行层。
+    """
+
+    def __init__(self, world: FakeWorld, *, harvested: dict | None = None,
+                 move_qid: str | None = None, free_nothing: bool = False) -> None:
+        super().__init__(world)
+        self.harvested = dict(harvested or {})
+        self.move_qid = move_qid
+        self.free_nothing = free_nothing
+        self.ship_calls = 0
+        self.sell_calls = 0
+
+    def _row(self, qid: str | None) -> dict | None:
+        return next((r for r in self.w.inventory
+                     if qid and str(r.get("qualifiedId")) == qid), None)
+
+    def sell_loot(self, *, timeout_ms=8000, max_items=24):
+        self.ship_calls += 1
+        row = self._row(self.move_qid)
+        if row is None:
+            return []
+        step = StepResult("sell", None, ok=True, code="ok", reason="假出货：放进出货箱")
+        step.before = {"slot": int(row.get("slot") or 0), "qid": row.get("qualifiedId"),
+                       "stack": row.get("stack"), "count": 1, "shipping_bin": 0}
+        step.after = {"slot": int(row.get("slot") or 0), "qid": row.get("qualifiedId"),
+                      "count": 0, "shipping_bin": 1}
+        if not self.free_nothing:
+            self.w.inventory.remove(row)
+        return [step]
+
+    def sell(self, slot, *, whitelist=None, timeout_ms=8000):
+        self.sell_calls += 1
+        return StepResult("sell", None, ok=False, code="not_whitelisted",
+                          reason="假世界：材料通道今天不可用")
+
+
+class TestTask198SlotRelief(unittest.TestCase):
+    """task-198：`freeSlots == 0` ⇒ **先腾格、再收**；腾不出就如实 `inventory_blocked`。
+
+    真机 run A′（`logs/longrun-runA3-0736.jsonl`）：45 条 harvest 同句失败（背包满）、
+    `harvest_gave_up` 59 次、`no_hard_failures=false` ⇒ 整天不可能 VERIFIED。
+    这里钉住四件事：①`no_slot` 不是这一格的结论（不封格/不吃配额）②守卫不拿"还有熟作物"
+    当"还能干活"③腾格回路把 ship/sell 提到 collect 前、每天有界、每轮必须腾 ≥1 格
+    ④腾不出 ⇒ `inventory_blocked` 如实收尾（`day_justified=False`，但不算 hard failure）。
+    """
+
+    RIPE = (60, 10)
+
+    def _world(self, *, rows: int = 12, with_loot: bool = True, ripe: int = 1) -> FakeWorld:
+        w = FakeWorld(seeds=0, money=0, weeds=0)
+        tiles = [(60 + i, 10) for i in range(ripe)]
+        w.dirt = set(tiles)
+        w.crops = {t: {"ripe": True, "watered": True} for t in tiles}
+        inv = [{"slot": 0, "id": "Axe", "qualifiedId": "(T)Axe", "name": "Axe",
+                "stack": 1, "isTool": True},
+               {"slot": 1, "id": "Hoe", "qualifiedId": "(T)Hoe", "name": "Hoe",
+                "stack": 1, "isTool": True}]
+        fill = rows - (1 if with_loot else 0)
+        while len(inv) < fill:
+            inv.append({"slot": len(inv), "id": "388", "qualifiedId": "(O)388",
+                        "name": "Wood", "stack": 99, "isTool": False})
+        if with_loot:
+            inv.append({"slot": rows - 1, "id": "24", "qualifiedId": "(O)24",
+                        "name": "Parsnip", "stack": 1, "isTool": False})
+        w.inventory = inv[:rows]
+        return w
+
+    def _run(self, w: FakeWorld, worker: "_SlotReliefWorker") -> LongRun:
+        run = make_run(w)
+        run.client = FakeClient(w)
+        run.worker = worker
+        return run
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list[dict]:
+        return [e for e in run.entries if e["event"] == name]
+
+    def test_bag_full_relief_ships_loot_and_frees_a_slot(self):
+        w = self._world()
+        worker = _SlotReliefWorker(w, harvested={"(O)24": 1}, move_qid="(O)24")
+        run = self._run(w, worker)
+        self.assertEqual(player_free_slots(FarmWorker.player_of(w.obs()))[0], 0)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        self.assertTrue(run._slot_relief(w.obs(), rep))
+        self.assertEqual(worker.ship_calls, 1)
+        ev = self._events(run, "slot_relief")
+        self.assertEqual(len(ev), 1)
+        self.assertGreaterEqual(ev[0]["freed"], 1)
+        self.assertEqual(ev[0]["freeSlots_before"], 0)
+        self.assertGreaterEqual(ev[0]["freeSlots_after"], 1)
+        self.assertFalse(run.inventory_blocked_today)
+        self.assertEqual(player_free_slots(FarmWorker.player_of(w.obs()))[0], 1)
+        # 腾出格子后不再需要腾格（也不许再白发出货请求）
+        self.assertFalse(run._slot_relief(w.obs(), rep))
+        self.assertEqual(worker.ship_calls, 1)
+
+    def test_bag_full_guard_does_not_claim_ripe_work(self):
+        w = self._world()
+        run = self._run(w, _SlotReliefWorker(w, harvested={"(O)24": 1}, move_qid="(O)24"))
+        reasons = run.work_reasons(w.obs())
+        self.assertFalse([r for r in reasons if "熟了" in r], reasons)
+        self.assertTrue([r for r in reasons if "腾格" in r], reasons)
+        # 今天已经证明腾不出：连"去腾格"都不许再当工作理由（否则就是自旋）
+        run.inventory_blocked_today = True
+        again = run.work_reasons(w.obs())
+        self.assertFalse([r for r in again if "腾格" in r], again)
+
+    def test_cannot_free_a_slot_ends_honestly(self):
+        w = self._world(with_loot=False)
+        worker = _SlotReliefWorker(w, harvested={}, move_qid=None)
+        run = self._run(w, worker)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        self.assertFalse(run._slot_relief(w.obs(), rep))
+        self.assertTrue(run.inventory_blocked_today)
+        self.assertEqual(len(self._events(run, "inventory_blocked")), 1)
+        # 每天只记一次、且不再自旋
+        self.assertFalse(run._slot_relief(w.obs(), rep))
+        self.assertEqual(len(self._events(run, "inventory_blocked")), 1)
+        allow, code, text = run.sleep_guard(w.obs())
+        self.assertTrue(allow)
+        self.assertEqual(code, "inventory_blocked")
+        self.assertIn("腾不出", text)
+        self.assertFalse(is_justified_end("sleep", f"{code}:{text}"))
+        self.assertNotIn("inventory_blocked", JUSTIFIED_END_REASONS)
+
+    def test_relief_is_bounded_per_day(self):
+        w = self._world()
+        # 回执说成了、但一格都没真腾出来 ⇒ 不许按轮数空转
+        worker = _SlotReliefWorker(w, harvested={"(O)24": 1}, move_qid="(O)24",
+                                   free_nothing=True)
+        run = self._run(w, worker)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        for _ in range(SLOT_RELIEF_MAX + 2):
+            self.assertFalse(run._slot_relief(w.obs(), rep))
+        self.assertLessEqual(worker.ship_calls, 1, "腾不出就该立刻停手，不许按轮数空转")
+        self.assertEqual(len(self._events(run, "slot_relief")), 1)
+        self.assertLessEqual(len(self._events(run, "inventory_blocked")), 1)
+        # 再显式调用：早退，不再发请求
+        calls = worker.ship_calls
+        self.assertFalse(run._slot_relief(w.obs(), rep))
+        self.assertEqual(worker.ship_calls, calls)
+
+    def test_no_slot_steps_never_seal_or_consume_quota(self):
+        """`no_slot` 是全局阻塞：不吃每格配额、不进 `harvest_gave_up`（run A′ 的 59 次）。"""
+        w = self._world()
+        run = self._run(w, _SlotReliefWorker(w))
+        st = StepResult("harvest", self.RIPE, ok=False, code="failed", status=NO_SLOT_CODE,
+                        reason="背包满 ⇒ 全局阻塞")
+        st.env_block = True
+        st.no_slot = True
+        run._count_attempts([st])
+        self.assertEqual(run.tile_attempts, {})
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        run._note_harvest_gave_up([st], rep)
+        self.assertEqual(run.harvest_gave_up, set())
+        self.assertEqual(self._events(run, "harvest_gave_up"), [])
+
+    def test_one_free_slot_with_multiple_ripe_crops_triggers_relief(self):
+        """低水位：1 空格 + 3 格熟作物 ⇒ **提前腾格**（不是等 0 格才腾）。
+
+        run A′ 的形态就是"1 空格 + 多格熟作物"：等 `free==0` 时第一批收获已经撞
+        `no_slot`，当天既没收成、也没有可执行的腾格动作。deputy 预检抓到的就是这条。
+        """
+        w = self._world(rows=11, ripe=3)          # rows=11 ⇒ 1 空格
+        worker = _SlotReliefWorker(w, harvested={"(O)24": 1}, move_qid="(O)24")
+        run = self._run(w, worker)
+        self.assertEqual(player_free_slots(FarmWorker.player_of(w.obs()))[0], 1)
+        free_slots, need, status = run._bag_state(w.obs())
+        self.assertEqual((free_slots, need, status), (1, 1, "ok"))
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        self.assertTrue(run._slot_relief(w.obs(), rep))
+        ev = self._events(run, "slot_relief")
+        self.assertEqual(len(ev), 1)
+        self.assertGreaterEqual(ev[0]["freed"], 1)
+        self.assertEqual(ev[0]["freeSlots_before"], 1)
+
+    def test_one_free_slot_and_one_ripe_crop_does_not_relief(self):
+        """边界（Lead 点名）：1 空格 + 只有 1 格熟作物 ⇒ 收一格正好用掉那格，**不许白腾**。"""
+        w = self._world(rows=11, ripe=1)
+        worker = _SlotReliefWorker(w, harvested={"(O)24": 1}, move_qid="(O)24")
+        run = self._run(w, worker)
+        self.assertEqual(run._bag_state(w.obs())[:2], (1, 0))
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        self.assertFalse(run._slot_relief(w.obs(), rep))
+        self.assertEqual(worker.ship_calls, 0, "没有需求就不许白腾")
+        self.assertFalse(run.inventory_blocked_today)
+
+    def test_no_slot_steps_are_excluded_from_hard_failures(self):
+        """日级账本：`no_slot` 进 `env_block` 桶，**不许**进 `failed`/`failed_steps`。
+
+        deputy 预检实测："1 空格 + 3 格熟作物" ⇒ `harvest: failed=6 env_block=6`、
+        `day.failed_steps=9`、`no_hard_failures=False` —— 根因是 `failed_any` 没排除 `no_slot`。
+        """
+
+        class _NoSlotStageWorker(FakeWorker):
+            def run_stage(self, stage, tiles, *, min_stamina=12.0, max_steps=200):
+                res = StageResult(stage=stage, tiles=list(tiles))
+                for tile in tiles[:3]:
+                    st = StepResult("harvest", tuple(tile), ok=False, code="failed",
+                                    status=NO_SLOT_CODE, reason="背包满 ⇒ 全局阻塞")
+                    st.env_block = True
+                    st.no_slot = True
+                    res.steps.append(st)
+                    self.steps.append(st)
+                return res
+
+        w = self._world(rows=11, ripe=3)
+        run = self._run(w, _NoSlotStageWorker(w))
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        plot = {"zone": "", "label": "", "anchor": [60, 10],
+                "tiles": [(60, 10), (61, 10), (62, 10)], "note": ""}
+        run._step_stage("harvest", w.obs(), plot, rep)
+        stage = rep.stages[-1]
+        self.assertEqual(stage["failed"], 0, "no_slot 不是硬失败")
+        self.assertEqual(stage["failed_any"], 0, "failed_any 也必须排除 no_slot")
+        # 阶段内会有界重试（`max_stage_rounds`），所以 env_block 计数 ≥ 一次的量即可
+        self.assertGreaterEqual(stage["env_block"], 3)
+        self.assertLessEqual(stage["env_block"], 3 * run.max_stage_rounds)
+        self.assertEqual(rep.failed_steps, 0)
+        self.assertEqual(run.tile_attempts, {}, "no_slot 不吃每格配额")
+
+    def test_inventory_blocked_is_not_a_justified_end(self):
+        """本卡不加任何 `checks` 键：`inventory_blocked` 只做 `ended_reason`，且不算达标收工。"""
+        self.assertEqual(SLOT_RESERVE, 1)
+        self.assertFalse(is_justified_end("sleep", "inventory_blocked: 背包满"))
+        self.assertFalse(is_justified_end("stuck", "inventory_blocked: 背包满"))
+
+
+class _LootClient(FakeClient):
+    """能真的把背包行搬走的假桥：`sell` = 清单里那行消失（= 腾出一格）。"""
+
+    def __init__(self, world: FakeWorld) -> None:
+        super().__init__(world)
+        self.sold: list[str] = []
+
+    def sell(self, slot, *, whitelist=None, timeout_ms=8000):
+        row = next((r for r in self.w.inventory
+                    if int(r.get("slot") or 0) == int(slot)), None)
+        allow = list(whitelist or [])
+        if row is None or (allow and str(row.get("qualifiedId")) not in allow):
+            return {"ok": False, "status": "not_whitelisted", "reason": "假世界：不在白名单"}
+        self.w.inventory.remove(row)
+        self.sold.append(str(row.get("qualifiedId")))
+        return {"ok": True, "status": "ok", "reason": "假出货：放进出货箱"}
+
+
+class TestTask198InventoryDay(unittest.TestCase):
+    """task-198 **日级**形态（deputy 的 198f-1..8 / A′ day13 原型）。
+
+    卡面硬要求：任何形态都**不许**出现「守卫仍说还有活」+ `stuck` 的组合；
+    背包堵住的诚实结论是 `inventory_blocked`（不假 VERIFIED、不算 hard failure），
+    有空位/能腾格时必须在同一天把熟作物收进来。
+
+    用**真 `FarmWorker` + 假桥**跑完整 `run.run()`（只 `target_days=1/max_days=1`）：
+    `FakeWorker.run_stage` 是假执行层，不经过 `harvest()` 的满包前置，测不到本卡。
+    """
+
+    RIPE_TILES = 8
+
+    def _day(self, *, rows: int, ripe: int):
+        w = FakeWorld(seeds=0, money=0, weeds=0)
+        tiles = [(60 + i, 10) for i in range(ripe)]
+        w.dirt = set(tiles)
+        w.crops = {t: {"ripe": True, "watered": True} for t in tiles}
+        inv = [{"slot": 0, "id": "Axe", "qualifiedId": "(T)Axe", "name": "Axe",
+                "stack": 1, "isTool": True},
+               {"slot": 1, "id": "Hoe", "qualifiedId": "(T)Hoe", "name": "Hoe",
+                "stack": 1, "isTool": True}]
+        while len(inv) < rows:
+            inv.append({"slot": len(inv), "id": "388", "qualifiedId": "(O)388",
+                        "name": "Wood", "stack": 99, "isTool": False})
+        w.inventory = inv[:rows]
+        run = make_run(w, max_days=1, target_days=1)
+        client = _LootClient(w)
+        # `run()` 会用工厂重建 client/worker ⇒ 只能改工厂
+        run.client_factory = lambda: client
+        run.worker_factory = lambda c: FarmWorker(c, log=lambda *_: None,
+                                                  pause=lambda *_: None)
+        run.run()
+        return run, w, client
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list[dict]:
+        return [e for e in run.entries if e["event"] == name]
+
+    def test_full_bag_with_many_ripe_ends_inventory_blocked_not_stuck(self):
+        """满包 + 8 格熟 + 腾不出 ⇒ `inventory_blocked`（**不是** `stuck`、不是 `no_work`）。"""
+        run, w, _client = self._day(rows=12, ripe=self.RIPE_TILES)
+        rep = run.days[0]
+        self.assertEqual(rep.ended_by, "inventory_blocked")
+        self.assertIn("背包满", rep.ended_reason)
+        self.assertNotIn("守卫仍说还有活", rep.ended_reason)
+        self.assertNotIn("stuck", rep.ended_by)
+        self.assertEqual(rep.failed_steps, 0, "no_slot 不算硬失败")
+        self.assertTrue(rep.checks["no_hard_failures"])
+        self.assertFalse(rep.checks["day_justified"])
+        self.assertFalse(rep.verified, "背包堵住当天不许假 VERIFIED")
+        stage = [s for s in rep.stages if s["stage"] == "harvest"][-1]
+        self.assertEqual(stage["leftover"], self.RIPE_TILES, "_leftover 仍如实")
+        self.assertEqual(stage["stopped"], "no_slot")
+        self.assertEqual(len(w.crops), self.RIPE_TILES)
+        self.assertEqual(len(self._events(run, "inventory_blocked")), 1)
+
+    def test_bag_fills_mid_day_relief_ships_harvest_and_collects_all(self):
+        """2 空格 + 8 熟 ⇒ 边收边腾格（每轮必须真腾 ≥1 格），同一天全部收进来。"""
+        run, w, client = self._day(rows=10, ripe=self.RIPE_TILES)
+        rep = run.days[0]
+        relief = self._events(run, "slot_relief")
+        self.assertGreaterEqual(len(relief), 1)
+        self.assertTrue(all(e["freed"] >= 1 for e in relief), relief)
+        self.assertTrue(all(e["freeSlots_before"] == 0 for e in relief), relief)
+        self.assertTrue(client.sold, "腾格必须真的把行从背包搬走")
+        self.assertEqual(len(w.crops), 0, "腾格后 8 格熟作物应全部收进来")
+        self.assertGreaterEqual(rep.ok_steps, self.RIPE_TILES)
+        self.assertTrue(rep.verified)
+        self.assertNotIn("inventory_blocked", rep.ended_by)
+
+    def test_one_free_slot_with_many_ripe_reliefs_then_blocks_honestly(self):
+        """1 空格 + 8 熟 ⇒ 先腾格（`freeSlots_before==1`）、收不进来的部分如实 `inventory_blocked`。"""
+        run, w, _client = self._day(rows=11, ripe=self.RIPE_TILES)
+        rep = run.days[0]
+        relief = self._events(run, "slot_relief")
+        self.assertGreaterEqual(len(relief), 1)
+        self.assertEqual(relief[0]["freeSlots_before"], 1, "低水位就要腾格，不是等 0 格")
+        self.assertEqual(rep.ended_by, "inventory_blocked")
+        self.assertEqual(rep.failed_steps, 0)
+        self.assertTrue(rep.checks["no_hard_failures"])
+        self.assertFalse(rep.verified)
+        self.assertNotIn("守卫仍说还有活", rep.ended_reason)
+        stage = [s for s in rep.stages if s["stage"] == "harvest"][-1]
+        self.assertEqual(stage["leftover"], self.RIPE_TILES - stage["ok"])
+        self.assertEqual(len(w.crops), stage["leftover"])
+
+    def test_no_form_ever_reports_guard_complaint_with_stuck(self):
+        """四种构造都不许出现「守卫仍说还有活」+ `stuck` 组合（deputy 的四条 FAIL）。"""
+        for rows in (12, 11, 10):
+            with self.subTest(rows=rows):
+                run, _w, _client = self._day(rows=rows, ripe=self.RIPE_TILES)
+                rep = run.days[0]
+                self.assertNotEqual(rep.ended_by, "stuck", rep.ended_reason)
+                self.assertNotIn("守卫仍说还有活", rep.ended_reason)
+                self.assertIn(rep.ended_by, ("inventory_blocked", "sleep"))
 
 
 if __name__ == "__main__":  # pragma: no cover

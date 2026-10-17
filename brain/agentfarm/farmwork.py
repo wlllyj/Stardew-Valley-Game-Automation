@@ -112,6 +112,15 @@ CLUMP_KINDS = ("clump", "stump", "log", "boulder", "rockPile", "greenRain")
 #: ⇒ 一格 grass 最多要 4 刀（IL 级证据见 `docs/_analyze-longrun-run1.md`）。
 MAX_CLEAR_SWINGS = 4
 
+#: 【task-198】"背包没有空格"这一类**全局阻塞**的专属 `code`（不是这一格的属性）。
+#: 真机 run A′（`logs/longrun-runA3-0736.jsonl`）里 45 条 harvest 失败全同句"背包满…先出货/整理
+#: 背包再来收"，结果被判成 `failed` ⇒ 每格试满 `MAX_TILE_ATTEMPTS` 就进 `harvest_gave_up`
+#: （59 次）⇒ `day_end.checks.no_hard_failures=false` ⇒ 一整天都不可能 VERIFIED。
+#: 它的正确归类是**环境/阻塞类**（与 `busy`/`ui_modal` 同族）：不封格、不占本日每格配额、
+#: 不计 `failed_steps`；**该由日级"腾格收敛回路"来界住**（`longrun._slot_relief()`），
+#: 腾不出格子就如实 `inventory_blocked` 收尾。
+NO_SLOT_CODE = "no_slot"
+
 #: 【task-189 / R2】收获记账的"有界确认"次数与间隔。
 #: 真机 task-184 复测：一次动作收多格、或掉进**既有同一叠**（`(O)262 +4` / `(O)178 +2`）时，
 #: 动作后**第一张观测**里背包可能还没反映出来（掉落物被玩家自动拾取有延迟），而脑侧当时
@@ -132,7 +141,9 @@ TILE_INERT_STATUSES = ("tool_ineffective", "precondition_failed")
 #:   真机触发时序很现实：run2 有两次 180s 客户端超时（Mod 还在跑长技能），期间任何新 exec 都回 busy。
 #: 这些码**全桥通用**（不止 `clear()`）：`MoveToLocationSkill`/`PlantSkill`/`StepMover` 都会回
 #: `no_save`/`ui_modal` ⇒ 分类必须按 `exc.status` 统一做，见 `_classify_status`。
-ENV_BLOCK_STATUSES = ("no_save", "ui_modal", "world_fading", "busy")
+#: 【task-198】`no_slot`（脑侧合成，见 `NO_SLOT_CODE`）也在这一族：背包满不是这一格的问题，
+#: 它同样是"现在整个环境不让动手"（先把格子腾出来才能动手）。
+ENV_BLOCK_STATUSES = ("no_save", "ui_modal", "world_fading", "busy", NO_SLOT_CODE)
 
 #: `use_tool` 回执里代表"请求发出去了、但**没拿到世界的结论**"的状态码（task-22）：
 #: `timeout` = 墙钟超时（可能一次都没挥出去）、`error` = Mod 侧异常/`ok=false` 却没给码。
@@ -467,9 +478,14 @@ class StepResult:
     #: **这一格今天已被观测证明干不动**：缺工具 / 有 feature 或 objId 挡着 / 挥了世界没变。
     #: `longrun._mark_blocked` 据此把该格记进当天的 `blocked`（同一格最多白试一次）。
     proven_inert: bool = False
-    #: **环境挡路**（`no_save`/`ui_modal`/`world_fading`，task-22）：不是"这一格干不动"
+    #: **环境挡路**（`no_save`/`ui_modal`/`world_fading`/`busy`，task-22）：不是"这一格干不动"
     #: ⇒ `longrun._mark_blocked` 不封格、`_count_attempts` **不占当天配额**（下轮还能试）。
     env_block: bool = False
+    #: 【task-198】其中的**背包满**特例（`NO_SLOT_CODE`）：它连"这一格能不能收"都还没问过，
+    #: 纯粹是"背包里没有空格"这个**全局**阻塞 ⇒ 不封格、不占每格配额、不进 `harvest_gave_up`；
+    #: 该由日级腾格回路（`longrun._slot_relief()`）界住，腾不出来就如实 `inventory_blocked` 收尾。
+    #: 与 `env_block` 是**包含关系**：`no_slot ⇒ env_block`（进 `ENV_BLOCK_STATUSES` 同一族）。
+    no_slot: bool = False
     #: **没有结论**（`timeout`/`error`/任何没见过的码，task-22）：不许封格，但**仍占配额**
     #: —— 它真烧了墙钟；持续如此就该被限流成 `capped`，当天如实 `needs_review`。
     inconclusive: bool = False
@@ -557,6 +573,8 @@ class StepResult:
             d["proven_inert"] = True
         if self.env_block:
             d["env_block"] = True
+        if self.no_slot:
+            d["no_slot"] = True
         if self.inconclusive:
             d["inconclusive"] = True
         if self.unreachable:
@@ -2324,13 +2342,19 @@ class FarmWorker:
             r.reason = (f"游戏口径不可收 ⇒ 不摘；{note}" if note else
                         "游戏口径不可收（ready != true：复收冷却 / 阶段没走完 / 枯死 / 采集作物形态 2）⇒ 不摘")
             return r
-        # 【task-181 必修 3】背包满 ⇒ 一次都不动：空槽按 `inventory[]` **行数**算
-        # （`inventoryCount` 是**容量**字段，真机腾出一格后仍读 12 ⇒ 拿它判满会永远"满"）。
+        # 【task-198】背包满 ⇒ 一次都不动。归类是**全局阻塞**（`no_slot`，进 `ENV_BLOCK_STATUSES`
+        # 同族），不是"这一格摘不下来"：run A′ 里它被记成 failed ⇒ 45 条同句失败、59 次
+        # `harvest_gave_up`、整天 `no_hard_failures=false`。所以这里同时置 `env_block`（不封格、
+        # 不吃 `harvest_gave_up`、不计 hard failure）与 `no_slot`（供日级腾格回路与账本区分）。
         free_rows, free_status = player_free_slots(player or {})
         if free_status == "ok" and free_rows <= 0:
             r.code = "failed"
+            r.status = NO_SLOT_CODE
+            r.env_block = True
+            r.no_slot = True
             r.reason = ("背包满（空槽 = `inventoryCount` 容量 − `inventory[]` 行数 = 0；"
-                        "`inventoryCount` 是容量字段，不能拿它判满）⇒ 先出货/整理背包再来收")
+                        "`inventoryCount` 是容量字段，不能拿它判满）⇒ 这是**全局阻塞**、不是这一格"
+                        "摘不下来：先出货/腾格再来收（日级腾格回路负责）")
             return r
         # 【task-68】站不到旁边 ⇒ **先看四邻能不能开路**（清掉 weeds/stone/twig/grass 再重试）；
         # 开路后仍站不到 ⇒ 被不可清障物围住记 `encircled`、清了上限还不通记 `unreachable`
