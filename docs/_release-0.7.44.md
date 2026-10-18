@@ -30,7 +30,14 @@
 
 ## §3 真机门禁（A9 前）
 
-1. **短跑 ≥1 天**（`--phase launch/wait --days 1 --size 5 --max-minutes 60 --max-days 2 --journal logs\longrun-smoke-0744.jsonl --tag smoke-0744 --capture-observe --observe-every 120 --no-crops`），在 winter 26 上应至少 **1 天 `verified=true`**（若仍无作物，浇水/收获子项记【无法判定·无作物】）。
+1. **短跑 ≥1 天**（用 0.7.42 门禁骨架 `scratch\smoke-0742.py` 四阶段；`--phase/--capture-observe/--observe-every/--no-crops` 都是它的参数，`run-longrun.py` 没有；tag=smoke-0744 ⇒ journal `logs\longrun-smoke-0744.jsonl`、pid `logs\longrun-smoke-0744.pid`）：
+   - `python scratch\smoke-0742.py --phase pre --tag smoke-0744 --expect-version 0.7.44 --no-crops`
+   - `python scratch\smoke-0742.py --phase launch --tag smoke-0744 --expect-version 0.7.44 --days 1 --size 5 --max-minutes 60 --max-days 2 --capture-observe --observe-every 120 --no-crops`
+   - 起跑成功后**立即** `python tools\run-guardian.py --tag longrun-smoke-0744 --detach`
+   - `python scratch\smoke-0742.py --phase wait --tag smoke-0744 --wait-minutes 60 --capture-observe --observe-every 120 --no-crops`
+   - `python scratch\smoke-0742.py --phase post --tag smoke-0744 --freeze-smapi --no-crops`
+
+   在 winter 26 上应至少 **1 天 `verified=true`**（若仍无作物，浇水/收获子项记【无法判定·无作物】）。
 2. **两条死循环的离线判据**：用 A8 账本当夹具，新逻辑重放后冬 7/12/18 不再出现 `work_spot_resume` 式 stuck、冬 9/14 不再出现 28–60 个 1 格阶段（作者脚本 + deputy 的独立变异都要两列）。
 3. `smoke-0742.py` 的步 3（砍树）/步 5（逐格证据）/步 8（幂等/事件）沿用 0.7.43 结论；步 5 用新账本重跑 `--only 5` 必须全部 conforming。
 4. 全绿 ⇒ A9/B9 放行。
@@ -38,8 +45,8 @@
 ## §4 A9/B9 协议（用户 2026-10-18 已授权：新起点 winter 26，全授权真机/存档）
 
 - **起点**：当前存档第 1 年 winter 26（钱 2767g，无作物）→ `python scratch\arm-start-helper.py backup --arm A9` ⇒ `logs\ab-backup\A9-start\`（四件 + MANIFEST）。
-- **A9**：0.7.44 装机后起跑，`--days 5 --size 5 --max-minutes 240 --max-days 12 --journal logs\longrun-runA9-0744.jsonl`；**冬 26/27/28 三天为热身**（winter 28 天：26→27→28 之后才是 spring 1），**尾 5 天应落在 spring**（提前达标则 spring 1–5）；解决 0.7.43 §4「冬季农务面不可判」。**A8 与 A9 是不同起点 ⇒ 两对臂不可跨对比较，证据 §1 写明「新的一对起点」。**
-- **B9**：A9 收工后 `arm-start-helper.py restore --arm A9` 还原并逐件 SHA256 核对；A9 的 `<journal>-lessons.json` **字节拷贝**为 B9 的；同 argv 起 `logs\longrun-runB9-0744.jsonl`。
+- **A9**：0.7.44 装机后起跑，`python tools\start-detached-longrun.py --journal logs\longrun-runA9-0744.jsonl --expect-version 0.7.44 --days 5 --size 5 --max-minutes 240 --max-days 12`；起跑成功立即 `python tools\run-guardian.py --tag longrun-runA9-0744 --detach`。**冬 26/27/28 三天为热身**（winter 28 天：26→27→28 之后才是 spring 1），**尾 5 天应落在 spring**（提前达标则 spring 1–5）；解决 0.7.43 §4「冬季农务面不可判」。**A8 与 A9 是不同起点 ⇒ 两对臂不可跨对比较，证据 §1 写明「新的一对起点」。**
+- **B9**：A9 收工后 `arm-start-helper.py restore --arm A9` 还原并逐件 SHA256 核对；A9 的 `logs\longrun-runA9-0744-lessons.json` **字节拷贝**为 `logs\longrun-runB9-0744-lessons.json`；同 argv 起 `logs\longrun-runB9-0744.jsonl`（guardian `--tag longrun-runB9-0744`）。
 - **判据**：`verify-run3 --days 5 --smapi` + `analyze-longrun --window 5` + `compare-runs` L0–L5 + 三检查器 + 外部证据（六串 ≥5/5、每日 ≥2 份独立观测、存档四件、优雅退出四项）。
 - **纪律**：起跑必须带 task-9 看护守护（脑进程消失 ⇒ 自动 `stop-game`）；游戏只要开着必须有脑在跑；跑完立刻优雅退。
 
