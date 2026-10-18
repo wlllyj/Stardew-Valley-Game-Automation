@@ -36,7 +36,21 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.38"   # v0.7.38：0.7.37 白名单事故 + F3 取回死锁的补救批次 —— Mod 侧
+MOD_VERSION_EXPECTED = "0.7.39"   # v0.7.39：能力覆盖与"意图对账"批次 —— Mod 侧
+                                  # ①`debug_dump` 支持 1.6 强类型资产（`trigger_actions`/`objects`/
+                                  #   `big_craftables`/`machines`，逐表 fail-closed + `type`/`error` +
+                                  #   `matchMode=value_substring`），并暴露 `knownCraftingRecipes`
+                                  #   三态（task-222）；
+                                  # ②新技能 `advance_dialogue`：**只推进非提问对话**，提问/职业选择
+                                  #   fail-closed、永不替游戏选（task-228）；
+                                  # ③新技能 `craft_item`/`place_object`/`machine` + 逐格机器状态与
+                                  #   `location.objectList`（≤64、(y,x) 排序、截断、三态）（task-210）；
+                                  # ④`FarmView.clumps` 等五类障碍计数同源补齐 + `SkillCatalog` 单一
+                                  #   数据源、C# 自检 85 断言（task-230/216）。
+                                  # 脑侧：树纳入清障 + 护栏 A/B（task-218）；意图-执行对账 + gaps 旁车
+                                  # （task-219/230）；事件受控推进守卫（task-228）。
+                                  # --- 历史 ---
+                                  # v0.7.38：0.7.37 白名单事故 + F3 取回死锁的补救批次 —— Mod 侧
                                   # ①新增 `SkillCatalog.cs` 单一数据源：`Skills.Create` 的每个 case 名
                                   #   必须登记，`BridgeHost` 的 known 判定与 `IsLongTaskSkill` 语义
                                   #   全部从这张表派生（0.7.37 装机版漏登记 7 个新技能 ⇒ 全回
