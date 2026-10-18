@@ -11984,5 +11984,191 @@ class TestTask240SeedSeasons(unittest.TestCase):
         self.assertIs(ev["seeds_metadata"], True)
 
 
+class _MixedClearWorker(FakeWorker):
+    """按 `tiles` 顺序返回手工步：前 `n_real` 格真变化，其余回 `already`（没站位/没变化）。
+
+    复刻 `brain/agentfarm/farmwork.py:2397-2400` 的"没有需要清的障碍"分支：`ok=True`、
+    `code="already"`、`stood=False`、无 `before/after` kind —— 这正是 0.7.42 冒烟里
+    9 个阶段 `ok` 比 `cleared_tiles` 多 1–3 的差额来源。
+    """
+
+    def __init__(self, world: FakeWorld, *, n_real: int, collateral: bool = False) -> None:
+        super().__init__(world, log=lambda *_: None)
+        self.n_real = n_real
+        self.collateral = collateral
+
+    def run_stage(self, stage, tiles, *, min_stamina=12.0, max_steps=200):
+        res = StageResult(stage=stage, tiles=list(tiles))
+        for i, tile in enumerate(tiles):
+            t = (int(tile[0]), int(tile[1]))
+            if i < self.n_real:
+                st = StepResult(action="clear", tile=t, ok=True, code="ok",
+                                reason="清掉了",
+                                before={"kind": "weed"},
+                                after={"kind": "none", "kind_after": "none",
+                                       "cleared": True})
+            else:
+                st = StepResult(action="clear", tile=t, ok=True, code="already",
+                                reason="本来就没障碍")
+                if self.collateral:
+                    # 开路时把这一格连带清掉的证据（`open_way` → `StepResult.opened`）
+                    st.opened = [{"neighbour": [t[0], t[1]], "kind": "weed",
+                                  "result": "ok"}]
+            res.steps.append(st)
+        return res
+
+
+class TestTask242ClearAreaEvidence(unittest.TestCase):
+    """task-242：`clear_area` 的 `ok` 必须 = 真世界变化格数，逐格证据链自解释。
+
+    根因（0.7.42 八步冒烟 `docs/_smoke-0742.md`，账本 `logs/longrun-smoke-0742.jsonl`）：
+    9 个阶段 `ok ≠ len(cleared_tiles)`（差 1–3，合计 13），形态一致 ——
+    `ok == attempted == ok_tiles == tiles == bound_basis` 而
+    `engaged == len(cleared_tiles)`。漏记路径 = `farmwork.clear()` 的"没有需要清的
+    障碍"分支（`brain/agentfarm/farmwork.py:2397-2400`）：返回 `ok=True, code="already"`，
+    但**没站位（`stood=False`）、没观测、没耗体力** ⇒ 进了 `ok`/`attempted`/`ok_tiles`，
+    却不会进 `cleared_tiles`（那里只收 `before.kind != after.kind_after` 的步）。
+    旧代码把这 13 处差额只记在进程内 `unclear_steps` 变量里、**账本无痕**。
+
+    修法（卡面选项 B：计数对齐）：`ok` 只数"真的改变了一格"的步；`clear()` 的 `already`
+    步单列 `already`/`attempted_ok`/`already_tiles`/`already_cause`（并区分"被本次开路
+    连带清掉" vs "本来就没目标"），`unclear` 也落账。阶段不变式变成
+    `ok == len(cleared_tiles)`（每个真清掉的格子一格一步）。
+    """
+
+    def _run(self, w: FakeWorld) -> LongRun:
+        run = make_run(w)
+        run.client = FakeClient(w)
+        return run
+
+    def _plot(self, tiles) -> dict:
+        return {"anchor": list(tiles[0]), "tiles": [list(t) for t in tiles],
+                "zone": "", "label": "", "size": 5}
+
+    def _world(self, coords) -> FakeWorld:
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        for t in coords:
+            w.blockers[(int(t[0]), int(t[1]))] = "weed"
+        return w
+
+    def test_already_steps_are_not_counted_as_ok(self):
+        """`already` 步（没改变任何格子）不算 ok：`ok == len(cleared_tiles)`。"""
+        coords = [(60, 10), (61, 10), (62, 10), (60, 11), (61, 11)]
+        w = self._world(coords)
+        run = self._run(w)
+        run.worker = _MixedClearWorker(w, n_real=2)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        run._step_stage("clear_area", w.obs(), self._plot(coords), rep)
+        stage = rep.stages[-1]
+        self.assertEqual(len(stage["cleared_tiles"]), 2)
+        self.assertTrue({tuple(t) for t in stage["cleared_tiles"]} <= set(coords))
+        self.assertEqual(stage["ok"], 2, "ok 只数真清掉的格子")
+        self.assertEqual(len(stage["cleared_tiles"]), stage["ok"])
+        self.assertEqual(stage["already"], 3, "差额必须落账，不许只活在进程内变量里")
+        self.assertEqual(stage["attempted_ok"], 3, "`attempted_ok` = 尝试成功但世界没变")
+        self.assertEqual(len(stage["already_tiles"]), 3)
+        self.assertEqual(stage["unclear"], 0, "already 步不是「拿不到证据」，要分开数")
+        self.assertEqual(stage["ok_tiles"], 5, "already 格仍是已达标的格（瓦片不变式不动）")
+        self.assertNotEqual(stage["stopped"], "incomplete",
+                            "already 步不构成「挥过刀却没变」，护栏 B 不该判红")
+
+    def test_every_ok_tile_is_in_cleared_tiles(self):
+        """凡真变化一格 ⇒ 必进 `cleared_tiles`（逐格证据链）。"""
+        coords = [(60, 10), (61, 10), (62, 10)]
+        w = self._world(coords)
+        run = self._run(w)
+        run.worker = _MixedClearWorker(w, n_real=3)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        run._step_stage("clear_area", w.obs(), self._plot(coords), rep)
+        stage = rep.stages[-1]
+        self.assertEqual(stage["ok"], 3)
+        self.assertEqual({tuple(t) for t in stage["cleared_tiles"]},
+                         set(coords), "每个 ok 的格都要在逐格清单里")
+        self.assertEqual(stage["already"], 0)
+        self.assertEqual(stage["unclear"], 0)
+
+    def test_guardrail_b_ignores_already_steps(self):
+        """整阶段全是 `already` ⇒ 没有"挥过刀却没变"的声明 ⇒ 不判 incomplete。"""
+        coords = [(60, 10), (61, 10)]
+        w = self._world(coords)
+        run = self._run(w)
+        run.worker = _MixedClearWorker(w, n_real=0)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        run._step_stage("clear_area", w.obs(), self._plot(coords), rep)
+        stage = rep.stages[-1]
+        self.assertEqual(stage["ok"], 0)
+        self.assertEqual(stage["cleared_tiles"], [])
+        self.assertEqual(stage["already"], 2)
+        self.assertNotEqual(stage["stopped"], "incomplete",
+                            "already 步没有改变世界，不构成护栏 B 的红")
+        self.assertEqual([e for e in run.entries if e["event"] == "stage_stop_named"], [])
+
+    def test_collateral_neighbour_clear_is_explained(self):
+        """被本次开路连带清掉的格 ⇒ `already_cause.cleared_by_neighbor`（不是"没目标"）。"""
+        coords = [(60, 10), (61, 10), (62, 10)]
+        w = self._world(coords)
+        run = self._run(w)
+        run.worker = _MixedClearWorker(w, n_real=1, collateral=True)
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        run._step_stage("clear_area", w.obs(), self._plot(coords), rep)
+        stage = rep.stages[-1]
+        self.assertEqual(stage["ok"], 1)
+        self.assertEqual(len(stage["cleared_tiles"]), 1)
+        cause = stage["already_cause"]
+        real = {tuple(t) for t in stage["cleared_tiles"]}
+        self.assertEqual(len(cause["cleared_by_neighbor"]), 2)
+        self.assertEqual(real | {tuple(t) for t in cause["cleared_by_neighbor"]},
+                         set(coords), "真清掉 1 格 + 连带清掉 2 格 = 全部目标格")
+        self.assertEqual(cause["no_target"], [])
+
+    def test_smoke_ledger_offline_fixture_all_nine_stages_conform(self):
+        """0.7.42 冒烟账本当离线夹具：9 个不等阶段重放后必须全部 conforming。
+
+        `logs/` 不在（干净检出）⇒ `skipTest`，**绝不当 PASS**。
+        """
+        ledger = Path("logs/longrun-smoke-0742.jsonl")
+        if not ledger.exists():
+            self.skipTest("0.7.42 冒烟账本不在（干净检出）⇒ skip，不许当 PASS")
+        rows = []
+        for line in ledger.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        stages = [st for r in rows if r.get("event") == "day_end"
+                  for st in (r.get("stages") or [])
+                  if st.get("stage") == "clear_area"
+                  and int(st.get("ok") or 0) != len(st.get("cleared_tiles") or [])]
+        self.assertEqual(len(stages), 9, "0.7.42 冒烟账本里应有 9 个 ok≠cleared 的阶段")
+        all_tiles = [(60 + i, 10 + j) for j in range(5) for i in range(5)]
+        for st in stages:
+            with self.subTest(ok=st.get("ok"), cleared=len(st.get("cleared_tiles") or [])):
+                ok_old = int(st.get("ok") or 0)
+                engaged = int(st.get("engaged") or 0)
+                cleared = [tuple(t) for t in (st.get("cleared_tiles") or [])]
+                # 旧账本形态自证：engaged（真的站到过旁边）= 真变化格数 ⇒ 差额全是 already 步
+                self.assertEqual(engaged, len(cleared))
+                delta = ok_old - engaged
+                self.assertGreaterEqual(delta, 1)
+                self.assertEqual(int(st.get("attempted") or 0), ok_old)
+                need = len(cleared) + delta
+                coords = all_tiles[:need]
+                w = self._world(coords)
+                run = self._run(w)
+                run.worker = _MixedClearWorker(w, n_real=len(cleared))
+                rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+                run._step_stage("clear_area", w.obs(), self._plot(coords), rep)
+                stage = rep.stages[-1]
+                self.assertEqual(stage["ok"], len(cleared),
+                                 "重放后 ok 必须 = 账本里的真变化格数（engaged）")
+                self.assertEqual(len(stage["cleared_tiles"]), stage["ok"])
+                self.assertEqual(stage["already"], delta, "旧账本差额 = already 步数")
+                self.assertEqual(stage["attempted_ok"], delta)
+                self.assertEqual(stage["unclear"], 0)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

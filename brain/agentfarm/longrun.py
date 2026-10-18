@@ -6648,6 +6648,14 @@ class LongRun:
             for s in all_steps:
                 if not (s.ok and s.tile):
                     continue
+                # 【task-242】`code=="already"` 的 ok 步**没有改变过任何一格**：
+                # `farmwork.clear()` 在"没有需要清的障碍"分支（farmwork.py:2397-2400）
+                # 直接返回，没观测、没站位、没耗体力 ⇒ 它既不是"清掉一格"，也不该被算成
+                # "拿不到 kind 证据"（后者会抑制护栏 B）。0.7.42 冒烟 9 个阶段 ok 比
+                # cleared_tiles 多 1–3、且 `engaged`/`stamina_spent` 恰好只对应真清掉的格，
+                # 就是这些 already 步。单列到 `already`/`already_tiles`，不参与 clear 对账。
+                if str(getattr(s, "code", "") or "") == "already":
+                    continue
                 before_kind = str((s.before or {}).get("kind") or "")
                 after_kind = str((s.after or {}).get("kind_after")
                                  or (s.after or {}).get("kind") or "")
@@ -6662,7 +6670,11 @@ class LongRun:
                 blocker_drop = int(b0) - int(b1)      # 只作 info（没有这个字段就是 None）
             budget_or_tool = (bool(self._budget_defer_reason("clear_area", obs))
                               or not self._tree_budget_left(obs))
-            ok_steps = [s for s in all_steps if s.ok]
+            # 【task-242】护栏 B 只看**真的动过**的 ok 步（`already` 没有改变任何格子，
+            # 不构成"挥过刀却没变"的声明；它们已单列到 `already`）。
+            # 注意：这里必须就地算，不能引用下面才定义的 `oks`（否则 UnboundLocalError）。
+            ok_steps = [s for s in all_steps
+                        if s.ok and str(getattr(s, "code", "") or "") != "already"]
             if ok_steps and not cleared_tiles and not unclear_steps and not budget_or_tool:
                 # 有成功步却一格没变 ⇒ 这个阶段**事实上没做成**：`stopped` 一律改写成
                 # `incomplete`（哪怕 runner 报了 `done`/`budget` —— 判据是逐格证据）。
@@ -6697,7 +6709,20 @@ class LongRun:
                 continue                    # 判据证明这一格今天干不动 ⇒ 不算"还有活"
             self.leftover_targets.add(tt)
         skipped = [s for s in all_steps if s.skipped]
-        oks = [s for s in all_steps if s.ok]
+        ok_all = [s for s in all_steps if s.ok]
+        # 【task-242】清障阶段的 `ok` 只数**真的改变了格子**的成功步：`code=="already"`
+        # （本来就没障碍 / 已被本次开路连带清掉）单列 `already`，不算 ok。
+        # 这样 `len(cleared_tiles) == ok` 才有可能成立（0.7.42 冒烟步 5 的 9 个阶段正是
+        # 被这些 already 步撑大了 ok）。其它阶段不动：`already` 在 till/plant/water 里
+        # 语义是"已经达标"（真成功），没有逐格 cleared 对账。
+        if task == "clear_area":
+            already_steps = [s for s in ok_all
+                             if str(getattr(s, "code", "") or "") == "already"]
+            oks = [s for s in ok_all
+                   if str(getattr(s, "code", "") or "") != "already"]
+        else:
+            already_steps = []
+            oks = ok_all
         inert = [s for s in all_steps if s.proven_inert]
         env_fail = [s for s in all_steps if s.env_block]
         inconclusive = [s for s in all_steps if s.inconclusive]
@@ -6738,7 +6763,9 @@ class LongRun:
         # 且每个"没做成"的格都要有一个**闭合集**原因码（`INTENT_REASON_CODES`），集外码由
         # analyzer 判红。这份账本**只留痕**：不改 checks、不动 `_leftover`、不做任何豁免。
         assigned_set = {tuple(t) for t in assigned}
-        ok_tiles_set = {tuple(s.tile) for s in oks if s.tile} & assigned_set
+        # 【task-242】瓦片级 ok 集合仍按**全部 ok 步**（含 `already`）算：那些格子确实已经达标，
+        # 不该掉进 unexecuted；`ok` 的**步数**则只数真清掉的（见上）。
+        ok_tiles_set = {tuple(s.tile) for s in ok_all if s.tile} & assigned_set
         bad_steps: dict[tuple[int, int], list[StepResult]] = {}
         for s in all_steps:
             if not s.tile or s.ok:
@@ -6760,9 +6787,40 @@ class LongRun:
             tool = str(getattr(steps_here[0], "tool_need", "") or "") if steps_here else ""
             reason_rows.append((key, reason, kind, tool))
         self._gaps_merge(reason_rows, rep)
+        # 【task-242】`already` 步的两种原因（逐格证据，只留痕）：
+        #   * `cleared_by_neighbor` —— 该格是被本次**开路**连带清掉的（`clear()` 的
+        #     `open_way` 清邻格，之后它自己作为目标再被走到时已空 ⇒ 回 already）；
+        #   * `no_target` —— 本来就没有需要清的障碍（观测与目标池之间的一次竞态/陈旧）。
+        neighbor_open: set[tuple[int, int]] = set()
+        for item in opens:
+            nb = item.get("neighbour")
+            if isinstance(nb, (list, tuple)) and len(nb) == 2:
+                try:
+                    neighbor_open.add((int(nb[0]), int(nb[1])))
+                except (TypeError, ValueError):
+                    continue
+        already_cause: dict[str, list[list[int]]] = {"cleared_by_neighbor": [], "no_target": []}
+        for s in already_steps:
+            if not s.tile:
+                continue
+            key = (int(s.tile[0]), int(s.tile[1]))
+            bucket = "cleared_by_neighbor" if key in neighbor_open else "no_target"
+            already_cause[bucket].append([key[0], key[1]])
         rep.stages.append({
             "stage": task, "tiles": 0 if not all_steps else len({s.tile for s in all_steps if s.tile}),
             "ok": len(oks), "skipped": len(skipped), "failed": len(failed),
+            # 【task-242】清障账面的第三类"成功"：没改变格子、也没消耗体力的 `already` 步。
+            # 不计入 `ok`；这样 `ok == len(cleared_tiles)`（每个真清掉的格子一格一步）。
+            # 口径声明（task-242 根因）：`ok` 从"尝试成功数"改成"**真世界变化数**"；
+            # `attempted_ok` = 尝试成功但世界没变（= already 步，deputy 的账本形态
+            # `ok == attempted == bound_basis`、`engaged == len(cleared_tiles)` 即此）。
+            "already": len(already_steps),
+            "attempted_ok": len(already_steps),
+            "already_tiles": sorted([list(t) for t in
+                                     {tuple(s.tile) for s in already_steps if s.tile}]),
+            "already_cause": already_cause,
+            # `unclear` = ok 步但拿不到 kind 证据（旧代码只在本进程里数、账本无痕 ⇒ 差额不可解释）
+            "unclear": unclear_steps,
             "failed_any": len(failed_any),
             "proven_inert": len(inert),
             "env_block": len(env_fail), "inconclusive": len(inconclusive),
