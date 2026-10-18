@@ -30,6 +30,10 @@
   python scratch\\smoke-0739.py --phase post              # 步骤 5-7
   python scratch\\smoke-0739.py --phase all --wait-minutes 40   # 一次跑完（分阶段之间不重启游戏）
 
+分阶段跑时结果**按步骤号合并**进 --json（`phases_run` 记录已跑过的 phase），不会互相覆盖；
+`--only` 只跑相关 phase（不会因为 `--only 1` 就把 step4 真起跑起来）。
+退出码只反映**本次 phase** 的结果，累计状态看打印的"累计"表或 JSON 的 `results_all_steps`。
+
 退出码：0 = 全部 PASS；10 = 有 FAIL；11 = 环境阻塞（版本/桥/前置文件不满足）；12 = 证据缺失（无法判定）。
 结果 JSON：`scratch/smoke-0739.json`（每次覆盖，含每步 verdict + 原文摘录）。
 """
@@ -521,6 +525,18 @@ def main() -> int:
     want = {int(x) for x in args.only.split(",") if x.strip()} if args.only else None
     results: list[dict] = []
     blocked_env = False
+    # --only 时不跑无关 phase（否则 `--only 1` 也会把 step4 真起跑起来）
+    if want is not None:
+        phases: set[str] = set()
+        if want & {1, 2, 3}:
+            phases.add("pre")
+        if 4 in want:
+            phases |= {"launch", "wait"}
+        if want & {5, 6, 7}:
+            phases.add("post")
+    else:
+        phases = {"pre", "launch", "wait", "post"} if args.phase == "all" else {args.phase}
+    print(f"[plan] phases={sorted(phases)} only={sorted(want) if want else '全部'}")
 
     def run_pre() -> None:
         nonlocal blocked_env
@@ -540,20 +556,18 @@ def main() -> int:
         results.extend([r for r in recs if want is None or r["step"] in want])
 
     def run_post() -> None:
-        recs = [step5(step_record(5, PLAN[4][1])), step6(step_record(6, PLAN[5][1])), step7(step_record(7, PLAN[6][1]))]
+        recs = [step5(step_record(5, PLAN[4][1])), step6(step_record(6, PLAN[5][1]), args),
+                step7(step_record(7, PLAN[6][1]))]
         results.extend([r for r in recs if want is None or r["step"] in want])
 
-    if args.phase in ("pre", "all"):
+    if "pre" in phases:
         run_pre()
-    if not blocked_env and args.phase in ("launch", "all"):
+    if not blocked_env and "launch" in phases:
         results.append(step4_launch(step_record(4, PLAN[3][1]), args))
-    if not blocked_env and args.phase in ("wait", "all"):
+    if not blocked_env and "wait" in phases:
         results.append(step4_wait(step_record(4, PLAN[3][1]), args))
-    if not blocked_env and args.phase in ("post", "all"):
+    if not blocked_env and "post" in phases:
         run_post()
-
-    if want is not None:
-        results = [r for r in results if r["step"] in want]
 
     print("\n" + "=" * 78)
     for r in results:
@@ -562,13 +576,38 @@ def main() -> int:
             print(f"          {r['reason']}")
     print("=" * 78)
 
+    # 分阶段跑时**合并**已有结果（否则 --phase pre→launch→post 会互相覆盖）
+    out_path = Path(args.json_out)
+    merged: dict[int, dict] = {}
+    phases_run: list[str] = []
+    if out_path.exists():
+        try:
+            old = json.loads(out_path.read_text(encoding="utf-8"))
+            for r in (old.get("results_all_steps") or old.get("results") or []):
+                merged[int(r["step"])] = r
+            phases_run = [str(x) for x in (old.get("phases_run") or ([old["phase"]] if old.get("phase") else []))]
+        except Exception as exc:  # noqa: BLE001
+            print(f"[warn] 旧结果读取失败（本次覆盖写）：{type(exc).__name__}: {exc}")
+    for r in results:
+        merged[int(r["step"])] = r
+    phases_run.append(args.phase)
+
+    print("\n=== 累计（含之前 phase 已跑的步骤）===")
+    for step in range(1, 8):
+        r = merged.get(step)
+        print(f"  步骤 {step}: " + ("未执行" if r is None else f"[{r['verdict']}] {r['name'][:52]}"))
+
     payload = {"generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "expect_version": args.expect_version,
-               "journal": str(SMOKE_JOURNAL), "phase": args.phase, "env": env, "results": results}
+               "journal": str(SMOKE_JOURNAL), "phase": args.phase, "phases_run": phases_run,
+               "env": env, "results": results,
+               "results_all_steps": [merged[k] for k in sorted(merged)]}
     try:
-        Path(args.json_out).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"结果已写 {args.json_out}")
+        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"结果已写 {out_path}（本次 {len(results)} 条 / 累计 {len(merged)} 条 / phases_run={phases_run}）")
     except OSError as exc:
         print(f"[warn] 结果写盘失败：{exc}")
+
+    # 退出码只反映**本次 phase** 的结果；累计状态看上面的表与 JSON
 
     if blocked_env:
         return 11
