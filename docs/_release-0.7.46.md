@@ -25,7 +25,8 @@
 
 | 卡 | 任务 | 优先级 | 提交 | 读数 |
 |---|---|---|---|---|
-| A | task-25 背包升级经济动作（12→24，Pierre 2000g）。**Plan A（按货架买）已否证** ⇒ 改对话式购买：`interact` Pierre → 按响应文本 `answerDialogue(Response)` → 差分判据：钱−2000 且 inventoryCount 12→24 | P0 | 待填 | 待填（先等 task-32 真机只读对话探针） |
+| A-前置 | task-33 Mod 新增 `talk` 原语：按 NPC 名找 `characters` → 相邻校验（否则回 `not_adjacent`+`npcTile`）→ 调游戏 `NPC.checkAction(Farmer,GameLocation)`；禁合成键鼠/禁改 Money/Items/MaxItems | P0 | 待填 | 待填（真机探针 task-34 验收：talk 能否开 Pierre 背包对话） |
+| A | task-25 背包升级经济动作（12→24，Pierre 2000g）。**Plan A（按货架买）已否证**；真机探针又证**无 talk 原语** ⇒ 分两步：task-33 加 `talk` + 本卡脑侧 `talk Pierre` → observe `ui.dialogueResponses` → `dismiss_modal{answerText:"Purchase"}` → 差分判据：钱−2000 且 inventoryCount 12→24；含 Town 事件卡死自愈（≤90s + load_save(force) 兜底） | P0 | 待填 | 待填（task-34 探针通过后实现） |
 | B | task-26 冬27 形态：`resume_walks` 先加后走（失败步行烧成功预算）+ `_resume_exhausted` 无条件宣称无目标 ⇒ 改为 attempts/walks 拆分 + `claim_exhausted=(exec==0 and malformed==0)`，假则写 `resume_budget_exhausted:`；未放宽 `is_justified_end` | P0 | `002afdb`（3 files +476/−28） | 定向 `TestTask26ResumeBudget` Ran 6 OK；全量 Ran 1354 OK；变异 3/3 被杀；Lead 亲跑 6/6 OK |
 | C | task-27 挡死格证据口径收口：目标池前置过滤（`_known_enclosed`/`_prefilter_known_enclosed`）+ 执行层 `_observed_foothold` 判"本该可达"、无落脚点证据归 encircled；判死格仍进 assigned/assigned_undone（不洗成没活）；bound 公式与 20% 未动；附带 `pending_executable_tiles[:8]`/`pending_stalled_tiles[:8]` | P1 | `acf2f6c`（5 files +628/−24）+ `1800ef1`（3 files +70/−1） | 定向 `TestTask27EnclosedBatch` Ran 9 OK（总 195 OK）；全量 Ran 1363 OK；变异 8/8 被杀（worktree+冻结 HEAD 双跑）；Lead 核公式与 `:9811` 未动、测试 195 OK |
 | D | task-28 售材白名单收紧（建材/锭类全部移出）+ inventory_blocked 证据门槛 + 满包清障有界（loot_lost_steps ≤ 常量，留痕） | P1 | 待填 | 待填 |
@@ -63,11 +64,12 @@
 
 ## 5. 已知限制 / 风险
 
-1. 背包升级**不在 SeedShop 货架**（真机只读探针实测 20 条全表无 Backpack/Deluxe Backpack，见 §7）；机制是 Pierre 对话式购买，入口是否可自动化**尚未真机确认**（task-32 探针）。若对话入口也取不到 ⇒ 卡 A 停、Plan B（木箱存储）由 Lead 另裁。
+1. 背包升级**不在 SeedShop 货架**（真机只读探针实测 20 条全表无 Backpack/Deluxe Backpack，见 §7.1）；机制是 Pierre 对话式购买已由探针定位（§7.3：DB 级证据 `NPC.checkAction` + DLL 对话键 `SeedShop_BuyBackpack_*`/`Purchase`），但**现有技能无 talk 原语**（task-32 六问已试 6 条通道全败）⇒ 卡 A 拆成 task-33（Mod talk）+ task-25（脑侧购买）。若 task-34 探针证 talk 也打不开对话 ⇒ 卡 A 停、Plan B（木箱存储/接受 12 格 + 证据门槛）由 Lead 另裁。
 2. 建材/锭类移出白名单后可腾格项变少 ⇒ 满包时更容易诚实收工；结构性解法是背包升级（卡 A），不是放宽白名单。
 3. 冬26 40 格（263−223）账本无坐标 ⇒【无法判定】，不参与任何 PASS 结论。
 4. 0.7.45 的 `stage_midway_leftover` 遮蔽形态仍有（8 条/1 天），只 info。
 5. 春季农务腿（crops/watering/harvest）仍未真机验证；smoke 用 `--no-crops`。
+6. **Town 事件 `15389722` 非确定卡死（真机 2/3 次，task-32 探针）**：`eventUp=true / activeMenu=null / isModal=true / canMove=false / worldAdvancing=false / clock 冻结 610`；`advance_dialogue`→`[no_dialogue]`、`dismiss_modal` no-op、`move_to*`→`[ui_modal]`、店门 interact 全 `no_action`；唯一恢复 = `load_save(force=True)`。农务长跑不进 Town 时无影响；任何进城动作（卡 A）必须带事件自愈超时兜底。
 
 ## 6. 冻结记录（待填）
 
@@ -85,6 +87,25 @@
   - 维基：[Backpack](https://stardewvalleywiki.com/Backpack)（Large Pack 2000g / Deluxe 10000g）；[1.6.16 迁移页](https://wiki.stardewvalley.net/mediawiki/index.php?title=Modding:Migrate_to_Stardew_Valley_1.6.16) 把 `Strings/Locations: SeedShop_BuyBackpack_Response2000/Response10000/ResponseNo` 改名 `GenericPurchase_*`；[1.6 迁移页](https://wiki.stardewvalley.net/mediawiki/index.php?title=Modding:Migrate_to_Stardew_Valley_1.6) `Utility.TryOpenShopMenu`/`GetShopStock`。
   - `Content/Data/Shops.xnb` 离线解压失败（非标准 LZ4/raw-deflate）⇒ 走真机取证，不再手写解压器。
 - 结论：背包升级是**对话式购买**，不是货架条目 ⇒ 卡 A 改「`interact` Pierre → 按响应文本 `answerDialogue(Response)` → 观测差分（钱 −2000 且 `inventoryCount` 12→24）」，先等 task-32 只读对话探针确认入口与响应文本。
+
+### 7.3 task-32 结论 + DB 级证据 → 卡 A 拆成「Mod talk 原语 + 脑侧购买」
+
+- 真机只读探针（machine-runner `9d97d5d`/`ad65c03`，`docs/_probe-backpack-dialogue.md`）六问：
+  1. 进 SeedShop 不自动弹背包升级对话（触发的是世界事件 `3102768` 店内过场，推进 4 批结束）；
+  2. **interact Pierre 未取得**：`observe`/`WorldSnapshot` 只给 `characters` 数量（`Contracts.cs:372`、`WorldSnapshot.cs:684`）；**技能表无 talk**（`SkillCatalog.cs:32-35` Executable 无、`:42-45` Planned 未实现）；`interact` 走 `GameLocation.checkAction`（`Skills.cs:271-370`）⇒ 柜台 10 格全 `[no_action]`；
+  3. bridge **能**读 `ui.dialogueIsQuestion` + `ui.dialogueResponses`（`Contracts.cs:1042`）；
+  4. 已试 6 条通道全败：货架 buy 20 条 / 进店事件推进 / 柜台 interact×10 / 店内寻路 / 店门 interact×4 / 截图核对（PrintWindow 黑帧样本已保留）；
+  5. `dismiss_modal`（`AnswerRules.Pick`/`DismissDialogueExplicit` 走 `GameLocation.answerDialogue`）只能「答问」，不能「开对话」。
+- Lead 离线 DB 级证据（`logs/_probe_sdvmeta/`，SDV 1.6.15.24356，未动游戏）：
+  - `StardewValley.NPC` 有 `checkAction(Farmer who, GameLocation l) -> Boolean`；`StardewValley.GameLocation` 有 `getCharacterFromName(String) -> NPC`、`isCharacterAtTile(Vector2) -> NPC`、`characters: NetCollection`；`Game1.pressActionButton(...)` 存在。
+  - `Stardew Valley.dll` 的 #US 用户字符串堆（UTF-16，offset `0x48b8d8`–`0x48bbc0`）实锤背包对话键：`Strings\Locations:SeedShop_BuyBackpack_Response2000`、`…_Response10000`、`…_ResponseNo`、`…_Question24`、`…_Question36`、`Backpack`，以及响应键 **`Purchase`**（与 `buyJojaCola` 同类用法）⇒ 该对话由游戏本体代码创建、扣钱、调 `Farmer.increaseBackpackSize`。
+  - 另在 `0x4819fa`/`0x481a18` 见 `BackpackTip`/`pierreBackpack` 字符串（Game1 侧提示/一次性标记），不影响入口。
+- 裁决：卡 A 拆两步 —— **task-33**（Mod 新原语 `talk`：找 NPC → 相邻校验 → `npc.checkAction(Game1.player, Game1.currentLocation)`，禁合成键鼠）→ **task-34**（真机只读探针：`talk Pierre` 是否开出背包提问、响应原文是否含 `Purchase`，永不应答购买）→ **task-25**（脑侧 `dismiss_modal{answerText:"Purchase"}` + 观测差分）。
+
+### 7.4 事故风险：Town 事件 `15389722` 非确定卡死（产品缺陷线索）
+
+- task-32 探针 3 次进 Town：1 成功 / 2 卡死；卡死读数 `eventUp=true, eventId=15389722, activeMenu=null, isModal=true, canMove=false, worldAdvancing=false`、clock 冻结 610；`advance_dialogue`→`[no_dialogue]`、`dismiss_modal` no-op、`move_to*`→`[ui_modal]`、店门 interact 全 `no_action`；**唯一恢复 = `load_save(force=True)`**。成功样本：错误推进到提问态后 `dismiss_modal()` 无参选否（`answerDialogue("1")`）→ 1.5s 后事件结束、控制恢复。
+- 影响面：农务长跑（A9/B9）不进 Town ⇒ 不触发；任何进城动作（卡 A 买背包）必须带「事件态持续 + 无 worldAdvancing ⇒ 记 `event_hang` + load_save(force) 兜底 / 当日诚实收工」的自愈逻辑（已写进 task-25 卡面）。长期：事件态识别与自愈应单独立卡（backlog）。
 
 ### 7.2 事故：`mod/AgentFarm.Bridge/bin/Release` 被 WIP 构建污染
 
