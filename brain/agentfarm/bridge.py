@@ -36,7 +36,23 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.46"   # v0.7.46：A9 门禁批——真机冒烟（0.7.45 smoke）暴露的四形态 + 背包升级入口
+MOD_VERSION_EXPECTED = "0.7.47"   # v0.7.47：A9 门禁批快修——背包升级对话购买默认关闭（入口未取证，opt-in）
+                                  # ①`backpack_upgrade_enabled` 默认 False：不发任何 goto SeedShop /
+                                  #   talk / buy 请求，只留只读 `buy{status:skipped,code:disabled}` 与
+                                  #   `day_end.backpack_upgrade_skip="disabled"`，不写 checks、不加 notes；
+                                  # ②显式开启：`run-longrun.py --enable-backpack-upgrade` 或
+                                  #   `AGENTFARM_ENABLE_BACKPACK_UPGRADE=1/true/yes/on`；开启后与 0.7.46 一致
+                                  #   （gate capacity==12 且 money>=2000 / 每天 ≤2 次失败 / ≤90s /
+                                  #   钱−2000 且容量 12→24 双差分）；
+                                  # ③关闭原因（task-34 真机探针 4524665）：进 SeedShop 触发过场事件
+                                  #   3102768（先清 26 次 advance），相邻 talk Pierre 只回
+                                  #   activeMenuText="Sigh..."（非提问、无选项）；SeedShop 货架 20 条无背包
+                                  #   条目；Town 事件 15389722 仍 5 进 4 卡死（唯一恢复 load_save(force)）
+                                  #   ⇒ 对话入口【无法判定】，机制确认后再开（并入 task-14 升级路径评估）；
+                                  # ④本批无 Mod 代码变更：dll 与 0.7.46 逐字节相同（293888B/`C9B3BD6C…`）；
+                                  # checks 10 键语义与 `no_unmet_stages`/护栏 B 公式不变。
+                                  # --- 历史 ---
+                                  # v0.7.46：A9 门禁批——真机冒烟（0.7.45 smoke）暴露的四形态 + 背包升级入口
                                   # ①售材纪律（task-28）：`SURPLUS_MATERIAL_IDS` 收窄为 {92 Sap,766 Slime}，
                                   #   建材/锭类（388 Wood/390 Stone/330 Clay/771 Fiber/382 Coal/378 Copper/
                                   #   380 Iron/384 Gold/386 Iridium/909 Radioactive）永不卖；作物/晶石仍可卖；

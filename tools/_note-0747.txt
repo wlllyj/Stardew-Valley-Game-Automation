@@ -1,0 +1,6 @@
+v0.7.47（2026-10-18）— A9 门禁批快修：背包升级对话购买默认关闭（入口未取证）
+1. 背包升级（task-25）**默认关闭**：`backpack_upgrade_enabled=False` 时不发任何 goto SeedShop / talk / buy 请求，只留只读 `buy{status:skipped,code:disabled}` 与 `day_end.backpack_upgrade_skip="disabled"`，不写 checks。
+2. 显式开启：`tools/run-longrun.py --enable-backpack-upgrade`（或 `AGENTFARM_ENABLE_BACKPACK_UPGRADE=1/true/yes/on`）；开启后行为与 0.7.46 一致（gate capacity==12 且 money>=2000 / 每天 ≤2 次失败 / ≤90s / 钱−2000 且容量 12→24 双差分）。
+3. 关闭原因（task-34 真机探针 4524665）：进 SeedShop 触发过场事件 3102768（先清 26 次 advance），相邻 `talk Pierre` 只回 `activeMenuText="Sigh..."`、非提问、无选项；SeedShop 货架 20 条无背包条目；Town 事件 15389722 仍 5 进 4 卡死（唯一恢复 load_save(force)）⇒ 对话入口【无法判定】，等机制确认后再启（task-14 升级路径评估一并做）。
+4. 本批无 Mod 代码变更：dll 与 0.7.46 逐字节相同（293888B / C9B3BD6C…），manifest 版本 bump 到 0.7.47。
+5. 冻结前置（必须全过）：check-release 六项全绿；deploy 前核 bin\Release dll 哈希 == 冻结产物；preflight --expect 0.7.47 ✅；冒烟门禁 smoke-0746 六条（≥1 天 VERIFIED、0 条 `stuck:`、0 笔禁售卖单、inventory_blocked 证据门槛、冬27 exec 归零、落盘六串配对）；A9 判读 already/attempted_ok 与 ok 双列。
