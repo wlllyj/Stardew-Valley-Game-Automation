@@ -25,11 +25,11 @@
 |---|---|---|---|
 | 1 | `debug_dump crafting_recipes/Furnace` | **PASS** | `matchedCount=1`、无 `unknown_skill` |
 | 2 | `debug_dump trigger_actions` | **PASS** | 可读、无 `InvalidCastException` |
-| 3 | 单技能砍树 `use_tool(axe)` | **FAIL（前置不成立）** | 首跑玩家在 (64,15)、目标 (39,14) 相距 ~25 格 ⇒ 空挥 6 次；已按 Lead 裁 (A) 改成先 `move_to(邻格)` 再「只发一次」，**待下一轮 bring-up `--only 3` 补跑** |
+| 3 | 单技能砍树 `use_tool(axe)` | **FAIL（到位后仍 `tool_ineffective`，见 §4.4）** | 首跑：相距 ~25 格空挥（前置不成立）；(A) 重测：`move_to` 成功到 `(39,15)`，到位后单发 `use_tool(axe)` 仍 `tileChanged=false`、树仍 `tree` ⇒ 按 Lead 口径记 FAIL，并附"单次挥砍砍不倒树"的机理疑问待裁 |
 | 4 | 1 日长跑 ⇒ intent_coverage + gaps | **PASS** | `finish` 出现、`intent_coverage[]` 8 条/天、`scripts`→`logs\longrun-smoke-0739-gaps.json` 已生成 |
 | 5 | `clear_area` 逐格判据活 | **PASS（修取证路径后）** | `day_end.stages[]` 里 `clear_area tiles=2 ok=1` 且 `cleared_tiles` 1 条；首版只看 `outcome` 事件 ⇒ 误判"无法判定" |
 | 6 | 跨日落盘六串 6/6 | **PASS** | `NewDay/before save/Save called/Save task/completed/after save = 3/3/3/3/3/3`（排除插件描述行 1 条） |
-| 7 | analyzer §8 无红 + verify §8 只 info | **FAIL（部分）** | 头部对账计数**干净**（0 步且无原因码 **0** 条、计划无对账 **0** 条）；但 analyzer 红清单含 **`missed:intent_no_target_evidence:ship`**（一条 ship 意图没有目标证据）⇒ 待 Lead 裁是否算 §8 阻断 |
+| 7 | analyzer §8 无红 + verify §8 只 info | **PASS（带 1 条已立案缺陷）** | Lead m03892 裁定：**§8 分工成立**（verify-run3 侧 0 条把 `intent_coverage` 当 problem）；analyzer 红 33 条中 **1 条为真 §8 违规**（`missed:intent_no_target_evidence:ship`：裸 `no_target` 无 `evidence.stage_tiles_empty`，违反 §8.2b「证据不可用 ⇒ 必须降级 `unknown_evidence`」）⇒ 已立案 **task-233**；其余为日级未达标（不是 §8 红） |
 
 ## §3 步 1 / 步 2 原文要点
 
@@ -44,6 +44,8 @@
    世界确实未变 ⇒ 这条 FAIL 只作**"前置不成立"的证据**留档，**不能**当"单技能砍树坏"的结论。
 2. **按 Lead 裁 (A) 改成**：挑「四邻有可站格」的 `kind=="tree"` ⇒ `move_to(邻格, timeout_ms=30000)`（行走单独计入 `evidence.walk`，**不并入单技能结论**）⇒ 到位后重新 observe 取 before（记 `worldSeq_after_walk` / `player_after_walk`）⇒ **只发一次** `use_tool(axe)` ⇒ 比 `kind`（`tree→stump`/消失 = PASS）+ `worldSeq`；走不到邻格判【无法判定】不判 FAIL。代码已改好（`scratch/smoke-0739.py`），**未在长跑期间补跑**（single-writer：长跑在驱世界，不允许插一手）。
 3. **骨架自己的 int/float bug（被 dry-run 拦下）**：起跑器 `--max-minutes` 是 `int`，骨架首版传了 `40.0` ⇒ 起跑器 `--dry-run` 直接 `invalid int value: '40.0'`、rc=2。已改 `str(int(...))` 后重跑通过。**这条正好证明 dry-run 四要素校验有效**（把参数错误挡在起跑之前，而不是浪费一次真跑）。
+4. **(A) 重测读数（2026-10-18 11:43 bring-up 窗口；起点 = 秋 26 日 06:00 / Farm(64,15) / 体力 270 / 钱 1977g，0.7.39 指纹不变）**：走位前置已修好 —— 窗口内 `kind=="tree"` **130 格**、其中 **83 格**有四邻可站格；选中 `(39,14)`、邻格 `(39,15)`；`move_to` **ok 7544ms**（`worldSeq 16→48`），`player_after_walk=[39,15]`；随后**只发一次** `use_tool(axe)` ⇒ 仍 `tool_ineffective`（内部 6 次重试、`UsingTool=True`）、`tileChanged=false`、`readyCrops 34→34`、`inventoryGrew=false`、`kind` 仍是 `tree`。**两条读数都留档：①"够不着"的 FAIL（前置不成立）②"到位后单发无效"的 FAIL（按 Lead 口径 = 真 FAIL）**。
+   **但有一条机理疑问必须写清（待 Lead 裁）**：SDV 的树要**多次挥砍**才倒（通常 ~10 下）；`use_tool` 一次内部重试 6 下仍可能不够 ⇒ "one `use_tool` ⇒ tree→stump"这个判据对树可能过严。若 Lead 认可，步 3 应改成：**有界连续 `use_tool`（最多 N 次、记次数）直到 `kind` 变 `stump`/消失**，或改成"树格状态有变化（`kind`/`shake`/体力消耗）"判据。本次因卡面要求"只发一次"**没有继续挥**。
 
 ## §5 步 4 读数（1 日长跑）
 
@@ -81,11 +83,12 @@
 - 退出后四项核对：**进程 0** / `bridge.json` **已删** / 17890 只剩 **2 条 TIME_WAIT**（无 LISTENING）/ **存档四条逐字未变**（见 §1）。
 - SMAPI 窗口**等退出后**复制并校验 `BYTE_IDENTICAL=True`（0.7.35 那次留下的"源被占用不能做字节一致"缺口，这次按 Lead 建议补齐）。
 - 没有 `load_save`、没有 craft/place/buy/sell、没有对事件做 dismiss；步 3 在长跑期间**未**补跑（single-writer）。
+- **第二次 bring-up（`--only 3` 重测）同样收尾**：`stop-game.py` rc=0（原 pids `[24872]`）⇒ 进程 0 / `bridge.json` 已删 / 17890 仅 2×TIME_WAIT / 存档四条逐字未变（`4504729 B / 11:38:26`、`SaveGameInfo 31022 / 11:38:26`、`_old 4487494 / 11:35:42`、`info_old 30999 / 11:35:42`）；本次窗口内**没有跨日、没有落盘**。
 
 ## §10 结论与待办
 
-1. **管道结论：步 1、2、4、5、6 PASS；步 3 因测试前置不成立而 FAIL（已按 (A) 改好，待下一轮 bring-up `--only 3` 补跑）；步 7 部分 FAIL（§8 有一条 `missed:intent_no_target_evidence:ship`）**。
-2. **步 3 补跑计划（Lead 已批准）**：Lead 做 `deploy-mod --no-quit` + preflight（重开 = 秋 23 日清晨存档，树还在）⇒ 我只跑 `--only 3` ⇒ 立刻再退游戏。
+1. **管道结论（Lead m03892 裁定后）：步 1、2、4、5、6、7 PASS；步 3 FAIL（(A) 重测到位后仍 `tool_ineffective`，附"单次挥砍砍不倒树"的机理疑问待裁）**。步 7 的 1 条 §8 红已立案 **task-233**，其余红为日级未达标；另有本次暴露的 `inventory_blocked`/`slot_relief freed=0` 已立案 **task-232**。
+2. **步 3 补跑已完成**（见 §4.4：`move_to` 前置修好、到位后单发仍无效）。**待 Lead 裁**：是否把步 3 改成"有界连续挥砍/树格状态变化"判据后再测一轮（本次严格按卡面"只发一次"，没有多挥）。
 3. **步 7 待裁**：`missed:intent_no_target_evidence:ship` 是"ship 意图没有目标证据"—— 本次 `slot_relief` 腾格 3 轮 `freed=0`（没有可出货叠），是否该把这条当 §8 阻断，请 Lead 定。**它不改变"头部对账计数干净"这个事实**。
 4. 本报告**不作为验收/成绩证据**（1 日跑 0 VERIFIED），只作 0.7.39 管道冒烟。
 
