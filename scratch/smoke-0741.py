@@ -64,6 +64,9 @@ SIX = ("newday", "before_save", "save_called", "save_task", "completed", "after_
 
 EXPECT_VERSION = "0.7.41"
 L16_RULE = "有 `[HH:MM:SS LEVEL CHANNEL]` 前缀 且 不含 ` by AgentFarm ` / `| v0.`"
+# 结构性限制开关（Lead m04309）：冬季第 1 天农场 0 作物 ⇒ `harvest ok>0` 物理上不可能。
+# 由 main() 按 --no-crops 置位；只影响 `_harvest_ok_check` 的判法（全 0 ⇒ 无法判定·无作物，不判 FAIL）。
+NO_CROPS = False
 
 
 def sha256_file(path: Path) -> str:
@@ -590,7 +593,11 @@ def _slot_relief_check(recs: list[dict]) -> dict:
 
 
 def _harvest_ok_check(recs: list[dict]) -> dict:
-    """task-237 验收面：至少一天 `harvest` 的 ok>0（从 day_end.intent_coverage 取）。"""
+    """task-237 验收面：至少一天 `harvest` 的 ok>0（从 day_end.intent_coverage 取）。
+
+    结构性限制（Lead m04309）：冬季第 1 天农场 0 作物 ⇒ `harvest ok>0` 物理上不可能；
+    此时（`--no-crops`）全 0 记【无法判定·无作物】，**不判 FAIL**（不许为了 FAIL 而假装有作物）。
+    """
     per_day: dict[str, int | None] = {}
     for r in recs:
         if r.get("event") != "day_end":
@@ -611,11 +618,19 @@ def _harvest_ok_check(recs: list[dict]) -> dict:
                 ok = int(m.group(1)) if m else None
             per_day[day] = ok if per_day.get(day) is None else max(per_day.get(day) or 0, ok or 0)
     if not per_day:
+        if NO_CROPS:
+            return {"per_day": {}, "status": "无法判定",
+                    "reason": ("无法判定·无作物（--no-crops：冬季第 1 天农场 crops==0，"
+                               "`day_end.intent_coverage` 里根本没有 harvest 条目 ⇒ 该子项无法判定，不判 FAIL）")}
         return {"per_day": {}, "status": "无法判定",
                 "reason": "day_end.intent_coverage 里找不到 harvest 记录 ⇒ 缺失≠通过"}
     best = max((v or 0) for v in per_day.values())
     if best > 0:
         return {"per_day": per_day, "status": "PASS", "reason": f"至少一天 harvest ok>0（最大值 {best}）"}
+    if NO_CROPS:
+        return {"per_day": per_day, "status": "无法判定",
+                "reason": ("无法判定·无作物（--no-crops：preflight baseline farm.crops==0，冬季第 1 天没有作物可收 ⇒ "
+                           f"harvest ok>0 物理上不可能，不判 FAIL；读数 {per_day}）")}
     return {"per_day": per_day, "status": "FAIL", "reason": f"所有天的 harvest ok 都 = 0：{per_day}"}
 
 
@@ -786,6 +801,9 @@ def main() -> int:
     ap.add_argument("--wait-minutes", type=float, default=40.0)
     # 步 4 长跑参数（Lead m04100 口径：--days 2 —— 要跨 2 次日切、验证"跑尾声关框 ⇒ 末次也落盘"）
     ap.add_argument("--days", type=int, default=2)
+    ap.add_argument("--no-crops", dest="no_crops", action="store_true",
+                    help="结构性限制（Lead m04309）：baseline 农场 0 作物（冬季第 1 天）⇒ "
+                         "`harvest ok>0` 物理上不可能，该子项记【无法判定·无作物】而不是 FAIL")
     ap.add_argument("--size", type=int, default=5)
     ap.add_argument("--max-minutes", type=int, default=40)
     ap.add_argument("--max-days", type=int, default=3)
@@ -794,6 +812,8 @@ def main() -> int:
 
     SMOKE_JOURNAL = Path(args.journal)
     SMOKE_GAPS = SMOKE_JOURNAL.with_name(SMOKE_JOURNAL.stem + "-gaps.json")
+    global NO_CROPS
+    NO_CROPS = bool(args.no_crops)
 
     env = env_check(args.expect_version)
     if args.dry_run:
