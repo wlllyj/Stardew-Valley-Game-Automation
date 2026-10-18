@@ -224,6 +224,7 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -1123,6 +1124,318 @@ def is_settleable(item):
     """这条 finding 是否属于"瞬间态 class-1"（可能被同日结清降级）。"""
     subject = str((item or {}).get("subject") or "")
     return any(subject.startswith(prefix) for prefix in SETTLED_SUBJECT_PREFIXES)
+
+
+# ---------------------------------------------------------------------------
+# 【task-220】§8 意图-执行对账（`docs/_run10-criteria.md` §8；brain 侧 task-219 = `fc147a7`）
+#
+# 数据形状（以 brain 实现为准，`brain/agentfarm/longrun.py:1195-1250`、`:1333-1349`）：
+#   * `decision.plans[]` = 每个意图的计划（`intent_id/task/area_hint/source/boundary/at`）；
+#   * `day_end.intent_coverage[]` = 当天每个意图的执行对账
+#     （`intent_id/task/area_hint/area/source/boundary/requested_tiles/ok_tiles/failed_tiles/
+#      unexecuted_tiles/executed_steps/reasons/actionless/reasons_are_intent_level[/bad_reasons]`）。
+# **没有新增 journal 事件名**（卡面 §8.1 写的 `intent_plan`/`intent_execution` 两个事件名在
+# brain 里不存在 —— 实现把它们挂在 `decision` 行与 `day_end` 上；这里按实现写口径）。
+# ---------------------------------------------------------------------------
+
+#: 原因码闭合集（§8.2）。**取文档 12 码 ∪ brain 11 码的并集**：文档已批 `failed`、brain 的
+#: `INTENT_REASON_CODES`（`brain/agentfarm/longrun.py:101-104`）还没落 ⇒ 只按文档判会把 brain
+#: 合法发出的码误判红；只按 brain 判又漏 §8.2 要求的 `failed`。两边清单的同步由单测
+#: `TestIntentAndGaps::test_reason_codes_match_brain_source` 扫 brain 源码兜住（漂移即红）。
+INTENT_REASON_CODES_DOC = (
+    "no_target", "unknown_evidence", "superseded", "deferred_capability", "tool_level",
+    "budget", "blocked_tile", "blocked_modal", "no_slot", "world_stuck", "gated", "failed",
+)
+INTENT_REASON_CODES_BRAIN = (
+    "no_target", "deferred_capability", "tool_level", "budget", "blocked_tile",
+    "blocked_modal", "no_slot", "world_stuck", "unknown_evidence", "superseded", "gated",
+)
+INTENT_REASON_CODES = tuple(dict.fromkeys(INTENT_REASON_CODES_DOC + INTENT_REASON_CODES_BRAIN))
+#: §8.2c 无动作意图白名单（source of truth = `brain/agentfarm/longrun.py:94`；单测扫源码同步）。
+ACTIONLESS_TASKS = ("sleep", "review", "wait_for_save", "recover_stamina")
+#: §8.2：能力缺口原因码 —— 它们必须被追成修复卡（不是"没活"，也不是豁免额度）。
+CAPABILITY_REASON_CODES = ("deferred_capability", "tool_level")
+#: §8.3.5：brain 的"暂不支持清理"登记表（source of truth = `brain/agentfarm/planner.py:1374`；
+#: 单测 `test_deferred_kinds_match_brain_source` 扫源码同步）。
+DEFERRED_KINDS = ("fruitTree", "bush")
+#: `<journal>-gaps.json`（`brain/agentfarm/planner.py:442` GAPS_SCHEMA）。
+GAPS_SCHEMA = "agentfarm-gaps/1"
+GAPS_SAMPLE_TILES = 6
+
+
+def gaps_file_for(journal_path):
+    """`logs/x.jsonl` ⇒ `logs/x-gaps.json`（与 `brain/agentfarm/longrun.py:1150` 同规则；**只读**）。"""
+    try:
+        path = Path(journal_path)
+    except Exception:  # noqa: BLE001  pylint: disable=broad-except
+        return None
+    if not str(path.name):
+        return None
+    stem = path.name[: -len(path.suffix)] if path.suffix else path.name
+    return path.with_name(f"{stem}-gaps.json")
+
+
+def load_gaps_doc(path):
+    """读 `<journal>-gaps.json`（task-219，schema `agentfarm-gaps/1`）。**绝不抛**。
+
+    返回 `(items, meta)`：`items` = `[{kind,tool,reason,count,first_seen,last_seen,sample_tiles,src}]`，
+    `meta` = `{path,exists,error,dropped,schema}`。**缺文件 / 读坏 ⇒ `exists=False` 或 `error` 非空，
+    不是 0 条缺口**（缺失 ≠ 0，调用方必须写【无法判定】）。
+    """
+    meta = {"path": str(path) if path else "", "exists": False, "error": "", "dropped": 0, "schema": ""}
+    if not path:
+        meta["error"] = "no_path"
+        return [], meta
+    try:
+        p = Path(path)
+    except Exception as exc:  # noqa: BLE001
+        meta["error"] = f"bad_path:{type(exc).__name__}"
+        return [], meta
+    meta["path"] = str(p)
+    if not p.exists():
+        return [], meta
+    meta["exists"] = True
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        meta["error"] = f"read_failed:{type(exc).__name__}"
+        return [], meta
+    if not isinstance(raw, dict):
+        meta["error"] = "not_a_dict"
+        return [], meta
+    meta["schema"] = str(raw.get("schema") or "")
+    if meta["schema"] != GAPS_SCHEMA:
+        meta["error"] = "bad_schema"
+        return [], meta
+    raw_items = raw.get("gaps")
+    if not isinstance(raw_items, list):
+        meta["error"] = "not_a_list"
+        return [], meta
+    items = []
+    for it in raw_items:
+        if not isinstance(it, dict):
+            meta["dropped"] += 1
+            continue
+        reason = str(it.get("reason") or "")
+        if not reason:
+            meta["dropped"] += 1
+            continue
+        samples = []
+        for pair in as_list(it.get("sample_tiles"))[:GAPS_SAMPLE_TILES]:
+            if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+                try:
+                    samples.append([as_int(pair[0], 0), as_int(pair[1], 0)])
+                except Exception:  # noqa: BLE001
+                    continue
+        items.append({
+            "kind": str(it.get("kind") or "unknown"),
+            "tool": str(it.get("tool") or ""),
+            "reason": reason,
+            "count": as_int(it.get("count"), 0),
+            "first_seen": str(it.get("first_seen") or "")[:40],
+            "last_seen": str(it.get("last_seen") or "")[:40],
+            "sample_tiles": samples,
+            "src": str(it.get("src") or ""),
+        })
+    return items, meta
+
+
+def scan_gaps_siblings(journal_path):
+    """**跨 run 只读聚合**：扫同目录 `*-gaps.json`（每个 run 一份，task-219 设计）。
+
+    返回 `[{file, schema, error, items}]`；一个都没有 ⇒ `[]`。绝不写任何文件。
+    """
+    out = []
+    try:
+        folder = Path(journal_path).parent
+    except Exception:  # noqa: BLE001
+        return out
+    try:
+        files = sorted(folder.glob("*-gaps.json"))
+    except Exception:  # noqa: BLE001
+        return out
+    for p in files:
+        items, meta = load_gaps_doc(p)
+        if meta.get("exists"):
+            out.append({"file": p.name, "schema": meta.get("schema"),
+                        "error": meta.get("error") or "", "items": items})
+    return out
+
+
+def gaps_key_of(item):
+    """缺口条目的聚合键：`(kind, tool, reason)`（§8.3.6 的"同一缺口"）。"""
+    return f"{item.get('kind')}|{item.get('tool')}|{item.get('reason')}"
+
+
+def aggregate_gaps(items):
+    """把多本 `-gaps.json` 的条目按 `(kind,tool,reason)` 合并 count / first_seen / last_seen。"""
+    merged = {}
+    for it in items or []:
+        key = gaps_key_of(it)
+        cur = merged.get(key)
+        if cur is None:
+            merged[key] = dict(it)
+            merged[key].setdefault("files", [])
+            continue
+        cur["count"] = as_int(cur.get("count"), 0) + as_int(it.get("count"), 0)
+        firsts = [x for x in (cur.get("first_seen"), it.get("first_seen")) if x]
+        lasts = [x for x in (cur.get("last_seen"), it.get("last_seen")) if x]
+        cur["first_seen"] = firsts[0] if firsts else ""
+        cur["last_seen"] = lasts[-1] if lasts else ""
+        tiles = cur.setdefault("sample_tiles", [])
+        for tile in as_list(it.get("sample_tiles")):
+            if tile not in tiles and len(tiles) < GAPS_SAMPLE_TILES:
+                tiles.append(tile)
+    return list(merged.values())
+
+
+def day_text_index(text):
+    """把 gaps 里的日期文本（brain 写的是 `"1 fall 7"`）转成可比的 ordinal；认不出 ⇒ None。"""
+    parts = str(text or "").split()
+    if len(parts) < 3:
+        return None
+    try:
+        year = int(parts[0])
+        dom = int(parts[2])
+    except Exception:  # noqa: BLE001
+        return None
+    return day_index([year, parts[1], dom])
+
+
+def gaps_span_days(item):
+    """同一缺口从 first_seen 到 last_seen 跨了几个日历日（认不出 ⇒ None，绝不瞎猜）。"""
+    first = day_text_index(item.get("first_seen"))
+    last = day_text_index(item.get("last_seen"))
+    if first is None or last is None or last < first:
+        return None
+    return last - first + 1
+
+
+def intent_coverage_rows(sessions):
+    """收集所有 `day_end.intent_coverage[]` 记录：`[(行号, rec)]`。"""
+    rows = []
+    for sess in sessions:
+        for lineno, ev in sess["events"]:
+            if ev.get("event") != "day_end":
+                continue
+            for rec in as_list(ev.get("intent_coverage")):
+                if isinstance(rec, dict):
+                    rows.append((lineno, rec))
+    return rows
+
+
+def cat_intent(sessions, gaps_items, top):
+    """【task-220】§8.3 意图-执行对账的判红（`docs/_run10-criteria.md` §8.3，第 7 类）。
+
+    判据（每条都能在账本里指到行号）：
+      1. 有计划（`decision.plans[].intent_id`）却**没有**对账记录 ⇒ 红（对账缺失 = 无声缩水）；
+      2. `executed_steps==0` 且 `reasons` 为空 ⇒ 红（**actionless 任务豁免**，§8.2c）；
+      3. `reasons` 含闭合集外的码（或 brain 自己记的 `bad_reasons`）⇒ 红；
+      4. 能力缺口原因（`deferred_capability`/`tool_level`）却**没有 gaps 条目** ⇒ 红（缺口没落盘，§8.3.4）；
+      5. `deferred_capability` 的 gaps 条目 kind **不在** `DEFERRED_KINDS` ⇒ 红（登记错 = "合法偷懒"没留证据）；
+      6. 瓦片不变式 `requested == ok+failed+unexecuted`、`Σreasons == failed+unexecuted` 对不上 ⇒ 红
+         （意图级原因码 `reasons_are_intent_level` 的记录不适用第二条）。
+    旧账本没有 `intent_coverage` ⇒ 这里**不产出任何红**（由 `build_undecidable` 写【无法判定】）。
+    """
+    out = []
+    gaps = [it for it in (gaps_items or []) if isinstance(it, dict)]
+    gap_reasons = {str(it.get("reason") or "") for it in gaps}
+    for sess in sessions:
+        plans = []
+        for lineno, ev in sess["events"]:
+            if ev.get("event") != "decision":
+                continue
+            for plan in as_list(ev.get("plans")):
+                if isinstance(plan, dict) and str(plan.get("intent_id") or ""):
+                    plans.append((lineno, plan))
+        cov = []
+        covered = set()
+        for lineno, rec in intent_coverage_rows([sess]):
+            cov.append((lineno, rec))
+            covered.add(str(rec.get("intent_id") or ""))
+        if not plans and not cov:
+            continue
+        for lineno, plan in plans:
+            ident = str(plan.get("intent_id") or "")
+            if ident in covered:
+                continue
+            out.append(finding(
+                lineno, "decision",
+                f"意图 {ident}（{plan.get('task') or '?'}）有计划却没有执行对账"
+                f"（day_end.intent_coverage 里没有它；area_hint={plan.get('area_hint') or '-'}）",
+                hint="brain 的 _finish_intent_coverage（longrun.py:1333-1349）应给每个计划过的意图补一条"
+                     "（superseded/gated）；缺了就是「计划有、对账没有」= 无声缩水（§8.3.1）",
+                subject="missed:intent_no_execution",
+            ))
+        for lineno, rec in cov:
+            ident = str(rec.get("intent_id") or "?")
+            task = str(rec.get("task") or "?")
+            actionless = bool(rec.get("actionless")) or task in ACTIONLESS_TASKS
+            reasons = rec.get("reasons") if isinstance(rec.get("reasons"), dict) else {}
+            steps = as_int(rec.get("executed_steps"), 0)
+            if steps == 0 and not reasons and not actionless:
+                out.append(finding(
+                    lineno, "day_end",
+                    f"意图 {ident}（{task}）executed_steps=0 却没有任何原因码"
+                    "（这正是用户要防的「无声缩水」）",
+                    hint="未执行意图至少一条闭合集原因码（§8.3.2）；actionless（sleep/review/"
+                         "wait_for_save/recover_stamina）除外",
+                    subject=f"missed:intent_no_reason:{task}",
+                ))
+            bad = [str(c) for c in as_list(rec.get("bad_reasons")) if c]
+            bad += [str(c) for c in reasons if str(c) not in INTENT_REASON_CODES]
+            bad = sorted(set(bad))
+            if bad:
+                out.append(finding(
+                    lineno, "day_end",
+                    f"意图 {ident}（{task}）原因码出集：{bad[:6]}"
+                    f"（闭合集共 {len(INTENT_REASON_CODES)} 码）",
+                    hint="§8.2 闭合集之外的码一律判红；brain 侧集外码进 bad_reasons，不许静默丢",
+                    subject=f"missed:intent_bad_reason:{task}",
+                ))
+            if not actionless and not rec.get("reasons_are_intent_level"):
+                req = as_int(rec.get("requested_tiles"), 0)
+                ok = as_int(rec.get("ok_tiles"), 0)
+                failed = as_int(rec.get("failed_tiles"), 0)
+                unexec = as_int(rec.get("unexecuted_tiles"), 0)
+                if req != ok + failed + unexec:
+                    out.append(finding(
+                        lineno, "day_end",
+                        f"意图 {ident}（{task}）瓦片不变式不成立："
+                        f"requested={req} ≠ ok {ok} + failed {failed} + unexecuted {unexec}",
+                        hint="§8.2b：requested_tiles = ok+failed+unexecuted；账目不可信 ⇒ 红",
+                        subject=f"missed:intent_tiles_invariant:{task}",
+                    ))
+                elif req > 0 and sum(as_int(v, 0) for v in reasons.values()) != failed + unexec:
+                    out.append(finding(
+                        lineno, "day_end",
+                        f"意图 {ident}（{task}）原因码计数不符：Σreasons="
+                        f"{sum(as_int(v, 0) for v in reasons.values())} ≠ failed {failed} + "
+                        f"unexecuted {unexec}",
+                        hint="§8.2b：Σ reasons.count == failed_tiles + unexecuted_tiles（按瓦片计）",
+                        subject=f"missed:intent_reason_count:{task}",
+                    ))
+            caps = [c for c in reasons if c in CAPABILITY_REASON_CODES]
+            if caps and not any(c in gap_reasons for c in caps):
+                out.append(finding(
+                    lineno, "day_end",
+                    f"意图 {ident}（{task}）因能力缺口（{caps}）没做成，但 <journal>-gaps.json 里"
+                    "没有对应条目",
+                    hint="§8.3.4 缺口必须落盘（brain task-219 的 _gaps_merge/_gaps_flush）；"
+                         "文件缺失或空 = 缺口没落盘 ⇒ 红",
+                    subject=f"missed:intent_gap_missing:{task}",
+                ))
+    for it in gaps:
+        if str(it.get("reason") or "") == "deferred_capability" and str(it.get("kind") or "") not in DEFERRED_KINDS:
+            out.append(finding(
+                None, "gaps",
+                f"缺口清单里 deferred_capability 的 kind={it.get('kind')!r} 不在 DEFERRED_KINDS "
+                f"{list(DEFERRED_KINDS)} 里（count={it.get('count')}）",
+                hint="§8.3.5：『暂不支持』必须登记在 brain/agentfarm/planner.py:1374 DEFERRED_KINDS，"
+                     "只登记不告知/登记错 ⇒ 红",
+                subject="missed:gap_kind_not_deferred",
+            ))
+    return out[:top] if top else out
 
 
 def is_red_finding(item):
@@ -3108,6 +3421,30 @@ def build_advice(report, top=8):
             "lines": ((tu0.get("warn_ok_without_being_lines") or [])[:3]
                       + (tu0.get("warn_money_mismatch_lines") or [])[:3]),
         })
+    # 0s-8（task-220，dev task-219）：§8 意图-执行对账 —— 对账记录不是豁免；能力缺口要追修复卡
+    it = report.get("intent") or {}
+    gi = report.get("gaps") or {}
+    _int_parts = []
+    if it.get("no_reason"):
+        _int_parts.append(f"executed_steps=0 却无原因码 {it['no_reason']} 条")
+    if it.get("missing_coverage"):
+        _int_parts.append(f"有计划无对账 {it['missing_coverage']} 条")
+    if it.get("bad_reason"):
+        _int_parts.append(f"原因码出集 {it['bad_reason']} 条")
+    if it.get("invariant_bad"):
+        _int_parts.append(f"瓦片/原因计数不变式不符 {it['invariant_bad']} 条")
+    if gi.get("capability_count"):
+        _int_parts.append(f"能力缺口条目 {gi['capability_count']} 条（deferred_capability/tool_level）")
+    if gi.get("span_warn"):
+        _int_parts.append(f"≥3 天未修 {len(gi['span_warn'])} 条"
+                          + (f"（已给 --repairs：{','.join(gi.get('repairs') or [])}）"
+                             if gi.get("repairs") else "（未给 --repairs，需人工对修复卡）"))
+    if _int_parts:
+        advice.append({
+            "text": "意图-执行对账/能力缺口（§8：对账记录不是豁免、不做额度；能力缺口必须被追成修复卡）："
+                    + "；".join(_int_parts),
+            "lines": (it.get("lines") or [])[:10],
+        })
     # 0c) 环境挡路 / 没拿到结论（task-22 记账）
     env = report.get("env_inconclusive") or {}
     if env.get("env_fail_events"):
@@ -3593,6 +3930,21 @@ def build_undecidable(rows, sessions, prelude, report):
     if no_step_fields:
         out.append(f"有 {len(no_step_fields)} 天自称 VERIFIED，但既没有 stages 也没有 ok_steps"
                    f"（行 {no_step_fields[:8]}）：无法判定当天是否'0 步 VERIFIED'（缺失 ≠ 通过）")
+    # task-220（§8.3.7）：旧账本没有 `intent_coverage` / gaps 文件 ⇒ 无法判定（缺失 ≠ 通过，也不许当失败）
+    _no_cov = []
+    for _sess in sessions:
+        if not _sess["day_ends"]:
+            continue
+        _ln, _ev = _sess["day_ends"][-1]
+        if "intent_coverage" not in _ev:
+            _no_cov.append(_ln)
+    if _no_cov:
+        out.append(f"有 {len(_no_cov)} 天的 day_end 没有 intent_coverage（行 {_no_cov[:8]}）："
+                   "无法判定「每个计划过的意图都有执行对账」（task-219 之前的旧账本；"
+                   "缺失 ≠ 通过，也不许当失败）")
+    if not (report.get("gaps") or {}).get("exists"):
+        out.append("本账本没有 `<journal>-gaps.json`（能力缺口清单）：无法判定「缺口是否已落盘 / "
+                   "是否被追成修复卡」（缺失 ≠ 0）")
     return out
 
 
@@ -5214,6 +5566,126 @@ def build_report(rows, path, args, bad_lines):
         _bd = days[_bdi] if 0 <= _bdi < len(days) else {}
         if _bd.get("verified") is True:
             tool_upgrade["blocked_then_verified_lines"].append(_bd.get("start_line"))
+    # ------------------------------------------------------------------
+    # 【task-220】§8 意图-执行对账 + 能力缺口（task-219 的 `day_end.intent_coverage` / `<journal>-gaps.json`）
+    # ------------------------------------------------------------------
+    _gaps_path = gaps_file_for(path)
+    _gaps_items, _gaps_meta = load_gaps_doc(_gaps_path)
+    _gaps_dir_arg = getattr(args, "gaps_dir", None)
+    _gaps_runs = scan_gaps_siblings(Path(_gaps_dir_arg) / "x.jsonl" if _gaps_dir_arg else path)
+    _gaps_merged = aggregate_gaps([it for run in _gaps_runs for it in (run.get("items") or [])])
+    if not _gaps_merged:
+        _gaps_merged = list(_gaps_items)
+    _int_rows = intent_coverage_rows(sessions)
+    _int_reasons = {}
+    _int_by_task = {}
+    _int_days = set()
+    _int_actionless = 0
+    _int_zero = 0
+    _int_no_reason = 0
+    _int_bad = 0
+    _int_invariant = 0
+    _int_capability = {}
+    _int_lines = []
+    for _ln, _rec in _int_rows:
+        _task = str(_rec.get("task") or "?")
+        _int_lines.append(_ln)
+        _int_days.add(_ln)
+        _actionless = bool(_rec.get("actionless")) or _task in ACTIONLESS_TASKS
+        _reasons = _rec.get("reasons") if isinstance(_rec.get("reasons"), dict) else {}
+        _steps = as_int(_rec.get("executed_steps"), 0)
+        if _actionless:
+            _int_actionless += 1
+        if _steps == 0 and not _actionless:
+            _int_zero += 1
+            if not _reasons:
+                _int_no_reason += 1
+        _bad = [str(c) for c in as_list(_rec.get("bad_reasons")) if c]
+        _bad += [str(c) for c in _reasons if str(c) not in INTENT_REASON_CODES]
+        if sorted(set(_bad)):
+            _int_bad += 1
+        if not _actionless and not _rec.get("reasons_are_intent_level"):
+            _req = as_int(_rec.get("requested_tiles"), 0)
+            _ok = as_int(_rec.get("ok_tiles"), 0)
+            _failed = as_int(_rec.get("failed_tiles"), 0)
+            _unexec = as_int(_rec.get("unexecuted_tiles"), 0)
+            if _req != _ok + _failed + _unexec:
+                _int_invariant += 1
+            elif _req > 0 and sum(as_int(v, 0) for v in _reasons.values()) != _failed + _unexec:
+                _int_invariant += 1
+        for _code in _reasons:
+            _int_reasons[str(_code)] = _int_reasons.get(str(_code), 0) + 1
+            if str(_code) in CAPABILITY_REASON_CODES:
+                _int_capability[str(_code)] = _int_capability.get(str(_code), 0) + 1
+        _item = _int_by_task.setdefault(_task, {
+            "task": _task, "intents": 0, "executed_steps": 0, "requested_tiles": 0,
+            "ok_tiles": 0, "failed_tiles": 0, "unexecuted_tiles": 0, "reasons": {},
+            "actionless": 0, "no_reason": 0, "lines": [],
+        })
+        _item["intents"] += 1
+        _item["executed_steps"] += _steps
+        _item["requested_tiles"] += as_int(_rec.get("requested_tiles"), 0)
+        _item["ok_tiles"] += as_int(_rec.get("ok_tiles"), 0)
+        _item["failed_tiles"] += as_int(_rec.get("failed_tiles"), 0)
+        _item["unexecuted_tiles"] += as_int(_rec.get("unexecuted_tiles"), 0)
+        _item["actionless"] += 1 if _actionless else 0
+        _item["no_reason"] += 1 if (_steps == 0 and not _reasons and not _actionless) else 0
+        _item["lines"].append(_ln)
+        for _code, _cnt in _reasons.items():
+            _item["reasons"][str(_code)] = _item["reasons"].get(str(_code), 0) + as_int(_cnt, 0)
+    _plan_ids = set()
+    for _sess in sessions:
+        for _ln, _ev in _sess["events"]:
+            if _ev.get("event") != "decision":
+                continue
+            for _plan in as_list(_ev.get("plans")):
+                if isinstance(_plan, dict) and str(_plan.get("intent_id") or ""):
+                    _plan_ids.add(str(_plan.get("intent_id")))
+    _cov_ids = {str(_rec.get("intent_id") or "") for _ln, _rec in _int_rows}
+    _missing_cov = len(_plan_ids - _cov_ids)
+    _intent_report = {
+        "rows": len(_int_rows),
+        "days_with_coverage": len(_int_days),
+        "actionless_rows": _int_actionless,
+        "zero_step_rows": _int_zero,
+        "no_reason": _int_no_reason,
+        "bad_reason": _int_bad,
+        "invariant_bad": _int_invariant,
+        "capability_reasons": dict(sorted(_int_capability.items())),
+        "reasons": dict(sorted(_int_reasons.items())),
+        "by_task": sorted(_int_by_task.values(), key=lambda it: (-it["intents"], it["task"]))[: max(1, args.top)],
+        "lines": sorted(set(_int_lines)),
+        "planned_intents": len(_plan_ids),
+        "missing_coverage": _missing_cov,
+    }
+    _cap_items = [it for it in _gaps_merged if str(it.get("reason") or "") in CAPABILITY_REASON_CODES]
+    _span_warn = []
+    for it in _gaps_merged:
+        _span = gaps_span_days(it)
+        if _span is not None and _span >= 3:
+            _span_warn.append({"key": gaps_key_of(it), "span_days": _span,
+                               "count": as_int(it.get("count"), 0),
+                               "first_seen": it.get("first_seen"), "last_seen": it.get("last_seen"),
+                               "kind": it.get("kind"), "tool": it.get("tool"),
+                               "reason": it.get("reason")})
+    _gaps_report = {
+        "path": str(_gaps_path) if _gaps_path else "",
+        "exists": bool(_gaps_meta.get("exists")),
+        "error": _gaps_meta.get("error") or "",
+        "schema": _gaps_meta.get("schema") or "",
+        "dropped": as_int(_gaps_meta.get("dropped"), 0),
+        "item_count": len(_gaps_merged),
+        "capability_count": len(_cap_items),
+        "capability_items": sorted(_cap_items, key=lambda it: -as_int(it.get("count"), 0))[: max(1, args.top)],
+        "by_reason": {c: len([it for it in _gaps_merged if str(it.get("reason") or "") == c])
+                      for c in sorted({str(it.get("reason") or "") for it in _gaps_merged})},
+        "span_warn": _span_warn,
+        "run_count": len(_gaps_runs),
+        "runs": [{"file": run.get("file"), "item_count": len(run.get("items") or []),
+                  "schema": run.get("schema"), "error": run.get("error")} for run in _gaps_runs][: max(1, args.top)],
+        "repairs": [x.strip() for x in str(getattr(args, "repairs", "") or "").split(",") if x.strip()],
+    }
+    # 0 步 VERIFIED 的弱日（已有 task-88 口径）；这里只做信息项。
     sleep_ok = sum(1 for _, ev in rows if ev.get("event") == "sleep" and ev.get("ok"))
     sleep_failed = sum(1 for _, ev in rows if ev.get("event") == "sleep" and not ev.get("ok"))
     blocked_by_action = {}
@@ -5636,6 +6108,9 @@ def build_report(rows, path, args, bad_lines):
     }
     # `t` 回退（只记信息项）
     report["t_regressions"] = t_regressions
+    # 【task-220】意图对账 / 能力缺口（上面在 report 建好之前算好，这里挂进去）
+    report["intent"] = _intent_report
+    report["gaps"] = _gaps_report
     # task-88：`cat_self_report` 要按**目标窗口**（`--window N`）而不是 `finish.days` 判自洽。
     report["window_days"] = as_int(getattr(args, "window", 3), 3)
     self_report = cat_self_report(report)
@@ -5646,6 +6121,7 @@ def build_report(rows, path, args, bad_lines):
         "ineffective": cat_ineffective(sessions, args.top),
         "sleep": cat_sleep(sessions, args.top, args.stamina_full, args.sleep_pct),
         "environment": cat_environment(all_sessions, args.top),
+        "intent": cat_intent(sessions, _gaps_merged, args.top),
     }
     report["categories_total"] = {
         "manual": len(manual_all),
@@ -5654,6 +6130,7 @@ def build_report(rows, path, args, bad_lines):
         "ineffective": len(cat_ineffective(sessions, 0)),
         "sleep": len(cat_sleep(sessions, 0, args.stamina_full, args.sleep_pct)),
         "environment": len(env_all),
+        "intent": len(cat_intent(sessions, _gaps_merged, 0)),
     }
     report["advice"] = build_advice(report)
     report["undecidable"] = build_undecidable(rows, sessions, prelude, report)
@@ -5694,7 +6171,8 @@ def build_report(rows, path, args, bad_lines):
     red_all, history_all, settled_all = [], [], []
     for items in (cat_manual(all_sessions, 0),
                   cat_missed(sessions, 0) + llm_reds,
-                  cat_wasted(sessions, 0) + cat_self_report(report)):
+                  cat_wasted(sessions, 0) + cat_self_report(report),
+                  cat_intent(sessions, _gaps_merged, 0)):
         for item in items:
             if not is_red_finding(item):
                 continue
@@ -6034,6 +6512,16 @@ MAPPING_TEXT = [
      "**如实上限**（`ended_by=inventory_blocked`、`verified=false`、`failed_steps=0`；`slept_by_us` 也认），"
      "**不许写成失败或豁免**；唯一可证伪 ⚠ = 那天却自称 VERIFIED（不进 rc）"),
     ("refill / plot", "辅助：补水、观测（截断警告）"),
+    ("day_end.intent_coverage / decision.plans（task-219/task-220，§8）",
+     "第 7 类「意图对账」：有计划无对账 / executed_steps=0 无原因码 / 原因码出集 / 瓦片或原因计数"
+     "不变式不符 / 能力缺口未落盘 ⇒ 红（`docs/_run10-criteria.md` §8.3，行号指到 day_end 或 decision）；"
+     "`reasons_are_intent_level=true` 的记录不适用 reason-count 不变式；actionless"
+     "（sleep/review/wait_for_save/recover_stamina）豁免“必须有原因码”；旧账本缺 intent_coverage ⇒【无法判定】"),
+    ("<journal>-gaps.json（task-219，能力缺口清单）",
+     "5 环境挡路？不：**只作提示、不进 checks/rc**（§8.4）——但缺口条目要能被追成修复卡："
+     "`deferred_capability`/`tool_level` = 能力缺口（不是“没活”，也不是豁免额度）；"
+     "`--gaps-dir` 可跨 run 只读聚合；同一缺口 first_seen→last_seen ≥3 天 ⇒ ⚠（Lead 复核，不自动判红）；"
+     "文件缺失 ⇒ `<缺失>` +【无法判定】（缺失 ≠ 0）"),
     ("idle", "辅助：一整轮没动作（acted/rounds）⇒ 空转，常与'该做没做'并看"),
 ]
 
@@ -6104,6 +6592,30 @@ def render_text(report, top):
                "货架没有当季种子（别下结论；行 "
                f"{[x['line'] for x in sl['sold_days_with_no_buy_next']][:10]}）"
                if sl.get("sold_days_with_no_buy_next") else ""))
+    # task-220：§8 意图-执行对账 + 能力缺口（只判「有意图无原因码/对账缺失/码出集/不变式不符」）
+    it = report.get("intent") or {}
+    if it.get("rows"):
+        add(f"未执行意图: 意图 {it['rows']} 条（覆盖 {it.get('days_with_coverage', 0)} 天；"
+            f"0 步 {it.get('zero_step_rows', 0)} 条 / 其中无原因码 {it.get('no_reason', 0)} 条；"
+            f"计划无对账 {it.get('missing_coverage', 0)} 条；原因码 "
+            + ("、".join(f"{k}×{v}" for k, v in sorted((it.get("reasons") or {}).items())) or "-")
+            + "）")
+    else:
+        add("未执行意图: <缺失>（本账本没有 day_end.intent_coverage ⇒ 【无法判定】，缺失 ≠ 0）")
+    gp = report.get("gaps") or {}
+    if gp.get("exists"):
+        add(f"能力缺口: {gp.get('item_count', 0)} 条（能力缺口 {gp.get('capability_count', 0)} 条；"
+            f"schema {gp.get('schema') or '-'}"
+            + (f"；读坏 {gp.get('error')}" if gp.get("error") else "")
+            + (f"；跨 run 聚合 {gp.get('run_count', 0)} 本" if gp.get("run_count") else "")
+            + (f"；⚠ ≥3 天未修 {len(gp.get('span_warn') or [])} 条（Lead 复核，不自动判红）"
+               if gp.get("span_warn") else "") + "）")
+        for _gi in (gp.get("capability_items") or [])[:3]:
+            add(f"    · {_gi.get('kind')}/{_gi.get('reason')} ×{_gi.get('count')}"
+                + (f"（需要 {_gi.get('tool')}）" if _gi.get("tool") else ""))
+    else:
+        add("能力缺口: <缺失>（没有 <journal>-gaps.json ⇒ 【无法判定】，缺失 ≠ 0）"
+            + (f"；读取错误 {gp.get('error')}" if gp.get("error") else ""))
     # task-32：两种新事件形态的计数（信息项）；task-38：跨日证据覆盖度
     # task-102（`9b09735`）：**背包空格闭环**一行 —— free_slots / buy 尝试 / buy_no_space /
     # 腾格卖出（`why=need_slot`）/ 当日钱变化 / `slept_without_work` / `modal_dismiss_failed`。
@@ -6825,6 +7337,12 @@ def parse_args(argv):
     parser.add_argument("--stamina-full", type=float, default=270.0, help="满体力（默认 270，用于睡觉时机判定）")
     parser.add_argument("--sleep-pct", type=float, default=0.60,
                         help="睡前体力比例超过它就判'体力还充裕就睡了'（默认 0.60）")
+    parser.add_argument("--gaps-dir", default=None,
+                        help="能力缺口清单的跨 run 聚合目录（默认：账本同目录）：只读扫 `*-gaps.json`，"
+                             "**不写任何文件**（task-220；卡面说的 logs/gaps-registry.json 由外部落盘）")
+    parser.add_argument("--repairs", default="",
+                        help="已派出的修复卡号清单（逗号分隔，如 task-226,task-231）：仅用于把"
+                             "「同一缺口 ≥3 天未修」的 ⚠ 提示写明已给了哪张卡（§8.3.6 不自动判红）")
     return parser.parse_args(argv)
 
 

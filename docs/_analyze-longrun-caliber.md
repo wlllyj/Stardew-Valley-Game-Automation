@@ -1184,6 +1184,43 @@ python tools\analyze-longrun.py --journal logs\longrun-runA-0732.jsonl --days 6 
 python scratch\_t194_undec.py    # HEAD 导出 vs 新版：六账本 rc/红/#无法判定 并排
 ```
 
+## 3.33 §8 意图-执行对账 + 能力缺口（task-219 `fc147a7`，task-220 收录）—— **缺口不是豁免**
+
+**证据来源**：`day_end.intent_coverage[]`（每意图一条：`intent_id/task/area_hint/source/boundary/
+requested_tiles/ok_tiles/failed_tiles/unexecuted_tiles/executed_steps/reasons/reasons_are_intent_level`，
+brain `longrun.py:1200-1271`）+ `<journal>-gaps.json`（schema `agentfarm-gaps/1`，按
+`(kind,tool,reason)` 聚合 `count/first_seen/last_seen/sample_tiles`）。
+
+**判红 7 条（`docs/_run10-criteria.md` §8.3，第 7 类）**：
+
+| # | 判据 | subject |
+|---|---|---|
+| 1 | 计划里有 `intent_id`，但 `intent_coverage` 没有它（对账缺失 = 无声缩水） | `missed:intent_no_execution` |
+| 2 | `executed_steps==0` 且 `reasons` 为空（`ACTIONLESS_TASKS` 除外） | `missed:intent_no_reason:<task>` |
+| 3 | 原因码出闭合集（或 brain 自记的 `bad_reasons` 非空） | `missed:intent_bad_reason:<task>` |
+| 4 | 能力缺口原因（`deferred_capability`/`tool_level`）却**没有** gaps 条目 | `missed:intent_gap_missing:<task>` |
+| 5 | `deferred_capability` 的 gaps 条目 kind 不在 `DEFERRED_KINDS` | `missed:gap_kind_not_deferred` |
+| 6 | 瓦片不变式 `requested=ok+failed+unexecuted` 不成立 | `missed:intent_tiles_invariant:<task>` |
+| 7 | `Σreasons.count` ≠ `failed+unexecuted`（意图级原因码不适用） | `missed:intent_reason_count:<task>` |
+
+**只提示、不判红**：①同一缺口 `first_seen→last_seen` 跨 **≥3 天**仍未修 ⇒ ⚠（`--repairs` 只做人工
+对修复卡的附注）；②`--gaps-dir` 可跨 run 只读聚合（默认扫账本同目录 `*-gaps.json`）；③缺口清单只在
+头部「能力缺口」行与建议里出现，**不进 checks、不豁免任何日级判据**。
+
+**闭合集以 brain 源码为唯一权威**：`INTENT_REASON_CODES`（`brain/agentfarm/longrun.py:101`，11 码）
++ 老账本兼容 `failed`；`ACTIONLESS_TASKS`（`:93`）与 `DEFERRED_KINDS`
+（`brain/agentfarm/planner.py:1374`）都有**扫描 brain 源码**的漂移单测，不许手抄常量。
+
+**旧账本一律【无法判定】**：没有 `intent_coverage` / 没有 gaps 文件 ⇒ `未执行意图: <缺失>`、
+`能力缺口: <缺失>`，**不判红、也不判通过**（缺失 ≠ 0）。
+
+**口径边界**：§8 的红**只由本工具判**（`tools\verify-run3.py` 只出 info，不动它的 day_end 白名单）；
+`reasons` 只做证据，**不是免罚额度**；`bad_reasons` 集外码会同时进【无法判定】说明，不许静默丢。
+
+**顺带修的真 bug**：`tools\analyze-longrun.py` 之前**缺 `from pathlib import Path`**
+（`gaps_file_for()` 的 `NameError` 被 `except Exception` 静默吞掉 ⇒ `<journal>-gaps.json` 永远读不到，
+功能等于没接上）。本卡补 import，单测 `test_gaps_file_is_parsed_and_aggregated` 抓到。
+
 ## 4. 复核命令
 
 ```
@@ -1197,8 +1234,14 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run9d.jsonl --da
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
 python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
-python -m unittest tests.test_analyze_longrun  # 当前 231 OK（task-207 + 工具升级全链 6 条）
-python -m unittest discover -s tests           # 当前 Ran 1032 tests / OK（0 红）
+python -m unittest tests.test_analyze_longrun  # 当前 247 OK（task-220 + §8 意图对账/能力缺口 16 条）
+python -m unittest discover -s tests           # 当前 Ran 1122 tests / OK（0 红）
+python scratch\_t194_undec.py                   # 六账本 HEAD 导出 vs 新版并排读数：
+                                               #   rc/红数**一字未变** —— runA 1/117、runB 1/84、run9 1/84、
+                                               #   run9b 1/45、run9c 0/0、run9d 1/29；
+                                               #   #无法判定 每本 **+2** = task-220 的「intent_coverage 缺失」
+                                               #   与「gaps.json 缺失」两条（旧账本 0 命中 ⇒ 如实报【无法判定】）
+python tools\analyze-longrun.py --journal logs\longrun-runA-0732.jsonl --days 6 --gaps-dir logs  # 跨 run 缺口聚合
 python scratch\_t194_undec.py                   # task-207 完成读数（HEAD 导出 vs 新版，六账本并排）：
                                                #   rc/红数**一字未变** —— runA 1/117、runB 1/84、run9 1/84、
                                                #   run9b 1/45、run9c 0/0、run9d 1/29（verify-run3 同向，run9c 为

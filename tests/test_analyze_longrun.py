@@ -4483,5 +4483,208 @@ class TestToolUpgradeAccounting(unittest.TestCase):
         self.assertEqual(rep["red"]["total"], 0, "缺失只记【无法判定】，绝不因此判红/判通过")
 
 
+class TestIntentCoverageAndGaps(unittest.TestCase):
+    """task-220（Lead）：§8 意图-执行对账 + 能力缺口清单（brain task-219 `fc147a7`）。
+
+    口径（`docs/_0.7.39-p0-patches.md` P0-4/P0-5、`docs/_run10-criteria.md` §8.2/8.2b/8.2c/8.3）：
+    证据 = `day_end.intent_coverage[]` + `<journal>-gaps.json`；旧账本没有这两样 ⇒
+    **一律【无法判定】，绝不判红**（缺失 ≠ 0）；`ACTIONLESS_TASKS` 不算"有动作意图"；
+    缺口/原因码只作证据，**不豁免、不进 checks/rc**；§8 的红只由本工具判
+    （`tools/verify-run3.py` 对 §8 只出 info）。
+    """
+
+    _CHECKS = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+               "crops_watered": True, "day_justified": True, "watered_outdoor": True,
+               "no_unmet_stages": True}
+    _FW = {"t": 9.0, "location": "Farm", "tiles": 84, "crops": 31, "dry": 0, "scope": "farm"}
+
+    def _run(self, argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = mod.main(argv)
+        return rc, buf.getvalue()
+
+    def _ledger(self, name, *, plans=None, coverage=None, gaps=None, gaps_schema=None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        extra = []
+        if plans is not None:
+            extra.append({"event": "decision", "t": 2.0, "day": MODAL_DAY, "zone": "field_ne",
+                          "source": "llm", "llm": True, "boundary": None, "intents": [],
+                          "plans": plans})
+        overrides = {"checks": dict(self._CHECKS), "final_water": dict(self._FW)}
+        if coverage is not None:
+            overrides["intent_coverage"] = coverage
+        path = write_ledger(tmp.name, name, integrity_ledger(
+            extra_events=extra, day_end_overrides=overrides))
+        if gaps is not None:
+            gp = os.path.join(tmp.name, os.path.splitext(name)[0] + "-gaps.json")
+            with open(gp, "w", encoding="utf-8") as fh:
+                json.dump({"schema": gaps_schema or mod.GAPS_SCHEMA, "runs": 1, "gaps": gaps},
+                          fh, ensure_ascii=False)
+        return path
+
+    def _rec(self, ident="1#01", task="clear_area", *, steps=3, requested=3, ok=3, failed=0,
+             unexecuted=0, reasons=None, **kw):
+        rec = {"intent_id": ident, "task": task, "source": "llm", "area_hint": "field_ne",
+               "boundary": "", "requested_tiles": requested, "ok_tiles": ok,
+               "failed_tiles": failed, "unexecuted_tiles": unexecuted,
+               "executed_steps": steps, "reasons": dict(reasons or {}),
+               "reasons_are_intent_level": False}
+        rec.update(kw)
+        return rec
+
+    def _gap(self, *, kind="fruitTree", tool="axe", reason="deferred_capability", count=1,
+             first="1 fall 7", last="1 fall 7", tiles=None, src="agentfarm"):
+        return {"kind": kind, "tool": tool, "reason": reason, "count": count,
+                "first_seen": first, "last_seen": last,
+                "sample_tiles": tiles if tiles is not None else [[60, 29]], "src": src}
+
+    def _subjects(self, rep, cat):
+        return subjects(rep["categories"][cat])
+    # ---- 与 brain 源码同步（漂移即红，不许手抄常量） ----
+
+    def test_reason_codes_and_actionless_match_brain_source(self):
+        with open(BRAIN_LONG_RUN, encoding="utf-8") as fh:
+            src = fh.read()
+        m = re.search(r"INTENT_REASON_CODES[^=]*=\s*\((.*?)\)", src, re.S)
+        self.assertIsNotNone(m, "brain 侧找不到 INTENT_REASON_CODES 字面量")
+        brain_codes = set(re.findall(r'"([a-z_]+)"', m.group(1)))
+        self.assertTrue(brain_codes)
+        self.assertEqual(brain_codes - set(mod.INTENT_REASON_CODES), set(),
+                         "analyzer 闭合集必须覆盖 brain 的全部原因码（否则集内码会被误判红）")
+        m2 = re.search(r"ACTIONLESS_TASKS[^=]*=\s*\((.*?)\)", src, re.S)
+        self.assertIsNotNone(m2)
+        self.assertEqual(set(re.findall(r'"([a-z_]+)"', m2.group(1))), set(mod.ACTIONLESS_TASKS))
+
+    def test_deferred_kinds_match_brain_source(self):
+        with open(os.path.join(ROOT, "brain", "agentfarm", "planner.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        m = re.search(r"^DEFERRED_KINDS[^=]*=\s*\{(.*?)\}", src, re.M | re.S)
+        self.assertIsNotNone(m, "planner.py 找不到 DEFERRED_KINDS 字面量")
+        brain_kinds = set(re.findall(r'"([A-Za-z]+)"\s*:', m.group(1)))
+        self.assertEqual(brain_kinds, set(mod.DEFERRED_KINDS),
+                         "DEFERRED_KINDS 两侧必须一字不差（§8.3.5 的『暂不支持』白名单）")
+
+    # ---- 判红 7 条 ----
+
+    def test_plan_without_coverage_is_red(self):
+        path = self._ledger("plan_only.jsonl", plans=[
+            {"intent_id": "1#01", "task": "clear_area", "area_hint": "field_ne", "source": "llm"}],
+            coverage=[])
+        rep = report_for(path, days=1)
+        self.assertIn("missed:intent_no_execution", self._subjects(rep, "intent"),
+                      "有计划却没有执行对账 = 无声缩水（§8.3.1）")
+        rc, _ = self._run(["--journal", path, "--days", "1"])
+        self.assertEqual(rc, 1)
+
+    def test_zero_steps_without_reason_is_red(self):
+        path = self._ledger("zero_steps.jsonl", coverage=[
+            self._rec("1#02", "till_area", steps=0, requested=0, ok=0)])
+        rep = report_for(path, days=1)
+        self.assertIn("missed:intent_no_reason:till_area", self._subjects(rep, "intent"))
+        _rc, out = self._run(["--journal", path, "--days", "1"])
+        self.assertIn("executed_steps=0 却无原因码", out)
+
+    def test_actionless_task_without_reason_is_not_red(self):
+        path = self._ledger("actionless.jsonl", coverage=[
+            self._rec("1#03", "sleep", steps=0, requested=0, ok=0)])
+        rep = report_for(path, days=1)
+        self.assertEqual(rep["red"]["total"], 0, "sleep/review 这类不算有动作意图（§8.2c）")
+        self.assertFalse([s for s in self._subjects(rep, "intent") if s.startswith("missed:intent")])
+
+    def test_bad_reason_code_is_red(self):
+        path = self._ledger("bad_reason.jsonl", coverage=[
+            self._rec("1#04", "clear_area", steps=0, requested=1, ok=0, unexecuted=1,
+                      reasons={"made_up_code": 1})])
+        rep = report_for(path, days=1)
+        self.assertIn("missed:intent_bad_reason:clear_area", self._subjects(rep, "intent"))
+
+    def test_capability_reason_without_gaps_is_red(self):
+        path = self._ledger("cap_no_gaps.jsonl", coverage=[
+            self._rec("1#05", "clear_area", steps=0, requested=1, ok=0, unexecuted=1,
+                      reasons={"tool_level": 1})])
+        rep = report_for(path, days=1)
+        self.assertIn("missed:intent_gap_missing:clear_area", self._subjects(rep, "intent"))
+        self.assertIn("gaps.json", " ".join(rep.get("undecidable") or []))
+
+    def test_tiles_invariant_is_red(self):
+        path = self._ledger("invariant.jsonl", coverage=[
+            self._rec("1#06", "clear_area", steps=1, requested=5, ok=1, failed=1, unexecuted=1)])
+        rep = report_for(path, days=1)
+        self.assertIn("missed:intent_tiles_invariant:clear_area", self._subjects(rep, "intent"))
+
+    def test_reason_count_mismatch_is_red(self):
+        path = self._ledger("reason_count.jsonl", coverage=[
+            self._rec("1#07", "clear_area", steps=1, requested=3, ok=1, failed=0, unexecuted=2,
+                      reasons={"no_target": 1})])
+        rep = report_for(path, days=1)
+        self.assertIn("missed:intent_reason_count:clear_area", self._subjects(rep, "intent"))
+
+    def test_gap_kind_not_deferred_is_red(self):
+        path = self._ledger("bad_kind.jsonl", coverage=[self._rec("1#08")],
+                            gaps=[self._gap(kind="stone", reason="deferred_capability")])
+        rep = report_for(path, days=1)
+        self.assertIn("missed:gap_kind_not_deferred", self._subjects(rep, "intent"))
+
+    # ---- 缺口清单：证据可见、只提示不判红、跨日才 ⚠ ----
+
+    def test_gaps_file_is_parsed_and_aggregated(self):
+        path = self._ledger("gaps_ok.jsonl", coverage=[self._rec("1#09")],
+                            gaps=[self._gap(count=3, tiles=[[60, 29], [61, 29]])],
+                            gaps_schema=mod.GAPS_SCHEMA)
+        rep = report_for(path, days=1)
+        gaps = rep["gaps"]
+        self.assertTrue(gaps["exists"])
+        self.assertEqual(gaps["item_count"], 1)
+        self.assertEqual(gaps["capability_count"], 1)
+        self.assertEqual(gaps["runs"][0]["item_count"], 1)
+        self.assertEqual(gaps["span_warn"], [], "同一天 ⇒ 不提示修复卡")
+        self.assertEqual(rep["red"]["total"], 0, "缺口本身不判红")
+
+    def test_gap_span_three_days_is_warning_not_red(self):
+        path = self._ledger("gaps_span.jsonl", coverage=[self._rec("1#10")],
+                            gaps=[self._gap(first="1 fall 7", last="1 fall 10")])
+        rep = report_for(path, days=1)
+        self.assertTrue(rep["gaps"]["span_warn"], "连续 ≥3 天没修复 ⇒ ⚠")
+        self.assertEqual(rep["red"]["total"], 0, "⚠ 只提示，不进 rc")
+
+    def test_bad_gaps_schema_is_error_not_red(self):
+        path = self._ledger("gaps_bad.jsonl", coverage=[self._rec("1#11")],
+                            gaps=[self._gap()], gaps_schema="agentfarm-gaps/999")
+        rep = report_for(path, days=1)
+        self.assertTrue(rep["gaps"]["exists"], "文件在，但 schema 认识不了")
+        self.assertEqual(rep["gaps"]["error"], "bad_schema")
+        self.assertEqual(rep["red"]["total"], 0, "schema 不认识 ⇒ 不采信、不判红")
+
+    # ---- 旧账本：缺失 ⇒【无法判定】，不是 0 也不是红 ----
+
+    def test_old_ledger_missing_coverage_is_undecidable_not_red(self):
+        path = self._ledger("old.jsonl")
+        rep = report_for(path, days=1)
+        self.assertEqual(rep["red"]["total"], 0, "缺失 ≠ 0：旧账本不许因§8判红")
+        und = " ".join(rep.get("undecidable") or [])
+        self.assertIn("intent_coverage", und)
+        self.assertIn("gaps", und)
+        rc, _ = self._run(["--journal", path, "--days", "1"])
+        self.assertEqual(rc, 0)
+
+    def test_clean_covered_day_has_no_intent_red(self):
+        ident = "1#12"
+        path = self._ledger("clean_cov.jsonl",
+                            plans=[{"intent_id": ident, "task": "clear_area",
+                                    "area_hint": "field_ne", "source": "llm"}],
+                            coverage=[self._rec(ident)])
+        rep = report_for(path, days=1)
+        self.assertEqual(rep["red"]["total"], 0)
+        self.assertEqual(rep["intent"]["rows"], 1)
+
+    def test_cli_accepts_gaps_dir_and_repairs(self):
+        args = mod.parse_args(["--journal", "x.jsonl", "--gaps-dir", "logs",
+                               "--repairs", "task-226,task-231"])
+        self.assertEqual(args.gaps_dir, "logs")
+        self.assertIn("task-226", args.repairs)
+
+
 if __name__ == "__main__":
     unittest.main()
