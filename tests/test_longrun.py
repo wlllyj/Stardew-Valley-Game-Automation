@@ -13678,6 +13678,163 @@ class TestTask16InventoryFull(unittest.TestCase):
         self.assertNotIn("inventory_blocked", str(rep.ended_reason))
 
 
+class TestTask38SlotReliefFieldParity(unittest.TestCase):
+    """【task-38 / 0.7.48 快修】`slot_relief` 事件字段奇偶补齐的**定向护栏**。
+
+    背景：smoke-0746（0.7.47）步 7 FAIL —— 账本里 3 条 `slot_relief` 中 `trigger=clear_gate`
+    那条（`longrun.py::_note_clear_area_bag_gate`）只写了 demand/demand_basis/target_free，
+    **漏 `reached`**；task-237 规定的字段集是 `demand`/`demand_basis`/`target_free`/`reached`
+    （见 `tools/_note-0741.txt` 第 2 条），验收探针 `scratch/smoke-0742.py:680` 按该集合校验
+    （把整条记录 JSON 串出来做 `f'"{k}"'` 子串搜，缺一即 FAIL）。
+
+    本类对**四处** `slot_relief` 写入点逐一钉死（复用事件名，不新增事件）：
+      ① `longrun.py:6670` 主 `_slot_relief`（腾格通道，trigger=space_pressure）；
+      ② `longrun.py:6296` `_note_slot_pressure_stuck`（压力通道腾不出，trigger=none）；
+      ③ `longrun.py:7455` 买种前满包（demand_basis=buy_full）；
+      ④ `longrun.py:6445` `_note_clear_area_bag_gate`（满包清障闸，trigger=clear_gate）← 本次缺口。
+
+    只认**字段在场 + 语义**（`reached` 是否如实），不改任何行为判据 / rc 语义。
+    """
+
+    #: probe 口径的 task-237 必填字段集（`scratch/smoke-0742.py:680` 逐字面量搜这 3 个 + demand_basis）。
+    TASK237_FIELDS = ("demand", "demand_basis", "target_free", "reached")
+
+    MATERIAL_ROWS = (
+        ("(O)388", "Wood"), ("(O)390", "Stone"), ("(O)330", "Clay"),
+        ("(O)771", "Fiber"), ("(O)382", "Coal"), ("(O)378", "Copper Ore"),
+        ("(O)380", "Iron Ore"), ("(O)384", "Gold Ore"), ("(O)386", "Iridium Ore"),
+    )
+
+    def _row(self, slot: int, qid: str, name: str, stack: int, *,
+             tool: bool = False) -> dict:
+        item_id = qid.rsplit(")", 1)[-1] if qid.startswith("(") else qid
+        return {"slot": slot, "id": item_id, "qualifiedId": qid, "name": name,
+                "stack": stack, "isTool": tool}
+
+    def _full(self, rows=(), *, weeds: int = 0, seeds: int = 0,
+              money: int = 3000) -> FakeWorld:
+        """满包 12/12：3 工具 + `rows`，其余 Hay 填满。"""
+        w = FakeWorld(seeds=seeds, money=money, weeds=weeds)
+        inv = [self._row(0, "(T)Axe", "Axe", 1, tool=True),
+               self._row(1, "(T)Hoe", "Hoe", 1, tool=True),
+               self._row(2, "(T)WateringCan", "Watering Can", 1, tool=True)]
+        for i, (qid, name) in enumerate(rows):
+            inv.append(self._row(3 + i, qid, name, 30))
+        while len(inv) < 12:
+            inv.append(self._row(len(inv), "(O)178", "Hay", 5))
+        w.inventory = inv[:12]
+        return w
+
+    def _full_unsellable(self, *, weeds: int = 4) -> FakeWorld:
+        """满包 + **无可卖叠**（Hay 表外）⇒ 压力通道腾不出 / 买种前满包两条路都走这条形态。"""
+        w = FakeWorld(seeds=0, money=500, weeds=weeds)
+        w.inventory = [self._row(0, "(T)Axe", "Axe", 1, tool=True),
+                       self._row(1, "(T)Hoe", "Hoe", 1, tool=True),
+                       self._row(2, "(T)WateringCan", "Watering Can", 1, tool=True)]
+        while len(w.inventory) < 12:
+            w.inventory.append(self._row(len(w.inventory), "(O)178", "Hay", 5))
+        return w
+
+    def _full_with_surplus(self) -> FakeWorld:
+        """满包 + 真盈余 Slime 99 ⇒ 主腾格通道会真的卖出（trigger=space_pressure）。"""
+        w = FakeWorld(seeds=0, money=500, weeds=0)
+        inv = [self._row(0, "(T)Axe", "Axe", 1, tool=True),
+               self._row(1, "(T)Hoe", "Hoe", 1, tool=True),
+               self._row(2, "(T)WateringCan", "Watering Can", 1, tool=True)]
+        inv += [self._row(3 + i, "(O)766", "Slime", 99) for i in range(9)]
+        w.inventory = inv[:12]
+        return w
+
+    def _run(self, w: FakeWorld, worker) -> LongRun:
+        run = make_run(w)
+        client = FakeClient(w)
+        run.client = client
+        run.worker = worker
+        run.client_factory = lambda: client
+        run.worker_factory = lambda _c: worker
+        return run
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list:
+        return [e for e in run.entries if e.get("event") == name]
+
+    @staticmethod
+    def _rep() -> DayReport:
+        return DayReport(day_key=("winter", 26, 1), started_at=0.0)
+
+    def _plot(self, tiles) -> dict:
+        return {"zone": "", "label": "", "area": "field_nw", "anchor": list(tiles[0]),
+                "tiles": list(tiles), "note": ""}
+
+    def _assert_task237(self, ev: dict) -> None:
+        """字段在场（dict 键）+ **探针口径**（JSON 串子串）双口径都过。
+
+        双口径是必须的：探针 `scratch/smoke-0742.py:684` 是 `f'"{k}"' not in blob` 的**字面量**
+        子串搜 —— 光给 `demand_basis` 不会满足 `"demand"` 键，所以必须真的写独立的 `demand`。
+        """
+        for k in self.TASK237_FIELDS:
+            self.assertIn(k, ev, f"slot_relief 缺 task-237 字段 {k!r}：{ev}")
+        blob = json.dumps(ev, ensure_ascii=False)
+        for k in self.TASK237_FIELDS:
+            self.assertIn(f'"{k}"', blob, f"探针口径（子串搜）缺 {k!r}：{blob}")
+        self.assertIsInstance(int(ev["target_free"]), int, ev)
+
+    # ---- ① 主腾格通道（longrun.py:6670）----
+    def test_main_slot_relief_channel_carries_task237_fields(self):
+        w = self._full_with_surplus()
+        worker = _SpaceWorker(w)
+        run = self._run(w, worker)
+        self.assertTrue(run._slot_relief(w.obs(), self._rep()))
+        ev = self._events(run, "slot_relief")
+        self.assertEqual(len(ev), 1, ev)
+        self._assert_task237(ev[0])
+        # 语义：reached == (卖后空格 >= 目标水位)，不谎报。
+        self.assertEqual(bool(ev[0]["reached"]),
+                         int(ev[0]["freeSlots_after"]) >= int(ev[0]["target_free"]), ev[0])
+
+    # ---- ② 压力通道腾不出（longrun.py:6296）----
+    def test_pressure_stuck_channel_carries_task237_fields(self):
+        w = self._full_unsellable(weeds=0)
+        worker = _SpaceWorker(w)
+        run = self._run(w, worker)
+        rep = self._rep()
+        for _ in range(SLOT_RELIEF_MAX + 2):
+            self.assertFalse(run._slot_relief(w.obs(), rep))
+        ev = [e for e in self._events(run, "slot_relief") if e.get("trigger") == "none"]
+        self.assertEqual(len(ev), 1, self._events(run, "slot_relief"))
+        self._assert_task237(ev[0])
+        self.assertIs(ev[0]["reached"], False, "腾不出 ⇒ reached 必须如实 False")
+        self.assertEqual(ev[0]["target_free"], longrun_mod.SLOT_RELIEF_TARGET_FREE)
+
+    # ---- ③ 买种前满包（longrun.py:7455）----
+    def test_buy_full_channel_carries_task237_fields(self):
+        w = self._full_unsellable(weeds=0)
+        w.player_seeds = []                                  # 当季可种 0 ⇒ 走到买种子门闸
+        worker = _SpaceWorker(w)
+        run = self._run(w, worker)
+        self.assertFalse(run._preconditions_apply(w.obs(), self._rep()))
+        ev = self._events(run, "slot_relief")
+        self.assertEqual(len(ev), 1, ev)
+        self.assertEqual(ev[0]["demand_basis"], "buy_full")
+        self._assert_task237(ev[0])
+        self.assertIs(ev[0]["reached"], False, "不买 ⇒ 没腾到水位，reached 如实 False")
+
+    # ---- ④ 满包清障闸（longrun.py:6445）← 本次修的缺口 ----
+    def test_clear_gate_channel_carries_task237_fields(self):
+        w = self._full(rows=self.MATERIAL_ROWS, weeds=4)
+        run = self._run(w, FakeWorker(w))
+        self.assertEqual(run._stage_tiles("clear_area", w.obs(),
+                                          self._plot([(60, 10), (61, 10)])), [])
+        gate = [e for e in self._events(run, "slot_relief")
+                if e.get("trigger") == "clear_gate"]
+        self.assertEqual(len(gate), 1, self._events(run, "slot_relief"))
+        self._assert_task237(gate[0])
+        # 语义：clear_gate 是"今天不再新开 clear_area"的闸，**不是**腾到了目标水位 ⇒ reached=False。
+        self.assertIs(gate[0]["reached"], False, "clear_gate 不许谎报水位达标")
+        self.assertEqual(gate[0]["demand"], 0)
+        self.assertEqual(gate[0]["target_free"], longrun_mod.SLOT_RELIEF_TARGET_FREE)
+
+
 class TestTask22MalformedTiles(unittest.TestCase):
     """task-22 / 0.7.45：观测 `tiles[]` 里**字段残缺**的 tile 记录不得算 unobserved 放行。
 

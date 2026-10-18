@@ -6442,9 +6442,15 @@ class LongRun:
         if self.clear_area_bag_gate_noted:
             return
         self.clear_area_bag_gate_noted = True
+        # 【task-237 / 0.7.48 字段奇偶补齐】`slot_relief` 的 task-237 字段集是
+        # demand/demand_basis/target_free/**reached** —— 本闸此前漏写 `reached`（纯只读字段
+        # 缺口，非行为变更；验收探针 scratch/smoke-0742.py:680 按该字段集校验）。
+        # 语义：clear_gate **不是**"腾到了目标水位"，而是"今天不再新开 clear_area"的闸
+        # ⇒ `reached` 如实填 False，绝不谎报水位达标（与压力通道一致）。
         self._journal("slot_relief", pressure=True, need=0, demand=0,
                       demand_basis="space_pressure", trigger="clear_gate",
-                      target_free=SLOT_RELIEF_TARGET_FREE, freed=0, stage=task,
+                      target_free=SLOT_RELIEF_TARGET_FREE, reached=False, freed=0,
+                      stage=task,
                       reason=why, loot_lost_steps=int(self.loot_lost_steps_today),
                       loot_lost_limit=int(CLEAR_LOOT_LOSS_MAX_STEPS),
                       note=("满包清障闸：不新开 clear_area（落地即丢；开路必要前置仍允许）"
