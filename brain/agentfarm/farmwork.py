@@ -71,6 +71,7 @@ __all__ = [
     "SURPLUS_MIN_UNIT_PRICE",
     "SURPLUS_MONEY_FACTOR",
     "TILE_INERT_STATUSES",
+    "TREE_SWING_CALLS",
     "TREE_KIND",
     "TREE_STAMINA_ESTIMATE",
     "UNREACHABLE_CODE",
@@ -138,6 +139,15 @@ NOT_CLEARABLE_KINDS = {
 #: 砍倒成桩不改变 kind）⇒ 判据只能是"**kind 离开 tree**"，不能是"挥过刀"。
 TREE_KIND = "tree"
 MAX_TREE_SWINGS = 16
+
+#: 【task-241】树/石/枝类目标**每次 `use_tool` 调用内部只挥 6 下**（Mod `UseToolSkill.MaxSwings`），
+#: 一棵树常常要多发几次请求才倒。0.7.41 冒烟的硬证据：9 条 `blocked` **全部**是 `use_tool(axe)`
+#: **单发**回 `tool_ineffective`（Mod 内部挥满 6 下、树未倒）就被封格；而同一次冒烟的 A2 判据
+#: 证明同类树 1–3 次调用必倒 ⇒ 生产 `clear_area` 必须跟上：每格最多 `TREE_SWING_CALLS` 次调用，
+#: **kind 变 / 目标消失即停**；3 次都 `tool_ineffective` 才判"这格干不动"并留
+#: `tool_ineffective_bound`（calls / 每次回执 / kind 前后）。
+#: `tool_ineffective` 单发**不再**直接 blocked（旧行为 = 4 天只清掉 8 格的瓶颈）。
+TREE_SWING_CALLS = 3
 
 #: 【task-218 ④】一棵树的大致体力成本（斧头 ~10 体力/刀 × 8–12 刀）。
 #: 日级预算用它做保守估计：**浇水/收获优先，绝不为砍树漏浇**（`longrun._stage_tiles`）。
@@ -2417,6 +2427,12 @@ class FarmWorker:
         # 【task-218】多刀类（树 / 够格的 clump）用 `MAX_TREE_SWINGS`：树要砍倒+清桩，
         # 巨石要连敲；草仍是 `MAX_CLEAR_SWINGS=4`。判据一律"**kind 离开这一类**"。
         cap = MAX_TREE_SWINGS if multi else MAX_CLEAR_SWINGS
+        # 【task-241】树/clump/石/枝：`tool_ineffective` **不再单发封格** —— Mod 每次调用
+        # 内部只挥 6 下，一棵树要多发几次请求才倒（0.7.41 冒烟 9 格全是"单发即封"）。
+        # 给最多 `TREE_SWING_CALLS` 次调用；草/杂草仍按旧口径（单发即结论）。
+        retry_inert = multi or kind in DEBRIS_KINDS
+        if retry_inert:
+            cap = min(cap, TREE_SWING_CALLS)
         tool = want if multi else ("scythe" if want_grass else "auto")
         traces: list[str] = []
         statuses: list[str] = []    # 每次请求的 Mod status（进 after，供事后复核）
@@ -2424,6 +2440,8 @@ class FarmWorker:
         env_block = ""              # Mod 说"现在整个环境不让动手"
         unreach = ""                # 【task-52】Mod 说"这一格走不到"（A* 没算出路径）
         swung = False               # 至少有一次请求**真的挥出去了**（回执 ok 但世界没变）
+        inert_calls = 0             # 【task-241】`tool_ineffective` 的连续调用次数
+        inert_receipts: list[str] = []
         for i in range(1, cap + 1):
             status = ""
             try:
@@ -2464,11 +2482,19 @@ class FarmWorker:
                 # 护栏 B 的判据是"逐格 kind 真的变了"（tree→stump 也算 progress），
                 # 不是"挥过刀"、也不依赖观测里根本不存在的 `farm.blockers`。
                 r.after = {**r.after, "kind_before": kind, "kind_after": after_kind,
-                           "cleared": True, "requests": i, "statuses": list(statuses)}
+                           "cleared": True, "requests": i, "statuses": list(statuses),
+                           **({"inert_calls": inert_calls} if inert_calls else {})}
                 r.reason = (f"已清掉（kind {kind or '未知'} → {kind_now or '未知'}；"
                             f"{'、'.join(traces)}）")
                 return r
             if status in TILE_INERT_STATUSES:
+                # 【task-241】有界补请求：Mod 单次调用内部只挥 6 下，树可能还没倒。
+                # 只有连续 `TREE_SWING_CALLS` 次都回"工具无效"才判这格干不动。
+                if retry_inert:
+                    inert_calls += 1
+                    inert_receipts.append(status)
+                    if inert_calls < TREE_SWING_CALLS:
+                        continue
                 conclusive = True
                 break
             # 【task-52】"走不到"要单独成类：它不是"这一格干不动"（世界可能变好），
@@ -2520,10 +2546,22 @@ class FarmWorker:
         # 记 skipped（不是 failed，见上面的 grass 限制），并打 proven_inert 让上层当天封格。
         r.code = "skipped"
         r.proven_inert = True
+        bound: dict[str, Any] | None = None
+        if conclusive and retry_inert and inert_calls >= TREE_SWING_CALLS:
+            # 【task-241】"单发 tool_ineffective 就封格"是 0.7.41 冒烟的瓶颈：证据必须是
+            # **有界连续调用**（本格打了 `inert_calls` 次请求、每次 Mod 内部挥 6 下、全回
+            # "工具无效"、kind 前后没变），而不是一次回执。
+            bound = {"calls": inert_calls, "receipts": list(inert_receipts),
+                     "kind_before": kind, "kind_after": after_kind, "tool": tool}
         if isinstance(r.after, dict):
             r.after = {**r.after, "kind_before": kind, "kind_after": after_kind,
-                       "cleared": False, "requests": i, "statuses": list(statuses)}
-        why = "Mod 回「工具全无效」" if conclusive else f"连挥 {cap} 刀"
+                       "cleared": False, "requests": i, "statuses": list(statuses),
+                       **({"tool_ineffective_bound": bound} if bound else {})}
+        if bound:
+            why = (f"连发 {bound['calls']} 次请求（每次 Mod 内部挥 6 下）全部回「工具全无效」"
+                   f"（statuses={'、'.join(bound['receipts'])}）")
+        else:
+            why = "Mod 回「工具全无效」" if conclusive else f"连挥 {cap} 刀"
         r.reason = (f"{why}（{tool}）这格还是 {kind_now or '未知'}"
                     f"⇒ 判据「kind 离开 {kind or '未知'}」未满足"
                     f"（{'、'.join(traces)}；回执 {r.receipt or '无'}）；{_work_context(obs)}")

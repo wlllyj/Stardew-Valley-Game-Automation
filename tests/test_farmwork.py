@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "brain"))
 from agentfarm.bridge import BridgeError  # noqa: E402
 from agentfarm.farmwork import (  # noqa: E402
     NEIGHBORS, NO_SLOT_CODE, FarmWorker, KIND_TOOL, LOOT_CONFIRM_TRIES, LOOT_CONFIRM_WAIT_S,
-    MAX_CLEAR_SWINGS, StepResult as SR, StageResult,
+    MAX_CLEAR_SWINGS, TREE_SWING_CALLS, StepResult as SR, StageResult,
     SURPLUS_MATERIAL_IDS, buy_count_for, farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles,
     farm_empty_dirt, has_seed_metadata, is_seed_offer, plantable_seeds, seed_season_state,
     is_unreachable, pick_seed_offer, player_free_slots, seed_offers_from, surplus_sell_plan,
@@ -971,14 +971,28 @@ class TestClearSwingsUntilKindChanges(unittest.TestCase):
         self.assertEqual(len(w.calls), MAX_CLEAR_SWINGS, "假 ok 不能让它提前收工")
         self.assertIn("还是 grass", r.reason)
 
-    def test_tool_ineffective_stops_immediately(self):
-        """Mod 明确回「工具全无效」（它自己已换遍工具）⇒ 立刻停手，不补第二刀。"""
+    def test_tool_ineffective_is_retried_three_times_then_bounded(self):
+        """【task-241】Mod 回「工具全无效」**不再单发封格**：树/石/枝最多补到 3 次请求。
+
+        背景（0.7.41 冒烟）：树上 Mod 每次调用内部只挥 6 下，单发 `tool_ineffective`
+        就记 blocked ⇒ 9 格全封死、一天砍不倒一棵。现在必须有界连发
+        `TREE_SWING_CALLS=3` 次，仍无效果才 blocked，并把"连发证据"写进
+        `after["tool_ineffective_bound"]`（calls/receipts/kind 前后/工具）。
+        """
         w = MiniWorld(records=[weed_rec()], inventory=INV_WITH_SCYTHE, tools=TOOLS_WITH_SCYTHE)
         w.fail_status[(60, 10)] = "tool_ineffective"
         r = make_worker(w).clear((60, 10))
-        self.assertEqual(len(w.calls), 1)
+        self.assertEqual(len(w.calls), TREE_SWING_CALLS,
+                         "单发不许直接封格：要补到 TREE_SWING_CALLS 次")
         self.assertEqual((r.code, r.proven_inert, r.failed), ("skipped", True, False))
-        self.assertIn("Mod 回「工具全无效」", r.reason)
+        self.assertIn("连发 3 次请求", r.reason)
+        bound = r.after.get("tool_ineffective_bound")
+        self.assertIsInstance(bound, dict)
+        self.assertEqual(bound["calls"], TREE_SWING_CALLS)
+        self.assertEqual(bound["receipts"], ["tool_ineffective"] * TREE_SWING_CALLS)
+        self.assertEqual(bound["kind_before"], "weed")
+        self.assertEqual(bound["kind_after"], "weed")
+        self.assertEqual(bound["tool"], "auto")
 
     def test_env_block_is_failed_and_not_sealed(self):
         """环境挡住（没存档/模态/渐黑）不是"这一格干不动" ⇒ failed、`env_block` 打标且**不封格**。"""
@@ -1109,7 +1123,8 @@ class TestClearSwingsUntilKindChanges(unittest.TestCase):
         self.assertTrue(r.inconclusive)
         self.assertFalse(r.env_block)
         self.assertFalse(r.proven_inert)
-        self.assertEqual(len(w.calls), MAX_CLEAR_SWINGS, "没结论要补刀到上限")
+        # 【task-241】枝/石类（weed/twig/stone）的请求上限被 `TREE_SWING_CALLS` 收窄到 3。
+        self.assertEqual(len(w.calls), TREE_SWING_CALLS, "没结论要补请求到上限")
         self.assertIn("stale", r.reason)
 
 
@@ -1260,7 +1275,8 @@ class TestRunStage(unittest.TestCase):
         self.assertEqual([s.code for s in res.steps], ["ok", "skipped"])
         self.assertEqual(res.ok_count, 1)
         self.assertEqual(res.skipped_count, 1)
-        self.assertEqual(len(w.calls), 2)          # 每格只挥一次
+        self.assertEqual(len(w.calls), 1 + TREE_SWING_CALLS,
+                         "树/石/枝 stuck 的那格要连发 TREE_SWING_CALLS 次（task-241）")
         self.assertEqual(len(res.failed_steps), 0)
 
 
@@ -2189,7 +2205,10 @@ class TestTask68OpenWay(unittest.TestCase):
         r = make_worker(w).clear(self.TARGET)
         self.assertEqual(r.code, "unreachable")
         self.assertIs(r.failed, False)
-        self.assertEqual(len(w.calls), 1, "只试一次就停（有界），不许在同一格死磕")
+        # 【task-241】那个被拒的邻格现在要连发 `TREE_SWING_CALLS` 次才判干不动；
+        # 有界性体现在"只尝试这一个突破口就退回 unreachable"，不再往别的邻格死磕。
+        self.assertEqual(len(w.calls), TREE_SWING_CALLS,
+                         "开路只试一个邻格且该格连发上限次（有界）")
         self.assertIn("上限 4 次", r.reason)
 
     def test_stood_is_true_only_when_really_beside_target(self):
@@ -3655,6 +3674,87 @@ class TestTask240SeedSeasons(unittest.TestCase):
         self.assertEqual(rows[0]["stack"], 10)
         self.assertTrue(rows[0]["plantable_now"])
         self.assertEqual(plantable_seeds(self._player(seeds=None)), [])
+
+
+class TestTask241TreeSwingCalls(unittest.TestCase):
+    """task-241：树/石/枝的 `tool_ineffective` **单发不许封格**，最多补到 `TREE_SWING_CALLS`。
+
+    背景（0.7.41 冒烟 `logs/longrun-smoke-0741.jsonl`）：9 格 blocked 全是 `clear`，
+    reason 一律「第1次请求→tree；回执 tool_ineffective：Axe 挥 6 次无效（UsingTool=True）」
+    —— Mod 每次调用内部只挥 6 下，一棵 tree 要多次调用才倒，而旧实现第一次回
+    `tool_ineffective` 就 `conclusive` 封格 ⇒ 一天一棵都砍不倒。
+    """
+
+    def test_tree_needing_two_calls_is_ok(self):
+        w = MiniWorld(records=[{"tile": [60, 10], "kind": "tree"}],
+                      inventory=INV_WITH_SCYTHE, tools=TOOLS_WITH_SCYTHE)
+        w.swings_needed[(60, 10)] = 2
+        w.result[(60, 10)] = "stump"
+        r = make_worker(w).clear((60, 10))
+        self.assertTrue(r.ok, r.reason)
+        self.assertEqual(len(w.calls), 2)
+        self.assertEqual(r.after["kind_after"], "stump")
+
+    def test_tree_needing_three_calls_is_still_ok_not_sealed(self):
+        w = MiniWorld(records=[{"tile": [60, 10], "kind": "tree"}],
+                      inventory=INV_WITH_SCYTHE, tools=TOOLS_WITH_SCYTHE)
+        w.swings_needed[(60, 10)] = TREE_SWING_CALLS
+        w.result[(60, 10)] = "stump"
+        r = make_worker(w).clear((60, 10))
+        self.assertTrue(r.ok, r.reason)
+        self.assertEqual(len(w.calls), TREE_SWING_CALLS,
+                         "第 3 次才倒也要算成功（旧实现单发就封格）")
+        self.assertFalse(r.proven_inert)
+
+    def test_stuck_tree_is_capped_at_three_calls_with_bound_evidence(self):
+        w = MiniWorld(records=[{"tile": [60, 10], "kind": "tree"}],
+                      inventory=INV_WITH_SCYTHE, tools=TOOLS_WITH_SCYTHE)
+        w.stuck.add((60, 10))          # 每次 use_tool 都回 tool_ineffective
+        r = make_worker(w).clear((60, 10))
+        self.assertEqual(len(w.calls), TREE_SWING_CALLS,
+                         "上限是 TREE_SWING_CALLS（不是 MAX_TREE_SWINGS=16）")
+        self.assertEqual((r.code, r.proven_inert, r.failed), ("skipped", True, False))
+        self.assertIn("连发 3 次请求", r.reason)
+        bound = r.after["tool_ineffective_bound"]
+        self.assertEqual(bound["calls"], TREE_SWING_CALLS)
+        self.assertEqual(bound["kind_before"], "tree")
+        self.assertEqual(bound["kind_after"], "tree")
+        self.assertEqual(len(bound["receipts"]), TREE_SWING_CALLS)
+
+    def test_offline_fixture_smoke_0741_blocked_tiles_need_multiple_calls(self):
+        """离线夹具：用 0.7.41 冒烟真实 9 格 blocked（全是 tree）复跑 clear。
+
+        修复前：每格 1 次调用就封格（日志原文「第1次请求→tree」）；
+        修复后：每格都必须连发 `TREE_SWING_CALLS` 次才允许 blocked，且带连发证据。
+        """
+        import json
+        import os
+        log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "logs", "longrun-smoke-0741.jsonl")
+        if not os.path.isfile(log):        # 干净检出（logs/ 不入库）⇒ 跳过，不造假
+            self.skipTest("logs/longrun-smoke-0741.jsonl 不在（机器上才有）")
+        tiles: list[tuple[int, int]] = []
+        with open(log, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if '"event": "blocked"' not in line:
+                    continue
+                ev = json.loads(line)
+                if ev.get("action") != "clear":
+                    continue
+                t = tuple(int(v) for v in ev.get("tile") or ())
+                if len(t) == 2 and t not in tiles:
+                    tiles.append(t)
+        self.assertEqual(len(tiles), 8, "冒烟里 9 条 blocked / 8 个不同 tile")
+        w = MiniWorld(records=[{"tile": [x, y], "kind": "tree"} for x, y in tiles],
+                      inventory=INV_WITH_SCYTHE, tools=TOOLS_WITH_SCYTHE)
+        for t in tiles:
+            w.stuck.add(t)
+        worker = make_worker(w)
+        for t in tiles:
+            r = worker.clear(t)
+            self.assertEqual((r.code, r.proven_inert), ("skipped", True), r.reason)
+            self.assertEqual(r.after["tool_ineffective_bound"]["calls"],
+                             TREE_SWING_CALLS, f"{t} 必须连发 {TREE_SWING_CALLS} 次才判干不动")
 
 
 if __name__ == "__main__":  # pragma: no cover

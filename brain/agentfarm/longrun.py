@@ -46,7 +46,7 @@ from .farmwork import (CLUMP_KINDS, ENV_BLOCK_STATUSES, FRONTIER_KINDS, PATH_STA
                        SEED_KEEP_FACTOR, SLOT_RELIEF_KEEP, STAGE_ACTION, STAMINA_COST_CLEAR,
                        STAMINA_COST_SOW,
                        STAMINA_COST_TILL, STAMINA_COST_WATER, STEP_RESULT_CODES,
-                       TREE_KIND, TREE_STAMINA_ESTIMATE,
+                       TREE_KIND,
                        UPGRADE_KINDS, UPGRADE_PRICES,
                        UPGRADE_TRADE_ITEMS, FarmWorker, StageResult, StepResult,
                        buy_count_for, farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles,
@@ -91,9 +91,13 @@ ACTIONABLE_KINDS = ("weed", "twig", "stone", "grass")
 #: 而树要额外受日级体力预算约束（`_tree_budget_left`）——混在一起会让预算挡下的树把守卫钉死。
 CLEARABLE_KINDS = ACTIONABLE_KINDS + (TREE_KIND,) + CLUMP_KINDS
 
-#: 【task-218 ④】一天最多砍几棵树。一棵树 ~10 体力/刀 × 8–12 刀 ≈ 100 体力（`TREE_STAMINA_ESTIMATE`），
-#: 砍多了必然漏浇 ⇒ 再加一条"剩余体力够不够砍一棵"的门槛；**浇水/收获永远优先**。
-TREE_CLEAR_MAX_PER_DAY = 2
+#: 【task-241】清障预算**体力驱动**（0.7.41 冒烟的硬编码"每天 2 棵"对照 `farm.trees 804`
+#: ⇒ 要 400 天，目标 1「整场清完」不可达）。预算 = 可支配体力 ÷ 单棵成本，封顶
+#: `MAX_TREES_PER_DAY`。单棵成本按卡面口径估：每棵 ~6 刀 × `STAMINA_COST_CLEAR`；
+#: 浇水/收获永远优先（`_stamina_budget` 的 `water_reserve` 先扣）。砍倒一棵后
+#: `trees_cleared_today` 立刻 +1 且下一轮用**新观测**重算剩余预算。
+MAX_TREES_PER_DAY = 20
+TREE_STAMINA_COST = 6.0 * STAMINA_COST_CLEAR
 
 #: 【task-219】"不产生瓦片级执行对账"的任务：它们本来就不按"有没有目标格"判，
 #: 所以**免于**"非空 reasons 才合格"这条不变式（但它们仍然要有 `intent_execution` 记录）。
@@ -3382,40 +3386,60 @@ class LongRun:
         return int(raw)
 
     def _tree_budget_left(self, obs: dict[str, Any]) -> bool:
-        """【task-218 ④】今天还能不能砍树。两条都要满足：
+        """【task-218 ④ / task-241】今天还能不能砍树（**体力驱动**预算 + 浇水优先）。
 
-          * 今天砍倒的树 < `TREE_CLEAR_MAX_PER_DAY`；
-          * `体力 − 浇水预备 > TREE_STAMINA_ESTIMATE`（`_stamina_budget()` 的同一份真值）
-            ⇒ **绝不为砍树漏浇**（用户目标：作物先伺候完）。
+        判据：`_tree_budget_room(obs) > 0`（可支配体力 ÷ 单棵成本，封顶
+        `MAX_TREES_PER_DAY`，见 `_tree_budget_room`），且 `clear_area` 整体没被预算拦下。
 
         预算挡下的树：不进 `_stage_tiles` 目标池、不算"还有活"（`_plot_has_work`）、
         也不进 `_leftover`（"今天不做 ≠ 该做没做"），**不记 hard failure**。
-        每天记一次 `rep.notes`（**不发新事件名**：analyzer 的机械枚举会因此漂移）。
+        每天记一次 `deferred_by_budget`（**不发新事件名**：analyzer 的机械枚举会因此漂移），
+        理由写清「预算 N / 已砍 M」。
         """
         # 整个 `clear_area` 已经被体力预算拦下时**不再单独留痕**（避免同一天两套
         # `deferred_by_budget` 语义打架，也避免已有用例的期望集合被无谓污染）。
         if self._budget_defer_reason("clear_area", obs):
             return False
-        if int(self.trees_cleared_today or 0) >= int(TREE_CLEAR_MAX_PER_DAY):
-            if not self.tree_budget_noted:
-                self.tree_budget_noted = True
-                self._journal("deferred_by_budget", task="clear_area_tree",
-                              why=f"今天已砍 {self.trees_cleared_today} 棵（上限 "
-                                  f"{TREE_CLEAR_MAX_PER_DAY}）",
-                              note="只因**砍树预算**而不做；不算硬失败、不进 leftover")
-            return False
+        if self._tree_budget_room(obs) > 0:
+            return True
+        if not self.tree_budget_noted:
+            self.tree_budget_noted = True
+            b = self._stamina_budget(obs)
+            try:
+                stam = float(b.get("stamina") or 0.0)
+                reserve = float(b.get("water_reserve") or 0.0)
+            except (TypeError, ValueError):
+                stam = reserve = 0.0
+            discretionary = max(0.0, stam - reserve)
+            raw = min(int(MAX_TREES_PER_DAY), int(discretionary // TREE_STAMINA_COST))
+            cleared = int(self.trees_cleared_today or 0)
+            self._journal("deferred_by_budget", task="clear_area_tree",
+                          why=(f"预算 {raw} 棵 / 已砍 {cleared} 棵（体力驱动：可支配体力 "
+                               f"{discretionary:g} ÷ 单棵 {TREE_STAMINA_COST:g}，封顶 "
+                               f"{MAX_TREES_PER_DAY}）"),
+                          budget_trees=raw, cleared_trees=cleared,
+                          discretionary_stamina=round(discretionary, 2),
+                          per_tree_stamina=TREE_STAMINA_COST,
+                          note="只因**砍树预算**而不做；不算硬失败、不进 leftover")
+        return False
+
+    def _tree_budget_room(self, obs: dict[str, Any]) -> int:
+        """【task-241】今天**还能砍几棵树**（体力驱动；封顶 `MAX_TREES_PER_DAY`）。
+
+        `budget = floor(max(0, 当前体力 − 浇水预备) ÷ TREE_STAMINA_COST)`，再减今天已砍。
+        证据不可用 ⇒ `_stamina_budget()` 走 conservative（`water_reserve = 现有体力`）⇒
+        可支配体力 0 ⇒ 返回 0（**fail-closed**：绝不为砍树漏浇）。返回 0 = "今天不砍"，
+        不是失败；每砍倒一棵 `trees_cleared_today` 立刻 +1，下一轮用新观测重算剩余额度。
+        """
         b = self._stamina_budget(obs)
-        stam = float(b.get("stamina") or 0.0)
-        reserve = float(b.get("water_reserve") or 0.0)
-        if (stam - reserve) <= float(TREE_STAMINA_ESTIMATE):
-            if not self.tree_budget_noted:
-                self.tree_budget_noted = True
-                self._journal("deferred_by_budget", task="clear_area_tree",
-                              why=(f"体力 {stam:g} − 浇水预备 {reserve:g} ≤ 砍一棵树的估算 "
-                                   f"{TREE_STAMINA_ESTIMATE:g}"),
-                              note="浇水优先，绝不为砍树漏浇；不算硬失败、不进 leftover")
-            return False
-        return True
+        try:
+            stam = float(b.get("stamina") or 0.0)
+            reserve = float(b.get("water_reserve") or 0.0)
+        except (TypeError, ValueError):
+            return 0
+        discretionary = max(0.0, stam - reserve)
+        budget = min(int(MAX_TREES_PER_DAY), int(discretionary // TREE_STAMINA_COST))
+        return max(0, budget - int(self.trees_cleared_today or 0))
 
     def _deferred_scan(self, task: str, obs: dict[str, Any]) -> list[tuple[int, int]]:
         """【task-163】还没挑作业区时，用观测直接扫出"这个任务今天有多少格没做完"。
@@ -4173,7 +4197,7 @@ class LongRun:
                                               _dist(item[0], anchor), item[0][1], item[0][0]))
             trees: list[tuple[int, int]] = []
             if tree_ok:
-                room = max(0, int(TREE_CLEAR_MAX_PER_DAY) - int(self.trees_cleared_today or 0))
+                room = self._tree_budget_room(obs)
                 trees = [t for t, _v in tree_cands[:room]]
             # 非树障碍仍**只取片地内**（旧口径不变）：老四类 debris + 够格的 clump 一族。
             non_tree = [t for t in local
@@ -6163,8 +6187,17 @@ class LongRun:
                 continue
             self.blocked[key] = f"{s.action} 无效：{s.reason[:80]}"
             marked += 1
+            # 【task-241】树/石/枝的"干不动"必须有**有界连续调用**证据（单发
+            # tool_ineffective 曾把 0.7.41 冒烟的 9 格全封死）；证据从 StepResult.after 带过来。
+            bound = None
+            if isinstance(s.after, dict):
+                bound = s.after.get("tool_ineffective_bound")
+            extra: dict[str, Any] = {}
+            if isinstance(bound, dict) and bound:
+                extra = {"tool_ineffective_bound": bound}
             self._journal("blocked", tile=list(key), action=s.action,
-                          no_effect=bool(s.failed), reason=s.reason[:160])
+                          no_effect=bool(s.failed), reason=s.reason[:160],
+                          **extra)
         if marked:
             rep.notes.append(
                 f"记下 {marked} 格「动了没用」的地，今天不再碰（共 {len(self.blocked)} 格）")

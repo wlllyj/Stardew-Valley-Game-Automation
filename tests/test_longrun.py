@@ -48,7 +48,7 @@ from agentfarm.longrun import (  # noqa: E402
     MAX_STUCK_FLUSH, MAX_TILE_ATTEMPTS, PLOT_EXHAUSTED_BURST, READY_FAR_MAX_TRIES,
     NON_PLOT_INTENT_TASKS,
     SLOT_RELIEF_MAX, SLOT_RELIEF_KEEP, SLOT_RELIEF_MAX_STACKS_TOTAL, SLOT_RESERVE,
-    STEP_CODE_TO_REASON, TREE_CLEAR_MAX_PER_DAY,
+    STEP_CODE_TO_REASON, MAX_TREES_PER_DAY,
     DayReport, LongRun,
     _intent_coverage_ok, _till_blocked_by, is_justified_end, plot_observe,
 )
@@ -10532,7 +10532,8 @@ class TestTask218TreeClearing(unittest.TestCase):
     背景（用户 m18938/m18962）：`planner.OBSTACLE_KINDS` 含 `tree`、`Brief.counts["blockers"]`
     也算树 ⇒ 模型确实输出 `clear_area`，但 `farmwork.SKIP_KINDS` 把树静默跳过 ⇒
     "意图被实现层悄悄缩小"，十几轮没人砍过树。本卡把 tree 移出 SKIP_KINDS、加多刀判据、
-    加日预算（`TREE_CLEAR_MAX_PER_DAY`，浇水/收获永远优先），并给护栏 A/B 的结构性用例。
+    加日预算（**task-241 起改体力驱动**：`_tree_budget_room()`，封顶 `MAX_TREES_PER_DAY`，
+    浇水/收获永远优先），并给护栏 A/B 的结构性用例。
     """
 
     def _run(self, w: FakeWorld):
@@ -10572,7 +10573,9 @@ class TestTask218TreeClearing(unittest.TestCase):
         w.blockers[(60, 10)] = "tree"
         w.blockers[(61, 10)] = "weed"
         run = self._run(w)
-        run.trees_cleared_today = TREE_CLEAR_MAX_PER_DAY
+        # 【task-241】预算改成体力驱动：把"可支配体力"设成 0（浇水预备吃掉全部体力）
+        # 等价于"预算 0 棵"，比旧的"已砍满 2 棵"更贴近真机口径。
+        run.trees_cleared_today = MAX_TREES_PER_DAY
         tiles = run._stage_tiles("clear_area", w.obs(), self._plot((60, 10), (61, 10)))
         self.assertNotIn((60, 10), tiles, "树的日预算用满 ⇒ 今天不再列树")
         self.assertIn((61, 10), tiles, "非树清障不受树的日预算影响")
@@ -10580,13 +10583,19 @@ class TestTask218TreeClearing(unittest.TestCase):
     def test_tree_budget_uses_the_existing_deferred_event_once(self):
         w = FakeWorld(weeds=0, seeds=0, money=0)
         run = self._run(w)
-        run.trees_cleared_today = TREE_CLEAR_MAX_PER_DAY
+        run.trees_cleared_today = MAX_TREES_PER_DAY
         self.assertFalse(run._tree_budget_left(w.obs()))
         self.assertFalse(run._tree_budget_left(w.obs()))
         ev = self._events(run, "deferred_by_budget")
         self.assertEqual(len(ev), 1, "每天一条（复用既有事件名，不新增 analyzer 桶）")
         self.assertEqual(ev[0]["task"], "clear_area_tree")
         self.assertIn("不算硬失败", ev[0]["note"])
+        # 【task-241】理由必须是「预算 N / 已砍 M」的体力驱动口径（含推导字段）。
+        self.assertIn("预算", ev[0]["why"])
+        self.assertIn("已砍", ev[0]["why"])
+        self.assertEqual(ev[0]["cleared_trees"], MAX_TREES_PER_DAY)
+        self.assertIn("discretionary_stamina", ev[0])
+        self.assertIn("per_tree_stamina", ev[0])
 
     def test_guardrail_b_ok_without_kind_change_is_incomplete(self):
         """护栏 B（P0-1 逐格版）：有 ok 步、kind 却一格没变 ⇒ 该阶段如实 incomplete。"""
@@ -10689,6 +10698,77 @@ class TestTask218TreeClearing(unittest.TestCase):
                          "真清掉的格必须进逐格证据（真 FarmWorker 走假桥）")
         self.assertIsNone(stage["blocker_drop"],
                           "观测里没有 farm.blockers ⇒ info 是 None，不当 0（P0-1）")
+
+
+class TestTask241TreeBudgetAndBoundaryEvidence(unittest.TestCase):
+    """task-241：清障预算**体力驱动** + 树"干不动"必须带**有界连发**证据。
+
+    背景（0.7.41 冒烟 `logs/longrun-smoke-0741.jsonl`）：硬编码"每天 2 棵"对照观测
+    `farm.trees=804` ⇒ 要 400 天，用户目标「整场清完」不可达；而 9 格 blocked 全是
+    单发 `tool_ineffective` 就封格（日志原文「第1次请求→tree」）。
+    """
+
+    def _run(self, w: FakeWorld):
+        client = FakeClient(w)
+        worker = FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+        run = make_run(w, client_factory=lambda: client, worker_factory=lambda c: worker)
+        run.worker = worker
+        run.client = client
+        return run
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list[dict]:
+        return [e for e in run.entries if e.get("event") == name]
+
+    def test_tree_room_is_stamina_driven_and_capped(self):
+        """预算 = (体力 − 浇水预备) ÷ 单棵成本，封顶 `MAX_TREES_PER_DAY`；已砍的要扣掉。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0, stamina=270.0)
+        run = self._run(w)
+        room = run._tree_budget_room(w.obs())
+        self.assertEqual(room, MAX_TREES_PER_DAY,
+                         "270 体力 ⇒ 远超封顶，按上限 20 棵算（不再硬编码 2 棵）")
+        run.trees_cleared_today = 3
+        self.assertEqual(run._tree_budget_room(w.obs()), MAX_TREES_PER_DAY - 3,
+                         "砍倒一棵立刻从预算里扣（下一次重观测就少一棵）")
+
+    def test_tree_room_zero_when_stamina_only_covers_watering(self):
+        w = FakeWorld(weeds=0, seeds=0, money=0, stamina=5.0)
+        run = self._run(w)
+        self.assertEqual(run._tree_budget_room(w.obs()), 0,
+                         "可支配体力不够一棵 ⇒ 0 棵（浇水优先，绝不漏浇）")
+        self.assertFalse(run._tree_budget_left(w.obs()))
+        ev = self._events(run, "deferred_by_budget")
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["task"], "clear_area_tree")
+        self.assertIn("预算 0 棵", ev[0]["why"])
+        self.assertIn("已砍 0 棵", ev[0]["why"])
+
+    def test_blocked_journal_carries_bounded_inert_evidence(self):
+        """树 blocked 的 journal 必须带 `tool_ineffective_bound`（连发次数/回执/kind 前后）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(36, 10)] = "tree"
+        run = self._run(w)
+        before = w.obs()
+        after = w.obs()          # 世界没变 ⇒ 逐格 before==after
+        step = StepResult(
+            action="clear", tile=(36, 10), ok=False, code="skipped",
+            reason="连发 3 次请求（每次 Mod 内部挥 6 下）全部回「工具全无效」", proven_inert=True,
+            before="tree", after={"kind_before": "tree", "kind_after": "tree",
+                                  "cleared": False, "requests": 3,
+                                  "tool_ineffective_bound": {
+                                      "calls": 3, "receipts": ["tool_ineffective"] * 3,
+                                      "kind_before": "tree", "kind_after": "tree",
+                                      "tool": "axe"}})
+        rep = DayReport(day_key=("winter", 1, 1), started_at=0.0)
+        run._mark_blocked(before, after, [step], rep)
+        ev = self._events(run, "blocked")
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["tile"], [36, 10])
+        bound = ev[0].get("tool_ineffective_bound")
+        self.assertIsInstance(bound, dict, "blocked 事件必须带连发证据（单发不再封格）")
+        self.assertEqual(bound["calls"], 3)
+        self.assertEqual(len(bound["receipts"]), 3)
+        self.assertEqual((bound["kind_before"], bound["kind_after"]), ("tree", "tree"))
 
 
 class TestTask219IntentCoverage(unittest.TestCase):
