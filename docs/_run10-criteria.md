@@ -80,43 +80,52 @@
 
 > 起因：LLM 明确要求 `clear_area`（简报里树就是障碍），而实现层 `SKIP_KINDS` 静默跳过树 —— **没有任何一条判据发现"意图被无声缩水"**，这个缺口活了十几轮。本节把"每个 LLM 意图都必须有执行对账"固化成判据；实现卡 = task-219（brain）、task-220（analyzer）。
 
-### 8.1 数据形状（只有这三样，别再加新事件名）
+### 8.1 数据形状（三个**挂载点**，不是新事件名；2026-10-18 按 task-219/220 实现与 task-232 对账修订）
 
-1. `intent_plan{intent_id, task, area_hint, source(deterministic|llm), boundary, at}` —— 决策落地时每个意图一条（可挂在现有 `decision` 行上，加字段）。
-2. `intent_execution{intent_id, task, requested_tiles, executed_steps, ok_steps, unexecuted_tiles, reasons:{code:count}}` —— 该意图被换掉或当天收尾时记一条。
-3. `day_end.intent_coverage[]` —— 当天所有意图的执行对账汇总；**不新增 checks 键**。
+1. **`decision.plans[]`**（挂在既有 `decision` 行上的字段）—— 每个意图 `{intent_id, task, area_hint, source(deterministic|llm), boundary}`；`intent_id = "<day_key>#<seq>"`。
+2. **`day_end.intent_coverage[]`** —— 当天每个意图的执行对账 `{intent_id, task, requested_tiles, ok_tiles, failed_tiles, unexecuted_tiles, executed_steps, reasons:{code:count}, area_hint, source, boundary, reasons_are_intent_level}`；**不新增 checks 键**。
+3. **`<journal>-gaps.json`**（旁车文件，schema `agentfarm-gaps/1`）—— 缺口清单按 `(kind|capability, tool, reason)` 聚合 `count/first_seen/last_seen/sample_tiles`；**per-run 隔离**，跨 run 聚合由工具侧只读生成 `logs/gaps-registry.json`。
 
-### 8.2 固定原因码枚举（闭合集，出现集外值 ⇒ 判红；2026-10-18 按 task-225 评审修订）
+**关键字段（analyzer 判红依赖，改名会静默失效 ⇒ 必须有源码漂移测试）**：`reasons_are_intent_level`（区分 intent 级 vs 瓦片级口径）、`bad_reasons`（集外码不丢、专供判红）、`actionless`（无动作意图标记）。
 
-`no_target` / `unknown_evidence` / `superseded` / `deferred_capability` / `tool_level` / `budget` / `blocked_tile` / `blocked_modal` / `no_slot` / `world_stuck` / `gated` / `failed`。
+### 8.2 固定原因码枚举（闭合集，出现集外值 ⇒ 判红）
 
+目标集合 **12 码**：`no_target` / `unknown_evidence` / `superseded` / `deferred_capability` / `tool_level` / `budget` / `blocked_tile` / `blocked_modal` / `no_slot` / `world_stuck` / `gated` / `failed`。
+
+- **现状（2026-10-18）**：brain `INTENT_REASON_CODES` 是 **11 码**，缺 `failed`（由 task-230 补齐）⇒ 本文件只把 `failed` 标为「新增」，`unknown_evidence`/`superseded` 在 task-219 已落地；
 - **`no_target`** 必须附证据 `{stage_tiles_empty: true, obs_seq | counts 快照}`；`tiles` 缺失/截断/证据不可用 ⇒ **禁止裸用**，改用 `unknown_evidence`；
-- **`unknown_evidence`**（新）：观测不可用/被截断/字段缺失导致判不了 —— 这是"没证据"，不是"没目标"；
-- **`superseded`**（新）：策略层改写/合并意图（`_apply_policy`）导致该意图未执行 —— 与 verify 的 `cancel` 分开（cancel 归 `no_target`，unknown 归 `unknown_evidence`）；
-- **`failed`**（新）：执行了但真实失败（`tool_ineffective`/`sow_failed`/`no_seed`/中途体力耗尽等）—— 必须有**完备映射表**（单一数据源 + 漂移测试），映射不到的 step 状态码 ⇒ 判红（漏码即缺陷）；
-- `deferred_capability` 必须同时在 `DEFERRED_KINDS` 且**简报如实写"暂不支持 + 缺什么能力"**；只登记不告知 ⇒ 判红（这是"合法偷懒"的唯一出口，必须留证据）；
-- `budget` / `gated` 属策略性延后：**不进 hard failure**，但必须在 gaps/次日简报可见；
+- **`unknown_evidence`**：观测不可用/被截断/字段缺失导致判不了 —— "没证据"≠"没目标"；
+- **`superseded`**：策略层改写/合并意图（`_apply_policy`）导致该意图未执行 —— 与 verify 的 `cancel`（归 `no_target`）分开；
+- **`failed`**（新增）：执行了但真实失败（`tool_ineffective`/`sow_failed`/`no_seed`/中途体力耗尽等）—— 必须有**完备映射表**（单一数据源 + 漂移测试），映射不到的 step 状态码 ⇒ 判红（漏码即缺陷）；
+- `deferred_capability` 必须同时在 `DEFERRED_KINDS`；「简报如实写暂不支持」这条**由 brain 单测守**（analyzer 读不到提示词，日志层不可判）；
+- `budget` / `gated` 属策略性延后：**不进 hard failure**（gaps/次日简报可见性由 brain 单测守）；
 - 一个意图可以有多条原因码（按环节累计），但**不许 0 条**。
 
 ### 8.2b 计数单位与不变式（瓦片制）
 
 - `requested_tiles = ok_tiles + failed_tiles + unexecuted_tiles`；
-- `Σ reasons.count = failed_tiles + unexecuted_tiles`（`reasons.count` 明确按**瓦片数**计，不按 step 数）；
+- `Σ reasons.count = failed_tiles + unexecuted_tiles`（`reasons.count` 按**瓦片数**计，不按 step 数；intent 级原因码记 `reasons_are_intent_level: true` 时按 0 瓦片计）；
 - 对不上 ⇒ 判红（账目不可信）。
 
 ### 8.2c ACTIONLESS 白名单
 
-`sleep` / `review` / `wait_for_save` / `recover_stamina` 这类**无动作意图**在 `_verify_intents`（`brain/agentfarm/longrun.py:5924-5926`）不产生 verdict ⇒ 必须显式列入 `ACTIONLESS_TASKS`，否则 §8.3.2 会**每天误报**。不在白名单的任务一律按有动作意图对账。
+`sleep` / `review` / `wait_for_save` / `recover_stamina` 这类**无动作意图**在 `_verify_intents`（`brain/agentfarm/longrun.py:6314` 附近）不产生 verdict ⇒ 必须显式列入 `ACTIONLESS_TASKS`，否则 §8.3.2 会**每天误报**。不在白名单的任务一律按有动作意图对账。
 
-### 8.3 analyzer 判红（task-220 验收必须覆盖）
+### 8.3 analyzer 判红（task-220 实现 + task-232 对齐后，硬性 9 条）
 
-1. 有 `intent_plan` 而**无** `intent_execution` ⇒ 红（对账缺失）；
-2. `executed_steps==0` 且 `reasons` 为空 ⇒ 红（无声缩水）；
-3. `reasons` 含集外码 ⇒ 红；
-4. `deferred_capability` 而 `<journal>-gaps.json` 无对应条目 ⇒ 红（缺口没落盘）；
-5. `DEFERRED_KINDS` 里的 kind 出现可执行目标却一次都没执行 ⇒ 红（该取消的登记没取消）；
-6. 同 (kind, reason) 连续 **≥3 天**出现在 gaps 且无修复卡 ⇒ **⚠**（Lead 复核，不自动判红）；
-7. 旧账本没有这些字段 ⇒ 【无法判定】（缺失 ≠ 通过，也不许当失败）。
+1. 有意图计划而**无** `intent_coverage` 条目 ⇒ 红（对账缺失）；
+2. `executed_steps==0` 且 `reasons` 为空（且非 ACTIONLESS）⇒ 红（无声缩水）；
+3. `reasons` 含集外码（`bad_reasons` 非空）⇒ 红；
+4. `deferred_capability`/`tool_level`（能力缺口）而 `<journal>-gaps.json` 无对应条目 ⇒ 红（缺口没落盘）；
+5. gaps 条目里的 `kind` **不在** `DEFERRED_KINDS` ⇒ 红（登记表与缺口不一致；**注：原稿「DEFERRED_KINDS 里的 kind 出现可执行目标却一次没执行 ⇒ 红」语义不同，属另一件事，暂记待实现，见 §8.6**）；
+6. 瓦片不变式不符（§8.2b 两条）⇒ 红；
+7. `no_target` 无 `evidence.stage_tiles_empty` ⇒ 红；
+8. 同 `(kind, reason)` 连续 **≥3 天**出现在 gaps 且无修复卡 ⇒ **⚠**（Lead 复核，不自动判红）；
+9. 旧账本没有这些字段 ⇒ 【无法判定】（缺失 ≠ 通过，也不许当失败）。
+
+### 8.6 待实现（记入 backlog，不在 0.7.39）
+
+- 「`DEFERRED_KINDS` 里的 kind 出现可执行目标却一次都没执行 ⇒ 红」—— 需 brain 侧导出"每类 kind 是否产出过可执行目标"的证据，0.7.40 再评估（与 task-151/221 的田区工作一起）。
 
 ### 8.4 次日可见（只提示，不豁免）
 
