@@ -560,16 +560,36 @@ SCOPE_SHED_MAX_PER_DAY = 1
 SCOPE_SHED_MAX_FRACTION = 0.34
 
 
-def is_justified_end(ended_by: str, ended_reason: str) -> bool:
-    """这一天是不是以**正当理由**收工（`day_justified` 的判据，task-32）。
+#: 【task-15 / 0.7.45】新增的"**有证据**的诚实收工理由"：`day_justified` 只在这些前缀
+#: **且日终"当前可执行且可达的待做格"为 0** 时才认（见 `is_justified_end`）。
+#: 为什么不能直接并进 `JUSTIFIED_END_REASONS`：那会变成"口号达标" —— 只要写了
+#: `resume_exhausted:` 就绿，不看当天还有没有真能干的活（洗白通道）。
+HONEST_EXHAUSTED_END_REASONS = ("resume_exhausted",)
 
-    口径与旧实现逐字一致（`ended_reason.split(":", 1)[0] in 白名单`），只是把白名单提成
-    模块常量 `JUSTIFIED_END_REASONS` 并抽成函数：一是单测可以直接钉死"`no_plot` 不在里面"，
-    二是别处（`_finish`/日报/工具）不会各抄一份前缀表。
+
+def is_justified_end(ended_by: str, ended_reason: str, *,
+                     pending_executable: int | None = None) -> bool:
+    """这一天是不是以**正当理由**收工（`day_justified` 的判据，task-32 / task-15）。
+
+    口径：
+    * `ended_by` 必须是 `sleep`（我们真的让游戏日翻篇了）；
+    * 前缀在 `JUSTIFIED_END_REASONS`（夜里到点 / 体力见底 / 确实没活）⇒ 正当（与旧实现逐字一致）；
+    * 【task-15】前缀在 `HONEST_EXHAUSTED_END_REASONS`（`resume_exhausted`）**且**
+      `pending_executable == 0` ⇒ 正当。"换片/回片区/当前观测都拿不出目标"本来就是诚实收工，
+      但必须带独立证据：日终"当前可执行且可达"的待做格确实是 0。`pending_executable is None`
+      （观测证据不可用）一律按"不确定"处理 ⇒ 不放行（fail-closed，绝不把"没看到"当成"没有"）；
+    * 其余前缀（`stuck` / `inventory_blocked` / `gave_up_*` / `no_water` / `no_plot` …）照旧不放行。
+
+    旧口径逐字保留在第一条白名单分支上（单测可直接钉死"`no_plot` 不在里面"）。
     """
     if ended_by != "sleep":
         return False
-    return str(ended_reason or "").split(":", 1)[0] in JUSTIFIED_END_REASONS
+    prefix = str(ended_reason or "").split(":", 1)[0]
+    if prefix in JUSTIFIED_END_REASONS:
+        return True
+    if prefix in HONEST_EXHAUSTED_END_REASONS:
+        return pending_executable is not None and int(pending_executable) == 0
+    return False
 
 
 #: "上一天未知"的哨兵日键：用来把**一天的第一次决策**顶到 `new_day` 边界上
@@ -740,6 +760,31 @@ class DayReport:
     #: 绝不拿这两个数放宽判据 —— 该做没做照旧如实、当天仍可不 VERIFIED。
     plot_pending_executable: int = 0
     plot_pending_blocked: int = 0
+    #: 【task-15 / 0.7.45】日终"还有活"的**多口径并列留痕**（只作 info，不改 checks 10 键语义；
+    #: `day_justified` 只看 `pending_executable`）：
+    #: * `pending_ledger` = **原始账本**口径余格（0.7.44 冒烟 journal 的 `pending=263/217`）；
+    #: * `pending_guard` = 守卫口径 `_pending_work()` 的日终读数（ledger − 已判死）；
+    #: * `pending_stalled` = 其中被卡 1 换片机制标成"回去看过、拿不出目标"或被围住的格数
+    #:   （`resume_stall_tiles` ∪ `encircled_day`；它们不再进守卫"还有活"，但如实留痕）；
+    #: * `pending_executable` = 最后一张**户外农场观测**里"看得见 + 确实要做 + 预算/工具允许 +
+    #:   站得到边上"的格数；`None` = 观测证据不可用（fail-closed，不放行 `resume_exhausted`）；
+    #: * `pending_blocked` = ledger 里今天**已判死**的格数（`blocked` ∪ `encircled_day` ∪
+    #:   `resume_stall_tiles`：干不动/走不到/被围住/回去看过拿不出目标）；
+    #: * `pending_unobserved` = 其余（不在 `tiles[]`/观测截断/已达标陈旧账本/预算延后/工具不够/
+    #:   背包堵/四邻没得站/无法判定）。
+    #: 不变式：`pending_ledger == pending_guard + pending_blocked`；
+    #: `pending_guard == pending_executable + pending_unobserved`（观测不可用时 executable=guard）。
+    pending_ledger: int = 0
+    pending_guard: int = 0
+    pending_stalled: int = 0
+    pending_executable: int | None = None
+    pending_blocked: int = 0
+    pending_unobserved: int = 0
+    #: 【task-15 / 0.7.45】当天"更早轮 leftover>0、**最后一轮**同种类 leftover==0"的
+    #: `stage_midway_leftover` 事件明细（count/tiles/leftover/round/stage）。
+    #: 日级判定**不许只看最后一轮**：这些轮次的一手读数在这里并列留痕（只作 info，
+    #: 不改 `no_unmet_stages`/`plot_pending` 的既有公式）。
+    stage_midway_leftover: list[dict[str, Any]] = field(default_factory=list)
     deferred_tiles: int = 0
     #: 【task-158】当天的**浇水优先体力预算**（`stamina_budget` journal 的同名快照）：
     #: `{max, stamina, live_crops, dry, water_reserve, water_cost_est, path_allowance,
@@ -854,6 +899,16 @@ class DayReport:
             # 【task-5 / 0.7.44】可执行余格 vs 物理挡死格（只 info；和恒等于 plot_pending）
             "plot_pending_executable": self.plot_pending_executable,
             "plot_pending_blocked": self.plot_pending_blocked,
+            # 【task-15 / 0.7.45】守卫 pending / 已标记停滞 / 当前观测可执行面（三口径并列；
+            # 只作证据，`checks` 仍只有 10 键，语义改动只有 `day_justified` 的"有证据"分支）
+            "pending_ledger": self.pending_ledger,
+            "pending_guard": self.pending_guard,
+            "pending_stalled": self.pending_stalled,
+            "pending_executable": self.pending_executable,
+            "pending_blocked": self.pending_blocked,
+            "pending_unobserved": self.pending_unobserved,
+            # 【task-15 / 0.7.45】更早轮 leftover>0 而最后一轮归零的遮蔽证据（日级判定不许只看最后一轮）
+            "stage_midway_leftover": [dict(m) for m in self.stage_midway_leftover],
             "deferred_tiles": self.deferred_tiles,
             # 【task-168】主动认输的片区（只 info：不进 checks、不扣 plot_pending/assigned_undone）
             "scope_shed": dict(self.scope_shed),
@@ -3677,6 +3732,10 @@ class LongRun:
                 # 后者是 A8 冬 9/14 的病灶之一：`[37,35]` 被围住却仍被算成"field_sw 还有地要清"，
                 # 守卫因此一整天不放行、而执行层每轮又拿它当目标（世界不变）⇒ 3 轮 idle 判 stuck。
                 continue
+            if t in self.resume_stall_tiles:
+                # 【task-15 / 0.7.45】换片机制"回去看过、拿不出目标"的格今天也不算这片地的活
+                # （否则守卫被 0.7.44 冒烟冬 27 的 217 格旧账钉死；日终在 pending_stalled 留痕）。
+                continue
             tv = tmap.get(t)
             if tv is None:
                 # 没动过的格子在 tiles[] 里根本不存在，只能靠 tillable[] 认。
@@ -3981,41 +4040,56 @@ class LongRun:
                 f"回片区/换片都拿不出目标 ⇒ 先清观测里可达的一格 {tile}"
                 f"（frontier_clear {self.frontier_clears}/{FRONTIER_CLEAR_MAX}）")
             return "acted", None
-        # ③ 确实没有可执行目标 ⇒ 诚实收工（不写 stuck、不判 VERIFIED）。
+        # ③ 确实没有可执行目标 ⇒ 诚实收工（不写 stuck；`day_justified` 由可执行面证据决定：
+        #    当前观测里一格可执行格都没有才认，有活却收工照旧不 VERIFIED）。
         self._resume_exhausted(obs, rep, plot=plot, where=where, marked=marked)
         return "ended", None
 
     def _resume_exhausted(self, obs: dict[str, Any], rep: "DayReport", *,
                           plot: dict[str, Any] | None, where: str, marked: int = 0) -> None:
-        """【task-4 / 0.7.44】回片区/换片/观测都拿不出目标 ⇒ 诚实收工。
+        """【task-4 / 0.7.44】【task-15 / 0.7.45】回片区/换片/观测都拿不出目标 ⇒ 诚实收工。
 
-        * `ended_reason` 前缀 = `resume_exhausted`：不在 `JUSTIFIED_END_REASONS` 白名单 ⇒
-          `day_justified=False`、当天**绝不 VERIFIED**（与 `no_work`/`stuck` 都区分开）；
+        * `ended_reason` 前缀 = `resume_exhausted`：不在 `JUSTIFIED_END_REASONS` 白名单；
+          但【task-15】`is_justified_end` 另有一条**带证据**的分支 —— 日终"当前可执行且可达"
+          的待做格为 0 时才认（证据 = `_pending_snapshot`）。**不是无条件放行**：只要观测里
+          还有一格真能干（或观测证据不可用），`day_justified` 仍是 False、当天绝不 VERIFIED。
         * `ended_by` 由 `_do_sleep` 决定：睡成功 = `"sleep"`（游戏日真的前进）；
           睡失败/0 动作被拒 = 原样返回（照样不 VERIFIED）。**绝不写** `stuck:` ——
           "今天真没有可执行目标"不是卡死；0.7.43 冬 7/12/18 三天就是这么被误报成 stuck 的；
-        * journal 复用既有事件 `no_progress_burst`（`exhausted=True` + 新增字段），不新增事件名。
+        * journal 复用既有事件 `no_progress_burst`（`exhausted=True` + 新增证据字段），不新增事件名。
         """
         plot = plot or {}
-        pending = self._pending_work()
+        # 事件里的 `pending` 保留**原始账本口径**（与 0.7.44 冒烟 journal 的 263/217 可直接对数）；
+        # 守卫口径另记 `pending_guard`（= `_pending_work()`，已剔停滞/被围）。
+        raw_pending = self._ledger_pending()
         reasons = self.work_reasons(obs)[:3]
-        encircled_pending = sorted(t for t in pending if t in self.encircled_day)
+        encircled_pending = sorted(t for t in raw_pending if t in self.encircled_day)
         from_anchor = self._resume_anchor(plot)
+        # 【task-15 / 0.7.45】收工同时把"可执行面"证据一起记下来（与 day_end 同一口径）：
+        # 写 resume_exhausted 的时候必须能指着数字说"当前观测里真的一格可执行格都没有"。
+        snap = self._pending_snapshot(obs)
         self._journal(
             "no_progress_burst", count=self.no_progress_cycles,
             source=f"回片区（{where}）", tiles=len(plot.get("tiles") or []),
             reasons=reasons, exhausted=True,
             from_area=str(plot.get("area") or ""),
             from_anchor=[from_anchor[0], from_anchor[1]] if from_anchor else None,
-            pending=len(pending), stalled_tiles=len(self.resume_stall_tiles),
+            pending=len(raw_pending), pending_ledger=snap["ledger"],
+            stalled_tiles=len(self.resume_stall_tiles),
             newly_stalled=marked, encircled_pending=len(encircled_pending),
             switches=self.resume_switches, farm_actions_today=self.farm_actions_today,
-            samples=[[t[0], t[1]] for t in sorted(pending)[:8]],
+            samples=[[t[0], t[1]] for t in raw_pending[:8]],
+            # 【task-15 / 0.7.45】新增证据字段（事件名不变）
+            pending_executable=snap["executable"], pending_blocked=snap["blocked"],
+            pending_unobserved=snap["unobserved"], pending_guard=snap["guard"],
+            pending_stalled=snap["stalled"],
             note="回片区 / 换片 / 当前观测都没有可执行目标 ⇒ 今天按 resume_exhausted 诚实收工："
-                 "睡下去让游戏日前进，但绝不写 stuck、也绝不判 VERIFIED")
+                 "睡下去让游戏日前进；只有当前观测里**确实没有可执行格**时 day_justified 才认这条，"
+                 "否则照旧不 VERIFIED")
         rep.notes.append(
-            f"回片区 {len(self.resume_stall_tiles)} 格 / 换片 {self.resume_switches} 次都拿不出目标、"
-            f"当前观测也没有可执行格 ⇒ 按 resume_exhausted 诚实收工（不判 VERIFIED）")
+            f"回片区 {len(self.resume_stall_tiles)} 格 / 换片 {self.resume_switches} 次都拿不出目标；"
+            f"当前观测可执行 {snap['executable']} 格 vs 守卫口径 {snap['guard']} 格 ⇒ 按 resume_exhausted "
+            f"诚实收工（day_justified 由可执行面证据决定）")
         why = (f"resume_exhausted:回片区 {len(self.resume_stall_tiles)} 格都回去看过、"
                f"换片 {self.resume_switches} 次，当前观测里没有可执行目标"
                f"（守卫仍说：{'；'.join(reasons) if reasons else '（无）'}）"
@@ -4823,6 +4897,17 @@ class LongRun:
 
         【task-163】被**体力预算显式延后**的格子也不算：延后是"今天不做"，与"干不动"不同 ⇒
         它们不该再让守卫说"还有活"（延后格数在 `budget_deferred_tiles{task: n}` 里如实记着）。
+
+        【task-15 / 0.7.45】**两套口径对齐**：守卫原先只认 `blocked`，而卡 1 换片机制把
+        "回去看过、拿不出目标"的格标进 `resume_stall_tiles` 后，它们**仍被算成"还有活"** ——
+        0.7.44 冒烟冬 26/27 的 263/217 格就是这么来的（冬 27 甚至 217/217 全部标了停滞、
+        守卫还报 217）。现在同样剔除：
+        * `resume_stall_tiles` = 换片/回片区已回去看过、当前确实拿不出目标的格（今天不算"活"，
+          日终在 `pending_stalled` 如实留痕，不进任何豁免）；
+        * `encircled_day` = 四邻没有突破口、今天物理上够不着的格（task-5 已不分配，守卫同口径）。
+        **诚实边界**：剔除只影响"今天还有没有活"这一个判断；`_leftover`/`plot_pending`/
+        `no_unmet_stages` 的既有会计公式一个字没动（该做没做照旧如实，见 day_end 的
+        `plot_pending*` / `stage_midway_leftover`）。
         """
         defer = self._budget_deferred_tile_set()
         # 【task-170 ②】今天已判"收不到"的收获格同样不算"还有活"（否则守卫被一格钉住）。
@@ -4830,7 +4915,9 @@ class LongRun:
         shed = self._shed_tile_set()
         return sorted(t for t in self.leftover_targets
                       if t not in self.blocked and t not in defer
-                      and t not in self.harvest_gave_up and t not in shed)
+                      and t not in self.harvest_gave_up and t not in shed
+                      and t not in self.resume_stall_tiles
+                      and t not in self.encircled_day)
 
     def _dead_tile_set(self) -> set[tuple[int, int]]:
         """【task-5 / 0.7.44】今天**"物理/判据挡死"**的格子：`blocked` ∪ `encircled_day`。
@@ -4846,21 +4933,157 @@ class LongRun:
         """
         return set(self.blocked) | set(self.encircled_day)
 
+    def _ledger_pending(self) -> list[tuple[int, int]]:
+        """【task-15 / 0.7.45】**原始账本口径**的待做余格（守卫口径的母集）。
+
+        = `leftover_targets` − `blocked` − 预算延后 − 认输 − 收不到；**不**剔
+        `resume_stall_tiles`/`encircled_day`。历史意义与旧 `_pending_work()` 完全一致
+        （0.7.44 冒烟里 journal 的 `pending=263/217` 就是这个口径），保留给证据/会计；
+        "守卫今天还算不算活"看 `_pending_work()`（它在此之上再剔停滞/被围格）。
+        """
+        defer = self._budget_deferred_tile_set()
+        shed = self._shed_tile_set()
+        return sorted(t for t in self.leftover_targets
+                      if t not in self.blocked and t not in defer
+                      and t not in self.harvest_gave_up and t not in shed)
+
     def _dead_end_pending(self) -> list[tuple[int, int]]:
         """【task-5 / 0.7.44】账本里**只剩"挡死"余格**时返回它们，否则 `[]`。
 
-        判据只看"还能不能执行"：`_pending_work()` 的格必须**全部**落在 `encircled_day`
-        （四邻没突破口）或 `resume_stall_tiles`（卡 1：回去看过、仍然拿不出目标）；`blocked`
-        的格本来就被 `_pending_work` 排除。这种日子再按窗口候选分配只会重分同一个做不成的格
-        （A8 冬 9/14：1 格阶段 28/62 轮、世界不变 ⇒ 3 轮 idle 判 stuck）⇒ 调用方应走卡 1 的
-        换片/`resume_exhausted` 诚实收工。
+        判据只看"还能不能执行"：账本余格必须**全部**落在 `encircled_day`（四邻没突破口）或
+        `resume_stall_tiles`（卡 1：回去看过、仍然拿不出目标）；`blocked` 的格本来就被排除。
+        这种日子再按窗口候选分配只会重分同一个做不成的格（A8 冬 9/14：1 格阶段 28/62 轮、
+        世界不变 ⇒ 3 轮 idle 判 stuck）⇒ 调用方应走卡 1 的换片/`resume_exhausted` 诚实收工。
+
+        【task-15 / 0.7.45】这里**刻意不用 `_pending_work()`**：后者已经把停滞/被围格当作
+        "今天不算活"剔掉（守卫口径），而本函数要回答的是"账本里**只剩**挡死格吗" ——
+        用剔除后的集合会永远得到 `[]`、把这条兜底路径变成死代码。所以走 `_ledger_pending()`。
         """
-        pending = self._pending_work()
+        pending = self._ledger_pending()
         if not pending:
             return []
         if not all(t in self.encircled_day or t in self.resume_stall_tiles for t in pending):
             return []
         return [t for t in pending if t not in self.blocked]
+
+    # ------------------------------------------------- task-15：可执行面快照
+    @staticmethod
+    def _standable_next_to(obs: dict[str, Any], tile: tuple[int, int]) -> bool:
+        """`tile` 的四邻里有没有"能站"的格（够不够得着）。
+
+        与 `farmwork.FarmWorker._standable_near` 同口径：观测明确 `standable=true`、玩家此刻
+        就站在旁边、或该邻格**没被观测覆盖**（交给 Mod 试）都算够得着；四邻都看过且都不能站
+        ⇒ 够不着。观测没覆盖的邻格按"可能能站"处理 —— fail-closed 方向是**别把真活洗白**
+        （宁可算可执行 ⇒ 当天不判 VERIFIED）。
+        """
+        tmap = FarmWorker.tiles_of(obs)
+        try:
+            pt = FarmWorker.player_tile(obs)
+        except Exception:  # pragma: no cover - 观测缺 player 时按"不知道站哪"处理
+            pt = None
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            n = (tile[0] + dx, tile[1] + dy)
+            if pt is not None and n == pt:
+                return True
+            ntv = tmap.get(n)
+            if ntv is None or ntv.get("standable"):
+                return True
+        return False
+
+    def _pending_snapshot(self, obs: dict[str, Any] | None) -> dict[str, int]:
+        """【task-15 / 0.7.45】日终"还有活"的**可执行面快照**（`day_justified` 的唯一"活"口径）。
+
+        输入 `obs` 应是当天**最后一张户外农场观测**（调用方从 `outdoor_obs` 取；没有则传
+        `None`）。输出（全部是**并列读数**，不互相推导豁免）：
+
+        * `ledger` = **原始账本**口径的余格（`leftover_targets` − 预算延后 − 认输 − 收不到；
+          0.7.44 冒烟 journal 里的 `pending=263/217` 就是这个口径）；
+        * `blocked` = ledger 里今天**已判死**的格（`blocked` ∪ `encircled_day` ∪
+          `resume_stall_tiles`：干不动/走不到/被围住/回去看过拿不出目标）；
+        * `stalled` = 其中"停滞/被围"那一类的子集（`resume_stall_tiles` ∪ `encircled_day`），
+          单列给 Lead 的对账表用；
+        * `guard` = `_pending_work()`（ledger − 已判死之后的"守卫口径"待做；
+          不变式 `guard + blocked == ledger`）；
+        * `executable` / `unobserved` = 对 `guard` 里的格按最后一张户外观测分类：
+          看得见 + 确实要做 + 预算/工具允许 + 站得到 ⇒ `executable`；其余（不在 `tiles[]`、
+          观测截断、已做/账本陈旧、预算延后、工具不够、背包堵、四邻没得站）⇒ `unobserved`
+          （不变式 `executable + unobserved == guard`；`None` 观测 ⇒ 全部算 executable 的
+          fail-closed 方向，见下）；
+        * `ledger == guard + blocked`、`guard == executable + unobserved`。
+
+        观测不可用（`obs is None` / 不是农场观测）⇒ **全部按可执行计**（fail-closed：不许把
+        "没看到"当"没有"，`day_justified` 因此不放行）。
+
+        分类顺序：已判死（`blocked`/`encircled_day`/`resume_stall_tiles`）→ 不在 `tiles[]`
+        ⇒ unobserved（这正是 0.7.44 冒烟 263/217 被判成"还有活"的病灶）→ 看得见但今天
+        已不需要做 ⇒ unobserved → 要做但不允许/站不到 ⇒ unobserved（"今天没证据能执行"）→ 其余 executable。
+        """
+        defer = self._budget_deferred_tile_set()
+        shed = self._shed_tile_set()
+        universe = [t for t in self.leftover_targets
+                    if t not in defer and t not in self.harvest_gave_up and t not in shed]
+        dead = self._dead_tile_set()
+        stalled_set = set(self.resume_stall_tiles) | set(self.encircled_day)
+        blocked_tiles = [t for t in universe if t in dead or t in self.resume_stall_tiles]
+        guard_tiles = [t for t in universe
+                       if t not in dead and t not in self.resume_stall_tiles]
+        base = {"ledger": len(universe), "guard": len(guard_tiles),
+                "stalled": sum(1 for t in universe if t in stalled_set),
+                "blocked": len(blocked_tiles)}
+        farm: dict[str, Any] | None = obs if (obs is not None and self._is_farm(obs)) else None
+        if farm is None:
+            # 观测证据不可用 ⇒ 不许声称"没有可执行的活"（executable 取全量 ⇒ day_justified 不放行）
+            return {**base, "executable": len(guard_tiles), "unobserved": 0}
+        tmap = FarmWorker.tiles_of(farm)
+        tillable = FarmWorker.tillable_of(farm)
+        _seeds, _money, can_plant = self._seed_outlook(farm)
+        deferred = self._budget_deferred_tasks()
+        # 用无副作用的预算读数（`_tree_budget_left` 会排队 `deferred_by_budget` 事件，别在日终再记一遍）
+        tree_ok = (not self._budget_defer_reason("clear_area", farm)
+                   and self._tree_budget_room(farm) > 0)
+        free_slots, bag_need, bag_status = self._bag_state(farm)
+        bag_blocked = self.inventory_blocked_today or (bag_status == "ok" and bag_need > 0)
+        executable = unobserved = 0
+        for t in guard_tiles:
+            tv = tmap.get(t)
+            if tv is None:
+                unobserved += 1          # 不在 tiles[]（含截断）⇒ 看不见、不算活
+                continue
+            kind = str(tv.get("kind") or "")
+            need = False
+            allowed = True
+            if tv.get("crop"):
+                if not tv.get("watered") and not tv.get("dead"):
+                    need = True                       # 该浇（浇水永不延后）
+                elif (not tv.get("dead") and tile_ready(tv)
+                        and t not in self.harvest_gave_up):
+                    need = True                       # 该收；背包堵住 ⇒ 今天不可执行
+                    allowed = not bag_blocked
+                elif tv.get("dead"):
+                    need = True                       # 该清死苗
+            elif kind in ACTIONABLE_KINDS:
+                need = True
+                allowed = "clear_area" not in deferred
+            elif kind in CLUMP_KINDS:
+                need = True
+                allowed = "clear_area" not in deferred and not _tool_blocked_tv(tv)
+            elif kind == TREE_KIND:
+                need = True
+                allowed = "clear_area" not in deferred and tree_ok
+            elif t in tillable:
+                need = bool(can_plant) and "till_area" not in deferred
+                allowed = need
+            elif kind == "dirt":
+                need = bool(can_plant) and "plant_area" not in deferred
+                allowed = need
+            if not need:
+                unobserved += 1          # 已做/账本陈旧：今天不需要做，不算活
+                continue
+            if not allowed or not self._standable_next_to(farm, t):
+                unobserved += 1          # 预算延后/工具不够/背包堵/四邻没得站 ⇒ 今天不可执行
+                continue
+            executable += 1
+        return {**base, "executable": executable, "unobserved": unobserved}
 
     # ------------------------------------------------ task-124：review 独苗的对账路径
 
@@ -4956,7 +5179,10 @@ class LongRun:
                         f"{[i.task for i in intents]}")
                     return SimpleNamespace(intents=intents), False
         pending = self._pending_work()
-        if pending and self.resume_walks < self.max_plots_per_day:
+        # 【task-15 / 0.7.45】守卫口径的 pending 已把"停滞/被围"格剔除；只剩挡死格时它会是空集，
+        # 但这条兜底仍必须接管（否则会掉回调用方的 stuck / no_work）⇒ 用 `_dead_end_pending()`
+        # 补上"账本里只剩挡死格"的情形。
+        if (pending or self._dead_end_pending()) and self.resume_walks < self.max_plots_per_day:
             self._resume_reevaluate(where="review_only_fallback")     # 【task-134 A】
             resume = self._resume_plot(obs)
             if resume is None:
@@ -5039,7 +5265,10 @@ class LongRun:
         * `"ended"`  ⇒ 已按诚实口径收工（调用方 `break`）；
         * `"none"`   ⇒ 没走成/没得走（调用方落回既有"换片/recovered"路径）。
         """
-        if not (self._pending_work() and self.resume_walks < self.max_plots_per_day):
+        # 【task-15 / 0.7.45】守卫口径 pending 已剔除停滞/被围格；只剩挡死格时它为空，但诚实
+        # 收口仍要接管（见 `_dead_end_pending` 的原始账本口径）。
+        if not ((self._pending_work() or self._dead_end_pending())
+                and self.resume_walks < self.max_plots_per_day):
             return "none", False
         self._resume_reevaluate(where="guard_leftover")               # 【task-134 A】
         resume = self._resume_plot(obs)
@@ -5304,6 +5533,15 @@ class LongRun:
                 "不许判『没活可做』；先想办法回农场，回不去就按 stuck 如实收尾")
         reasons = self.work_reasons(obs)
         if not reasons:
+            # 【task-15 / 0.7.45】"没活"必须区分**真没活**与**只剩挡死格**：账本里如果还有
+            # 被围/回去看过拿不出目标的格，那不是 `no_work`（`no_work` 在 JUSTIFIED 白名单里，
+            # 会白拿一个 VERIFIED 并掩盖"该做没做完"）⇒ 交回主循环走换片/诚实收工
+            # （`resume_exhausted`，`day_justified` 仍由可执行面证据决定）。
+            _dead_pending = self._dead_end_pending()
+            if _dead_pending:
+                return False, "keep_working", (
+                    f"账本还剩 {len(_dead_pending)} 格挡死格（被围 / 回去看过拿不出目标）⇒ "
+                    "按换片/诚实收工收口（这不是「没活可做」，不许判 no_work）")
             # 【task-198】背包满 + 今天已证明腾不出格子 ⇒ 熟作物的理由已由 `work_reasons` 闭嘴，
             # 但**不许**洗成 `no_work`：那不是"没活可做"，是"活被背包堵住、腾不出格"。
             # 用 `inventory_blocked` 如实收尾（不在 `JUSTIFIED_END_REASONS` ⇒ `day_justified=False`
@@ -8445,13 +8683,12 @@ class LongRun:
                     if self.inventory_blocked_today:
                         self._end_inventory_blocked(obs, rep)
                         break
-                    # 【task-4 / 0.7.44】回片区/换片/观测清障都用尽，残留格全是"已停滞/被围住"
-                    # ⇒ 今天真没有可执行目标：按 `resume_exhausted` 诚实收工，
-                    # 不许落到下面的 `stuck:守卫说还有活…`（那不是卡死，是"没活可执行"）。
-                    _pending_now = self._pending_work()
-                    if _pending_now and not (set(_pending_now)
-                                             - self.resume_stall_tiles
-                                             - self.encircled_day):
+                    # 【task-4 / 0.7.44】【task-15 / 0.7.45】回片区/换片/观测清障都用尽，
+                    # 残留格全是"已停滞/被围住" ⇒ 今天真没有可执行目标：按 `resume_exhausted`
+                    # 诚实收工，不许落到下面的 `stuck:守卫说还有活…`（那不是卡死，是"没活可执行"）。
+                    # 判据用 `_dead_end_pending()` 的**原始账本**口径（守卫口径的 pending 已剔除
+                    # 停滞/被围格，会是空集）。
+                    if self._dead_end_pending():
                         self._resume_exhausted(obs, rep, plot=None,
                                                where="work_spot_none", marked=0)
                         break
@@ -8669,17 +8906,21 @@ class LongRun:
                         self._journal("plot_exhausted_burst", count=burst, zone=self.zone_name,
                                       note="同一秒内连发换片（run9 形态：0.6 秒 12 次）⇒ 不再把"
                                            "整天耗在无目的换片上，按既有有界机制收尾")
-                        rep.ended_by, rep.ended_reason = self._do_sleep(
-                            obs, rep,
-                            f"stuck:同一秒连发 {burst} 次换片都没有目标（守卫仍说还有活：{text}）"
-                            + self._not_on_farm_suffix())
+                        # 【task-15 / 0.7.45】有界 ≠ 可放行：收尾**不再写 `stuck:`** 掩盖。
+                        # 按可执行面证据收口（`_resume_exhausted` 会记 `no_progress_burst`
+                        # `exhausted=True` + pending_* 证据）：观测里真没可执行格 ⇒ day_justified
+                        # 可认；还有可执行格却收工 ⇒ 前缀照旧不在证据白名单里 ⇒ 当天不 VERIFIED。
+                        self._resume_exhausted(
+                            obs, rep, plot=self._resume_plot(obs),
+                            where="plot_exhausted_burst")
                         break
                     if recovered > self.max_plots_per_day:
                         rep.notes.append(f"换过 {recovered} 片地都拿不出目标")
-                        # ⚠️ 守卫**说还有活**却找不到任何目标 ⇒ 这是 `stuck`，不是"今天没活"：
-                        #    写成 `no_work` 会白拿 `day_justified=true` 并把病灶洗白（task-49）。
-                        rep.ended_by, rep.ended_reason = self._do_sleep(
-                            obs, rep, f"stuck:换过 {recovered} 片地都没有目标（守卫仍说还有活：{text}）")
+                        # 【task-15 / 0.7.45】换片次数有界用尽同样是"有界收工"，不再写
+                        # `stuck:`（"有界≠可放行"：`day_justified` 由可执行面证据决定）。
+                        self._resume_exhausted(
+                            obs, rep, plot=self._resume_plot(obs),
+                            where="switch_limit")
                         break
                     rep.notes.append(f"「{self.zone_name or '当前作业区'}」没目标了，但{text} ⇒ 换一片地继续")
                     self.no_target.clear()     # "本片没目标"是**片区级**记账，换片就得清
@@ -8952,12 +9193,15 @@ class LongRun:
         # leftover==0 ⇒ "前一片地没做完、后一片地干净"的遮蔽发生了。**纯信息项**：不改 VERIFIED、
         # 不改退出码，只发 journal + 进 notes，让 run3 事后能人工复核。
         midway: dict[str, dict] = {}
+        midway_all: list[dict] = []
         for i, s in enumerate(rep.stages):
             name = str(s.get("stage") or "")
             if int(s.get("tiles") or 0) <= 0 or int(s.get("leftover") or 0) <= 0:
                 continue
-            midway[name] = {"stage": name, "tiles": int(s.get("tiles") or 0),
-                            "leftover": int(s.get("leftover") or 0), "round": i + 1}
+            rec = {"stage": name, "tiles": int(s.get("tiles") or 0),
+                   "leftover": int(s.get("leftover") or 0), "round": i + 1}
+            midway[name] = rec
+            midway_all.append(rec)
         for name, mid in midway.items():
             last = last_by_stage.get(name)
             if last is None or int(last.get("leftover") or 0) != 0:
@@ -8966,6 +9210,11 @@ class LongRun:
             self._journal("stage_midway_leftover", **mid,
                           note=("同一阶段种类当天更早一轮还剩格子、最后一轮 leftover==0 ⇒ 日级判定取"
                                 "最后一轮；若那批格子属于另一片地则存在遮蔽，请人工复核 `stage_exhausted`"))
+            # 【task-15 / 0.7.45】日级留痕**不许只写最后一轮**：把该阶段当天**每一轮** leftover>0
+            # 的记录（含轮次/格数）全部并列进 day_end，遮蔽才可复核；只作 info，
+            # 不改 `no_unmet_stages`/`plot_pending` 既有公式（deputy 44 条对抗判据按旧公式回归）。
+            rep.stage_midway_leftover.extend(
+                dict(r) for r in midway_all if r["stage"] == name)
             rep.notes.append(
                 f"阶段 {name} 中途剩 {mid['leftover']}/{mid['tiles']} 格、当天最后一轮已归零"
                 f"（stage_midway_leftover，当天第 {mid['round']} 条阶段记录）")
@@ -9004,6 +9253,25 @@ class LongRun:
                 "浇水证据不足/未浇完：" + str(water_info.get("note") or "")
                 + f"（scope={water_info.get('scope')}、tiles={water_info.get('tiles')}、"
                   f"crops={water_info.get('crops')}、dry={water_info.get('dry')}）")
+        # 【task-15 / 0.7.45】日终"还有活"的**可执行面快照**：`day_justified` 只认这里的
+        # `pending_executable`（当前最后一张户外农场观测里"看得见 + 要做 + 允许 + 站得到"的格数）。
+        # 三口径并列留痕：守卫 `_pending_work()` / 已标记停滞 / 阶段窗口 exec+blocked / 中途轮
+        # leftover（上面 `stage_midway_leftover`）。这样 0.7.44 冒烟冬 26（263）与冬 27（217）
+        # "账本 accum pending vs 当前观测没活"的差异在 day_end 里一眼可查，不靠末轮单口径。
+        snap = self._pending_snapshot(outdoor_obs)
+        rep.pending_ledger = snap["ledger"]
+        rep.pending_guard = snap["guard"]
+        rep.pending_stalled = snap["stalled"]
+        rep.pending_executable = snap["executable"]
+        rep.pending_blocked = snap["blocked"]
+        rep.pending_unobserved = snap["unobserved"]
+        if rep.pending_ledger or rep.pending_stalled or rep.pending_blocked:
+            rep.notes.append(
+                f"日终账本：原始 {rep.pending_ledger} 格（守卫口径 {rep.pending_guard} 格、"
+                f"已判死 {rep.pending_blocked} 格，其中停滞/被围 {rep.pending_stalled} 格）；"
+                f"当前观测里可执行 {rep.pending_executable} 格、看不见/已陈旧/今天不可执行 "
+                f"{rep.pending_unobserved} 格"
+                + ("（观测证据不可用 ⇒ 诚实收工判定不放行）" if outdoor_obs is None else ""))
         rep.checks = {
             # 【task-198】`inventory_blocked` 也是"我们睡下去让游戏日翻篇了"（`_do_sleep` 成功），
             # 只是收尾原因写成了背包堵住 —— 所以 `slept_by_us` 必须为真，否则报告会说谎。
@@ -9032,7 +9300,12 @@ class LongRun:
             "watered_outdoor": bool(watered_outdoor),
             # 【task-32】白名单里**没有** `no_plot`：作业区配额到顶是我们自己设的软上限，
             # 被它憋停不等于"没活可做"，不许据此判 VERIFIED（判据见 `is_justified_end`）。
-            "day_justified": is_justified_end(rep.ended_by, rep.ended_reason),
+            # 【task-15 / 0.7.45】`resume_exhausted`（换片/回片区/观测都拿不出目标）也只有
+            # **当前观测里可执行格为 0** 时才认（证据 = 上面的 `pending_executable`）；
+            # 有活却收工/观测证据不可用 ⇒ 仍是 False，反向洗白用例钉死这条。
+            "day_justified": is_justified_end(
+                rep.ended_by, rep.ended_reason,
+                pending_executable=rep.pending_executable),
             # 【task-149 C】0 动作日**不许** VERIFIED —— 除非当天有真正独立的"无活可做"证据
             # （`sleep_guard` 在 farm 证据齐备且 `work_reasons` 为空时置的
             # `no_work_evidence_ok`）。run9c summer 20：22.81 秒、`ok_steps=0`、`decision=0`，

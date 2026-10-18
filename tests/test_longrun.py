@@ -3361,7 +3361,7 @@ class TestTask4ResumeNoOutput(unittest.TestCase):
         用 `_ensure_plot` 注入"本片观测拿不出作业区、账本里还留着跨片地残留"的形态：先真的做
         一轮 `clear_area`（timeout 格进 leftover、不封格），再把玩家挪走 —— 这正是 0.7.43
         冬 7/12/18 的最后一段。旧代码在这里会写 `stuck:回片区（work_spot_resume）`；
-        新口径必须是 `resume_exhausted:`（sleep、day_justified=false、不 VERIFIED）。
+        新口径必须是 `resume_exhausted:`（sleep、day_justified 由可执行面证据决定、不 VERIFIED）。
         """
         w = MyopicWorld(weeds=0, seeds=0, money=0)
         for t in ((60, 10), (60, 11)):
@@ -3390,7 +3390,12 @@ class TestTask4ResumeNoOutput(unittest.TestCase):
         self.assertEqual(rep.ended_by, "sleep", rep.ended_reason)
         self.assertTrue(str(rep.ended_reason).startswith("resume_exhausted:"), rep.ended_reason)
         self.assertFalse(str(rep.ended_reason).startswith("stuck:"), rep.ended_reason)
-        self.assertFalse(rep.checks.get("day_justified", True), rep.checks)
+        # 【task-15 / 0.7.45】`day_justified` 只认"当前观测里可执行格为 0"的证据：这两个残留格
+        # 已经不在最后一张户外观测里（unobserved）⇒ 诚实收工理由被认；但 `no_unmet_stages`
+        # 仍如实为 false ⇒ 当天**不 VERIFIED**（反向洗白用例见 TestTask15DayAccounting：
+        # 真有一格可执行时必须 day_justified=false）。
+        self.assertEqual(rep.pending_executable, 0, rep.notes)
+        self.assertTrue(rep.checks.get("day_justified", False), rep.checks)
         self.assertTrue(self._events(run, "resume_walk"), "回片区必须留痕")
         bursts = [e for e in self._events(run, "no_progress_burst") if e.get("exhausted")]
         self.assertEqual(len(bursts), 1, run.entries)
@@ -5260,7 +5265,10 @@ class TestTask5EncircledRealloc(unittest.TestCase):
         self.assertTrue(str(rep.ended_reason).startswith("resume_exhausted:"), rep.ended_reason)
         self.assertFalse(str(rep.ended_reason).startswith("stuck:"),
                          f"只剩挡死格 ≠ 卡死：{rep.ended_reason}")
-        self.assertFalse(rep.checks.get("day_justified", True), rep.checks)
+        # 【task-15 / 0.7.45】被围格今天不可执行 ⇒ 可执行面为 0，诚实收工理由被认；
+        # 但 `no_unmet_stages` 仍如实为 false ⇒ 不 VERIFIED（前面已断言）。
+        self.assertEqual(rep.pending_executable, 0, rep.notes)
+        self.assertTrue(rep.checks.get("day_justified", False), rep.checks)
         self.assertEqual(len(self._events(run, "encircled")), 1,
                          "被围住的格只该被分配一次（旧代码会重分几十轮）")
         self.assertLessEqual(len(self._events(run, "idle")), 2,
@@ -13018,6 +13026,244 @@ class TestTask245EventWait(unittest.TestCase):
         self.assertFalse(blocked, rep.ended_reason)
         self.assertEqual(len(self._events(run, "event_wait")), 0, run.entries)
         self.assertEqual(w.dismiss_calls, 1)
+
+
+class _EmptyDecision:
+    """【task-15 测试】一个**没有任何意图**的决策（逼出主循环的"守卫说有活"分支）。"""
+
+    intents: tuple = ()
+    boundary = ""
+    source = "deterministic"
+    llm_called = False
+    problems: tuple = ()
+    fallback_reason = ""
+    truncated = False
+
+    def as_dict(self) -> dict:
+        return {}
+
+
+class TestTask15PendingCaliber(unittest.TestCase):
+    """【task-15 / 0.7.45】0.7.44 冒烟冬 26/27：两天 `needs_review`、`verified_streak=0`。
+
+    真机病灶（`logs/longrun-smoke-0744.jsonl`，只读）：
+    * 冬 26 收尾 = `stuck:同一秒连发 5 次换片都没有目标（守卫仍说还有活：今天早些时候还有
+      263 格没做完…）`（jsonl:233 `plot_exhausted_burst` + `:8665-8676` 老收尾）；
+    * 冬 27 收尾 = `resume_exhausted:回片区 217 格都回去看过、换片 4 次…`（jsonl:300
+      `no_progress_burst exhausted=true, pending=217, switches=4`）；
+    * 两天 `ended_by=sleep`、`sleep.ok=true`、`plot_pending=0`、`assigned_undone=0`
+      ⇒ 不是卡 1/1b 的回退，而是第三形态：**当前可执行面没活 vs 账本累积 pending**。
+    * `is_justified_end`（`longrun.py:563-572`）的白名单只有 `night/stamina/no_work`
+      ⇒ `stuck:` / `resume_exhausted:` 两种诚实收工都被判 `day_justified=false`。
+
+    本类钉死新口径（`day_justified` 认**证据**、不认文案；反向不许洗白）：
+    1) 守卫口径 `_pending_work()` 认识"已标记停滞/被围"（不再被旧账本 263/217 钉死）；
+       原始账本口径 `_ledger_pending()` 保留同一份读数给对账；
+    2) 日终并列留痕 `pending_ledger / pending_guard / pending_stalled / pending_blocked /
+       pending_executable / pending_unobserved`（`ledger == guard + blocked`、
+       `guard == executable + unobserved`，观测不可用 ⇒ executable=guard 的 fail-closed）；
+    3) `day_justified` 认 `resume_exhausted` **当且仅当** `pending_executable == 0`
+       （`stuck:` 永不认；`no_work/night/stamina` 原语义不动）；
+    4) 反向洗白：早轮 leftover 还留在账本里 ⇒ 就算最后一轮 leftover==0，也算"当前可执行"，
+       `day_justified` 必须 false；
+    5) `plot_exhausted_burst`（冬 26 同秒 5 次换片）收尾走 `resume_exhausted`，**不再写
+       `stuck:`**（有界 ≠ 可放行：是否放行仍由可执行面证据决定）。
+    """
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list:
+        return [e for e in run.entries if e.get("event") == name]
+
+    @staticmethod
+    def _plot(area: str, tiles, anchor=None) -> dict:
+        return {"zone": "", "label": "", "area": area,
+                "anchor": list(anchor or tiles[0]), "tiles": list(tiles), "note": ""}
+
+    def _run(self, w: FakeWorld):
+        client = _CountingClient(w)
+        worker = FarmWorker(client, log=lambda *_: None)
+        run = make_run(w, target_days=1, max_days=1,
+                       client_factory=lambda: client, worker_factory=lambda c: worker)
+        run.worker = worker
+        run.client = client
+        return run
+
+    def test_ledger_pending_keeps_stalled_guard_does_not(self):
+        """守卫口径剔停滞/被围；原始账本口径保留同一份读数（263/217 对账用）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = self._run(w)
+        run.leftover_targets = {(60, 10), (61, 10), (62, 10)}
+        run.leftover_area = {(60, 10): "field_nw", (61, 10): "field_nw",
+                             (62, 10): "field_ne"}
+        run.resume_stall_tiles = {(60, 10)}
+        run.encircled_day = {(61, 10)}
+
+        self.assertEqual(run._ledger_pending(), [(60, 10), (61, 10), (62, 10)])
+        self.assertEqual(run._pending_work(), [(62, 10)],
+                         "守卫口径：停滞/被围的格今天不算活（否则冬 27 的 217 格旧账钉死整天）")
+        # 全部变成挡死 ⇒ 卡 1/卡 5 的"只剩挡死格"兜底路径必须还能看见它们
+        run.resume_stall_tiles.add((62, 10))
+        self.assertEqual(run._dead_end_pending(), [(60, 10), (61, 10), (62, 10)])
+
+    def test_is_justified_end_resume_exhausted_requires_zero_executable(self):
+        """白名单与新理由码一致：只认 `resume_exhausted` + 可执行面为 0 的**证据**。"""
+        self.assertFalse(is_justified_end("sleep", "resume_exhausted:回片区拿不出目标"),
+                         "没有 pending_executable 证据 ⇒ 不许放行（fail-closed）")
+        self.assertFalse(is_justified_end("sleep", "resume_exhausted:回片区拿不出目标",
+                                          pending_executable=3),
+                         "当前观测还有 3 格可执行 ⇒ 不许洗成「没活」")
+        self.assertTrue(is_justified_end("sleep", "resume_exhausted:回片区拿不出目标",
+                                         pending_executable=0))
+        self.assertFalse(is_justified_end("sleep", "stuck:同一秒连发 5 次换片",
+                                          pending_executable=0),
+                         "`stuck:` 是失败标签，永不进白名单")
+        self.assertFalse(is_justified_end("stuck", "no_work:…"),
+                         "不是我们睡下去的日子（ended_by≠sleep）一律不放行")
+        self.assertTrue(is_justified_end("sleep", "no_work:确实找不到可做的活"))
+        self.assertTrue(is_justified_end("sleep", "night:已经到点了"))
+
+    def test_pending_snapshot_parallel_readings(self):
+        """日终快照：账本/守卫/挡死/停滞/可执行/不可见 六口径并列且自洽。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.player_tile = [62, 14]
+        w.blockers[(63, 14)] = "weed"          # 看得见 + 要做 + 站得到 ⇒ executable
+        run = self._run(w)
+        run.leftover_targets = {(60, 10), (60, 11), (60, 12), (63, 14), (90, 90)}
+        run.leftover_area = {t: "field_nw" for t in run.leftover_targets}
+        run.blocked[(60, 10)] = "blocked_tile"   # 干不动（封格）
+        run.encircled_day.add((60, 11))        # 被围住
+        run.resume_stall_tiles.add((60, 12))   # 回去看过、拿不出目标
+        # (90, 90) 不在最后观测里 ⇒ unseen（0.7.44 冬 26/27 的 263/217 主力）
+
+        snap = run._pending_snapshot(w.obs())
+
+        self.assertEqual(snap["ledger"], 5)
+        self.assertEqual(snap["blocked"], 3, "挡死 = blocked ∪ encircled ∪ stalled")
+        self.assertEqual(snap["stalled"], 2, "stalled 单列被围/停滞（blocked 不算）")
+        self.assertEqual(snap["guard"], 2)
+        self.assertEqual(snap["executable"], 1)
+        self.assertEqual(snap["unobserved"], 1)
+        self.assertEqual(snap["ledger"], snap["guard"] + snap["blocked"])
+        self.assertEqual(snap["guard"], snap["executable"] + snap["unobserved"])
+        # 观测证据不可用 ⇒ fail-closed：全部按可执行计，day_justified 不放行
+        blind = run._pending_snapshot(None)
+        self.assertEqual(blind["executable"], blind["guard"])
+        self.assertEqual(blind["unobserved"], 0)
+
+    def test_earlier_round_leftover_is_not_masked_by_clean_last_round(self):
+        """反向洗白（Lead m01290 ②）：早轮 leftover 还在账本里 ⇒ 最后一轮 0 也算"有活"。"""
+        w = MyopicWorld(weeds=0, seeds=0, money=0)
+        w.revealed = True
+        w.player_tile = [60, 12]
+        w.blockers[(60, 10)] = "weed"
+        run = self._run(w)
+        run.leftover_targets = {(60, 10)}
+        run.leftover_area = {(60, 10): "field_nw"}
+        rep = DayReport(day_key=("winter", 1, 26), started_at=0.0)
+        # 模拟"最后一轮同种类 leftover==0"（冬 27 的日级判定只看末轮 ⇒ 遮蔽）
+        rep.stages.append({"stage": "clear_area", "tiles": 12, "leftover": 0,
+                           "leftover_executable": 0, "leftover_blocked": 0})
+
+        snap = run._pending_snapshot(w.obs())
+
+        self.assertEqual(snap["executable"], 1, "早轮账本余格仍在当前观测里 ⇒ 不能当没活")
+        self.assertFalse(is_justified_end("sleep", "resume_exhausted:换片 4 次",
+                                          pending_executable=snap["executable"]),
+                         "有可执行格却按 resume_exhausted 收工 ⇒ 当天必须不 VERIFIED")
+        self.assertEqual(snap["guard"] + snap["blocked"], snap["ledger"])
+
+    def test_full_day_resume_exhausted_with_zero_executable_is_justified_but_not_verified(self):
+        """端到端：观测里真没可执行格 ⇒ `resume_exhausted` 被认（day_justified=true）但
+        `no_unmet_stages` 仍如实 false ⇒ 当天**不** VERIFIED（务实收口，不洗白）。"""
+        w = MyopicWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        w.blockers[(60, 11)] = "weed"
+        w.fail_status[(60, 10)] = "timeout"
+        w.fail_status[(60, 11)] = "timeout"
+        w.player_tile = [60, 12]
+        w.revealed = True
+        run = self._run(w)
+        seeded = {"n": 0}
+
+        def ensure(obs, rep):
+            seeded["n"] += 1
+            if seeded["n"] == 1:
+                run._step_stage("clear_area", w.obs(),
+                                self._plot("field_nw", [(60, 10), (60, 11)]), rep)
+                w.player_tile = [62, 14]
+                w.revealed = False          # 残留格不再出现在最后一张户外观测里
+            return None
+
+        run._ensure_plot = ensure
+        code = run.run()
+
+        rep = run.days[0]
+        self.assertEqual(code, 1, "没有 VERIFIED 就不许返 0")
+        self.assertFalse(rep.verified, rep.checks)
+        self.assertEqual(rep.ended_by, "sleep", rep.ended_reason)
+        self.assertTrue(str(rep.ended_reason).startswith("resume_exhausted:"), rep.ended_reason)
+        self.assertFalse(str(rep.ended_reason).startswith("stuck:"), rep.ended_reason)
+        # 这两天走"回片区看一眼 ⇒ 标记停滞"把旧账本格变为挡死：原始账本 2 格 = 守卫 0 + 挡死 2。
+        self.assertEqual(rep.pending_ledger, 2, rep.notes)
+        self.assertEqual(rep.pending_guard, 0, rep.notes)
+        self.assertEqual(rep.pending_stalled, 2, rep.notes)
+        self.assertEqual(rep.pending_blocked, 2, rep.notes)
+        self.assertEqual(rep.pending_executable, 0, rep.notes)
+        self.assertEqual(rep.pending_unobserved, 0, rep.notes)
+        self.assertTrue(rep.checks.get("day_justified", False), rep.checks)
+        self.assertFalse(rep.checks.get("no_unmet_stages", True), rep.checks)
+        self.assertEqual(rep.pending_ledger,
+                         rep.pending_guard + rep.pending_blocked)
+        self.assertEqual(rep.pending_guard,
+                         rep.pending_executable + rep.pending_unobserved)
+
+    def test_burst_close_is_resume_exhausted_not_stuck(self):
+        """端到端（`同秒 5 次换片` 分支，冬 26 jsonl:233）：收尾不再写 `stuck:`，
+        按可执行面证据走 `resume_exhausted`；有界性由 `plot_exhausted_burst` 留痕。"""
+        w = MyopicWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        w.fail_status[(60, 10)] = "timeout"     # 做一次拿不到结论 ⇒ 进账本 leftover、不封格
+        w.player_tile = [60, 12]
+        w.revealed = True
+        run = self._run(w)
+        seeded = {"n": 0}
+        area = self._plot("field_nw", [(60, 10)])
+
+        def ensure(obs, rep):
+            seeded["n"] += 1
+            if seeded["n"] == 1:
+                run._step_stage("clear_area", w.obs(), area, rep)
+                w.player_tile = [62, 14]
+                w.revealed = False             # 残留格不再出现在最后一张户外观测里
+            return self._plot("field_nw", [(60, 10)])   # 本片永远拿不出新作业区
+
+        run._ensure_plot = ensure
+        run.planner.decide = lambda *a, **k: _EmptyDecision()
+        run.sleep_guard = lambda obs: (False, "guard", "守卫仍说还有活")
+        run._guard_leftover_resume = lambda obs, rep, *, text="": ("none", False)
+        run._do_sleep = lambda obs, rep, why, **kw: ("sleep", why)
+
+        run.run()
+
+        rep = run.days[0]
+        self.assertGreater(seeded["n"], 0, "本用例必须真的走到 `_ensure_plot` 兜底")
+        self.assertTrue(self._events(run, "plot_exhausted_burst"), run.entries)
+        self.assertTrue(str(rep.ended_reason).startswith("resume_exhausted:"), rep.ended_reason)
+        self.assertNotIn("同一秒连发", str(rep.ended_reason),
+                         "有界 burst 不允许再用 `stuck:` 文案掩盖（Lead m01290 ③）")
+        # 有界 ≠ 可放行：本用例残留格仍在当前观测里（真能干的活）⇒ day_justified 必须 false，
+        # 哪怕只是被 burst 有界收尾；空转多少次都不能洗成"没活"。
+        self.assertFalse(rep.checks.get("day_justified", True), rep.checks)
+        self.assertFalse(rep.verified, rep.checks)
+        bursts = [e for e in self._events(run, "no_progress_burst") if e.get("exhausted")]
+        self.assertEqual(len(bursts), 1, run.entries)
+        ev = bursts[0]
+        self.assertIn("pending_ledger", ev, ev)
+        self.assertEqual(ev["pending_ledger"], 1, ev)
+        self.assertEqual(ev["pending"], 1, ev)
+        self.assertEqual(ev["pending_executable"], 1, ev)
+        self.assertEqual(ev["pending_unobserved"], 0, ev)
+        self.assertEqual(ev["source"], "回片区（plot_exhausted_burst）", ev)
 
 
 if __name__ == "__main__":  # pragma: no cover
