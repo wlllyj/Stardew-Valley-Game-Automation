@@ -1,0 +1,12 @@
+v0.7.42（2026-10-18）：冬季可验证性 + 清障吞吐批次（0.7.41 七步冒烟抓出的两条 A″ 门禁级缺陷）
+
+1. 种子季节闸门（task-240）：
+   Mod 侧 `PlayerView.seeds[]` 新增 `{id,name,stack,seasons,plantableNow}`（`PlantableNow` 用 `JsonIgnoreCondition.Never`：缺键 / null / 真布尔三态可辨）；新纯函数 `SeedRules`（`PlantableNow` 三态、`NormalizeSeason`、`NormalizeSeasons`、`DescribeSeasons`）；`WorldSnapshot.ReadSeeds/EnsureSeedSeasons` 从 `Data/Crops` 取季节（IL 实证：`Crop.GetData()` ⇒ `cropData.TryGetValue(netSeedIndex.Value)`，键就是种子 id；`CropData.SeedItemId` 在 1.6.15 不存在）。
+   脑侧 `has_seed_metadata`（空列表 ≠ 缺字段，旧 Mod 退回老口径）/`plantable_seeds`/`seed_season_state`；`_seed_outlook` 首值改「当季可种」；全隔季 ⇒ `sleep_guard` 诚实 `no_work`；farm 级「该去种/该去买」只在人不在农场或**窗口真有 plantable 目标**时出现（窗口外空耕地不再被宣称）；`plant_area` 零目标补 `evidence.why="seed_out_of_season"`（原因码仍 `no_target`）。
+
+2. 清障吞吐（task-241）：
+   `farmwork.clear()` 对树/石/枝/clump 的 `tool_ineffective` **有界补请求**到 `TREE_SWING_CALLS=3`（kind 变/目标消失即停，成功步 `after.inert_calls`），3 次仍无效才 blocked 并带 `tool_ineffective_bound{calls,receipts,kind_before,kind_after,tool}`；**单发不再直接 blocked**。
+   清障预算改体力驱动：`MAX_TREES_PER_DAY=20`、单棵成本 `TREE_STAMINA_COST`（≈6 刀 × `STAMINA_COST_CLEAR`）；`_tree_budget_room = min(20, 可支配体力 ÷ 单棵) − 已砍`，证据不可用 ⇒ conservative 0（绝不为砍树漏浇）；预算挡下时每天一次 `deferred_by_budget{task:"clear_area_tree", why:"预算 N 棵 / 已砍 M 棵（体力驱动：可支配体力 X ÷ 单棵 Y，封顶 20）"}`。
+
+语义未动：`cleared_tiles`/护栏 B/`assigned_undone`/`plot_pending` 不变；多次调用不记 ok；`blocked` 只加字段、无新事件名、无新 checks 键。
+验证口径：全量单测基线 `Ran 1217 tests / OK`；C# 自检 88 断言；真机冒烟须满足「至少 1 天 verified=true、不得再出现'该去种'式 stuck、单发 tool_ineffective 封格=0、farm.trees 日降幅>2」。

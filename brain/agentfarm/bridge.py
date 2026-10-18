@@ -36,7 +36,22 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.41"   # v0.7.41：全脑侧修复批次（0.7.40 七步冒烟抓出的三处真缺陷；
+MOD_VERSION_EXPECTED = "0.7.42"   # v0.7.42：冬季可验证性 + 清障吞吐批次（0.7.41 七步冒烟抓出的两条
+                                  # A″ 门禁级缺陷）——
+                                  # ①种子季节闸门（task-240）：Mod `PlayerView.seeds[]`
+                                  #   `{id,name,stack,seasons,plantableNow}`（三态可辨）+ `SeedRules`
+                                  #   纯函数 + `Data/Crops` 取季节；脑侧 `plantable_seeds` /
+                                  #   `seed_season_state` / `has_seed_metadata`；`_seed_outlook`
+                                  #   首值改「当季可种」；全隔季 ⇒ 诚实 `no_work`；farm 级
+                                  #   「该去种」只在人不在农场或**窗口真有 plantable 目标**时出现；
+                                  #   `plant_area` 零目标补 `evidence.why="seed_out_of_season"`；
+                                  # ②清障吞吐（task-241）：树/石/枝 `tool_ineffective` 有界补请求
+                                  #   `TREE_SWING_CALLS=3`（kind 变即停）+ `tool_ineffective_bound`
+                                  #   证据；清障预算改体力驱动 `MAX_TREES_PER_DAY=20` /
+                                  #   `_tree_budget_room`（conservative 0、绝不为砍树漏浇）+
+                                  #   `deferred_by_budget{task:"clear_area_tree"}`。
+                                  # --- 历史 ---
+                                  # v0.7.41：全脑侧修复批次（0.7.40 七步冒烟抓出的三处真缺陷；
                                   # Mod 无代码变更，dll 与 0.7.40 同源重建）——
                                   # ①末次跨日落盘守卫（task-236）：跑尾声 `ui.isModal` ⇒ ≤3 次
                                   #   `dismiss_modal`（`modal_dismissed{kind:"cleanup"}`）/
