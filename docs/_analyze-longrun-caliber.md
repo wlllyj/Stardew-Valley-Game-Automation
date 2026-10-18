@@ -1317,6 +1317,53 @@ python -m unittest tests.test_analyze_longrun.TestEventWaitAccounting   # 7 条�
   - **B2**：起跑前触发的事件（如 102）没有账本落点，analyzer 无法归因；若验收要求覆盖
     "跑前事件"，需在 `day_start` 里带一条 `ui.eventId`（或 `goto_farm` 结果带）。
 
+## 3.35 A8 新形态三聚合：`stage_churn` / `work_spot_resume_exhausted` / `stuck_without_sleep`（task-3，2026-10-18）
+
+**背景**：A8 真账本 `logs\longrun-runA8-0743.jsonl`（0.7.43，1322 行，winter 7→18）暴露了两种新形态 +
+一种归因缺口，旧 analyzer 只能人工读数才能发现。本工具新增三块聚合，**默认 info /【无法判定】、
+除非有硬证据否则不进 rc**（本任务没发现硬证据 ⇒ 全部不进 rc）：
+
+| 聚合 | 判据（字段级） | 结论 / 呈现 |
+| --- | --- | --- |
+| `stage_churn` | `day_end.stages[]` **数组相邻**同 `stage`，每段 `assigned<=1`（常量 `STAGE_CHURN_SMALL_ASSIGNED=1`）+ `stopped=="incomplete"` + 段内 `leftover` **不降**（next>=prev），连续长度 `>= STAGE_CHURN_MIN_RUN=3` | **info**（不进 rc）：同一天同 stage 反复重分「1 格余量」的空转。报告 `report["stage_churn"]` 给 `runs/stages_total/days_with_runs/max_run/coords` + 逐日 `days[]`（日级计数 + 每段 `run_details`：start/end idx、leftovers、坐标、reasons）；头部「阶段 churn:」+「阶段 churn 日级:」两行；建议 0s-10 |
+| `work_spot_resume_exhausted` | `day_end.ended_reason` 原文含 `work_spot_resume` **且**含 `拿不出目标`（一等证据）；结构化旁证 `no_progress_burst{source="回片区（work_spot_resume）",count,tiles}`（brain `_no_progress_stop`，`PLOT_EXHAUSTED_BURST=5`） | **info**（不进 rc）：有界诚实收尾（task-134 A 防空转生效），不是失败。报告给 `state∈found/zero/undecidable`、`days_count`、`max_consecutive`、逐日 **原文逐字**（`ended_reason`）、burst 行/次数/格数；只有 burst 没原文 ⇒ `burst_mismatch_days`（**不许凭 burst 编原文**）；头部「回片区死循环（work_spot_resume）:」+ 每天原文 |
+| `stuck_without_sleep` | `ended_by=="stuck"` 且 `checks.slept_by_us is False` | **info /【无法判定】**（不进 rc）：当天**没由我们睡过去**，「为什么 stuck / 是否真的收工」只有 `ended_reason` 自述、没有 `day_after` 可对账 ⇒ 只能【无法判定】；不是睡眠失败、也不是通过。`slept_by_us==true` 却 stuck 的自相形态单独计 `coherent`；整键缺失 ⇒【无法判定】（缺失 ≠ 0，绝不默认 false/true）；头部「stuck 未睡:」+ 每天原文 |
+
+**涉及格坐标（`stage_churn`）**：只从 stage 记录的结构化数组字段
+（`cleared_tiles`/`unreachable_tiles`/`encircled_tiles`/`already_tiles`/`failed_tiles`/`ok_tiles`/`unexecuted_tiles`）
+取，**绝不从 note/ended_reason 文本里猜**。注意两个"最近格"概念不同：churn 坐标是 stage 的 `encircled_tiles`（A8 冬 9/14 都是
+`[37,35]`），而守卫的 `ended_reason`"最近的是 `[x, y]`"是跨片 leftover 的最近格（冬 9 是 `[43,27]`）——报告分两处呈现、不互相推导。
+
+**缺失行为（fail-closed，新增 5 条 `FIELD_PROBES`）**：
+`day_end.stages[].assigned` / `day_end.stages[].stopped` / `day_end.stages[].leftover` /
+`day_end.ended_reason` / `day_end.checks.slept_by_us`。缺失 ⇒【无法判定】（缺失 ≠ 0），
+**只记 info /【无法判定】、不进 rc**。`build_undecidable` 只给新探针开了
+`day_end.stages[].<键>`（数组内对象真找键）与 `day_end.checks.slept_by_us`（嵌套 dict）的解析路径，
+**不动**任何旧探针的判定路径（否则旧账本 `#无法判定` 会被顺手改掉，违反"只允许按新增探针增加"）。
+
+**同向性**：`tools\verify-run3.py` 对这三种形态零命中（三个都是本工具新聚合、不是 journal 事件名）⇒ 本工具一律不判红，
+不会造出反向；若将来 verify-run3 收紧，以它为准。
+
+**回归口径（2026-10-18 实测，`scratch\_t3_cmp.py`：HEAD 版 vs 新版）**：六本旧账本 rc / 红数**一字未变** ——
+runA 1/117、runB 1/84、run9 1/84、run9b 1/45、run9c 0/0、run9d 1/29；
+`#无法判定` 只 run9 / run9b 各 **+1**（新增探针 `day_end.stages[].assigned` 在 0.7.36 时代形态里确实缺失 ⇒ 如实【无法判定】），
+其余 0 变化。A8 读数：rc=1 / 红 35（原有） / `#无法判定` 103；三聚合 = churn 2 天/3 段/89 次（冬 9=24+3、冬 14=62，坐标
+`[[37,35]]`）、work_spot_resume 3 天（冬 7/12/18，连续 5 次）、stuck_without_sleep 2 天（冬 9/14）。读数与原文见
+`docs\_analyze-A8.md`。
+
+```
+# A8 三形态（真账本）
+python tools\analyze-longrun.py --journal logs\longrun-runA8-0743.jsonl --days 12 | rg "阶段 churn|回片区死循环|stuck 未睡"
+# 六本旧账本 HEAD vs 新版：rc/红/【无法判定】并排（rc/红数必须一字不变）
+git cat-file -p HEAD:tools/analyze-longrun.py > scratch\_t3_head_analyze.py   # 或 python 写字节，避免 PS 重定向毁中文
+python scratch\_t3_cmp.py
+# 定向单测（task-3 新增 18 条）
+python -m unittest tests.test_analyze_longrun.TestStageChurn
+python -m unittest tests.test_analyze_longrun.TestWorkSpotResumeExhausted
+python -m unittest tests.test_analyze_longrun.TestStuckWithoutSleep
+python -m unittest tests.test_analyze_longrun.TestRealRunA8Shapes
+```
+
 ## 4. 复核命令
 
 ```
@@ -1330,8 +1377,10 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run9d.jsonl --da
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
 python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
-python -m unittest tests.test_analyze_longrun  # 当前 264 OK（task-246：event_wait/event_blocked 事件闸门 7 条）
-python -m unittest discover -s tests           # 当前 Ran 1236 tests / OK（0 红，须 PYTHONUTF8=1）
+python -m unittest tests.test_analyze_longrun  # 当前 282 OK（task-3：三类 A8 新形态 18 条）
+python -m unittest discover -s tests           # 当前 Ran 1260 tests / OK（0 红，须 PYTHONUTF8=1）
+python tools\analyze-longrun.py --journal logs\longrun-runA8-0743.jsonl --days 12  # A8 真账本：rc=1/红 35/【无法判定】103；三形态读数见 docs\_analyze-A8.md
+python scratch\_t3_cmp.py                       # 六账本 HEAD 导出 vs 新版并排（rc/红数一字不变；#无法判定 只 run9/run9b 各 +1）
 python scratch\_t194_undec.py                   # 六账本 HEAD 导出 vs 新版并排读数：
                                                #   rc/红数**一字未变** —— runA 1/117、runB 1/84、run9 1/84、
                                                #   run9b 1/45、run9c 0/0、run9d 1/29；

@@ -32,9 +32,13 @@ _spec.loader.exec_module(mod)
 RUN1 = os.path.join(ROOT, "logs", "longrun-3day-llm-run1.jsonl")
 RUN2 = os.path.join(ROOT, "logs", "longrun-3day-llm-run2.jsonl")
 RUN5 = os.path.join(ROOT, "logs", "longrun-3day-llm-run5.jsonl")
+RUN_A8 = os.path.join(ROOT, "logs", "longrun-runA8-0743.jsonl")
 GREEN = os.path.join(ROOT, "scratch", "_ledger_green.jsonl")
 FALLBACK = os.path.join(ROOT, "scratch", "_ledger_fallback.jsonl")
 WASH = os.path.join(ROOT, "scratch", "_ledger_leftover_verified.jsonl")
+
+#: task-3：区分「字段缺失」与「字段值为 false」的哨兵（缺 `slept_by_us` 必须【无法判定】）。
+_MISSING = object()
 
 
 def report_for(path, days=3, top=50, window=None):
@@ -4970,6 +4974,303 @@ class TestEventWaitAccounting(unittest.TestCase):
                       " ".join(rep["undecidable"]))
         self.assertNotIn("事件等待:", mod.render_text(rep, 50))
         self.assertNotIn("manual:event_blocked_without_wait", rep["red"]["subjects"])
+
+
+class TestStageChurn(unittest.TestCase):
+    """task-3 A（A8 winter 9/14）：同一天同一 stage 反复重分「1 格余量」⇒ `stage_churn` 聚合。
+
+    口径：**纯 info、不进 rc**；判据 = 连续（数组相邻）同 stage + `assigned<=1` +
+    `stopped=incomplete` + `leftover` **不降**，且连续轮数 `>= STAGE_CHURN_MIN_RUN`；
+    `assigned`/`leftover` 缺失 ⇒【无法判定】（缺失 ≠ 0，绝不猜、绝不当 0）。
+    """
+
+    def _report(self, events, name):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=1)
+
+    def _churn_stage(self, *, assigned=1, leftover=1, stopped="incomplete",
+                     stage="clear_area", tiles=((37, 35),)):
+        return {"stage": stage, "tiles": assigned, "ok": 0, "skipped": 0, "failed": 1,
+                "proven_inert": 0, "env_block": 0, "inconclusive": 0, "stopped": stopped,
+                "leftover": leftover, "assigned": assigned, "assigned_undone": assigned,
+                "attempted": assigned, "requested_tiles": assigned, "ok_tiles": 0,
+                "failed_tiles": 1, "unexecuted_tiles": 0,
+                "reasons": {"blocked_tile": 1},
+                "cleared_tiles": [], "unreachable_tiles": [], "already_tiles": [],
+                "encircled_tiles": [list(t) for t in tiles]}
+
+    def _ledger(self, stages, *, ended_by="stuck",
+                reason="stuck:连续 3 轮世界没有任何变化（最后意图：['clear_area']）"):
+        checks = {"slept_by_us": False, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": False}
+        return integrity_ledger(day_end_overrides={
+            "verified": False, "ended_by": ended_by, "ended_reason": reason,
+            "checks": checks, "stages": list(stages),
+            "failed_steps": sum(int(st.get("failed") or 0) for st in stages),
+            "ok_steps": sum(int(st.get("ok") or 0) for st in stages),
+            "skipped_steps": 0,
+        })
+
+    def test_churn_run_is_aggregated_with_coords_and_day_count(self):
+        """连续 4 轮 assigned=1/incomplete/leftover=1 ⇒ 1 段 4 次，带格坐标与日级计数。"""
+        stages = [self._churn_stage() for _ in range(4)]
+        rep = self._report(self._ledger(stages), "churn.jsonl")
+        sc = rep["stage_churn"]
+        self.assertEqual(sc["min_run"], mod.STAGE_CHURN_MIN_RUN)
+        self.assertEqual(sc["runs"], 1)
+        self.assertEqual(sc["days_with_runs"], 1)
+        self.assertEqual(sc["stages_total"], 4)
+        self.assertEqual(sc["max_run"], 4)
+        self.assertEqual(sc["coords"], [[37, 35]])
+        self.assertEqual(sc["undecidable_days"], [])
+        day = sc["days"][0]
+        self.assertEqual((day["runs"], day["churn_stages"], day["max_run"]), (1, 4, 4))
+        text = mod.render_text(rep, 50)
+        self.assertIn("阶段 churn: 1 天 / 1 段 / 4 次", text)
+        self.assertIn("[[37, 35]]", text)
+        self.assertIn("纯 info：这不是失败、不进 rc", text)
+        # info：不许新增任何红
+        self.assertFalse([s for s in rep["red"]["subjects"] if "stage_churn" in s])
+        self.assertTrue(any("A8 新形态（task-3" in a["text"] for a in rep["advice"]),
+                        "新形态必须有带证据行的建议")
+
+    def test_churn_requires_continuous_run_length(self):
+        """只有 2 轮（< STAGE_CHURN_MIN_RUN）⇒ 不算 churn；单次 incomplete 是正常重试。"""
+        rep = self._report(self._ledger([self._churn_stage() for _ in range(2)]), "short.jsonl")
+        sc = rep["stage_churn"]
+        self.assertEqual((sc["runs"], sc["stages_total"], sc["max_run"]), (0, 0, 0))
+        self.assertIn("阶段 churn: 0 次", mod.render_text(rep, 50))
+
+    def test_churn_breaks_when_leftover_decreases(self):
+        """leftover 降了 = 有真实进展 ⇒ 不是空转：5→4→3→2 的 4 轮一段 churn 都不算。"""
+        stages = [self._churn_stage(leftover=left) for left in (5, 4, 3, 2)]
+        rep = self._report(self._ledger(stages), "decreasing.jsonl")
+        sc = rep["stage_churn"]
+        self.assertEqual(sc["runs"], 0)
+        self.assertIn("阶段 churn: 0 次", mod.render_text(rep, 50))
+
+    def test_churn_requires_same_stage_and_incomplete(self):
+        """同 stage 才连续；`stopped` 不是 incomplete（例如 unreachable）⇒ 断开、不算空转。"""
+        mixed = [self._churn_stage(stage="clear_area"), self._churn_stage(stage="till_area"),
+                 self._churn_stage(stage="plant_area")]
+        rep = self._report(self._ledger(mixed), "mixed.jsonl")
+        self.assertEqual(rep["stage_churn"]["runs"], 0)
+        stopped = [self._churn_stage(stopped="unreachable") for _ in range(4)]
+        rep2 = self._report(self._ledger(stopped), "stopped.jsonl")
+        self.assertEqual(rep2["stage_churn"]["runs"], 0)
+
+    def test_churn_missing_assigned_is_undecidable_not_zero(self):
+        """缺 `assigned`（旧账本 run9/run9b 形态）⇒【无法判定】+ 新增探针行；绝不当 0 次。"""
+        stages = [{k: v for k, v in self._churn_stage().items() if k != "assigned"} for _ in range(4)]
+        rep = self._report(self._ledger(stages), "noassigned.jsonl")
+        sc = rep["stage_churn"]
+        self.assertFalse(sc["has_assigned"])
+        self.assertEqual(sc["runs"], 0)
+        self.assertEqual(sc["undecidable_days"], ["1年 spring 12日"])
+        text = mod.render_text(rep, 50)
+        self.assertIn("【无法判定】", text)
+        self.assertIn("assigned", text)
+        self.assertIn("判据字段缺失", text)
+        self.assertTrue(any("本账本没有 day_end.stages[].assigned" in u
+                            for u in rep["undecidable"]),
+                        "缺失字段必须走新增探针【无法判定】，缺失 ≠ 0")
+        self.assertFalse([s for s in rep["red"]["subjects"] if "stage_churn" in s])
+
+    def test_churn_missing_leftover_is_undecidable_not_zero(self):
+        """`assigned` 在、`leftover` 缺 ⇒ 判不了「不降」⇒【无法判定】，不许当作 0 次通过。"""
+        stages = [{k: v for k, v in self._churn_stage().items() if k != "leftover"} for _ in range(4)]
+        rep = self._report(self._ledger(stages), "noleft.jsonl")
+        sc = rep["stage_churn"]
+        self.assertEqual(sc["runs"], 0)
+        self.assertEqual(sc["undecidable_days"], ["1年 spring 12日"])
+        self.assertIn("【无法判定】", mod.render_text(rep, 50))
+
+
+class TestWorkSpotResumeExhausted(unittest.TestCase):
+    """task-3 B（A8 winter 7/12/18）：`work_spot_resume` 连续 5 次拿不出目标而收工。
+
+    口径：**info、不进 rc** —— 这是 task-134 A 的有界诚实收尾，不是失败；证据 = `ended_reason`
+    原文 + `no_progress_burst{source=回片区（work_spot_resume）}`。两者都缺且整本没有
+    `resume_reevaluate`/`no_progress_burst` ⇒【无法判定】（task-134 之前的老账本，缺失 ≠ 0）。
+    """
+
+    REASON = ("stuck:回片区（work_spot_resume） 连续 5 次都拿不出目标"
+              "（守卫仍说还有活：今天早些时候还有 11 格没做完（跨片地，最近的是 [60, 32]））")
+
+    def _report(self, events, name):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=1)
+
+    def _ledger(self, *, reason, extra_events=(), ended_by="sleep"):
+        checks = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": True}
+        return integrity_ledger(extra_events=list(extra_events), day_end_overrides={
+            "verified": False, "ended_by": ended_by, "ended_reason": reason, "checks": checks,
+            "stages": [], "failed_steps": 0, "ok_steps": 0, "skipped_steps": 0,
+        })
+
+    def _burst(self):
+        return {"event": "no_progress_burst", "t": 5.0, "count": 5,
+                "source": "回片区（work_spot_resume）", "tiles": 11,
+                "reasons": ["今天早些时候还有 11 格没做完（跨片地，最近的是 [60, 32]）"],
+                "note": "回片区/换作业区连续无产出 ⇒ 按既有有界机制诚实收尾，不再空转"}
+
+    def test_exhausted_day_counted_with_raw_reason(self):
+        """原文 + 结构化 burst 都在 ⇒ 日级计数 1、连续 5 次、原文逐字保留；纯 info。"""
+        rep = self._report(self._ledger(reason=self.REASON, extra_events=[self._burst()]),
+                           "wsr.jsonl")
+        wr = rep["work_spot_resume_exhausted"]
+        self.assertEqual(wr["state"], "found")
+        self.assertEqual(wr["days_count"], 1)
+        self.assertEqual(wr["max_consecutive"], 5)
+        self.assertEqual(wr["days"][0]["ended_reason"], self.REASON, "原文不许改写")
+        self.assertEqual(wr["days"][0]["burst_counts"], [5])
+        self.assertEqual(wr["burst_mismatch_days"], [])
+        text = mod.render_text(rep, 50)
+        self.assertIn("回片区死循环（work_spot_resume）: 1 天收工", text)
+        self.assertIn(self.REASON, text)
+        self.assertIn("有界诚实收尾（task-134 A），不是失败、不进 rc", text)
+        self.assertFalse([s for s in rep["red"]["subjects"] if "work_spot_resume" in s])
+
+    def test_reason_only_still_counts(self):
+        """只有 `ended_reason` 原文、没有 burst 事件 ⇒ 仍然算命中（原文是一等证据）。"""
+        rep = self._report(self._ledger(reason=self.REASON), "reason-only.jsonl")
+        wr = rep["work_spot_resume_exhausted"]
+        self.assertEqual((wr["days_count"], wr["max_consecutive"]), (1, 5))
+        self.assertEqual(wr["burst_mismatch_days"], [], "没有 burst 不算 mismatch")
+
+    def test_zero_is_real_when_mechanism_present(self):
+        """机制事件（resume_reevaluate）在场、原文无该形态 ⇒ 0 天是**真实读数**，不是无法判定。"""
+        ev = {"event": "resume_reevaluate", "t": 3.0, "where": "guard_leftover",
+              "cleared": ["clear_area"], "note": "回到跨片区 leftover 之前清掉任务级 no_target"}
+        rep = self._report(self._ledger(reason="night:时间 2200 已经到夜里", extra_events=[ev]),
+                           "zero.jsonl")
+        wr = rep["work_spot_resume_exhausted"]
+        self.assertEqual(wr["state"], "zero")
+        self.assertEqual(wr["days_count"], 0)
+        self.assertIn("0 天（机制事件在场", mod.render_text(rep, 50))
+        self.assertFalse([s for s in rep["red"]["subjects"] if "work_spot_resume" in s])
+
+    def test_missing_mechanism_is_undecidable(self):
+        """没有 `resume_reevaluate`/`no_progress_burst`（task-134 之前的旧账本）⇒【无法判定】。"""
+        rep = self._report(self._ledger(reason="night:时间 2200 已经到夜里"), "old.jsonl")
+        wr = rep["work_spot_resume_exhausted"]
+        self.assertEqual(wr["state"], "undecidable")
+        self.assertEqual(wr["undecidable_days"], ["1年 spring 12日"])
+        text = mod.render_text(rep, 50)
+        self.assertIn("回片区死循环（work_spot_resume）: <缺失>", text)
+        self.assertIn("缺失 ≠ 0", text)
+
+    def test_burst_without_reason_is_flagged_not_guessed(self):
+        """burst 在、原文没命中 ⇒ 不能凭 burst 编收工原文：列为 mismatch（收工结论只能无法判定）。"""
+        rep = self._report(self._ledger(reason="night:时间 2200 已经到夜里",
+                                        extra_events=[self._burst()]), "mismatch.jsonl")
+        wr = rep["work_spot_resume_exhausted"]
+        self.assertEqual(wr["days_count"], 1)
+        self.assertEqual(wr["burst_mismatch_days"], ["1年 spring 12日"])
+        self.assertIn("原文没命中", mod.render_text(rep, 50))
+
+
+class TestStuckWithoutSleep(unittest.TestCase):
+    """task-3 C（A8 winter 9/14）：`ended_by=stuck` 但 `checks.slept_by_us=false`。
+
+    口径：**info /【无法判定】、不进 rc** —— 当天没由我们睡过去，「为什么 stuck / 是否真的收工」
+    说不清；`checks.slept_by_us` 缺失同样【无法判定】（缺失 ≠ 0，绝不默认 true/false）。
+    """
+
+    def _report(self, events, name):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=1)
+
+    def _ledger(self, *, slept, ended_by="stuck", reason="stuck:连续 3 轮世界没有任何变化"):
+        checks = {"no_blocking_modal": True, "no_hard_failures": True,
+                  "crops_watered": True, "day_justified": False}
+        if slept is not _MISSING:
+            checks["slept_by_us"] = slept
+        return integrity_ledger(day_end_overrides={
+            "verified": False, "ended_by": ended_by, "ended_reason": reason, "checks": checks,
+            "stages": [], "failed_steps": 0, "ok_steps": 0, "skipped_steps": 0,
+        })
+
+    def test_stuck_without_sleep_is_flagged_with_raw_reason(self):
+        """ended_by=stuck + slept_by_us=false ⇒ 记 1 天，原文保留；不进 rc。"""
+        rep = self._report(self._ledger(slept=False), "nosleep.jsonl")
+        sw = rep["stuck_without_sleep"]
+        self.assertEqual((sw["stuck_days"], sw["flagged"], sw["undecidable"]), (1, 1, 0))
+        self.assertEqual(sw["flagged_days"], ["1年 spring 12日"])
+        self.assertEqual(sw["days"][0]["ended_reason"], "stuck:连续 3 轮世界没有任何变化")
+        text = mod.render_text(rep, 50)
+        self.assertIn("stuck 未睡: 1 天", text)
+        self.assertIn("【无法判定】", text)
+        self.assertFalse([s for s in rep["red"]["subjects"] if "stuck_without_sleep" in s])
+
+    def test_stuck_with_sleep_is_coherent_not_flagged(self):
+        """ended_by=stuck 但 slept_by_us=true ⇒ 不归入本形态（单独计 coherent，供人工核对）。"""
+        rep = self._report(self._ledger(slept=True), "slept.jsonl")
+        sw = rep["stuck_without_sleep"]
+        self.assertEqual((sw["flagged"], sw["coherent"], sw["undecidable"]), (0, 1, 0))
+        self.assertIn("stuck 未睡: 0 天", mod.render_text(rep, 50))
+
+    def test_missing_slept_by_us_is_undecidable_not_false(self):
+        """缺 `checks.slept_by_us` ⇒【无法判定】（不当 false 判命中、也不当 true 放行）。"""
+        rep = self._report(self._ledger(slept=_MISSING), "missing.jsonl")
+        sw = rep["stuck_without_sleep"]
+        self.assertEqual((sw["flagged"], sw["coherent"], sw["undecidable"]), (0, 0, 1))
+        self.assertTrue(any("本账本没有 day_end.checks.slept_by_us" in u
+                            for u in rep["undecidable"]),
+                        "缺失字段必须走新增探针【无法判定】")
+        self.assertIn("stuck 未睡: <缺失>", mod.render_text(rep, 50))
+        self.assertFalse([s for s in rep["red"]["subjects"] if "stuck_without_sleep" in s])
+
+
+class TestRealRunA8Shapes(unittest.TestCase):
+    """task-3 真账本读数（`logs/longrun-runA8-0743.jsonl`，0.7.43，冬 7→18）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        if not os.path.isfile(RUN_A8):
+            raise unittest.SkipTest(f"缺少账本 {RUN_A8}")
+        cls.rep = report_for(RUN_A8, days=12)
+
+    def test_stage_churn_readings(self):
+        sc = self.rep["stage_churn"]
+        self.assertEqual((sc["runs"], sc["days_with_runs"], sc["stages_total"]), (3, 2, 89))
+        self.assertEqual((sc["max_run"], sc["coords"]), (62, [[37, 35]]))
+        days = {d["label"]: d for d in sc["days"]}
+        self.assertEqual(days["1年 winter 9日"]["runs"], 2)
+        self.assertEqual(days["1年 winter 9日"]["churn_stages"], 27)
+        self.assertEqual(days["1年 winter 14日"]["churn_stages"], 62)
+        self.assertEqual(sc["undecidable_days"], [])
+
+    def test_work_spot_resume_readings(self):
+        wr = self.rep["work_spot_resume_exhausted"]
+        self.assertEqual((wr["state"], wr["days_count"], wr["max_consecutive"]), ("found", 3, 5))
+        labels = [d["label"] for d in wr["days"]]
+        self.assertEqual(labels, ["1年 winter 7日", "1年 winter 12日", "1年 winter 18日"])
+        for day in wr["days"]:
+            self.assertIn("work_spot_resume", day["ended_reason"])
+            self.assertIn("连续 5 次都拿不出目标", day["ended_reason"])
+            self.assertTrue(day["burst_lines"], "结构化 no_progress_burst 必须在场")
+
+    def test_stuck_without_sleep_readings(self):
+        sw = self.rep["stuck_without_sleep"]
+        self.assertEqual((sw["stuck_days"], sw["flagged"], sw["undecidable"]), (2, 2, 0))
+        self.assertEqual(sw["flagged_days"], ["1年 winter 9日", "1年 winter 14日"])
+        for day in sw["days"]:
+            self.assertIs(day["slept_by_us"], False)
+
+    def test_new_aggregations_add_no_red(self):
+        subjects = self.rep["red"]["subjects"]
+        for name in ("stage_churn", "work_spot_resume", "stuck_without_sleep"):
+            self.assertFalse([s for s in subjects if name in s],
+                             f"{name} 只允许 info /【无法判定】，绝不进 rc")
+        text = mod.render_text(self.rep, 20)
+        self.assertIn("阶段 churn: 2 天 / 3 段 / 89 次", text)
+        self.assertIn("回片区死循环（work_spot_resume）: 3 天收工", text)
+        self.assertIn("stuck 未睡: 2 天", text)
 
 
 if __name__ == "__main__":

@@ -24,7 +24,15 @@
      旧账本缺字段=【无法判定】。另：gaps 读/写失败（`gaps_load_failed`/`gaps_write_failed`、
      `day_end.gaps_problem` 非空）= problem ⇒ 判红。**§8 的红只由本工具判**，
      `tools\verify-run3.py` 对 §8 只出 info（不动它的 day_end 白名单）。
-外加：每天一行摘要、3-8 条带证据行的改进建议、"本账本无法判定"清单。
+【task-3】（A8 真账本新形态，2026-10-18）三类聚合，**默认 info /【无法判定】、不进 rc**：
+      ① `stage_churn` = 同一天同一 stage **连续多轮** `assigned<=1` + `stopped=incomplete` + `leftover` 不降
+      ⇒ 反复重分「1 格余量」的空转（日级计数 + 涉及格坐标；`assigned`/`leftover` 缺失 ⇒【无法判定】）；
+      ② `work_spot_resume_exhausted` = `day_end.ended_reason` 原文「stuck:回片区（work_spot_resume）
+      连续 N 次都拿不出目标」+ `no_progress_burst{source=回片区（work_spot_resume）}` ⇒ 有界诚实收工
+      （info；日级计数 + 原文）；
+      ③ `stuck_without_sleep` = `ended_by=stuck` 但 `checks.slept_by_us=false` ⇒ 当天没由我们睡过去，
+      「为什么 stuck / 是否真的收工」只能【无法判定】（info；缺 `slept_by_us` ⇒ 无法判定，不当 0）。
+外加：每天一行摘要、3-9 条带证据行的改进建议、"本账本无法判定"清单。
 
 与 `tools\\verify-run3.py` 的关系：两者**独立读数、交叉核对**。本工具只做分析、不判验收；
 但下列口径与它对齐（同一本账本给出相反结论 ⇒ 停下来人工对账，别单方面改口径）：
@@ -746,6 +754,20 @@ FIELD_PROBES = [
      "event_blocked 前等了多久（秒；brain = EVENT_WAIT_TRIES×EVENT_WAIT_SECONDS，task-245）"),
     ("ui.eventId", "ui.eventId",
      "观测 `ui` 块里的事件 id（task-245 Mod 新增，三态：有值 / null=读不到 / 缺字段=旧 Mod）"),
+    # task-3（2026-10-18，A8 真账本）：三类新形态的判据字段。**缺失 ⇒【无法判定】**（缺失 ≠ 0），
+    # 只记 info /【无法判定】、不进 rc；`stage_churn` 缺 `assigned` 就分不出「1 格余量反复重分」，
+    # `work_spot_resume_exhausted` 缺 `ended_reason` 就答不出「为什么收工」，`stuck_without_sleep`
+    # 缺 `slept_by_us` 就判不了「当天是不是我们睡过去的」。
+    ("day_end.stages[].assigned", "day_end.stages[].assigned",
+     "阶段分下去的格数（`stage_churn`：连续多轮 assigned<=1 + stopped=incomplete + leftover 不降 ⇒ 空转）"),
+    ("day_end.stages[].stopped", "day_end.stages[].stopped",
+     "阶段收尾方式（`stage_churn`：incomplete = 还有分配未成事的格才可能反复重分 1 格余量）"),
+    ("day_end.stages[].leftover", "day_end.stages[].leftover",
+     "阶段结束时片区还剩几格（`stage_churn`：**不降**才算空转；降了说明有真实进展）"),
+    ("day_end.ended_reason", "day_end.ended_reason",
+     "当天收工原文（`work_spot_resume_exhausted`：原文里必须有 work_spot_resume + 连续 N 次拿不出目标）"),
+    ("day_end.checks.slept_by_us", "day_end.checks.slept_by_us",
+     "当天是否由我们睡过去（`stuck_without_sleep`：ended_by=stuck 且 false ⇒【无法判定】为什么 stuck）"),
 ]
 OUTCOME_RE = re.compile(
     r"目标\s*(\d+)\s*步：做成\s*(\d+)、跳过\s*(\d+)、失败\s*(\d+)"
@@ -1616,6 +1638,130 @@ def day_label(ev):
     if isinstance(day, list) and day:
         return "/".join(str(x) for x in day)
     return "?"
+
+
+# ---------------------------------------------------------------- task-3（A8 真账本新形态）
+#: A) `stage_churn`：同一天同一 stage **连续多轮**重分「1 格余量」的判据
+#: （A8 winter 9 / winter 14 的真形态；旧账本 runA/runB 的 harvest 阶段也有同形态）：
+#:   * 连续长度 >= `STAGE_CHURN_MIN_RUN`（3）才算 churn —— 单次 `incomplete` 是正常重试；
+#:   * `assigned <= STAGE_CHURN_SMALL_ASSIGNED`（1）= 这一轮只分下去 1 格；
+#:   * `stopped == "incomplete"` = 这一轮还有分配未成事的格（brain 的 stop 原因）；
+#:   * 段内 `leftover` 逐轮**不降**（next >= prev）⇒ 片区剩余没变少 = 空转；
+#:     一旦降了说明有真实进展 ⇒ run 到此结束（**不许**把降了 leftover 还说成空转）。
+#: 缺失/非 int 字段 ⇒ 该记录**不参与判定**并计入 undecidable（**缺失 ≠ 0**，绝不猜）。
+STAGE_CHURN_MIN_RUN = 3
+STAGE_CHURN_SMALL_ASSIGNED = 1
+#: 只从这些结构化数组字段取「涉及格坐标」，**绝不从 note/ended_reason 文本里猜坐标**。
+STAGE_TILE_FIELDS = ("cleared_tiles", "unreachable_tiles", "encircled_tiles", "already_tiles",
+                     "failed_tiles", "ok_tiles", "unexecuted_tiles")
+
+
+def stage_tile_coords(stage):
+    """从一个 stage 记录里收集结构化格坐标（`[[x,y],…]`，去重保序）。"""
+    out = []
+    if not isinstance(stage, dict):
+        return out
+    for key in STAGE_TILE_FIELDS:
+        for tile in as_list(stage.get(key)):
+            if isinstance(tile, list) and len(tile) == 2:
+                pair = [tile[0], tile[1]]
+                if pair not in out:
+                    out.append(pair)
+    return out
+
+
+def scan_stage_churn(stages, min_run=STAGE_CHURN_MIN_RUN, small=STAGE_CHURN_SMALL_ASSIGNED):
+    """扫一天 `day_end.stages[]` 里的「1 格余量反复重分」连续段（task-3 A）。
+
+    返回 dict（全量、不截断）：
+      * `runs`：每段 `{stage,start_idx,end_idx,count,leftovers,coords,coord_missing,
+        assigned_max,assigned_undone_sum,reasons}`；
+      * `records` / `has_assigned` / `bad_assigned` / `bad_stopped` / `bad_leftover`；
+      * `undecidable`（bool）/ `undecidable_why`（str 列表）。
+
+    **缺失 ≠ 0**：缺 `assigned`/`leftover` 的段一律不参与判定、计入 undecidable，
+    绝不把「判不了」当成「没发生过」（旧账本 run9/run9b 的 stages[] 就没有 `assigned`）。
+    """
+    recs = as_list(stages)
+    runs = []
+    run = []
+    stats = {"records": len(recs), "has_assigned": False, "bad_assigned": 0,
+             "bad_stopped": 0, "bad_leftover": 0, "bad_records": 0}
+
+    def _flush():
+        if len(run) < min_run:
+            run.clear()
+            return
+        coords = []
+        for st in run:
+            for tile in stage_tile_coords(st):
+                if tile not in coords:
+                    coords.append(tile)
+        reasons = {}
+        for st in run:
+            for code, n in as_dict(st.get("reasons")).items():
+                reasons[str(code)] = reasons.get(str(code), 0) + as_int(n)
+        runs.append({
+            "stage": str(run[0].get("stage") or "?"),
+            "start_idx": int(run[0]["_idx"]),
+            "end_idx": int(run[-1]["_idx"]),
+            "count": len(run),
+            "leftovers": [as_int(st.get("leftover")) for st in run],
+            "coords": coords,
+            "coord_missing": not coords,
+            "assigned_max": max(as_int(st.get("assigned")) for st in run),
+            "assigned_undone_sum": sum(as_int(st.get("assigned_undone")) for st in run),
+            "reasons": reasons,
+        })
+        run.clear()
+
+    for idx, st in enumerate(recs):
+        if not isinstance(st, dict):
+            stats["bad_records"] += 1
+            _flush()
+            continue
+        assigned = st.get("assigned")
+        assigned_ok = isinstance(assigned, int) and not isinstance(assigned, bool)
+        if "assigned" in st:
+            stats["has_assigned"] = True
+        if not assigned_ok:
+            stats["bad_assigned"] += 1
+        stopped = st.get("stopped")
+        if not isinstance(stopped, str):
+            stats["bad_stopped"] += 1
+        leftover = st.get("leftover")
+        leftover_ok = isinstance(leftover, int) and not isinstance(leftover, bool)
+        eligible = assigned_ok and int(assigned) <= small and stopped == "incomplete"
+        if not eligible:
+            _flush()
+            continue
+        if not leftover_ok:
+            # 判不了「不降」⇒ 这一段不能算 churn（缺失 ≠ 0）
+            stats["bad_leftover"] += 1
+            _flush()
+            continue
+        if run and (str(st.get("stage") or "?") != str(run[0].get("stage") or "?")
+                    or int(leftover) < as_int(run[-1].get("leftover"))):
+            _flush()
+        st = dict(st)
+        st["_idx"] = idx
+        run.append(st)
+    _flush()
+    why = []
+    if stats["records"] and not stats["has_assigned"]:
+        why.append("stages[] 没有任何 `assigned` 字段")
+    if stats["bad_assigned"]:
+        why.append(f"{stats['bad_assigned']} 段缺/非整数 assigned")
+    if stats["bad_stopped"]:
+        why.append(f"{stats['bad_stopped']} 段缺/非字符串 stopped")
+    if stats["bad_leftover"]:
+        why.append(f"{stats['bad_leftover']} 段缺/非整数 leftover（判不了「不降」）")
+    stats["churn"] = bool(runs)
+    stats["undecidable"] = bool(stats["records"]) and bool(why)
+    stats["undecidable_why"] = why
+    stats["runs"] = runs
+    return stats
+
 
 
 #: 季节顺序（跨日校验用：每季固定 28 天）
@@ -2890,7 +3036,8 @@ def cat_event(rows, top):
     return out[:top] if top else out
 
 
-def build_advice(report, top=8):
+def build_advice(report, top=9):
+    """汇总带证据行的改进建议（默认最多 9 条；task-3 起从 8 提到 9，给 A8 三类新形态留一格）。"""
     advice = []
     events = report["events"]
     sessions = report["_sessions"]
@@ -3591,6 +3738,41 @@ def build_advice(report, top=8):
                     "⇒ 升级 Mod 后重跑才有归因",
             "lines": ((eg.get("wait_lines") or [])[:5] + (eg.get("blocked_lines") or [])[:5]),
         })
+    # 0s-10（task-3，A8 真账本）：三类新形态 —— 默认 info /【无法判定】，**不进 rc**
+    sc0 = report.get("stage_churn") or {}
+    wr0 = report.get("work_spot_resume_exhausted") or {}
+    sw0 = report.get("stuck_without_sleep") or {}
+    _t3_parts = []
+    _t3_lines = []
+    if sc0.get("runs"):
+        _t3_parts.append(
+            f"同日同 stage 反复重分「1 格余量」{sc0['runs']} 段 / {sc0['days_with_runs']} 天"
+            f"（最长 {sc0['max_run']} 次；涉及格 {sc0.get('coords') or '坐标<缺失>'}；"
+            f"判据 = 连续 assigned<={sc0.get('small_assigned')} + stopped=incomplete + leftover 不降）"
+            "—— 空转证据，不是失败")
+        _t3_lines.extend([d.get("line") for d in (sc0.get("days") or []) if d.get("runs")])
+    if sc0.get("undecidable_days"):
+        _t3_parts.append(f"stage churn 字段缺失 ⇒【无法判定】（{'、'.join(sc0['undecidable_days'][:6])}）")
+        _t3_lines.extend([d.get("line") for d in (sc0.get("days") or []) if d.get("undecidable")])
+    if wr0.get("days"):
+        _t3_parts.append(
+            f"回片区（work_spot_resume）连续拿不出目标而收工 {wr0.get('days_count', 0)} 天"
+            f"（连续 {wr0.get('max_consecutive', 0)} 次为上限；原文在 day_end.ended_reason）"
+            "—— task-134 A 的有界诚实收尾，不是失败")
+        _t3_lines.extend([d.get("line") for d in wr0.get("days") or []])
+    if sw0.get("flagged"):
+        _t3_parts.append(
+            f"ended_by=stuck 但 checks.slept_by_us=false {sw0['flagged']} 天"
+            f"（{'、'.join(sw0.get('flagged_days') or [])}）"
+            "—— 当天没由我们睡过去，为什么 stuck / 是否真的收工只能【无法判定】")
+        _t3_lines.extend([d.get("line") for d in sw0.get("days") or []])
+    if sw0.get("undecidable"):
+        _t3_parts.append(f"stuck 天缺 checks.slept_by_us {sw0['undecidable']} 天 ⇒【无法判定】")
+    if _t3_parts:
+        advice.append({
+            "text": "A8 新形态（task-3；**全是 info /【无法判定】，不进 rc**）：" + "；".join(_t3_parts),
+            "lines": [ln for ln in _t3_lines if ln is not None][:10],
+        })
     # 0c) 环境挡路 / 没拿到结论（task-22 记账）
     env = report.get("env_inconclusive") or {}
     if env.get("env_fail_events"):
@@ -3816,6 +3998,20 @@ def build_undecidable(rows, sessions, prelude, report):
                 _decs = [ev for _, ev in rows if ev.get("event") == "decision"]
                 absent = not any(isinstance(_pl, dict) and str(_pl.get("intent_id") or "")
                                  for ev in _decs for _pl in as_list(ev.get("plans")))
+            elif _spec.startswith("day_end.stages[]."):
+                # task-3：`day_end.stages[]` 是**数组里的对象**，要真去 stage 记录里找键
+                # （不能拿 "stages[].assigned" 当整串文本/当 day_end 的顶层键找 —— 那样恒缺失）。
+                _sk = _spec.split("day_end.stages[].", 1)[1]
+                _stage_recs = [st for _, ev in rows if ev.get("event") == "day_end"
+                               for st in as_list(ev.get("stages")) if isinstance(st, dict)]
+                absent = not any(_sk in st for st in _stage_recs)
+            elif _spec == "day_end.checks.slept_by_us":
+                # task-3：`day_end.checks` 是**嵌套 dict**，要真去 `.checks` 里找键
+                # （只给这一条新探针开嵌套；**不改**其它探针的既有判定，免得旧账本
+                # 的【无法判定】条数被顺手改掉 —— "#无法判定 只允许按新增探针增加"）。
+                absent = not any(isinstance(ev.get("checks"), dict)
+                                 and "slept_by_us" in ev["checks"]
+                                 for _, ev in rows if ev.get("event") == "day_end")
             elif _spec.startswith("ui."):
                 # task-246：`ui` 是每行观测里的嵌套 dict，要真去找键（不能拿 "ui.eventId" 当整串文本找）
                 _uk = _spec.split(".", 1)[1]
@@ -5932,6 +6128,206 @@ def build_report(rows, path, args, bad_lines):
         "id_text": "、".join(_id_known[:3]) if _id_known else "无法归因",
         "has_events": bool(_ew_lines or _eb_lines),
     }
+    # 【task-3】（2026-10-18，A8 `logs\longrun-runA8-0743.jsonl` 暴露的两种新形态 + 一种归因缺口）
+    # 口径：三类**默认 info /【无法判定】、不进 rc**（没有硬证据就不判红；六本旧账本 rc/红数一字不变）。
+    #   A) `stage_churn`：同一天同一 stage 连续多轮 `assigned<=1` + `stopped=incomplete` +
+    #      `leftover` 不降 ⇒ 反复重分「1 格余量」的空转（A8 winter 9：24+3 段；winter 14：62 段
+    #      ⇒ 最终 stuck）。这是**修复候选的证据**，不是失败。
+    #   B) `work_spot_resume_exhausted`：`ended_reason` 原文「stuck:回片区（work_spot_resume）
+    #      连续 N 次都拿不出目标」+ `no_progress_burst{source=回片区（work_spot_resume）}」
+    #      ⇒ 有界诚实收工（A8 winter 7/12/18；task-134 A 的防空转机制生效，**不是失败**）。
+    #   C) `stuck_without_sleep`：`ended_by=stuck` 但 `checks.slept_by_us=false`（A8 winter 9/14）
+    #      ⇒ 当天没由我们睡过去，「为什么 stuck / 是否真的收工」只能【无法判定】（不是失败）。
+    _churn_day_rows = []
+    _churn_runs_total = _churn_stages_total = _churn_max_run = 0
+    _churn_coords = []
+    _churn_undecidable_days = []
+    _churn_days_with_stages = 0
+    _churn_records_total = 0
+    _churn_has_assigned = False
+    for _sess, _drow in zip(sessions, days):
+        _ends = _sess.get("day_ends") or []
+        if not _ends:
+            continue
+        _end_ln, _end = _ends[-1]
+        if "stages" not in _end:
+            continue
+        _churn_days_with_stages += 1
+        _scan = scan_stage_churn(_end.get("stages"))
+        _churn_records_total += _scan["records"]
+        _churn_has_assigned = _churn_has_assigned or _scan["has_assigned"]
+        _day_coords = []
+        for _run in _scan["runs"]:
+            for _tile in _run["coords"]:
+                if _tile not in _day_coords:
+                    _day_coords.append(_tile)
+        _day_runs = len(_scan["runs"])
+        _day_stages = sum(_run["count"] for _run in _scan["runs"])
+        _day_max = max([_run["count"] for _run in _scan["runs"]] or [0])
+        _churn_runs_total += _day_runs
+        _churn_stages_total += _day_stages
+        _churn_max_run = max(_churn_max_run, _day_max)
+        for _tile in _day_coords:
+            if _tile not in _churn_coords:
+                _churn_coords.append(_tile)
+        _label = _drow.get("label") or day_label(_end)
+        if _scan["undecidable"]:
+            _churn_undecidable_days.append(_label)
+        if _day_runs or _scan["undecidable"]:
+            _churn_day_rows.append({
+                "label": _label,
+                "line": _end_ln,
+                "ended_by": _end.get("ended_by"),
+                "verified": _end.get("verified"),
+                "stage_records": _scan["records"],
+                "runs": _day_runs,
+                "churn_stages": _day_stages,
+                "max_run": _day_max,
+                "coords": _day_coords,
+                "undecidable": _scan["undecidable"],
+                "undecidable_why": _scan["undecidable_why"],
+                "run_details": _scan["runs"],
+            })
+    stage_churn = {
+        "min_run": STAGE_CHURN_MIN_RUN,
+        "small_assigned": STAGE_CHURN_SMALL_ASSIGNED,
+        "days": _churn_day_rows,
+        "days_with_stages": _churn_days_with_stages,
+        "stage_records": _churn_records_total,
+        "has_stage_data": _churn_days_with_stages > 0,
+        "has_assigned": _churn_has_assigned,
+        "runs": _churn_runs_total,
+        "stages_total": _churn_stages_total,
+        "days_with_runs": len([_d for _d in _churn_day_rows if _d["runs"]]),
+        "max_run": _churn_max_run,
+        "coords": _churn_coords,
+        "undecidable_days": _churn_undecidable_days,
+    }
+    # B) 回片区死循环收工（`_no_progress_stop(source="回片区（work_spot_resume）")`）：
+    #    结构化证据 = `no_progress_burst{source=…}`；原文证据 = `day_end.ended_reason`。
+    #    只有两者都缺、且整本连 `resume_reevaluate`/`no_progress_burst` 都没有时才【无法判定】
+    #    （task-134 A 之前的老账本根本不会写这两个名字 ⇒ **缺失 ≠ 0**）。
+    _npb_all = [(ln, ev) for ln, ev in rows if ev.get("event") == "no_progress_burst"]
+    _resume_all = [(ln, ev) for ln, ev in rows if ev.get("event") == "resume_reevaluate"]
+    _wsr_bounds = []
+    for _i, _sess in enumerate(sessions):
+        _bs = _sess.get("start_line") or 0
+        _be = (sessions[_i + 1].get("start_line") - 1) if _i + 1 < len(sessions) else 10 ** 9
+        _wsr_bounds.append((_bs, _be))
+    _wsr_re = re.compile(r"连续\s*(\d+)\s*次")
+    _wsr_days = []
+    _wsr_undecidable_days = []
+    _wsr_burst_mismatch_days = []
+    _wsr_all_labels = []
+    for _di, (_sess, _drow) in enumerate(zip(sessions, days)):
+        _ends = _sess.get("day_ends") or []
+        if not _ends:
+            continue
+        _end_ln, _end = _ends[-1]
+        _label = _drow.get("label") or day_label(_end)
+        _wsr_all_labels.append(_label)
+        _reason = _end.get("ended_reason")
+        _reason_ok = isinstance(_reason, str) and _reason.strip() != ""
+        _bs, _be = _wsr_bounds[_di]
+        _bursts = [(ln, ev) for ln, ev in _npb_all if _bs <= ln <= _be
+                   and "work_spot_resume" in str(ev.get("source") or "")]
+        _matched = bool(_reason_ok and "work_spot_resume" in _reason and "拿不出目标" in _reason)
+        if not _matched and not _bursts:
+            if not _reason_ok:
+                _wsr_undecidable_days.append(_label)
+            continue
+        if _bursts and not _matched:
+            _wsr_burst_mismatch_days.append(_label)
+        _consec = None
+        _m = _wsr_re.search(_reason) if _reason_ok else None
+        if _m:
+            _consec = as_int(_m.group(1), None)
+        if _consec is None:
+            _counts = [as_int(ev.get("count"), None) for _, ev in _bursts]
+            _counts = [c for c in _counts if c is not None]
+            if _counts:
+                _consec = max(_counts)
+        _wsr_days.append({
+            "label": _label,
+            "line": _end_ln,
+            "ended_by": _end.get("ended_by"),
+            "verified": _end.get("verified"),
+            "ended_reason": _reason,
+            "reason_matched": _matched,
+            "consecutive": _consec,
+            "burst_lines": [ln for ln, _ in _bursts],
+            "burst_counts": [as_int(ev.get("count"), None) for _, ev in _bursts],
+            "burst_tiles": [as_int(ev.get("tiles"), None) for _, ev in _bursts],
+        })
+    _wsr_mechanism = bool(_npb_all or _resume_all)
+    if _wsr_days:
+        _wsr_state = "found"
+    elif not days:
+        _wsr_state = "undecidable"
+        _wsr_undecidable_days.append("<整本没有 day_end>")
+    elif _wsr_undecidable_days:
+        _wsr_state = "undecidable"
+    elif _wsr_mechanism:
+        _wsr_state = "zero"
+    else:
+        # task-134 A 之前的老账本：没有 `no_progress_burst`/`resume_reevaluate` ⇒
+        # 「0 次」不可证伪 ⇒ 这些天全部记【无法判定】（缺失 ≠ 0，绝不当 0 次通过）。
+        _wsr_state = "undecidable"
+        _wsr_undecidable_days = list(_wsr_all_labels) or ["<整本没有 day_end>"]
+    work_spot_resume_exhausted = {
+        "state": _wsr_state,
+        "days": _wsr_days,
+        "days_count": len(_wsr_days),
+        "max_consecutive": max([int(d["consecutive"]) for d in _wsr_days
+                                if d.get("consecutive") is not None] or [0]),
+        "undecidable_days": _wsr_undecidable_days,
+        "burst_mismatch_days": _wsr_burst_mismatch_days,
+        "no_progress_burst_events": len(_npb_all),
+        "resume_reevaluate_events": len(_resume_all),
+        "mechanism_present": _wsr_mechanism,
+    }
+    # C) `ended_by=stuck` + `checks.slept_by_us=false`：当天**没有由我们睡过去** →
+    #    「为什么 stuck / 是否真的收工」只能【无法判定】（缺 `slept_by_us` 同样无法判定，不当 0）。
+    _stuck_days = []
+    _stuck_slept_days = []
+    _stuck_undecidable_days = []
+    _stuck_slept_field_seen = False
+    for _sess, _drow in zip(sessions, days):
+        _ends = _sess.get("day_ends") or []
+        if not _ends:
+            continue
+        _end_ln, _end = _ends[-1]
+        if _end.get("ended_by") != "stuck":
+            continue
+        _checks = as_dict(_end.get("checks"))
+        _slept = _checks.get("slept_by_us")
+        if "slept_by_us" in _checks:
+            _stuck_slept_field_seen = True
+        _entry = {
+            "label": _drow.get("label") or day_label(_end),
+            "line": _end_ln,
+            "verified": _end.get("verified"),
+            "slept_by_us": _slept,
+            "ended_reason": _end.get("ended_reason"),
+        }
+        if _slept is False:
+            _stuck_days.append(_entry)
+        elif _slept is True:
+            _stuck_slept_days.append(_entry)
+        else:
+            _stuck_undecidable_days.append(_entry)
+    stuck_without_sleep = {
+        "stuck_days": len(_stuck_days) + len(_stuck_slept_days) + len(_stuck_undecidable_days),
+        "flagged": len(_stuck_days),
+        "days": _stuck_days,
+        "flagged_days": [_d["label"] for _d in _stuck_days],
+        "coherent": len(_stuck_slept_days),
+        "coherent_days": [_d["label"] for _d in _stuck_slept_days],
+        "undecidable": len(_stuck_undecidable_days),
+        "undecidable_days": _stuck_undecidable_days,
+        "has_slept_field": _stuck_slept_field_seen,
+        "has_day_end": bool(days),
+    }
     # 0 步 VERIFIED 的弱日（已有 task-88 口径）；这里只做信息项。
     sleep_ok = sum(1 for _, ev in rows if ev.get("event") == "sleep" and ev.get("ok"))
     sleep_failed = sum(1 for _, ev in rows if ev.get("event") == "sleep" and not ev.get("ok"))
@@ -6360,6 +6756,10 @@ def build_report(rows, path, args, bad_lines):
     report["gaps"] = _gaps_report
     # 【task-246】事件闸门（eventUp 的有界等待 / 事件归因）—— info 为主，唯一红见 cat_event
     report["event_gate"] = _event_gate
+    # 【task-3】A8 新形态三聚合（默认 info /【无法判定】、不进 rc；六本旧账本 rc/红数不变）
+    report["stage_churn"] = stage_churn
+    report["work_spot_resume_exhausted"] = work_spot_resume_exhausted
+    report["stuck_without_sleep"] = stuck_without_sleep
     # task-88：`cat_self_report` 要按**目标窗口**（`--window N`）而不是 `finish.days` 判自洽。
     report["window_days"] = as_int(getattr(args, "window", 3), 3)
     self_report = cat_self_report(report)
@@ -6782,6 +7182,26 @@ MAPPING_TEXT = [
      "`eventWaitTries` 整键缺失 = task-245 之前的旧 Mod ⇒【无法判定】只记信息，绝不判红；"
      "`eventId` 三态（有值 / null=读不到 / 缺字段=旧 Mod），缺失 ⇒【无法判定】不许猜；"
      "`verify-run3.py` 对两事件只作 info，本工具的这条红是补充、不与其冲突"),
+    ("stage_churn（task-3，A8 winter 9/14）",
+     "A8 新形态·**信息项、不进 rc**：同一天同一 stage **连续多轮** `assigned<=1` + "
+     "`stopped=incomplete` + `leftover` 不降 ⇒ 反复重分「1 格余量」的空转（判据常量 "
+     f"`STAGE_CHURN_MIN_RUN={STAGE_CHURN_MIN_RUN}` / `STAGE_CHURN_SMALL_ASSIGNED="
+     f"{STAGE_CHURN_SMALL_ASSIGNED}`；按 `day_end.stages[]` 连续段扫）。报告给**日级计数** + "
+     "**涉及格坐标**（只从 cleared/unreachable/encircled/already/failed/ok/unexecuted 这些结构化"
+     "数组字段取，绝不从文本猜）；`assigned`/`leftover` 缺失 ⇒【无法判定】（缺失 ≠ 0，旧账本 "
+     "run9/run9b 就没 `assigned`）；单次 `incomplete`（<3 轮）是正常重试、不算 churn"),
+    ("work_spot_resume_exhausted（task-3，A8 winter 7/12/18）",
+     "A8 新形态·**信息项、不进 rc**：`day_end.ended_reason` 原文「stuck:回片区（work_spot_resume） "
+     "连续 N 次都拿不出目标（守卫仍说还有活：…）」+ 结构化 `no_progress_burst{source=回片区"
+     "（work_spot_resume）, count, tiles}` ⇒ `_no_progress_stop` 的有界诚实收尾（task-134 A 防"
+     "空转机制生效），**不是失败**；报告给日级计数 + 原文（`max_consecutive` 从原文/burst 取，"
+     "取不到就是 None，不许猜）。两者都没有、且整本没有 `resume_reevaluate`/`no_progress_burst` "
+     "⇒【无法判定】（task-134 之前的老账本；缺失 ≠ 0）"),
+    ("stuck_without_sleep（task-3，A8 winter 9/14）",
+     "A8 新形态·**info /【无法判定】、不进 rc**：`ended_by=stuck` 且 `checks.slept_by_us=false` ⇒ "
+     "当天**没有由我们睡过去**，「为什么 stuck / 是否真的收工」只能【无法判定】（不是睡眠失败、"
+     "也不是通过）；`checks.slept_by_us` 缺失同样【无法判定】（缺失 ≠ 0，绝不默认 false 或 true）；"
+     "`slept_by_us=true` 却 `ended_by=stuck` 的天单独计数（自相形态，只作核对线索）"),
 
     ("idle", "辅助：一整轮没动作（acted/rounds）⇒ 空转，常与'该做没做'并看"),
 ]
@@ -6892,6 +7312,83 @@ def render_text(report, top):
         if eg.get("event_id_undecidable"):
             _eg_txt += "；eventId 缺失 ⇒【无法判定】"
         add(_eg_txt + "）")
+    # task-3：A8 三类新形态（默认 info /【无法判定】，**不进 rc**）
+    # A) 同一天同一 stage 反复重分「1 格余量」⇒ stage_churn（日级计数 + 涉及格坐标）
+    sc = report.get("stage_churn") or {}
+    if not sc.get("has_stage_data"):
+        add("阶段 churn: <缺失>（本账本 day_end 没有 stages[] ⇒ 无法判定「同一 stage 反复重分 1 格余量」；"
+            "缺失 ≠ 0）")
+    elif sc.get("runs"):
+        _sc_coords = (json.dumps(sc.get("coords") or [], ensure_ascii=False)
+                      if sc.get("coords") else "<缺失>（段记录没有结构化坐标字段）")
+        add(f"阶段 churn: {sc.get('days_with_runs', 0)} 天 / {sc.get('runs', 0)} 段 / "
+            f"{sc.get('stages_total', 0)} 次（同 stage 连续 assigned<={sc.get('small_assigned')} 且 "
+            f"stopped=incomplete、leftover 不降；最长 {sc.get('max_run', 0)} 次；"
+            f"涉及格 {_sc_coords}）"
+            "；纯 info：这不是失败、不进 rc")
+        _day_parts = []
+        for _d in sc.get("days") or []:
+            if not _d.get("runs"):
+                continue
+            _day_parts.append(
+                f"{_d['label']}={_d['runs']} 段/{_d['churn_stages']} 次（最长 {_d['max_run']}"
+                + (f"；格 {json.dumps(_d.get('coords') or [], ensure_ascii=False)}"
+                   if _d.get("coords") else "")
+                + "）")
+        if _day_parts:
+            add("阶段 churn 日级: " + "；".join(_day_parts))
+    else:
+        _sc_tail = ""
+        if sc.get("undecidable_days"):
+            _sc_why = []
+            for _d in sc.get("days") or []:
+                for _w in _d.get("undecidable_why") or []:
+                    if _w not in _sc_why:
+                        _sc_why.append(_w)
+            _sc_tail = (f"；但 {'、'.join(sc['undecidable_days'][:8])} 的判据字段缺失"
+                        f"（{'；'.join(_sc_why[:3]) or '缺 assigned/leftover'}）"
+                        " ⇒【无法判定】是否空转（缺失 ≠ 0）")
+        add(f"阶段 churn: 0 次（{sc.get('days_with_stages', 0)} 天 / "
+            f"{sc.get('stage_records', 0)} 段可判；阈值 = 连续 >={sc.get('min_run')} 轮）" + _sc_tail)
+    # B) 回片区（work_spot_resume）连续 N 次拿不出目标而收工 ⇒ 有界诚实收尾（info + 原文）
+    wr = report.get("work_spot_resume_exhausted") or {}
+    if wr.get("days"):
+        _wr_parts = []
+        for _d in wr["days"]:
+            _wr_parts.append(
+                f"{_d['label']}（连续 {_d.get('consecutive')} 次；L{_d.get('line')}"
+                + (f"；no_progress_burst L{_d['burst_lines'][0]}" if _d.get("burst_lines") else "")
+                + "）")
+        add(f"回片区死循环（work_spot_resume）: {wr.get('days_count', 0)} 天收工"
+            f"（{'；'.join(_wr_parts)}）⇒ info：有界诚实收尾（task-134 A），不是失败、不进 rc；原文见下")
+        for _d in wr["days"]:
+            add(f"    · {_d['label']} 原文: {_d.get('ended_reason')}")
+        if wr.get("burst_mismatch_days"):
+            add(f"    ⚠ 结构化 burst 有、`ended_reason` 原文没命中：{wr['burst_mismatch_days']}"
+                " ⇒ 收工结论只能【无法判定】")
+    elif wr.get("state") == "undecidable":
+        add("回片区死循环（work_spot_resume）: <缺失>（本账本没有 no_progress_burst/"
+            "resume_reevaluate，`ended_reason` 也无命中 ⇒ 无法判定死循环是否发生过；缺失 ≠ 0）")
+    else:
+        add("回片区死循环（work_spot_resume）: 0 天（机制事件在场、`ended_reason` 无该形态 ⇒ "
+            "0 是真实读数）")
+    # C) ended_by=stuck 但 checks.slept_by_us=false ⇒ 当天没由我们睡过去（info/【无法判定】）
+    sw = report.get("stuck_without_sleep") or {}
+    if sw.get("flagged"):
+        add(f"stuck 未睡: {sw['flagged']} 天（ended_by=stuck 且 checks.slept_by_us=false："
+            f"{'、'.join(sw.get('flagged_days') or [])}）"
+            "⇒【无法判定】当天没由我们睡过去、为什么 stuck / 是否真的收工说不清；"
+            "不是失败、不进 rc；原文见下")
+        for _d in sw.get("days") or []:
+            add(f"    · {_d['label']} 原文: {_d.get('ended_reason')}")
+    elif sw.get("undecidable"):
+        add(f"stuck 未睡: <缺失>（{sw['undecidable']} 天 ended_by=stuck 但缺 "
+            "`checks.slept_by_us` ⇒ 无法判定是谁结束的那天；缺失 ≠ 0）")
+    elif not sw.get("has_day_end"):
+        add("stuck 未睡: <缺失>（本账本没有 day_end ⇒ 无法判定）")
+    else:
+        add(f"stuck 未睡: 0 天（ended_by=stuck 共 {sw.get('stuck_days', 0)} 天，"
+            "`slept_by_us` 均不是 false）")
     # task-32：两种新事件形态的计数（信息项）；task-38：跨日证据覆盖度
     # task-102（`9b09735`）：**背包空格闭环**一行 —— free_slots / buy 尝试 / buy_no_space /
     # 腾格卖出（`why=need_slot`）/ 当日钱变化 / `slept_without_work` / `modal_dismiss_failed`。
