@@ -149,17 +149,40 @@ def step3(rec: dict) -> dict:
     if not loc.get("isOutdoorFarm"):
         rec["verdict"], rec["reason"] = "无法判定", f"当前不在户外农场（location={loc.get('name')}）⇒ 先 goto Farm 再跑本步"
         return rec
-    trees = [t for t in (loc.get("tiles") or []) if t.get("kind") == "tree"]
+    tiles_all = {tuple(x["tile"]): x for x in (loc.get("tiles") or [])}
+    trees = [t for t in tiles_all.values() if t.get("kind") == "tree"]
     rec["evidence"]["tree_tiles_in_window"] = len(trees)
     if not trees:
         rec["verdict"] = "无法判定"
         rec["reason"] = "窗口（400 格）内没有 kind==tree 的格 ⇒ 需先站到树旁；不许扫全图乱走"
         return rec
-    t = sorted(trees, key=lambda x: (x["tile"][0], x["tile"][1]))[0]
-    tile = tuple(t["tile"])
-    before_kind = t.get("kind")
+    # Lead m03672：优先挑「四邻有可站格」的树（否则斧头挥不到），并记候选统计
+    dirs = ((0, -1), (1, 0), (0, 1), (-1, 0))
+
+    def standable_nbrs(t):
+        x, y = t["tile"]
+        out = []
+        for dx, dy in dirs:
+            n = tiles_all.get((x + dx, y + dy))
+            if n is not None and n.get("standable") is True:
+                out.append([x + dx, y + dy])
+        return out
+
+    cand = [(t, standable_nbrs(t)) for t in trees]
+    with_nbr = [c for c in cand if c[1]]
+    rec["evidence"]["tree_candidates"] = {"total": len(trees),
+                                          "with_standable_neighbor": len(with_nbr)}
+    if with_nbr:
+        pick, nbrs = sorted(with_nbr, key=lambda c: (c[0]["tile"][0], c[0]["tile"][1]))[0]
+    else:
+        pick, nbrs = sorted(trees, key=lambda x: (x["tile"][0], x["tile"][1]))[0], []
+        rec["evidence"]["picked_without_standable_neighbor"] = True
+    tile = tuple(pick["tile"])
+    before_kind = pick.get("kind")
     rec["evidence"]["tile"] = list(tile)
-    rec["evidence"]["before"] = {k: t.get(k) for k in ("kind", "tool", "feature", "objId", "actionable", "standable")}
+    rec["evidence"]["standable_neighbors"] = nbrs
+    rec["evidence"]["worldSeq_before"] = obs.get("worldSeq")
+    rec["evidence"]["before"] = {k: pick.get(k) for k in ("kind", "tool", "feature", "objId", "actionable", "standable")}
     try:
         r = c.use_tool(tile, tool="axe", timeout_ms=20000)
         rec["evidence"]["receipt"] = r
@@ -167,6 +190,15 @@ def step3(rec: dict) -> dict:
         rec["verdict"], rec["reason"] = "FAIL", f"use_tool 抛错：{type(exc).__name__}: {exc}"
         return rec
     obs2 = c.observe(detail="full")
+    rec["evidence"]["worldSeq_after"] = obs2.get("worldSeq")
+    # Lead m03672：before/after 同时记 StepResult.after 的 kind 字段（0.7.39 护栏 B 靠它）
+    step_after = r.get("after") if isinstance(r, dict) else None
+    if isinstance(step_after, dict):
+        keep = ("kind", "kind_before", "kind_after", "before_kind", "after_kind",
+                "tile", "objId", "tool", "feature", "changed")
+        rec["evidence"]["step_after"] = {k: step_after.get(k) for k in keep if k in step_after}
+    else:
+        rec["evidence"]["step_after"] = step_after
     tiles2 = {tuple(x["tile"]): x for x in ((obs2.get("location") or {}).get("tiles") or [])}
     after = tiles2.get(tile)
     rec["evidence"]["after"] = None if after is None else {

@@ -1,20 +1,20 @@
 # -*- coding: utf-8 -*-
-"""run9d 收尾取证（只读）：
-1) 冻结 SMAPI-latest.txt → logs\\run9d-smapi-window.txt（记 size/mtime/sha256）
-2) 窗口内六串计数 + 行号（NewDay / before save / Save called / Save task / completed / after save）
+"""run 收尾取证（只读，参数化版）：
+1) 冻结 SMAPI-latest.txt → logs\\<tag>-smapi-window.txt（一次性读源→写副本→双侧 SHA256）
+2) 窗口内六串计数 + 行号（NewDay / before save / Save called(含 L16 判别) / Save task / completed / after save）
    + Warping to Farm / 噪声关键词
-3) 用 python subprocess(encoding="utf-8") 跑三个检查器，输出落 logs\\run9d-*.txt 并打印 rc 与判决行
+3) 用 python subprocess(encoding="utf-8") 跑三个检查器，输出落 logs\\<tag>-*.txt 并打印 rc 与判决行
 
-用法：python scratch\\run9d-tools.py [--after HH:MM:SS] [--before HH:MM:SS]
+参数化（mechanical 改造，默认值保持 run9d 原行为）：
+  python scratch\\run9d-tools.py                            # 等价原行为（tag=run9d）
+  python scratch\\run9d-tools.py --tag runA5-0739 --journal logs/longrun-runA5-0739.jsonl
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -22,9 +22,6 @@ import time
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 PY = sys.executable
 SMAPI_SRC = os.path.join(os.environ["APPDATA"], "StardewValley", "ErrorLogs", "SMAPI-latest.txt")
-SMAPI_DST = os.path.join(ROOT, "logs", "run9d-smapi-window.txt")
-JOURNAL = os.path.join(ROOT, "logs", "longrun-3day-llm-run9d.jsonl")
-SNAPSHOTS = os.path.join(ROOT, "scratch", "run9d-external-snapshots.jsonl")
 
 TS = re.compile(r"^\[(\d{2}:\d{2}:\d{2})")
 
@@ -38,22 +35,45 @@ def sha256(path: str) -> str:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--after", default="01:32:58")
-    ap.add_argument("--before", default="02:11:45")
+    ap = argparse.ArgumentParser(description="run 收尾取证（默认保持 run9d 原行为）")
+    ap.add_argument("--tag", default="run9d", help="产物前缀（默认 run9d）")
+    ap.add_argument("--journal", default=None, help="账本（默认 logs/longrun-3day-llm-<tag>.jsonl）")
+    ap.add_argument("--smapi", default=None, help="SMAPI 副本（默认 logs/<tag>-smapi-window.txt）")
+    ap.add_argument("--snapshots", default=None, help="外部快照（默认 scratch/<tag>-external-snapshots.jsonl）")
+    ap.add_argument("--after", default=None, help="窗口起点 HH:MM:SS（默认整文件首个时间戳）")
+    ap.add_argument("--before", default=None, help="窗口终点 HH:MM:SS（默认整文件末个时间戳）")
+    ap.add_argument("--days", type=int, default=5, help="verify-run3 --days（默认 5）")
+    ap.add_argument("--window", type=int, default=5, help="analyze-longrun --window（默认 5）")
     args = ap.parse_args()
 
-    # 1) 冻结
-    shutil.copy2(SMAPI_SRC, SMAPI_DST)
-    st = os.stat(SMAPI_DST)
+    tag = args.tag
+    smapi_dst = args.smapi or os.path.join(ROOT, "logs", f"{tag}-smapi-window.txt")
+    journal = args.journal or os.path.join(ROOT, "logs", f"longrun-3day-llm-{tag}.jsonl")
+    snapshots = args.snapshots or os.path.join(ROOT, "scratch", f"{tag}-external-snapshots.jsonl")
+
+    # 1) 冻结：一次性读源 → 用同一份字节写副本 → 双侧 SHA256
     print("=== SMAPI 冻结 ===")
+    if not os.path.exists(SMAPI_SRC):
+        print(f"!! 源不存在：{SMAPI_SRC}", file=sys.stderr)
+        return 12
+    with open(SMAPI_SRC, "rb") as fh:
+        src_bytes = fh.read()
+    with open(smapi_dst, "wb") as fh:
+        fh.write(src_bytes)
+    st = os.stat(smapi_dst)
+    src_sha = hashlib.sha256(src_bytes).hexdigest().upper()
+    dst_sha = sha256(smapi_dst)
     print(f"src = {SMAPI_SRC}")
-    print(f"dst = {SMAPI_DST}")
-    print(f"size = {st.st_size} B / mtime = {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(st.st_mtime))} / sha256 = {sha256(SMAPI_DST)}")
-    print(f"src sha256 = {sha256(SMAPI_SRC)}（与 dst 一致 = {sha256(SMAPI_SRC) == sha256(SMAPI_DST)}）")
+    print(f"dst = {smapi_dst}")
+    print(f"size = {st.st_size} B / mtime = {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(st.st_mtime))} / sha256 = {dst_sha}")
+    print(f"src sha256 = {src_sha}（与 dst 一致 = {src_sha == dst_sha}）")
 
     # 2) 六串计数
-    lines = open(SMAPI_DST, encoding="utf-8", errors="replace").read().splitlines()
+    lines = open(smapi_dst, encoding="utf-8", errors="replace").read().splitlines()
+    if args.after is None or args.before is None:
+        stamps = [TS.match(s).group(1) for s in lines if TS.match(s)]
+        args.after = args.after or (stamps[0] if stamps else "00:00:00")
+        args.before = args.before or (stamps[-1] if stamps else "23:59:59")
     pats = {
         "NewDay": lambda s: "Synchronizing 'NewDay' task" in s,
         "before_save": lambda s: "Context: before save." in s,
@@ -83,14 +103,14 @@ def main() -> int:
     # 3) 检查器
     jobs = [
         ("verify-run3", [PY, "-X", "utf8", os.path.join(ROOT, "tools", "verify-run3.py"),
-                         "--journal", JOURNAL, "--days", "5", "--json"],
-         os.path.join(ROOT, "logs", "run9d-verify.txt")),
+                         "--journal", journal, "--days", str(args.days), "--json"],
+         os.path.join(ROOT, "logs", f"{tag}-verify.txt")),
         ("analyze-longrun", [PY, "-X", "utf8", os.path.join(ROOT, "tools", "analyze-longrun.py"),
-                             "--journal", JOURNAL, "--window", "5"],
-         os.path.join(ROOT, "logs", "run9d-analyze.txt")),
+                             "--journal", journal, "--window", str(args.window)],
+         os.path.join(ROOT, "logs", f"{tag}-analyze.txt")),
         ("lead-check", [PY, "-X", "utf8", os.path.join(ROOT, "scratch", "run9-lead-check.py"),
-                        "--journal", JOURNAL, "--snapshots", SNAPSHOTS, "--smapi", SMAPI_DST],
-         os.path.join(ROOT, "logs", "run9d-lead-check.txt")),
+                        "--journal", journal, "--snapshots", snapshots, "--smapi", smapi_dst],
+         os.path.join(ROOT, "logs", f"{tag}-lead-check.txt")),
     ]
     print("\n=== 检查器 ===")
     for name, cmd, out in jobs:
