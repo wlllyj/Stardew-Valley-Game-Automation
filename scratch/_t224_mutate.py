@@ -71,7 +71,45 @@ TEMPLATES = [
     ("219", "gaps 写文件改成非原子（直接 write_text）", "P0-4 半写防护"),
     ("220", "analyzer 删掉 §8 判红分支", "P0-5 工具分工"),
     ("220", "verify-run3 反向加 §8 判红", "P0-5 工具分工"),
+    # ---- D 段 task-228 advance_dialogue（Lead m09338）----
+    ("228", "DialogueAdvanceRules.Precheck 去掉 is_question 拦截（安全红线，必须被杀）", "D228-1 选项红线"),
+    ("228", "Precheck 去掉 professions_pending 拦截（替玩家选职业=最大事故）", "D228-1 选项红线"),
+    ("228", "MaxStepsCap 60→600 / ClampMaxSteps 上限失效", "D228-6/7 有界性"),
+    ("228", "Classify 恒返回 ProgressAdvanced（stalled 永不判 ⇒ 卡住却一直点）", "D228-2/停转语义"),
+    ("228", "Skill：Precheck 挪到点击之后（先点后判 = 越权）", "D228-4 点击前校验"),
+    ("228", "脑侧单事件 40 步上限打掉", "D228-8 有界性"),
+    ("228", "脑侧每天 60 步上限打掉", "D228-9 有界性"),
+    ("228", "脑侧 stalled 重试次数 2→0 / 间隔 3000→0（单步无变化即判死）", "D228-10/11 pause 语义"),
+    ("228", "脑侧把 advance 状态塞进 JUSTIFIED_END_REASONS / checks（洗白判定）", "D228-14/15 不洗白"),
 ]
+
+
+# ---- D 段 task-228（advance_dialogue）变异：锚点取自工作树在制文件（交付后按冻结树用 --check-anchors 重校）----
+# 安全红线：m228a 打掉 is_question 拦截，必须被杀（替游戏做选项 = 最大事故）
+_D_R = "mod/AgentFarm.Bridge/DialogueAdvanceRules.cs"
+_D_S = "mod/AgentFarm.Bridge/DialogueAdvanceSkill.cs"
+reg("m228a_no_is_question_guard", "228", "?", "csharp",
+    [(_D_R, "if (isQuestion) return StatusIsQuestion;", "")],
+    "安全红线：提问拦截失效 ⇒ C# 自检/探针必须杀")
+reg("m228b_no_professions_guard", "228", "?", "csharp",
+    [(_D_R, "if (professionsPending) return StatusProfessionsPending;", "")],
+    "安全红线：职业选择拦截失效")
+reg("m228c_no_maxsteps_clamp", "228", "?", "csharp",
+    [(_D_R, "if (v > MaxStepsCap) v = MaxStepsCap;", "if (false) v = MaxStepsCap;")],
+    "有界性：maxSteps 上限钳制失效")
+reg("m228d_no_retry_after_no_change", "228", "?", "csharp",
+    [(_D_R, "return noChangeCount <= StallRetries;", "return false;")],
+    "pause 语义：单次无变化即放弃重试")
+reg("m228e_no_retry_gap", "228", "?", "probe",
+    [(_D_S, "this._nextAllowedUtc = DateTime.UtcNow.AddMilliseconds(DialogueAdvanceRules.StallRetryGapMs);",
+      "this._nextAllowedUtc = DateTime.UtcNow;")],
+    "pause 语义：重试间隔被抹平（应被 D228-11 抓）")
+reg("m228f_precheck_bypassed", "228", "?", "probe",
+    [(_D_S, "if (pre.Length > 0)", "if (false)")],
+    "安全红线：Precheck 被绕过（先点后判，应被 D228-4b 抓）")
+reg("m228g_stalled_immediately", "228", "?", "probe",
+    [(_D_S, "if (DialogueAdvanceRules.ShouldRetryAfterNoChange(this._noChangeCount))", "if (false)")],
+    "pause 语义：重试判定被跳过（应被 D228-11 抓）")
 
 
 def sh(cmd: list[str], cwd: Path, env: dict[str, str] | None = None, timeout: int = 1800):
