@@ -42,8 +42,38 @@ REPO = Path(__file__).resolve().parents[1]
 PY = sys.executable
 COPY = ("brain", "tests", "tools")
 
-# 交付后按实际实现填：每条 = (name, card, claimed, kind, [(relpath, old, new), ...], note)
-CASES: list[tuple[str, str, str | None, str, list[tuple[str, str, str]], str]] = []
+# 已填（卡 1 / task-4，冻结树 b702708，2026-10-18）：每条 = (name, card, claimed, kind,
+# [(relpath, old, new), ...], note)。判杀器 = 我方 `_t0744_probe.py` 的 B6 卡 1 独立重放。
+CASES: list[tuple[str, str, str | None, str, list[tuple[str, str, str]], str]] = [
+    (
+        "m0744a_switch_ignores_avoid_area", "4", "无（我方自建，独立于作者 m1）", "probe",
+        [("brain/agentfarm/longrun.py",
+          "            rank = (0 if area != avoid_area else 1) if avoid_area else 0",
+          "            rank = 0")],
+        "换片不再优先『别的片』（avoid_area 失效）⇒ 又会走回同一片空转",
+    ),
+    (
+        "m0744b_exhaust_written_as_stuck", "4", "无（我方自建，独立于作者 m2）", "probe",
+        [("brain/agentfarm/longrun.py",
+          '        why = (f"resume_exhausted:回片区 {len(self.resume_stall_tiles)} 格都回去看过、',
+          '        why = (f"stuck:回片区 {len(self.resume_stall_tiles)} 格都回去看过、')],
+        "把『真没有可执行目标』写回 stuck ⇒ 缺陷误报复发",
+    ),
+    (
+        "m0744c_encircled_treated_as_executable", "4", "无（我方自建，独立于作者 m3）", "probe",
+        [("brain/agentfarm/longrun.py",
+          "        skip = set(self.resume_stall_tiles) | set(self.encircled_day)",
+          "        skip = set(self.resume_stall_tiles)")],
+        "被围住的格当成可执行目标 ⇒ 拿 encircled 当『他片可做』",
+    ),
+    (
+        "m0744d_stall_not_marked", "4", "无（我方自建，独立于作者 m4）", "probe",
+        [("brain/agentfarm/longrun.py",
+          "        self.resume_stall_tiles |= marked",
+          "        pass  # mutation: 不记停滞")],
+        "回去看过没产出的邻域不记停滞 ⇒ 下一轮又走回同一片",
+    ),
+]
 TEMPLATES: list[tuple[str, str, str | None, str, list[tuple[str, str, str]], str]] = []
 
 

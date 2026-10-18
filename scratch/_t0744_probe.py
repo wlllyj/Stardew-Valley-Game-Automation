@@ -46,8 +46,10 @@ A8_BUDGET_WATER_WARN_LINES = [33, 150, 254, 527, 542, 563]
 LOOP_A_DAYS = [("1", "winter", 7), ("1", "winter", 12), ("1", "winter", 18)]
 # 死循环 B：1 格余量反复重分（stage_stop_named incomplete assigned=1 的条数下界）
 LOOP_B_DAYS = [(("1", "winter", 9), 28), (("1", "winter", 14), 62)]
-# 【交付后按实际命名更新】卡 4 允许使用的事件/原因码候选（卡面只给"如"的例子）
-CARD4_EVENT_CANDIDATES = ("work_spot_switch", "resume_exhausted")
+# 【交付后按实际命名更新】卡 4（task-4）口径标记（B 案：复用既有事件名，只加字段）
+CARD4_FIELD_MARKERS = ("plot_exhausted", "resume_exhausted", "exhausted=True", "switched=")
+RESUME_EXHAUSTED_PREFIX = "resume_exhausted"
+DEFAULT_PLOT_LIMIT = 5  # max_plots_per_day 的期望量级（交付后按常量核对）
 # 0.7.43 阶段/日级键集基线（AST 抽取，用于"只许新增、须单列"核对）
 CHECKS_BASELINE = ("slept_by_us", "no_blocking_modal", "no_hard_failures",
                    "unreachable_within_bound", "refused_within_bound", "no_unmet_stages",
@@ -180,10 +182,11 @@ def case_a(readings: bool) -> None:
         removed_j = sorted(old_j - new_j)
         check("A2 既有 journal 事件名未被改名/删除", not removed_j, f"removed={removed_j}")
         info("A2b 新增 journal 事件（报告须单列）", added_j)
-        cand = [c for c in CARD4_EVENT_CANDIDATES
-                if any(c in j for j in added_j) or c in "".join(added_j)]
-        check("A2c 卡 4 新增事件/原因码（换片/收工）在源码出现",
-              bool(cand), f"命中候选={cand}；新增事件={added_j}（交付后按实际命名更新候选表）")
+        src_new = read("brain/agentfarm/longrun.py")
+        hits = {k: (k in src_new) for k in CARD4_FIELD_MARKERS}
+        check("A2c 卡 4 换片/收工口径字段在源码出现（复用既有事件名，B 案）",
+              all(hits.values()), f"{hits}；新增事件={added_j}")
+        info("A2h 卡 4 新增 journal 事件名（B 案期望 0）", added_j or "0（复用既有事件名）")
         # 语义键：阶段记录 / day_end / checks 键集
         import ast
 
@@ -286,6 +289,187 @@ def _in_range(rows: list[tuple[int, dict]], lo: int, hi: int, pred) -> list[tupl
     return [(i, r) for i, r in rows if lo <= i <= hi and pred(r)]
 
 
+# ---------------------------------------------------------------- B6：卡 1 独立重放（我方场景）
+
+def _probe_fixtures():
+    """用被测树自己的 `tests/test_longrun.py` 夹具（FakeWorld / CountingClient / make_run）。"""
+    for p in (ROOT / "tests", ROOT / "brain", ROOT):
+        s = str(p)
+        if s not in sys.path:
+            sys.path.insert(0, s)
+    import test_longrun as TL  # noqa: N813
+    return TL
+
+
+def _mk_run(TL, world):
+    client = TL._CountingClient(world) if hasattr(TL, "_CountingClient") else TL.FakeClient(world)
+    if hasattr(TL, "FarmWorker"):
+        worker = TL.FarmWorker(client, log=lambda *_: None)
+    else:
+        worker = TL.FakeWorker(world, log=lambda *_: None)
+    run = TL.make_run(world, target_days=1, max_days=1,
+                      client_factory=lambda c: client, worker_factory=lambda c: worker)
+    run.worker = worker
+    run.client = client
+    return run
+
+
+def _plot_of(area: str, tiles, anchor=None) -> dict:
+    return {"zone": "", "label": "", "area": area,
+            "anchor": list(anchor or tiles[0]), "tiles": [list(t) for t in tiles], "note": ""}
+
+
+def check_resume_replay(rows: list[tuple[int, dict]]) -> None:
+    """卡 1 修后形状的**我方独立重放**：不跑作者用例，用自己的场景/断言核产品代码。"""
+    print("== B6 段：卡 1 独立重放（我方场景；非作者用例）==")
+    src = read("brain/agentfarm/longrun.py")
+    if "_resume_switch_or_exhaust" not in src:
+        skip("B6 卡 1 独立重放",
+             "被测树无 `_resume_switch_or_exhaust`（0.7.43 修前形态）⇒ 修前红由 B1 账本证明")
+        return
+    # B6f 先核 A8 路由：冬 7/12/18 的形态必须落在被修复的入口上
+    bursts = [r for _, r in rows if r.get("event") == "no_progress_burst"]
+    srcs = sorted({str(r.get("source") or "") for r in bursts})
+    check("B6f A8 冬 7/12/18 形态路由在修复路径内（账本 source 全为 work_spot_resume）",
+          bool(bursts) and all("work_spot_resume" in s for s in srcs), f"sources={srcs}")
+    try:
+        TL = _probe_fixtures()
+    except Exception as exc:  # noqa: BLE001
+        skip("B6 卡 1 独立重放", f"夹具 import 失败: {type(exc).__name__}: {exc}")
+        return
+
+    def _new_rep():
+        return TL.DayReport(day_key=("winter", 1, 7), started_at=0.0)
+
+    def _case(tag: str, fn) -> None:
+        try:
+            bad = fn()
+        except Exception as exc:  # noqa: BLE001 - 探针自己的 bug 与产品 bug 分开判
+            check(tag, False, f"判据自身异常: {type(exc).__name__}: {exc}")
+            return
+        check(tag, not bad, "; ".join(bad) if bad else "绿")
+
+    def switch_case():
+        w = TL.FakeWorld(weeds=0, seeds=0, money=0)
+        w.player_tile = [80, 11]
+        run = _mk_run(TL, w)
+        # 账本两片：field_nw 的残留格比 field_se 更近（>OBSERVE_REACH，不会先被标停滞）
+        run.leftover_targets = {(60, 10), (95, 35)}
+        run.leftover_area = {(60, 10): "field_nw", (95, 35): "field_se"}
+        rep = _new_rep()
+        action, alt = run._resume_switch_or_exhaust(
+            w.obs(), rep, plot=_plot_of("field_nw", [(80, 11)], anchor=[80, 11]),
+            where="deputy_replay")
+        bad = []
+        if action != "walk" or not alt:
+            bad.append(f"action={action} alt={bool(alt)}")
+        else:
+            if alt.get("area") != "field_se":
+                bad.append(f"没换到另一片（area={alt.get('area')}；avoid_area 应优先别片）")
+            if not set(map(tuple, alt.get("tiles") or [])) <= run.leftover_targets:
+                bad.append("换片坐标不在账本记账")
+        if rep.ended_by:
+            bad.append(f"换片成功却收工：{rep.ended_by}")
+        evs = [e for e in run.entries if e["event"] == "plot_exhausted"]
+        if not evs or evs[-1].get("source") != "resume_ledger":
+            bad.append("plot_exhausted 缺 source=resume_ledger")
+        return bad
+
+    def frontier_case():
+        w = TL.FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        w.player_tile = [60, 12]
+        run = _mk_run(TL, w)
+        run.leftover_targets = {(60, 10)}
+        run.leftover_area = {(60, 10): "field_x"}
+        rep = _new_rep()
+        action, _alt = run._resume_switch_or_exhaust(
+            w.obs(), rep, plot=_plot_of("field_x", [(60, 10)]), where="deputy_replay")
+        bad = []
+        if action != "acted":
+            bad.append(f"action={action}（期望先清一格）")
+        if (60, 10) in w.blockers:
+            bad.append("frontier 没清掉 blocker")
+        return bad
+
+    def exhausted_case():
+        w = TL.FakeWorld(weeds=0, seeds=0, money=0)
+        w.player_tile = [62, 14]
+        run = _mk_run(TL, w)
+        run.leftover_targets = {(60, 10)}
+        run.leftover_area = {(60, 10): "field_x"}
+        run.farm_actions_today = 5
+        rep = _new_rep()
+        action, _alt = run._resume_switch_or_exhaust(
+            w.obs(), rep, plot=_plot_of("field_x", [(60, 10)]), where="deputy_replay")
+        reason = str(rep.ended_reason or "")
+        bad = []
+        if action != "ended":
+            bad.append(f"action={action}")
+        if not reason.startswith(RESUME_EXHAUSTED_PREFIX):
+            bad.append(f"reason 前缀不是 resume_exhausted：{reason[:60]}")
+        if reason.startswith("stuck"):
+            bad.append("写回 stuck 口径")
+        return bad
+
+    def encircled_case():
+        w = TL.FakeWorld(weeds=0, seeds=0, money=0)
+        w.player_tile = [80, 11]
+        run = _mk_run(TL, w)
+        # encircled 格离锚点 >OBSERVE_REACH：不会先被标停滞，只由 encircled 规则排除
+        run.leftover_targets = {(37, 35)}
+        run.leftover_area = {(37, 35): "field_nw"}
+        run.encircled_day = {(37, 35)}
+        run.farm_actions_today = 5
+        rep = _new_rep()
+        action, _alt = run._resume_switch_or_exhaust(
+            w.obs(), rep, plot=_plot_of("field_nw", [(80, 11)], anchor=[80, 11]),
+            where="deputy_replay")
+        bad = []
+        if action != "ended":
+            bad.append(f"action={action}（encircled 不该有可执行目标）")
+        if any(e["event"] == "plot_exhausted" for e in run.entries):
+            bad.append("encircled 被当换片目标")
+        ev = [e for e in run.entries if e["event"] == "no_progress_burst" and e.get("exhausted")]
+        if not ev or int(ev[-1].get("encircled_pending") or 0) < 1:
+            bad.append("exhausted 未记 encircled_pending")
+        return bad
+
+    _case("B6a 修后：换到另一片账本待做格（我方场景）", switch_case)
+    _case("B6b 修后：观测里可达一格先清（frontier_clear）", frontier_case)
+    _case("B6c 修后：确实没活 ⇒ resume_exhausted 诚实收工（不 stuck）", exhausted_case)
+    _case("B6d 修后：encircled 不算可执行目标", encircled_case)
+
+    # B6e GAP：另两条 resume 入口未动（Lead 要求独立核实；卡 1 只按路径修复）
+    gap: list[str] = []
+    try:
+        w = TL.FakeWorld(weeds=0, seeds=0, money=0)
+        run = _mk_run(TL, w)
+        run.leftover_targets = {(60, 10), (85, 10)}
+        run.leftover_area = {(60, 10): "field_nw", (85, 10): "field_ne"}
+        run.no_progress_cycles = 4
+        rep = _new_rep()
+        calls: list[str] = []
+
+        def fake_stop(obs, rep_, *, source, tiles):
+            calls.append(str(source))
+            rep_.ended_by = "stuck"
+            rep_.ended_reason = f"stuck:{source}（deputy 重放：该入口未改）"
+            return rep_.ended_by, rep_.ended_reason
+
+        run._no_progress_stop = fake_stop
+        run._review_only_fallback(w.obs(), rep)
+        gap.append(f"review_only_fallback 走到 stuck 路径={bool([s for s in calls if 'review_only' in s])}")
+    except Exception as exc:  # noqa: BLE001
+        gap.append(f"调用异常 {type(exc).__name__}: {exc}")
+    src2 = read("brain/agentfarm/longrun.py")
+    gap.append("guard_leftover 入口仍在源码=" + str('source="回片区（guard_leftover）"' in src2))
+    gap.append("A8 账本 review_only_fallback 事件数="
+               + str(sum(1 for _, r in rows if r.get("event") == "review_only_fallback")))
+    info("B6e 其他 resume 入口（GAP，需 Lead 决定是否扩面）",
+         "；".join(gap) + " ⇒ 同形态经这些入口仍写 stuck（卡 1 按路径修复，A8 实测路由见 B6f）")
+
+
 def case_b() -> None:
     print("== B 段：A8 修前红复现（死循环 A/B + task-6 两条）==")
     rows, src_path = _load_a8()
@@ -354,6 +538,9 @@ def case_b() -> None:
     check("B3 task-6① 修前红复现（冬 9/14 sleep 成功但 slept_by_us=false）", snap == 2,
           f"命中 {snap}/2")
 
+    # B6 卡 1 修后形状（我方独立重放；无方法=修前树 ⇒ SKIP，不判 PASS）
+    check_resume_replay(rows)
+
     # B4 task-6 ②：0.7.43 analyzer 在 A8 上报「只因预算延后却自称户外浇水达标」6 行
     analyzer = ROOT / "tools/analyze-longrun.py"
     if not analyzer.exists():
@@ -404,35 +591,96 @@ def case_b() -> None:
 
 # ---------------------------------------------------------------- C 段：独立判据（伪造记录 → 判红/判绿）
 
-def judge_card4_day(day: dict, events: list[dict], *, obs_executable: set | None = None,
-                    ledger_pending: set | None = None, blocked: set | None = None) -> list[str]:
-    """卡 4：换片/诚实收工判据（卡面语义，独立实现）。"""
+def judge_card4_day(day: dict, events: list[dict]) -> list[str]:
+    """卡 4④：`resume_exhausted` 日不许洗白；修后不许再出现 `stuck:回片区…` 老形态。"""
     v: list[str] = []
     reason = str(day.get("ended_reason") or "")
     checks = day.get("checks") or {}
-    if reason.startswith("resume_exhausted"):
+    if reason.startswith(RESUME_EXHAUSTED_PREFIX):
         if day.get("verified") is not False:
             v.append("resume_exhausted 日 verified 必须 False")
         if checks.get("day_justified") is not False:
             v.append("resume_exhausted 日 checks.day_justified 必须 False（不许洗成 no_work）")
         if "stuck" in reason:
             v.append("resume_exhausted 与 stuck 口径混写")
-    allowed = set(obs_executable or set()) | set(ledger_pending or set())
-    blocked = set(blocked or set())
-    for ev in events:
-        if ev.get("event") != "work_spot_switch":
+    if reason.startswith("stuck") and "回片区" in reason:
+        v.append("修后仍写 stuck:回片区（0.7.43 老形态，应为 resume_exhausted/换片）")
+    return v
+
+
+def judge_card4_switch(events: list[dict], *, ledger_pending: set | None = None,
+                       encircled: set | None = None) -> list[str] | None:
+    """卡 4①：换片字段合法（`to_anchor` 只来自账本记账；不指 encircled；不同片；有界）。
+
+    返回 None = 没有账本集合可对账（【无法判定】）。"""
+    if ledger_pending is None:
+        return None
+    ledger = {tuple(t) for t in ledger_pending}
+    enc = {tuple(t) for t in (encircled or ())}
+    v: list[str] = []
+    evs = [e for e in events if e.get("event") == "plot_exhausted"
+           and e.get("source") == "resume_ledger"]
+    if not evs:
+        return ["无 plot_exhausted{source=resume_ledger} 事件（换片无留痕）"]
+    for e in evs:
+        ta = e.get("to_anchor")
+        if not isinstance(ta, (list, tuple)) or len(ta) != 2:
+            v.append("换片缺 to_anchor")
             continue
-        tiles = [tuple(t) for t in (ev.get("tiles") or [])]
-        if not tiles:
-            v.append("work_spot_switch.tiles 为空")
+        t = (int(ta[0]), int(ta[1]))
+        if t not in ledger:
+            v.append(f"to_anchor 不在账本记账: {t}")
+        if t in enc:
+            v.append(f"to_anchor 指向 encircled: {t}")
+        if int(e.get("to_tiles") or 0) <= 0:
+            v.append("to_tiles<=0")
+        if str(e.get("from_area") or "") and str(e.get("from_area")) == str(e.get("to_area") or ""):
+            v.append("换片 from_area == to_area（没换到别片）")
+        sw, lim = int(e.get("switches") or 0), int(e.get("limit") or 0)
+        if lim and sw > lim:
+            v.append(f"switches {sw} > limit {lim}")
+    return v
+
+
+def judge_card4_loop(walks: list[dict], burst: int = DEFAULT_PLOT_LIMIT) -> list[str]:
+    """卡 4③：不得连续 `resume_walk` 无换片/无产出（旧 stuck 空转形态）。"""
+    run = 0
+    for e in walks:
+        if e.get("event") != "resume_walk":
             continue
-        if allowed:
-            off = [t for t in tiles if t not in allowed]
-            if off:
-                v.append(f"switch 坐标不在当前观测/账本记账: {off[:4]}")
-        hit = [t for t in tiles if t in blocked]
-        if hit:
-            v.append(f"switch 指向挡死格: {hit[:4]}")
+        if e.get("switched"):
+            run = 0
+            continue
+        run += 1
+        if run >= burst:
+            return [f"连续 {run} 次 resume_walk 无换片/无产出（旧 stuck 形态）"]
+    return []
+
+
+def judge_card4_exhausted(events: list[dict]) -> list[str] | None:
+    """卡 4②：诚实收工前的 `no_progress_burst{exhausted:true}` 证据必须自洽。
+
+    返回 None = 关键字段缺失（【无法判定】）。"""
+    ev = [e for e in events if e.get("event") == "no_progress_burst"
+          and e.get("exhausted") is True]
+    if not ev:
+        return ["resume_exhausted 日缺 no_progress_burst{exhausted:true} 留痕"]
+    need = ("pending", "stalled_tiles", "encircled_pending", "switches", "limit")
+    if any(k not in e for e in ev for k in need):
+        return None
+    v: list[str] = []
+    for e in ev:
+        pending = int(e["pending"])
+        stalled = int(e["stalled_tiles"])
+        enc = int(e["encircled_pending"])
+        if pending > stalled + enc:
+            v.append(f"exhausted 但 pending={pending} > stalled={stalled}+encircled={enc}"
+                     "（还有可执行格却收工）")
+        if int(e.get("newly_stalled") or 0) > stalled:
+            v.append("newly_stalled > stalled_tiles")
+        sw, lim = int(e["switches"]), int(e["limit"])
+        if lim and sw > lim:
+            v.append(f"switches {sw} > limit {lim}")
     return v
 
 
@@ -517,23 +765,48 @@ def judge_clear_invariant(stage: dict) -> list[str]:
 
 def case_c() -> None:
     print("== C 段：三卡修法判据（伪造记录 → 期望判红/判绿/无法判定）==")
-    day_ok = {"event": "day_end", "ended_by": "sleep", "ended_reason": "no_work:确实没活",
-              "verified": False, "checks": {"day_justified": False}, "day_after": ["1", "spring", 2]}
-    switch_ok = {"event": "work_spot_switch", "tiles": [[61, 10]]}
-    switch_blocked = {"event": "work_spot_switch", "tiles": [[37, 35]]}
-    exhaust_day = {"event": "day_end", "ended_by": "resume_exhausted",
+    exhaust_day = {"event": "day_end", "ended_by": "sleep",
                    "ended_reason": "resume_exhausted:回片区与换片都无目标",
                    "verified": False, "checks": {"day_justified": False}}
+    switch_ok = {"event": "plot_exhausted", "source": "resume_ledger",
+                 "from_area": "field_nw", "to_area": "field_ne", "to_anchor": [85, 10],
+                 "to_tiles": 1, "switches": 1, "limit": 5}
+    walk_no_switch = [{"event": "resume_walk", "attempt": i, "switched": False} for i in range(1, 6)]
+    walk_with_switch = ([{"event": "resume_walk", "attempt": i, "switched": False} for i in range(1, 4)]
+                        + [{"event": "resume_walk", "attempt": 4, "switched": True}])
+    exhausted_ok = {"event": "no_progress_burst", "exhausted": True, "pending": 12,
+                    "stalled_tiles": 10, "encircled_pending": 2, "newly_stalled": 3,
+                    "switches": 1, "limit": 5}
+    exhausted_bad = {"event": "no_progress_burst", "exhausted": True, "pending": 12,
+                     "stalled_tiles": 3, "encircled_pending": 0, "newly_stalled": 2,
+                     "switches": 1, "limit": 5}
     cases = [
-        ("C4-1 换片坐标越界/不在观测（伪造）", judge_card4_day, (day_ok, [{"event": "work_spot_switch", "tiles": [[99, 99]]}]),
-         {"obs_executable": {(61, 10)}}, "red"),
-        ("C4-2 换片指向挡死格（伪造）", judge_card4_day, (day_ok, [switch_blocked]), {"blocked": {(37, 35)}}, "red"),
-        ("C4-3 合法换片（可执行格）", judge_card4_day, (day_ok, [switch_ok]), {"obs_executable": {(61, 10)}}, "green"),
-        ("C4-4 resume_exhausted 却 VERIFIED（伪造）",
+        ("C4-J1a 换片 to_anchor 不在账本记账（伪造）", judge_card4_switch,
+         ([{"event": "plot_exhausted", "source": "resume_ledger", "from_area": "field_nw",
+            "to_area": "field_ne", "to_anchor": [99, 99], "to_tiles": 3,
+            "switches": 1, "limit": 5}],), {"ledger_pending": {(85, 10)}}, "red"),
+        ("C4-J1b 换片到账本里的另一片（可解释）", judge_card4_switch,
+         ([switch_ok],), {"ledger_pending": {(85, 10)}}, "green"),
+        ("C4-J2a 换片次数超 limit（伪造）", judge_card4_switch,
+         ([{**switch_ok, "switches": 6, "limit": 5}],), {"ledger_pending": {(85, 10)}}, "red"),
+        ("C4-J3a 连续 5 次 resume_walk 无换片（旧 stuck 形态）", judge_card4_loop,
+         (walk_no_switch,), {}, "red"),
+        ("C4-J3b 中途换片（可解释）", judge_card4_loop, (walk_with_switch,), {}, "green"),
+        ("C4-J4a resume_exhausted 却 VERIFIED（伪造）",
          judge_card4_day, ({**exhaust_day, "verified": True}, []), {}, "red"),
-        ("C4-5 resume_exhausted 却 day_justified=True（伪造）",
-         judge_card4_day, ({**exhaust_day, "checks": {"day_justified": True}}, []), {}, "red"),
-        ("C4-6 诚实 resume_exhausted（不 VERIFIED）", judge_card4_day, (exhaust_day, []), {}, "green"),
+        ("C4-J4b 诚实 resume_exhausted（不 VERIFIED）", judge_card4_day, (exhaust_day, []), {}, "green"),
+        ("C4-J5a 换片指向 encircled 格（伪造）", judge_card4_switch,
+         ([{**switch_ok, "to_anchor": [37, 35]}],),
+         {"ledger_pending": {(37, 35)}, "encircled": {(37, 35)}}, "red"),
+        ("C4-J6a exhausted 但 pending 仍有可执行格（伪造）", judge_card4_exhausted,
+         ([exhausted_bad],), {}, "red"),
+        ("C4-J6b exhausted 证据自洽（pending ⊆ stalled+encircled）", judge_card4_exhausted,
+         ([exhausted_ok],), {}, "green"),
+        ("C4-J6c exhausted 关键字段缺失 ⇒ 无法判定", judge_card4_exhausted,
+         ([{"event": "no_progress_burst", "exhausted": True}],), {}, "undecidable"),
+        ("C4-J7a 修后仍写 stuck:回片区（老形态，伪造）", judge_card4_day,
+         ({"ended_reason": "stuck:回片区（work_spot_resume）连续 5 次都拿不出目标",
+           "ended_by": "stuck", "verified": False}, []), {}, "red"),
         ("C5-1 挡死格被下一轮重分（伪造）", judge_card5_reassign,
          ([{"tiles_list": [[37, 35]]},
            {"encircled_tiles": [[37, 35]]},
