@@ -207,13 +207,40 @@ def step3(rec: dict) -> dict:
     before_kind = pick.get("kind")
     rec["evidence"]["worldSeq_before"] = obs.get("worldSeq")
     rec["evidence"]["before"] = {k: pick.get(k) for k in ("kind", "tool", "feature", "objId", "actionable", "standable")}
-    try:
-        r = c.use_tool(tile, tool="axe", timeout_ms=20000)
-        rec["evidence"]["receipt"] = r
-    except Exception as exc:  # noqa: BLE001
-        rec["verdict"], rec["reason"] = "FAIL", f"use_tool 抛错：{type(exc).__name__}: {exc}"
-        return rec
+    # Lead m03933 裁（A2）：树 ~10 刀才倒，一次 use_tool 内部只挥 6 下 ⇒ 单发放倒树是不可能的。
+    # A2 = **有界连续 use_tool（最多 3 次调用，每次内部最多 6 下 ⇒ ≤18 刀）**，直到 kind 变 stump/消失；
+    # 记 calls / stamina / worldSeq / 每次的 kind；3 次后仍 tree 才判 FAIL。
+    # `tool_ineffective` **不是失败证据**（它只说明这一批没打倒），只作过程留痕。
+    receipts: list = []
+    kind_trace: list = []
+    stamina_before = (obs.get("player") or {}).get("stamina")
+    r: dict = {}
+    calls = 0
+    for i in range(3):
+        try:
+            r = c.use_tool(tile, tool="axe", timeout_ms=20000)
+            receipts.append(r)
+        except Exception as exc:  # noqa: BLE001
+            receipts.append({"error": f"{type(exc).__name__}: {exc}"})
+            rec["evidence"]["use_tool_error"] = f"{type(exc).__name__}: {exc}"
+            break
+        calls += 1
+        obs_i = c.observe(detail="full")
+        tiles_i = {tuple(x["tile"]): x for x in ((obs_i.get("location") or {}).get("tiles") or [])}
+        t_i = tiles_i.get(tile)
+        k_i = None if t_i is None else t_i.get("kind")
+        kind_trace.append({"call": calls, "kind": k_i, "worldSeq": obs_i.get("worldSeq"),
+                           "stamina": (obs_i.get("player") or {}).get("stamina")})
+        obs = obs_i
+        if k_i is None or k_i != before_kind:
+            break
+    rec["evidence"]["receipt"] = r if isinstance(r, dict) else {}
+    rec["evidence"]["use_tool_calls"] = calls
+    rec["evidence"]["kind_trace"] = kind_trace
+    rec["evidence"]["receipts"] = receipts
     obs2 = c.observe(detail="full")
+    rec["evidence"]["stamina_before"] = stamina_before
+    rec["evidence"]["stamina_after"] = (obs2.get("player") or {}).get("stamina")
     rec["evidence"]["worldSeq_after"] = obs2.get("worldSeq")
     # Lead m03672：before/after 同时记 StepResult.after 的 kind 字段（0.7.39 护栏 B 靠它）
     step_after = r.get("after") if isinstance(r, dict) else None
@@ -231,13 +258,14 @@ def step3(rec: dict) -> dict:
     rec["evidence"]["before_kind"], rec["evidence"]["after_kind"] = before_kind, after_kind
     if after_kind is not None and after_kind != before_kind and after_kind in ("stump", "log", "none", None):
         rec["verdict"] = "PASS"
-        rec["reason"] = f"({tile[0]},{tile[1]}) kind {before_kind} → {after_kind}（after 带 before/after kind）"
+        rec["reason"] = f"({tile[0]},{tile[1]}) kind {before_kind} → {after_kind}（calls={calls}，after 带 before/after kind）"
     elif after is None or after.get("kind") != before_kind:
         rec["verdict"] = "PASS"
-        rec["reason"] = f"({tile[0]},{tile[1]}) kind {before_kind} → {after_kind}（kind 已变化即算 progress；tree→stump 记 progress 不算红）"
+        rec["reason"] = f"({tile[0]},{tile[1]}) kind {before_kind} → {after_kind}（calls={calls}；kind 已变化即算 progress）"
     else:
         rec["verdict"] = "FAIL"
-        rec["reason"] = f"挥了一斧头但 kind 仍是 {before_kind} —— 单技能砍树没生效（护栏 B 会因此判红）"
+        rec["reason"] = (f"连续 {calls} 次 use_tool（每次内部最多 6 下 ⇒ ≤{calls * 6} 刀）后 kind 仍是 {before_kind}"
+                         f"（kind_trace={kind_trace}）—— 3 次调用仍未倒，才按失败记")
     return rec
 
 

@@ -25,7 +25,7 @@
 |---|---|---|---|
 | 1 | `debug_dump crafting_recipes/Furnace` | **PASS** | `matchedCount=1`、无 `unknown_skill` |
 | 2 | `debug_dump trigger_actions` | **PASS** | 可读、无 `InvalidCastException` |
-| 3 | 单技能砍树 `use_tool(axe)` | **FAIL（到位后仍 `tool_ineffective`，见 §4.4）** | 首跑：相距 ~25 格空挥（前置不成立）；(A) 重测：`move_to` 成功到 `(39,15)`，到位后单发 `use_tool(axe)` 仍 `tileChanged=false`、树仍 `tree` ⇒ 按 Lead 口径记 FAIL，并附"单次挥砍砍不倒树"的机理疑问待裁 |
+| 3 | 单技能砍树 `use_tool(axe)` | **未达成（判据过严，非缺陷）· A2 版待 0.7.40 冒烟重测** | 首跑：相距 ~25 格空挥（前置不成立）；(A) 重测：`move_to` 成功到 `(39,15)`，到位后单发 `use_tool` 仍 `tree` —— **Lead m03933 裁定这符合游戏机制（树 ~10 刀才倒，一次调用内部只 6 下），原"到位后仍 tool_ineffective = FAIL"口径作废**；A2（≤3 次调用直到 `kind→stump`/消失，记 `calls/stamina/kind_trace`）已写进 `smoke-0739.py` |
 | 4 | 1 日长跑 ⇒ intent_coverage + gaps | **PASS** | `finish` 出现、`intent_coverage[]` 8 条/天、`scripts`→`logs\longrun-smoke-0739-gaps.json` 已生成 |
 | 5 | `clear_area` 逐格判据活 | **PASS（修取证路径后）** | `day_end.stages[]` 里 `clear_area tiles=2 ok=1` 且 `cleared_tiles` 1 条；首版只看 `outcome` 事件 ⇒ 误判"无法判定" |
 | 6 | 跨日落盘六串 6/6 | **PASS** | `NewDay/before save/Save called/Save task/completed/after save = 3/3/3/3/3/3`（排除插件描述行 1 条） |
@@ -44,8 +44,9 @@
    世界确实未变 ⇒ 这条 FAIL 只作**"前置不成立"的证据**留档，**不能**当"单技能砍树坏"的结论。
 2. **按 Lead 裁 (A) 改成**：挑「四邻有可站格」的 `kind=="tree"` ⇒ `move_to(邻格, timeout_ms=30000)`（行走单独计入 `evidence.walk`，**不并入单技能结论**）⇒ 到位后重新 observe 取 before（记 `worldSeq_after_walk` / `player_after_walk`）⇒ **只发一次** `use_tool(axe)` ⇒ 比 `kind`（`tree→stump`/消失 = PASS）+ `worldSeq`；走不到邻格判【无法判定】不判 FAIL。代码已改好（`scratch/smoke-0739.py`），**未在长跑期间补跑**（single-writer：长跑在驱世界，不允许插一手）。
 3. **骨架自己的 int/float bug（被 dry-run 拦下）**：起跑器 `--max-minutes` 是 `int`，骨架首版传了 `40.0` ⇒ 起跑器 `--dry-run` 直接 `invalid int value: '40.0'`、rc=2。已改 `str(int(...))` 后重跑通过。**这条正好证明 dry-run 四要素校验有效**（把参数错误挡在起跑之前，而不是浪费一次真跑）。
-4. **(A) 重测读数（2026-10-18 11:43 bring-up 窗口；起点 = 秋 26 日 06:00 / Farm(64,15) / 体力 270 / 钱 1977g，0.7.39 指纹不变）**：走位前置已修好 —— 窗口内 `kind=="tree"` **130 格**、其中 **83 格**有四邻可站格；选中 `(39,14)`、邻格 `(39,15)`；`move_to` **ok 7544ms**（`worldSeq 16→48`），`player_after_walk=[39,15]`；随后**只发一次** `use_tool(axe)` ⇒ 仍 `tool_ineffective`（内部 6 次重试、`UsingTool=True`）、`tileChanged=false`、`readyCrops 34→34`、`inventoryGrew=false`、`kind` 仍是 `tree`。**两条读数都留档：①"够不着"的 FAIL（前置不成立）②"到位后单发无效"的 FAIL（按 Lead 口径 = 真 FAIL）**。
-   **但有一条机理疑问必须写清（待 Lead 裁）**：SDV 的树要**多次挥砍**才倒（通常 ~10 下）；`use_tool` 一次内部重试 6 下仍可能不够 ⇒ "one `use_tool` ⇒ tree→stump"这个判据对树可能过严。若 Lead 认可，步 3 应改成：**有界连续 `use_tool`（最多 N 次、记次数）直到 `kind` 变 `stump`/消失**，或改成"树格状态有变化（`kind`/`shake`/体力消耗）"判据。本次因卡面要求"只发一次"**没有继续挥**。
+4. **(A) 重测读数（2026-10-18 11:43 bring-up 窗口；起点 = 秋 26 日 06:00 / Farm(64,15) / 体力 270 / 钱 1977g，0.7.39 指纹不变）**：走位前置已修好 —— 窗口内 `kind=="tree"` **130 格**、其中 **83 格**有四邻可站格；选中 `(39,14)`、邻格 `(39,15)`；`move_to` **ok 7544ms**（`worldSeq 16→48`），`player_after_walk=[39,15]`；随后**只发一次** `use_tool(axe)` ⇒ 回 `tool_ineffective`（内部 6 次重试、`UsingTool=True`）、`tileChanged=false`、`readyCrops 34→34`、`inventoryGrew=false`、`kind` 仍是 `tree`。**两条读数都留档：①"够不着"的 FAIL（前置不成立）②"到位后单发未倒"（过程证据，不作失败结论）**。
+5. **Lead m03933 裁定（作废我上一轮的判据）**：SDV 的树（`kind=="tree"`）**约 10 刀才倒**（0 级斧），`use_tool` 一次内部只挥 6 下 ⇒ 单发打不倒树**符合游戏机制**，**不能判 Mod 缺陷**；"到位后仍 `tool_ineffective` = 真 FAIL"这个口径对树不成立（对 twig/stone 才成立）。⇒ 步 3 结论改记「**机制性未达成（判据过严，非缺陷）**」，并且 `tool_ineffective` **不得**再当失败证据（它只说明"这一批没打倒"）。
+6. **A2 判据已写进 `scratch/smoke-0739.py`（本报告之后的新 commit）**：树格改成**有界连续 `use_tool`，最多 3 次调用**（每次内部 ≤6 下 ⇒ ≤18 刀）直到 `kind` 变 `stump`/消失；PASS = `kind` 变化（stump/消失）；同时记 `use_tool_calls`、`stamina_before/after`（体力耗损是"真挥了"的旁证）、`worldSeq` 变化、`kind_trace`（每次调用后的 kind/worldSeq/stamina）；3 次后仍 `tree` 才判 FAIL 并贴原文。**A2 版折叠进 0.7.40 冻结后的七步冒烟一起跑**（本次不再单独 bring-up 重跑）。
 
 ## §5 步 4 读数（1 日长跑）
 
@@ -87,9 +88,9 @@
 
 ## §10 结论与待办
 
-1. **管道结论（Lead m03892 裁定后）：步 1、2、4、5、6、7 PASS；步 3 FAIL（(A) 重测到位后仍 `tool_ineffective`，附"单次挥砍砍不倒树"的机理疑问待裁）**。步 7 的 1 条 §8 红已立案 **task-233**，其余红为日级未达标；另有本次暴露的 `inventory_blocked`/`slot_relief freed=0` 已立案 **task-232**。
-2. **步 3 补跑已完成**（见 §4.4：`move_to` 前置修好、到位后单发仍无效）。**待 Lead 裁**：是否把步 3 改成"有界连续挥砍/树格状态变化"判据后再测一轮（本次严格按卡面"只发一次"，没有多挥）。
-3. **步 7 待裁**：`missed:intent_no_target_evidence:ship` 是"ship 意图没有目标证据"—— 本次 `slot_relief` 腾格 3 轮 `freed=0`（没有可出货叠），是否该把这条当 §8 阻断，请 Lead 定。**它不改变"头部对账计数干净"这个事实**。
+1. **管道结论（Lead m03892 + m03933 裁定后）：步 1、2、4、5、6、7 PASS；步 3 =「未达成（判据过严，非缺陷）」—— 树 ~10 刀才倒、单次 `use_tool` 内部只 6 下，符合游戏机制；A2 版（≤3 次有界连续挥砍）待 0.7.40 冒烟重测**。步 7 的 1 条 §8 红已立案 **task-233**，其余红为日级未达标；另有本次暴露的 `inventory_blocked`/`slot_relief freed=0` 已立案 **task-232**。
+2. **步 3 不再单独 bring-up 重跑**（Lead m03933）：A2 判据已写进 `smoke-0739.py`，**折叠进 0.7.40 冻结后的七步冒烟**一起跑；届时长跑结束后**不要立刻退游戏**（A″/B″ 紧接其后要用同一份装机）。
+3. **步 7 已裁（Lead m03892）**：`missed:intent_no_target_evidence:ship` **算真 §8 违规**（裸 `no_target` 无 `evidence.stage_tiles_empty`，违反 §8.2b）⇒ task-233 在制；步 7 按"管道跑通"记 **PASS（带 1 条已立案缺陷）**。
 4. 本报告**不作为验收/成绩证据**（1 日跑 0 VERIFIED），只作 0.7.39 管道冒烟。
 
 ## §11 保留物
