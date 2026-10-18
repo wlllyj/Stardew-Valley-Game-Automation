@@ -1296,6 +1296,27 @@ python tools\analyze-longrun.py --journal logs\longrun-runA-0732.jsonl --days 6 
 python -m unittest tests.test_analyze_longrun.TestEventWaitAccounting   # 7 条（红/info/三态/旧账本）
 ```
 
+### 3.34.1 真账本核验（2026-10-18，A8 `logs\longrun-runA8-0743.jsonl`，0.7.43 `56795627`）
+
+- A8 截至 117 行（冬 7 06:40 起跑、第 1 天未收工）：`event_wait` **0** 条、`event_blocked`
+  **0** 条、`eventId` **0** 命中 ⇒ 本工具在**真账本**上走的是 `<缺失>` + 【无法判定】路径
+  （第 8 节 0 条；6 条探针行 + 1 条"整本没有任何 event_wait/event_blocked"），**没有误判红**；
+  新旧分析器对同一 A8 账本 rc=1 / 红 **27 条** / subjects 完全一致（旧版 = `HEAD~1`）⇒
+  真账本回归与六本旧账本同结论。
+- `decision.plans` 在 A8 真账本中**确实存在**（task-219 的形状在 0.7.43 生效）✓。
+- 起跑前的农场剧情事件由外部受控推进（`logs\event-102-advance-2026-10-18.log`）：
+  `ui.eventId="102"` 真机生效、**多场景**（首场景 9 步 → 新场景 3 步，全程无选择题）、
+  `advance_dialogue` 反复调用可安全推进到 `eventUp=false`；但它在**记账本之前** ⇒ 不进 A8 账本，
+  **不能当 task-245 的账本验收面**。
+- **真机正例仍缺**：A8 尚无 `eventUp` 阻断 ⇒ `event_wait`/`event_blocked` 的真账本形态要等
+  某个 run 真的被事件挡住才能验收。
+- **backlog（只登记，不单独开卡）**：
+  - **B1**：多场景事件按轮推进可用（脑侧每轮 10 步上限够），但账本**不记录**每轮 advance
+    步数/场景数 ⇒ 事后无法判定"多场景事件是否被完整推进"。若要可观测，需在 task-245 后续
+    把 `eventId + 每轮 advance 步数` 写进 journal。
+  - **B2**：起跑前触发的事件（如 102）没有账本落点，analyzer 无法归因；若验收要求覆盖
+    "跑前事件"，需在 `day_start` 里带一条 `ui.eventId`（或 `goto_farm` 结果带）。
+
 ## 4. 复核命令
 
 ```
