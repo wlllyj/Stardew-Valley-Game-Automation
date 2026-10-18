@@ -75,3 +75,33 @@
 eserve_for_upgrade 落地后再跑 3–5 天真机核账。
 
 **已知不阻塞项**（0.7.40+）：task-195/196/193/197 遗留、task-16 常设、task-82/111/112 复盘进化（task-58/59 已交付）。
+
+---
+
+## 5. 执行记录（2026-10-18 冻结与装机）
+
+### 5.1 冻结链（九步）
+1. `tools/_note-0739.txt` 首串 `v0.7.39`（8 条 + 210/228/230 三条补记）已核。
+2. `python tools/_bump-mod-version.py 0.7.39 --note-file tools/_note-0739.txt` ⇒ `manifest Version 0.7.38 → 0.7.39`，Description 头部插入。
+3. `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.39"`（注释补 v0.7.39 四类 Mod 内容 + 脑侧三项，`--- 历史 ---` 保留 v0.7.38 原文）。
+4. `dotnet build .\mod\AgentFarm.Bridge\AgentFarm.Bridge.csproj -c Release --nologo --no-incremental` ⇒ **0 警 0 错**；dll **281088 B** / manifest **62661 B**。
+5. 冻结提交 **`cea9c0f`**（2 files changed：bridge.py + manifest.json）。
+6. `python tools/check-release.py --expect 0.7.39` ⇒ **六项全绿**（manifest==brain / 版本==期望 / dll 不比源码旧 / py_compile 22 文件 / **`Ran 1153 tests` OK** / 树干净）。
+7. `python tools/deploy-mod.py --no-quit` ⇒ `0.7.38 → 0.7.39`，桥 `modVersion=0.7.39 port=17890`，自动读档 `Wahaha_450799035` → `FarmHouse (9,9)`。
+8. `python -m agentfarm goto Farm`（需 `PYTHONPATH=<repo>\brain`）⇒ ok，`hop1 FarmHouse→Farm source=[3,12] landing=[64,15]` **7617ms**。
+9. `python tools/preflight.py --expect 0.7.39 --save-baseline logs/run10g-baseline.json` ⇒ **✅ 可以起跑**。
+
+### 5.2 起跑基线（logs/run10g-baseline.json）
+第 1 年 **秋 23 日 06:10** debris 🌧 / `Farm(64,15)` / 体力 270/270 / 钱 **1977g** / `Wheat Seeds×10` / farmingLevel 2 / crops 34 / unwateredCrops 2 / **dryCrops 34** / `waterLeft 25` / tillableCount 138 / tileCount 400 truncated / 无模态 / worldAdvancing true。
+
+### 5.3 五文件指纹（A″/B″ 起跑时逐字比对）
+- `brain/agentfarm/longrun.py` `B98BCBC6A0DCAFD1C87638F3C0D9D06B440FACF1E2B5C2C3DE2FCE72A50677B0`（535469 B）
+- `brain/agentfarm/farmwork.py` `BEB8E1A63A437B10AADFC9A2CF56A9B1F13EC1C87A1F658E84B8024CD6545255`（211847 B）
+- `brain/agentfarm/bridge.py` `A298F135A9C339CEFDB967000C45132A46ACCC979AE0EE8F454EDAD059C68388`（63651 B）
+- dll `FF05225C6846D80C6CCF4E8B16A15F399FACCBED572705DF886486A8E419BD08`（281088 B）
+- manifest `9CA523EF19882305CD05890DF88909796746F95B0716267DDAF36EDDD8BE59D1`（62661 B）
+
+### 5.4 待验（装机后必须过才算 0.7.39 可用）
+- machine-runner 七步真机冒烟（`scratch/smoke-0739.py`：`debug_dump trigger_actions` 可读 / 单技能砍树 `tree→stump` / 1 日 `intent_coverage`+gaps+落盘六串 / analyzer 判 §8 / verify-run3 对 §8 只 info）。
+- deputy task-224 冻结树对抗验收（`git archive cea9c0f`，A/B/C/D 四段 + 变异「自报 vs 实测」两列 + 冒烟 7 步核对），给「可/不可放行 A″/B″」。
+- 全绿后起 A″/B″（`task-113`：`logs/longrun-runA5-0739.jsonl` / `runB5-0739.jsonl`，教训库字节拷贝、L0–L5 对照）。
