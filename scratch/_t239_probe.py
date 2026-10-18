@@ -460,6 +460,10 @@ def case_c(tree: Tree, src_tag: str) -> None:
               bool(cap) and cap.group(1) == "12" and clamp,
               f"cap={cap.group(1) if cap else None} clamp={clamp}")
         check("C4b 需求来自可收格数而非手写", "_harvest_demand" in lr)
+        seg237 = lr[lr.find("def _harvest_demand"):][:2500]
+        check("C4c 需求估算读可收格数/没被上界替代",
+              bool(seg237) and ("harvest" in seg237 or "tiles" in seg237)
+              and "HARVEST_DEMAND_CAP" in seg237, seg237[:72])
 
     # C5/C6 属 238
     if not has238:
@@ -486,6 +490,10 @@ def case_c(tree: Tree, src_tag: str) -> None:
               all(k in seg for k in ("eventUp", "LevelUpMenu", "professionsToChoose",
                                      "MODAL_WAIT_ONLY", "cleanup_skipped")),
               "_cleanup_modals_before_finish")
+        fin = lr[lr.find("def _finish(self, code"):][:4000]
+        check("C8e `_finish` 真的在 `finish` 前调用收尾守卫，且 stuck 进 summary/journal",
+              ("_cleanup_modals_before_finish(" in fin) and ("cleanup_modal_stuck" in fin)
+              and ("summary" in fin), fin[:0] or "见 _finish")
         try:
             _lr, TL = _load_tree(tree)
             FW = importlib.import_module("agentfarm.farmwork")
