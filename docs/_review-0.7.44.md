@@ -230,10 +230,22 @@
 2. **是 GAP 扩面（第三个形态）**：卡 1/1b 把“拿不出目标”从 `stuck` 升级为“换片 → `resume_exhausted:` 诚实收工”，但 `day_justified` 的**理由白名单**没有跟上——它只认 `night/stamina/no_work`。于是“**当前观测/可达面没活、但当日累积 pending 还有 263/217 格**”这一形态的收工，只能落到 `stuck:` 或 `resume_exhausted:`，两种都被判不 VERIFIED。卡面写的是「确实没活 ⇒ 诚实收工不 VERIFIED」，而真机形态是「当前没活、账本还有 263/217 格」——判定“确实没活”的口径与账本累积口径不同步，这正是 task-15 要修的 `day_justified` 只对**当前可执行可达**待做格敏感 + 263/217 归属表。
 3. **对我此前 GAP-3 裁决的自我修正**：0.7.44 验收时我把 burst 路径判为“有界诚实停、非洗白、可不改”。真机正例证实**有界性成立**（0.32s/5 次即停、随后立即睡成），但**有界 ≠ 可放行**：它停在 `stuck:` 标签上，导致 `day_justified=false`、`verified=false`，A9 目标「连续 5 日 VERIFIED」不可达。因此 GAP-3（burst 写 `stuck:` 标签）必须与 task-15 一并收口：至少要改理由口径（白名单是否接纳新收工形态，或改 `ended_reason` 语义并配反向洗白用例）；burst 的**有界逻辑本身**可保留。
 4. **对 task-15 验收的输入（我给 Lead 的建议）**：①`day_justified` 改成只看**当前可执行可达**待做格（不是累积 pending）；②263/217 归属表（逐格/逐区归因：当前可见可执行 / 不可达 / 被围 / 已封 / 观测截断未返回）；③反向洗白用例（伪造“当前没活”必须判红；有真实可执行格时 `day_justified` 必须 false）；④对 burst 写 `stuck:` 给出判定（扩白名单或改 reason 语义），不得放宽 `no_unmet_stages`/护栏 B（§4 的 44 条判据可直接复用）；⑤A9 开跑前后都要看 `verified_streak` 与 `day_justified` 的逐日原文。
+5. **0.7.45 回归单列判据（burst 收尾标签，Lead m00889 要求单列）**：允许 burst 路径有界停（本机 0.32 秒内 5 次即停是正例）；但 **①不许再写 `stuck:` 掩盖**（要么改成可审计的诚实收工理由码，要么扩 `day_justified` 白名单并配反向洗白用例）；**②不许因“有界停”而不 VERIFIED**，除非有证据证明当天真有活没干完（真实可执行可达格遗留 / `assigned_undone>0` / 护栏 B 红）。该条是 0.7.45 回归（task-18）必过项。
 
 ### 7.4 结论
 
 **0.7.44 不可据此放行 A9/B9**。冻结树四卡代码面仍判 PASS-WITH-NITS（§0-§6），但真机门禁（release §3.4 要求 smoke ≥1 天 `verified=true`）**未过（0/2）**，且暴露的是卡 1/1b “诚实收工”判定的未收口形态（task-15）。放行条件见 §0 末「还差什么」。
+
+### 7.5 补充：真机差异（提交后补记，Lead m00889 第 1 项）
+
+> 除 §7.1 已记的「装机成功、冒烟 2 日失败」外，账本里还有以下差异/事实未被 §7.1 收录，全部有原文行号；不改变结论。
+
+- **实际跑满 2 日，收在 `day_cap`**：argv 是 `--days 1 --max-days 2`；账本 `day_cap`（jsonl:307）`{days:2, max_days:2}`；`finish`（jsonl:308）`code=1, verified_streak=0, actions=156, minutes=8.54, stages_seen=[clear_area, plant_area, till_area], no_unmet_stages=true, unmet_days=[], stuck_flushes=0, cleanup_modal_stuck=false, cleanup_attempts=0`。即 0.7.44 冒烟不是“跑 1 天就崩”，而是**跑满 2 天、每天都有真实动作、每天都不 VERIFIED**。
+- **`plots_capped`（jsonl:81）**：`plots_today=10, limit=10`，「已开满 10 片地（上限 10），不再累计新作业区」——这是 263/217「跨片地累积且不再新增作业区」的直接来源之一。
+- **日级判定被“最后一轮”遮蔽的风险（与 task-15/17 的归属表直接相关）**：`stage_midway_leftover`（jsonl:238，t=389.74，`clear_area`，`tiles=2, leftover=2, round=39`）与（jsonl:304，t=512.04，`clear_area`，`tiles=12, leftover=220, round=1`）。该事件 note 原文警告：「同一阶段种类当天更早一轮还剩格子、最后一轮 leftover==0 ⇒ 日级判定取最后一轮；若那批格子属于另一片地则存在遮蔽，请人工复核 stage_exhausted」。冬 27 的 `no_unmet_stages=true` 取的正是最后一轮 leftover=0，而第一轮 leftover=220 ⇒ **day 级 unmet 判定存在被“最后一轮”遮蔽的可能**；263/217 归属表必须把 `stage_midway_leftover` 的早轮 leftover 一起算，不能只看 `day_end.plot_pending`。
+- **`gaps.json` 挡死格真实存在**：`tree:12 / grass:3 / stone:1 / twig:1`（`reason=blocked_tile`，first/last seen 均 winter 26）——与卡 5 B7「blocked 集真实、不是探针臆造」一致；这些格对应 B7/`_dead_tile_set` 口径。
+- **收尾纪律（guardian）**：`logs/longrun-smoke-0744-guardian-state.json`：`brain_dead=true`、`finish` 已出现、`trigger` 理由「脑死 且 finish 已出现」、`stop.executed=true` rc=0、`verify` 游戏进程 0；`bridge.json` 在停止前快照存在（modVersion=0.7.44），停止后已删。真机已按 AGENTS 纪律收尾，无残留进程/桥。
+- **version.json 的 `worktree_clean=false`**：只来自他人 `scratch/` 在制；产品文件（longrun.py/manifest/dll）与冻结树 LF 归一化一致（§7 开头已给 sha/blob），不是版本问题。
 
 ---
 
