@@ -69,4 +69,29 @@
 | check-release | `python tools\check-release.py --expect 0.7.45`：六项全绿 —— 版本一致、dll 18:54:09 不比源码旧（最新 WorldSnapshot.cs 14:36:09）、py_compile 30 文件、全量 **Ran 1330 tests / OK**、工作树干净（首跑因 log-analyst 两个未跟踪 scratch 探针红 ⇒ 提交 `1830e28` 后复跑全绿；末行文案仍写「四项全绿」系脚本旧文案）。 |
 | 装机 / goto / preflight | `deploy-mod.py --no-quit`：0.7.44 → 0.7.45，桥 `modVersion=0.7.45 port=17890`，load_save 进 `Wahaha_450799035`（FarmHouse(9,9)）`[OK] 部署闭环完成`；`agentfarm goto Farm` OK（FarmHouse→Farm，landing=[64,15]，7653ms）；`preflight.py --expect 0.7.45 --save-baseline logs\runA9-baseline.json` ⇒ `✅ 可以起跑`（基线 700B SHA256 `141F7EDE8F543F3A85CAE5EFFE9C63939F966EF9D5433BB381A9D08415EA07E7`，冬28 06:00 Farm/钱2767/体力270/种子 483×10/耕地8/作物0/tileCount 400）。**注**：该基线取自当前档（winter 28，冒烟推进后的档）；A9 起跑前 restore `A9-start`（winter 26）后必须按 §4 重跑 preflight 并重写基线，以 restore 后读数为准。 |
 | 收尾 | `stop-game.py --wait 45`：quit_game 回执 ok、原 pids=[10532] 消失 ⇒ 进程 0 / 仓库根 `bridge.json` 不存在 / 17890 无 LISTENING / AppData 无残留。 |
-| 冒烟（smoke-0745） | 待 machine-runner 执行（tag `smoke-0745`；门禁见 §3，≥1 天 VERIFIED 才放行 A9）。 |
+| 冒烟（smoke-0745） | **FAIL（0/2 天 VERIFIED）**：冬26 `ended_by=inventory_blocked`、冬27 `ended_by=sleep`+`pending_executable=7`；两日 `day_justified=false` ⇒ 步 8.1 FAIL、A9 不放行。详见 §7 与 `docs/_smoke-0745.md`。 |
+
+## §7 真机冒烟 smoke-0745 结果：FAIL（0/2 天 VERIFIED，A9 hold）
+
+- 执行：machine-runner，2026-10-18 18:57:34–19:16（本地 UTC+8）；mod 0.7.45（冻结 `2feb1f8`）；存档 `Wahaha_450799035`；起跑 HEAD `3608593`。
+- 证据：`docs/_smoke-0745.md`（312 行）、账本 `logs/longrun-smoke-0745.jsonl`（650 行 / 2 天 / 0 坏行）、SMAPI 窗口 `logs/smoke-0745-smapi-window.txt`（428250B / 4631 行 / SHA256 `A24EB3D5…1780`）、guardian 日志 `logs/longrun-smoke-0745-guardian.log`。
+
+| 日 | ended_by | ok_steps | unreachable | checks 红 | pending（账本/守卫/停滞/可执行/判死/看不见/残缺） | free_slots 开/终/低 | loot_lost_steps |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 冬26（jsonl:231） | inventory_blocked | 33 | 32 | unreachable_within_bound、day_justified | 3/3/0/0/0/3/0 | 0/1/0 | 21 |
+| 冬27（jsonl:647） | sleep | 210 | 16 | day_justified | 230/7/0/**7**/223/0/0 | 0/0/0 | 205 |
+
+- finish（jsonl:650）：`code=1, verified_streak=0, target_days=null, actions=420, minutes=14.57, no_unmet_stages=true, unmet_days=[], stuck_flushes=0`。
+- ended_reason 原文（不加工）：
+  - 冬26：`inventory_blocked:背包满（空格 1）且今天已经腾不出格子：不是没活、也不是 stuck —— 是背包堵住（先去出货/卖材料腾格，明天再收）`
+  - 冬27：`resume_exhausted:回片区 220 格都回去看过、换片 4 次，当前观测里没有可执行目标（守卫仍说：今天早些时候还有 7 格没做完（跨片地，最近的是 [31, 42]））`
+- 与 0.7.44 两个失败日对照：`stuck:` 事件 **0 条**（旧形态消失）、`pending_ledger=230 = executable 7 + blocked 223` 不变式成立（旧 263/217 口径矛盾消除）；但两日 `verified` 仍 `false` ⇒ 步 8.1 **未转 PASS**。
+- 本跑新暴露四条（决定 0.7.46 四卡）：
+  1. **12 格背包结构性死锁**：`inventoryCount=12` 且 12 格全占（5 工具 + Acorn/Maple Seed/Copper Ore/Stone/Hay/Coal/Wheat Seeds），按纪律无可腾格项 ⇒ 清障掉落永久丢（loot_lost 21+205 步）；钱 2767→3264 已够 2000g 背包升级。
+  2. **售材违反纪律**：slot_relief 实卖建材 95 件（Wood (O)388 共 92 件、Clay (O)330 3 件），`before.whitelist` 当时含 `(O)388`/`(O)330` ⇒ 与 AGENTS.md §5 冲突；证据 `docs/_analyze-smoke-0745.md` §5b。
+  3. **till 32 格「四邻都站不过去」被记成 unreachable**（冬26 32 > bound 15 ⇒ 判据红）；clear 有 encircled 归类，till 没有。
+  4. **冬27 day 级 7 格可执行与守卫口径未闭合**：`no_progress_burst.samples=[[30,47],[31,42],[31,43],[31,46],[31,47],[31,48],[31,49],[37,36]]`，`pending_blocked 223 − pending_stalled 218 = 5 格`来源未单列。
+- 八步判定：步 3/4/5/6 PASS；步 1/2 本批 `--only 3` 未执行⇒【无法判定】；步 7【无法判定·无作物】；步 8 **FAIL**（8.1 0/2；8.2② 砍树 PASS，best -19）。
+- 收尾：guardian 19:15:16 判据成立（脑死 + finish 已出现）→ `stop-game.py --wait 45` rc=0 → 进程 0 / `bridge.json` 已删 / 17890 无 LISTENING；跑后存档四件已记（游戏落盘 winter 28，**不是 A9 起点**；A9-start 备份四件未动）。
+- 探针缺陷单列：pre 步 3 首跑 FAIL 属探针「3 次调用上限」偏紧（该树共需 21 刀），重跑 PASS，**不改判产品**。
+- 处置：门禁 FAIL ⇒ A9 hold；开 **0.7.46 四卡**（task-25 背包升级 / task-26 7 格口径 / task-27 till unreachable / task-28 售材纪律+inventory_blocked 证据门槛）+ task-29 冻结九步 + task-30 smoke-0746 门禁（见 `docs/_release-0.7.46.md`）。
