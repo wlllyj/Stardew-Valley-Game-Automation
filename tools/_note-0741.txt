@@ -1,0 +1,9 @@
+v0.7.41（2026-10-18）：全脑侧修复批次（0.7.40 七步冒烟抓出的三处真缺陷），Mod 无代码变更（dll 与 0.7.40 同源重建）
+
+1. 末次跨日落盘守卫（task-236）：跑尾声若 `ui.isModal` ⇒ 最多 3 次 `dismiss_modal`+observe（journal 复用 `modal_dismissed{kind:"cleanup"}` / `modal_dismiss_failed{kind:"cleanup_blocked"}`），仍卡 ⇒ `finish.cleanup_modal_stuck=true`；`eventUp=true`、职业选择弹窗、`MODAL_WAIT_ONLY`（存档菜单）**收尾也绝不关**；`tools/verify-run3.py` 新增 `--smapi`：六串判据计数（L16 插件行只进原始计数）必须全等且末次 `NewDay` 行号早于末次 `Save called`，否则 problem；缺 SMAPI ⇒ 无法判定。
+
+2. 需求驱动腾格（task-237）：`_harvest_demand(obs)->(demand,basis)` = max(窗口 `ready` 活苗格数, 窗口外 `readyTiles`, `farm.readyCrops`)，封顶 `HARVEST_DEMAND_CAP=12`，三口径都不可用 ⇒ 保守 3 + `demand_basis="conservative"`；目标水位 `target_free=min(SLOT_RESERVE+demand, SLOT_FREE_CAP=12)`；`_slot_relief` 提前到所有阶段之前、每卖一叠重观测、达标即停；`SLOT_RELIEF_MAX` 3→6、`SLOT_RELIEF_MAX_STACKS_TOTAL` 5→10；`slot_relief` 事件新增 `demand`/`demand_basis`/`target_free`/`reached`（复用事件名）；卖前先清模态，关不掉 ⇒ 不卖、如实 blocked；"没有可腾来源"不消耗轮数；修红线漏洞：多叠同 qid 逐个扣减 `remaining`，保证卖完仍 ≥ 每 qid 保留下限 K。
+
+3. §8 意图对账兜底（task-238）：`_finish_intent_coverage` 汇总前，任何 `executed_steps==0 && reasons=={}` 的意图按当天 `ended_by` 回填**闭合集**原因码（`inventory_blocked→no_slot`、`blocked_modal→blocked_modal`、`blocked_event→gated`、`stuck*/bridge_down/sleep_failed→world_stuck`、夜里/体力/no_work/no_plot→`gated`、其余→`unknown_evidence`），并写 `evidence{why:"finalize_fallback", ended_by, ended_reason}`；**只补原因码**，不改 `executed_steps`/`checks`/`verified`；`docs/_run10-criteria.md` §8.2c 补语义（非洗白通道）。
+
+验证口径：0.7.41 冒烟必须 4 PASS + 步 5 如实【无法判定】+ 步 6/步 7 全绿（见 `docs/_release-0.7.41.md` §3）；全量单测基线 `Ran 1199 tests / OK`。

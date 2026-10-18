@@ -36,7 +36,24 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.40"   # v0.7.40：全脑侧修复批次（Mod 无代码变更，dll 与 0.7.39 同源重建）——
+MOD_VERSION_EXPECTED = "0.7.41"   # v0.7.41：全脑侧修复批次（0.7.40 七步冒烟抓出的三处真缺陷；
+                                  # Mod 无代码变更，dll 与 0.7.40 同源重建）——
+                                  # ①末次跨日落盘守卫（task-236）：跑尾声 `ui.isModal` ⇒ ≤3 次
+                                  #   `dismiss_modal`（`modal_dismissed{kind:"cleanup"}`）/
+                                  #   `cleanup_blocked` + `finish.cleanup_modal_stuck`；`eventUp`、
+                                  #   职业弹窗、存档菜单收尾也绝不关；工具侧 `verify-run3 --smapi`
+                                  #   六串判据计数（L16 插件行只进原始计数）全等 + 末次 NewDay 行号
+                                  #   早于末次 Save called；
+                                  # ②需求驱动腾格（task-237）：`_harvest_demand`（窗口 ready /
+                                  #   readyTiles / farm.readyCrops，封顶 12，缺失 ⇒ 保守 3 +
+                                  #   demand_basis）⇒ `target_free=min(SLOT_RESERVE+demand,12)`；
+                                  #   提前到所有阶段前、6 轮/10 叠、优先卖当天收获产物、卖前清模态；
+                                  #   修红线漏洞：多叠同 qid 逐个扣减（卖完仍 ≥K）；
+                                  # ③§8 意图对账兜底（task-238）：`executed_steps==0 && reasons=={}`
+                                  #   按当天 `ended_by` 回填闭合原因码（`why="finalize_fallback"`），
+                                  #   只补原因码、不改步数/判定。
+                                  # --- 历史 ---
+                                  # v0.7.40：全脑侧修复批次（Mod 无代码变更，dll 与 0.7.39 同源重建）——
                                   # ①非片区意图（ship/sell/sleep/review/recover_stamina/
                                   #   wait_for_save）失败不许裸用 `no_target`，证据不可用 ⇒
                                   #   `unknown_evidence` + `unknown_why`（non_plot_task/no_plot/
