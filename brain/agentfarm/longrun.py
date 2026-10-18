@@ -568,11 +568,17 @@ HONEST_EXHAUSTED_END_REASONS = ("resume_exhausted",)
 
 
 def is_justified_end(ended_by: str, ended_reason: str, *,
-                     pending_executable: int | None = None) -> bool:
-    """这一天是不是以**正当理由**收工（`day_justified` 的判据，task-32 / task-15）。
+                     pending_executable: int | None = None,
+                     malformed_tiles: int = 0) -> bool:
+    """这一天是不是以**正当理由**收工（`day_justified` 的判据，task-32 / task-15 / task-22）。
 
     口径：
     * `ended_by` 必须是 `sleep`（我们真的让游戏日翻篇了）；
+    * 【task-22】`malformed_tiles > 0` ⇒ **一律不放行**（fail-closed）：观测 `tiles[]` 里
+      出现了**字段残缺**的 tile 记录（只有 `tile`、缺 `kind`/`crop` 等工作种类字段）说明
+      "看不见"是**观测坏了**，不是"没有活"；若把它当 unobserved，Mod 字段一改名就能让
+      全部格变成 unobserved ⇒ executable=0 ⇒ 每个诚实收工日都洗成 VERIFIED。这条放在白名单
+      之前：残缺读数和任何收工理由同时出现都**不许**判正当（缺失≠通过）；
     * 前缀在 `JUSTIFIED_END_REASONS`（夜里到点 / 体力见底 / 确实没活）⇒ 正当（与旧实现逐字一致）；
     * 【task-15】前缀在 `HONEST_EXHAUSTED_END_REASONS`（`resume_exhausted`）**且**
       `pending_executable == 0` ⇒ 正当。"换片/回片区/当前观测都拿不出目标"本来就是诚实收工，
@@ -582,6 +588,9 @@ def is_justified_end(ended_by: str, ended_reason: str, *,
 
     旧口径逐字保留在第一条白名单分支上（单测可直接钉死"`no_plot` 不在里面"）。
     """
+    # 【task-22】残缺 tile 记录 = 观测不可信 ⇒ 无论什么理由都不判"正当"（防洗白）。
+    if int(malformed_tiles) > 0:
+        return False
     if ended_by != "sleep":
         return False
     prefix = str(ended_reason or "").split(":", 1)[0]
@@ -771,15 +780,20 @@ class DayReport:
     #: * `pending_blocked` = ledger 里今天**已判死**的格数（`blocked` ∪ `encircled_day` ∪
     #:   `resume_stall_tiles`：干不动/走不到/被围住/回去看过拿不出目标）；
     #: * `pending_unobserved` = 其余（不在 `tiles[]`/观测截断/已达标陈旧账本/预算延后/工具不够/
-    #:   背包堵/四邻没得站/无法判定）。
+    #:   背包堵/四邻没得站/无法判定）；
+    #: * 【task-22】`pending_malformed` = 在 `tiles[]` 里出现、但**缺工作种类字段**的残缺记录
+    #:   （只有坐标、没有 `kind`/`crop`）——不并入 unobserved（那是观测坏了，不是没活）；
+    #:   >0 ⇒ `day_justified` 必为 false（fail-closed，堵 deputy NIT-1 洗白通道）。
     #: 不变式：`pending_ledger == pending_guard + pending_blocked`；
-    #: `pending_guard == pending_executable + pending_unobserved`（观测不可用时 executable=guard）。
+    #: `pending_guard == pending_executable + pending_unobserved + pending_malformed`
+    #: （观测不可用时 executable=guard、malformed=0）。
     pending_ledger: int = 0
     pending_guard: int = 0
     pending_stalled: int = 0
     pending_executable: int | None = None
     pending_blocked: int = 0
     pending_unobserved: int = 0
+    pending_malformed: int = 0
     #: 【task-15 / 0.7.45】当天"更早轮 leftover>0、**最后一轮**同种类 leftover==0"的
     #: `stage_midway_leftover` 事件明细（count/tiles/leftover/round/stage）。
     #: 日级判定**不许只看最后一轮**：这些轮次的一手读数在这里并列留痕（只作 info，
@@ -921,6 +935,8 @@ class DayReport:
             "pending_executable": self.pending_executable,
             "pending_blocked": self.pending_blocked,
             "pending_unobserved": self.pending_unobserved,
+            # 【task-22 / 0.7.45】观测 tiles[] 里字段残缺的记录数（>0 ⇒ day_justified 必 false）
+            "pending_malformed": self.pending_malformed,
             # 【task-15 / 0.7.45】更早轮 leftover>0 而最后一轮归零的遮蔽证据（日级判定不许只看最后一轮）
             "stage_midway_leftover": [dict(m) for m in self.stage_midway_leftover],
             # 【task-16 / 0.7.45】背包空格 + 清障掉落被拒收的日级留痕（只 info；不进 checks）
@@ -4119,6 +4135,8 @@ class LongRun:
             pending_executable=snap["executable"], pending_blocked=snap["blocked"],
             pending_unobserved=snap["unobserved"], pending_guard=snap["guard"],
             pending_stalled=snap["stalled"],
+            # 【task-22 / 0.7.45】残缺 tile 数（>0 ⇒ 当天 day_justified 必 false）
+            pending_malformed=snap.get("malformed", 0),
             note="回片区 / 换片 / 当前观测都没有可执行目标 ⇒ 今天按 resume_exhausted 诚实收工："
                  "睡下去让游戏日前进；只有当前观测里**确实没有可执行格**时 day_justified 才认这条，"
                  "否则照旧不 VERIFIED")
@@ -5040,19 +5058,23 @@ class LongRun:
           单列给 Lead 的对账表用；
         * `guard` = `_pending_work()`（ledger − 已判死之后的"守卫口径"待做；
           不变式 `guard + blocked == ledger`）；
-        * `executable` / `unobserved` = 对 `guard` 里的格按最后一张户外观测分类：
-          看得见 + 确实要做 + 预算/工具允许 + 站得到 ⇒ `executable`；其余（不在 `tiles[]`、
-          观测截断、已做/账本陈旧、预算延后、工具不够、背包堵、四邻没得站）⇒ `unobserved`
-          （不变式 `executable + unobserved == guard`；`None` 观测 ⇒ 全部算 executable 的
-          fail-closed 方向，见下）；
-        * `ledger == guard + blocked`、`guard == executable + unobserved`。
+        * `executable` / `unobserved` / `malformed` = 对 `guard` 里的格按最后一张户外观测分类：
+          看得见 + 确实要做 + 预算/工具允许 + 站得到 ⇒ `executable`；**不在 `tiles[]`**（截断/
+          不在视野）⇒ `unobserved`（不变式 `executable + unobserved + malformed == guard`）；
+        * 【task-22】`malformed` = **在 `tiles[]` 里出现、但缺工作种类字段**的残缺记录
+          （例如 `{"tile":[60,10]}` 只有坐标，没有 `kind`/`crop`，也不在 `tillable[]`）——
+          **绝不许算 unobserved**：那是"观测坏了"而不是"没有活"。它单独计数，
+          调用方用 `is_justified_end(..., malformed_tiles=...)` 强制 `day_justified=false`
+          （fail-closed，堵 deputy NIT-1 的洗白通道）；
+        * `ledger == guard + blocked`、`guard == executable + unobserved + malformed`。
 
         观测不可用（`obs is None` / 不是农场观测）⇒ **全部按可执行计**（fail-closed：不许把
         "没看到"当"没有"，`day_justified` 因此不放行）。
 
         分类顺序：已判死（`blocked`/`encircled_day`/`resume_stall_tiles`）→ 不在 `tiles[]`
-        ⇒ unobserved（这正是 0.7.44 冒烟 263/217 被判成"还有活"的病灶）→ 看得见但今天
-        已不需要做 ⇒ unobserved → 要做但不允许/站不到 ⇒ unobserved（"今天没证据能执行"）→ 其余 executable。
+        ⇒ unobserved（这正是 0.7.44 冒烟 263/217 被判成"还有活"的病灶）→ 【task-22】在
+        `tiles[]` 但缺工作种类字段 ⇒ malformed → 看得见但今天已不需要做 ⇒ unobserved →
+        要做但不允许/站不到 ⇒ unobserved（"今天没证据能执行"）→ 其余 executable。
         """
         defer = self._budget_deferred_tile_set()
         shed = self._shed_tile_set()
@@ -5069,7 +5091,7 @@ class LongRun:
         farm: dict[str, Any] | None = obs if (obs is not None and self._is_farm(obs)) else None
         if farm is None:
             # 观测证据不可用 ⇒ 不许声称"没有可执行的活"（executable 取全量 ⇒ day_justified 不放行）
-            return {**base, "executable": len(guard_tiles), "unobserved": 0}
+            return {**base, "executable": len(guard_tiles), "unobserved": 0, "malformed": 0}
         tmap = FarmWorker.tiles_of(farm)
         tillable = FarmWorker.tillable_of(farm)
         _seeds, _money, can_plant = self._seed_outlook(farm)
@@ -5079,13 +5101,18 @@ class LongRun:
                    and self._tree_budget_room(farm) > 0)
         free_slots, bag_need, bag_status = self._bag_state(farm)
         bag_blocked = self.inventory_blocked_today or (bag_status == "ok" and bag_need > 0)
-        executable = unobserved = 0
+        executable = unobserved = malformed = 0
         for t in guard_tiles:
             tv = tmap.get(t)
             if tv is None:
                 unobserved += 1          # 不在 tiles[]（含截断）⇒ 看不见、不算活
                 continue
             kind = str(tv.get("kind") or "")
+            # 【task-22】记录在 tiles[] 里、却缺"工作种类"字段（无 crop、无 kind、也不在 tillable）
+            # ⇒ 观测残缺/字段被改名，不能当"没活"：单列 malformed 并强制 not justified。
+            if not tv.get("crop") and not kind and t not in tillable:
+                malformed += 1
+                continue
             need = False
             allowed = True
             if tv.get("crop"):
@@ -5119,7 +5146,8 @@ class LongRun:
                 unobserved += 1          # 预算延后/工具不够/背包堵/四邻没得站 ⇒ 今天不可执行
                 continue
             executable += 1
-        return {**base, "executable": executable, "unobserved": unobserved}
+        return {**base, "executable": executable,
+                "unobserved": unobserved, "malformed": malformed}
 
     # ------------------------------------------------ task-124：review 独苗的对账路径
 
@@ -9534,12 +9562,17 @@ class LongRun:
         rep.pending_executable = snap["executable"]
         rep.pending_blocked = snap["blocked"]
         rep.pending_unobserved = snap["unobserved"]
+        # 【task-22 / 0.7.45】tiles[] 里字段残缺的 tile 记录数：不并入 unobserved，
+        # 单独留痕并强制 day_justified=false（缺失≠通过，堵 deputy NIT-1 fail-open）。
+        rep.pending_malformed = int(snap.get("malformed", 0))
         if rep.pending_ledger or rep.pending_stalled or rep.pending_blocked:
             rep.notes.append(
                 f"日终账本：原始 {rep.pending_ledger} 格（守卫口径 {rep.pending_guard} 格、"
                 f"已判死 {rep.pending_blocked} 格，其中停滞/被围 {rep.pending_stalled} 格）；"
                 f"当前观测里可执行 {rep.pending_executable} 格、看不见/已陈旧/今天不可执行 "
                 f"{rep.pending_unobserved} 格"
+                + (f"、观测记录残缺 {rep.pending_malformed} 格（不并入看不见，day_justified 必 false）"
+                   if rep.pending_malformed else "")
                 + ("（观测证据不可用 ⇒ 诚实收工判定不放行）" if outdoor_obs is None else ""))
         # 【task-16 / 0.7.45】背包空格与"清障掉落被游戏拒收"的日终留痕：**只作 info** ——
         # 满包清障照常算做成（不因此判失败、不改下面任何一个 checks 键）；但"掉的战利品可能
@@ -9585,9 +9618,11 @@ class LongRun:
             # 【task-15 / 0.7.45】`resume_exhausted`（换片/回片区/观测都拿不出目标）也只有
             # **当前观测里可执行格为 0** 时才认（证据 = 上面的 `pending_executable`）；
             # 有活却收工/观测证据不可用 ⇒ 仍是 False，反向洗白用例钉死这条。
+            # 【task-22 / 0.7.45】`pending_malformed > 0`（tiles[] 记录字段残缺）⇒ 一律 False。
             "day_justified": is_justified_end(
                 rep.ended_by, rep.ended_reason,
-                pending_executable=rep.pending_executable),
+                pending_executable=rep.pending_executable,
+                malformed_tiles=rep.pending_malformed),
             # 【task-149 C】0 动作日**不许** VERIFIED —— 除非当天有真正独立的"无活可做"证据
             # （`sleep_guard` 在 farm 证据齐备且 `work_reasons` 为空时置的
             # `no_work_evidence_ok`）。run9c summer 20：22.81 秒、`ok_steps=0`、`decision=0`，

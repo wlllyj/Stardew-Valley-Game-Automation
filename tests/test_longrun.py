@@ -13554,5 +13554,93 @@ class TestTask16InventoryFull(unittest.TestCase):
                                 stage[-1])
 
 
+class TestTask22MalformedTiles(unittest.TestCase):
+    """task-22 / 0.7.45：观测 `tiles[]` 里**字段残缺**的 tile 记录不得算 unobserved 放行。
+
+    deputy NIT-1 的 fail-open：`{"tile":[60,10]}`（只有坐标、没有 kind/crop）被归 unobserved
+    ⇒ executable=0 ⇒ day_justified 放行。将来 Mod 字段改名/裁剪让全部 tile 变残缺，就能把
+    每个诚实收工日洗成 VERIFIED。口径：
+      ① 账本待做格**根本不在 tiles[]**（截断/不在视野）⇒ 保持 unobserved、不阻断（冬26 的 2 格）；
+      ② 在 tiles[] 里但缺工作种类字段 ⇒ 单列 `malformed`，`day_justified` 必 false；
+      ③ 整张观测缺失 ⇒ executable=guard（fail-closed）。
+    """
+
+    def _run_with(self, tiles: Iterable[tuple[int, int]], *,
+                  malformed: Iterable[tuple[int, int]] = ()):
+        w = FakeWorld()
+        w.blockers = {}                    # 让观测里没有任何"自带 kind"的记录干扰
+        run = make_run(w)
+        run.leftover_targets = {(int(t[0]), int(t[1])) for t in tiles}
+        obs = w.obs()
+        for t in malformed:
+            # 残缺记录：只有坐标，没有 kind / crop（deputy 实测的形态）。
+            # 观测的 tiles[] 挂在 location 下（见 FakeWorld.obs 的 "location" 块）。
+            obs["location"]["tiles"].append({"tile": [int(t[0]), int(t[1])]})
+        return run, obs
+
+    def test_malformed_tile_record_is_not_unobserved_and_blocks_justification(self):
+        run, obs = self._run_with([(70, 20)], malformed=[(70, 20)])
+        snap = run._pending_snapshot(obs)
+        self.assertEqual(snap["ledger"], 1, snap)
+        self.assertEqual(snap["guard"], 1, snap)
+        self.assertEqual(snap["malformed"], 1, snap)      # 残缺记录单列
+        self.assertEqual(snap["unobserved"], 0, snap)     # 绝不并入 unobserved
+        self.assertEqual(snap["executable"], 0, snap)
+        # 不变式：guard == executable + unobserved + malformed
+        self.assertEqual(snap["guard"],
+                         snap["executable"] + snap["unobserved"] + snap["malformed"], snap)
+        # 只要 malformed>0 ⇒ 不放行（连白名单理由也一样：缺失≠通过）
+        self.assertFalse(is_justified_end(
+            "sleep", "resume_exhausted:回片区（work_spot_resume）",
+            pending_executable=snap["executable"], malformed_tiles=snap["malformed"]))
+        self.assertFalse(is_justified_end("sleep", "no_work",  # 白名单也要被残缺读数一票否决
+                                          malformed_tiles=snap["malformed"]))
+
+    def test_absent_tile_from_observation_stays_unobserved_and_can_justify(self):
+        # 冬 26 的 263 里有 2 格"不在 tiles[]"（观测截断/不在视野）：保持 unobserved，不阻断
+        run, obs = self._run_with([(70, 20), (71, 20)])
+        snap = run._pending_snapshot(obs)
+        self.assertEqual(snap["guard"], 2, snap)
+        self.assertEqual(snap["unobserved"], 2, snap)
+        self.assertEqual(snap["malformed"], 0, snap)
+        self.assertEqual(snap["executable"], 0, snap)
+        self.assertTrue(is_justified_end(
+            "sleep", "resume_exhausted:回片区（work_spot_resume）",
+            pending_executable=snap["executable"], malformed_tiles=snap["malformed"]))
+
+    def test_whole_observation_missing_is_fail_closed(self):
+        w = FakeWorld()
+        run = make_run(w)
+        run.leftover_targets = {(70, 20), (71, 20)}
+        snap = run._pending_snapshot(None)     # 日终没有户外农场观测
+        self.assertEqual(snap["guard"], 2, snap)
+        self.assertEqual(snap["executable"], snap["guard"], snap)   # 全按可执行计
+        self.assertEqual(snap["unobserved"], 0, snap)
+        self.assertEqual(snap["malformed"], 0, snap)
+        self.assertFalse(is_justified_end(
+            "sleep", "resume_exhausted:回片区（work_spot_resume）",
+            pending_executable=snap["executable"], malformed_tiles=snap["malformed"]))
+
+    def test_mixed_absent_plus_malformed_invariant_and_replay(self):
+        # 冬 26 重放语义：2 格不在视野 ⇒ exec0/unobs2 ⇒ justified True（不带残缺记录时）
+        run, obs = self._run_with([(70, 20), (71, 20)])
+        snap = run._pending_snapshot(obs)
+        self.assertTrue(is_justified_end(
+            "sleep", "resume_exhausted:回片区（work_spot_resume）",
+            pending_executable=snap["executable"], malformed_tiles=snap["malformed"]))
+        # 把 (71,20) 换成 tiles[] 里的残缺记录 ⇒ 不变式仍成立，但不许放行
+        run2, obs2 = self._run_with([(70, 20), (71, 20)], malformed=[(71, 20)])
+        snap2 = run2._pending_snapshot(obs2)
+        self.assertEqual(snap2["guard"], 2, snap2)
+        self.assertEqual(snap2["unobserved"], 1, snap2)
+        self.assertEqual(snap2["malformed"], 1, snap2)
+        self.assertEqual(snap2["executable"], 0, snap2)
+        self.assertEqual(snap2["guard"],
+                         snap2["executable"] + snap2["unobserved"] + snap2["malformed"], snap2)
+        self.assertFalse(is_justified_end(
+            "sleep", "resume_exhausted:回片区（work_spot_resume）",
+            pending_executable=snap2["executable"], malformed_tiles=snap2["malformed"]))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
