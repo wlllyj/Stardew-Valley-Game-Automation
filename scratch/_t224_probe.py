@@ -20,6 +20,7 @@ import importlib
 import inspect
 import os
 import re
+import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -138,6 +139,13 @@ def markers() -> dict[str, bool]:
         "gaps_path" in _src(ROOT / "brain/agentfarm/longrun.py")
     m["P0-5 analyzer 判 §8"] = "intent_coverage" in _src(ROOT / "tools/analyze-longrun.py")
     m["P0-5 verify-run3 只 info"] = "intent_coverage" in _src(ROOT / "tools/verify-run3.py")
+    # ---- D 段：task-228 advance_dialogue（Lead m09338；这是"替游戏做选项"的安全红线）----
+    mod = ROOT / "mod/AgentFarm.Bridge"
+    m["D228 规则+技能接线"] = ((mod / "DialogueAdvanceRules.cs").is_file()
+                            and (mod / "DialogueAdvanceSkill.cs").is_file()
+                            and "advance_dialogue" in _src(mod / "Skills.cs"))
+    m["D228 脑侧"] = ("advance_dialogue" in _src(ROOT / "brain/agentfarm/bridge.py")
+                    and "advance_dialogue" in _src(ROOT / "brain/agentfarm/longrun.py"))
     return m
 
 
@@ -171,6 +179,12 @@ def gates() -> dict[str, bool]:
     g["222"] = all(f'JsonPropertyName("{k}")' in cs for k in ("weeds", "stones", "twigs", "trees", "clumps"))
     g["219"] = "intent_coverage" in _src(ROOT / "brain/agentfarm/longrun.py")
     g["220"] = "intent_coverage" in _src(ROOT / "tools/analyze-longrun.py")
+    # ---- D 段（task-228）：Mod 侧接线 + 脑侧语义分开设门，脑侧没交付时只 SKIP 不烧红 ----
+    mod = ROOT / "mod/AgentFarm.Bridge"
+    g["228"] = ((mod / "DialogueAdvanceRules.cs").is_file()
+                and (mod / "DialogueAdvanceSkill.cs").is_file()
+                and "advance_dialogue" in _src(mod / "Skills.cs"))
+    g["228brain"] = markers()["D228 脑侧"]
     g["union"] = bool(union)
     # 自测用：T224_ASSUME=218,219,220 强制视为已交付（验证断言真的"活"、不会静默跳过）
     assume = {x.strip() for x in os.environ.get("T224_ASSUME", "").split(",") if x.strip()}
@@ -523,6 +537,149 @@ def p05_tool_division() -> None:
                   f"keys={sorted(keys)}")
 
 
+# ---------------------------------------------------------------- D 段 task-228 advance_dialogue
+
+
+# 安全红线：替游戏做选项的 API 一律不许出现在 advance_dialogue 里
+ADVANCE_BANNED = ("answerDialogue", "answerDialogueAction", "selectOption",
+                  "Farmer.answerDialogue", "setAnswer", "chooseProfession")
+
+
+def _cs_files() -> dict[str, str]:
+    mod = ROOT / "mod/AgentFarm.Bridge"
+    return {name: _src(mod / name) for name in ("DialogueAdvanceRules.cs", "DialogueAdvanceSkill.cs")}
+
+
+def _dotnet_selftest() -> tuple[bool, str]:
+    """跑 Mod 的 C# 自检工程；杀条数口径 = 输出里 `^FAIL\\s` 行数（task-190 沿用的口径）。"""
+    proj = ROOT / "mod/AgentFarm.Bridge.Tests/AgentFarm.Bridge.Tests.csproj"
+    if not proj.is_file():
+        return False, "无 C# 自检工程"
+    try:
+        r = subprocess.run(["dotnet", "run", "--project", str(proj), "-c", "Release", "--nologo"],
+                           cwd=str(ROOT), capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=900)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"dotnet 跑不起来：{exc!r}"
+    out = (r.stdout or "") + (r.stderr or "")
+    fails = [ln for ln in out.splitlines() if re.match(r"^FAIL\s", ln)]
+    return (r.returncode == 0 and not fails), f"rc={r.returncode} FAIL行={len(fails)}"
+
+
+def p228_option_redline() -> None:
+    print("[D-228] 选项红线：提问/职业选择必须拒绝，且技能里绝不许出现替玩家应答的 API")
+    if not GATES["228"]:
+        pending("D228-1..5 选项红线", "task-228 尚未交付（DialogueAdvanceRules/Skill 未接线）")
+        return
+    cs = _cs_files()
+    rules, skill = cs["DialogueAdvanceRules.cs"], cs["DialogueAdvanceSkill.cs"]
+    i_q = rules.find("if (isQuestion) return StatusIsQuestion;")
+    i_p = rules.find("if (professionsPending) return StatusProfessionsPending;")
+    i_d = rules.find("if (!hasDialogue) return StatusNoDialogue;")
+    i_e = rules.find("if (!eventUp) return StatusEventNotRunning;")
+    check("D228-1 Precheck 顺序：is_question 最先（红线优先于一切）",
+          0 <= i_q < i_p < i_d < i_e, f"idx is_question={i_q} professions={i_p} no_dialogue={i_d} not_running={i_e}")
+    check("D228-2 五个拒绝/停转状态码齐全",
+          all(k in rules for k in ("StatusIsQuestion", "StatusProfessionsPending", "StatusNoDialogue",
+                                   "StatusEventNotRunning", "StatusAdvanceStalled")), "")
+    banned = [b for b in ADVANCE_BANNED if b in skill]
+    check("D228-3 技能内无替玩家应答/选职业的 API（安全红线）", not banned, f"命中={banned}")
+    pre_pos = skill.find("DialogueAdvanceRules.Precheck(")
+    click_pos = skill.find("box.receiveLeftClick(0, 0, true);")
+    check("D228-4 Precheck 在任何点击之前", 0 <= pre_pos < click_pos,
+          f"precheck@{pre_pos} click@{click_pos}")
+    check("D228-4b Precheck 调用未被 if(false) 绕过", "if (pre.Length > 0)" in skill, "")
+    proj = _src(ROOT / "mod/AgentFarm.Bridge.Tests/AgentFarm.Bridge.Tests.csproj")
+    prog = _src(ROOT / "mod/AgentFarm.Bridge.Tests/Program.cs")
+    if "DialogueAdvanceRules.cs" not in proj:
+        skip("D228-5 C# 行为自检覆盖规则层", "Tests.csproj 还没 Include DialogueAdvanceRules.cs（交付时必须有）")
+    elif not re.search(r"228|advance", prog, re.I):
+        skip("D228-5 C# 行为自检覆盖规则层", "Program.cs 还没有 228 断言（交付时必须有）")
+    else:
+        ok, detail = _dotnet_selftest()
+        check("D228-5 C# 行为自检（含 228 断言）0 红", ok, detail)
+
+
+def p228_bounds() -> None:
+    print("[D-228] 有界性：规则层 maxSteps 钳制（1..10、默认 1，Lead m21195 批准口径），脑侧单次 ≤10 / 每天 ≤60 步")
+    if not GATES["228"]:
+        pending("D228-6..9 有界性", "task-228 尚未交付")
+        return
+    rules = _cs_files()["DialogueAdvanceRules.cs"]
+    check("D228-6 maxSteps 默认 1 / 上限 10 / 下限 1（卡面 1..10）",
+          all(s in rules for s in ("MaxStepsDefault = 1", "MaxStepsCap = 10", "MaxStepsFloor = 1")), "")
+    check("D228-7 ClampMaxSteps 越界钳到 [1,10]",
+          "ClampMaxSteps" in rules and "if (v > MaxStepsCap)" in rules and "if (v < MaxStepsFloor)" in rules, "")
+    if not GATES["228brain"]:
+        pending("D228-8/9 脑侧 10/60 上限", "脑侧尚未交付（单次 ≤10、每天 ≤60 需在 longrun/farmwork 落地）")
+        return
+    both = _src(ROOT / "brain/agentfarm/longrun.py") + _src(ROOT / "brain/agentfarm/farmwork.py")
+    ev = re.search(r"(EVENT_ADVANCE_MAX_STEPS|ADVANCE_MAX_PER_EVENT|ADVANCE_STEPS_PER_EVENT)\s*=\s*(\d+)", both)
+    day = re.search(r"(EVENT_ADVANCE_DAY_STEPS|ADVANCE_MAX_PER_DAY|ADVANCE_STEPS_PER_DAY)\s*=\s*(\d+)", both)
+    check("D228-8 单次调用上限 ≤10（与 Mod 1..10 同口径）", bool(ev) and 0 < int(ev.group(2)) <= 10,
+          f"命中={ev.group(0) if ev else None}")
+    check("D228-9 每天步数上限 ≤60", bool(day) and 0 < int(day.group(2)) <= 60,
+          f"命中={day.group(0) if day else None}")
+
+
+def p228_pause_semantics() -> None:
+    print("[D-228] pause 语义：单步“文本没变”不得立刻判 stalled（同一处 ≤3 次、间隔 ≥3s）")
+    if not GATES["228"]:
+        pending("D228-10..12 pause 语义", "task-228 尚未交付")
+        return
+    cs = _cs_files()
+    rules, skill = cs["DialogueAdvanceRules.cs"], cs["DialogueAdvanceSkill.cs"]
+    check("D228-10 重试语义：同一处最多 3 次点击（首次+重试 2，StallMaxClicks=3），连续 2 次 stalled 才放弃（ConsecutiveStallLimit=2）",
+          all(s in rules for s in ("StallRetries = 2", "StallMaxClicks = StallRetries + 1",
+                                   "StallRetryGapMs = 3000", "ConsecutiveStallLimit = 2")), "")
+    check("D228-11 技能用 ShouldRetryAfterNoChange + StallRetryGapMs 重试（不是立刻判死）",
+          "if (DialogueAdvanceRules.ShouldRetryAfterNoChange(this._noChangeCount))" in skill
+          and "this._nextAllowedUtc = DateTime.UtcNow.AddMilliseconds(DialogueAdvanceRules.StallRetryGapMs);"
+          in skill, "逐字核重试行与间隔行")
+    retry_pos = skill.find("ShouldRetryAfterNoChange(")
+    stalled_pos = skill.find("StatusAdvanceStalled")
+    check("D228-12 判 stalled 之前先过重试判定", 0 <= retry_pos < stalled_pos,
+          f"retry@{retry_pos} stalled@{stalled_pos}")
+    prog = _src(ROOT / "mod/AgentFarm.Bridge.Tests/Program.cs")
+    if not re.search(r"stall|retry|no_change|nochange|pause", prog, re.I):
+        skip("D228-12b C# 行为自检覆盖“前两次无变化、第三次变化”",
+             "Program.cs 尚无 pause/retry 行为断言（交付时必须有：合成序列 ⇒ 不误报 stalled）")
+    else:
+        ok, detail = _dotnet_selftest()
+        check("D228-12b C# 行为自检（含 pause/retry 序列断言）0 红", ok, detail)
+
+
+def p228_policy_no_conflict() -> None:
+    print("[D-228] 与既有政策不冲突：eventUp+is_question 仍走 event_blocked 诚实收尾，advance 不得洗白")
+    if not GATES["228"]:
+        pending("D228-13..16 政策不冲突", "task-228 尚未交付")
+        return
+    lr = _src(ROOT / "brain/agentfarm/longrun.py")
+    check("D228-13 longrun 仍保留 event_blocked 诚实收尾路径", "event_blocked" in lr, "既有政策未被替换")
+    j = re.search(r"JUSTIFIED_END_REASONS\s*=\s*\(([^)]*)\)", lr)
+    justified = j.group(1) if j else ""
+    check("D228-14 JUSTIFIED_END_REASONS 未加 advance 类",
+          all(k in justified for k in ("night", "stamina", "no_work")) and "advance" not in justified,
+          f"justified={justified.strip()}")
+    if _ok("longrun"):
+        try:
+            keys = set(LR.DayReport(day_key=("spring", 1, 1), started_at=0.0).as_dict().get("checks") or {})
+        except Exception:  # noqa: BLE001
+            keys = set()
+        if keys:
+            check("D228-15 checks 键集未因 228 新增可洗白键", not any("advance" in k for k in keys),
+                  f"keys={sorted(keys)}")
+    if not GATES["228brain"]:
+        pending("D228-16..17 脑侧无选项/不新增事件名", "脑侧尚未交付")
+        return
+    check("D228-16 脑侧：is_question/无对话时不点（一次都不替玩家应答）",
+          "if not has_dialogue or is_question:" in lr, "advance 入口 fail-closed")
+    check("D228-17 脑侧不新增 journal 事件名（复用 modal_dismissed/modal_dismiss_failed，kind=dialogue_advance）",
+          'kind="dialogue_advance"' in lr, "analyzer 机械枚举纪律")
+    check("D228-18 用满额度/连续 stalled 后交给 event_blocked 诚实收尾（不无限自旋）",
+          "event_blocked" in lr and "EVENT_STALL_GIVE_UP" in lr, "")
+
+
 CASES = [
     ("P0-1", p01_after_kind_schema),
     ("P0-1", p01_guard_b_fields),
@@ -537,6 +694,10 @@ CASES = [
     ("P0-3", p03_intent_id_actionless),
     ("P0-4", p04_gaps_layering),
     ("P0-5", p05_tool_division),
+    ("D-228", p228_option_redline),
+    ("D-228", p228_bounds),
+    ("D-228", p228_pause_semantics),
+    ("D-228", p228_policy_no_conflict),
 ]
 
 
