@@ -71,10 +71,19 @@
 5. 春季农务腿（crops/watering/harvest）仍未真机验证；smoke 用 `--no-crops`。
 6. **Town 事件 `15389722` 非确定卡死（真机 5 次进 Town = 1 成功 / 4 卡死，task-32 探针）**：`eventUp=true / activeMenu=null / isModal=true / canMove=false / worldAdvancing=false / clock 冻结`；`advance_dialogue`→`[no_dialogue]`、`dismiss_modal` no-op、`move_to*`→`[ui_modal]`、店门 interact 全 `no_action`；唯一恢复 = `load_save(force=True)`。农务长跑不进 Town 时无影响；任何进城动作（卡 A）必须带事件自愈超时兜底（判据见 §7.4）。
 
-## 6. 冻结记录（待填）
+## 6. 冻结记录（Lead，2026-10-18 20:39–20:44 本地，已实测）
 
-- 冻结提交：待填
-- 版本一致性 / dll 指纹 / manifest 指纹 / build 读数 / C# 自检 / check-release / 装机 / goto Farm / preflight baseline / 优雅退：待填
+- **冻结提交**：`737c4a5abc7593ab4e5607f93eae76b9f039cd45`（`chore(release): 冻结 0.7.46（售材纪律/背包满门槛/回片区预算/挡死格口径/talk 原语/背包升级）`，3 files +32/−4：`brain/agentfarm/bridge.py`（+32/−1）、`mod/AgentFarm.Bridge/manifest.json`、`tools/_note-0746.txt`；按路径 add，cached name-only 已核）。前置：deputy 预热脚本收口 `0ffe11c`（3 files +805）；卡片读数文档 `6528e47`。
+- **版本一致性**：manifest `0.7.46` == `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.46"`；manifest 75293B SHA256 **`84FBA465D26F0122DD6F9E429D3E89353E72793FDEB87880F8D6400A2915C9A0`**（repo = 装机，同长度同哈希）。
+- **dll 指纹**：`mod/AgentFarm.Bridge/bin/Release/AgentFarm.Bridge.dll` **293888B / SHA256 `C9B3BD6CE42BEFE87E75DD64857A5C92F5B9F317940BDC3091D42D5E039A662A`**（mtime 20:39:40）；装机 `...\Mods\AgentFarm.Bridge\AgentFarm.Bridge.dll` 同长度同哈希。与 0.7.45 的 286208B/`806C1069…` 不同，**符合预期**（本批新增 talk 原语）。
+- **build**：`dotnet build mod\AgentFarm.Bridge\AgentFarm.Bridge.csproj -c Release --no-incremental` = **0 警 0 错**；`python -W error::SyntaxWarning -m py_compile brain\agentfarm\bridge.py` rc=0。
+- **C# 自检**：`dotnet run --project mod\AgentFarm.Bridge.Tests\AgentFarm.Bridge.Tests.csproj -c Release` = **OK 97 断言全部通过**（含 t233 talk 7 条）。
+- **check-release**：`python tools\check-release.py --expect 0.7.46` = **六项全绿**（版本一致 0.7.46/0.7.46；dll 20:39:40 不比最新源码 `Skills.cs` 20:26:30 旧；py_compile 34 文件；全量 **Ran 1383 tests / OK**；工作树干净）。末行文案仍写「四项全绿」系脚本旧文案。
+- **装机**：`python tools\deploy-mod.py --no-quit`（先核：无游戏进程 / 无 bridge.json / 17890 空闲 / `bin\Release` dll 哈希 == 冻结产物；ALSOFT_DRIVERS=null）⇒ 0.7.45→**0.7.46**（dll 293888B、manifest 75293B）→ 桥 `modVersion=0.7.46 port=17890` → load_save 进 `Wahaha_450799035`（FarmHouse(9,9)）`[OK] 部署闭环完成`。
+- **goto Farm**：`PYTHONPATH=brain python -m agentfarm goto Farm` = OK（FarmHouse→Farm hop1 `landing=[64,15]` 7674ms）；移动后 第1年冬28 06:00 Farm(64,15) 体力270/270 钱3288g 农场[石58/枝34/树908 耕地6 作物0]。
+- **preflight**：`python tools\preflight.py --expect 0.7.46 --save-baseline logs\runA9-baseline.json` = **✅ 可以起跑**；baseline **761B / SHA256 `7C5F7DD0B85A3FBBCE716D46C4F194F61A55D59F221076ABBA23E36EA138B3D2`**（**边界：取自 winter 28 当前档；A9 起跑前 restore winter 26 后必须重跑 preflight 重写 baseline**）。
+- **优雅退**：`python tools\stop-game.py --wait 45` = rc=0（原 pids=[6476]，quit_game 回执 ok）⇒ 复核 **进程 0 / 仓库根 bridge.json 无 / AppData bridge.json 无 / 17890 无 LISTENING**。
+- **冻结后待办**：①deputy task-31 对 `737c4a5` 冻结树做合并验收（A/B/C/D 四段，含 task-25/33 作弊面与 task-28 纪律面）；②machine-runner task-34 只读 talk 探针（GO 附冻结 dll 哈希 `C9B3BD6C…`，安全闸 `--expect-version 0.7.46 --expect-dll-sha`）；③探针判卡 A 生死 → task-30 smoke-0746 六条门禁 → A9/B9。
 
 ## 7. 勘察记录（2026-10-18 晚，Lead）
 
