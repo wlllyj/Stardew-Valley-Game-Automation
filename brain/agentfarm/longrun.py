@@ -7571,6 +7571,17 @@ class LongRun:
                     assigned.add((int(_t[0]), int(_t[1])))
                 except (TypeError, ValueError, IndexError):
                     continue
+            # 【task-27 / 0.7.46】被目标池前置过滤判死的格**没有 step**，但它们是这一阶段
+            # 真实存在、本该动却没动的格：必须照样留在 `assigned` 里。否则
+            # `assigned_undone` / `no_unmet_stages` 会因为"根本没分到"而变绿 ——
+            # 挡死格可以不计 `unreachable`、不进豁免分子，但**不许被洗成没活**。
+            for _r in self._prefiltered_encircled_today[prefiltered_before:]:
+                if str(_r.get("stage") or "") != task:
+                    continue
+                try:
+                    assigned.add((int(_r["tile"][0]), int(_r["tile"][1])))
+                except (TypeError, ValueError, IndexError, KeyError):
+                    continue
             if not tiles and not walked:
                 # 观测是**以玩家为中心**的：`tiles[]` 上限 400 且近处优先，`tillable[]` 同理。
                 # 站在别处问"这片地还有可锄的吗"，答案会是 0 —— 真机证据：浇完水站在田区另一头，
@@ -7912,7 +7923,12 @@ class LongRun:
         tmap_now = FarmWorker.tiles_of(obs)
         for key in sorted(failed_set | unexec_set):
             steps_here = bad_steps.get(key) or []
-            reason = self._tile_reason(key, steps_here, stopped=stopped, obs=obs)
+            if not steps_here and key in self.encircled_day:
+                # 【task-27 / 0.7.46】目标池前置过滤判死的格没有 step：既不是"做成了"，
+                # 也不是"没试过"，如实归 `blocked_tile`（闭合集内，不落 unknown_evidence）。
+                reason = "blocked_tile"
+            else:
+                reason = self._tile_reason(key, steps_here, stopped=stopped, obs=obs)
             tile_reasons[reason] = tile_reasons.get(reason, 0) + 1
             tv = tmap_now.get(key) or {}
             kind = str(tv.get("kind") or "")

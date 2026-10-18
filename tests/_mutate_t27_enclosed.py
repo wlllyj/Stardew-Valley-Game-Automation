@@ -90,6 +90,31 @@ MUTATIONS: list[tuple[str, Path, str, str, str]] = [
         "",
         "day_end 的逐格坐标证据被删",
     ),
+    (
+        "m7_prefiltered_not_assigned",
+        LONGRUN_REL,
+        "            for _r in self._prefiltered_encircled_today[prefiltered_before:]:\n"
+        "                if str(_r.get(\"stage\") or \"\") != task:\n"
+        "                    continue\n"
+        "                try:\n"
+        "                    assigned.add((int(_r[\"tile\"][0]), int(_r[\"tile\"][1])))\n"
+        "                except (TypeError, ValueError, IndexError, KeyError):\n"
+        "                    continue\n",
+        "            pass  # 变异：前置过滤判死格不进 assigned\n",
+        "预过滤判死格从 assigned 蒸发 ⇒ 挡死被洗成「没活」",
+    ),
+    (
+        "m8_dead_reason_unknown",
+        LONGRUN_REL,
+        "            if not steps_here and key in self.encircled_day:\n"
+        "                # 【task-27 / 0.7.46】目标池前置过滤判死的格没有 step：既不是\"做成了\"，\n"
+        "                # 也不是\"没试过\"，如实归 `blocked_tile`（闭合集内，不落 unknown_evidence）。\n"
+        "                reason = \"blocked_tile\"\n"
+        "            else:\n"
+        "                reason = self._tile_reason(key, steps_here, stopped=stopped, obs=obs)\n",
+        "            reason = self._tile_reason(key, steps_here, stopped=stopped, obs=obs)\n",
+        "判死格的原因码落回 unknown_evidence（证据缺口被吞）",
+    ),
 ]
 
 

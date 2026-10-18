@@ -14111,6 +14111,34 @@ class TestTask27EnclosedBatch(unittest.TestCase):
         self.assertEqual(burst2["pending_executable_tiles"], [])
         self.assertEqual(burst2["pending_stalled_tiles"], [])
 
+    def test_prefiltered_tiles_stay_assigned_undone_not_washed(self) -> None:
+        """挡死格在目标池被判死之后**仍然算"分下去却没做成"**：它不许从 `assigned_undone`
+        蒸发（否则 `no_unmet_stages` 会因为"根本没分到"而变绿 = 把挡死洗成没活）。"""
+        T = (60, 10)
+        ring = [{"tile": [T[0] + dx, T[1] + dy], "kind": "tree", "standable": False}
+                for dx, dy in _NB4]
+        w = FakeWorld(weeds=0, seeds=10, money=500)
+        run = self._run(w)
+        real_obs = w.obs
+
+        def obs_with_ring():
+            o = real_obs()
+            o["location"]["tiles"].extend(dict(t) for t in ring)
+            return o
+
+        w.obs = obs_with_ring
+        rep = DayReport(day_key=("winter", 1, 26), started_at=0.0)
+
+        run._step_stage("till_area", w.obs(), self._plot([T]), rep)
+
+        st = rep.stages[-1]
+        self.assertEqual(st.get("encircled_prefiltered"), 1, st)
+        self.assertEqual(st.get("requested_tiles"), 1, st)
+        self.assertEqual(st.get("unexecuted_tiles"), 1, st)
+        self.assertEqual(st.get("reasons"), {"blocked_tile": 1}, st)
+        self.assertGreaterEqual(int(st.get("assigned_undone") or 0), 1, st)
+        self.assertEqual(st.get("ok"), 0, "挡死格绝不许记成 already/ok（那是洗白）")
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
