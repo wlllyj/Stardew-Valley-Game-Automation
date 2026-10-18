@@ -48,6 +48,7 @@ __all__ = [
     "plot_in_zone",
     "resolve_zone",
     "zone_brief_lines",
+    "zone_blockers_total",
     "zones_from_observe",
 ]
 
@@ -343,6 +344,25 @@ def zone_brief_lines(zones: list[Zone]) -> list[str]:
         f"已有作物 {z.crops} 格、待浇水 {z.unwatered} 格、离你约 {z.distance} 格"
         for z in zones
     ]
+
+
+def zone_blockers_total(zone: Zone, obs: Any) -> int | None:
+    """指定田区内的待清理格数（按 ZONE_BLOCKER_KINDS 口径）。
+
+    只统计 zone.bounds 内、且在 location.tiles[] 里出现的格；不猜、不造。
+    tilesTruncated 时返回 None：数据不完整，调用方必须标【无法判定】，绝不当 0。
+    """
+    loc = _loc(obs)
+    if loc.get("tilesTruncated"):
+        return None
+    tiles = _tile_index(loc.get("tiles"))
+    x0, y0, x1, y1 = zone.bounds
+    n = 0
+    for xy, tv in tiles.items():
+        if x0 <= xy[0] <= x1 and y0 <= xy[1] <= y1:
+            if tv.get("kind") in ZONE_BLOCKER_KINDS:
+                n += 1
+    return n
 
 
 def area_hint_text(zones: list[Zone]) -> str:
