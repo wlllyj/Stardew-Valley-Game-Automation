@@ -22,8 +22,8 @@
   三检查器输出 logs/X-{verify,analyze,lead-check}.txt；快照默认 scratch/X-external-snapshots.jsonl。
   窗口默认整文件（首个→最后一个带时间戳行）；给了 --after/--before 就用给定的。
 
-退出码：0 = 全部完成（检查器红不算工具失败，红在判决行里如实打印）
-        11 = journal 不存在  12 = SMAPI 源与副本都不可用  13 = 参数冲突
+退出码：0 = 全部完成（journal 缺失、检查器红都**只如实记录、不改变退出码**，红在判决行里打印）
+        12 = SMAPI 冻结失败（源不存在）  13 = --after 晚于 --before
 """
 from __future__ import annotations
 
