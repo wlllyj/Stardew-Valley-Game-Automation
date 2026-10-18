@@ -25,7 +25,7 @@
 
 | 卡 | 任务 | 优先级 | 提交 | 读数 |
 |---|---|---|---|---|
-| A | task-25 背包升级经济动作（SeedShop 买 Backpack 2000g，12→24；能力型差分判据：钱−2000 且 inventoryCount 12→24；走 `ShopMenu.tryToPurchaseItem`） | P0 | 待填 | 待填 |
+| A | task-25 背包升级经济动作（12→24，Pierre 2000g）。**Plan A（按货架买）已否证** ⇒ 改对话式购买：`interact` Pierre → 按响应文本 `answerDialogue(Response)` → 差分判据：钱−2000 且 inventoryCount 12→24 | P0 | 待填 | 待填（先等 task-32 真机只读对话探针） |
 | B | task-26 冬27 形态 day 级 7 格逐格归因（L641 burst samples 坐标 → 为何 resume 拿不到；5 格未单列；10 格账本差；冬26 plot_pending_executable=3 不同源）；核 ended_by=sleep 与 resume_exhausted 自洽 | P0 | 待填 | 待填 |
 | C | task-27 till_area 32 格前置过滤 + 事后 encircled 归类（不计 rep.unreachable、后续阶段不再选）；bound 公式不动 | P1 | 待填 | 待填 |
 | D | task-28 售材白名单收紧（建材/锭类全部移出）+ inventory_blocked 证据门槛 + 满包清障有界（loot_lost_steps ≤ 常量，留痕） | P1 | 待填 | 待填 |
@@ -38,7 +38,7 @@
 4. `dotnet build -c Release --no-incremental`（0 警 0 错）+ C# 自检（`dotnet run -c Release`，OK 91 断言）+ `python -W error::SyntaxWarning -m py_compile brain\agentfarm\bridge.py`。
 5. 按路径 `git add`/`git commit`（禁 amend / 禁 add -A；bridge.py、manifest.json、_note-0746.txt）。
 6. `python tools\check-release.py --expect 0.7.46`（六项全绿：版本一致 / dll 不比源码旧 / py_compile / 全量单测 / 工作树干净）。
-7. 部署前核对（无 Stardew 进程、仓库根与 %APPDATA% 无 bridge.json、17890 无 LISTENING）→ `python tools\deploy-mod.py --no-quit`（ALSOFT_DRIVERS=null）。
+7. 部署前核对（无 Stardew 进程、仓库根与 %APPDATA% 无 bridge.json、17890 无 LISTENING；**`bin\Release\AgentFarm.Bridge.dll` 哈希必须 == 冻结产物**，否则先 `dotnet build -c Release --no-incremental` 重建再核——见 §7.2 事故）→ `python tools\deploy-mod.py --no-quit`（ALSOFT_DRIVERS=null）。
 8. `PYTHONPATH=<repo>\brain python -m agentfarm goto Farm`（落 Farm）。
 9. `python tools\preflight.py --expect 0.7.46 --save-baseline logs\runA9-baseline.json` → `python tools\stop-game.py --wait 45` 优雅退 → 复核进程 0 / bridge.json 删 / 17890 空闲。
 
@@ -63,7 +63,7 @@
 
 ## 5. 已知限制 / 风险
 
-1. 背包升级条目在 SeedShop 货架 20 条中是否真的存在**尚未真机确认**（`buy` 回执 `availableItems` 20 条、文字 Listing 只列 12 条）——machine-runner 只读货架探针产物 `scratch/_t18_shop_shelf.json` 为准；若不存在 ⇒ 卡 A 停、Plan B=木箱（Chest 50 木），Lead 另裁。
+1. 背包升级**不在 SeedShop 货架**（真机只读探针实测 20 条全表无 Backpack/Deluxe Backpack，见 §7）；机制是 Pierre 对话式购买，入口是否可自动化**尚未真机确认**（task-32 探针）。若对话入口也取不到 ⇒ 卡 A 停、Plan B（木箱存储）由 Lead 另裁。
 2. 建材/锭类移出白名单后可腾格项变少 ⇒ 满包时更容易诚实收工；结构性解法是背包升级（卡 A），不是放宽白名单。
 3. 冬26 40 格（263−223）账本无坐标 ⇒【无法判定】，不参与任何 PASS 结论。
 4. 0.7.45 的 `stage_midway_leftover` 遮蔽形态仍有（8 条/1 天），只 info。
@@ -73,3 +73,22 @@
 
 - 冻结提交：待填
 - 版本一致性 / dll 指纹 / manifest 指纹 / build 读数 / C# 自检 / check-release / 装机 / goto Farm / preflight baseline / 优雅退：待填
+
+## 7. 勘察记录（2026-10-18 晚，Lead）
+
+### 7.1 背包升级机制：Plan A 否证 → 对话式购买
+
+- 真机只读货架探针（machine-runner commit `27458df`、`docs/_smoke-0745-shop-probe.md`）：SeedShop `availableItems` **20 条全表无 `Backpack`/`Deluxe Backpack`**（`backpack_hits=[]`）；20<30 说明不是 `Shelf()` 截断（`BuySkill.cs:456-469` 的 12 条只是**文字 Listing** 显示截断）。⇒ 现有 `buy` 技能按 `itemPriceAndStock` 找条目，**结构上买不到背包升级**。
+- 离线侦察（Lead，未动游戏）：
+  - `Stardew Valley.dll`（1.6.15.24356）二进制串：`increaseBackpackSize`/`clearBackpack`/`backpack`/`MaxItems` 存在；**无** `TryBuyBackpack`/`BuyBackpack`/`SeedShop_BuyBackpack`/`backpackCost`。
+  - net6 反射元数据探针（`logs/_probe_sdvmeta/`）：`ShopMenu` 无任何名字含 backpack 的成员；`Farmer.increaseBackpackSize(Int32)`；`SpecialItem` 静态常量 `backpack`（Int32）+ `actionWhenReceived(Farmer)`；全库含 backpack 成员仅 `Farmer.increaseBackpackSize` / `Farmer.clearBackpack` / `SpecialItem::backpack`(static) / `DebugCommands.Backpack` / `FillBackpack`。
+  - 维基：[Backpack](https://stardewvalleywiki.com/Backpack)（Large Pack 2000g / Deluxe 10000g）；[1.6.16 迁移页](https://wiki.stardewvalley.net/mediawiki/index.php?title=Modding:Migrate_to_Stardew_Valley_1.6.16) 把 `Strings/Locations: SeedShop_BuyBackpack_Response2000/Response10000/ResponseNo` 改名 `GenericPurchase_*`；[1.6 迁移页](https://wiki.stardewvalley.net/mediawiki/index.php?title=Modding:Migrate_to_Stardew_Valley_1.6) `Utility.TryOpenShopMenu`/`GetShopStock`。
+  - `Content/Data/Shops.xnb` 离线解压失败（非标准 LZ4/raw-deflate）⇒ 走真机取证，不再手写解压器。
+- 结论：背包升级是**对话式购买**，不是货架条目 ⇒ 卡 A 改「`interact` Pierre → 按响应文本 `answerDialogue(Response)` → 观测差分（钱 −2000 且 `inventoryCount` 12→24）」，先等 task-32 只读对话探针确认入口与响应文本。
+
+### 7.2 事故：`mod/AgentFarm.Bridge/bin/Release` 被 WIP 构建污染
+
+- 现象（machine-runner 2026-10-18 19:2x 探针前发现）：`bin\Release\AgentFarm.Bridge.dll` = **291840B / mtime 19:23:25 / SHA256 `F05289C9D44D38762232E2410178CEF38B82037135943A26A086257E8A05E5B9`**，不是冻结 0.7.45 的 **286208B / `806C1069D217EEEFAB6D3354BA09DA049847D97EE5B4A1D2D65845F1DCB0B17F`**（0.7.46 WIP 构建）。
+- 风险：`tools\deploy-mod.py:154-172` 无条件从 `bin\Release` 复制 ⇒ 此时 deploy 会把 WIP dll 当 0.7.45 装机，覆盖冻结 dll、并使任何冒烟证据作废。
+- 处置：machine-runner **跳过 deploy 的装机步骤**、直接启动已装好的冻结 0.7.45（装机目录 dll 286208B `806C1069…B17F` 18:54:09、manifest `DECBA677…` 0.7.45），探针继续；本条记为开发日志事故记录。
+- **新硬检查（写入冻结九步第 7 步）**：任何 deploy 前必须核对 `bin\Release\AgentFarm.Bridge.dll` 哈希 == 冻结产物（或从冻结提交 `dotnet build -c Release --no-incremental` 重建后再核）；未核对不得 deploy。dev-coder 本地 C# 验证建议 `-o` 到隔离目录，避免仓库 bin 长期停在非冻结状态。
