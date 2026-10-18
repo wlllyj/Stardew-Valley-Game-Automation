@@ -374,7 +374,9 @@ def step4_launch(rec: dict, args) -> dict:
         rec["evidence"]["obs_baseline"] = None if ob is None else ob
         if ob:
             print(f"  [obs] 起跑前基线 {ob['path']} day={ob['day']} trees={ob['trees']}")
-    base = [PY, str(launcher), "--journal", str(SMOKE_JOURNAL), "--expect-version", EXPECT_VERSION,
+    # task-8（0.7.44 冒烟）修正：原来写死 EXPECT_VERSION=0.7.42 ⇒ 起跑器 preflight 必红；
+    # 改用 CLI 的 --expect-version，和 pre 阶段 env_check 口径一致（探针 bug 与产品 bug 分开判）。
+    base = [PY, str(launcher), "--journal", str(SMOKE_JOURNAL), "--expect-version", args.expect_version,
             "--days", str(args.days), "--size", str(args.size),
             "--max-minutes", str(int(args.max_minutes)), "--max-days", str(args.max_days)]
     rc, out, err = sh(base + ["--dry-run"], timeout=300)
