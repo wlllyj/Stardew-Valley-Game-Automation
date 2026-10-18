@@ -440,8 +440,11 @@ def check_resume_replay(rows: list[tuple[int, dict]]) -> None:
     _case("B6c 修后：确实没活 ⇒ resume_exhausted 诚实收工（不 stuck）", exhausted_case)
     _case("B6d 修后：encircled 不算可执行目标", encircled_case)
 
-    # B6e GAP：另两条 resume 入口未动（Lead 要求独立核实；卡 1 只按路径修复）
+    # B6e GAP-1/2（task-11 扩面）：`review_only_fallback` / `guard_leftover` 必须统一路由到
+    # `_resume_switch_or_exhaust`（换片→观测清一格→resume_exhausted）。Lead 裁决 GAP-3
+    # （plot_exhausted_burst / 换片超限）= 有界诚实停，保留、不算洗白 ⇒ 本段不核 GAP-3。
     gap: list[str] = []
+    gap1: bool | None = None
     try:
         w = TL.FakeWorld(weeds=0, seeds=0, money=0)
         run = _mk_run(TL, w)
@@ -459,15 +462,24 @@ def check_resume_replay(rows: list[tuple[int, dict]]) -> None:
 
         run._no_progress_stop = fake_stop
         run._review_only_fallback(w.obs(), rep)
-        gap.append(f"review_only_fallback 走到 stuck 路径={bool([s for s in calls if 'review_only' in s])}")
+        gap1 = bool([s for s in calls if "review_only" in s])
+        gap.append(f"B6e1 review_only_fallback 仍走 stuck 路径={gap1}"
+                   f"（ended_by={rep.ended_by or '无'}）")
     except Exception as exc:  # noqa: BLE001
-        gap.append(f"调用异常 {type(exc).__name__}: {exc}")
+        gap.append(f"B6e1 调用异常 {type(exc).__name__}: {exc}")
     src2 = read("brain/agentfarm/longrun.py")
-    gap.append("guard_leftover 入口仍在源码=" + str('source="回片区（guard_leftover）"' in src2))
+    idx = src2.find('where="guard_leftover"')
+    seg = src2[idx: idx + 1500] if idx >= 0 else ""
+    gap2 = bool(seg) and ("_no_progress_stop" in seg)
+    gap.append(f"B6e2 guard_leftover 段仍含 _no_progress_stop={gap2}"
+               f"（段内含 _resume_switch_or_exhaust={'_resume_switch_or_exhaust' in seg}）")
     gap.append("A8 账本 review_only_fallback 事件数="
                + str(sum(1 for _, r in rows if r.get("event") == "review_only_fallback")))
-    info("B6e 其他 resume 入口（GAP，需 Lead 决定是否扩面）",
-         "；".join(gap) + " ⇒ 同形态经这些入口仍写 stuck（卡 1 按路径修复，A8 实测路由见 B6f）")
+    if gap1 is False and gap2 is False:
+        check("B6e GAP-1/2 已收口（两入口统一路由到换片/清一格/resume_exhausted）",
+              True, "；".join(gap))
+    else:
+        info("B6e GAP-1/2 仍 open（task-11 未交付时预期）", "；".join(gap))
 
 
 def case_b() -> None:
