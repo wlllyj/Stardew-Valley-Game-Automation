@@ -7,15 +7,17 @@
 
 | # | 卡 | 内容 | 状态 |
 |---|---|---|---|
-| 1 | task-218 | 树纳入清障（普通树 0 级斧可砍）+ **护栏 A 意图-执行覆盖矩阵（端到端 6 层）** + **护栏 B 逐格/逐 kind 清障判据** + 片地优先/体力预算/桩与圆木 backlog | dev-coder 在制 |
+| 1 | task-218 | 树纳入清障（普通树 0 级斧可砍）+ **护栏 A 端到端 6 层** + **护栏 B 逐格判据** + 片地优先/体力预算/桩与圆木 backlog | ✅ `b679f4e`（9 files +887/−64） |
+| 2 | task-222 | Mod `debug_dump` 支持 1.6 强类型资产（四表 + 逐表 fail-closed + `type`/`error`）+ 观测 `knownCraftingRecipes` 三态 | ✅ `7f030c2`（7 files +399/−66） |
+| 3 | task-223 结果 | Furnace 配方 1.6 合法授予路径定案 | ✅ `fb275a8`（`docs/_il-furnace-unlock.md`） |
+| 4 | task-219 | **意图-执行对账闭环**（`intent_coverage` + 12 码闭合集 + `<journal>-gaps.json` + `Brief.recent_gaps`） | ✅ `fc147a7`（5 files +950/−22） |
+| 5 | task-210 | 机器链技能层 `craft_item`/`place_object`/`machine`（策略层并入 task-227） | ✅ `2dde12e`（3 files +613） |
+| 6 | task-228 | Mod `advance_dialogue`：**只推进非提问对话**（用户 `m19382` 授权；无人值守跑批前提） | dev-coder 在制 |
+| 7 | task-220 | analyzer 收 `intent_coverage`/gaps + §8 判红 + 跨 run `gaps-registry.json` | log-analyst 在制 |
 
-> ⚠ 涉及护栏 A/B 与 §8 的实现细节**一律以 `docs\_0.7.39-p0-patches.md` 为准**（源自 task-225 设计对抗评审的 4 项 P0 + 1 项工具分工，覆盖本文件与卡面旧表述）。
-| 2 | task-222 | Mod `debug_dump` 支持 1.6 强类型资产（`trigger_actions`/`objects`/`big_craftables`/`machines`，泛型反射 + 每表 fail-closed）+ 观测 `knownCraftingRecipes`（三态） | dev-coder 排队（218 之后） |
-| 3 | task-223 结果 | Furnace 配方合法授予路径定案（`docs/_il-furnace-unlock.md`）；**若结论需要 Mod 侧合法触发入口，则按需加一张卡再进本批** | log-analyst 在制 |
-| 4 | task-219 | **意图-执行对账闭环**（`User said (m18972)`）：每个 LLM 意图 `intent_execution` 记录 + 固定原因码 + `<journal>-gaps.json` 缺口清单 + `Brief.recent_gaps` 次日可见 | 待派 |
-| 5 | task-220 | analyzer 收 `intent_coverage`/gaps + 判红「有意图 executed_steps==0 却无原因码」+ 连续能力缺口 ⚠ | 待派（blocked_by 219） |
+**本批不进**（0.7.40+）：task-227 铜斧全链路、task-229 床上睡觉坑、task-195/196/193/197 遗留、task-151/221（目标 1 的田区清空与余力多清）。
 
-**移出本批**（0.7.40+）：task-210 机器链（craft/place/feed/collect）、task-152/151 目标 1 的升级选型与田区清空验收、task-195/196/193/197 遗留。
+> **§1b 本批外的重大真机结论（2026-10-18，task-226 `d1e085a`）**：**买 1 个铜矿即可触发 Clint 送 Furnace 蓝图**（存档 `<craftingRecipes>` 19→20、新增键 `Furnace`；与旧 wiki"购买不触发"相反）。P0-0「没有铜锭」在"蓝图"环节已解，剩余是钱与材料（缺口 ≈6300g，现有 1977g）。详见 `docs/_run10-furnace-acquire.md` 与开发日志条目 078。
 
 ## §2 冻结九步（照 0.7.37/0.7.38 同款）
 
