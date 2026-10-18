@@ -72,13 +72,15 @@ MOD_FILES = ["AgentFarm.Bridge.dll", "manifest.json"]
 SMAPI_COPY = os.path.join(REPO, "logs", "probe-talk-0746-smapi-window.txt")
 OUT_DEFAULT = os.path.join(REPO, "scratch", "_t34_talk_probe.json")
 
-# 事件卡死门限（docs/_probe-backpack-dialogue.md §3.4）：连续 10 次 no_dialogue 或 60s 无进展
-HANG_CONSEC_NO_DIALOGUE = 10
-HANG_SECONDS = 60.0
+# 事件卡死门限（docs/_probe-backpack-dialogue.md §3.4 + 实跑校准：task-32 A#2 从进 Town
+# 到「提问」约 56s，故 no_dialogue 连续 12 次 / 90s 无进展才判 hang）
+HANG_CONSEC_NO_DIALOGUE = 12
+HANG_SECONDS = 90.0
 SELF_HEAL_LIMIT = 2
+OPEN_TIME = 900  # 店门 9:00 开；之前进店 Pierre 不在柜台（task-32 实测 7:50 锁门）
 
 # 8 邻格偏移（切比雪夫距离 1），用于 talk 的 not_adjacent 后贴近 NPC
-NEIGHBOR_OFFSETS = [(1, 0), (0, 1), (-1, 0), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1)]
+NEIGHBOR_OFFSETS = [(0, 1), (1, 0), (-1, 0), (1, 1), (-1, 1), (0, -1), (1, -1), (-1, -1)]
 
 LOG: list[dict] = []
 
@@ -247,6 +249,34 @@ def receipt_code(rec: dict) -> str:
     return ""
 
 
+def clear_cutscene(c: BridgeClient, out: dict, deadline: float, max_s: float = 110.0) -> bool:
+    """推进"事件态过场"（含无对话盒的走位/定格段），直到 eventUp=false 或超时。
+
+    只调 advance_dialogue（受控推进原语）：绝不 dismiss（那会 closeDialogue 跳句）、
+    绝不替玩家选选项（提问 ⇒ 立即停并返回 False）。
+    """
+    t0 = time.time()
+    rounds = 0
+    out.setdefault("cutscene_advance", [])
+    while time.time() - t0 < max_s and time.time() < deadline:
+        o = observe(c)
+        snap = ui_snapshot(o)
+        ui = snap.get("ui") or {}
+        if not ui.get("eventUp"):
+            return True
+        rec = exec_raw(c, "advance_dialogue", {"maxSteps": 10}, 20000)
+        code = receipt_code(rec)
+        rounds += 1
+        out["cutscene_advance"].append({"t": now_iso(), "ui": ui, "receipt": rec})
+        log("cutscene advance", round=rounds, code=code,
+            eventId=ui.get("eventId"), menu=ui.get("activeMenu"))
+        if code in ("question", "is_question"):
+            return False
+        if code == "no_dialogue":
+            time.sleep(2.0)
+    return False
+
+
 def wait_modal_clear(c: BridgeClient, rounds: int = 3, out: dict | None = None) -> bool:
     """无参 dismiss_modal 清模态（永不回答 Purchase、不选 Yes）。"""
     for i in range(1, rounds + 1):
@@ -254,6 +284,8 @@ def wait_modal_clear(c: BridgeClient, rounds: int = 3, out: dict | None = None) 
         snap = ui_snapshot(obs)
         if not snap["ui"]["isModal"]:
             return True
+        if snap["ui"].get("eventUp"):
+            return False  # 事件对话归 advance_dialogue；dismiss 会 closeDialogue() 跳句
         rec = exec_raw(c, "dismiss_modal", None, 5000)
         if out is not None:
             out.setdefault("dismiss_receipts", []).append({"round": i, "before": snap["ui"], "receipt": rec})
@@ -263,9 +295,26 @@ def wait_modal_clear(c: BridgeClient, rounds: int = 3, out: dict | None = None) 
     return not ui_snapshot(obs)["ui"]["isModal"]
 
 
+def wait_until_open(c: BridgeClient, out: dict, deadline: float, open_tod: int = OPEN_TIME) -> bool:
+    """只读等待游戏时钟到开门时间（不睡觉、不用调试命令）。"""
+    t0 = time.time()
+    while time.time() < deadline:
+        snap = ui_snapshot(observe(c))
+        if snap["location"] == "SeedShop":
+            return True
+        tod = snap["clock"]
+        if isinstance(tod, int) and tod >= open_tod:
+            return True
+        if int(time.time() - t0) % 30 < 5:
+            log("waiting for shop open", clock=tod, waited_s=round(time.time() - t0, 1))
+        time.sleep(5.0)
+    out.setdefault("notes", []).append("等待开门超时（deadline）")
+    return False
+
+
 def wait_event_and_modal_clear(c: BridgeClient, out: dict, deadline: float,
                                heal_limit: int = SELF_HEAL_LIMIT) -> str:
-    """等事件/对话结束；卡死时按 §3.4 门限判 hang 并 load_save(force=True) 自愈。
+    """等事件/对话结束；卡死时按门限判 hang 并 load_save(force=True) 自愈。
 
     返回: 'cleared' | 'healed' | 'question' | 'deadline'
     """
@@ -275,43 +324,71 @@ def wait_event_and_modal_clear(c: BridgeClient, out: dict, deadline: float,
     while time.time() < deadline:
         obs = observe(c)
         snap = ui_snapshot(obs)
+        loc = snap["location"]
         ui = snap["ui"]
         if not ui["isModal"] and not ui["eventUp"]:
             return "cleared"
         if ui["dialogueIsQuestion"]:
-            return "question"
+            # 红线：绝不回答 Purchase/Yes；无参 dismiss = 游戏自己的「选否/关对话」
+            rec = exec_raw(c, "dismiss_modal", None, 8000)
+            out.setdefault("question_dismiss", []).append({"t": now_iso(), "loc": loc, "ui": ui, "receipt": rec})
+            log("question seen -> dismiss_modal no-arg", loc=loc, code=receipt_code(rec))
+            time.sleep(2.5)
+            continue
+        if loc == "BusStop":
+            # BusStop 的 520702 是过场：通常几秒自己结束，只等不点，不计入 hang 门限
+            time.sleep(3.0)
+            continue
         if (ui["eventUp"] or ui["isModal"]) and not ui["activeMenu"]:
-            rec = exec_raw(c, "advance_dialogue", {"max_steps": 6}, 20000)
+            rec = exec_raw(c, "advance_dialogue", {"maxSteps": 10}, 20000)
             code = receipt_code(rec)
-            out.setdefault("event_advance", []).append({"t": now_iso(), "ui": ui, "receipt": rec})
-            if code in ("no_dialogue", ""):
-                no_dialogue += 1
-            else:
+            body = rec.get("result") if rec.get("http_ok") else (rec.get("payload") or {})
+            stepped = 0
+            if isinstance(body, dict):
+                try:
+                    stepped = int(body.get("stepped") or 0)
+                except (TypeError, ValueError):
+                    stepped = 0
+            progress = code in ("max_steps_reached", "ok", "advanced", "typing") or stepped > 0
+            out.setdefault("event_advance", []).append({"t": now_iso(), "loc": loc, "ui": ui, "receipt": rec})
+            if progress:
                 no_dialogue = 0
                 t_no_progress = time.time()
+            else:
+                no_dialogue += 1
             stalled_for = time.time() - t_no_progress
-            log("event advance", code=code, no_dialogue=no_dialogue, stalled_s=round(stalled_for, 1))
+            log("event advance", loc=loc, code=code, stepped=stepped, no_dialogue=no_dialogue,
+                stalled_s=round(stalled_for, 1))
             if no_dialogue >= HANG_CONSEC_NO_DIALOGUE or stalled_for >= HANG_SECONDS:
-                if heals < heal_limit:
-                    heals += 1
-                    log("EVENT HANG -> load_save(force=True) self-heal", attempt=heals)
-                    heal = exec_raw(c, "load_save", {"save": "Wahaha_450799035", "force": True}, 90000)
-                    out.setdefault("self_heals", []).append({"at": now_iso(), "ui_before": ui, "heal": heal})
+                # 先试一次无参 dismiss（个别"无对话盒的等待"其实是模态提示）
+                if out.get("stall_dismiss_tried") != loc:
+                    rec2 = exec_raw(c, "dismiss_modal", None, 5000)
+                    out.setdefault("stall_dismiss", []).append({"at": now_iso(), "loc": loc, "receipt": rec2})
+                    out["stall_dismiss_tried"] = loc
                     time.sleep(3.0)
                     no_dialogue = 0
                     t_no_progress = time.time()
+                    continue
+                if heals < heal_limit:
+                    heals += 1
+                    log("EVENT HANG -> load_save(force=True) self-heal", attempt=heals, loc=loc,
+                        stalled_s=round(stalled_for, 1))
+                    heal = exec_raw(c, "load_save", {"save": "Wahaha_450799035", "force": True}, 90000)
+                    out.setdefault("self_heals", []).append(
+                        {"at": now_iso(), "loc": loc, "ui_before": ui, "heal": heal})
+                    time.sleep(3.0)
                     return "healed"
                 out.setdefault("notes", []).append("事件卡死且自愈次数用尽，停止推进")
                 return "deadline"
-            time.sleep(3.0)
+            time.sleep(2.5)
         elif ui["activeMenu"] == "DialogueBox":
-            rec = exec_raw(c, "advance_dialogue", {"max_steps": 6}, 20000)
+            rec = exec_raw(c, "advance_dialogue", {"maxSteps": 10}, 20000)
             out.setdefault("dialogue_advance", []).append({"t": now_iso(), "ui": ui, "receipt": rec})
             no_dialogue = 0
             t_no_progress = time.time()
             time.sleep(1.5)
         else:
-            # 有活动菜单但不是对话（如锁门提示/商店）：只用无参 dismiss，不选任何选项
+            # 有活动菜单但不是对话（锁门提示/商店等）：只用无参 dismiss，不选任何选项
             rec = exec_raw(c, "dismiss_modal", None, 5000)
             out.setdefault("dismiss_receipts", []).append({"at": now_iso(), "ui": ui, "receipt": rec})
             time.sleep(2.0)
@@ -320,7 +397,9 @@ def wait_event_and_modal_clear(c: BridgeClient, out: dict, deadline: float,
 
 def goto_seedshop(c: BridgeClient, out: dict, deadline: float) -> bool:
     heals_used = 0
-    for attempt in range(1, 5):
+    # 店门 9:00 开、Pierre 9:00 才在柜台：先在城里等时钟（只读），别在 6:00 白跑
+    wait_until_open(c, out, deadline)
+    for attempt in range(1, 6):
         if time.time() >= deadline:
             return False
         obs = observe(c)
@@ -344,6 +423,8 @@ def goto_seedshop(c: BridgeClient, out: dict, deadline: float) -> bool:
             if heals_used >= SELF_HEAL_LIMIT:
                 out.setdefault("notes", []).append("进店被事件反复阻断，自愈用尽")
                 return False
+            # 自愈 = 重读存档（回到 06:00）：等开门再试，避免又撞店门/事件时序问题
+            wait_until_open(c, out, deadline)
             continue
         if state == "question":
             out.setdefault("notes", []).append("进店路径上出现提问对话（已按无参 dismiss 退出）")
@@ -384,15 +465,37 @@ def move_adjacent(c: BridgeClient, npc_tile: list[int], out: dict) -> bool:
         if rec["http_ok"]:
             time.sleep(0.8)
             return True
+        out.setdefault("adjacent_snaps", []).append({"tile": tile, "snap": ui_snapshot(observe(c))})
+        if receipt_code(rec) == "ui_modal":
+            # 观测说"没有菜单/事件"但 move_to 仍报 ui_modal：把两条恢复车道都各试一次
+            for skill, args in (("dismiss_modal", None), ("advance_dialogue", {"maxSteps": 5})):
+                rec2 = exec_raw(c, skill, args, 10000)
+                out.setdefault("unstick_attempts", []).append({"tile": tile, "skill": skill, "receipt": rec2})
+                log("unstick try", tile=tile, skill=skill, code=receipt_code(rec2))
+                time.sleep(0.5)
+            rec3 = exec_raw(c, "move_to", {"tile": tile}, 30000)
+            out["adjacent_attempts"].append({"tile": tile, "retry": True, "receipt": rec3})
+            log("move adjacent retry", tile=tile, http_ok=rec3["http_ok"], code=receipt_code(rec3))
+            if rec3["http_ok"]:
+                time.sleep(0.8)
+                return True
     return False
 
 
 def talk_pierre(c: BridgeClient, out: dict, deadline: float) -> dict:
     """talk {"npc":"Pierre"}；not_adjacent 时先贴近再重试。返回最后一条回执。"""
     last = None
-    for attempt in range(1, 4):
+    for attempt in range(1, 7):
         if time.time() >= deadline:
             break
+        # 进店/落点后事件可能延迟 1-2 秒才触发：先稳 2s 再判断
+        time.sleep(2.0)
+        for _ in range(12):
+            snap = ui_snapshot(observe(c))
+            if not (snap.get("ui") or {}).get("eventUp"):
+                break
+            clear_cutscene(c, out, deadline, max_s=110.0)
+            time.sleep(1.0)
         wait_modal_clear(c, rounds=2, out=out)
         rec = exec_raw(c, "talk", {"npc": "Pierre"}, 20000)
         out.setdefault("talk_receipts", []).append({"attempt": attempt, "receipt": rec})
@@ -405,7 +508,16 @@ def talk_pierre(c: BridgeClient, out: dict, deadline: float) -> dict:
         if code == "not_adjacent":
             npc_tile = (body or {}).get("npcTile")
             if isinstance(npc_tile, list) and len(npc_tile) == 2:
-                move_adjacent(c, npc_tile, out)
+                before_n = len(out.get("adjacent_attempts") or [])
+                ok_move = move_adjacent(c, npc_tile, out)
+                tries = (out.get("adjacent_attempts") or [])[before_n:]
+                if (not ok_move) and tries and all(
+                        str(((t.get("receipt") or {}).get("status") or "")) == "ui_modal"
+                        for t in tries):
+                    clear_cutscene(c, out, deadline, max_s=110.0)
+                    wait_modal_clear(c, rounds=2, out=out)
+                    time.sleep(1.0)
+                    move_adjacent(c, npc_tile, out)
             continue
         if code in ("npc_not_found", "not_supported", "no_action"):
             break
@@ -433,7 +545,7 @@ def explore_dialogue(c: BridgeClient, out: dict, deadline: float, rounds: int = 
             break
         if ui["activeMenu"] != "DialogueBox" or not ui["isModal"]:
             break
-        rec = exec_raw(c, "advance_dialogue", {"max_steps": 6}, 20000)
+        rec = exec_raw(c, "advance_dialogue", {"maxSteps": 10}, 20000)
         out.setdefault("dialogue_advance", []).append({"round": i, "receipt": rec})
         if not rec["http_ok"]:
             break
@@ -562,6 +674,11 @@ def main(argv: list[str] | None = None) -> int:
         obs = observe(c)
         out["observe_start"] = ui_snapshot(obs)
         log("observe start", **{k: out["observe_start"][k] for k in ("location", "clock")})
+        # 0) talk 原语可用性先验：当前地点（FarmHouse）没有 Pierre ⇒ 期望 npc_not_found，
+        #    证明 0.7.46 装机 dll 里 talk 已注册（否则会 not_implemented/unknown_skill）。
+        out["initial_talk"] = exec_raw(c, "talk", {"npc": "Pierre"}, 15000)
+        log("initial talk probe", code=receipt_code(out["initial_talk"]),
+            loc=out["observe_start"]["location"])
         # 1) 清模态（无参，绝不选 Yes/Purchase）
         wait_modal_clear(c, rounds=3, out=out)
         # 2) 进店
@@ -571,6 +688,20 @@ def main(argv: list[str] | None = None) -> int:
         if not reached:
             out.setdefault("notes", []).append("未能进 SeedShop（事件/门锁/寻路），talk 无法验证")
         else:
+            # 2.5) 进店常驻过场（如 SeedShop 开店事件）会挡住移动：先受控推进到 eventUp=false。
+            #      只推非提问对话；提问立即停；超时/无变化就如实记录后继续（talk 会报 not_adjacent/ui_modal）。
+            # 进店常驻过场（SeedShop 开店事件 3102768）会挡住一切移动/talk；
+            # 该事件在进店后约 1-2 秒才触发 ⇒ 先稳 8s 或观察到 eventUp 再清。
+            t_settle = time.time() + 8.0
+            out.setdefault("shop_entry_observes", [])
+            while time.time() < t_settle and time.time() < deadline:
+                snap0 = ui_snapshot(observe(c))
+                out["shop_entry_observes"].append({"t": now_iso(), "snap": snap0})
+                if (snap0.get("ui") or {}).get("eventUp"):
+                    break
+                time.sleep(1.0)
+            out["shop_entry_observes"].append({"t": now_iso(), "snap": ui_snapshot(observe(c))})
+            clear_cutscene(c, out, deadline, max_s=120.0)
             wait_modal_clear(c, rounds=2, out=out)
             # 3) talk Pierre
             rec = talk_pierre(c, out, deadline)
