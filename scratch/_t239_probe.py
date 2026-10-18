@@ -467,12 +467,89 @@ def case_c(tree: Tree, src_tag: str) -> None:
 
     # C5/C6 属 238
     if not has238:
-        skip("C5 空 reasons 一律填 unknown_evidence（兜底泛滥）", "task-238 未落地")
+        skip("C5 兜底回填只补闭合原因码、不泛滥", "task-238 未落地")
         skip("C6 兜底不得改 executed_steps", "task-238 未落地")
     else:
         seg = lr[lr.find("finalize_fallback"):][:2500]
         check("C6 兜底代码块内不写 executed_steps",
               bool(seg) and not re.search(r"executed_steps\s*[+\-]?=", seg), seg[:80])
+        # C5（自想通道 / Lead 提示）：兜底映射表 + 只补「0 步且空原因」 + 不动步数/判定
+        try:
+            _lr, TL = _load_tree(tree)
+            LR = _lr
+            FW = importlib.import_module("agentfarm.farmwork")
+
+            def _mk5(w):
+                client = TL.FakeClient(w)
+                worker = FW.FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+                r = TL.make_run(w, target_days=1, max_days=1)
+                r.client = client
+                r.worker = worker
+                return r
+
+            rep = TL.DayReport(day_key=("spring", 1, 1), started_at=0.0)
+            mapping = {
+                ("inventory_blocked", ""): "no_slot",
+                ("blocked_modal", ""): "blocked_modal",
+                ("blocked_event", ""): "gated",
+                ("stuck:连续 3 轮世界没有任何变化", ""): "world_stuck",
+                ("bridge_down", ""): "world_stuck",
+                ("sleep_failed", ""): "world_stuck",
+                ("sleep", "night:到点收工"): "gated",
+                ("sleep", "stamina:体力 8 < 12"): "gated",
+                ("sleep", "no_work:确实找不到可做的活"): "gated",
+                ("sleep", "weird:没见过的收尾"): "unknown_evidence",
+            }
+            bad = []
+            for (eb, er), want in mapping.items():
+                rep.ended_by, rep.ended_reason = eb, er
+                got = LR.LongRun._finalize_reason_for(rep)
+                if got != want:
+                    bad.append(f"{eb}/{er[:12]}⇒{got}(want {want})")
+            check("C5a 兜底映射表 10 例（inventory_blocked→no_slot / modal / event / stuck / "
+                  "bridge/sleep_failed→world_stuck / 夜与体力→gated / 未知→unknown_evidence）",
+                  not bad, str(bad[:3]))
+            run = _mk5(TL.FakeWorld())
+            run.intent_coverage = [
+                {"intent_id": "d#01", "task": "harvest", "executed_steps": 3,
+                 "reasons": {}, "requested_tiles": 5},
+                {"intent_id": "d#02", "task": "water_area", "executed_steps": 0,
+                 "reasons": {"no_target": 1}, "requested_tiles": 2},
+                {"intent_id": "d#03", "task": "water_area", "executed_steps": 0,
+                 "reasons": {}, "requested_tiles": 4},
+                {"intent_id": "d#04", "task": "till_area", "executed_steps": 0,
+                 "reasons": {}, "requested_tiles": 0},
+            ]
+            rep2 = TL.DayReport(day_key=("spring", 1, 1), started_at=0.0,
+                                ended_by="inventory_blocked", ended_reason="背包满")
+            before_checks = dict(rep2.checks or {})
+            before_verified = rep2.verified
+            run._finish_intent_coverage(rep2)
+            recs = {str(r.get("intent_id")): r for r in (rep2.intent_coverage or [])}
+            c1, c2 = recs.get("d#01") or {}, recs.get("d#02") or {}
+            c3, c4 = recs.get("d#03") or {}, recs.get("d#04") or {}
+            check("C5b 只补「0 步且空原因」：有步数 / 已有原因码的记录一字不动",
+                  c1.get("reasons") == {} and c2.get("reasons") == {"no_target": 1},
+                  f"d#01={c1.get('reasons')} d#02={c2.get('reasons')}")
+            check("C5c 兜底回填用闭合原因码 + evidence.why=finalize_fallback",
+                  c3.get("reasons") == {"no_slot": 1} and c4.get("reasons") == {"no_slot": 1}
+                  and (c3.get("evidence") or {}).get("why") == "finalize_fallback",
+                  f"d#03={c3.get('reasons')} ev={(c3.get('evidence') or {}).get('why')}")
+            check("C5d 兜底不改 executed_steps / checks / verified",
+                  [int((recs.get(k) or {}).get("executed_steps") or 0)
+                   for k in ("d#01", "d#03")] == [3, 0]
+                  and dict(rep2.checks or {}) == before_checks
+                  and rep2.verified == before_verified,
+                  f"checks={len(rep2.checks or {})} verified={rep2.verified}")
+            check("C5e reasons_are_intent_level 按 requested_tiles==0 推导",
+                  c3.get("reasons_are_intent_level") is False
+                  and c4.get("reasons_are_intent_level") is True,
+                  f"d#03={c3.get('reasons_are_intent_level')} d#04={c4.get('reasons_are_intent_level')}")
+            codes = set(getattr(LR, "INTENT_REASON_CODES", ()) or ())
+            check("C5f 兜底码 ∈ 闭合集 INTENT_REASON_CODES", "no_slot" in codes,
+                  f"codes={len(codes)}")
+        except Exception as exc:  # noqa: BLE001
+            check("C5 兜底通道可运行", False, f"{type(exc).__name__}: {exc}")
 
     # C7 伪造 after save
     if "forged_after" in fx:
