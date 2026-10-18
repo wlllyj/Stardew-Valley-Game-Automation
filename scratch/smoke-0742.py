@@ -6,7 +6,7 @@
   2. `debug_dump table=trigger_actions` ⇒ 能读（task-222 目标；仍 `InvalidCastException` ⇒ 本批 smoke 判红回炉）
   3. 单技能砍树（**A2 判据**）：`kind=="tree"` 的格有界连续 `use_tool(axe)` **≤3 次调用**（≈≤18 刀）直到 `kind` 变 `stump`/消失；`tool_ineffective` 只留痕、不作失败证据；3 次后仍 `tree` 才 FAIL
   4. 跑 **2 个游戏日**（`tools/start-detached-longrun.py --days 2`）⇒ `day_end.intent_coverage` 出现、`<journal>-gaps.json` 生成
-  5. `day_end.stages[]` 的 `clear_area` 每个 ok 步都有 `cleared_tiles`/kind 变化（P0-1 逐格判据活）
+  5. **task-242 逐格判据（护栏 B）**：`day_end.stages[]` 的每个 `clear_area`/`clear_dead`/`clear_neighbor`/`frontier_clear` 阶段必须 **`len(cleared_tiles) == ok`**；允许账本里**可解释的「目标格/连带格」区分**（阶段带 `target_tiles`/`collateral_tiles` 一类结构化字段，或 note 明确写连带）；否则 **FAIL 并逐条列出差异对**（Lead m04544 收紧，替代旧的 `len>=ok` 口径）
   6. **跨日落盘守卫**：调 `scratch/save-chain-check.py`（本工具不再自己数六串）—— 六串 6/6 配对 + **末次跨日也必须落盘**（`NewDay > Save called` ⇒ FAIL；缺 SMAPI/窗口不完整 ⇒ 无法判定）
   7. `tools/analyze-longrun.py --days 2` 判 §8 无「意图 executed_steps==0 且无原因码」、且 **`missed:intent_no_reason:*` 必须消失**；`slot_relief` 事件必须带 `demand`/`target_free`/`reached` 且**至少一天 `harvest` ok>0**（task-236/237 验收面）；`tools/verify-run3.py` 对 §8 只出 info
   8. **0.7.42 三条硬判据**（`docs/_release-0.7.42.md` §3，Lead m04423）：
@@ -33,6 +33,14 @@
   python scratch\\smoke-0742.py --phase wait --wait-minutes 40
   python scratch\\smoke-0742.py --phase post --freeze-smapi   # 步 5-7（先时点冻结 SMAPI，步 6/7 用副本判）
   python scratch\\smoke-0742.py --phase all --wait-minutes 40   # 一次跑完（分阶段之间不重启游戏）
+
+**0.7.43 部分复跑**（Lead m04544：`0.7.43 = 0.7.42 + task-242`，冻结后不必整跑，只复验步 3/5/8）：
+  python scratch\\smoke-0742.py --phase all --only 3 --no-crops            # 步 3 要游戏在跑（只发有界 use_tool）
+  python scratch\\smoke-0742.py --phase all --only 5,8 --no-crops \\
+      --journal logs\\longrun-smoke-0743.jsonl --tag smoke-0743 --smapi logs\\smoke-0743-smapi-window.txt
+  # ↑ --only 时 phase 自动裁剪：只含 1-3 走 pre、4 走 launch/wait、5-8 走 post；**不会**意外起跑。
+  # 步 5 用 task-242 新判据；步 8 三条 0.7.42 判据继续沿用（8.2① 要 tool_ineffective_bound 正样本，
+  # 没有就记【无法判定】；8.2② 需要 --capture-observe 的快照；8.2③ 看 deferred_by_budget 文案）。
 
 分阶段跑时结果**按步骤号合并**进 --json（`phases_run` 记录已跑过的 phase），不会互相覆盖；
 `--only` 只跑相关 phase（不会因为 `--only 1` 就把 step4 真起跑起来）。
@@ -452,6 +460,48 @@ def pid_alive(pid: int | None) -> bool:
 
 
 # ---------------------------------------------------------------- 5：逐格判据（护栏 B）
+# task-242 验收面（Lead m04544）：每个 clear_area 阶段必须 `len(cleared_tiles) == ok`；
+# 允许"可解释的目标格/连带格区分"（阶段记录里带 target_tiles/collateral_tiles 一类结构化字段，
+# 或 note/reason 明确说明连带/目标格），否则 **FAIL 并把差异对逐条列出**。
+CLEAR_STAGES = ("clear_area", "clear_dead", "clear_neighbor", "frontier_clear")
+EXPLAIN_KEYS = ("cleared_targets", "cleared_target", "target_tiles", "targets",
+                "collateral_tiles", "collateral", "cleared_collateral", "extra_tiles",
+                "cleared_extra", "combo_tiles", "chain_tiles")
+EXPLAIN_WORDS = ("连带", "一次多格", "目标格", "附带", "顺手清", "多格")
+STAGE_META_KEYS = ("stage", "ok", "skipped", "failed", "failed_any", "proven_inert", "env_block",
+                   "inconclusive", "unreachable", "unreachable_tiles", "unreachable_leftover",
+                   "refused", "refused_tiles", "refused_leftover", "encircled", "encircled_tiles",
+                   "encircled_leftover", "attempted", "requested_tiles", "ok_tiles", "failed_tiles",
+                   "unexecuted_tiles", "reasons", "bound_basis", "encircled_tried", "engaged",
+                   "stopped", "leftover", "cleared_tiles", "note", "reason", "tiles", "assigned",
+                   "assigned_undone", "cause", "codes", "stamina_before", "stamina_after",
+                   "stamina_spent", "blocker_drop")
+
+
+def _explain_stage(s: dict, delta: int) -> str | None:
+    """返回"可解释"的说明；None = 不可解释（→ FAIL）。"""
+    per_key: dict[str, int] = {}
+    for k in EXPLAIN_KEYS:
+        v = s.get(k)
+        if isinstance(v, list):
+            per_key[k] = len(v)
+        elif isinstance(v, int):
+            per_key[k] = v
+    if per_key:
+        n_cleared = len(s.get("cleared_tiles") or [])
+        for combo in (("target_tiles", "collateral_tiles"), ("cleared_targets", "cleared_collateral"),
+                      ("targets", "cleared_collateral"), ("target_tiles", "extra_tiles"),
+                      ("cleared_target", "cleared_collateral")):
+            if all(c in per_key for c in combo) and sum(per_key[c] for c in combo) == n_cleared + delta:
+                return "结构化区分：" + " + ".join(f"{c}={per_key[c]}" for c in combo)
+        if any(v == delta for v in per_key.values()):
+            return "结构化区分：" + ", ".join(f"{k}={v}" for k, v in per_key.items())
+    text = f"{s.get('note') or ''} {s.get('reason') or ''}"
+    if any(wd in text for wd in EXPLAIN_WORDS):
+        return "文案说明：" + text.strip()[:120]
+    return None
+
+
 def step5(rec: dict) -> dict:
     if not SMOKE_JOURNAL.exists():
         rec["verdict"], rec["reason"] = "无法判定", f"账本不存在：{SMOKE_JOURNAL}"
@@ -462,57 +512,61 @@ def step5(rec: dict) -> dict:
     if not ends:
         rec["verdict"], rec["reason"] = "无法判定", "账本里没有 day_end（跑批没跑完一天）"
         return rec
-    # 账本层能拿到的逐格证据只可能在 outcome / stage 步记录里；先按 outcome 扫
-    clear_ok, clear_with, clear_without = 0, 0, []
-    for r in rows:
-        if r.get("event") not in ("outcome", "stage_step", "blocked"):
-            continue
-        kind = r.get("kind") or r.get("stage")
-        if kind not in ("clear_area", "clear", "clear_dead", "clear_neighbor", "frontier_clear"):
-            continue
-        if not r.get("ok"):
-            continue
-        clear_ok += 1
-        has = bool(r.get("cleared_tiles")) or bool(r.get("kind_changes")) or bool(r.get("before") or r.get("after"))
-        if has:
-            clear_with += 1
-        else:
-            clear_without.append(r.get("tile") or r.get("tiles") or r.get("t"))
-    rec["evidence"].update({"clear_area_ok_steps": clear_ok, "with_tile_evidence": clear_with,
-                            "without_tile_evidence": clear_without[:10]})
-    # 补（Lead 复核后修）：账本没有逐格 clear 事件时，退到 day_end.stages[] 的阶段级证据
-    # —— 阶段里 ok>0 且 cleared_tiles 条数 >= ok 同样证「逐格判据活」。
-    stage_ok, stage_with, stage_without = 0, 0, []
-    for r in rows:
-        if r.get("event") != "day_end":
-            continue
+
+    conform: list[dict] = []
+    explained: list[dict] = []
+    unexplained: list[dict] = []
+    total_ok = 0
+    for r in ends:
         for s in (r.get("stages") or []):
-            if s.get("stage") not in ("clear_area", "clear_dead", "clear_neighbor", "frontier_clear"):
+            if s.get("stage") not in CLEAR_STAGES:
                 continue
-            n = int(s.get("ok") or 0)
-            if n <= 0:
+            n_ok = int(s.get("ok") or 0)
+            if n_ok <= 0:
                 continue
             tiles = s.get("cleared_tiles") or []
-            stage_ok += n
-            if len(tiles) >= n:
-                stage_with += n
+            n_cleared = len(tiles) if isinstance(tiles, list) else 0
+            total_ok += n_ok
+            delta = n_ok - n_cleared
+            item = {"day": r.get("day"), "stage": s.get("stage"), "ok": n_ok,
+                    "cleared_tiles": n_cleared, "delta": delta,
+                    "cleared": (tiles[:6] if isinstance(tiles, list) else None),
+                    "attempted": s.get("attempted"), "engaged": s.get("engaged"),
+                    "ok_tiles": s.get("ok_tiles"), "tiles_field": s.get("tiles"),
+                    "extra_keys": sorted(k for k in s if k not in STAGE_META_KEYS)}
+            if delta == 0:
+                conform.append({k: item[k] for k in ("day", "stage", "ok", "cleared_tiles")})
+                continue
+            why = _explain_stage(s, delta) if delta > 0 else None
+            if why:
+                explained.append({**item, "why": why,
+                                  "note": str(s.get("note") or s.get("reason") or "")[:160]})
             else:
-                stage_without.append({"day": r.get("day"), "stage": s.get("stage"),
-                                      "ok": n, "cleared_tiles": len(tiles)})
-    total_ok, total_with = clear_ok + stage_ok, clear_with + stage_with
-    rec["evidence"].update({"clear_stage_ok_tiles": stage_ok, "clear_stage_with_tiles": stage_with,
-                            "clear_stage_without_tiles": stage_without[:10],
-                            "clear_total_ok": total_ok, "clear_total_with": total_with})
+                unexplained.append(item)
+
+    rec["evidence"].update({
+        "criterion": ("task-242：每个 clear_area 阶段 `len(cleared_tiles) == ok`，或账本里可解释的"
+                      "「目标格/连带格」区分（结构化字段或 note 文案）；不满足 ⇒ FAIL 并列差异对"),
+        "clear_stage_total_ok": total_ok,
+        "conforming_stages": conform,
+        "explained_stages": explained[:10], "explained_total": len(explained),
+        "unexplained_stages": unexplained[:15], "unexplained_total": len(unexplained),
+    })
+
     if total_ok == 0:
         rec["verdict"] = "无法判定"
-        rec["reason"] = "整跑没有 clear_area 的 ok 步/ok 格 ⇒ 无法验证「逐格判据活」（不是失败，是这天/这跑没清障）"
-    elif clear_without or stage_without:
+        rec["reason"] = "整跑没有 clear_area 的 ok 格 ⇒ 无法验证「逐格判据活」（不是失败，是这跑没清障）"
+    elif unexplained:
         rec["verdict"] = "FAIL"
-        rec["reason"] = (f"{len(clear_without) + len(stage_without)}/{total_ok} 个 clear_area ok 动作没有逐格证据"
-                         f"（cleared_tiles/kind 变化）：{clear_without[:5] or stage_without[:5]}")
+        diffs = "；".join(
+            f"{it['day']}/{it['stage']}: ok={it['ok']} cleared={it['cleared_tiles']} 差{it['delta']}"
+            f"(extra_keys={it['extra_keys']})" for it in unexplained[:6])
+        rec["reason"] = (f"{len(unexplained)} 个 clear_area 阶段的 `len(cleared_tiles)` != ok 且不可解释"
+                         f"（task-242 验收面未过）：{diffs}")
     else:
         rec["verdict"] = "PASS"
-        rec["reason"] = f"{total_with}/{total_ok} 个 clear_area ok 动作都带逐格证据（cleared_tiles/kind 变化）"
+        rec["reason"] = (f"{total_ok} 个 clear_area ok 格全部有逐格证据且对得上"
+                         f"（等值阶段 {len(conform)} 个 / 可解释阶段 {len(explained)} 个）")
     return rec
 
 
@@ -984,7 +1038,7 @@ PLAN = [
     (2, "debug_dump trigger_actions 可读（无 InvalidCastException）"),
     (3, "单技能砍树：kind==tree 的格 use_tool(axe) ⇒ tree→stump/消失，after 带前后 kind"),
     (4, "2 日长跑：start-detached-longrun --days 2 ⇒ intent_coverage + <journal>-gaps.json（跨 2 次日切）"),
-    (5, "逐格判据活：clear_area 每个 ok 步都有 cleared_tiles/kind 变化"),
+    (5, "task-242 逐格判据：每个 clear_area 阶段 `len(cleared_tiles)==ok`（或可解释的目标格/连带格区分），否则 FAIL + 差异对"),
     (6, "跨日落盘守卫：save-chain-check.py 判六串 6/6 且末次跨日也落盘（NewDay>Save called ⇒ FAIL）"),
     (7, "analyzer §8 无红 + `missed:intent_no_reason:*` 必消失 + slot_relief 带 demand/target_free/reached 且≥1 天 harvest ok>0 + verify-run3 对 §8 只 info"),
     (8, "0.7.42 三条硬判据：8.1 冬季≥1 天 verified 且旧守卫文案 0 次 / 8.2① 单发 tool_ineffective 封格 = 0 / 8.2② farm.trees 日降幅>2 / 8.2③ 预算理由含「预算 N/已砍 M」"),
