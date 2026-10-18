@@ -30,6 +30,10 @@
 
 `python tools/start-detached-longrun.py --days 2 --size 5 --max-minutes 60 --max-days 4 --journal logs\longrun-smoke-0741.jsonl --expect-version 0.7.41`，随后 `scratch/smoke-0741.py`：
 
+**前置（缺一不可，先跑再冒烟）**：
+- `scratch/save-chain-check.py --selftest` ⇒ **6 夹具全 PASS**（A 红 / B 绿 / C 无法判定 / D 末次顺序 / E 链内逆序 / F 插件行 L16）；
+- `tools/verify-run3.py --smapi <0.7.40 抢救前窗口> --before 12:22:00` ⇒ **必须判 problem**（NewDay 3 / Save 2）；同一份全窗口 ⇒ **不得判 problem**（3/3）；两夹具口径见 `scratch/_t239_win/`。
+
 | 步 | 判据 |
 | --- | --- |
 | 1 | `debug_dump crafting_recipes key=Furnace`：`matchedCount>=1`（验活，不得 unknown_skill） |
@@ -37,7 +41,7 @@
 | 3 | 砍树 A2：有界 ≤3 次 `use_tool`，`kind` 一变即 PASS（`tool_ineffective` 只留痕） |
 | 4 | 长跑起跑 = 脱离式、PID 记录、`finish` 出现 |
 | 5 | 逐格证据：`clear_area` ok 步的 `cleared_tiles`/before-after（ok=0 时如实【无法判定】） |
-| 6 | **`scratch/save-chain-check.py`：`NewDay == Save called == after save`**（`--days 2` 必须跨 2 次日切；有 `NewDay > Save` ⇒ FAIL） |
+| 6 | **`scratch/save-chain-check.py --freeze-smapi`：六串 `NewDay == before save == Save called == completed == after save` 且链内行号单调**（`--days 2` 必须跨 2 次日切；`NewDay > Save` 或逆序 ⇒ FAIL；L16 插件行只进原始计数）；`smoke-0741.py` 只认检查器 verdict，不自己重数 |
 | 7 | `analyze-longrun --days 2`：**不得出现 `missed:intent_no_reason:*`**；`slot_relief` 带 `demand/target_free/reached`；**至少一天 `harvest` ok>0** |
 
 全绿 ⇒ A″/B″ 放行；任一 FAIL ⇒ 修卡再冻结，不许"带病起跑"。
