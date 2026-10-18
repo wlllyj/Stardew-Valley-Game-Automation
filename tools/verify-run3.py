@@ -55,6 +55,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import sys
 from collections import Counter
 from typing import Any
@@ -339,7 +340,117 @@ def build_days(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return days
 
 
-def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[str, Any]]:
+#: SMAPI 日志行前缀：`[HH:MM:SS LEVEL CHAN]`。
+_SMAPI_LINE_RE = re.compile(r"^\[(\d{2}):(\d{2}):(\d{2})\s+([A-Z]+)\s+([A-Za-z0-9_.-]+)\]")
+#: 插件**描述行**的标记（`... 0.7.40 by AgentFarm | v0.7.40（...）`）。
+#: deputy 实测（task-239 夹具 `scratch/_t239_win/red_0740_with_plugin_line.txt:16`）：
+#: 这类行的描述文本里可能出现**字面** `SaveGame.Save() called.` / `Synchronizing 'NewDay' task`
+#: ⇒ 若照单全收，真窗口 3/2 会被数成 3/3，**判不出 problem（假绿）**。
+_PLUGIN_LINE_MARKERS = (" by ", "| v")
+
+
+def _smapi_line_kind(line: str) -> str:
+    """给一行分级：`"judge"`（真运行时行，进判据）/`"plugin"`（插件描述行，只进原始计数）/
+    `"raw"`（没有时间戳/没有通道前缀 ⇒ 只进原始计数，绝不当证据）。"""
+    if not _SMAPI_LINE_RE.match(line):
+        return "raw"
+    if any(m in line for m in _PLUGIN_LINE_MARKERS):
+        return "plugin"
+    return "judge"
+
+
+def parse_smapi_window(path: str) -> dict[str, int]:
+    """【task-236】从 SMAPI 窗口文本里数"日切落盘"的几串标记。
+
+    为什么要它（AGENTS.md §3）：**跨日 ≠ 落盘** —— 前一天有出货时游戏先把
+    `ShippingMenu` 压上来、`SaveGameMenu` 被推迟；run 尾声不关它，那一次 `NewDay`
+    的存档根本不会开始（0.7.40 A2 冒烟：NewDay 3 / Save called 2，存档停在当天清晨）。
+
+    返回 dict：
+      * `newday`/`before_save`/`save_called`/`save_completed`/`after_save` = **判据计数**
+        （只数 `_smapi_line_kind == "judge"` 的行）；
+      * `raw_<同名>` = 原始计数（含插件描述行/无时间戳行，只用于对账展示，**不参与判据**）；
+      * `newday_line`/`save_called_line` = 判据计数里最后一行的**行号**（1 基；0 = 没有）。
+    """
+    names = ("newday", "before_save", "save_called", "save_completed", "after_save")
+    counts: dict[str, int] = {n: 0 for n in names}
+    counts.update({f"raw_{n}": 0 for n in names})
+    counts.update({"newday_line": 0, "save_called_line": 0})
+    markers = (
+        ("newday", "Synchronizing 'NewDay' task"),
+        ("before_save", "Context: before save."),
+        ("save_called", "SaveGame.Save() called."),
+        ("save_completed", "SaveGame.Save() completed without exceptions."),
+        ("after_save", "Context: after save, starting"),
+    )
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for lineno, line in enumerate(fh, start=1):
+            matched = [name for name, needle in markers if needle in line]
+            if not matched:
+                continue
+            kind = _smapi_line_kind(line)
+            for name in matched:
+                counts[f"raw_{name}"] += 1
+                if kind != "judge":
+                    continue
+                counts[name] += 1
+                if name == "newday":
+                    counts["newday_line"] = lineno
+                elif name == "save_called":
+                    counts["save_called_line"] = lineno
+    return counts
+
+
+def smapi_verdict(counts: dict[str, int] | None) -> tuple[list[str], list[str]]:
+    """把 SMAPI 计数变成 `(problems, infos)`。**缺失 ⇒ 【无法判定】**，绝不默认 PASS。
+
+    判据（task-236 + Lead 2026-10-18 追加两条）：
+      1. **六串计数全等**（NewDay / before save / Save called / completed / after save）；
+      2. **末次 `NewDay` 行号 < 末次 `Save called` 行号**（计数相等也可能顺序颠倒 ⇒ 静默丢档）；
+      3. 插件描述行/无时间戳行只进"原始计数"展示，**不参与判据**（否则假绿）。
+    """
+    problems: list[str] = []
+    infos: list[str] = []
+    judge_total = 0 if not counts else sum(
+        int(counts.get(n) or 0) for n in
+        ("newday", "before_save", "save_called", "save_completed", "after_save"))
+    if not counts or judge_total <= 0:
+        infos.append(
+            "【无法判定】SMAPI 窗口里没数到判据可用的 NewDay/保存标记"
+            "（没给 --smapi、内容不含，或只出现在插件描述行/无时间戳行）⇒ "
+            "末次跨日是否落盘无法判定（缺失 ≠ 通过）"
+        )
+        return problems, infos
+
+    names = ("newday", "before_save", "save_called", "save_completed", "after_save")
+    judged = {n: int(counts.get(n) or 0) for n in names}
+    raw = {n: int(counts.get(f"raw_{n}") or 0) for n in names}
+    detail = "、".join(f"{n}={judged[n]}" for n in names)
+    raw_detail = "、".join(f"{n}={raw[n]}" for n in names)
+    if len(set(judged.values())) != 1:
+        problems.append(
+            f"日切落盘链不完整（判据计数 {detail} 不相等）："
+            "跨日 ≠ 落盘（见 task-236 收尾守卫）；原始计数 {"
+            f"{raw_detail}"
+            "}（含插件描述行/无时间戳行，仅对账用）"
+        )
+    newday_line = int(counts.get("newday_line") or 0)
+    save_line = int(counts.get("save_called_line") or 0)
+    if newday_line and save_line and newday_line > save_line:
+        problems.append(
+            f"日切顺序颠倒（末次 NewDay 在第 {newday_line} 行、末次 SaveGame.Save() called "
+            f"在第 {save_line} 行）：计数虽相等，但最后一次跨日之后没有再落盘"
+        )
+    infos.append(
+        "SMAPI 日切落盘：" + detail
+        + f"；末次 NewDay 行 {newday_line or '?'} / 末次 Save called 行 {save_line or '?'}"
+        + f"；原始计数（仅对账）{raw_detail}"
+    )
+    return problems, infos
+
+
+def report(rows: list[dict[str, Any]], *, target_days: int,
+           smapi_counts: dict[str, int] | None = None) -> tuple[bool, dict[str, Any]]:
     bad_lines = [r for r in rows if r.get("event") == "_bad_line"]
     events = Counter(r.get("event") for r in rows)
     days = build_days(rows)
@@ -1363,6 +1474,12 @@ def report(rows: list[dict[str, Any]], *, target_days: int) -> tuple[bool, dict[
             "之后拿账本当验收依据 —— 写到一半的账本会缺字段/半行，曾出现读到半行 `day_end` 的误判）"
         )
 
+    # 【task-236】末次跨日是否真落盘：靠 SMAPI 窗口的 NewDay / Save called 两串独立对账。
+    # 没给 `--smapi`（或窗口里数不到）⇒【无法判定】，只记 info、绝不默认 PASS。
+    smapi_problems, smapi_infos = smapi_verdict(smapi_counts)
+    problems.extend(smapi_problems)
+    infos.extend(smapi_infos)
+
     ok = _ok_now()
     summary = {
         "journal": None,
@@ -1425,6 +1542,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--journal", default=None, help="journal 路径（默认取 logs 下最新一份 longrun-*.jsonl）")
     ap.add_argument("--days", type=int, default=3, help="要求的尾部连续 VERIFIED 天数（默认 3）")
     ap.add_argument("--json", action="store_true", help="只打印 JSON")
+    ap.add_argument("--smapi", default=None,
+                    help="SMAPI 窗口文本路径（task-236：数 NewDay/Save called 判末次跨日是否落盘；"
+                         "不给则该项【无法判定】）")
     args = ap.parse_args(argv)
 
     path = latest_journal(args.journal)
@@ -1432,8 +1552,16 @@ def main(argv: list[str] | None = None) -> int:
         print("找不到 journal（--journal 指定，或 logs\\longrun-*.jsonl 不存在）")
         return 2
     rows = load(path)
-    ok, summary = report(rows, target_days=args.days)
+    smapi_counts = None
+    if args.smapi:
+        if not os.path.isfile(args.smapi):
+            print(f"找不到 SMAPI 窗口：{args.smapi}（末次跨日落盘 ⇒【无法判定】）")
+            return 2
+        smapi_counts = parse_smapi_window(args.smapi)
+    ok, summary = report(rows, target_days=args.days, smapi_counts=smapi_counts)
     summary["journal"] = path
+    summary["smapi"] = args.smapi or ""
+    summary["smapi_counts"] = smapi_counts or {}
 
     if args.json:
         print(json.dumps(summary, ensure_ascii=False, indent=2))

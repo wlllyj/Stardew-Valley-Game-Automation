@@ -394,6 +394,14 @@ MODAL_DISMISS_BUDGET_MS = {
     "ShippingMenu": 20000,
 }
 
+#: 【task-236】跑结束前"末次跨日落盘守卫"最多关几次模态。
+#:
+#: 0.7.40 A2 冒烟：第 3 次跨日后跑立刻 finish 退出，把**保存推迟的 `ShippingMenu`** 留在
+#: 屏幕上没人关 ⇒ 那一次 `NewDay` 的存档从未开始（SMAPI 窗口 `NewDay 3` 而
+#: `SaveGame.Save() called` 只有 2，存档停在第 3 天清晨、当天全天只在内存里）。
+#: 所以收尾必须把挡着的模态关掉再退；但**只能有界**（3 轮），仍卡就如实记账、不洗白。
+CLEANUP_DISMISS_MAX = 3
+
 #: 挡住当天、必须人来处理的模态（职业选择等不可逆操作）对应的 `ended_by`。
 #: 它同时让 `slept_by_us=false` ⇒ 当天**不判 VERIFIED**（宁可停下等人，也不静默丢档）。
 ENDED_BY_MODAL = "blocked_modal"
@@ -6981,12 +6989,16 @@ class LongRun:
                               note="只等不关的模态超时（没敢 dismiss）⇒ 当天如实停下等人")
                 return obs, False, waited
 
-    def _dismiss_modal_once(self, menu: str, ui: dict[str, Any], *, kind: str) -> dict[str, Any]:
+    def _dismiss_modal_once(self, menu: str, ui: dict[str, Any], *, kind: str,
+                            tries: int = 0) -> dict[str, Any]:
         """关一次模态并重新观测（回执原文进 journal；世界是否真变了解除由后续观测回答）。
 
         【task-129】`ShippingMenu` 要走"出货 → 日切保存 → 换天"整条链（Mod 侧反射
         `okClicked()` 后只等游戏自己走完），合法地要十几秒 ⇒ 必须显式给大预算
         （客户端默认只有 5s，会把"游戏正在存档"判成超时）。其它模态仍是短活。
+
+        【task-236】`tries` 是收尾守卫的轮次（`kind="cleanup"` 时带出去，便于账本对"关了几次")；
+        其它调用点保持默认 0，**事件名与既有字段不变**（不新增事件名，避免 analyzer 漂移）。
         """
         assert self.client is not None
         menu_text = str(ui.get("activeMenuText") or "")
@@ -6994,7 +7006,7 @@ class LongRun:
         receipt = self.client.dismiss_modal(timeout_ms=budget)
         self._actions += 1
         self._journal("modal_dismissed", kind=kind, menu=menu, menuText=menu_text,
-                      receipt=receipt,
+                      receipt=receipt, tries=tries,
                       note=("提问走 dismiss_modal 的选否口径（项目硬规则：永不注入确认键）"
                             if kind == "question" else None))
         self._say(f"  · 关掉挡路模态 {menu or '?'}（{kind}）"
@@ -8288,8 +8300,89 @@ class LongRun:
         code = 0 if self._verified_streak() >= self.target_days else 1
         return self._finish(code)
 
+    def _cleanup_modals_before_finish(self) -> dict[str, Any]:
+        """【task-236】收尾前把挡着的模态关掉（末次跨日的落盘守卫）。
+
+        为什么必需（0.7.40 A2 冒烟）：第 3 次跨日后跑立刻 `finish` 退出，把保存推迟的
+        `ShippingMenu` 留在屏幕上没人关 ⇒ 那一次 `NewDay` 的存档从未开始
+        （SMAPI 窗口 `NewDay 3` / `SaveGame.Save() called 2`，存档停在第 3 天清晨）。
+
+        纪律（卡面明文 + 项目既有口径）：
+          * **只关模态**：不 `load_save`、不改档、不 sleep；
+          * 存档类菜单（`MODAL_WAIT_ONLY`）**只等不关**（等游戏自己走完，dismiss 会打断存档）；
+          * 最多 `CLEANUP_DISMISS_MAX` 轮；仍卡 ⇒ 如实记账、**不洗白**（进 `finish` 摘要）；
+          * **不新增 journal 事件名**：复用 `modal_dismissed`（每轮，带 `kind="cleanup"`）与
+            `modal_dismiss_failed`（卡住时，带 `kind="cleanup_blocked"`）—— analyzer 的机械
+            枚举测试会盯 `_journal("<新名字>"`，新事件名会让全量变红。
+        """
+        result: dict[str, Any] = {"attempts": 0, "menu": None, "stuck": False}
+        if self.worker is None or self.client is None:
+            return result
+        obs: dict[str, Any]
+        for attempt in range(1, CLEANUP_DISMISS_MAX + 1):
+            try:
+                obs = self._snap()
+            except BridgeError as exc:
+                result["stuck"] = True
+                result["error"] = f"{type(exc).__name__}: {exc}"
+                self._journal("modal_dismiss_failed", kind="cleanup_blocked",
+                              menu=result["menu"], tries=attempt - 1,
+                              reason=str(exc),
+                              note="收尾清模态时连观测都失败 ⇒ 无法确认末次跨日是否落盘")
+                return result
+            is_modal, menu, ui = self._modal_info(obs)
+            if not is_modal:
+                return result
+            # 【不可逆/人工模态绝不关】—— 既有硬规则优先于"收尾清模态"：
+            #   * `eventUp=true`（游戏事件/剧情）：task-41/228 规定事件一律视为阻断模态，一次都不动手；
+            #   * 职业选择 `LevelUpMenu`（`professionsToChoose` 非空、或读不到 ⇒ fail-closed）：
+            #     dismiss = 永久丢掉 Tiller/Artisan 选择（不可逆，必须人来点）。
+            if ui.get("eventUp") is True:
+                result["skipped"] = "event_up"
+                return result
+            if menu == "LevelUpMenu":
+                pending = ui.get("professionsToChoose")
+                if pending is None or list(pending):
+                    result["skipped"] = "profession_pending"
+                    return result
+            result["attempts"] = attempt
+            result["menu"] = menu
+            if menu in MODAL_WAIT_ONLY:
+                obs, gone, waited = self._wait_modal_gone(menu, obs)
+                self._journal("modal_dismissed", kind="cleanup_wait", menu=menu, tries=attempt,
+                              receipt=None, waited_s=round(waited, 1), ok=gone,
+                              note="收尾守卫：存档类菜单只等不关（dismiss 会打断存档）")
+                if gone:
+                    continue
+                result["stuck"] = True
+                self._journal("modal_dismiss_failed", kind="cleanup_blocked", menu=menu,
+                              tries=attempt,
+                              note="收尾时存档菜单一直没有自己走完 ⇒ 末次跨日可能没落盘")
+                return result
+            try:
+                obs = self._dismiss_modal_once(menu, ui, kind="cleanup", tries=attempt)
+            except BridgeError as exc:
+                result["stuck"] = True
+                result["error"] = f"{type(exc).__name__}: {exc}"
+                self._journal("modal_dismiss_failed", kind="cleanup_blocked", menu=menu,
+                              tries=attempt, reason=str(exc),
+                              note="收尾关模态失败 ⇒ 末次跨日可能没落盘")
+                return result
+            after_modal, after_menu, _ui = self._modal_info(obs)
+            if not after_modal:
+                return result
+            result["menu"] = after_menu or menu
+        result["stuck"] = True
+        self._journal("modal_dismiss_failed", kind="cleanup_blocked", menu=result["menu"],
+                      tries=CLEANUP_DISMISS_MAX,
+                      note=f"收尾清模态 {CLEANUP_DISMISS_MAX} 轮仍卡 ⇒ 末次跨日可能没落盘")
+        return result
+
     def _finish(self, code: int) -> int:
         streak = self._verified_streak()
+        # 【task-236】末次跨日落盘守卫：跑结束前把挡着的模态关掉（最多 `CLEANUP_DISMISS_MAX` 轮）。
+        # 不关掉保存推迟的 `ShippingMenu`，那一次 NewDay 的存档根本不会开始（0.7.40 冒烟）。
+        cleanup = self._cleanup_modals_before_finish()
         # task-15 §②：汇总行也要能一眼看到"有没有哪天留下了没做完的阶段"（`checks["no_unmet_stages"]`）。
         unmet_days = [d.day_text for d in self.days if not d.checks.get("no_unmet_stages", True)]
         self.summary = {
@@ -8305,13 +8398,24 @@ class LongRun:
             # 【task-73】整轮用掉几次"stuck 日翻篇"（上界 `MAX_STUCK_FLUSH`）：>0 说明有日子是
             # 靠睡过去才让运行继续的 —— 那些日子本身仍如实算 `stuck`/不 VERIFIED，这里只是账。
             "stuck_flushes": self.stuck_flushes,
+            # 【task-236】收尾清模态的账：`stuck=true` 说明最后一次跨日**可能没落盘**
+            # （保存模态一直没走完）。它不进 `checks`（不给洗白面），只作运行级诚实记账。
+            "cleanup_modal_stuck": bool(cleanup.get("stuck")),
+            "cleanup_attempts": int(cleanup.get("attempts") or 0),
+            "cleanup_menu": cleanup.get("menu") or "",
+            # 被保护而未清的模态（`event_up` / `profession_pending`）：如实记账，不碰它。
+            "cleanup_skipped": cleanup.get("skipped") or "",
             "journal": str(self.journal_path) if self.journal_path else "",
             **({"prepare_error": self.summary["prepare_error"]} if self.summary.get("prepare_error") else {}),
+            **({"cleanup_error": cleanup["error"]} if cleanup.get("error") else {}),
         }
         self._journal("finish", code=code, verified_streak=streak, actions=self._actions,
                       minutes=round(self._elapsed_minutes(), 2), stages_seen=self.summary["stages_seen"],
                       no_unmet_stages=not unmet_days, unmet_days=unmet_days,
-                      stuck_flushes=self.stuck_flushes)
+                      stuck_flushes=self.stuck_flushes,
+                      cleanup_modal_stuck=self.summary["cleanup_modal_stuck"],
+                      cleanup_attempts=self.summary["cleanup_attempts"],
+                      cleanup_menu=self.summary["cleanup_menu"])
         if self._jf is not None:
             try:
                 self._jf.close()
@@ -8324,5 +8428,8 @@ class LongRun:
                   + f"；no_unmet_stages={not unmet_days}"
                   + (f"（有未完成阶段的天：{'、'.join(unmet_days)}）" if unmet_days else "")
                   + (f"；stuck 日翻篇 {self.stuck_flushes} 次" if self.stuck_flushes else "")
-                  + (f"；准备失败：{self.summary['prepare_error']}" if self.summary.get("prepare_error") else ""))
+                  + (f"；准备失败：{self.summary['prepare_error']}" if self.summary.get("prepare_error") else "")
+                  + (f"；⚠ 收尾清模态卡住（{self.summary['cleanup_menu'] or '?'}，试 "
+                     f"{self.summary['cleanup_attempts']} 次）⇒ 末次跨日可能没落盘"
+                     if self.summary["cleanup_modal_stuck"] else ""))
         return code

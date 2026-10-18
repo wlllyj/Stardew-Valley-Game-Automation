@@ -1160,5 +1160,110 @@ class TestVerifyRun3(unittest.TestCase):
         )
 
 
+class Task236SmapiPersistenceGuardTest(unittest.TestCase):
+    """task-236：末次跨日是否**真落盘**要靠 SMAPI 窗口独立对账。
+
+    0.7.40 A2 冒烟：跑在第 3 次跨日后立刻 finish 退出，保存推迟的 `ShippingMenu` 没人关 ⇒
+    `NewDay 3` 而 `SaveGame.Save() called` 只有 2（存档停在当天清晨）。本工具据此判红；
+    没给 `--smapi`（或窗口里数不到）⇒【无法判定】，绝不默认通过。
+    """
+
+    WINDOW = (
+        "[11:32:06 TRACE SMAPI] Synchronizing 'NewDay' task...\n"
+        "[11:32:07 TRACE SMAPI] Context: before save.\n"
+        "[11:32:07 TRACE game] SaveGame.Save() called.\n"
+        "[11:32:07 TRACE game] Saving without compression...\n"
+        "[11:32:08 TRACE game] SaveGame.Save() completed without exceptions.\n"
+        "[11:32:09 TRACE SMAPI] Context: after save, starting fall 24 Y1.\n"
+    )
+
+    def test_parse_smapi_window_counts_markers(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "smapi-window.txt"
+            path.write_text(self.WINDOW + self.WINDOW, encoding="utf-8")
+            counts = vr.parse_smapi_window(str(path))
+        self.assertEqual(counts["newday"], 2)
+        self.assertEqual(counts["before_save"], 2)
+        self.assertEqual(counts["save_called"], 2)
+        self.assertEqual(counts["save_completed"], 2)
+        self.assertEqual(counts["after_save"], 2)
+
+    def test_plugin_description_lines_never_enter_judgement_counts(self):
+        """deputy 夹具形态：插件描述行里出现**字面**保存串 ⇒ 只进原始计数、判据不变。"""
+        import tempfile
+
+        plugin = ("[12:06:38 INFO  SMAPI]    AgentFarm Bridge 0.7.40 by AgentFarm | v0.7.40（...）"
+                  "：跨日 `Synchronizing 'NewDay' task` 与 SaveGame.Save() called. 两条都要对账\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "with-plugin-line.txt"
+            path.write_text(plugin + self.WINDOW, encoding="utf-8")
+            counts = vr.parse_smapi_window(str(path))
+        for name in ("newday", "before_save", "save_called", "save_completed", "after_save"):
+            self.assertEqual(counts[name], 1, f"判据计数不许被插件描述行污染：{name} {counts}")
+        self.assertEqual(counts["raw_save_called"], 2, counts)
+        self.assertEqual(counts["raw_newday"], 2, counts)
+
+    def test_counts_equal_but_newday_after_save_is_a_problem(self):
+        ok, summary = vr.report([], target_days=0, smapi_counts={
+            "newday": 3, "before_save": 3, "save_called": 3, "save_completed": 3, "after_save": 3,
+            "newday_line": 30, "save_called_line": 20})
+        self.assertTrue(any("日切顺序颠倒" in p for p in summary["problems"]), summary["problems"])
+        self.assertEqual(summary["verdict"], "needs_review")
+
+    def test_half_chain_is_a_problem_with_raw_and_judged_numbers(self):
+        ok, summary = vr.report([], target_days=0, smapi_counts={
+            "newday": 3, "before_save": 2, "save_called": 2, "save_completed": 2, "after_save": 2,
+            "newday_line": 10, "save_called_line": 20})
+        self.assertTrue(any("日切落盘链不完整" in p for p in summary["problems"]),
+                        summary["problems"])
+        self.assertTrue(any("原始计数" in p for p in summary["problems"]), summary["problems"])
+
+    def test_clean_window_is_not_a_problem(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "green.txt"
+            path.write_text(self.WINDOW, encoding="utf-8")
+            counts = vr.parse_smapi_window(str(path))
+        ok, summary = vr.report([], target_days=0, smapi_counts=counts)
+        self.assertFalse(any("日切" in p for p in summary["problems"]), summary["problems"])
+        self.assertTrue(any("SMAPI 日切落盘" in i for i in summary["infos"]), summary["infos"])
+
+    def test_no_timestamp_lines_are_raw_only(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "no-ts.txt"
+            path.write_text("SaveGame.Save() called.\nSynchronizing 'NewDay' task...\n",
+                            encoding="utf-8")
+            counts = vr.parse_smapi_window(str(path))
+        self.assertEqual(counts["save_called"], 0, counts)
+        self.assertEqual(counts["raw_save_called"], 1, counts)
+        ok, summary = vr.report([], target_days=0, smapi_counts=counts)
+        self.assertTrue(any("无法判定" in i for i in summary["infos"]), summary["infos"])
+
+    def test_newday_ahead_of_save_called_is_a_problem(self):
+        ok, summary = vr.report([], target_days=0, smapi_counts={
+            "newday": 3, "before_save": 2, "save_called": 2, "save_completed": 2, "after_save": 2,
+            "newday_line": 10, "save_called_line": 20})
+        self.assertTrue(summary["problems"], summary["problems"])
+        self.assertEqual(summary["verdict"], "needs_review")
+
+    def test_equal_counts_are_not_a_problem(self):
+        ok, summary = vr.report([], target_days=0, smapi_counts={
+            "newday": 3, "before_save": 3, "save_called": 3, "save_completed": 3, "after_save": 3,
+            "newday_line": 10, "save_called_line": 20})
+        self.assertFalse(any("日切" in p for p in summary["problems"]), summary["problems"])
+        self.assertTrue(any("SMAPI 日切落盘" in i for i in summary["infos"]), summary["infos"])
+
+    def test_missing_smapi_is_undetermined_not_pass(self):
+        for counts in (None, {}):
+            ok, summary = vr.report([], target_days=0, smapi_counts=counts)
+            self.assertFalse(any("日切" in p for p in summary["problems"]), summary["problems"])
+            self.assertTrue(any("无法判定" in i for i in summary["infos"]), summary["infos"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -39,7 +39,8 @@ from agentfarm.farmwork import (  # noqa: E402
     StageResult, harvest_tool, player_free_slots, seed_items, tile_ready,
 )
 from agentfarm.longrun import (  # noqa: E402
-    ACTIONLESS_TASKS, CLEARABLE_KINDS, DEFAULT_LLM_MAX_TOKENS, ENDED_BY_EVENT, ENDED_BY_MODAL,
+    ACTIONLESS_TASKS, CLEANUP_DISMISS_MAX, CLEARABLE_KINDS, DEFAULT_LLM_MAX_TOKENS,
+    ENDED_BY_EVENT, ENDED_BY_MODAL,
     EVENT_ADVANCE_DAY_STEPS, EVENT_ADVANCE_MAX_STEPS, EVENT_STALL_GIVE_UP,
     FAR_DRY_MAX_TRIES, FAR_DRY_OPEN_MAX, FAR_DRY_REFILL_MAX,
     FRONTIER_CLEAR_MAX, INTENT_REASON_CODES, JUSTIFIED_END_REASONS, MAX_BUY_TRIES_PER_DAY,
@@ -11425,6 +11426,138 @@ class TestTask232SpacePressure(unittest.TestCase):
         self.assertFalse(run._slot_relief(w.obs(), rep))
         self.assertEqual(worker.sell_calls, [])
         self.assertEqual(self._events(run, "slot_relief"), [])
+
+
+class _StickyModalWorld(FakeWorld):
+    """关不掉的世界：`dismiss_modal` 回 ok，但模态还在（模拟"关了一次没关掉"）。"""
+
+    def dismiss(self) -> dict:
+        self.dismiss_calls += 1
+        self.dismissed.append(str(self.ui_script[0].get("activeMenu") or "") if self.ui_script else "")
+        return {"ok": True, "status": "ok", "worldResumed": True, "worldSeq": self.seq}
+
+
+class TestTask236CleanupGuard(unittest.TestCase):
+    """task-236：跑结束前必须把挡着的模态关掉（末次跨日的落盘守卫）。
+
+    0.7.40 A2 冒烟：第 3 次跨日后跑立刻 finish 退出，保存推迟的 `ShippingMenu` 没人关 ⇒
+    那次 NewDay 的存档从未开始（SMAPI `NewDay 3` / `Save called 2`）。四条硬口径：
+    ①存档类模态只等不关（dismiss 会打断存档）；②普通模态有界关（≤ CLEANUP_DISMISS_MAX 轮）；
+    ③关不掉 ⇒ `finish.cleanup_modal_stuck=true` 如实记账、不洗白；④没有模态 ⇐ 一步不动。
+    """
+
+    def _run(self, w: FakeWorld) -> LongRun:
+        run = make_run(w)
+        run.client = FakeClient(w)
+        run.worker = FakeWorker(w)
+        return run
+
+    @staticmethod
+    def _modal_rows(run: LongRun, *, event: str = "modal_dismissed", kind: str | None = None):
+        rows = [e for e in run.entries if e["event"] == event]
+        return [r for r in rows if kind is None or r.get("kind") == kind]
+
+    def test_save_menu_is_waited_never_dismissed(self):
+        """存档类模态（`SaveGameMenu`）**只等不关**：dismiss 会打断正在写的存档。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.ui_script = [{"activeMenu": "SaveGameMenu", "_autoGoneAfterPolls": 1}]
+        run = self._run(w)
+        result = run._cleanup_modals_before_finish()
+        self.assertIs(result["stuck"], False)
+        self.assertEqual(w.dismiss_calls, 0, "存档类菜单只等不关（dismiss 会打断存档）")
+        rows = self._modal_rows(run, kind="cleanup_wait")
+        self.assertEqual(len(rows), 1)
+        self.assertIs(rows[0]["ok"], True)
+
+    def test_shipping_menu_is_dismissed_so_the_delayed_save_can_start(self):
+        """0.7.40 冒烟的真形态：跑尾声挡着的是 `ShippingMenu` ⇒ 必须关掉（它才会走日切保存）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.ui_script = [{"activeMenu": "ShippingMenu"}]
+        run = self._run(w)
+        result = run._cleanup_modals_before_finish()
+        self.assertIs(result["stuck"], False)
+        self.assertEqual(w.dismiss_calls, 1)
+        self.assertEqual(w.dismissed, ["ShippingMenu"])
+        rows = self._modal_rows(run, kind="cleanup")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["tries"], 1)
+
+    def test_level_up_menu_is_dismissed_once(self):
+        """普通升级（`professionsToChoose: []`）⇒ 可以关；职业选择弹窗另见下一条。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.ui_script = [{"activeMenu": "LevelUpMenu", "professionsToChoose": []}]
+        run = self._run(w)
+        result = run._cleanup_modals_before_finish()
+        self.assertIs(result["stuck"], False)
+        self.assertEqual(w.dismiss_calls, 1)
+        self.assertEqual(w.dismissed, ["LevelUpMenu"])
+        rows = self._modal_rows(run, kind="cleanup")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["tries"], 1)
+
+    def test_profession_choice_menu_is_never_dismissed_at_cleanup(self):
+        """职业选择（`professionsToChoose` 非空或**判不了**）⇒ 绝不关（关了 = 永久丢职业）。"""
+        for payload in ({"professionsToChoose": [1, 4]}, {}):
+            w = FakeWorld(weeds=0, seeds=0, money=0)
+            w.ui_script = [{"activeMenu": "LevelUpMenu", **payload}]
+            run = self._run(w)
+            result = run._cleanup_modals_before_finish()
+            self.assertEqual(w.dismiss_calls, 0, payload)
+            self.assertIs(result["stuck"], False, payload)
+            self.assertEqual(result.get("skipped"), "profession_pending", payload)
+
+    def test_chained_modals_are_cleared_in_order(self):
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.ui_script = [{"activeMenu": "LevelUpMenu", "professionsToChoose": []},
+                       {"activeMenu": "GameMenu"}]
+        run = self._run(w)
+        result = run._cleanup_modals_before_finish()
+        self.assertIs(result["stuck"], False)
+        self.assertEqual(w.dismiss_calls, 2)
+        self.assertEqual(w.dismissed, ["LevelUpMenu", "GameMenu"])
+
+    def test_sticky_modal_is_bounded_and_reported_as_stuck(self):
+        w = _StickyModalWorld(weeds=0, seeds=0, money=0)
+        w.ui_script = [{"activeMenu": "GameMenu"}]
+        run = self._run(w)
+        result = run._cleanup_modals_before_finish()
+        self.assertIs(result["stuck"], True)
+        self.assertEqual(result["attempts"], CLEANUP_DISMISS_MAX)
+        self.assertEqual(w.dismiss_calls, CLEANUP_DISMISS_MAX)
+        blocked = self._modal_rows(run, event="modal_dismiss_failed", kind="cleanup_blocked")
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["tries"], CLEANUP_DISMISS_MAX)
+
+    def test_clean_world_needs_no_action(self):
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = self._run(w)
+        result = run._cleanup_modals_before_finish()
+        self.assertEqual(result, {"attempts": 0, "menu": None, "stuck": False})
+        self.assertEqual(w.dismiss_calls, 0)
+        self.assertEqual(self._modal_rows(run), [])
+
+    def test_finish_summary_reports_stuck_modal(self):
+        w = _StickyModalWorld(weeds=0, seeds=0, money=0)
+        w.ui_script = [{"activeMenu": "GameMenu"}]
+        run = self._run(w)
+        run._finish(1)
+        self.assertIs(run.summary["cleanup_modal_stuck"], True)
+        self.assertEqual(run.summary["cleanup_attempts"], CLEANUP_DISMISS_MAX)
+        self.assertEqual(run.summary["cleanup_menu"], "GameMenu")
+        finish_rows = [e for e in run.entries if e["event"] == "finish"]
+        self.assertEqual(len(finish_rows), 1)
+        self.assertIs(finish_rows[0]["cleanup_modal_stuck"], True)
+        self.assertTrue(any("收尾清模态卡住" in line for line in run.logs), run.logs)
+
+    def test_finish_summary_is_clean_without_modal(self):
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = self._run(w)
+        run._finish(1)
+        self.assertIs(run.summary["cleanup_modal_stuck"], False)
+        self.assertEqual(run.summary["cleanup_attempts"], 0)
+        finish_rows = [e for e in run.entries if e["event"] == "finish"]
+        self.assertEqual(len(finish_rows), 1)
+        self.assertIs(finish_rows[0]["cleanup_modal_stuck"], False)
 
 
 if __name__ == "__main__":  # pragma: no cover
