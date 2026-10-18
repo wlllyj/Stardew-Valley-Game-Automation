@@ -154,3 +154,23 @@
 `logs/longrun-smoke-0742.jsonl`（149 条）、`logs/longrun-smoke-0742-gaps.json`、`logs/smoke-0742-smapi-window.txt`（冻结）、`logs/smoke-0742-digest.txt`、`scratch/smoke-0742.json`（逐步结果）、`scratch/smoke-0742-observe-*.json`（3 份 full observe）、`scratch/smoke-0742-save-chain.json`；脚本 `scratch/smoke-0742.py`、`scratch/_smoke0742_digest.py`。
 
 > 诚实声明：本卡没有做任何世界写入类技能（除步 3 一次有界 `use_tool`），未 `load_save`、未买/卖/种/放；所有结论都来自账本原文 + 独立观测 + SMAPI 原文 + 存档四件，缺数据处一律写【无法判定】。
+
+## §13 步 5 判据按 task-242 收紧（2026-10-18，离线，提交 `926dddd`）
+
+**新判据（写进 `scratch/smoke-0742.py` 的 `step5`）**：对每个 `day_end.stages[]` 里的 clear 类阶段（`CLEAR_STAGES = clear_area / clear_dead / clear_neighbor / frontier_clear`）：
+- `len(cleared_tiles) == ok` ⇒ **conforming**；
+- 否则若账本给了可解释的「目标格 / 连带格」区分（结构化字段 `target_tiles`/`collateral_tiles`/`cleared_targets`/`cleared_collateral`/`targets`/`extra_tiles` 之和等于 `len(cleared_tiles)+delta`，或任一计数等于 delta；或 `note`/`reason` 文案含「连带 / 一次多格 / 目标格 / 附带 / 顺手清 / 多格」）⇒ **explained**；
+- 都不可解释 ⇒ **unexplained ⇒ FAIL**，并逐条列出 `ok / cleared / delta / attempted / engaged / ok_tiles / tiles / extra_keys`。
+
+**反向夹具（真实账本，必须 FAIL）**：`python scratch\smoke-0742.py --phase post --only 5 --journal logs\longrun-smoke-0742.jsonl --tag selftest-0743 --no-crops` ⇒ **rc=10 / 步 5 FAIL**，9 个 clear_area 阶段全部 unexplained（`ok=7 cleared=6 差1`、`5/4 差1`、`3/2 差1`、`2/1 差1`、`5/2 差3`、`4/2 差2`、`2/1`、`4/2`、`2/1`；`extra_keys=[]` ⇒ 账本里没有新字段可解释）。原文落 `logs/selftest-step5-reverse.txt`。
+
+**正向对照自测（新脚本 `scratch/_selftest_step5_0742.py`，离线、无游戏）**：`py_compile -W error::SyntaxWarning`=0；`--selftest` **STEP5 SELFTEST PASS 5/5** —— A 等值(ok=3/1, cleared 3/1)⇒PASS、B 结构化可解释(`target_tiles` 2 + `collateral_tiles` 3 = cleared 3 + delta 2)⇒PASS、B2 文案可解释(note「一次多格」)⇒PASS、C 不可解释(ok=5/cleared=3)⇒FAIL(列差异)、D 整跑无 clear_area ok 格⇒无法判定。
+
+**机制发现（task-242 的定位依据）**：0.7.42 账本里那 9 个不等值阶段的字段显示 `ok == attempted == ok_tiles == tiles == bound_basis`，而 **`engaged` 恰等于 `len(cleared_tiles)`**（6/6、4/4、2/2、1/1、2/2、2/2、1/1、2/2、1/1）⇒ **`ok` 计的是"尝试成功"的格，只有 `engaged` 个格真的产生了世界变化，`cleared_tiles` 只收后者**。账本已有 `attempted`/`engaged` 两个字段但未在语义上声明「目标格 vs 实际变化格」，`cleared_tiles` 也不含未变化的目标格 ⇒ 这正是 task-242 要补的口径。
+
+**部分复跑入口（0.7.43 用，无需改代码）**：`main()` 的 `--only` 分派是 `want & {1,2,3}`→pre、`4 in want`→launch+wait、`want & {5,6,7,8}`→post ⇒
+- `python scratch\smoke-0742.py --phase all --only 3 --no-crops` ⇒ 只跑步 1–3（**不会起跑**）；
+- `python scratch\smoke-0742.py --phase all --only 5,8 --journal logs\longrun-smoke-0743.jsonl --tag smoke-0743 --smapi logs\smoke-0743-smapi-window.txt --no-crops` ⇒ 只跑离线步 5/8。
+保留纪律：冬季 0 作物 ⇒ 步 7 `harvest` 子项【无法判定·无作物】；`eventUp=true` ⇒ 当天停手上报、不判 VERIFIED。
+
+**A8 同起点备份路径（无需改代码）**：`python scratch\arm-start-helper.py backup --arm A8` ⇒ `logs\ab-backup\A8-start\`（`BACKUP_ROOT = logs\ab-backup`、`--arm` 默认 `A7`，实测 `--selftest` 6 用例 PASS）。
