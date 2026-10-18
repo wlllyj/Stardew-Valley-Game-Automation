@@ -69,7 +69,7 @@
 3. 冬26 40 格（263−223）账本无坐标 ⇒【无法判定】，不参与任何 PASS 结论。
 4. 0.7.45 的 `stage_midway_leftover` 遮蔽形态仍有（8 条/1 天），只 info。
 5. 春季农务腿（crops/watering/harvest）仍未真机验证；smoke 用 `--no-crops`。
-6. **Town 事件 `15389722` 非确定卡死（真机 2/3 次，task-32 探针）**：`eventUp=true / activeMenu=null / isModal=true / canMove=false / worldAdvancing=false / clock 冻结 610`；`advance_dialogue`→`[no_dialogue]`、`dismiss_modal` no-op、`move_to*`→`[ui_modal]`、店门 interact 全 `no_action`；唯一恢复 = `load_save(force=True)`。农务长跑不进 Town 时无影响；任何进城动作（卡 A）必须带事件自愈超时兜底。
+6. **Town 事件 `15389722` 非确定卡死（真机 5 次进 Town = 1 成功 / 4 卡死，task-32 探针）**：`eventUp=true / activeMenu=null / isModal=true / canMove=false / worldAdvancing=false / clock 冻结`；`advance_dialogue`→`[no_dialogue]`、`dismiss_modal` no-op、`move_to*`→`[ui_modal]`、店门 interact 全 `no_action`；唯一恢复 = `load_save(force=True)`。农务长跑不进 Town 时无影响；任何进城动作（卡 A）必须带事件自愈超时兜底（判据见 §7.4）。
 
 ## 6. 冻结记录（待填）
 
@@ -114,3 +114,42 @@
 - 风险：`tools\deploy-mod.py:154-172` 无条件从 `bin\Release` 复制 ⇒ 此时 deploy 会把 WIP dll 当 0.7.45 装机，覆盖冻结 dll、并使任何冒烟证据作废。
 - 处置：machine-runner **跳过 deploy 的装机步骤**、直接启动已装好的冻结 0.7.45（装机目录 dll 286208B `806C1069…B17F` 18:54:09、manifest `DECBA677…` 0.7.45），探针继续；本条记为开发日志事故记录。
 - **新硬检查（写入冻结九步第 7 步）**：任何 deploy 前必须核对 `bin\Release\AgentFarm.Bridge.dll` 哈希 == 冻结产物（或从冻结提交 `dotnet build -c Release --no-incremental` 重建后再核）；未核对不得 deploy。dev-coder 本地 C# 验证建议 `-o` 到隔离目录，避免仓库 bin 长期停在非冻结状态。
+
+## 8. 口径裁定（2026-10-18 20:1x，Lead；防冻结后返工）
+
+> 背景：deputy 离线预热提出 5 个待定口径（prep 草案在旧 smoke-0745 冬26 上"四门槛全过"，无法区分 0.7.45 前后行为）。以下为冻结前裁定，C 段验收照此写判据。
+
+### 8.1 inventory_blocked 诚实收工：字段级五条件（全满足才认 day_justified=true）
+- **E1** `day_end.ended_by == "inventory_blocked"`（该理由只由 clear 步因满包被拒时写入）；
+- **E2** 观测可用且真满：`day_end.free_slots_status == "ok"` 且 `day_end.free_slots_last == 0`（不用 `min`，`min==0` 只说明某刻满过）；
+- **E3** 腾格已用尽（字段级）：当天存在 ≥1 次 `slot_relief` 事件（`trigger=="space_pressure"` 或 `demand_basis=="buy_full"`），且**最后一次腾格尝试之后**无 `freed>0`；且其后不再出现可卖白名单 `sell`（`strategy=="slot_relief_space"`）事件；
+- **E4** `day_end.pending_executable == 0` 且 `day_end.pending_malformed == 0`（`pending_unobserved` 允许 >0）；
+- **E5** 浪费有界：`day_end.loot_lost_steps <= 5`（卡 D 常量）。
+- 反向三例必须 False：冬27 形态（loot_lost_steps=205）、满包但 `pending_executable>0`、满包但最后一次腾格之后又有成功卖出。
+- 旧 smoke-0745 冬26 在 0.7.45 下 `day_justified=false` 是旧代码无 E1 白名单项；0.7.46 起它应为 True——**这正是门禁第②条要看的行为变化，不是缺陷**。
+
+### 8.2 卡 A 观测面与差分窗口
+- `observe('summary')` 的 `player.inventoryCount`/`player.money` 已直出（0.7.45 真机账本验证）。
+- 购买差分窗口**必须同一天且不跨 NewDay**：`before` 紧接 talk/应答前，`after` 在应答后 1–2 tick；窗口内出现 `sell`/`ship`/`NewDay` 事件或 `shippingBin.count` 变化 ⇒ 记 `money_diff_ambiguous` 判该次失败（不计成功、不许另算）。
+- 负对照：同窗口不买、observe 两次，`money` 必须不变（进探针/单测）。
+- 结构断言：`after.inventoryCount == 2*before.inventoryCount`（12→24）且 `money_after == money_before - 2000`。
+
+### 8.3 `resume_budget_exhausted` 不进 `is_justified_end` 白名单
+- 保持 `day_justified=False`（预算耗尽≠证据门）；代价：这类日子不计入 5 日 streak；5 日窗口内出现 ≥2 天按缺陷升级（另卡提预算/改换片），不许放宽判据。
+- 证据要求：`no_progress_burst` 的 `walks/attempts/limits` 齐全且 `claim_exhausted==false`；缺任一 ⇒ 该日【无法判定】并红。
+
+### 8.4 task-33 `talk` JSON 契约（冻结）
+- exec：`POST /v1/exec {"skill":"talk","args":{"npc":"Pierre"}}`（大小写不敏感；可选 `"npcTile":[x,y]`）。
+- 回执：`{ok, applied, code:"ok"|"npc_not_found"|"not_adjacent"|"no_action"|"not_supported", npc, npcTile, distance, available(仅 npc_not_found), activeMenu, dialogueIsQuestion, dialogueResponses}`。
+- 判定：`code=="ok" && applied==true` ⇒ 必须同时有 `activeMenu`（DialogueBox/ShopMenu）或 `dialogueIsQuestion==true`，否则判实现缺陷（红）。
+- `dismiss_modal` 接口不变（`answerText` 精确匹配 / `answerIndex`）。
+- 禁区：talk 内不得改 Money/Items/MaxItems、不得调 `increaseBackpackSize`、不得合成键鼠。
+
+### 8.5 task-32「无可自动化入口」与卡 A 的张力
+- 冻结后按 task-34 实跑 walkthrough 三档判：`talk` 开出背包提问且响应含 `Purchase` ⇒ 卡 A 继续；`talk` applied 但只有普通商店/其它对话 ⇒ 卡 A **停**（记"入口形态不符"，Plan B 另裁）；`talk` 不可 applied ⇒ 记【无法判定·入口不存在】，卡 A 停。
+- **不许用推理替代实测**，不许拿 0.7.45 失败当 0.7.46 结论。
+
+### 8.6 对 deputy 重放草案的补充判法
+- J2（旧账本冬27 `resume_exhausted` + `pending_executable=7`）在 task-26 之后是**旧形态、新代码不可复现**：改判"source 级证据（`claim_exhausted=(exec==0 and malformed==0)`）+ 单测反向用例"，旧账本不一致只记【0.7.46 起不可复现】，不当卡 FAIL。
+- J3（`223−218=5`）已由 log-analyst 判【无法判定】（5 格属 `self.blocked`，坐标未落账）；冻结树验收只核「独立复算=223 且 5 格差额可解释」，既不当缺陷也不当 PASS。
+- prep 的 4 个产物留 scratch 不提交；task-31 正式报告时把 `.py` 按路径 `git add -f` 提交，证据 `.txt` 留 logs/scratch（被忽略）。
