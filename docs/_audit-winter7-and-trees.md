@@ -47,7 +47,7 @@
 1. **识别**：Mod `ui` 观察面加 `eventId`（`Game1.currentEvent?.id`）——1 行、零风险，从此"事件挂住"可归因（本卡只报，不改代码）。
 2. **规避**：起跑后进 Farm 前先 `observe`；若 `ui.eventUp==true` 且 `activeMenu==null` ⇒ 先等 60~120s（每 30s 重观测），仍 true 才按"事件卡死"处理；**不要**直接停整天（本次 4.92 分钟白烧）。
 3. **A″ 判据**：`ended_by=blocked_event` 当天记【无法判定】、不作 FAIL，但它会把 `verified_streak` 清零 ⇒ A″ 起跑前先做一次"农场门口 eventUp 探测"，true 就重起进程/换存档，否则整跑可能只剩 3 天。
-4. 现有口径（`docs/_run10-criteria.md` §6 + `checks.no_blocking_modal=false`）已覆盖"诚实停手"，但缺"如何识别/恢复"这条；脑侧行为本身正确（不 dismiss/sleep/load_save），**无需改脑**。
+4. **既有口径覆盖情况**：脑侧政策已完整 —— `brain/agentfarm/longrun.py:427-433`（`ENDED_BY_EVENT="blocked_event"`，task-41 依据的「135 秒零推进」事故）、`:7488-7495`（`eventUp` ⇒ 一次都不动手）、`:7560-7594`（`_event_blocked`：`ended_by=blocked_event`、`checks.no_blocking_modal=false`、不 dismiss/sleep/load_save）；task-228 另有受控推进 `:7361-7451`（仅 `eventUp + DialogueBox + 非提问` 才点，本次 `activeMenu=null` ⇒ 不适用）。**但** `docs/_run10-criteria.md` 只在 task-238 回填语义里出现 `blocked_event→gated`（`:114`），**没有「eventUp 识别 / 恢复」的验收判据** ⇒ 建议补一条（先探测、必要时重起进程，别让整跑白烧）；脑侧行为本身正确，**无需改脑**。
 
 ## 2. `farm.trees` 计数口径（P1）
 
