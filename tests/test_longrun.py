@@ -14374,6 +14374,33 @@ class TestTask28BagEvidence(unittest.TestCase):
         self.assertLessEqual(len(run2._stage_tiles("clear_dead", w.obs(), plot)), 2,
                              "剩余额度=5-3=2 ⇒ 池子最多 2 格")
 
+    def test_loot_cap_is_structural_and_evidence_is_readable(self):
+        """【Lead §8.1 E5】`loot_lost_steps` 到顶后当天**不可能**再新增 clear 掉落：
+
+        结构保证 = `_stage_tiles` 的 clear 池 = min(limit, 5−已丢步数)，到顶即 [] ⇒ 没有 clear
+        动作就没有新掉落。另外 `bag_evidence` 只读带 `loot_lost_steps/loot_lost_limit`，deputy
+        的 C 段可以直接判「E5 未被超过」，不用读散文。
+        """
+        w = self._full(rows=self.MATERIAL_ROWS, weeds=0)
+        w.dirt = {(60 + i, 10) for i in range(4)}
+        w.crops = {t: {"ripe": False, "watered": True, "dead": True} for t in w.dirt}
+        plot = self._plot(sorted(w.dirt))
+        run = self._run(w, FakeWorker(w))
+        run.loot_lost_steps_today = 5
+        # 到顶：clear_area（满包清障闸）与 clear_dead（loot 额度）都必须空池
+        self.assertEqual(run._stage_tiles("clear_dead", w.obs(), plot), [])
+        self.assertEqual(run._stage_tiles("clear_area", w.obs(), self._plot(
+            [(60, 10), (61, 10)])), [])
+        ev = run._bag_relief_evidence(w.obs())
+        self.assertEqual(int(ev["loot_lost_steps"]), 5, ev)
+        self.assertEqual(int(ev["loot_lost_limit"]), longrun_mod.CLEAR_LOOT_LOSS_MAX_STEPS, ev)
+        # 结构保证：到顶后跑一个 clear_dead 阶段也不会产生任何 clear 步 ⇒ 已丢步数不变
+        rep = self._rep()
+        before = int(run.loot_lost_steps_today)
+        run._step_stage("clear_dead", w.obs(), plot, rep)
+        self.assertEqual(int(run.loot_lost_steps_today), before,
+                         "到顶后不得再新增 clear 掉落步")
+
     # ---- 日终：证据进 day_end，checks 10 键不动 ----
     def test_day_end_carries_bag_evidence_and_checks_stay_ten(self):
         """满了且腾不出 ⇒ 诚实收尾 `inventory_blocked`；日终把证据落到只读字段、checks 10 键

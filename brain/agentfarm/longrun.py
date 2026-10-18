@@ -6313,6 +6313,9 @@ class LongRun:
           * `plan_pressure`/`skip_reason` —— 决策层原始读数，便于事后解释"为什么没可卖的"；
           * `exhausted` —— 语义 = 「证据可信 + free_slots==0 + (没有可卖叠 或 轮数到顶 或 叠数到顶)」。
             **证据不可信（`free_slots_status != "ok"`）⇒ 一律 False**：读不到 ≠ 腾不出（fail-closed）。
+          * `loot_lost_steps`/`loot_lost_limit` —— 【E5 可判】当天已发生/允许发生的清障落地丢失步数
+            （只读；`_stage_tiles` 的 clear 闸按 `loot_lost_limit - loot_lost_steps` 收窄阶段 limit，
+            所以调用方拿到这组数就能复核「E5 不可能被超过」，不用读散文）。
         """
         if not isinstance(obs, dict):
             obs = {}
@@ -6345,6 +6348,10 @@ class LongRun:
             "skip_reason": str(plan.get("skipReason") or "") if plan else "free_slots 证据不可用",
             "reserve": int(SLOT_RESERVE),
             "exhausted": exhausted,
+            # 【Lead §8.1 E5】只读读数：当天已丢失 / 全天硬上界；`_stage_tiles` 的 clear 闸按
+            # `limit - loot_lost_steps` 收窄，所以这组数就是"E5 不会被超过"的可复核证据。
+            "loot_lost_steps": int(self.loot_lost_steps_today),
+            "loot_lost_limit": int(CLEAR_LOOT_LOSS_MAX_STEPS),
         }
         self.bag_evidence_today = dict(ev)
         self.bag_relief_exhausted_today = exhausted
