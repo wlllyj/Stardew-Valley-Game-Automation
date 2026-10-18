@@ -1129,6 +1129,19 @@ class LongRun:
         self.stuck_flushes = 0
         # 本日"为了看没做完的格子而往回走"的次数上限（防"来回跑"把一天走光）。
         self.resume_walks = 0
+        # 【task-4 / 0.7.44】`leftover_targets` 的**片区归属**（记账坐标 → fields 田区名；
+        # 观测里没有田区信息时退化成 8×8 空间簇 `@x,y`）。只由 `_step_stage` 在记账时写入，
+        # 换片只从这份账本里挑坐标 —— 绝不臆造。冬 7/12/18 的病灶正是"最近的残留格全是
+        # 砍树预算耗尽后不可执行的树"，没有片区归属时 `_resume_plot` 每次都走回同一片。
+        self.leftover_area: dict[tuple[int, int], str] = {}
+        # 今天已经"回去看过、仍然拿不出目标"的账本邻域（只标 `leftover_targets` 里真有的坐标）。
+        self.resume_stall_tiles: set[tuple[int, int]] = set()
+        # 上一次回片区走的锚点（同一格连续走第二遍 = 该邻域已经看过、没目标 ⇒ 立刻换片）。
+        self.resume_last_anchor: tuple[int, int] | None = None
+        # 今天换过几次片区（上界 = `max_plots_per_day`，与 `resume_walks` 同量级）。
+        self.resume_switches = 0
+        # `frontier_clear` 最近一次真清掉的格（坐标来自当前观测；给换片的 journal 证据用）。
+        self.frontier_last_tile: tuple[int, int] | None = None
         # 【task-50】窗口外干作物（Mod 的 `farm.dryTiles`）：每格试了几次、哪些已经认输。
         # run5 三天 `farm.dryCrops` 恒剩 1、而每个作业区 `leftover=0` —— 那 1 格在玩家 400 格
         # 观测窗口之外，脑侧连坐标都没有，只能 `no_work` 收工（`day_justified=true` 白拿）。
@@ -3702,8 +3715,17 @@ class LongRun:
             "note": f"没有作业区但有 {len(tiles)} 格作物待浇/待收（收尾活，不计入换区配额）",
         }
 
-    def _resume_plot(self, obs: dict[str, Any]) -> dict[str, Any] | None:
+    def _resume_plot(self, obs: dict[str, Any], *, avoid_area: str = "") -> dict[str, Any] | None:
         """【task-49】把今天**已经见过、还没做完**的格子当作业区，回去把它做完。
+
+        【task-4 / 0.7.44】0.7.43 的补充规则：
+
+        * **一次只挑账本里的一片**（`leftover_area` 的田区归属；没田区信息时按 8×8 空间簇）——
+          冬 7/12/18 的连续 5 次空转就是"每次都把最近的同一批不可执行树当目标走回去"；
+          换片由调用方在"邻域已看过、仍然没目标"时触发，坐标全部来自账本记账；
+        * **跳过今天已证明"回去也拿不出目标"的邻域**（`resume_stall_tiles`）与**被围住的格**
+          （`encircled_day`：四邻没有突破口 ⇒ 不是可执行目标，绝不能拿来当"他片可做"的借口）；
+        * `avoid_area` 非空时优先挑**别的**片区（调用方换片用）。
 
         为什么需要它：观测是**以玩家为中心**的窗口，人一换片地，原来那片地的格子就不在
         `tiles[]`/`tillable[]` 里了 ⇒ `_plot_candidates`/`_plot_has_work` 都看不见它们。
@@ -3717,15 +3739,204 @@ class LongRun:
         pending = self._pending_work()
         if not pending:
             return None
+        # 【task-4 / 0.7.44】被围住（没有突破口）不是可执行目标；回去看过没产出的邻域也不再选。
+        skip = set(self.resume_stall_tiles) | set(self.encircled_day)
+        cand = [t for t in pending if t not in skip]
+        if not cand:
+            return None
         pt = FarmWorker.player_tile(obs)
-        tiles = sorted(pending, key=lambda t: (_dist(t, pt), t[1], t[0]))[:25]
+        # 账本片区归属（`_step_stage` 记账时算）：一次只挑一片，避免"最近的同一批格"反复空转。
+        by_area: dict[str, list[tuple[int, int]]] = {}
+        for t in cand:
+            by_area.setdefault(str(self.leftover_area.get(t) or ""), []).append(t)
+        if not by_area:
+            return None
+
+        def _area_key(item: tuple[str, list[tuple[int, int]]]) -> tuple[int, int, str]:
+            area, tiles = item
+            near = min(_dist(t, pt) for t in tiles)
+            # avoid_area 优先挑**别的**片；没有别的片时自然落回同一片（如实记 from/to area）。
+            rank = (0 if area != avoid_area else 1) if avoid_area else 0
+            return (rank, near, area)
+
+        area, tiles = min(by_area.items(), key=_area_key)
+        tiles = sorted(tiles, key=lambda t: (_dist(t, pt), t[1], t[0]))[:25]
+        if not tiles:
+            return None
         return {
-            "zone": "",
+            "zone": area if area and not area.startswith("@") else "",
             "label": "",
+            "area": area,
             "anchor": [tiles[0][0], tiles[0][1]],
             "tiles": tiles,
-            "note": f"今天还有 {len(tiles)} 格没做完（跨片地，玩家窗口看不见）：回去接着做",
+            "note": (f"今天还有 {len(tiles)} 格没做完（{area or '跨片地'}，玩家窗口看不见）：回去接着做"),
         }
+
+    @staticmethod
+    def _resume_anchor(plot: dict[str, Any] | None) -> tuple[int, int] | None:
+        """作业区（含 `_resume_plot` 给的容器）的锚点坐标；拿不到就返回 None（不猜）。"""
+        if not plot:
+            return None
+        a = plot.get("anchor")
+        if isinstance(a, (list, tuple)) and len(a) == 2:
+            try:
+                return (int(a[0]), int(a[1]))
+            except (TypeError, ValueError):
+                return None
+        tiles = plot.get("tiles") or []
+        if tiles:
+            try:
+                return (int(tiles[0][0]), int(tiles[0][1]))
+            except (TypeError, ValueError, IndexError):
+                return None
+        return None
+
+    def _tile_area(self, obs: dict[str, Any], tile: tuple[int, int]) -> str:
+        """账本坐标 → 具名田区（`fields.zones_from_observe` 由**当前观测**现算，不硬编码坐标）。
+
+        观测里没有田区信息（室内 / fields 缺失 / 旧 Mod）时退化成确定性的 8×8 空间簇 `@x,y`：
+        换片只需要"不同的片区"这个粒度，坐标本身仍然来自 `leftover_targets` 记账，绝不臆造。
+        """
+        try:
+            zones = self._zones(obs)
+        except Exception:                       # pragma: no cover - 田区坏了不该拖垮主流程
+            zones = []
+        for z in zones:
+            try:
+                x0, y0, x1, y1 = (int(v) for v in tuple(getattr(z, "bounds")))
+            except Exception:                   # pragma: no cover - 坏田区跳过
+                continue
+            if x0 <= tile[0] <= x1 and y0 <= tile[1] <= y1:
+                return str(getattr(z, "name", "") or "")
+        return f"@{tile[0] // 8},{tile[1] // 8}"
+
+    def _mark_resume_no_output(self, obs: dict[str, Any], plot: dict[str, Any]) -> int:
+        """把"已经走过去看过、仍然拿不出目标"的账本邻域记进当天停滞集合（task-4 / 0.7.44）。
+
+        半径用 `OBSERVE_REACH`（观测可见半径）：走到锚点旁边之后，这个半径内的格子都在传感器
+        里出现过；它们仍然拿不出目标 ⇒ 再走回同一片只是重复 0.7.43 的连续空转。**只标
+        `leftover_targets` 里真有记账的坐标**（不往集合里造坐标）。返回本次新标了几格。
+        """
+        anchor = self._resume_anchor(plot)
+        pending = self._pending_work()
+        if anchor is None:
+            marked = {tuple(t) for t in plot.get("tiles") or []
+                      if tuple(t) in self.leftover_targets}
+        else:
+            marked = {t for t in pending if _dist(t, anchor) <= OBSERVE_REACH}
+            marked |= {tuple(t) for t in plot.get("tiles") or []
+                       if tuple(t) in self.leftover_targets}
+        new = marked - self.resume_stall_tiles
+        self.resume_stall_tiles |= marked
+        return len(new)
+
+    def _resume_switch_or_exhaust(self, obs: dict[str, Any], rep: "DayReport", *,
+                                  plot: dict[str, Any], where: str,
+                                  repeated: bool = False) -> tuple[str, dict[str, Any] | None]:
+        """回片区连续拿不出目标时的**有界退路**（task-4 / 0.7.44）。
+
+        0.7.43 的形态（冬 7/12/18）：`leftover_targets` 里残留 200+ 棵"早先可见、砍树预算耗尽后
+        不可执行"的树 ⇒ `_resume_plot` 连续 5 次把人带回同一片 ⇒ 整天记成
+        `stuck:回片区（work_spot_resume）`，把"今天真没有可执行目标"误报成卡死。按卡面顺序：
+
+        ① **换到另一片/另一田区的账本待做格**（坐标全部来自 `leftover_targets` 记账）⇒
+           journal 复用既有事件 `plot_exhausted`（`source="resume_ledger"`，新增字段见下）；
+        ② **当前观测里可达 + 可清障的一格**（坐标来自本张观测；复用 task-68 的 `frontier_clear`）
+           ⇒ journal `plot_exhausted`（`source="resume_observation"`）+ 既有 `frontier_clear`；
+        ③ 都没有 ⇒ **诚实收工**：journal 复用既有事件 `no_progress_burst`（`exhausted=True`），
+           `ended_reason` 前缀 = `resume_exhausted`（不在 `JUSTIFIED_END_REASONS` 白名单 ⇒
+           `day_justified=False`/不 VERIFIED），绝不写 `stuck:`。
+
+        返回 `("walk", 另一片的作业区)` / `("acted", None：已经真清了一格)` / `("ended", None)`。
+        全部有界：换片次数 < `max_plots_per_day`，总走回次数 < `max_plots_per_day`，
+        frontier 另有 `FRONTIER_CLEAR_MAX`/天的上界。
+        """
+        marked = self._mark_resume_no_output(obs, plot)
+        from_area = str(plot.get("area") or "")
+        from_anchor = self._resume_anchor(plot)
+        alt: dict[str, Any] | None = None
+        if self.resume_switches < self.max_plots_per_day:
+            alt = self._resume_plot(obs, avoid_area=from_area)
+        if alt is not None:
+            self.resume_switches += 1
+            to_anchor = self._resume_anchor(alt)
+            self._journal(
+                "plot_exhausted", recovered=self.resume_switches, zone=self.zone_name,
+                source="resume_ledger", repeated=bool(repeated),
+                from_area=from_area,
+                from_anchor=[from_anchor[0], from_anchor[1]] if from_anchor else None,
+                to_area=str(alt.get("area") or ""),
+                to_anchor=[to_anchor[0], to_anchor[1]] if to_anchor else None,
+                to_tiles=len(alt.get("tiles") or []),
+                stalled_tiles=marked, stalled_total=len(self.resume_stall_tiles),
+                switches=self.resume_switches, limit=int(self.max_plots_per_day),
+                pending=len(self._pending_work()),
+                note="回片区连续拿不出目标 ⇒ 换到另一片的账本待做格再看：坐标全部来自 "
+                     "leftover_targets 记账（不含臆造/已封/被围格）")
+            rep.notes.append(
+                f"回片区拿不出目标 ⇒ 换到另一片（{str(alt.get('area') or '未命名片区')}）的 "
+                f"{len(alt.get('tiles') or [])} 格待做格再看一次"
+                f"（换片 {self.resume_switches}/{int(self.max_plots_per_day)}）")
+            return "walk", alt
+        # ② 当前观测里"可达 + 可清障"的格（坐标来自本张观测）——沿用 task-68 的 frontier_clear。
+        if self._frontier_clear(obs, rep):
+            tile = self.frontier_last_tile
+            self._journal(
+                "plot_exhausted", recovered=self.resume_switches, zone=self.zone_name,
+                source="resume_observation", repeated=bool(repeated),
+                from_area=from_area,
+                from_anchor=[from_anchor[0], from_anchor[1]] if from_anchor else None,
+                to_area="", to_anchor=list(tile) if tile else None, to_tiles=1,
+                stalled_tiles=marked, stalled_total=len(self.resume_stall_tiles),
+                switches=self.resume_switches, limit=int(self.max_plots_per_day),
+                pending=len(self._pending_work()),
+                note="另一片也没有可回看的账本待做格 ⇒ 先清当前观测里可达的一格"
+                     "（frontier_clear；坐标来自本张观测，不臆造）")
+            rep.notes.append(
+                f"回片区/换片都拿不出目标 ⇒ 先清观测里可达的一格 {tile}"
+                f"（frontier_clear {self.frontier_clears}/{FRONTIER_CLEAR_MAX}）")
+            return "acted", None
+        # ③ 确实没有可执行目标 ⇒ 诚实收工（不写 stuck、不判 VERIFIED）。
+        self._resume_exhausted(obs, rep, plot=plot, where=where, marked=marked)
+        return "ended", None
+
+    def _resume_exhausted(self, obs: dict[str, Any], rep: "DayReport", *,
+                          plot: dict[str, Any] | None, where: str, marked: int = 0) -> None:
+        """【task-4 / 0.7.44】回片区/换片/观测都拿不出目标 ⇒ 诚实收工。
+
+        * `ended_reason` 前缀 = `resume_exhausted`：不在 `JUSTIFIED_END_REASONS` 白名单 ⇒
+          `day_justified=False`、当天**绝不 VERIFIED**（与 `no_work`/`stuck` 都区分开）；
+        * `ended_by` 由 `_do_sleep` 决定：睡成功 = `"sleep"`（游戏日真的前进）；
+          睡失败/0 动作被拒 = 原样返回（照样不 VERIFIED）。**绝不写** `stuck:` ——
+          "今天真没有可执行目标"不是卡死；0.7.43 冬 7/12/18 三天就是这么被误报成 stuck 的；
+        * journal 复用既有事件 `no_progress_burst`（`exhausted=True` + 新增字段），不新增事件名。
+        """
+        plot = plot or {}
+        pending = self._pending_work()
+        reasons = self.work_reasons(obs)[:3]
+        encircled_pending = sorted(t for t in pending if t in self.encircled_day)
+        from_anchor = self._resume_anchor(plot)
+        self._journal(
+            "no_progress_burst", count=self.no_progress_cycles,
+            source=f"回片区（{where}）", tiles=len(plot.get("tiles") or []),
+            reasons=reasons, exhausted=True,
+            from_area=str(plot.get("area") or ""),
+            from_anchor=[from_anchor[0], from_anchor[1]] if from_anchor else None,
+            pending=len(pending), stalled_tiles=len(self.resume_stall_tiles),
+            newly_stalled=marked, encircled_pending=len(encircled_pending),
+            switches=self.resume_switches, farm_actions_today=self.farm_actions_today,
+            samples=[[t[0], t[1]] for t in sorted(pending)[:8]],
+            note="回片区 / 换片 / 当前观测都没有可执行目标 ⇒ 今天按 resume_exhausted 诚实收工："
+                 "睡下去让游戏日前进，但绝不写 stuck、也绝不判 VERIFIED")
+        rep.notes.append(
+            f"回片区 {len(self.resume_stall_tiles)} 格 / 换片 {self.resume_switches} 次都拿不出目标、"
+            f"当前观测也没有可执行格 ⇒ 按 resume_exhausted 诚实收工（不判 VERIFIED）")
+        why = (f"resume_exhausted:回片区 {len(self.resume_stall_tiles)} 格都回去看过、"
+               f"换片 {self.resume_switches} 次，当前观测里没有可执行目标"
+               f"（守卫仍说：{'；'.join(reasons) if reasons else '（无）'}）"
+               + self._not_on_farm_suffix())
+        ended_by, ended_reason = self._do_sleep(obs, rep, why)
+        rep.ended_by, rep.ended_reason = ended_by, ended_reason
 
     # ------------------------------------------------------------------ 简报
     def _plot_brief(self, obs: dict[str, Any], plot: dict[str, Any]) -> Brief:
@@ -4703,6 +4914,8 @@ class LongRun:
         """
         if self.frontier_clears >= FRONTIER_CLEAR_MAX:
             return False
+        # 【task-4 / 0.7.44】记下**最近一次**真清掉的格（换片的 journal 证据用；坐标来自本张观测）。
+        self.frontier_last_tile = None
         # 用逐格视图（`tiles_of`）而不是 `_tile_states`：这里要看 `kind`/`crop`/`standable`。
         tiles = FarmWorker.tiles_of(obs) or {}
         player = FarmWorker.player_tile(obs)
@@ -4746,6 +4959,7 @@ class LongRun:
                           note="【task-68】一轮不许零动作：清的是可达的杂草/石头/树枝，"
                                "不是当前阶段目标")
             if acted:
+                self.frontier_last_tile = (int(tile[0]), int(tile[1]))
                 return True
         return False
 
@@ -6716,11 +6930,16 @@ class LongRun:
         for s in all_steps:
             if s.ok and s.tile:
                 self.leftover_targets.discard(tuple(s.tile))
+                self.leftover_area.pop(tuple(s.tile), None)
         for t in leftover:
             tt = tuple(t)
             if tt in self.blocked:
                 continue                    # 判据证明这一格今天干不动 ⇒ 不算"还有活"
             self.leftover_targets.add(tt)
+            # 【task-4 / 0.7.44】记账时把坐标归到**账本片区**（fields 田区 / 8×8 空间簇）：
+            # 换片只从这份归属里挑"另一片"，坐标本身仍来自 leftover（绝不臆造）。
+            if tt not in self.leftover_area:
+                self.leftover_area[tt] = self._tile_area(fresh, tt)
         skipped = [s for s in all_steps if s.skipped]
         ok_all = [s for s in all_steps if s.ok]
         # 【task-242】清障阶段的 `ok` 只数**真的改变了格子**的成功步：`code=="already"`
@@ -7765,6 +7984,12 @@ class LongRun:
         self.encircled_day = set()
         self.frontier_clears = 0
         self.resume_walks = 0
+        # 【task-4 / 0.7.44】回片区"换片/停滞"账本每日重置：坐标只来自当天的 `leftover_targets`。
+        self.leftover_area = {}
+        self.resume_stall_tiles = set()
+        self.resume_last_anchor = None
+        self.resume_switches = 0
+        self.frontier_last_tile = None
         # 【task-50】窗口外干作物的重试记账，每天清零（第二天壶/世界都变了，重新判）。
         self.far_dry_tries = {}
         self.far_dry_given_up = set()
@@ -7948,6 +8173,16 @@ class LongRun:
                     if self.inventory_blocked_today:
                         self._end_inventory_blocked(obs, rep)
                         break
+                    # 【task-4 / 0.7.44】回片区/换片/观测清障都用尽，残留格全是"已停滞/被围住"
+                    # ⇒ 今天真没有可执行目标：按 `resume_exhausted` 诚实收工，
+                    # 不许落到下面的 `stuck:守卫说还有活…`（那不是卡死，是"没活可执行"）。
+                    _pending_now = self._pending_work()
+                    if _pending_now and not (set(_pending_now)
+                                             - self.resume_stall_tiles
+                                             - self.encircled_day):
+                        self._resume_exhausted(obs, rep, plot=None,
+                                               where="work_spot_none", marked=0)
+                        break
                     why = ("no_work" if not reasons else
                            "stuck:守卫说还有活（" + "；".join(reasons)
                            + "）但没有任何作业区拿得出目标" + self._not_on_farm_suffix())
@@ -7959,24 +8194,49 @@ class LongRun:
                 # 【task-49】`_resume_plot` 给的是**别处**的格子（玩家窗口看不到）⇒ 先走回去，
                 # 让传感器重新看见它们再谈策略。上界 `resume_walks < max_plots_per_day`
                 # （与"换片地"同一个量级）；走不动就落回正常判定，不空转。
+                # 【task-4 / 0.7.44】同一锚点连走第二遍 = 该邻域已经看过、仍然拿不出目标 ⇒
+                # 先换到另一片的账本待做格，再尝试观测里可达的一格；都没有才按
+                # `resume_exhausted` 诚实收工（绝不写 `stuck:回片区…`、绝不 VERIFIED）。
                 if work_spot is None and picked is plot and self.resume_walks < self.max_plots_per_day:
+                    self._resume_reevaluate(where="work_spot_resume")  # 【task-134 A】
+                    anchor = self._resume_anchor(plot)
+                    pt = FarmWorker.player_tile(obs)
+                    # "同一锚点 + 人已经在它旁边" = 这片邻域已经走进传感器看过、仍拿不出目标。
+                    # 只比锚点会把"几小时前走过、现在人还在别处"误判成重复 ⇒ 必须同时看距离。
+                    repeated = (anchor is not None and anchor == self.resume_last_anchor
+                                and (pt is None
+                                     or _dist((int(pt[0]), int(pt[1])), anchor) <= OBSERVE_REACH))
                     self.resume_walks += 1
                     self.no_progress_cycles += 1                       # 【task-134 A】
-                    self._resume_reevaluate(where="work_spot_resume")  # 【task-134 A】
-                    if self.no_progress_cycles >= PLOT_EXHAUSTED_BURST:
-                        rep.ended_by, rep.ended_reason = self._no_progress_stop(
-                            obs, rep, source="回片区（work_spot_resume）",
-                            tiles=len(plot["tiles"]))
-                        break
+                    switched = False
+                    if repeated or self.no_progress_cycles >= PLOT_EXHAUSTED_BURST:
+                        action, alt = self._resume_switch_or_exhaust(
+                            obs, rep, plot=plot, where="work_spot_resume",
+                            repeated=bool(repeated))
+                        if action == "ended":
+                            break
+                        if action == "acted":
+                            self.idle_rounds = 0
+                            continue
+                        plot = alt
+                        switched = True
                     walked = self._walk_into_plot(obs, plot)
                     self._journal("resume_walk", zone=self.zone_name, tiles=len(plot["tiles"]),
                                   walked=bool(walked), attempt=self.resume_walks,
-                                  note="回到今天还没做完的格子旁边（玩家窗口看不见它们）")
+                                  switched=bool(switched),
+                                  note=("回片区拿不出目标 ⇒ 换到另一片的待做格旁边再看一次"
+                                        if switched else
+                                        "回到今天还没做完的格子旁边（玩家窗口看不见它们）"))
                     if walked:
                         self._actions += 1
                         rep.notes.append(
                             f"回到没做完的 {len(plot['tiles'])} 格旁边再看一次"
-                            f"（resume_walk {self.resume_walks}/{self.max_plots_per_day}）")
+                            f"（resume_walk {self.resume_walks}/{self.max_plots_per_day}"
+                            + (f"，换片 {self.resume_switches}" if switched else "") + "）")
+                        self.resume_last_anchor = self._resume_anchor(plot)
+                        if switched:
+                            self.no_progress_cycles = 0
+                            self.idle_rounds = 0
                         continue
 
             brief = self._plot_brief(obs, plot)

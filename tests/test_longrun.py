@@ -3167,6 +3167,235 @@ class TestTask49CrossPlotNoWork(unittest.TestCase):
         self.assertLessEqual(run.resume_walks, run.max_plots_per_day)
 
 
+# ------------------------------------- task-4 / 0.7.44：回片区拿不出目标时的换片与诚实收工
+class TestTask4ResumeNoOutput(unittest.TestCase):
+    """【task-4 / 0.7.44】`work_spot_resume` 拿不出目标时：换片 → 观测清一格 → 诚实收工。
+
+    真机病灶（`logs/longrun-runA8-0743.jsonl` 冬 7/12/18 三天）：砍树预算耗尽后，
+    `_leftover("clear_area")` 对树取的是**全场可见 tmap**，`leftover_targets` 里还留着
+    200+ 棵"早先可见、现在不可执行"的树；`_resume_plot` 每次都把最近的同一批树当目标
+    走回去 ⇒ 连续 5 次无产出 ⇒ 整天 `stuck:回片区（work_spot_resume）`（= 缺陷误报成卡死）。
+    本类钉死新口径：
+
+    ① 换到**另一片/另一田区**的账本待做格（坐标只能来自 `leftover_targets`，不许臆造）；
+    ② 当前观测里还有"可达 + 可清障"的格 ⇒ 先清一格（复用 `frontier_clear`，坐标来自观测）；
+    ③ 都没有 ⇒ `resume_exhausted:` **诚实收工**（`ended_by=sleep`、`day_justified=false`、
+       不 VERIFIED），**绝不**再写 `stuck:回片区…`；
+    ④ 被围住的格（`encircled_day`）不是可执行目标（不许拿它当"他片可做"）。
+    """
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list:
+        return [e for e in run.entries if e["event"] == name]
+
+    @staticmethod
+    def _plot(area: str, tiles, anchor=None) -> dict:
+        return {"zone": "", "label": "", "area": area,
+                "anchor": list(anchor or tiles[0]), "tiles": list(tiles), "note": ""}
+
+    def _run(self, w: FakeWorld):
+        """真 `FarmWorker` + 数数假桥（`frontier_clear`/`_do_sleep` 都走真执行层）。"""
+        client = _CountingClient(w)
+        worker = FarmWorker(client, log=lambda *_: None)
+        run = make_run(w, target_days=1, max_days=1,
+                       client_factory=lambda: client, worker_factory=lambda c: worker)
+        run.worker = worker
+        run.client = client
+        return run
+
+    def _rep(self) -> DayReport:
+        return DayReport(day_key=("winter", 1, 7), started_at=0.0)
+
+    def test_ledger_records_area_for_leftover_tiles(self):
+        """账本必须给残留格记上片区归属 —— 换片只从这份账本里挑，坐标不臆造。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        w.fail_status[(60, 10)] = "timeout"            # 没做成、也不封格 ⇒ 进 leftover
+        run = self._run(w)
+        w.player_tile = [60, 12]
+        rep = self._rep()
+
+        run._step_stage("clear_area", w.obs(), self._plot("field_nw", [(60, 10)]), rep)
+
+        self.assertIn((60, 10), run.leftover_targets)
+        area = run.leftover_area.get((60, 10))
+        self.assertTrue(area, f"残留格必须有片区归属（fields 田区 / @x,y 空间簇）：{run.leftover_area}")
+
+    def test_resume_plot_prefers_another_area_and_skips_encircled(self):
+        """`_resume_plot`：默认最近一片、`avoid_area` 优先别片、并跳过被围住/已停滞的格。"""
+        w = MyopicWorld(weeds=0, seeds=0, money=0)
+        w.player_tile = [62, 14]
+        run = self._run(w)
+        run.leftover_targets = {(60, 10), (80, 10), (90, 10)}
+        run.leftover_area = {(60, 10): "field_nw", (80, 10): "field_ne", (90, 10): "field_se"}
+
+        nearest = run._resume_plot(w.obs())
+        self.assertEqual(nearest["area"], "field_nw", nearest)
+        self.assertEqual(tuple(nearest["tiles"][0]), (60, 10))
+
+        other = run._resume_plot(w.obs(), avoid_area="field_nw")
+        self.assertNotEqual(other["area"], "field_nw", "换片必须优先别的片区")
+        self.assertIn(tuple(other["tiles"][0]), run.leftover_targets,
+                      "换片坐标只能来自账本记账（不许臆造）")
+
+        # 被围住 / 已证明回去也没产出的格都不是可执行目标
+        run.encircled_day = {(80, 10)}
+        run.resume_stall_tiles = {(60, 10)}
+        third = run._resume_plot(w.obs())
+        self.assertEqual(third["area"], "field_se", third)
+
+        run.resume_stall_tiles = {(60, 10), (90, 10)}
+        self.assertIsNone(run._resume_plot(w.obs()),
+                          "剩下的全被围住/已停滞 ⇒ 拿不出可执行目标（不许把 encircled 当可做）")
+
+    def test_resume_no_output_switches_to_other_area_from_ledger(self):
+        """① 回片区拿不出目标 ⇒ 换到另一片的账本待做格（`plot_exhausted` + `source=resume_ledger`）。"""
+        w = MyopicWorld(weeds=0, seeds=0, money=0)
+        w.player_tile = [80, 11]
+        w.revealed = False
+        run = self._run(w)
+        # 账本：field_nw 两格（回去看过、拿不出目标）+ field_ne 一格待做格
+        run.leftover_targets = {(60, 10), (60, 11), (85, 10)}
+        run.leftover_area = {(60, 10): "field_nw", (60, 11): "field_nw", (85, 10): "field_ne"}
+        rep = self._rep()
+        plot = self._plot("field_nw", [(60, 10), (60, 11)])
+
+        action, alt = run._resume_switch_or_exhaust(w.obs(), rep, plot=plot, where="unit")
+
+        self.assertEqual(action, "walk", rep.notes)
+        self.assertIsNotNone(alt)
+        self.assertEqual(alt["area"], "field_ne")
+        self.assertEqual(tuple(alt["tiles"][0]), (85, 10))
+        self.assertTrue(set(map(tuple, alt["tiles"])) <= run.leftover_targets,
+                        "换片坐标必须全部来自 leftover_targets")
+        self.assertEqual(run.resume_switches, 1)
+        self.assertFalse(rep.ended_by, "换片成功不许收工")
+        ev = self._events(run, "plot_exhausted")[-1]
+        self.assertEqual(ev["source"], "resume_ledger", ev)
+        self.assertEqual(ev["from_area"], "field_nw", ev)
+        self.assertEqual(ev["to_area"], "field_ne", ev)
+        self.assertEqual(ev["to_anchor"], [85, 10], ev)
+        self.assertEqual(ev["switches"], 1, ev)
+        self.assertTrue(run.resume_stall_tiles >= {(60, 10), (60, 11)},
+                        "回去看过没产出的邻域要记停滞，否则下一轮又走回同一片")
+
+    def test_resume_no_output_clears_one_observed_tile_before_giving_up(self):
+        """② 另一片没有可回看格、但观测里有可达可清障格 ⇒ 先清一格（`source=resume_observation`）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        w.player_tile = [60, 12]
+        run = self._run(w)
+        run.leftover_targets = {(60, 10)}
+        run.leftover_area = {(60, 10): "field_x"}
+        rep = self._rep()
+        plot = self._plot("field_x", [(60, 10)])
+
+        action, alt = run._resume_switch_or_exhaust(w.obs(), rep, plot=plot, where="unit")
+
+        self.assertEqual(action, "acted", rep.notes)
+        self.assertIsNone(alt)
+        self.assertNotIn((60, 10), w.blockers, "frontier_clear 必须真的清掉一格")
+        self.assertEqual(run.frontier_clears, 1)
+        self.assertFalse(rep.ended_by, "清掉一格 = 还有可执行目标，不许收工")
+        ev = [e for e in self._events(run, "plot_exhausted")
+              if e.get("source") == "resume_observation"]
+        self.assertEqual(len(ev), 1, run.entries)
+        self.assertEqual(ev[0]["to_anchor"], [60, 10], ev[0])
+        self.assertTrue(self._events(run, "frontier_clear"), run.entries)
+
+    def test_resume_no_output_sleeps_with_resume_exhausted_reason(self):
+        """③ 真没有可执行目标 ⇒ `resume_exhausted:` 诚实收工，不写 stuck、不判 VERIFIED。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.player_tile = [62, 14]
+        run = self._run(w)
+        run.leftover_targets = {(60, 10)}
+        run.leftover_area = {(60, 10): "field_x"}
+        run.farm_actions_today = 46                 # 真机冬 7：收工前已做成 46 步
+        rep = self._rep()
+        plot = self._plot("field_x", [(60, 10)])
+
+        action, alt = run._resume_switch_or_exhaust(w.obs(), rep, plot=plot, where="unit")
+
+        self.assertEqual(action, "ended", rep.notes)
+        self.assertIsNone(alt)
+        self.assertEqual(rep.ended_by, "sleep", rep.ended_reason)
+        self.assertTrue(str(rep.ended_reason).startswith("resume_exhausted:"), rep.ended_reason)
+        self.assertFalse(str(rep.ended_reason).startswith("stuck:"),
+                         f"没有可执行目标 ≠ 卡死：{rep.ended_reason}")
+        self.assertFalse(is_justified_end(rep.ended_by, rep.ended_reason),
+                         "resume_exhausted 不在 JUSTIFIED_END_REASONS 白名单 ⇒ day_justified=false")
+        self.assertEqual(w.sleeps, 1)
+        ev = [e for e in self._events(run, "no_progress_burst") if e.get("exhausted")]
+        self.assertEqual(len(ev), 1, run.entries)
+        self.assertEqual(ev[0]["pending"], 1, ev[0])
+        self.assertEqual(ev[0]["switches"], 0, ev[0])
+
+    def test_encircled_tile_is_not_an_executable_resume_target(self):
+        """④ 被围住的格不算可执行目标：不许拿它去换片/当"他片可做"，只能如实收工。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.player_tile = [62, 14]
+        run = self._run(w)
+        run.leftover_targets = {(60, 10)}
+        run.leftover_area = {(60, 10): "field_nw"}
+        run.encircled_day = {(60, 10)}              # 四邻没有突破口 ⇒ 不是可执行目标
+        run.farm_actions_today = 5
+        rep = self._rep()
+        plot = self._plot("field_nw", [(60, 10)])
+
+        action, alt = run._resume_switch_or_exhaust(w.obs(), rep, plot=plot, where="unit")
+
+        self.assertEqual(action, "ended", rep.notes)
+        self.assertIsNone(alt)
+        self.assertEqual(self._events(run, "plot_exhausted"), [],
+                         "被围住的格不许当换片目标")
+        ev = [e for e in self._events(run, "no_progress_burst") if e.get("exhausted")][-1]
+        self.assertEqual(ev["encircled_pending"], 1, ev)
+        self.assertEqual(ev["pending"], 1, ev)
+        self.assertTrue(str(rep.ended_reason).startswith("resume_exhausted:"), rep.ended_reason)
+        self.assertFalse(is_justified_end(rep.ended_by, rep.ended_reason))
+
+    def test_day_end_resume_exhausted_is_not_verified(self):
+        """端到端：整天按 `resume_exhausted:` 收工 ⇒ `day_end` 是 sleep + 可执行原因、不 VERIFIED。
+
+        用 `_ensure_plot` 注入"本片观测拿不出作业区、账本里还留着跨片地残留"的形态：先真的做
+        一轮 `clear_area`（timeout 格进 leftover、不封格），再把玩家挪走 —— 这正是 0.7.43
+        冬 7/12/18 的最后一段。旧代码在这里会写 `stuck:回片区（work_spot_resume）`；
+        新口径必须是 `resume_exhausted:`（sleep、day_justified=false、不 VERIFIED）。
+        """
+        w = MyopicWorld(weeds=0, seeds=0, money=0)
+        for t in ((60, 10), (60, 11)):
+            w.blockers[t] = "weed"
+            w.fail_status[t] = "timeout"            # 做过、没拿到结论 ⇒ 残留进账本、不封格
+        w.player_tile = [60, 12]
+        w.revealed = True
+        run = self._run(w)
+        seeded = {"n": 0}
+
+        def ensure(obs, rep):
+            seeded["n"] += 1
+            if seeded["n"] == 1:
+                run._step_stage("clear_area", w.obs(),
+                                self._plot("field_nw", [(60, 10), (60, 11)]), rep)
+                w.player_tile = [62, 14]             # 换到别处：残留格不在观测窗口里
+                w.revealed = False
+            return None                              # 本片观测永远拿不出作业区
+
+        run._ensure_plot = ensure
+        code = run.run()
+
+        rep = run.days[0]
+        self.assertEqual(code, 1, "没有 VERIFIED 就不许返 0")
+        self.assertFalse(rep.verified, rep.checks)
+        self.assertEqual(rep.ended_by, "sleep", rep.ended_reason)
+        self.assertTrue(str(rep.ended_reason).startswith("resume_exhausted:"), rep.ended_reason)
+        self.assertFalse(str(rep.ended_reason).startswith("stuck:"), rep.ended_reason)
+        self.assertFalse(rep.checks.get("day_justified", True), rep.checks)
+        self.assertTrue(self._events(run, "resume_walk"), "回片区必须留痕")
+        bursts = [e for e in self._events(run, "no_progress_burst") if e.get("exhausted")]
+        self.assertEqual(len(bursts), 1, run.entries)
+        self.assertEqual(w.sleeps, 1, "诚实收工必须真睡过去（游戏日前进）")
+
+
 # --------------------------------------------------------------- task-50：窗口外干作物
 class DryTilesWorld(MyopicWorld):
     """task-50 夹具：`farm.dryTiles` 报出"玩家观测窗口之外"的干作物坐标（run5 真机形态）。
