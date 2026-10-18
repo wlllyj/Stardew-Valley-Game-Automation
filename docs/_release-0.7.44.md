@@ -48,3 +48,19 @@
 - 春季农务腿（买种/播种/浇水/收获）是 **0.7.43 及以前从未在真机被完整验证过**的能力面；A9 可能暴露新缺陷 ⇒ 届时按「臂有效性」判：若被新缺陷支配，先止损再决定是否冻 0.7.45。
 - A8 的无人值守 7 次落盘（冬 19→26）全部**列废数据**，不进任何证据；A8 终态存档四件【无法判定】。
 - `event_wait`/`event_blocked` 在 A8 真账本 **0 条**（事件闸门仍缺真机正例）。
+
+## §6 冻结记录（2026-10-18 18:2x，Lead 实测原文登记）
+
+| 项 | 读数 |
+| --- | --- |
+| 冻结提交 | `37cac51`（`chore(release): 冻结 0.7.44（四卡收工/分配死循环修复）`，3 文件：`brain/agentfarm/bridge.py` / `mod/AgentFarm.Bridge/manifest.json` / `tools/_note-0744.txt`） |
+| 版本一致性 | manifest `Version=0.7.44` / brain `MOD_VERSION_EXPECTED="0.7.44"` |
+| dll | **`806C1069D217EEEFAB6D3354BA09DA049847D97EE5B4A1D2D65845F1DCB0B17F`**（286208B；**与 0.7.43 冻结 dll 逐字节相同 = 本批 Mod 无代码变更，符合 §2 步 4 预期**；repo 与装机同哈希） |
+| manifest | `77003E0B9EBD0C0644787831AF814274A9283BFC857BB5DF271FB3D9BF49DB92`（71491B；repo 与装机同哈希） |
+| build / C# 自检 | `dotnet build -c Release --no-incremental` = **0 警 0 错**；C# 自检 **91 断言全部通过**（rc=0） |
+| check-release | `--expect 0.7.44` **六项全绿**：版本一致 / dll 不比源码旧 / `py_compile`（27 文件）/ 全量单测 **`Ran 1277 tests / OK`** / 工作树干净（末行文案仍写「四项全绿」，系脚本旧文案，六项读数逐条见输出） |
+| 装机 | `deploy-mod.py --no-quit`：0.7.43→0.7.44，桥 `modVersion=0.7.44 port=17890`，`load_save` 进 `Wahaha_450799035`（FarmHouse(9,9)）；`goto Farm` OK（landing=[64,15]，7643ms）；`preflight --expect 0.7.44` ⇒ ✅ 可以起跑（`logs/runA9-baseline.json` `7082F6F4…`，701B） |
+| 收尾 | `stop-game.py --wait 45` ⇒ 优雅退出；进程 0 / 根 `bridge.json` 已删 / 17890 无 LISTENING / AppData 侧 bridge.json 无残留 |
+| A9-start 备份 | `logs/ab-backup/A9-start/`：`Wahaha_450799035` `053CAA71…`(3141826B) / `SaveGameInfo` `3D964F3F…`(32305B) / MANIFEST `5479354B…`(1222B)；起点 = 第 1 年 **冬 26**（17:03:52 存档，2767g、作物 0、Wheat Seeds 10、waterLeft 13、farmingLevel 3） |
+
+> 缺口/限制（照实）：①真机冒烟（§3）尚未做，未绿则 A9 不放行；②`deploy-mod` 自带的存档备份在 `logs/deploy-*/`，与本表的 A9-start 不是同一个口径，判据以 A9-start MANIFEST 为准；③本表所有哈希均为 2026-10-18 18:2x 实测，未使用任何事后推算值。
