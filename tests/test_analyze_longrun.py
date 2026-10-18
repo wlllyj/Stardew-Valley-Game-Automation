@@ -4692,5 +4692,158 @@ class TestIntentCoverageAndGaps(unittest.TestCase):
         self.assertIn("task-226", args.repairs)
 
 
+class TestTask231GapsProblemAndNoTargetEvidence(unittest.TestCase):
+    """task-231（dev task-230 P0-4.4/4.5 + P0-3.3）：gaps 读写失败可判红 + `no_target` 证据包。
+
+    口径（`docs/_run10-criteria.md` §8.2 / §8.3.7）：
+      * `no_target` 必须带 `evidence.stage_tiles_empty is True`，否则判红；
+      * gaps 读/写失败（`gaps_load_failed` / `gaps_write_failed` 事件，或 `day_end.gaps_problem` 非空）
+        = problem ⇒ 判红（brain task-230 P0-4.5 明确要求"写失败必须可判红"）；
+      * 旧账本没有这些字段/事件 ⇒ 【无法判定】，**缺失 ≠ 通过**，绝不判红。
+    """
+
+    _CHECKS = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+               "crops_watered": True, "day_justified": True, "watered_outdoor": True,
+               "no_unmet_stages": True}
+    _FW = {"t": 9.0, "location": "Farm", "tiles": 84, "crops": 31, "dry": 0, "scope": "farm"}
+
+    def _run(self, argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = mod.main(argv)
+        return rc, buf.getvalue()
+
+    def _ledger(self, name, *, extra=(), coverage=None, gaps_problem=None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        overrides = {"checks": dict(self._CHECKS), "final_water": dict(self._FW)}
+        if coverage is not None:
+            overrides["intent_coverage"] = coverage
+        if gaps_problem is not None:
+            overrides["gaps_problem"] = gaps_problem
+        return write_ledger(tmp.name, name, integrity_ledger(
+            extra_events=tuple(extra), day_end_overrides=overrides))
+
+    def _rec(self, ident="1#01", task="clear_area", *, steps=0, requested=1, ok=0, failed=0,
+             unexecuted=1, reasons=None, **kw):
+        rec = {"intent_id": ident, "task": task, "source": "llm", "area_hint": "field_ne",
+               "boundary": "", "requested_tiles": requested, "ok_tiles": ok,
+               "failed_tiles": failed, "unexecuted_tiles": unexecuted,
+               "executed_steps": steps, "reasons": dict(reasons or {}),
+               "reasons_are_intent_level": False}
+        rec.update(kw)
+        return rec
+
+    def _subjects(self, rep):
+        return subjects(rep["categories"]["intent"])
+
+    # ---- §8.3.7：no_target 必须有证据包 ----
+
+    def test_no_target_without_evidence_is_red(self):
+        path = self._ledger("t231_nt_noev.jsonl", coverage=[
+            self._rec(reasons={"no_target": 1})])
+        rep = report_for(path, days=1)
+        hit = [s for s in self._subjects(rep) if s.startswith("missed:intent_no_target_evidence:")]
+        self.assertTrue(hit, f"no_target 无证据必须判红，实际 subjects={self._subjects(rep)}")
+        rc, _ = self._run(["--journal", path, "--days", "1"])
+        self.assertEqual(rc, 1, "有红 ⇒ 退出码 1（task-65）")
+
+    def test_no_target_with_evidence_is_not_red(self):
+        path = self._ledger("t231_nt_ev.jsonl", coverage=[
+            self._rec(reasons={"no_target": 1},
+                      evidence={"stage_tiles_empty": True, "obs_seq": 42})])
+        rep = report_for(path, days=1)
+        self.assertFalse([s for s in self._subjects(rep)
+                          if s.startswith("missed:intent_no_target_evidence:")],
+                         "有 evidence.stage_tiles_empty=true ⇒ 不判红")
+        self.assertEqual(rep["red"]["total"], 0)
+        und = " ".join(rep.get("undecidable") or [])
+        self.assertNotIn("evidence.stage_tiles_empty", und,
+                         "有证据包时 FIELD_PROBES 不该再报缺失")
+
+    # ---- P0-4.4/4.5：gaps 读写失败 = problem（可判红） ----
+
+    def test_gaps_load_failed_event_is_red(self):
+        path = self._ledger("t231_gload.jsonl", extra=[
+            {"event": "gaps_load_failed", "t": 3.0, "day": MODAL_DAY,
+             "path": "logs/x-gaps.json", "error": "bad json",
+             "archived": "x-gaps.json.bad.1758770000"}])
+        rep = report_for(path, days=1)
+        self.assertIn("missed:gaps_io_failed:gaps_load_failed", self._subjects(rep))
+        rc, out = self._run(["--journal", path, "--days", "1"])
+        self.assertEqual(rc, 1)
+        self.assertIn("gaps_load_failed", out)
+
+    def test_gaps_write_failed_event_is_red(self):
+        path = self._ledger("t231_gwrite.jsonl", extra=[
+            {"event": "gaps_write_failed", "t": 3.0, "day": MODAL_DAY,
+             "path": "logs/x-gaps.json", "error": "disk full"}])
+        rep = report_for(path, days=1)
+        self.assertIn("missed:gaps_io_failed:gaps_write_failed", self._subjects(rep))
+
+    def test_gaps_problem_field_is_red(self):
+        path = self._ledger(
+            "t231_gprob.jsonl",
+            coverage=[self._rec(ok=1, requested=1, failed=0, unexecuted=0, steps=1)],
+            gaps_problem="缺口清单写失败（只影响提示词，但这是缺陷）：disk full")
+        rep = report_for(path, days=1)
+        self.assertIn("missed:gaps_problem", self._subjects(rep))
+        self.assertEqual(rep["gaps"]["gaps_problem_days"], 1)
+        self.assertEqual(rep["gaps"]["io_events"], 0)
+
+    def test_old_ledger_without_gaps_fields_is_undecidable_not_red(self):
+        path = self._ledger("t231_old.jsonl")
+        rep = report_for(path, days=1)
+        self.assertEqual(rep["red"]["total"], 0, "缺失 ≠ 通过：旧账本不许因 gaps 字段判红")
+        und = " ".join(rep.get("undecidable") or [])
+        self.assertIn("day_end.gaps_problem", und)
+        self.assertIn("gaps_load_failed", und)
+        self.assertIn("gaps_write_failed", und)
+
+    # ---- 源码漂移（字段/码集/映射表改名会静默失效 ⇒ 必须扫源码） ----
+
+    def test_intent_flag_field_names_match_brain_source(self):
+        with open(BRAIN_LONG_RUN, encoding="utf-8") as fh:
+            src = fh.read()
+        for field in ("reasons_are_intent_level", "bad_reasons", "actionless"):
+            self.assertIn(f'"{field}"', src, f"brain 源码里找不到字段 {field}（改名了？）")
+        with open(TOOL, encoding="utf-8") as fh:
+            tool_src = fh.read()
+        for field in ("reasons_are_intent_level", "bad_reasons", "actionless"):
+            self.assertIn(field, tool_src, f"analyzer 侧必须引用字段 {field}")
+
+    def test_reason_codes_match_criteria_doc(self):
+        with open(os.path.join(ROOT, "docs", "_run10-criteria.md"), encoding="utf-8") as fh:
+            doc = fh.read()
+        m = re.search(r"目标集合 \*\*12 码\*\*：(.+)", doc)
+        self.assertIsNotNone(m, "criteria §8.2 找不到『目标集合 **12 码**』一行")
+        doc_codes = set(re.findall(r"`([a-z_]+)`", m.group(1)))
+        self.assertEqual(doc_codes, set(mod.INTENT_REASON_CODES_DOC),
+                         "analyzer 的 DOC 码集必须与 criteria §8.2 目标集合逐字一致")
+        self.assertEqual(set(mod.INTENT_REASON_CODES_BRAIN), doc_codes,
+                         "brain 的 12 码必须与文档目标集合一致（task-230 已补 failed）")
+        self.assertEqual(set(mod.INTENT_REASON_CODES), doc_codes)
+
+    def test_step_code_to_reason_targets_are_in_closed_set(self):
+        with open(BRAIN_LONG_RUN, encoding="utf-8") as fh:
+            src = fh.read()
+        m = re.search(r"STEP_CODE_TO_REASON[^=]*=\s*\{(.*?)\n\}", src, re.S)
+        self.assertIsNotNone(m, "brain 找不到 STEP_CODE_TO_REASON 字面量")
+        vals = set(re.findall(r':\s*"([a-z_]*)"', m.group(1)))
+        self.assertTrue(vals)
+        bad = {v for v in vals if v and v not in mod.INTENT_REASON_CODES}
+        self.assertEqual(bad, set(), f"映射表值域超出闭合集：{bad}")
+
+    def test_capability_reason_codes_keep_tool_level(self):
+        with open(BRAIN_LONG_RUN, encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn('return "tool_level"', src,
+                      "brain 的 _tile_reason 会给工具不够格的格返回 tool_level")
+        self.assertIn("_gaps_merge(reason_rows", src,
+                      "这些行同路径写进 gaps ⇒ tool_level 必须算能力缺口（两侧同义）")
+        self.assertEqual(tuple(mod.CAPABILITY_REASON_CODES),
+                         ("deferred_capability", "tool_level"))
+
+
 if __name__ == "__main__":
     unittest.main()

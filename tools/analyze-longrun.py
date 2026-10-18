@@ -15,6 +15,14 @@
      **被游戏拒绝**（tool_refused / refused_stage / refused_summary，task-63/task-66：
      till 的 tool_ineffective/precondition_failed；政策同上但**独立起界**，两套豁免不许互相掩护）
      与没拿到结论（inconclusive_fail，占配额 ⇒ "配额被吃掉 N 格"）
+  6. 意图-执行对账（§8，`docs/_run10-criteria.md` §8）：每个策略意图都必须有执行对账
+     （`decision.plans[]` ↔ `day_end.intent_coverage[]`）与**闭合集**原因码；**对账记录不是豁免**，
+     能力缺口（`deferred_capability`/`tool_level`）必须落进 `<journal>-gaps.json` 并被追修复卡。
+     判红 9 条（§8.3）：有计划无对账 / 0 步无原因码 / 原因码出集 / 能力缺口没落盘 /
+     gaps kind 不在 DEFERRED_KINDS / 瓦片不变式不符 / `no_target` 无证据；≥3 天未修=⚠；
+     旧账本缺字段=【无法判定】。另：gaps 读/写失败（`gaps_load_failed`/`gaps_write_failed`、
+     `day_end.gaps_problem` 非空）= problem ⇒ 判红。**§8 的红只由本工具判**，
+     `tools\verify-run3.py` 对 §8 只出 info（不动它的 day_end 白名单）。
 外加：每天一行摘要、3-8 条带证据行的改进建议、"本账本无法判定"清单。
 
 与 `tools\\verify-run3.py` 的关系：两者**独立读数、交叉核对**。本工具只做分析、不判验收；
@@ -711,6 +719,17 @@ FIELD_PROBES = [
     ("event:decision.plans[*].intent_id", "decision.plans[*].intent_id",
      "计划里每个意图的 `intent_id`（task-219 ⇒ 必须与 `day_end.intent_coverage` 一一对上；"
      "「计划有、对账没有」= 无声缩水 ⇒ 判红）"),
+    # task-231（dev task-230 P0-4.5 / P0-3.3）：gaps 读/写失败 + `no_target` 证据包
+    ("day_end.gaps_problem", "day_end.gaps_problem",
+     "缺口清单读/写失败的缺陷字段（task-230：非空 ⇒ 判红；**缺失 = 旧账本，缺失 ≠ 通过**）"),
+    ("event:gaps_load_failed", "gaps_load_failed",
+     "缺口清单读失败 / 坏文件已归档（task-230 P0-4.4/4.5：path/error/archived ⇒ **可判红问题**）"),
+    ("event:gaps_write_failed", "gaps_write_failed",
+     "缺口清单写盘失败（task-230 P0-4.5：path/error ⇒ **可判红问题，不是 info**）"),
+    ("day_end.intent_coverage[*].evidence.stage_tiles_empty",
+     "day_end.intent_coverage[*].evidence.stage_tiles_empty",
+     "`no_target` 的证据包（task-230 P0-3.3：`stage_tiles_empty` + `obs_seq`/`counts`；"
+     "**没有证据的 no_target 一律判红**）"),
 ]
 OUTCOME_RE = re.compile(
     r"目标\s*(\d+)\s*步：做成\s*(\d+)、跳过\s*(\d+)、失败\s*(\d+)"
@@ -975,6 +994,11 @@ EVENT_BUCKETS = {
     "pickup_tool": "tool_pickups",
     "tool_upgrade_skipped": "tool_upgrade_skips",
     "tool_upgrade_blocked_work": "tool_upgrade_blocks",
+    # task-231（dev task-230 P0-4.4/4.5）：gaps 读/写失败 ⇒ **可判红问题，不是 info**。
+    #   读失败会把坏文件归档成 `<name>.bad.<ts>`（不覆盖、不静默丢）并写 `day_end.gaps_problem`；
+    #   写盘失败同样写 `gaps_problem`。缺文件 = 旧账本 ⇒ 缺失 ≠ 通过（走【无法判定】）。
+    "gaps_load_failed": "gaps_load_failures",
+    "gaps_write_failed": "gaps_write_failures",
 }
 
 #: 结构性事件：由报告的其他字段单独统计（day_start/day_end 切会话与验收、finish 自述），
@@ -1054,6 +1078,8 @@ NEW_EVENT_BUCKETS = (
     "ready_far_truncateds", "ready_far_unavailables",
     # task-207（dev task-205）：工具升级全链（升级/取回/如实跳过/在途阻塞；不判红、不进 rc）
     "tool_upgrades", "tool_pickups", "tool_upgrade_skips", "tool_upgrade_blocks",
+    # task-231（dev task-230）：gaps 读/写失败（可判红问题；一眼看到几次读失败/写失败）
+    "gaps_load_failures", "gaps_write_failures",
 )
 
 
@@ -1148,10 +1174,12 @@ def is_settleable(item):
 # brain 里不存在 —— 实现把它们挂在 `decision` 行与 `day_end` 上；这里按实现写口径）。
 # ---------------------------------------------------------------------------
 
-#: 原因码闭合集（§8.2）。**取文档 12 码 ∪ brain 11 码的并集**：文档已批 `failed`、brain 的
-#: `INTENT_REASON_CODES`（`brain/agentfarm/longrun.py:101-104`）还没落 ⇒ 只按文档判会把 brain
-#: 合法发出的码误判红；只按 brain 判又漏 §8.2 要求的 `failed`。两边清单的同步由单测
-#: `TestIntentAndGaps::test_reason_codes_match_brain_source` 扫 brain 源码兜住（漂移即红）。
+#: 原因码闭合集（§8.2）。**task-231 起两侧都是 12 码**（brain task-230 补了 `failed`）：
+#: `INTENT_REASON_CODES_DOC` = `docs/_run10-criteria.md` §8.2 的目标集合；
+#: `INTENT_REASON_CODES_BRAIN` = brain `longrun.py:106-110` 的现状（两者必须逐字相等）。
+#: 另：brain 的 `STEP_CODE_TO_REASON`（唯一映射表）值域不得超出该闭合集。
+#: 漂移由 `test_reason_codes_match_brain_source` / `test_reason_codes_match_criteria_doc` /
+#: `test_step_code_to_reason_targets_are_in_closed_set` 三道单测扫源码兜住（漂移即红）。
 INTENT_REASON_CODES_DOC = (
     "no_target", "unknown_evidence", "superseded", "deferred_capability", "tool_level",
     "budget", "blocked_tile", "blocked_modal", "no_slot", "world_stuck", "gated", "failed",
@@ -1159,11 +1187,15 @@ INTENT_REASON_CODES_DOC = (
 INTENT_REASON_CODES_BRAIN = (
     "no_target", "deferred_capability", "tool_level", "budget", "blocked_tile",
     "blocked_modal", "no_slot", "world_stuck", "unknown_evidence", "superseded", "gated",
+    "failed",
 )
 INTENT_REASON_CODES = tuple(dict.fromkeys(INTENT_REASON_CODES_DOC + INTENT_REASON_CODES_BRAIN))
 #: §8.2c 无动作意图白名单（source of truth = `brain/agentfarm/longrun.py:94`；单测扫源码同步）。
 ACTIONLESS_TASKS = ("sleep", "review", "wait_for_save", "recover_stamina")
 #: §8.2：能力缺口原因码 —— 它们必须被追成修复卡（不是"没活"，也不是豁免额度）。
+#: task-231 核实：brain `_tile_reason`（`longrun.py:5907-5908`）会给"工具不够格"的格返回
+#: `tool_level`，这些行**同样**经 `_gaps_merge`（`:6304-6312`）写进 `<journal>-gaps.json`
+#: ⇒ 两侧同义，保留两码（收窄成只 `deferred_capability` 会漏判 tool_level 缺口）。
 CAPABILITY_REASON_CODES = ("deferred_capability", "tool_level")
 #: §8.3.5：brain 的"暂不支持清理"登记表（source of truth = `brain/agentfarm/planner.py:1374`；
 #: 单测 `test_deferred_kinds_match_brain_source` 扫源码同步）。
@@ -1334,8 +1366,8 @@ def intent_coverage_rows(sessions):
     return rows
 
 
-def cat_intent(sessions, gaps_items, top):
-    """【task-220】§8.3 意图-执行对账的判红（`docs/_run10-criteria.md` §8.3，第 7 类）。
+def cat_intent(rows, sessions, gaps_items, top):
+    """【task-220/task-231】§8.3 意图-执行对账的判红（`docs/_run10-criteria.md` §8.3，第 7 类）。
 
     判据（每条都能在账本里指到行号）：
       1. 有计划（`decision.plans[].intent_id`）却**没有**对账记录 ⇒ 红（对账缺失 = 无声缩水）；
@@ -1344,7 +1376,10 @@ def cat_intent(sessions, gaps_items, top):
       4. 能力缺口原因（`deferred_capability`/`tool_level`）却**没有 gaps 条目** ⇒ 红（缺口没落盘，§8.3.4）；
       5. `deferred_capability` 的 gaps 条目 kind **不在** `DEFERRED_KINDS` ⇒ 红（登记错 = "合法偷懒"没留证据）；
       6. 瓦片不变式 `requested == ok+failed+unexecuted`、`Σreasons == failed+unexecuted` 对不上 ⇒ 红
-         （意图级原因码 `reasons_are_intent_level` 的记录不适用第二条）。
+         （`reasons_are_intent_level` 的意图级记录：`requested==0` 时只要求 `Σreasons>=1`）；
+      7. `no_target` 没有证据包（`evidence.stage_tiles_empty is not True`）⇒ 红（§8.3.7）；
+      8. gaps 读/写失败（`gaps_load_failed`/`gaps_write_failed` 事件，或 `day_end.gaps_problem` 非空）
+         ⇒ 红（P0-4.5：**缺失 ≠ 通过**；旧账本没有这些字段 ⇒ 不产出红，只进【无法判定】）。
     旧账本没有 `intent_coverage` ⇒ 这里**不产出任何红**（由 `build_undecidable` 写【无法判定】）。
     """
     out = []
@@ -1425,6 +1460,18 @@ def cat_intent(sessions, gaps_items, top):
                         hint="§8.2b：Σ reasons.count == failed_tiles + unexecuted_tiles（按瓦片计）",
                         subject=f"missed:intent_reason_count:{task}",
                     ))
+            if "no_target" in reasons:
+                _ev = rec.get("evidence")
+                _sti = _ev.get("stage_tiles_empty") if isinstance(_ev, dict) else None
+                if _sti is not True:
+                    out.append(finding(
+                        lineno, "day_end",
+                        f"意图 {ident}（{task}）用了 no_target，但没有证据包"
+                        f"（evidence.stage_tiles_empty 不是 true）：{str(_ev)[:160]}",
+                        hint="§8.3.7：no_target 必须附 evidence{stage_tiles_empty:true, obs_seq|counts}；"
+                             "拿不到证据只能记 unknown_evidence（brain task-230 的 _no_target_evidence）",
+                        subject=f"missed:intent_no_target_evidence:{task}",
+                    ))
             caps = [c for c in reasons if c in CAPABILITY_REASON_CODES]
             if caps and not any(c in gap_reasons for c in caps):
                 out.append(finding(
@@ -1444,6 +1491,32 @@ def cat_intent(sessions, gaps_items, top):
                 hint="§8.3.5：『暂不支持』必须登记在 brain/agentfarm/planner.py:1374 DEFERRED_KINDS，"
                      "只登记不告知/登记错 ⇒ 红",
                 subject="missed:gap_kind_not_deferred",
+            ))
+    # task-231（dev task-230 P0-4.4/4.5）：gaps 读/写失败 = 缺陷，**可判红**（不是 info）。
+    for lineno, ev in rows:
+        name = str(ev.get("event") or "")
+        if name not in ("gaps_load_failed", "gaps_write_failed"):
+            continue
+        what = "缺口清单读失败 / 坏文件已归档" if name == "gaps_load_failed" else "缺口清单写盘失败"
+        extra = f", archived={ev.get('archived')!r}" if ev.get("archived") else ""
+        out.append(finding(
+            lineno, name,
+            f"{what}（path={ev.get('path')!r}, error={ev.get('error')!r}{extra}）",
+            hint="P0-4.5：gaps 只影响提示词，但读/写失败本身是缺陷（写失败必须可判红）；"
+                 "坏文件应归档成 `<name>.bad.<ts>` 而不是静默丢弃",
+            subject=f"missed:gaps_io_failed:{name}",
+        ))
+    for lineno, ev in rows:
+        if ev.get("event") != "day_end":
+            continue
+        prob = str(ev.get("gaps_problem") or "")
+        if prob:
+            out.append(finding(
+                lineno, "day_end",
+                f"day_end.gaps_problem 非空：{prob[:200]}",
+                hint="P0-4.5：缺口清单读/写失败 ⇒ problem（缺失 ≠ 通过）；"
+                     "brain 的 rep.gaps_problem 专为此（旧账本没有该键 ⇒ 只进【无法判定】）",
+                subject="missed:gaps_problem",
             ))
     return out[:top] if top else out
 
@@ -3662,7 +3735,13 @@ def build_undecidable(rows, sessions, prelude, report):
             # 这里统一改成按 `<事件名>.<键>` 真去事件里找键。
             _spec = label.split(":", 1)[1]
         if _spec is not None:
-            if _spec.startswith("day_end.intent_coverage[*]."):
+            if _spec == "day_end.intent_coverage[*].evidence.stage_tiles_empty":
+                # task-231：证据包挂在 intent_coverage 的**数组元素**里，要真去找键（不是只看数组在不在）
+                _ic_recs = [r for _, ev in rows if ev.get("event") == "day_end"
+                            for r in as_list(ev.get("intent_coverage")) if isinstance(r, dict)]
+                absent = not any(isinstance(r.get("evidence"), dict)
+                                 and "stage_tiles_empty" in r["evidence"] for r in _ic_recs)
+            elif _spec.startswith("day_end.intent_coverage[*]."):
                 # task-220：`day_end.intent_coverage[]` 是数组，只要某天有这条记录就算在场
                 _ends_ic = [ev for _, ev in rows if ev.get("event") == "day_end"]
                 absent = (not _ends_ic) or (not any("intent_coverage" in ev for ev in _ends_ic))
@@ -5697,6 +5776,11 @@ def build_report(rows, path, args, bad_lines):
         "schema": _gaps_meta.get("schema") or "",
         "dropped": as_int(_gaps_meta.get("dropped"), 0),
         "item_count": len(_gaps_merged),
+        # task-231（dev task-230 P0-4.5）：gaps 读/写失败次数与 `gaps_problem` 天数（均可判红）
+        "io_events": sum(1 for _, ev in rows
+                         if ev.get("event") in ("gaps_load_failed", "gaps_write_failed")),
+        "gaps_problem_days": sum(1 for _, ev in rows
+                                 if ev.get("event") == "day_end" and str(ev.get("gaps_problem") or "")),
         "capability_count": len(_cap_items),
         "capability_items": sorted(_cap_items, key=lambda it: -as_int(it.get("count"), 0))[: max(1, args.top)],
         "by_reason": {c: len([it for it in _gaps_merged if str(it.get("reason") or "") == c])
@@ -6143,7 +6227,7 @@ def build_report(rows, path, args, bad_lines):
         "ineffective": cat_ineffective(sessions, args.top),
         "sleep": cat_sleep(sessions, args.top, args.stamina_full, args.sleep_pct),
         "environment": cat_environment(all_sessions, args.top),
-        "intent": cat_intent(sessions, _gaps_merged, args.top),
+        "intent": cat_intent(rows, sessions, _gaps_merged, args.top),
     }
     report["categories_total"] = {
         "manual": len(manual_all),
@@ -6152,7 +6236,7 @@ def build_report(rows, path, args, bad_lines):
         "ineffective": len(cat_ineffective(sessions, 0)),
         "sleep": len(cat_sleep(sessions, 0, args.stamina_full, args.sleep_pct)),
         "environment": len(env_all),
-        "intent": len(cat_intent(sessions, _gaps_merged, 0)),
+        "intent": len(cat_intent(rows, sessions, _gaps_merged, 0)),
     }
     report["advice"] = build_advice(report)
     report["undecidable"] = build_undecidable(rows, sessions, prelude, report)
@@ -6194,7 +6278,7 @@ def build_report(rows, path, args, bad_lines):
     for items in (cat_manual(all_sessions, 0),
                   cat_missed(sessions, 0) + llm_reds,
                   cat_wasted(sessions, 0) + cat_self_report(report),
-                  cat_intent(sessions, _gaps_merged, 0)):
+                  cat_intent(rows, sessions, _gaps_merged, 0)):
         for item in items:
             if not is_red_finding(item):
                 continue
@@ -6638,6 +6722,9 @@ def render_text(report, top):
     else:
         add("能力缺口: <缺失>（没有 <journal>-gaps.json ⇒ 【无法判定】，缺失 ≠ 0）"
             + (f"；读取错误 {gp.get('error')}" if gp.get("error") else ""))
+    if gp.get("io_events") or gp.get("gaps_problem_days"):
+        add(f"    ⚠ gaps 读写失败 {gp.get('io_events', 0)} 次 / `gaps_problem` "
+            f"{gp.get('gaps_problem_days', 0)} 天（P0-4.5：**problem，不是 info** ⇒ 判红）")
     # task-32：两种新事件形态的计数（信息项）；task-38：跨日证据覆盖度
     # task-102（`9b09735`）：**背包空格闭环**一行 —— free_slots / buy 尝试 / buy_no_space /
     # 腾格卖出（`why=need_slot`）/ 当日钱变化 / `slept_without_work` / `modal_dismiss_failed`。

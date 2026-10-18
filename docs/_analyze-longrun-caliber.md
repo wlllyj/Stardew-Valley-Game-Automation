@@ -1184,45 +1184,77 @@ python tools\analyze-longrun.py --journal logs\longrun-runA-0732.jsonl --days 6 
 python scratch\_t194_undec.py    # HEAD 导出 vs 新版：六账本 rc/红/#无法判定 并排
 ```
 
-## 3.33 §8 意图-执行对账 + 能力缺口（task-219 `fc147a7`，task-220 收录）—— **缺口不是豁免**
+## 3.33 §8 意图-执行对账 + 能力缺口（task-219 `fc147a7` / task-220 实现 / task-231 对齐）—— **缺口不是豁免**
 
-**证据来源**：`day_end.intent_coverage[]`（每意图一条：`intent_id/task/area_hint/source/boundary/
-requested_tiles/ok_tiles/failed_tiles/unexecuted_tiles/executed_steps/reasons/reasons_are_intent_level`，
-brain `longrun.py:1200-1271`）+ `<journal>-gaps.json`（schema `agentfarm-gaps/1`，按
-`(kind,tool,reason)` 聚合 `count/first_seen/last_seen/sample_tiles`）。
-`FIELD_PROBES` 有 3 条自动探针：`day_end.intent_coverage[*].executed_steps` /
-`day_end.intent_coverage[*].reasons` / `event:decision.plans[*].intent_id`（旧账本 ⇒【无法判定】行，
-**缺失 ≠ 0**）。
+**数据形状 = 三个挂载点**（不是新事件名；`docs/_run10-criteria.md` §8.1）：
 
-**判红 7 条（`docs/_run10-criteria.md` §8.3，第 7 类）**：
+1. **`decision.plans[]`**（挂在既有 `decision` 行上）：每个意图 `intent_id/task/area_hint/source/boundary`；
+2. **`day_end.intent_coverage[]`**（每意图一条对账）：`intent_id/task/requested_tiles/ok_tiles/
+   failed_tiles/unexecuted_tiles/executed_steps/reasons{code:count}/area_hint/source/boundary/
+   reasons_are_intent_level[/bad_reasons][/evidence]`；
+3. **`<journal>-gaps.json`**（旁车，schema `agentfarm-gaps/1`）：`(kind,tool,reason) → count/
+   first_seen/last_seen/sample_tiles`，per-run 隔离；跨 run 聚合是本工具只读扫出来的视图。
+
+> 实测字段名以 brain 源码为唯一权威：`requested_tiles`（**不是 `ok_steps`**，文档旧稿的 `ok_steps`
+> 已改）、`reasons_are_intent_level`（`longrun.py:1253`）、`bad_reasons`（`:1256`）、`actionless`（`:1245`）。
+> 这三个字段是判红依赖项，改名会静默失效 ⇒ 单测 `test_intent_flag_field_names_match_brain_source`
+> 直接扫 brain 源码，漂移即红。
+
+`FIELD_PROBES` 有 **4 条**自动探针：`day_end.intent_coverage[*].executed_steps` /
+`...[*].reasons` / `...[*].evidence.stage_tiles_empty` / `event:decision.plans[*].intent_id`
+（旧账本 ⇒【无法判定】行，**缺失 ≠ 0**）。
+
+**判红 9 条（§8.3，编号与 criteria 一致）**：
 
 | # | 判据 | subject |
 |---|---|---|
-| 1 | 计划里有 `intent_id`，但 `intent_coverage` 没有它（对账缺失 = 无声缩水） | `missed:intent_no_execution` |
+| 1 | 有计划（`decision.plans[].intent_id`）却**没有**对账记录 | `missed:intent_no_execution` |
 | 2 | `executed_steps==0` 且 `reasons` 为空（`ACTIONLESS_TASKS` 除外） | `missed:intent_no_reason:<task>` |
-| 3 | 原因码出闭合集（或 brain 自记的 `bad_reasons` 非空） | `missed:intent_bad_reason:<task>` |
+| 3 | `reasons` 含闭合集外的码（或 brain 自记的 `bad_reasons` 非空） | `missed:intent_bad_reason:<task>` |
 | 4 | 能力缺口原因（`deferred_capability`/`tool_level`）却**没有** gaps 条目 | `missed:intent_gap_missing:<task>` |
-| 5 | `deferred_capability` 的 gaps 条目 kind 不在 `DEFERRED_KINDS` | `missed:gap_kind_not_deferred` |
-| 6 | 瓦片不变式 `requested=ok+failed+unexecuted` 不成立 | `missed:intent_tiles_invariant:<task>` |
-| 7 | `Σreasons.count` ≠ `failed+unexecuted`（意图级原因码不适用） | `missed:intent_reason_count:<task>` |
+| 5 | gaps 条目里 `kind` **不在** `DEFERRED_KINDS`（登记表与缺口不一致） | `missed:gap_kind_not_deferred` |
+| 6 | 瓦片不变式不符（见下） | `missed:intent_tiles_invariant:<task>` / `missed:intent_reason_count:<task>` |
+| 7 | `no_target` 没有证据包（`evidence.stage_tiles_empty is not True`） | `missed:intent_no_target_evidence:<task>` |
+| 8 | 同 `(kind,reason)` 连续 **≥3 天**未修 ⇒ **⚠**（`--repairs` 只做附注，不自动判红） | 建议项 / `gaps.span_warn` |
+| 9 | 旧账本缺字段 ⇒ 【无法判定】（**缺失 ≠ 通过**，也不许当失败） | `build_undecidable` 行 |
 
-**只提示、不判红**：①同一缺口 `first_seen→last_seen` 跨 **≥3 天**仍未修 ⇒ ⚠（`--repairs` 只做人工
-对修复卡的附注）；②`--gaps-dir` 可跨 run 只读聚合（默认扫账本同目录 `*-gaps.json`）；③缺口清单只在
-头部「能力缺口」行与建议里出现，**不进 checks、不豁免任何日级判据**。
+**瓦片不变式（§8.2b）**：`requested_tiles = ok_tiles + failed_tiles + unexecuted_tiles`；
+`Σ reasons.count = failed_tiles + unexecuted_tiles`（按**瓦片**计；`reasons_are_intent_level=true`
+的意图级记录按 0 瓦片计 ⇒ 只要求 `Σ reasons.count >= 1`）。对不上 ⇒ 第 6 条红。
 
-**闭合集以 brain 源码为唯一权威**：`INTENT_REASON_CODES`（`brain/agentfarm/longrun.py:101`，11 码）
-+ 老账本兼容 `failed`；`ACTIONLESS_TASKS`（`:93`）与 `DEFERRED_KINDS`
-（`brain/agentfarm/planner.py:1374`）都有**扫描 brain 源码**的漂移单测，不许手抄常量。
+**gaps 读/写失败 = problem（P0-4.5，task-230）**：`gaps_load_failed`（含坏文件已归档
+`<name>.bad.<ts>`）/ `gaps_write_failed` 事件，或 `day_end.gaps_problem` 非空 ⇒ 判红
+（`missed:gaps_io_failed:<event>` / `missed:gaps_problem`）。理由：gaps 只影响提示词，但**读/写失败
+本身是缺陷**，只记 notes 等于把"缺失"当"通过"。旧账本没有这些字段/事件 ⇒ 只进【无法判定】。
+
+**闭合集 12 码、两侧一致**：`INTENT_REASON_CODES_DOC`（criteria §8.2 目标集合）==
+`INTENT_REASON_CODES_BRAIN`（brain `longrun.py:106-110` 现状，task-230 已补 `failed`）==
+12 码。三道漂移单测兜住：`test_reason_codes_match_brain_source` /
+`test_reason_codes_match_criteria_doc` / `test_step_code_to_reason_targets_are_in_closed_set`
+（brain 的 `STEP_CODE_TO_REASON` 单一映射表值域不得超出闭合集）。
+
+**`tool_level` 两侧同义**：brain `_tile_reason`（`longrun.py:5907-5908`）会给"工具不够格"的格返回
+`tool_level`，这些行**同样**经 `_gaps_merge`（`:6304-6312`）写进 gaps ⇒ `CAPABILITY_REASON_CODES`
+保留 `("deferred_capability","tool_level")` 两码（收窄会漏判 tool_level 缺口）。
+
+**只提示、不判红**：①缺口跨 ≥3 天未修 ⇒ ⚠（`--repairs` 只做人工附注）；②`--gaps-dir` 跨 run
+只读聚合（默认扫账本同目录 `*-gaps.json`，**不写任何文件**）；③缺口清单只在头部「能力缺口」行与
+建议里出现，**不进 checks、不豁免任何日级判据**。
+
+**§8.6 待实现（backlog，0.7.40）**：原稿的「`DEFERRED_KINDS` 里的 kind 出现可执行目标却一次没执行
+⇒ 红」语义上**不是**现在实现的那条（实现判的是"gaps 条目 kind 不在 DEFERRED_KINDS"）—— 需要 brain
+导出"每类 kind 是否产出过可执行目标"的证据，留 0.7.40 与田区工作一起评估。
 
 **旧账本一律【无法判定】**：没有 `intent_coverage` / 没有 gaps 文件 ⇒ `未执行意图: <缺失>`、
 `能力缺口: <缺失>`，**不判红、也不判通过**（缺失 ≠ 0）。
 
-**口径边界**：§8 的红**只由本工具判**（`tools\verify-run3.py` 只出 info，不动它的 day_end 白名单）；
-`reasons` 只做证据，**不是免罚额度**；`bad_reasons` 集外码会同时进【无法判定】说明，不许静默丢。
+**口径边界**：§8 的红**只由本工具判**（`tools\verify-run3.py` 对 §8 只出 info，不动它的 day_end
+白名单）；`reasons` 只做证据，**不是免罚额度**；`bad_reasons` 集外码会同时进【无法判定】说明，不许
+静默丢。
 
-**顺带修的真 bug**：`tools\analyze-longrun.py` 之前**缺 `from pathlib import Path`**
+**顺带修的真 bug（task-220）**：`tools\analyze-longrun.py` 之前**缺 `from pathlib import Path`**
 （`gaps_file_for()` 的 `NameError` 被 `except Exception` 静默吞掉 ⇒ `<journal>-gaps.json` 永远读不到，
-功能等于没接上）。本卡补 import，单测 `test_gaps_file_is_parsed_and_aggregated` 抓到。
+功能等于没接上）。已补 import，单测 `test_gaps_file_is_parsed_and_aggregated` 抓到。
 
 ## 4. 复核命令
 
@@ -1237,8 +1269,8 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run9d.jsonl --da
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
 python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
-python -m unittest tests.test_analyze_longrun  # 当前 247 OK（task-220 + §8 意图对账/能力缺口 16 条）
-python -m unittest discover -s tests           # 当前 Ran 1122 tests / OK（0 红）
+python -m unittest tests.test_analyze_longrun  # 当前 257 OK（task-231：§8 gaps 读写失败红 + no_target 证据红 + 12 码漂移 10 条）
+python -m unittest discover -s tests           # 当前 Ran 1153 tests / OK（0 红，须 PYTHONUTF8=1）
 python scratch\_t194_undec.py                   # 六账本 HEAD 导出 vs 新版并排读数：
                                                #   rc/红数**一字未变** —— runA 1/117、runB 1/84、run9 1/84、
                                                #   run9b 1/45、run9c 0/0、run9d 1/29；
