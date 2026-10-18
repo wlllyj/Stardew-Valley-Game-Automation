@@ -73,6 +73,67 @@ CASES: list[tuple[str, str, str | None, str, list[tuple[str, str, str]], str]] =
           "        pass  # mutation: 不记停滞")],
         "回去看过没产出的邻域不记停滞 ⇒ 下一轮又走回同一片",
     ),
+    # ---- 0.7.44 三卡（task-5/6/11）我方独立变异；判杀器 = B7/B8/B10 独立重放 ----
+    (
+        "m0744e_workspot_keeps_dead_tiles", "5", "无（我方自建）", "probe",
+        [("brain/agentfarm/longrun.py",
+          "            if dead:\n                tiles = [t for t in tiles if t not in dead]",
+          "            if False and dead:\n                tiles = [t for t in tiles if t not in dead]")],
+        "收尾作业区不再剔除挡死格 ⇒ 拿执行层做不成的格每轮重来（A8 冬 9/14 死循环回潮）",
+    ),
+    (
+        "m0744f_leftover_blocked_always_zero", "5", "无（我方自建）", "probe",
+        [("brain/agentfarm/longrun.py",
+          '            "leftover_blocked": len(leftover_blocked),',
+          '            "leftover_blocked": 0,')],
+        "leftover 拆分把物理挡死格洗成 0 ⇒ exec+blocked≠leftover（分母造假）",
+    ),
+    (
+        "m0744g_slept_by_us_back_to_ended_by", "6", "无（我方自建）", "probe",
+        [("brain/agentfarm/longrun.py",
+          '        return bool(rep.slept_ok or rep.ended_by in ("sleep", "inventory_blocked"))',
+          '        return rep.ended_by in ("sleep", "inventory_blocked")')],
+        "slept_by_us 退回只看 ended_by ⇒ A8 冬 9/14 真睡成却报 false（快照旧口径）",
+    ),
+    (
+        "m0744h_budget_defer_never_suppressed", "6", "无（我方自建）", "probe",
+        [("brain/agentfarm/longrun.py",
+          '        if watered_outdoor:\n            if rep is not None:',
+          '        if False and watered_outdoor:\n            if rep is not None:')],
+        "浇水达标日仍逐条落『只因预算延后』⇒ 与 watered_outdoor 同真（analyzer 假红回潮）",
+    ),
+    (
+        "m0744i_review_fallback_back_to_stuck", "11", "无（我方自建）", "probe",
+        [("brain/agentfarm/longrun.py",
+          '                dead = self._dead_end_pending()\n'
+          '                if dead:\n'
+          '                    action, alt = self._resume_switch_or_exhaust(\n'
+          '                        obs, rep,\n'
+          '                        plot={"zone": "", "label": "", "area": "",\n'
+          '                              "anchor": list(dead[0]), "tiles": dead,\n'
+          '                              "note": "只剩挡死格（review 兜底）"},\n'
+          '                        where="review_only_fallback")',
+          '                dead = self._dead_end_pending()\n'
+          '                if dead:\n'
+          '                    rep.ended_by, rep.ended_reason = "stuck", (\n'
+          '                        "stuck:回片区（变异：review 兜底不走卡 1）")\n'
+          '                    return None, False')],
+        "review 兜底 dead-only 分支不走卡 1 换片/诚实收工（GAP-1 回潮）",
+    ),
+    (
+        "m0744j_guard_leftover_back_to_stuck", "11", "无（我方自建）", "probe",
+        [("brain/agentfarm/longrun.py",
+          '            action, alt = self._resume_switch_or_exhaust(\n'
+          '                obs, rep,\n'
+          '                plot={"zone": "", "label": "", "area": "",\n'
+          '                      "anchor": list(dead[0]), "tiles": dead,\n'
+          '                      "note": "只剩挡死格（guard_leftover）"},\n'
+          '                where="guard_leftover")',
+          '            rep.ended_by, rep.ended_reason = "stuck", (\n'
+          '                "stuck:回片区（变异：guard_leftover 不走卡 1）")\n'
+          '            return "ended", False')],
+        "guard_leftover dead-only 分支回到 stuck（GAP-2 回潮）",
+    ),
 ]
 TEMPLATES: list[tuple[str, str, str | None, str, list[tuple[str, str, str]], str]] = []
 

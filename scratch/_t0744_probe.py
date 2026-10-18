@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import glob
 import hashlib
 import json
@@ -57,6 +58,18 @@ CHECKS_BASELINE = ("slept_by_us", "no_blocking_modal", "no_hard_failures",
 # task-5 leftover 拆口径的候选字段（交付后按实际命名更新；缺失 ⇒ 【无法判定】不是 PASS）
 LEFTOVER_EXEC_FIELDS = ("leftover_executable", "leftover_actionable", "leftover_retryable")
 LEFTOVER_BLOCKED_FIELDS = ("leftover_blocked", "leftover_physically_blocked", "leftover_doomed")
+# 0.7.44 三卡（task-5/6/11）关键实现标记（A2h2~h4；缺失 ⇒ 该卡未交付，不判 PASS）
+CARD5_MARKERS = ("_dead_tile_set", "leftover_executable", "leftover_blocked",
+                 "MAX_ALLOC_NO_PROGRESS = 3", "alloc_no_progress")
+CARD6_MARKERS = ("slept_ok", "_slept_by_us", "deferred_by_budget_suppressed",
+                 "budget_defer_events", "_flush_budget_deferrals")
+CARD11_MARKERS = ("_guard_leftover_resume", "_dead_end_pending", 'where="guard_leftover"')
+# 诚实停名：这些 stop 原因下允许 assigned_undone>0 而不判"洗白"（卡 5 不放宽 no_unmet_stages）
+HONEST_STOPPED = ("stamina", "budget", "night", "inventory_blocked", "unreachable", "refused")
+# 作者 repro 脚本自报"修前红"的形态（形如 `rc=1  Ran 5 红 3`）
+RC_RED_RX = re.compile(r"红\s*[1-9]\d*")
+# task-5 同格无产出重分上限（frozen longrun.py:244 原文 `MAX_ALLOC_NO_PROGRESS = 3`）
+MAX_ALLOC_NO_PROGRESS = 3
 
 
 def check(tag: str, ok: bool, detail: str = "") -> bool:
@@ -113,6 +126,26 @@ def sha256_file(p: Path) -> str:
         return hashlib.sha256(p.read_bytes()).hexdigest()
     except OSError:
         return ""
+
+
+def _checks_keys(src: str) -> list[str]:
+    """AST 取 `rep.checks = {...}` 字面键序（只认 Assign + Attribute(attr="checks") + Dict）。"""
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        tgt = node.targets[0]
+        if not (isinstance(tgt, ast.Attribute) and tgt.attr == "checks"
+                and isinstance(node.value, ast.Dict)):
+            continue
+        keys = [k.value for k in node.value.keys
+                if isinstance(k, ast.Constant) and isinstance(k.value, str)]
+        if keys:
+            return keys
+    return []
 
 
 # ---------------------------------------------------------------- A0 provenance
@@ -224,6 +257,22 @@ def case_a(readings: bool) -> None:
         src_new = read("brain/agentfarm/longrun.py")
         checks_named = [k for k in CHECKS_BASELINE if f'"{k}"' in src_new]
         check("A2g checks 10 键未被改", len(checks_named) == 10, f"命中 {len(checks_named)}/10")
+        # A2h2~h4：0.7.44 三卡关键实现标记（卡面要求逐项核在源码；缺失=未交付）
+        for tag, name, keys in (("A2h2", "task-5 挡死格/拆分/有界重分", CARD5_MARKERS),
+                                ("A2h3", "task-6 入睡真值/预算延后压制", CARD6_MARKERS),
+                                ("A2h4", "task-11 review/guard 统一路由", CARD11_MARKERS)):
+            miss = [k for k in keys if k not in src_new]
+            check(f"{tag} {name} 关键实现标记在源码", not miss, f"缺={miss}")
+        # A2h5：checks 字面键集（旧树/冻结树都必须恰为 10 键基线；新字段不得塞进 checks）
+        try:
+            keys_old = _checks_keys(old_src)
+        except NameError:
+            keys_old = []
+        keys_new = _checks_keys(src_new)
+        check("A2h5 checks 字面键集 = 10 键基线（新字段不得污染）",
+              keys_old == list(CHECKS_BASELINE) and keys_new == list(CHECKS_BASELINE),
+              f"old={len(keys_old)} 键 new={len(keys_new)} 键" if keys_new != list(CHECKS_BASELINE)
+              else "10/10 键序一致")
 
     if not readings:
         skip("A4 读数", "加 --readings 才跑（py_compile / 定向 / 全量 / build）")
@@ -552,6 +601,11 @@ def case_b() -> None:
 
     # B6 卡 1 修后形状（我方独立重放；无方法=修前树 ⇒ SKIP，不判 PASS）
     check_resume_replay(rows)
+    # B7~B10：0.7.44 三卡（task-5/6/11 + task-10 #1）我方独立重放
+    check_card5_replay(rows)
+    check_card6_replay(rows)
+    check_already_semantics(rows)
+    check_task11_replay(rows)
 
     # B4 task-6 ②：0.7.43 analyzer 在 A8 上报「只因预算延后却自称户外浇水达标」6 行
     analyzer = ROOT / "tools/analyze-longrun.py"
@@ -570,17 +624,28 @@ def case_b() -> None:
           f"rc={rc} lines={lines_hit}（期望 {A8_BUDGET_WATER_WARN_LINES}）" if lines_hit else
           f"rc={rc} 未解析到警告行")
 
-    # B5 修后形状：接作者离线重放（交付后出现；缺失 ⇒ GAP，不判 PASS）
+    # B5 修后形状：接作者离线重放（*replay*）；无真重放则退到作者 repro 脚本做形状验证。
     cands: list[str] = []
     for base in (ROOT, REPO):
         cands += _glob_scripts(base, "replay")
     cands = [p for p in dict.fromkeys(cands) if "_t0744" not in Path(p).name]
-    if not cands:
+    repro = sorted(REPO.glob("tests/_repro_*.py"))
+    if not cands and not repro:
         skip("B5 作者离线重放（A8 账本重放后两条死循环不再出现）", "脚本未交付 ⇒ GAP（不判 PASS）")
         return
-    rc, out = sh([PY, cands[0]], cwd=ROOT, timeout=600)
-    tail = [ln for ln in out.splitlines() if ln.strip()][-8:]
-    info("B5 作者重放脚本", f"{Path(cands[0]).name} rc={rc} | " + " / ".join(tail)[:400])
+    script = cands[0] if cands else str(repro[0])
+    rc, out = sh([PY, script], cwd=REPO, timeout=900)
+    tail = [ln for ln in out.splitlines() if ln.strip()][-10:]
+    info("B5 作者重放/Repro 脚本", f"{Path(script).name} rc={rc} | " + " / ".join(tail)[:500])
+    if not cands:
+        # 作者的修前红复跑脚本（形状验证）：修前 rev 必须红、修后 rev 必须绿，脚本自报结论成立。
+        # 注意：这是**作者脚本自报**，只作形状交叉验证；真正的 A8 修前红由 B1/B2 独立复现。
+        red_seen = RC_RED_RX.search(out) is not None
+        green_seen = "修前红 / 修后绿" in out
+        check("B5 作者 repro 形状验证（--rev b702708 红 / HEAD 绿，脚本结论成立）",
+              rc == 0 and red_seen and green_seen,
+              f"rc={rc} 修前红入输出={red_seen} 结论绿={green_seen}")
+        return
     # 独立判据：重放产物里若给出 day_end 形态，必须满足卡 4/5/6 的"修后"口径（判据见 C 段）
     json_rows = []
     for ln in out.splitlines():
@@ -599,6 +664,312 @@ def case_b() -> None:
             bad += [f"{r.get('day')}: {x}" for x in judge_card4_day(r, r.get("_events") or [])]
     check("B5b 重放产物卡 4 判据（无 stuck:回片区 / resume_exhausted 不 VERIFIED）",
           not bad, (bad[:4] if bad else f"JSON 行 {len(json_rows)}"))
+
+
+# ---------------------------------------------------------------- B7~B10：0.7.44 三卡独立重放
+
+ENC_TILE = (37, 35)      # A8 冬 9/14 的"被围格"形态：不封格，但当天不再分配
+BLK_TILE = (40, 30)      # "动了没用"被封格的格（_dead_tile_set 的 blocked 部分）
+OK_TILE = (38, 35)       # 同一片里真正可做的格
+
+
+def _crop_world(TL, crops: dict):
+    w = TL.FakeWorld(seeds=0, money=0, weeds=0, water_left=40)
+    w.dirt = set(crops)
+    w.crops = {t: dict(v) for t, v in crops.items()}
+    return w
+
+
+def _fresh_rep(TL, *, day: int = 9):
+    return TL.DayReport(day_key=("winter", 1, day), started_at=0.0)
+
+
+def check_card5_replay(rows) -> None:
+    """task-5 独立重放：挡死格语义 / 阶段拆分如实 / 重分有界 3 次且封后不再进池。"""
+    print("== B7 段：task-5 独立重放（我方场景；非作者用例）==")
+    src = read("brain/agentfarm/longrun.py")
+    if "_dead_tile_set" not in src:
+        skip("B7 task-5 重放", "冻结树无 _dead_tile_set ⇒ 卡未交付（不判 PASS）")
+        return
+    try:
+        TL = _probe_fixtures()
+    except Exception as exc:  # noqa: BLE001
+        skip("B7 task-5 重放", f"夹具 import 失败：{type(exc).__name__}: {exc}")
+        return
+
+    # B7a dead_tile_set = blocked ∪ encircled_day（encircled 不封格；只剩挡死格可识别）
+    try:
+        w = _crop_world(TL, {ENC_TILE: {"ripe": False, "watered": False, "dead": False},
+                             OK_TILE: {"ripe": False, "watered": False, "dead": False}})
+        run = _mk_run(TL, w)
+        run.blocked[BLK_TILE] = "动了没用（deputy 重放）"
+        run.encircled_day = {ENC_TILE}
+        run.leftover_targets = {ENC_TILE}
+        dead = set(run._dead_tile_set())
+        check("B7a `_dead_tile_set` = blocked ∪ encircled_day，且 encircled 不写 blocked",
+              dead == {BLK_TILE, ENC_TILE} and ENC_TILE not in run.blocked,
+              f"dead={sorted(dead)} encircled_in_blocked={ENC_TILE in run.blocked}")
+        pend = [tuple(t) for t in run._dead_end_pending()]
+        check("B7a2 只剩挡死格（encircled）时 `_dead_end_pending` 能识别",
+              pend == [ENC_TILE], f"pending={pend}")
+    except Exception as exc:  # noqa: BLE001
+        skip("B7a dead_tile_set 重放", f"{type(exc).__name__}: {exc}")
+
+    # B7b 被围格不进任何阶段的目标池（water_area 也排除）；可做格保留
+    try:
+        w = _crop_world(TL, {ENC_TILE: {"ripe": False, "watered": False, "dead": False},
+                             OK_TILE: {"ripe": False, "watered": False, "dead": False}})
+        run = _mk_run(TL, w)
+        run.encircled_day = {ENC_TILE}
+        obs = w.obs()
+        plot = _plot_of("water_area", [ENC_TILE, OK_TILE])
+        pool = {tuple(t) for t in run._stage_tiles("water_area", obs, plot)}
+        check("B7b 被围格不进下轮目标池（water_area），可做格仍进池",
+              ENC_TILE not in pool and OK_TILE in pool, f"pool={sorted(pool)}")
+    except Exception as exc:  # noqa: BLE001
+        skip("B7b 目标池重放", f"{type(exc).__name__}: {exc}")
+
+    # B7c 阶段记录 leftover 拆分如实：exec + blocked == leftover；被围格记 blocked 不算可执行
+    try:
+        w = _crop_world(TL, {ENC_TILE: {"ripe": False, "watered": False, "dead": False},
+                             OK_TILE: {"ripe": False, "watered": False, "dead": False}})
+        run = _mk_run(TL, w)
+        run.encircled_day = {ENC_TILE}
+        rep = _fresh_rep(TL)
+        obs = w.obs()
+        plot = _plot_of("water_area", [ENC_TILE, OK_TILE])
+        run._step_stage("water_area", obs, plot, rep)
+        st = (rep.stages or [{}])[-1]
+        lo = int(st.get("leftover") or 0)
+        ex = st.get("leftover_executable")
+        bl = st.get("leftover_blocked")
+        ok = (ex is not None and bl is not None and int(ex) + int(bl) == lo
+              and int(bl) >= 1 and int(ex) == lo - int(bl))
+        check("B7c 阶段记录 leftover 拆分如实（exec+blocked==leftover；被围格进 blocked）",
+              ok, f"leftover={lo} exec={ex} blocked={bl} "
+                  f"blocked_tiles={st.get('leftover_blocked_tiles')}")
+        if "leftover_blocked_tiles" in st:
+            tiles = [tuple(t) for t in (st.get("leftover_blocked_tiles") or [])]
+            check("B7c2 挡死清单里不混可执行格（清单格 ⊆ dead_set）",
+                  set(tiles) <= set(run._dead_tile_set()), f"tiles={tiles}")
+    except Exception as exc:  # noqa: BLE001
+        skip("B7c 阶段拆分重放", f"{type(exc).__name__}: {exc}")
+
+    # B7d 同格无产出重分有界 = 3 次：第 3 次封格并留 blocked{action=stage_realloc}；
+    #      封格后该格不再进 clear_area 目标池（挡死格不进下轮分配）。
+    try:
+        w = TL.FakeWorld(seeds=0, money=0, weeds=4, water_left=40)
+        run = _mk_run(TL, w)
+        obs = w.obs()
+        tmap = TL.FarmWorker.tiles_of(obs)
+        weed_tiles = [t for t, v in tmap.items() if v.get("kind") or v.get("weed")]
+        if not weed_tiles:
+            skip("B7d 有界重分重放", "FakeWorld 无可见杂草格（夹具形态变了）")
+        else:
+            plot = _plot_of("clear_area", weed_tiles)
+            pool = [tuple(t) for t in run._stage_tiles("clear_area", obs, plot)]
+            target = pool[0] if pool else None
+            if target is None:
+                skip("B7d 有界重分重放", "clear_area 目标池为空（夹具形态变了）")
+            else:
+                def _nodone(*_a, **_k):
+                    return TL.StageResult(stage="clear_area", steps=[], stopped="incomplete",
+                                          stopped_reason="deputy 重放：故意无产出")
+                run.worker.run_stage = _nodone  # type: ignore[assignment]
+                plot1 = _plot_of("clear_area", [target])
+                rep = _fresh_rep(TL)
+                for _ in range(3):
+                    run._step_stage("clear_area", obs, plot1, rep)
+                cap = [e for e in run.entries if e.get("event") == "blocked"
+                       and e.get("action") == "stage_realloc"
+                       and tuple(e.get("tile") or ()) == target]
+                check("B7d 同格无产出重分 3 次封格并留账（alloc_no_progress=3, limit=3）",
+                      bool(cap) and int(cap[0].get("alloc_no_progress") or 0) == MAX_ALLOC_NO_PROGRESS
+                      and int(cap[0].get("limit") or 0) == MAX_ALLOC_NO_PROGRESS
+                      and target in run.blocked,
+                      f"cap={cap[:1]} blocked={target in run.blocked}")
+                pool2 = {tuple(t) for t in run._stage_tiles("clear_area", w.obs(),
+                                                             _plot_of("clear_area", [target]))}
+                check("B7d2 封格后不再进下轮目标池", target not in pool2,
+                      f"target={target} pool={sorted(pool2)}")
+    except Exception as exc:  # noqa: BLE001
+        skip("B7d 有界重分重放", f"{type(exc).__name__}: {exc}")
+
+    # B7e 收尾作业区（_work_spot_plot）也不拿挡死格：只剩挡死格 ⇒ None
+    try:
+        w = _crop_world(TL, {ENC_TILE: {"ripe": False, "watered": False, "dead": False}})
+        run = _mk_run(TL, w)
+        run.encircled_day = {ENC_TILE}
+        got = run._work_spot_plot(w.obs())
+        check("B7e 只剩挡死格的收尾区 ⇒ 不返回可做作业区（None）", got is None,
+              f"got={'None' if got is None else got.get('tiles')}")
+    except Exception as exc:  # noqa: BLE001
+        skip("B7e 收尾区重放", f"{type(exc).__name__}: {exc}")
+
+
+def check_card6_replay(rows) -> None:
+    """task-6 独立重放：slept_by_us 取真值（不再只看 ended_by）；预算延后 × 浇水达标不同真。"""
+    print("== B8 段：task-6 独立重放（我方场景；非作者用例）==")
+    src = read("brain/agentfarm/longrun.py")
+    if "_slept_by_us" not in src:
+        skip("B8 task-6 重放", "冻结树无 _slept_by_us ⇒ 卡未交付（不判 PASS）")
+        return
+    try:
+        TL = _probe_fixtures()
+    except Exception as exc:  # noqa: BLE001
+        skip("B8 task-6 重放", f"夹具 import 失败：{type(exc).__name__}: {exc}")
+        return
+
+    # B8a slept_by_us：sleep 成功但 ended_by=stuck（A8 冬 9/14 形态）⇒ True；
+    #      没睡成 ⇒ False；ended_by=sleep ⇒ True。
+    try:
+        w = _crop_world(TL, {OK_TILE: {"ripe": False, "watered": True, "dead": False}})
+        run = _mk_run(TL, w)
+
+        def _rep(**kw):
+            r = _fresh_rep(TL)
+            for k, v in kw.items():
+                setattr(r, k, v)
+            return r
+
+        r1 = _rep(slept_ok=True, ended_by="stuck", ended_reason="stuck:回片区")
+        r2 = _rep(slept_ok=False, ended_by="stuck", ended_reason="stuck:回片区")
+        r3 = _rep(slept_ok=False, ended_by="sleep", ended_reason="夜晚")
+        got = [run._slept_by_us(r1), run._slept_by_us(r2), run._slept_by_us(r3)]
+        check("B8a slept_by_us 取真值（slept_ok 优先于 ended_by）",
+              got == [True, False, True], f"got={got}")
+    except Exception as exc:  # noqa: BLE001
+        skip("B8a slept_by_us 重放", f"{type(exc).__name__}: {exc}")
+
+    # B8b 预算延后 × 户外浇水达标不得同真：
+    #      浇水达标日 ⇒ 事件一条不落、只记 suppressed 计数、deferred_by_budget=false；
+    #      未达标日 ⇒ 逐条落 deferred_by_budget 事件。
+    try:
+        w = _crop_world(TL, {OK_TILE: {"ripe": False, "watered": True, "dead": False}})
+        run = _mk_run(TL, w)
+        ev = {"task": "water_area", "why": "stamina", "dry": 3, "tiles": 3,
+              "targets": [[60, 10]], "note": "只因预算而不做（deputy 重放）"}
+        # 正向：浇水达标 ⇒ 压制
+        run2 = _mk_run(TL, w)
+        run2.budget_defer_events = [dict(ev), dict(ev)]
+        rep = _fresh_rep(TL)
+        rep.stamina_budget = {}
+        n2 = run2._flush_budget_deferrals(watered_outdoor=True, rep=rep)
+        fired2 = [e for e in run2.entries if e.get("event") == "deferred_by_budget"]
+        sup = int((rep.stamina_budget or {}).get("deferred_by_budget_suppressed") or 0)
+        check("B8b 浇水达标日：预算延后事件一条不落，只记 suppressed 计数",
+              n2 == 0 and not fired2 and sup == 2
+              and (rep.stamina_budget or {}).get("deferred_by_budget") is False,
+              f"n={n2} fired={len(fired2)} suppressed={sup} "
+              f"flag={(rep.stamina_budget or {}).get('deferred_by_budget')}")
+        # 反向：未达标 ⇒ 落账
+        run3 = _mk_run(TL, w)
+        run3.budget_defer_events = [dict(ev)]
+        rep3 = _fresh_rep(TL)
+        rep3.stamina_budget = {}
+        n3 = run3._flush_budget_deferrals(watered_outdoor=False, rep=rep3)
+        fired3 = [e for e in run3.entries if e.get("event") == "deferred_by_budget"]
+        check("B8b2 未达标日：预算延后事件照常落账（不得静默吞掉）",
+              n3 == 1 and len(fired3) == 1, f"n={n3} fired={len(fired3)}")
+    except Exception as exc:  # noqa: BLE001
+        skip("B8b 预算延后压制重放", f"{type(exc).__name__}: {exc}")
+
+    # B8c A8 独立复算：预算延后事件 + watered_outdoor=true + final_water.dry==0 同真天数
+    try:
+        ranges = _day_ranges(rows)
+        days = 0
+        same = 0
+        for key, lo, hi, endr in ranges:
+            days += 1
+            evs = _in_range(rows, lo, hi, lambda r: r.get("event") == "deferred_by_budget")
+            fw = endr.get("final_water") or {}
+            checks = endr.get("checks") or {}
+            if evs and checks.get("watered_outdoor") is True and int(fw.get("dry") or 0) == 0:
+                same += 1
+        check("B8c A8 旧账本：预算延后 × 浇水达标同真天数 = 12（analyzer 只显示前 6 行）",
+              days == 12 and same == 12, f"day_end={days} 同真={same}")
+    except Exception as exc:  # noqa: BLE001
+        skip("B8c A8 复算", f"{type(exc).__name__}: {exc}")
+
+
+def check_already_semantics(rows) -> None:
+    """task-10 #1：阶段记录 `ok==0 & already>0` 阶段数（A8 期望 0）；工具口径注意。"""
+    print("== B9 段：task-10 #1「ok=0 & already>0」阶段语义（A8 夹具）==")
+    stages = [(i, st) for i, r in rows if r.get("event") == "day_end"
+              for st in (r.get("stages") or [])]
+    if not stages:
+        skip("B9 task-10#1", "A8 账本无嵌套 day_end.stages ⇒ 无法判定")
+        return
+    zero = [st for _, st in stages if int(st.get("ok") or 0) == 0 and int(st.get("already") or 0) > 0]
+    already_sum = sum(int(st.get("already") or 0) for _, st in stages)
+    check("B9 A8 中「ok=0 且 already>0」阶段数 = 0（already 已成账，不再被当没干活）",
+          not zero, f"阶段 {len(stages)}、命中 {len(zero)}、already 总步数 {already_sum}")
+    tv = read("tools/verify-run3.py")
+    ok_line = [ln.strip() for ln in tv.splitlines() if "_ok_self" in ln and "already" not in ln]
+    info("B9b 现有工具 ok 口径（A9 放行必须并列 already 读）",
+         f"verify-run3 `_ok_self` 只累加 stages[].ok（{ok_line[:1]}）；"
+         "现工具单列 ok 不并列 already ⇒ A9 判定须同时读 already，否则「ok=0 但 already>0」的诚实日会被误判没干活")
+
+
+def check_task11_replay(rows) -> None:
+    """task-11 独立重放：review 兜底 / guard_leftover 两入口在只剩挡死格时同形态走换片或诚实收工。"""
+    print("== B10 段：task-11 两入口统一路由（我方动态重放）==")
+    src = read("brain/agentfarm/longrun.py")
+    if "_guard_leftover_resume" not in src or "_dead_end_pending" not in src:
+        skip("B10 task-11 重放", "冻结树无 _guard_leftover_resume/_dead_end_pending ⇒ 卡未交付（不判 PASS）")
+        return
+    try:
+        TL = _probe_fixtures()
+    except Exception as exc:  # noqa: BLE001
+        skip("B10 task-11 重放", f"夹具 import 失败：{type(exc).__name__}: {exc}")
+        return
+
+    def _one(entry: str) -> tuple[str, list[str], bool]:
+        w = _crop_world(TL, {ENC_TILE: {"ripe": False, "watered": False, "dead": False}})
+        run = _mk_run(TL, w)
+        rec: list[str] = []
+        nps: list[str] = []
+
+        def _fake_stop(*a, **k):
+            nps.append("no_progress_stop")
+            run.__dict__.setdefault("_x", None)
+            return ("sleep", "stuck:回片区（deputy 重放：不应被调用）")
+
+        def _fake_switch(obs, rep, plot=None, where="", **_k):
+            rec.append(str(where))
+            rep.ended_by, rep.ended_reason = "sleep", "resume_exhausted:deputy 重放无目标"
+            return ("ended", None)
+
+        run._work_spot_plot = lambda obs: None  # type: ignore[assignment]
+        run._pending_work = lambda: [ENC_TILE]  # type: ignore[assignment]
+        run._dead_end_pending = lambda: [ENC_TILE]  # type: ignore[assignment]
+        run._resume_reevaluate = lambda **kw: None  # type: ignore[assignment]
+        run._resume_plot = lambda obs: None  # type: ignore[assignment]
+        run._resume_switch_or_exhaust = _fake_switch  # type: ignore[assignment]
+        run._no_progress_stop = _fake_stop  # type: ignore[assignment]
+        obs = w.obs()
+        rep = _fresh_rep(TL)
+        rep.stamina_budget = {}
+        if entry == "review":
+            ret = run._review_only_fallback(obs, rep)
+        else:
+            ret = run._guard_leftover_resume(obs, rep, text="deputy 重放")
+        stuck = str(rep.ended_reason or "").startswith("stuck")
+        return (f"{ret}", rec, bool(nps and not stuck) or bool(stuck))
+
+    try:
+        ret_rev, rec_rev, bad_rev = _one("review")
+        ret_g, rec_g, bad_g = _one("guard")
+        check("B10 `_review_only_fallback` 只剩挡死格 ⇒ 走换片/诚实收工（不落 stuck、不调 _no_progress_stop）",
+              rec_rev == ["review_only_fallback"] and "None" in ret_rev and not bad_rev,
+              f"ret={ret_rev} where={rec_rev}")
+        check("B10b `_guard_leftover_resume` 只剩挡死格 ⇒ 同形态走换片/诚实收工",
+              rec_g == ["guard_leftover"] and "ended" in ret_g and not bad_g,
+              f"ret={ret_g} where={rec_g}")
+    except AttributeError as exc:
+        skip("B10 task-11 重放", f"方法签名不符：{exc}")
+    except Exception as exc:  # noqa: BLE001
+        skip("B10 task-11 重放", f"{type(exc).__name__}: {exc}")
 
 
 # ---------------------------------------------------------------- C 段：独立判据（伪造记录 → 判红/判绿）
@@ -775,6 +1146,135 @@ def judge_clear_invariant(stage: dict) -> list[str]:
     return v
 
 
+def judge_sleep_evidence(day: dict, events: list[dict]) -> list[str] | None:
+    """task-6：slept_by_us=true 必须有入睡成功证据；有成功证据不得报 false。缺失 ⇒ None。"""
+    checks = day.get("checks")
+    if not isinstance(checks, dict) or "slept_by_us" not in checks:
+        return None
+    slept = checks.get("slept_by_us")
+    has_sleep = any(e.get("event") == "sleep" and e.get("ok") is True for e in events)
+    ended = str(day.get("ended_by") or "")
+    advanced = bool(day.get("day_after"))
+    v: list[str] = []
+    if slept is True and not (has_sleep or ended in ("sleep", "inventory_blocked") or advanced):
+        v.append(f"slept_by_us=true 但无入睡成功证据（ended_by={ended or '空'}、day_after={advanced}）")
+    if slept is False and has_sleep and advanced:
+        v.append("sleep 成功且跨日却 slept_by_us=false（伪造/快照滞后）")
+    return v
+
+
+def judge_water_evidence(day: dict, events: list[dict]) -> list[str] | None:
+    """task-6：watered_outdoor=true 不得与 final_water.dry>0 同真；final_water 缺 ⇒ None。"""
+    checks = day.get("checks")
+    if not isinstance(checks, dict) or "watered_outdoor" not in checks:
+        return None
+    fw = day.get("final_water")
+    if not isinstance(fw, dict) or "dry" not in fw:
+        return None
+    v: list[str] = []
+    if checks.get("watered_outdoor") is True and int(fw.get("dry") or 0) > 0:
+        v.append(f"watered_outdoor=true 但 final_water.dry={fw.get('dry')}（伪造浇水达标）")
+    return v
+
+
+def judge_leftover_dead_semantics(stage: dict, *, dead: set | None = None) -> list[str] | None:
+    """task-5：exec+blocked==leftover；挡死清单只许含 dead_set 格（不得误排可执行格）。"""
+    if any(k not in stage for k in ("leftover", "leftover_executable", "leftover_blocked")):
+        return None
+    lo = int(stage.get("leftover") or 0)
+    ex = int(stage.get("leftover_executable") or 0)
+    bl = int(stage.get("leftover_blocked") or 0)
+    v: list[str] = []
+    if ex + bl != lo:
+        v.append(f"拆分不平：executable={ex} + blocked={bl} != leftover={lo}")
+    if ex < 0 or bl < 0:
+        v.append("拆分出现负数")
+    tiles = stage.get("leftover_blocked_tiles")
+    if tiles is not None:
+        if bl <= 12 and len(tiles) != bl:
+            v.append(f"leftover_blocked_tiles 条数 {len(tiles)} != leftover_blocked {bl}")
+        if dead is not None:
+            bad = [t for t in tiles if tuple(t) not in dead]
+            if bad:
+                v.append(f"挡死清单含非挡死（可执行）格 {bad[:4]}（误排可执行格）")
+    return v
+
+
+def judge_alloc_cap_exemption(events: list[dict], *, cap: int = 3) -> list[str] | None:
+    """task-5：重分封格额度必须是 3（不得抬高成新豁免），且封格后不得再被分配/未做完。"""
+    cap_ev = [e for e in events if e.get("event") == "blocked"
+              and e.get("action") == "stage_realloc"]
+    if not cap_ev:
+        return None
+    v: list[str] = []
+    capped: set[tuple] = set()
+    for e in cap_ev:
+        lim = int(e.get("limit") or 0)
+        n = int(e.get("alloc_no_progress") or 0)
+        if lim != cap:
+            v.append(f"重分封格 limit={lim}，基线应为 {cap}（抬高=新豁免额度）")
+        if n < cap:
+            v.append(f"未到 {cap} 次就封格：alloc_no_progress={n}")
+        try:
+            capped.add(tuple(e.get("tile") or ()))
+        except TypeError:
+            pass
+    if capped:
+        for e in events:
+            if e.get("event") == "stage_shortfall":
+                hit = {tuple(t) for t in (e.get("tiles") or [])} & capped
+                if hit:
+                    v.append(f"已封格又出现在未做完清单：{sorted(hit)[:3]}")
+    return v
+
+
+def judge_checks_payload(checks) -> list[str] | None:
+    """task-242/244 面：checks 必须恰为 10 键基线，新字段不得塞进 checks 污染语义。"""
+    if not isinstance(checks, dict):
+        return None
+    if any(k not in checks for k in CHECKS_BASELINE):
+        return None
+    extra = [k for k in checks if k not in CHECKS_BASELINE]
+    return [] if not extra else [f"checks 新增键 {extra}（新字段不得污染 10 键语义）"]
+
+
+def judge_no_unmet_relax(day: dict, stages: list[dict]) -> list[str] | None:
+    """task-5：no_unmet_stages 不得放宽；分下去没做完且无诚实停 ⇒ 判红。缺键 ⇒ None。"""
+    checks = day.get("checks")
+    if not isinstance(checks, dict) or "no_unmet_stages" not in checks:
+        return None
+    if checks.get("no_unmet_stages") is not True:
+        return []
+    v: list[str] = []
+    for st in stages:
+        undone = int(st.get("assigned_undone") or 0)
+        if undone <= 0:
+            continue
+        stopped = str(st.get("stopped") or "")
+        if stopped in HONEST_STOPPED:
+            continue
+        if int(st.get("leftover_executable") or 0) <= 0:
+            continue
+        v.append(f"阶段分下去 {undone} 格没做完（stopped={stopped or '空'}）却 no_unmet_stages=true")
+    return v
+
+
+def judge_resume_unified(day: dict, events: list[dict]) -> list[str] | None:
+    """task-11：resume_exhausted 不得 VERIFIED；不得再写 stuck:回片区；两入口须留 source。"""
+    v: list[str] = []
+    reason = str(day.get("ended_reason") or "")
+    srcs = {str(e.get("source") or "") for e in events
+            if e.get("event") == "no_progress_burst" and e.get("exhausted")}
+    srcs.discard("")
+    if reason.startswith(RESUME_EXHAUSTED_PREFIX) and day.get("verified"):
+        v.append("resume_exhausted 却 VERIFIED（洗白）")
+    if reason.startswith("stuck") and "回片区" in reason:
+        v.append("仍写 stuck:回片区（task-11 未生效）")
+    if not srcs and not reason:
+        return None
+    return v
+
+
 def case_c() -> None:
     print("== C 段：三卡修法判据（伪造记录 → 期望判红/判绿/无法判定）==")
     exhaust_day = {"event": "day_end", "ended_by": "sleep",
@@ -847,6 +1347,66 @@ def case_c() -> None:
         ("C6-4 预算延后但 dry>0（不矛盾）", judge_budget_water,
          ({"checks": {"watered_outdoor": False}, "final_water": {"dry": 2}},
           [{"event": "deferred_by_budget", "task": "water_area"}]), {}, "green"),
+        # ---- task-5（0.7.44 卡 2）新增判据：拆分分母 / 挡死清单语义 / 重分额度 ----
+        ("C5-8 挡死清单混入可执行格（伪造）", judge_leftover_dead_semantics,
+         ({"leftover": 2, "leftover_executable": 1, "leftover_blocked": 1,
+           "leftover_blocked_tiles": [[60, 10]]},), {"dead": {(37, 35)}}, "red"),
+        ("C5-9 拆分自洽且挡死格确实在 dead_set（可解释）", judge_leftover_dead_semantics,
+         ({"leftover": 2, "leftover_executable": 1, "leftover_blocked": 1,
+           "leftover_blocked_tiles": [[37, 35]]},), {"dead": {(37, 35)}}, "green"),
+        ("C5-10 拆分字段缺失 ⇒ 无法判定", judge_leftover_dead_semantics,
+         ({"leftover": 2},), {}, "undecidable"),
+        ("C5-11 重分上限被抬高成豁免额度（伪造）", judge_alloc_cap_exemption,
+         ([{"event": "blocked", "action": "stage_realloc", "tile": [40, 30],
+            "alloc_no_progress": 3, "limit": 99}],), {}, "red"),
+        ("C5-12 未到 3 次就封格（伪造）", judge_alloc_cap_exemption,
+         ([{"event": "blocked", "action": "stage_realloc", "tile": [40, 30],
+            "alloc_no_progress": 1, "limit": 3}],), {}, "red"),
+        ("C5-13 重分 3 次封格（可解释）", judge_alloc_cap_exemption,
+         ([{"event": "blocked", "action": "stage_realloc", "tile": [40, 30],
+            "alloc_no_progress": 3, "limit": 3}],), {}, "green"),
+        ("C5-14 封格后又出现在阶段未做完清单（伪造）", judge_alloc_cap_exemption,
+         ([{"event": "blocked", "action": "stage_realloc", "tile": [40, 30],
+            "alloc_no_progress": 3, "limit": 3},
+           {"event": "stage_shortfall", "tiles": [[40, 30]]}],), {}, "red"),
+        # ---- task-6（0.7.44 卡 3）新增判据：入睡/浇水证据 ----
+        ("C6-5 伪造入睡成功（slept_by_us=true 但无 sleep 证据）", judge_sleep_evidence,
+         ({"checks": {"slept_by_us": True}, "ended_by": "stuck", "day_after": None}, []), {}, "red"),
+        ("C6-6 真睡成（sleep ok=true + 跨日）却报 false（伪造/滞后）", judge_sleep_evidence,
+         ({"checks": {"slept_by_us": False}, "ended_by": "stuck",
+           "day_after": ["1", "winter", 10]}, [{"event": "sleep", "ok": True}]), {}, "red"),
+        ("C6-7 睡成且口径 true（可解释）", judge_sleep_evidence,
+         ({"checks": {"slept_by_us": True}, "ended_by": "stuck",
+           "day_after": ["1", "winter", 10]}, [{"event": "sleep", "ok": True}]), {}, "green"),
+        ("C6-8 伪造浇水达标（watered_outdoor=true 但 dry>0）", judge_water_evidence,
+         ({"checks": {"watered_outdoor": True}, "final_water": {"dry": 2}}, []), {}, "red"),
+        ("C6-9 final_water 缺失 ⇒ 无法判定", judge_water_evidence,
+         ({"checks": {"watered_outdoor": True}}, []), {}, "undecidable"),
+        ("C6-10 浇水达标且干格=0（可解释）", judge_water_evidence,
+         ({"checks": {"watered_outdoor": True}, "final_water": {"dry": 0}}, []), {}, "green"),
+        # ---- task-242/244 面：checks 10 键不得被新字段污染 ----
+        ("C7-1 checks 被塞入新字段（污染 10 键语义，伪造）", judge_checks_payload,
+         ({**{k: True for k in CHECKS_BASELINE}, "slept_ok": True},), {}, "red"),
+        ("C7-2 checks 恰为 10 键（可解释）", judge_checks_payload,
+         ({k: True for k in CHECKS_BASELINE},), {}, "green"),
+        ("C7-3 checks 缺键 ⇒ 无法判定（缺失≠通过）", judge_checks_payload,
+         ({"slept_by_us": True},), {}, "undecidable"),
+        # ---- task-5：不得放宽 no_unmet_stages ----
+        ("C8-1 放宽 no_unmet_stages（分下去没做完却 true，伪造）", judge_no_unmet_relax,
+         ({"checks": {"no_unmet_stages": True}},
+          [{"assigned_undone": 2, "stopped": "", "leftover_executable": 2}]), {}, "red"),
+        ("C8-2 诚实停（stamina）下 no_unmet_stages=true（可解释）", judge_no_unmet_relax,
+         ({"checks": {"no_unmet_stages": True}},
+          [{"assigned_undone": 2, "stopped": "stamina", "leftover_executable": 2}]), {}, "green"),
+        # ---- task-11：两入口收工口径 ----
+        ("C9-1 resume_exhausted 却 VERIFIED（洗白）", judge_resume_unified,
+         ({"ended_reason": "resume_exhausted:无目标", "verified": True}, []), {}, "red"),
+        ("C9-2 两入口 dead-only 走 resume_exhausted 不 VERIFIED（可解释）", judge_resume_unified,
+         ({"ended_reason": "resume_exhausted:只剩挡死格", "verified": False},
+          [{"event": "no_progress_burst", "exhausted": True, "source": "guard_leftover"},
+           {"event": "no_progress_burst", "exhausted": True, "source": "review_only_fallback"}]), {}, "green"),
+        ("C9-3 修后仍写 stuck:回片区（伪造）", judge_resume_unified,
+         ({"ended_reason": "stuck:回片区（work_spot_resume）", "verified": False}, []), {}, "red"),
     ]
     for tag, fn, args, kwargs, want in cases:
         try:
