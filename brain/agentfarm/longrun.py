@@ -1579,6 +1579,29 @@ class LongRun:
             out.append(f"{int(it.get('count') or 0)} 次「{kind}」因{reason}没做成{need}"[:GAPS_TEXT_MAX_CHARS])
         return tuple(out)
 
+    @staticmethod
+    def _finalize_reason_for(rep: DayReport) -> str:
+        """【task-238】日终兜底：0 步且无原因码的意图该补哪个**闭合原因码**。
+
+        顺序按"当天到底被什么挡住"从具体到笼统；只用于**补原因码**，绝不改
+        `executed_steps`/`checks`（§8.2c：回填不是洗白通道）。
+        """
+        ended = str(rep.ended_by or "")
+        reason = str(rep.ended_reason or "")
+        if ended == "inventory_blocked":
+            return "no_slot"
+        if ended == ENDED_BY_MODAL:
+            return "blocked_modal"
+        if ended == ENDED_BY_EVENT:
+            return "gated"
+        if ended.startswith("stuck"):
+            return "world_stuck"
+        if ended in ("bridge_down", "sleep_failed"):
+            return "world_stuck"
+        if reason.split(":", 1)[0] in ("night", "stamina", "no_work", "no_plot"):
+            return "gated"
+        return "unknown_evidence"
+
     def _finish_intent_coverage(self, rep: DayReport) -> None:
         """【task-219】日终收口：**当天计划过**的意图一条都不能少。
 
@@ -1595,6 +1618,20 @@ class LongRun:
             self._record_intent(intent_id=ident, task=str(plan.get("task") or ""),
                                 reasons={reason: 1},
                                 note="计划过但没进执行（日终补记，原因见 reason 码）")
+        # 【task-238】§8.3 兜底：`executed_steps == 0 && reasons == {}` 的意图必须补一个
+        # 闭合原因码（0.7.40 A2 冒烟实证 `missed:intent_no_reason:water_area`：换任务兜底
+        # 生成的意图没有 plan 记录、`_step_stage` 又 0 目标 0 步 ⇒ 对账里空着）。
+        # 只补原因码 + evidence，不改 `executed_steps`/`checks`/`verified`。
+        fallback = self._finalize_reason_for(rep)
+        for rec in self.intent_coverage:
+            if int(rec.get("executed_steps") or 0) != 0 or rec.get("reasons"):
+                continue
+            rec["reasons"] = {fallback: 1}
+            rec["evidence"] = {"why": "finalize_fallback", "ended_by": str(rep.ended_by or ""),
+                               "ended_reason": str(rep.ended_reason or "")[:200]}
+            rec["note"] = ("日终兜底回填：0 步且无原因码 ⇒ 按当天收尾原因补 "
+                           f"`{fallback}`（只补原因码，不改步数/判定）")
+            rec["reasons_are_intent_level"] = int(rec.get("requested_tiles") or 0) == 0
         rep.intent_coverage = [dict(r) for r in self.intent_coverage]
 
     def _elapsed_minutes(self) -> float:

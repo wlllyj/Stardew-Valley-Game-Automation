@@ -11239,6 +11239,107 @@ class TestTask233NonPlotEvidence(unittest.TestCase):
             "missed:intent_no_target_evidence:") for f in findings), findings)
 
 
+class TestTask238FinalizeReasonFallback(unittest.TestCase):
+    """【task-238】§8.3 兜底：0 步且无原因码的意图必须回填**闭合集**原因码。
+
+    0.7.40 A2 冒烟实证 `missed:intent_no_reason:water_area`（`fall28#08`：换任务兜底
+    生成的意图没有 plan 记录、`_step_stage` 又 0 目标 0 步 ⇒ 对账里 reasons 空着）。
+    回填只补原因码 + evidence，**不改** `executed_steps`/`checks`。
+    """
+
+    def _run(self, *, ended_by: str, ended_reason: str = "",
+             recs: list[dict] | None = None) -> tuple[LongRun, DayReport]:
+        w = FakeWorld(weeds=0, seeds=10, money=500)
+        run = make_run(w)
+        run.started = run.now()
+        rep = DayReport(day_key=("fall", 28, 1), started_at=0.0)
+        rep.ended_by = ended_by
+        rep.ended_reason = ended_reason
+        for rec in (recs if recs is not None else [self._bare()]):
+            run.intent_coverage.append(dict(rec))
+        run._finish_intent_coverage(rep)
+        return run, rep
+
+    @staticmethod
+    def _bare(task: str = "water_area") -> dict:
+        return {
+            "intent_id": "fall28#08", "task": task, "area_hint": "", "area": "",
+            "source": "", "boundary": "", "requested_tiles": 0, "ok_tiles": 0,
+            "failed_tiles": 0, "unexecuted_tiles": 0, "executed_steps": 0,
+            "reasons": {}, "actionless": False, "reasons_are_intent_level": False,
+        }
+
+    def test_zero_step_empty_reasons_on_inventory_blocked_day_is_backfilled(self):
+        run, _rep = self._run(ended_by="inventory_blocked",
+                              ended_reason="inventory_blocked:背包满（空格 0）")
+        rec = [r for r in run.intent_coverage if r["task"] == "water_area"][0]
+        self.assertEqual(rec["reasons"], {"no_slot": 1}, rec)
+        self.assertEqual(rec["executed_steps"], 0, "回填只补原因码，不许改步数")
+        ev = rec["evidence"]
+        self.assertEqual(ev["why"], "finalize_fallback", ev)
+        self.assertEqual(ev["ended_by"], "inventory_blocked")
+        self.assertIn("兜底回填", rec["note"])
+        self.assertTrue(_intent_coverage_ok(rec), rec)
+
+    def test_zero_step_empty_reasons_on_night_day_becomes_gated(self):
+        run, _rep = self._run(ended_by="sleep", ended_reason="night:到点了")
+        rec = run.intent_coverage[0]
+        self.assertEqual(rec["reasons"], {"gated": 1}, rec)
+        self.assertEqual(rec["evidence"]["why"], "finalize_fallback")
+
+    def test_reason_mapping_covers_each_ended_by(self):
+        cases = {
+            "inventory_blocked": "no_slot",
+            "blocked_modal": "blocked_modal",
+            "blocked_event": "gated",
+            "stuck:守卫说还有活": "world_stuck",
+            "bridge_down": "world_stuck",
+        }
+        w = FakeWorld(weeds=0, seeds=10, money=500)
+        run = make_run(w)
+        for ended_by, want in cases.items():
+            rep = DayReport(day_key=("fall", 28, 1), started_at=0.0)
+            rep.ended_by = ended_by
+            self.assertEqual(run._finalize_reason_for(rep), want, ended_by)
+        rep = DayReport(day_key=("fall", 28, 1), started_at=0.0)
+        rep.ended_by = "sleep"
+        rep.ended_reason = "stamina:体力不够"
+        self.assertEqual(run._finalize_reason_for(rep), "gated")
+        rep.ended_reason = "whatever:unknown"
+        self.assertEqual(run._finalize_reason_for(rep), "unknown_evidence")
+
+    def test_normal_intents_are_not_touched(self):
+        ok_rec = dict(self._bare("harvest"), executed_steps=3, requested_tiles=3,
+                      ok_tiles=3, reasons={"no_slot": 1}, reasons_are_intent_level=False)
+        empty_but_has_reason = dict(self._bare("till_area"), reasons={"gated": 1})
+        run, _rep = self._run(ended_by="inventory_blocked",
+                              recs=[ok_rec, empty_but_has_reason])
+        self.assertEqual(run.intent_coverage[0]["reasons"], {"no_slot": 1})
+        self.assertEqual(run.intent_coverage[0]["executed_steps"], 3)
+        self.assertNotIn("evidence", run.intent_coverage[0])
+        self.assertEqual(run.intent_coverage[1]["reasons"], {"gated": 1})
+
+    def test_analyzer_no_longer_reports_intent_no_reason(self):
+        """回填前后跑 analyzer 的 §8.3.7：空 reasons 红、回填后不红。"""
+        import importlib.util
+        root = Path(__file__).resolve().parents[1]
+        spec = importlib.util.spec_from_file_location(
+            "analyze_longrun_task238", root / "tools" / "analyze-longrun.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        bare = self._bare()
+        sessions = [{"events": [(1, {"event": "day_end", "intent_coverage": [bare]})]}]
+        findings = mod.cat_intent([], sessions, [], 10)
+        self.assertTrue(any(str(f.get("subject") or "").startswith(
+            "missed:intent_no_reason:") for f in findings), findings)
+        run, _rep = self._run(ended_by="inventory_blocked")
+        fixed = run.intent_coverage[0]
+        sessions2 = [{"events": [(1, {"event": "day_end", "intent_coverage": [fixed]})]}]
+        findings2 = mod.cat_intent([], sessions2, [], 10)
+        self.assertFalse(any(str(f.get("subject") or "").startswith(
+            "missed:intent_no_reason:") for f in findings2), findings2)
+
+
 class TestTask233PlotNoTargetUnchanged(unittest.TestCase):
     """【task-233】片区任务的 `no_target` 口径**一字未改**：仍带 `stage_tiles_empty`。"""
 

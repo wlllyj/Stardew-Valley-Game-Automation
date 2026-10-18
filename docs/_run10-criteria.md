@@ -111,6 +111,8 @@
 
 `sleep` / `review` / `wait_for_save` / `recover_stamina` 这类**无动作意图**在 `_verify_intents`（`brain/agentfarm/longrun.py:6314` 附近）不产生 verdict ⇒ 必须显式列入 `ACTIONLESS_TASKS`，否则 §8.3.2 会**每天误报**。不在白名单的任务一律按有动作意图对账。
 
+【task-238 兜底回填语义】日终 `_finish_intent_coverage()` 会对 `executed_steps==0 && reasons=={}` 的意图按当天收尾原因补一个**闭合集**原因码（`inventory_blocked→no_slot`、`blocked_modal→blocked_modal`、`blocked_event→gated`、`stuck*→world_stuck`、夜里/体力收工→`gated`、其余→`unknown_evidence`），`evidence.why="finalize_fallback"` 且带当天 `ended_by` 原文。**回填只补原因码**：不改 `executed_steps`、不改 `checks`、不改 `verified`、不做任何豁免 —— 它不是洗白通道（否则等于把"实现漏记"变成"理由充分"）。
+
 ### 8.3 analyzer 判红（task-220 实现 + task-232 对齐后，硬性 9 条）
 
 1. 有意图计划而**无** `intent_coverage` 条目 ⇒ 红（对账缺失）；
