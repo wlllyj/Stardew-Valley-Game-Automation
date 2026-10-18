@@ -112,6 +112,20 @@
 - 这意味着：**那个没落盘的 `ShippingMenu` 现在还开着**（它挡着世界时间）。若之后要退出，**先关框等保存链走完再退**，否则 fall 28 整天的进度会丢；存档主档目前 = fall 28 清晨（12:18:23）。
 - 本卡未做：`load_save`、`buy`、`craft`、`place`、手改存档；`sell` 只发生在 `slot_relief` 内部（受制裁路径）；`use_tool` 仅步 3 的 3 次有界调用。
 
+### §9.1 现场抢救与优雅退出（Lead m04068 步骤 1–3，事后补记；这一步同时是步 6 根因的反证）
+
+- **关框前（只读）**：`ui={activeMenu:"ShippingMenu", isModal:true}`、`clock=winter 1 06:00 sunny`、`player={FarmHouse(9,9), 体力270, money 2767, isInBed:true}`、`liveness={worldAdvancing:false, secondsSinceClockMoved:190.1}`；存档四件 = 主档 **4464675 B / 12:18:23 / sha256 `2D9B92D6CB401B36…`**、`SaveGameInfo` 30992 / 12:18:23、`_old` 4515874 / 12:14:47、`SaveGameInfo_old` 31034 / 12:14:47。
+- **发一次 `dismiss_modal`**：回执 `ok=true`、`dismissPath="ok_clicked"`、`waitedMs=6768`、`menuGone=true`、`worldSeqBefore/After=1657`、reason `出货/存档菜单处理完毕（路径=ok_clicked：已反射调用 ShippingMenu.okClicked()…等了 6768ms；菜单已消失）`。
+- **同一秒保存链补齐（SMAPI 原文 5 行，12:23:53–12:23:56）**：
+  `Context: before save.` → `SaveGame.Save() called.` → `Synchronizing 'Save' task...` → `SaveGame.Save() completed without exceptions.` → **`Context: after save, starting winter 1 Y1.`**
+  ⇒ 存档主档 **4464675/12:18:23 → 3104089 B / 12:23:54**、`SaveGameInfo` 30992 → 31188；`_old` 轮换为上一对（4464675/12:18:23）。`ui.isModal → false`（`activeMenu=null`）。
+- **`worldAdvancing` 仍为 false（如实记）**：关框后 `worldAdvancing=false, secondsSinceClockMoved≈197` —— 玩家 `isInBed=true`（睡觉技能把角色留在床上，`FarmHouse(9,9)`），所以时钟不走。**这不影响"保存已补齐"的结论**（保存链 5 行齐全 + 主档前进），但"世界时间恢复"要等角色下床才成立。
+- **反证步 6 的根因**：同一个 `ShippingMenu`，没人关时（跑已退出）`NewDay` 之后**永无**保存链；**关一次**就立刻补齐 5 行 + 主档前进 ⇒ 步 6 的红是"跑尾声没人关框 + 没人等落盘"，**不是游戏跳过保存**。
+- **优雅退出（m02833）**：`tools\stop-game.py` rc=0（原 pids `[24756]`）⇒ 进程 **0** / `bridge.json` **已删** / 17890 仅 **2 条 TIME_WAIT**（无 LISTENING）/ **存档四件退出前后逐字节未变**；SMAPI 尾 `12:24:13 Disconnected: ClosedGame → Disposing... → 已删除发现文件 …\bridge.json`（无 Event 1000/1001）。
+- **「fall 28 全天是否保住」**：**保住了** —— 12:23:54 的这次保存写入的是内存里的**winter 1 06:00 状态**（money 2767 已含 fall 28 的出货结算），`_old` 保留的是 fall 28 清晨那份（4464675/12:18:23）；两次落盘之间没有丢失的游戏日。
+- 取证脚本：`scratch\_t_save_winter1.py`；读数 JSON：`scratch\t-save-winter1.json`。
+- 观察留痕（不解释）：主档体积 4464675 → 3104089（−1.36 MB），`after save, starting winter 1 Y1` 为权威；本报告不据此推断内容差异。
+
 ## §10 结论与建议（先结果，后建议）
 
 1. **管道结论**：步 1/2/3/4 PASS、步 5 无法判定、步 6 FAIL、步 7 FAIL ⇒ **冒烟未全绿**，其中步 6 是**新版硬问题口径下的真红**（每次跨日必须落盘）。
