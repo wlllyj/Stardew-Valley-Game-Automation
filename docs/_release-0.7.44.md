@@ -38,7 +38,7 @@
 ## §4 A9/B9 协议（用户 2026-10-18 已授权：新起点 winter 26，全授权真机/存档）
 
 - **起点**：当前存档第 1 年 winter 26（钱 2767g，无作物）→ `python scratch\arm-start-helper.py backup --arm A9` ⇒ `logs\ab-backup\A9-start\`（四件 + MANIFEST）。
-- **A9**：0.7.44 装机后起跑，`--days 5 --size 5 --max-minutes 240 --max-days 12 --journal logs\longrun-runA9-0744.jsonl`；冬 26/27 两天为热身，**尾 5 天应落在 spring 1–5**（解决 0.7.43 §4「冬季农务面不可判」）。**A8 与 A9 是不同起点 ⇒ 两对臂不可跨对比较，证据 §1 写明「新的一对起点」。**
+- **A9**：0.7.44 装机后起跑，`--days 5 --size 5 --max-minutes 240 --max-days 12 --journal logs\longrun-runA9-0744.jsonl`；**冬 26/27/28 三天为热身**（winter 28 天：26→27→28 之后才是 spring 1），**尾 5 天应落在 spring**（提前达标则 spring 1–5）；解决 0.7.43 §4「冬季农务面不可判」。**A8 与 A9 是不同起点 ⇒ 两对臂不可跨对比较，证据 §1 写明「新的一对起点」。**
 - **B9**：A9 收工后 `arm-start-helper.py restore --arm A9` 还原并逐件 SHA256 核对；A9 的 `<journal>-lessons.json` **字节拷贝**为 B9 的；同 argv 起 `logs\longrun-runB9-0744.jsonl`。
 - **判据**：`verify-run3 --days 5 --smapi` + `analyze-longrun --window 5` + `compare-runs` L0–L5 + 三检查器 + 外部证据（六串 ≥5/5、每日 ≥2 份独立观测、存档四件、优雅退出四项）。
 - **纪律**：起跑必须带 task-9 看护守护（脑进程消失 ⇒ 自动 `stop-game`）；游戏只要开着必须有脑在跑；跑完立刻优雅退。
