@@ -1994,9 +1994,16 @@ class TestTask51ClearDead(unittest.TestCase):
         self.assertEqual(len(w.calls), 1, "回「无效」是结论性的：不必挥满上限")
 
     def test_unreachable_is_its_own_class(self):
-        """四邻都站不过去 ⇒ task-52 的 `unreachable`（不是清死苗失败，也不封格）。"""
+        """四邻都站不过去 ⇒ task-52 的 `unreachable`（不是清死苗失败，也不封格）。
+
+        【task-27 / 0.7.46】口径收口后，`unreachable` 要求**观测过落脚点**（目标或四邻
+        `standable=true`）：只有"确实观测到能站、却还是走不到"才是"走不到"。
+        这里显式给一格可站的邻格，保持 task-52 原判据；"四邻毫无观测"的批量失败
+        归 `encircled`（挡死），见 `tests/test_longrun.py::TestTask27EnclosedBatch`。
+        """
         tile = (60, 10)
         w, worker = self._worker(dead_crop_rec(tile))
+        w.records.append({"tile": [tile[0] + 1, tile[1]], "kind": "dirt", "standable": True})
         w.unwalkable = {(tile[0] + dx, tile[1] + dy) for dx, dy in NEIGHBORS}
         r = worker.clear_dead(tile)
         self.assertEqual(r.code, "unreachable")

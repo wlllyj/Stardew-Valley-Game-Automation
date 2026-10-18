@@ -2039,6 +2039,32 @@ class FarmWorker:
                 return True
         return False
 
+    #: 【task-27 / 0.7.46】"没法开路的失败"只在对给这四类状态时才算真实结论；环境/没结论
+    #: 状态一律维持旧口径（归 unreachable/交给日级有界豁免，绝不当成"被围住"洗白）。
+    _FOOTHOLD_ENV_STATUSES = ENV_BLOCK_STATUSES + tuple(INCONCLUSIVE_STATUSES)
+
+    @staticmethod
+    def _observed_foothold(obs: dict[str, Any], tile: tuple[int, int]) -> bool:
+        """【task-27 / 0.7.46】观测里有没有**可站立落脚点**的证据（判断"本该可达"用）。
+
+        * 目标格自己有观测且 `standable=true` ⇒ 它本身是能站的地面（例如已被锄/长了作物的格）；
+        * 四邻里任何一格有观测且 `standable=true` ⇒ 有落脚点。
+
+        注意与 `_standable_near` 的区别：后者是**乐观**口径（"没观测到也算可站，交给 Mod 试"），
+        用于"先去试试"；本函数用**证据**口径（只认观测到的 `standable=true`），用于失败之后
+        归类"这是被围住（encircled）还是本该可达但走不到（unreachable）"。四邻全无观测、
+        也从未观测到可站 ⇒ 没有"本该可达"的证据 ⇒ 不许算进 `unreachable`（task-27 卡面不变式）。
+        """
+        tiles = FarmWorker.tiles_of(obs)
+        tv = tiles.get(tile)
+        if tv is not None and tv.get("standable"):
+            return True
+        for dx, dy in NEIGHBORS:
+            nv = tiles.get((tile[0] + dx, tile[1] + dy))
+            if nv is not None and nv.get("standable"):
+                return True
+        return False
+
     @staticmethod
     def _neighbour_kinds(obs: dict[str, Any], tile: tuple[int, int]) -> list[str]:
         """【task-78】四邻的**真实 kind**（照实写进走不到/被围住的 reason，不许替观测下结论）。
@@ -2151,23 +2177,48 @@ class FarmWorker:
             # 【task-78 NIT-2】reason 只写**看得见的事实**：试了几次开路 + 四邻真实 kind。
             # 不许再断言"是树/桩/大石"—— 四邻完全可能是 `weed` 只是自己站不上去（deputy 实证：
             # `weed` + `standable=false` ⇒ 0 次挥动却写成树/桩/大石，与事实不符）。
-            facts = self.snap()
-            try:
-                kinds = self._neighbour_kinds(facts, tile)
-            except Exception:                      # 观测拿不到就照实写"未知"，不许编
-                kinds = ["未知"] * len(NEIGHBORS)
-            r.code = ENCIRCLED_CODE
-            r.tried_open = len(cleared)
-            r.encircled_kinds = list(kinds)
-            r.reason = (f"四邻没有「可清障 + 自己够得着」的突破口（判据：四邻既没有落脚点，"
-                        f"也没有可清障类邻格）⇒ 归 encircled：不算「走不到」、不封格，"
-                        f"次日/开路后可能变可达；四邻实际 kind={kinds}；"
-                        f"已试开路 {len(cleared)} 次（上限 {MAX_OPEN_ACTIONS}）")
+            self._set_encircled(
+                r, tile, cleared,
+                cause="四邻没有「可清障 + 自己够得着」的突破口")
+            return False
+        # 【task-27 / 0.7.46】"没观测到落脚点"的批量失败不许再算 unreachable（这会无限打穿日级 bound）：
+        # 旧口径下 `_standable_near` 把"四邻没观测到"当"可能能站"，万一寻路/站位失败就整批记成
+        # "本该可达但走不到"——冬26 同一批 32 格（till 12 + clear 20）就是这么打穿 bound=15 的。
+        # 现在按证据收口：只有确实观测过"能站"（目标自身或四邻）才是 unreachable；否则归 encircled
+        # （挡死：不封格、不计 `rep.unreachable`、当天后续阶段不再选）。环境/没结论类失败（渐黑/模态/
+        # 没存档/超时）保持旧口径，绝不当"被围住"洗白。
+        fails = list(getattr(self, "_last_stand_statuses", []) or [])
+        env_failed = any(st in self._FOOTHOLD_ENV_STATUSES for st in fails)
+        if not env_failed and not self._observed_foothold(self.snap(), tile):
+            self._set_encircled(
+                r, tile, cleared,
+                cause=("四邻都站不过去，且观测里目标/四邻都没有「可站立」的落脚点"
+                       f"（站不到的状态={fails or ['未知']}）"))
             return False
         r.code = UNREACHABLE_CODE
         r.reason = (f"四邻都站不过去（已为开路清 {len(cleared)} 格邻格仍不通，"
                     f"上限 {MAX_OPEN_ACTIONS} 次）")
         return False
+
+    def _set_encircled(self, r: StepResult, tile: tuple[int, int],
+                       cleared: list[dict[str, Any]], *, cause: str) -> None:
+        """【task-27 / 0.7.46】把一次"站不到"的失败记成 `encircled`（挡死）。
+
+        统一在这里写 `r.code/tried_open/encircled_kinds/reason`，让两处入口（开路无突破口、
+        以及批量失败但观测里没有落脚点证据）共用同一套留痕口径：只写看得见的事实
+        （四邻真实 kind + 已试开路次数 + cause），不编造"是树/桩/大石"。
+        """
+        facts = self.snap()
+        try:
+            kinds = self._neighbour_kinds(facts, tile)
+        except Exception:                      # 观测拿不到就照实写"未知"，不许编
+            kinds = ["未知"] * len(NEIGHBORS)
+        r.code = ENCIRCLED_CODE
+        r.tried_open = len(cleared)
+        r.encircled_kinds = list(kinds)
+        r.reason = (f"{cause} ⇒ 归 encircled：不算「走不到」、不封格，"
+                    f"次日/开路后可能变可达；四邻实际 kind={kinds}；"
+                    f"已试开路 {len(cleared)} 次（上限 {MAX_OPEN_ACTIONS}）")
 
     def stand_next_to(self, tile: tuple[int, int], *, timeout_ms: int = 15000) -> bool:
         """站到目标格的四邻之一（先挑"观测说能站"的、再挑近的），返回是否到位。"""
@@ -2176,6 +2227,7 @@ class FarmWorker:
         tiles = self.tiles_of(obs)
         cands = [(tile[0] + dx, tile[1] + dy) for dx, dy in NEIGHBORS]
         if pt in cands:
+            self._last_stand_statuses = []
             return True
         # 排序：观测明确说 standable 的最优先；没观测到的其次；明确不可站的最后。再近的优先。
         def rank(t: tuple[int, int]) -> tuple[int, int]:
@@ -2184,13 +2236,19 @@ class FarmWorker:
                 return (1, abs(t[0] - pt[0]) + abs(t[1] - pt[1]))
             return (0 if tv.get("standable") else 2, abs(t[0] - pt[0]) + abs(t[1] - pt[1]))
 
+        fails: list[str] = []
         for t in sorted(cands, key=rank):
             try:
                 self.c.move_to(t[0], t[1], timeout_ms=timeout_ms)
                 self.walk_steps += 1
+                self._last_stand_statuses = []
                 return True
-            except BridgeError:
+            except BridgeError as exc:
+                fails.append(_exc_status(exc))
                 continue
+        # 【task-27】留"为什么没站过去"的状态：`_ensure_reachable` 用它判断这是环境/没结论
+        # （不算被围住）还是真的四邻站不上（可能归 encircled）。
+        self._last_stand_statuses = fails
         return False
 
     def move_to(self, tile: tuple[int, int], *, timeout_ms: int = 15000) -> StepResult:

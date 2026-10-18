@@ -42,7 +42,8 @@ from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Mapping
 
 from .bridge import MOD_VERSION_EXPECTED, BridgeClient, BridgeError
-from .farmwork import (CLUMP_KINDS, ENV_BLOCK_STATUSES, FRONTIER_KINDS, PATH_STAMINA_ALLOWANCE,
+from .farmwork import (CLUMP_KINDS, ENV_BLOCK_STATUSES, FRONTIER_KINDS, NEIGHBORS,
+                       PATH_STAMINA_ALLOWANCE,
                        SEED_KEEP_FACTOR, SLOT_RELIEF_KEEP, STAGE_ACTION, STAMINA_COST_CLEAR,
                        STAMINA_COST_SOW,
                        STAMINA_COST_TILL, STAMINA_COST_WATER, STEP_RESULT_CODES,
@@ -794,6 +795,10 @@ class DayReport:
     pending_blocked: int = 0
     pending_unobserved: int = 0
     pending_malformed: int = 0
+    #: 【task-27 / 0.7.46】并列只读坐标（有序、各取前 8 条）：`day_end` 逐格对账用。
+    #: 只作证据：不参与任何判据，也不新增 journal 事件名。
+    pending_executable_tiles: list[Any] = field(default_factory=list)
+    pending_stalled_tiles: list[Any] = field(default_factory=list)
     #: 【task-15 / 0.7.45】当天"更早轮 leftover>0、**最后一轮**同种类 leftover==0"的
     #: `stage_midway_leftover` 事件明细（count/tiles/leftover/round/stage）。
     #: 日级判定**不许只看最后一轮**：这些轮次的一手读数在这里并列留痕（只作 info，
@@ -937,6 +942,9 @@ class DayReport:
             "pending_unobserved": self.pending_unobserved,
             # 【task-22 / 0.7.45】观测 tiles[] 里字段残缺的记录数（>0 ⇒ day_justified 必 false）
             "pending_malformed": self.pending_malformed,
+            # 【task-27 / 0.7.46】逐格坐标证据（有序、各前 8 条；只读、不改任何判据）
+            "pending_executable_tiles": [list(t) for t in self.pending_executable_tiles],
+            "pending_stalled_tiles": [list(t) for t in self.pending_stalled_tiles],
             # 【task-15 / 0.7.45】更早轮 leftover>0 而最后一轮归零的遮蔽证据（日级判定不许只看最后一轮）
             "stage_midway_leftover": [dict(m) for m in self.stage_midway_leftover],
             # 【task-16 / 0.7.45】背包空格 + 清障掉落被拒收的日级留痕（只 info；不进 checks）
@@ -1268,6 +1276,9 @@ class LongRun:
         # 本日回片区的**尝试**次数（含失败），单独封顶 = `2 * max_plots_per_day`
         # （见 `_resume_walk_available`）：既防"失败重试"无限烧时间，又不再挤掉成功预算。
         self.resume_walk_attempts = 0
+        # 【task-27 / 0.7.46】今天被"目标池前置过滤"判成 encircled（挡死）的格：记录证据
+        # （tile/stage/zone/kinds/原因），进 `encircled_day`、不计 `rep.unreachable`。
+        self._prefiltered_encircled_today: list[dict[str, Any]] = []
         # 【task-4 / 0.7.44】`leftover_targets` 的**片区归属**（记账坐标 → fields 田区名；
         # 观测里没有田区信息时退化成 8×8 空间簇 `@x,y`）。只由 `_step_stage` 在记账时写入，
         # 换片只从这份账本里挑坐标 —— 绝不臆造。冬 7/12/18 的病灶正是"最近的残留格全是
@@ -4173,6 +4184,9 @@ class LongRun:
             pending_stalled=snap["stalled"],
             # 【task-22 / 0.7.45】残缺 tile 数（>0 ⇒ 当天 day_justified 必 false）
             pending_malformed=snap.get("malformed", 0),
+            # 【task-27 / 0.7.46】逐格坐标证据（有序、各前 8 条；只读、不改判据、不新增事件名）
+            pending_executable_tiles=list(snap.get("executable_tiles") or [])[:8],
+            pending_stalled_tiles=list(snap.get("stalled_tiles") or [])[:8],
             note=("回片区 / 换片 / 当前观测都没有可执行目标 ⇒ 今天按 resume_exhausted 诚实收工："
                   "睡下去让游戏日前进；只有当前观测里**确实没有可执行格**时 day_justified 才认这条，"
                   "否则照旧不 VERIFIED")
@@ -4745,8 +4759,73 @@ class LongRun:
         shed = self._shed_tile_set()
         if shed:
             pool = [t for t in pool if t not in shed]
+        # 【task-27 / 0.7.46】目标池前置过滤：观测已证明"四邻既站不了、也没有可清障的突破口"
+        # 的格，今天不再塞进目标池（避免整批走到跟前才发现站不过去、被记成 unreachable 打穿
+        # 日级 bound；冬26 的 12 格 till + 20 格 clear 就是这一形态）。逐格按 encircled
+        # （挡死）记账：写 `encircled` 事件 + 进 `encircled_day`（当天后续阶段不再选）。
+        # 观测不完整（四邻没覆盖全）时**不猜**，交给执行层按证据收口（`_ensure_reachable`）。
+        if task in ("clear_area", "clear_dead", "till_area", "plant_area"):
+            pool = self._prefilter_known_enclosed(task, obs, pool)
         pool = sorted(set(pool), key=lambda t: (_dist(t, pt), t[1], t[0]))
         return pool[:limit]
+
+    @staticmethod
+    def _known_enclosed(obs: dict[str, Any], tile: tuple[int, int]) -> bool:
+        """【task-27】观测是否已证明这格**被围死**（四邻既不可站、也没有可清障邻格）。
+
+        判据**只看已观测证据**，观测不完整一律返回 False（不猜）：
+          * 四邻必须全部出现在 `tiles[]` 里；
+          * 四邻里没有任何 `standable=true`；
+          * 四邻里没有"`FRONTIER_KINDS` 且没作物、且乐观口径下能站"的开路候选
+            （`_standable_near` 乐观口径只用于"值不值得试一次"，不用于判死）。
+        四邻里含有可清障类邻格（哪怕观测说它站不上）⇒ 不预过滤，交给 `open_way` 试。
+        """
+        tmap = FarmWorker.tiles_of(obs)
+        neigh = [(tile[0] + dx, tile[1] + dy) for dx, dy in NEIGHBORS]
+        views = [tmap.get(n) for n in neigh]
+        if any(v is None for v in views):
+            return False
+        if any(v.get("standable") for v in views):
+            return False
+        for n, v in zip(neigh, views):
+            kind = str(v.get("kind") or "")
+            if kind in FRONTIER_KINDS and not v.get("crop") and FarmWorker._standable_near(obs, n):
+                return False
+        return True
+
+    def _prefilter_known_enclosed(self, task: str, obs: dict[str, Any],
+                                  pool: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        """【task-27】把 `_known_enclosed` 的格从今天目标池里剔掉，并按 encircled 留痕。"""
+        kept: list[tuple[int, int]] = []
+        for t in pool:
+            if t in self.encircled_day or not self._known_enclosed(obs, t):
+                kept.append(t)
+                continue
+            self.encircled_day.add(t)
+            try:
+                kinds = FarmWorker._neighbour_kinds(obs, t)
+            except Exception:                  # 观测拿不到就照实写"未知"，不编
+                kinds = ["未知"] * len(NEIGHBORS)
+            # 【task-78 NIT-2】逐格 journal 的字段名与 step 侧 `encircled` 事件**逐字一致**
+            # （`kinds` / `tried_open`），且 reason 必须写**观测到的真实四邻 kind** —— 不许
+            # 暗示"树/桩/大石"（task-27 的预过滤同样是"没有突破口"，不是某类 kind）。
+            rec = {
+                "tile": [int(t[0]), int(t[1])],
+                "action": task,
+                "stage": task,
+                "zone": self.zone_name,
+                "prefilter": True,
+                "tried_open": 0,
+                "kinds": list(kinds),
+                "reason": (f"目标池前置过滤：四邻实际 kind={list(kinds)}（都已观测）；四邻既没有"
+                           "可站立落脚点，也没有「可清障 + 自己够得着」的突破口 ⇒ 按 encircled"
+                           "（挡死）记账：不算「走不到」、不计 `rep.unreachable`、今天后续阶段"
+                           "不再选、不封格（次日/开路后可能变可达）"),
+                "note": "判据见 `_known_enclosed`：四邻没全覆盖就不预过滤（不猜）",
+            }
+            self._prefiltered_encircled_today.append(dict(rec))
+            self._journal("encircled", **rec)
+        return kept
 
     def _leftover(self, task: str, obs: dict[str, Any], plot: dict[str, Any]) -> list[tuple[int, int]]:
         """后置条件复核：这一阶段**该做完的事**，现在还剩几格没做。
@@ -5092,7 +5171,7 @@ class LongRun:
                 return True
         return False
 
-    def _pending_snapshot(self, obs: dict[str, Any] | None) -> dict[str, int]:
+    def _pending_snapshot(self, obs: dict[str, Any] | None) -> dict[str, Any]:
         """【task-15 / 0.7.45】日终"还有活"的**可执行面快照**（`day_justified` 的唯一"活"口径）。
 
         输入 `obs` 应是当天**最后一张户外农场观测**（调用方从 `outdoor_obs` 取；没有则传
@@ -5135,11 +5214,17 @@ class LongRun:
                        if t not in dead and t not in self.resume_stall_tiles]
         base = {"ledger": len(universe), "guard": len(guard_tiles),
                 "stalled": sum(1 for t in universe if t in stalled_set),
-                "blocked": len(blocked_tiles)}
+                "blocked": len(blocked_tiles),
+                # 【task-27 / 0.7.46】并列只读坐标（有序，≤8 条由调用方截断）：让 day_end /
+                # no_progress_burst 能逐格对账"到底哪几格算停滞、哪几格算可执行"。
+                "stalled_tiles": [list(t) for t in sorted(t for t in universe if t in stalled_set)],
+                }
         farm: dict[str, Any] | None = obs if (obs is not None and self._is_farm(obs)) else None
         if farm is None:
             # 观测证据不可用 ⇒ 不许声称"没有可执行的活"（executable 取全量 ⇒ day_justified 不放行）
-            return {**base, "executable": len(guard_tiles), "unobserved": 0, "malformed": 0}
+            return {**base, "executable": len(guard_tiles), "unobserved": 0, "malformed": 0,
+                    "executable_tiles": [list(t) for t in sorted(guard_tiles)],
+                    "malformed_tiles": []}
         tmap = FarmWorker.tiles_of(farm)
         tillable = FarmWorker.tillable_of(farm)
         _seeds, _money, can_plant = self._seed_outlook(farm)
@@ -5150,6 +5235,8 @@ class LongRun:
         free_slots, bag_need, bag_status = self._bag_state(farm)
         bag_blocked = self.inventory_blocked_today or (bag_status == "ok" and bag_need > 0)
         executable = unobserved = malformed = 0
+        exec_tiles: list[tuple[int, int]] = []
+        malformed_tiles: list[tuple[int, int]] = []
         for t in guard_tiles:
             tv = tmap.get(t)
             if tv is None:
@@ -5160,6 +5247,7 @@ class LongRun:
             # ⇒ 观测残缺/字段被改名，不能当"没活"：单列 malformed 并强制 not justified。
             if not tv.get("crop") and not kind and t not in tillable:
                 malformed += 1
+                malformed_tiles.append(tuple(t))
                 continue
             need = False
             allowed = True
@@ -5194,8 +5282,11 @@ class LongRun:
                 unobserved += 1          # 预算延后/工具不够/背包堵/四邻没得站 ⇒ 今天不可执行
                 continue
             executable += 1
+            exec_tiles.append(tuple(t))
         return {**base, "executable": executable,
-                "unobserved": unobserved, "malformed": malformed}
+                "unobserved": unobserved, "malformed": malformed,
+                "executable_tiles": [list(t) for t in sorted(exec_tiles)],
+                "malformed_tiles": [list(t) for t in sorted(malformed_tiles)]}
 
     # ------------------------------------------------ task-124：review 独苗的对账路径
 
@@ -7459,6 +7550,9 @@ class LongRun:
         # 【task-144】只有"补水后原样重跑"这一种 `forced` 需要在重跑完成后继续正常循环
         # （把窗口里剩下的目标也做完）；环境挡路的 `forced` 不做这件事（那会白跑更多轮）。
         refill_resume = False
+        # 【task-27 / 0.7.46】本阶段开始时记录前置过滤证据的游标：阶段末尾把本阶段新增的
+        # "目标池判死（encircled）"格并进 `encircled` 计数/坐标（逐格证据不吞）。
+        prefiltered_before = len(self._prefiltered_encircled_today)
         # 本阶段已经为"壶空"补过几次水（上界 `STAGE_REFILL_MAX`；日级另有 `max_refills_per_day` 兜底）。
         stage_refills = 0
         while True:
@@ -7779,6 +7873,13 @@ class LongRun:
         # 只单独计数 + 逐格留痕（run6 的 42 格"走不到"里就有这种成分，混着会污染不可达上界）。
         encircled_steps = [s for s in all_steps if s.encircled]
         encircled_tiles = sorted({tuple(s.tile) for s in encircled_steps if s.tile})
+        # 【task-27 / 0.7.46】把本阶段"目标池前置过滤判死"的格并进 encircled 证据（它们没有
+        # step、不算 attempted、不进 bound_basis；只作为 encircled 逐格证据 + 后续阶段不再选）。
+        prefiltered_here = [r for r in self._prefiltered_encircled_today[prefiltered_before:]
+                            if str(r.get("stage") or "") == task]
+        prefiltered_tiles = sorted({tuple(int(x) for x in r["tile"]) for r in prefiltered_here})
+        if prefiltered_tiles:
+            encircled_tiles = sorted(set(encircled_tiles) | set(prefiltered_tiles))
         encircled_in_left = min(len(leftover),
                                 len([t for t in self.encircled_day if t in left_set]))
         # 【task-68】开路记录：为了够到目标格而先清掉的**邻格**（`farmwork._ensure_reachable`
@@ -7868,6 +7969,10 @@ class LongRun:
             "encircled": len(encircled_tiles),
             "encircled_tiles": [list(t) for t in encircled_tiles],
             "encircled_leftover": encircled_in_left,
+            # 【task-27 / 0.7.46】其中有多少是**目标池前置过滤**判死的（没有 step、没有尝试，
+            # 不进 unreachable/bound_basis；旁证在 journal `encircled` 的 prefilter=True 条）。
+            "encircled_prefiltered": len(prefiltered_tiles),
+            "encircled_prefiltered_tiles": [list(t) for t in prefiltered_tiles],
             "attempted": attempted_steps,
             # 【task-219】瓦片级对账（三分类 + 闭合集原因码；`reasons` 只对"没做成"的格计数，
             # 恒有 `Σ reasons.count == failed_tiles + unexecuted_tiles`）
@@ -7879,6 +7984,11 @@ class LongRun:
             # 【task-78 NIT-1】上界基数：发起过动作、且**不是** `encircled` 的步数。
             # `attempted` 一字不动（原始证据计数），豁免上界改用它做分母（fail-closed）。
             "bound_basis": sum(1 for s in all_steps if s.attempted and not s.encircled),
+            # 【task-27 / 0.7.46】其中**真的发起过动作**的 `encircled` 步数。task-27 起"被围死"
+            # 的格可能在目标池就被预过滤（`encircled_prefiltered`，0 次尝试、没有 step）⇒
+            # `attempted − encircled_attempted` 才是旧口径 `bound_basis` 的分母还原，
+            # 而 `encircled`（含预过滤）仍是**逐格证据总数**。两者都只留痕，判定不变。
+            "encircled_attempted": sum(1 for s in all_steps if s.attempted and s.encircled),
             # 【task-78 NIT-2】判 `encircled` 时**实际试了几次开路**（逐格证据，不参与判定）。
             "encircled_tried": sum(int(getattr(s, "tried_open", 0) or 0) for s in encircled_steps),
             # 【task-68】`engaged` = 其中**真的站到过目标格旁边**的步数（`stood`）——
@@ -8813,6 +8923,8 @@ class LongRun:
         self.resume_walks = 0
         # 【task-26 / 0.7.46】回片区尝试次数（含失败）每天重置；与 `resume_walks`（只数成功）分开。
         self.resume_walk_attempts = 0
+        # 【task-27 / 0.7.46】目标池前置过滤的 encircled 证据每天清零（次日可能开路/变了）。
+        self._prefiltered_encircled_today = []
         # 【task-4 / 0.7.44】回片区"换片/停滞"账本每日重置：坐标只来自当天的 `leftover_targets`。
         self.leftover_area = {}
         self.resume_stall_tiles = set()
@@ -9640,6 +9752,11 @@ class LongRun:
         # 【task-22 / 0.7.45】tiles[] 里字段残缺的 tile 记录数：不并入 unobserved，
         # 单独留痕并强制 day_justified=false（缺失≠通过，堵 deputy NIT-1 fail-open）。
         rep.pending_malformed = int(snap.get("malformed", 0))
+        # 【task-27 / 0.7.46】逐格坐标证据（有序、各前 8 条；只读，不参与判据）：
+        # `pending_executable_tiles` 让"day_justified 有证据"能落到具体坐标上；
+        # `pending_stalled_tiles` 让"停滞/挡死"能逐格对账（不是只报一个数）。
+        rep.pending_executable_tiles = list(snap.get("executable_tiles") or [])[:8]
+        rep.pending_stalled_tiles = list(snap.get("stalled_tiles") or [])[:8]
         if rep.pending_ledger or rep.pending_stalled or rep.pending_blocked:
             rep.notes.append(
                 f"日终账本：原始 {rep.pending_ledger} 格（守卫口径 {rep.pending_guard} 格、"

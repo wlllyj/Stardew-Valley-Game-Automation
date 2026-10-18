@@ -4982,12 +4982,23 @@ class TestTask78BoundBasis(unittest.TestCase):
         rep = run.days[0]
         attempted = sum(int(st.get("attempted") or 0) for st in rep.stages)
         encircled = sum(int(st.get("encircled") or 0) for st in rep.stages)
+        encircled_attempted = sum(int(st.get("encircled_attempted") or 0)
+                                  for st in rep.stages)
+        encircled_prefiltered = sum(int(st.get("encircled_prefiltered") or 0)
+                                    for st in rep.stages)
         self.assertGreaterEqual(encircled, 20, f"被围住的格子必须真的被记成 encircled：{rep.stages}")
+        self.assertGreaterEqual(encircled_prefiltered, 20,
+                                "task-27：四邻全覆盖且无突破口的格应在目标池就被预过滤记账")
+        self.assertEqual(encircled_attempted, 0,
+                         "预过滤的格没有发起过动作 ⇒ encircled_attempted 必须是 0")
         self.assertEqual(rep.unreachable, 2, "只有那 2 格是真·走不到")
-        self.assertEqual(rep.bound_basis, attempted - encircled, "bound_basis = attempted − encircled")
+        self.assertEqual(rep.bound_basis, attempted - encircled_attempted,
+                         "bound_basis = attempted − encircled_attempted（旧口径分母还原）")
         self.assertEqual(rep.unreachable_bound, 5, "界按 bound_basis 算（2 ⇒ 下限 5）")
-        self.assertLess(rep.unreachable_bound, max(5, int(0.2 * attempted)),
-                        "旧口径（attempted 当分母）会把界抬高 ⇒ 这条断言就是 NIT-1 的证伪点")
+        self.assertLess(rep.unreachable_bound,
+                        max(5, int(0.2 * (attempted + encircled_prefiltered))),
+                        "旧口径（attempted 当分母，含被围住/预过滤格）会把界抬高 ⇒ 这条断言"
+                        "就是 NIT-1 的证伪点")
         self.assertEqual(rep.unreachable_exempt, 2, "那 2 格才该被豁免")
         self.assertEqual({tuple(t) for t in rep.unreachable_tiles}, far)
 
@@ -5025,11 +5036,16 @@ class TestTask78BoundBasis(unittest.TestCase):
         run.run()
         rep = run.days[0]
         attempted = sum(int(st.get("attempted") or 0) for st in rep.stages)
+        encircled_prefiltered = sum(int(st.get("encircled_prefiltered") or 0)
+                                    for st in rep.stages)
         self.assertLessEqual(rep.bound_basis, attempted)
         self.assertEqual(rep.unreachable_bound, max(5, int(0.2 * rep.bound_basis)))
         self.assertEqual(rep.refused_bound, max(5, int(0.2 * rep.bound_basis)))
-        self.assertNotEqual(rep.unreachable_bound, max(5, int(0.2 * attempted)),
-                            "这条差值就是 NIT-1 的证伪点：分母不能是 attempted")
+        # 旧口径的分母 = "所有发起过动作的步数"；task-27 起被围死的格在目标池就被预过滤
+        # （0 次尝试）⇒ 用 attempted + encircled_prefiltered 还原旧口径的分母。
+        self.assertNotEqual(rep.unreachable_bound,
+                            max(5, int(0.2 * (attempted + encircled_prefiltered))),
+                            "这条差值就是 NIT-1 的证伪点：分母不能是 attempted（含挡死格）")
 
 
 class WeedRingWorld(FakeWorld):
@@ -13866,6 +13882,234 @@ class TestTask26ResumeBudget(unittest.TestCase):
         self.assertEqual((action, walked), ("none", False))
         self.assertEqual(run.resume_walk_attempts, 0, "预算被拒时连尝试计数都不该动")
         self.assertFalse(run._resume_walk_available())
+
+
+class TestTask27EnclosedBatch(unittest.TestCase):
+    """【task-27 / 0.7.46】冬26 形态：till/clear 批量「四邻都站不过去」被算成 `unreachable`。
+
+    真机证据（`logs\\longrun-smoke-0745.jsonl`，冬26）：12 格 till（t=88.71 同一秒）+ 20 格 clear
+    在 `plane`/`field_nw` 等片区各说一次「四邻都站不过去（已为开路清 0 格邻格仍不通）」，
+    日终 `unreachable=32 > bound=15` ⇒ `unreachable_within_bound=false` ⇒ 整天不 VERIFIED。
+    根因是 `_standable_near` 的**乐观**口径（"四邻没观测到也算可能能站"）被拿来给失败定性：
+    四邻全无观测的格站不到时也被写成"本该可达但走不到"。0.7.46 用**证据**口径收口：
+
+    * 目标格自身或四邻**观测到 `standable=true`** 才算"本该可达"（`_observed_foothold`）；
+    * 否则归 `encircled`（挡死）：不计 `rep.unreachable`、不进日级 bound、当天后续阶段不再选；
+    * 环境/没结论类失败（渐黑/模态/超时）保持旧口径，绝不洗成挡死；
+    * 目标池前置过滤（`_known_enclosed`，四邻必须**全部**观测到）只对"四邻既站不了也没有可清障
+      突破口"的格生效，观测不完整一律不猜。
+    """
+
+    @staticmethod
+    def _events(run: LongRun, event: str) -> list:
+        return [e for e in run.entries if e.get("event") == event]
+
+    @staticmethod
+    def _obs(tiles: list[dict]) -> dict:
+        """最小可分类观测：`location.tiles` 自带记录即可（`_known_enclosed`/`_observed_foothold`
+        只吃 `tiles[]` 与 `tillable[]`）。"""
+        return {
+            "ok": True, "status": "ok",
+            "location": {"name": "Farm", "tiles": [dict(t) for t in tiles],
+                         "tillable": [], "tilesTruncated": False},
+            "player": {"tile": [62, 14], "location": "Farm", "inventory": [],
+                       "inventoryCount": 12, "money": 500},
+        }
+
+    @staticmethod
+    def _plot(coords, zone: str = "field_nw") -> dict:
+        return {"zone": zone, "label": "", "anchor": list(coords[0]),
+                "tiles": [tuple(c) for c in coords], "note": ""}
+
+    def _run(self, w: FakeWorld, *, unreachable=(), **kw) -> LongRun:
+        client = _UnreachableClient(w, unreachable=unreachable or getattr(w, "unreachable", ()))
+        worker = FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+        kw.setdefault("target_days", 1)
+        kw.setdefault("max_days", 1)
+        run = make_run(w, client_factory=lambda: client, worker_factory=lambda _c: worker, **kw)
+        run.worker = worker
+        run.client = client
+        return run
+
+    def test_known_enclosed_needs_full_observation_and_no_foothold(self) -> None:
+        """前置过滤的判据：四邻**全部观测到**、没有可站的、也没有"可清障且够得着"的邻格。"""
+        T = (62, 12)
+        ring = [{"tile": [T[0] + dx, T[1] + dy], "kind": "tree", "standable": False}
+                for dx, dy in _NB4]
+        check = longrun_mod.LongRun._known_enclosed
+        self.assertTrue(check(self._obs(ring), T))
+        self.assertFalse(check(self._obs(ring[:-1]), T), "少看一格就不许判死（不猜）")
+        standable = [dict(ring[0], standable=True)] + ring[1:]
+        self.assertFalse(check(self._obs(standable), T), "有可站邻格 ⇒ 交 open_way 试，不预过滤")
+        openable = ([dict(ring[0], kind="weed")] + ring[1:]
+                    + [{"tile": [T[0], T[1] - 2], "kind": "dirt", "standable": True}])
+        self.assertFalse(check(self._obs(openable), T),
+                         "有可清障且够得着的邻格 ⇒ 交 open_way 试，不预过滤")
+
+    def test_prefilter_journals_encircled_once_and_keeps_unobserved(self) -> None:
+        """预过滤：逐格 journal `encircled`（prefilter=True、0 次尝试、四邻真实 kind），
+        四邻没覆盖全的格原样留下；重复调用不重复记账。"""
+        T, U = (62, 12), (70, 40)
+        tiles = [{"tile": [T[0] + dx, T[1] + dy], "kind": "tree", "standable": False}
+                 for dx, dy in _NB4]
+        run = self._run(FakeWorld(weeds=0, seeds=10, money=500))
+        obs = self._obs(tiles)
+
+        kept = run._prefilter_known_enclosed("till_area", obs, [T, U])
+
+        self.assertEqual(kept, [U], "四邻没覆盖全的格不许预过滤")
+        self.assertIn(T, run.encircled_day)
+        self.assertNotIn(U, run.encircled_day)
+        ev = self._events(run, "encircled")
+        self.assertEqual(len(ev), 1, ev)
+        e = ev[0]
+        self.assertIs(e.get("prefilter"), True)
+        self.assertEqual(tuple(e["tile"]), T)
+        self.assertEqual(e["kinds"], ["tree"] * 4, e)
+        self.assertEqual(e["tried_open"], 0, "预过滤 = 0 次尝试，证据里必须这么写")
+        self.assertIn("四邻实际 kind", e["reason"])
+        self.assertIn("不猜", e.get("note") or "")
+        run._prefilter_known_enclosed("till_area", obs, [T])
+        self.assertEqual(len(self._events(run, "encircled")), 1, "已判死的格不许重复记账")
+
+    def test_worker_reclassifies_unobserved_failure_as_encircled(self) -> None:
+        """执行层收口：四邻全无观测的格站不到 ⇒ `encircled`，绝不写 `unreachable`。"""
+        T = (62, 12)
+        w = FakeWorld(weeds=0, seeds=10, money=500)
+        client = _UnreachableClient(w, unreachable=[T])
+        worker = FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+        r = StepResult("till", T)
+
+        self.assertFalse(worker._ensure_reachable(T, r))
+
+        self.assertEqual(r.code, "encircled", r)
+        self.assertEqual(r.encircled_kinds, ["未知"] * 4, r.encircled_kinds)
+        self.assertIn("没有「可站立」的落脚点", r.reason)
+
+    def test_worker_keeps_unreachable_when_foothold_was_observed(self) -> None:
+        """反向用例：观测证明目标旁边有能站的格 ⇒ 仍是"本该可达但走不到"（unreachable）。"""
+        T = (62, 12)
+        w = FakeWorld(weeds=0, seeds=10, money=500)
+        w.dirt.add((61, 12))            # 观测里这条 dirt 记录 standable=true
+        client = _UnreachableClient(w, unreachable=[T])
+        worker = FarmWorker(client, log=lambda *_: None, pause=lambda _s: None)
+        r = StepResult("till", T)
+
+        self.assertFalse(worker._ensure_reachable(T, r))
+
+        self.assertEqual(r.code, "unreachable", r)
+        self.assertIn("四邻都站不过去", r.reason)
+
+    def test_stage_tiles_prefilter_skips_known_enclosed(self) -> None:
+        """`_stage_tiles` 在目标池阶段就把"观测已证明围死"的格剔掉 + 逐格留痕，不再白走到跟前。"""
+        T, K = (62, 12), (61, 13)
+        w = FakeWorld(weeds=0, seeds=10, money=500)
+        run = self._run(w)
+        obs = w.obs()
+        obs["location"]["tiles"].extend(
+            {"tile": [T[0] + dx, T[1] + dy], "kind": "tree", "standable": False}
+            for dx, dy in _NB4)
+
+        pool = run._stage_tiles("till_area", obs, self._plot([T, K]))
+
+        self.assertNotIn(T, pool, "已证明围死的格不许再进目标池")
+        self.assertIn(K, pool)
+        self.assertIn(T, run.encircled_day)
+        ev = [e for e in self._events(run, "encircled") if e.get("prefilter")]
+        self.assertEqual(len(ev), 1, ev)
+        self.assertEqual(tuple(ev[0]["tile"]), T)
+
+    def test_batch_unobserved_till_is_encircled_not_unreachable(self) -> None:
+        """冬26 的核心形态：12 格 till 四邻全无观测 + 走不到 ⇒ 阶段级 12 格 encircled、
+        `rep.unreachable` 一格外都不加（不再打穿日级 bound）。"""
+        coords = [(60, 10), (61, 10), (62, 10), (63, 10), (64, 10),
+                  (60, 11), (61, 11), (62, 11), (63, 11), (64, 11),
+                  (60, 12), (61, 12)]
+        w = FakeWorld(weeds=0, seeds=10, money=500)
+        run = self._run(w, unreachable=coords)
+        rep = DayReport(day_key=("winter", 1, 26), started_at=0.0)
+
+        run._step_stage("till_area", w.obs(), self._plot(coords), rep)
+
+        self.assertEqual(sum(int(s.get("encircled") or 0) for s in rep.stages), len(coords),
+                         [s.get("encircled") for s in rep.stages])
+        self.assertEqual(sum(int(s.get("unreachable") or 0) for s in rep.stages), 0,
+                         [s.get("unreachable") for s in rep.stages])
+        self.assertEqual(set(run.encircled_day), set(coords))
+        self.assertEqual(run.unreachable_day, set())
+        self.assertEqual(sum(int(s.get("ok") or 0) for s in rep.stages), 0,
+                         "挡死格绝不许记成 already/ok（那是洗白）")
+        per = self._events(run, "encircled")
+        self.assertEqual(len(per), len(coords), per)
+        self.assertTrue(all(not e.get("prefilter") for e in per), per)
+        self.assertEqual(self._events(run, "unreachable"), [])
+
+    def test_sixteen_observed_foothold_tiles_still_trip_the_bound(self) -> None:
+        """反向用例：16 格有落脚点证据、但就是走不到 ⇒ 照旧 `unreachable` 且 16>bound ⇒ 判红、
+        不 VERIFIED（新旧口径都不许把真走不到洗成挡死）。"""
+        cells = [(60 + i, 10 + j) for i in range(4) for j in range(4)]
+        w = UnreachableWorld(unreachable=cells, seeds=0, money=0)
+        run = self._run(w)
+
+        run.run()
+
+        rep = run.days[0]
+        # 16 格里有 1 格被邻格清障顺带做成（`cleared_by_neighbor`）⇒ 至少 15 格仍算走不到；
+        # 关键是它们**没有被洗成挡死**，且 15/16 都远超 `max(5, 20%)` 上界。
+        self.assertGreaterEqual(rep.unreachable, 15, rep.stages)
+        self.assertGreater(rep.unreachable, rep.unreachable_bound)
+        self.assertIs(rep.checks["unreachable_within_bound"], False, rep.checks)
+        self.assertIs(rep.verified, False)
+        day_end = self._events(run, "day_end")[-1]
+        self.assertEqual(len({tuple(t) for t in day_end["unreachable_tiles"]}), rep.unreachable)
+        self.assertEqual(self._events(run, "encircled"), [],
+                         "有落脚点证据的格不许被洗成挡死")
+
+    def test_day_end_and_burst_carry_ordered_pending_tile_lists(self) -> None:
+        """附带小改：`day_end` / `no_progress_burst` 的 `pending_*_tiles` 是**有序只读坐标**
+        （≤8 条；没有坐标时是空列表），且不影响任何判据。"""
+        w = MyopicWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        w.blockers[(60, 11)] = "weed"
+        w.fail_status[(60, 10)] = "timeout"
+        w.fail_status[(60, 11)] = "timeout"
+        w.player_tile = [60, 12]
+        w.revealed = True
+        run = self._run(w)
+        seeded = {"n": 0}
+
+        def ensure(obs, rep):
+            seeded["n"] += 1
+            if seeded["n"] == 1:
+                run._step_stage("clear_area", w.obs(),
+                                self._plot([(60, 10), (60, 11)]), rep)
+                w.player_tile = [62, 14]
+                w.revealed = False          # 残留格不再出现在最后一张户外观测里
+            return None
+
+        run._ensure_plot = ensure
+        self.assertEqual(run.run(), 1)
+        day_end = self._events(run, "day_end")[-1]
+        for key in ("pending_executable_tiles", "pending_stalled_tiles"):
+            self.assertIn(key, day_end)
+        self.assertEqual(day_end["pending_executable_tiles"], [])
+        self.assertEqual(day_end["pending_stalled_tiles"], [[60, 10], [60, 11]])
+        self.assertLessEqual(len(day_end["pending_stalled_tiles"]), 8)
+        burst = [e for e in self._events(run, "no_progress_burst")
+                 if e.get("claim_exhausted")]
+        self.assertTrue(burst, self._events(run, "no_progress_burst"))
+        self.assertEqual(burst[0]["pending_executable_tiles"], [])
+        self.assertEqual(burst[0]["pending_stalled_tiles"], [[60, 10], [60, 11]])
+
+        # 没有坐标的收工：两个列表都是空列表（不是缺键、不是 None）
+        rep2 = DayReport(day_key=("winter", 1, 28), started_at=0.0)
+        run2 = self._run(FakeWorld(weeds=0, seeds=0, money=0))
+        run2._do_sleep = lambda obs, rep, why, **kw: ("sleep", why)
+        run2._resume_exhausted(run2._snap(), rep2, plot=None, where="switch_limit")
+        burst2 = self._events(run2, "no_progress_burst")[-1]
+        self.assertIn("pending_executable_tiles", burst2)
+        self.assertEqual(burst2["pending_executable_tiles"], [])
+        self.assertEqual(burst2["pending_stalled_tiles"], [])
 
 
 if __name__ == "__main__":  # pragma: no cover
