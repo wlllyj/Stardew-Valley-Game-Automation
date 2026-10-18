@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-"""task-24 回归核对：六旧账本 + A8 + smoke-0744 的 rc/红数/#无法判定 与 HEAD 对照。"""
+"""task-24 回归核对：六旧账本 + A8 + smoke-0744 + smoke-0745 的 rc/红数/#无法判定 与基线提交对照。
+
+基线默认 `80488c8~1`（task-24 第一个实现提交的父，即未收 0.7.45 字段的 analyzer）。
+"""
 import importlib.util
 import json
 import subprocess
@@ -18,7 +21,9 @@ LEDGERS = [
     ("run9d", "logs/longrun-3day-llm-run9d.jsonl"),
     ("A8", "logs/longrun-runA8-0743.jsonl"),
     ("smoke0744", "logs/longrun-smoke-0744.jsonl"),
+    ("smoke0745", "logs/longrun-smoke-0745.jsonl"),
 ]
+BASE_REF = sys.argv[1] if len(sys.argv) > 1 else "80488c8~1"
 
 
 def load_module(path, name):
@@ -55,7 +60,7 @@ def snapshot(mod, path):
 
 def main():
     head_src = subprocess.run(
-        ["git", "cat-file", "-p", "HEAD:tools/analyze-longrun.py"],
+        ["git", "cat-file", "-p", f"{BASE_REF}:tools/analyze-longrun.py"],
         cwd=str(REPO), capture_output=True, check=True,
     ).stdout
     tmpdir = Path(tempfile.mkdtemp(prefix="t24_head_"))

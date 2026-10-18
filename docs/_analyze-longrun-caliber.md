@@ -1443,6 +1443,33 @@ dict 分支**）、`day_end.plot_pending`；`build_undecidable` 其余旧路径�
 - 单测：`tests.test_analyze_longrun` **Ran 316 / OK**（+8 条：guard_count 五态 + stage_capped 空字段 + 探针注册 +
   A8 fail-closed）；全量 `discover -s tests` **Ran 1311 / OK**。
 
+## 3.38 0.7.45 四聚合：`pending` 七口径 / justified 证据 / 背包压力 / 中途遮蔽（task-24，2026-10-18）
+
+**背景**：0.7.45（冻结 `2feb1f8`，冻结记录 `3608593`）新增 `day_end.pending_*` 七列、`day_end.slept_ok`、
+`day_end.free_slots_*`、`day_end.loot_lost_*`、`day_end.stage_midway_leftover`、`slot_relief{pressure,…}` 等。
+analyzer 收四块**只 info /【无法判定】、不进 rc** 的聚合（判据与三态见 `docs\_analyze-smoke-0745.md`）：
+
+| 聚合键 | 数据源 | 判据 / 不变式 |
+| --- | --- | --- |
+| `pending_caliber` | `day_end.pending_ledger/guard/stalled/executable/blocked/unobserved/malformed` | 不变式 `ledger==guard+blocked`、`guard==exec+unobserved+malformed`；违背 ⇒ ⚠ 人工核对；缺任一键 ⇒ 该日【无法判定】 |
+| `justified_evidence` | 同 + `checks.day_justified` + `day_end.verified` | `day_justified=false & exec=0 & malformed=0` ⇒ 可疑点名（`suspicious_unjustified_no_work`）；`true` 且 `exec>0/None` ⇒ 反向点名；不改判 |
+| `bag_pressure` | `day_end.free_slots_{start,last,min,status}`、`loot_lost_{steps,tiles,items}` + `slot_relief` | 最低空格、0 格天数、掉落被拒收步/格、压力通道次数与 `demand_basis`；`status=unavailable` ⇒【无法判定】 |
+| `midway_masking` | `day_end.stage_midway_leftover` | 更早轮 leftover>0、最后一轮同种类归零 ⇒ 日级「最后一轮」口径低估当日剩余；只 info |
+
+- 新探针 18 条（`#无法判定` 的唯一合法增量）：`day_end.pending_{ledger,guard,stalled,executable,blocked,unobserved,malformed}`、
+  `day_end.stage_midway_leftover`、`day_end.free_slots_{start,last,min,status}`、`day_end.loot_lost_{steps,tiles,items}`、
+  `event:slot_relief.{pressure,trigger,demand_basis}`；这些键都是 `day_end` 顶层键 / 事件字段，走 `build_undecidable`
+  既有通用分支即可，**本卡未新增/未改动任何嵌套分支**，旧判定路径逐字未动。
+- 真账本首验 `logs\longrun-smoke-0745.jsonl`（650 行/2 天）：`pending_caliber.state=found`（不变式 0 违背）、
+  `justified_evidence` 可疑 1 天（冬 26，`ended_by=inventory_blocked` 设计上不在白名单 ⇒ 属白名单缺口提示）、
+  `bag_pressure` 完整（226 步/226 格掉落被拒收、压力通道 5 次）、`midway_masking` 8 条/1 天。
+  **同日 `pending_executable=7` 仍 >0** 而原文称「当前观测里没有可执行目标」⇒ 诚实收工判据未闭合，实测 fail-closed
+  `day_justified=false`（喂 task-15/16，本工具只报数不猜）。
+- 回归（基线 `80488c8~1` vs 本卡，`scratch\_t24_check.py`）：六旧账本 rc/红数**一字未变**（runA 1/117、runB 1/84、
+  run9 1/84、run9b 1/45、run9c 0/0、run9d 1/29）；A8 1/35 **不变**、smoke-0744 1/33 **不变**；#无法判定各 **+18**
+  （新探针在旧账本 0 命中）；**smoke-0745 1/63/100 均不变（新探针全部命中 ⇒ 0 增量）**。
+- 单测：`tests.test_analyze_longrun` **Ran 334 / OK**；全量 `discover -s tests` **Ran 1348 / OK**；py_compile rc=0。
+
 ## 4. 复核命令
 
 ```
@@ -1480,4 +1507,9 @@ python -m unittest tests.test_analyze_longrun  # task-17 后：Ran 316 / OK（ta
 python -m unittest discover -s tests           # task-17 后：Ran 1311 / OK（0 红，须 PYTHONUTF8=1）
 python tools\analyze-longrun.py --journal logs\longrun-smoke-0744.jsonl --days 5  # 0.7.44 冒烟：rc=1/红 33/#无法判定 105；guard_count found 2 天（守卫 263/217、停滞 261/217、残余 2/0）；详见 docs\_analyze-smoke-0744.md
 python scratch\_t17_cmp.py                     # HEAD(a1d23b8) vs task-17 版并排：六账本 rc/红一字不变；#无法判定 仅 run9/run9b 各 +1（新探针 plot_pending 缺失）
+python -m unittest tests.test_analyze_longrun  # task-24 后：Ran 334 / OK（task-17 的 316 + task-24 新增 18 条）
+python -m unittest discover -s tests           # task-24 后：Ran 1348 / OK（0 红，须 PYTHONUTF8=1）
+python tools\analyze-longrun.py --journal logs\longrun-smoke-0745.jsonl --days 2  # 0.7.45 冒烟：rc=1/红 63/#无法判定 100；pending_caliber found 2 天（3/3/0/0/0/3/0 与 230/7/218/7/223/0/0，不变式 0 违背）；justified 可疑 1 天；背包压力 226 步/226 格；详见 docs\_analyze-smoke-0745.md
+python scratch\_t24_check.py                   # 八账本 基线(80488c8~1) vs task-24 版：rc/红数一字不变；#无法判定 各 +18；smoke-0745 +0
+python scratch\_t24_compare_one.py logs\longrun-smoke-0745.jsonl   # 单账本旧/新 red subjects 逐项对照（同 rc/红/无法判定）
 ```
