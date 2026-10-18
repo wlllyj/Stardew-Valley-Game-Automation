@@ -47,6 +47,15 @@
       变化数 ⇒ ok=0 不代表白干，判决必须 ok 与 already 两列并读；窗口内同时给两列）。
       另：`plot_exhausted{source,switches,stalled_tiles}`、`no_progress_burst{exhausted,switches}`、
       `resume_walk{switched}`、`blocked{alloc_no_progress,limit}` 全部进了 `FIELD_PROBES`（缺失⇒【无法判定】）。
+【task-17】（0.7.44 首个真机冒烟 `logs/longrun-smoke-0744.jsonl` 暴露的形态，2026-10-18）：
+      ⑦ `guard_count` = **守卫计数口径**：`day_end.verified=false` + `checks.day_justified=false` +
+      日级 `plot_pending*`=0（取每阶段种类**最后一轮**）却 `checks.no_unmet_stages=true`、stages[] 中间轮
+      leftover/executable/blocked>0，守卫原文还报「今天早些时候还有 N 格没做完（跨片地…）」⇒ 这是
+      **三套口径不一致**（守卫 `_pending_work()` 的 leftover_targets 累计 / 日级 plot_pending 取最后一轮 /
+      `stage_midway_leftover` 警告的「最后一轮遮蔽」），**不是农务失败**。报告并列给：守卫 pending、
+      已标记停滞(`stalled_total`)、残余、中间轮余格 max、观测截断 `plot` 次数(`plots[].tiles` 上限)；
+      缺任一字段 ⇒【无法判定】，缺失 ≠ 0。（建议侧另给 task-15 的可选修法，仍是 info、不进 rc。）
+      另：`stage_midway_leftover` / `plots_capped` / `stage_no_target` 也作为证据行进本聚合。
 外加：每天一行摘要、3-9 条带证据行的改进建议、"本账本无法判定"清单。
 
 与 `tools\\verify-run3.py` 的关系：两者**独立读数、交叉核对**。本工具只做分析、不判验收；
@@ -824,12 +833,25 @@ FIELD_PROBES = [
      "阶段里本来就不必做的格数（already-aware 双列之一；缺失 ⇒【无法判定】空转判断）"),
     ("day_end.stages[].already_cause", "day_end.stages[].already_cause",
      "阶段 why-already 归类（0.7.44 新增；缺失 ⇒【无法判定】空转成因）"),
+    # task-17（0.7.44 冒烟账本）：守卫计数口径 —— `day_justified=false` 但当前观测已无可执行目标。
+    ("day_end.verified", "day_end.verified",
+     "当天是否 VERIFIED（冒烟新形态：verified=false + day_justified=false + 日级 plot_pending=0；"
+     "缺失 ⇒【无法判定】是否判过这天）"),
+    ("day_end.checks.day_justified", "day_end.checks.day_justified",
+     "当天收工是否有正当理由（`checks` 里的嵌套键；缺失 ⇒【无法判定】收工理由口径）"),
+    ("day_end.plot_pending", "day_end.plot_pending",
+     "日终片区余格数（task-134 B：每阶段种类最后一条 leftover 之和；与守卫 `_pending_work()` 是"
+     "**两个口径**，日级 0 不能证明守卫 0；缺失 ⇒【无法判定】）"),
 ]
 OUTCOME_RE = re.compile(
     r"目标\s*(\d+)\s*步：做成\s*(\d+)、跳过\s*(\d+)、失败\s*(\d+)"
 )
 LEFTOVER_RE = re.compile(r"还剩\s*(\d+)\s*格")
 STOPPED_RE = re.compile(r"提前停：([^；;]+)")
+#: task-17：守卫理由里的「今天早些时候还有 N 格没做完（跨片地…）」——守卫 `_pending_work()` 口径。
+GUARD_PENDING_RE = re.compile(r"还有\s*(\d+)\s*格没做完")
+#: task-17：`plot` 事件 note 里的观测截断标记（不是结构键！只是 note 原文，缺结构字段 ⇒ 只作 info）。
+PLOT_TRUNC_MARK = "tilesTruncated=true"
 
 # ---------------------------------------------------------------- task-11 模态记账
 #: 红（必须人工介入）：这些事件的唯一产生路径是 longrun 的 `_modal_blocked`（不可逆职业选择 /
@@ -4016,6 +4038,23 @@ def build_advice(report, top=9):
                     + "；".join(_t13_parts),
             "lines": [ln for ln in _t13_lines if ln is not None][:10],
         })
+    # 0s-12（task-17，0.7.44 真机冒烟）：守卫计数口径 —— 只 info/审计，**不进 rc**
+    gc0 = report.get("guard_count") or {}
+    if gc0.get("days"):
+        _gc_parts = []
+        for _d in gc0["days"]:
+            _gc_parts.append(
+                f"{_d['label']}: 守卫 pending {_d.get('guard_pending')} / 停滞 {_d.get('stalled_marked')} / "
+                f"残余 {_d.get('residual')}；日级 plot_pending=0（exec {_d.get('plot_pending_executable')}）"
+                f"但 stages[] 中间轮 leftover 最大 {_d.get('stage_leftover_max')}"
+                + ("（最后一轮遮蔽）" if _d.get("midway_masked") else ""))
+        advice.append({
+            "text": "守卫计数口径（task-17；**info/审计，不进 rc**）：day_justified=false 但当前观测已无"
+                    "可执行待做 " + "；".join(_gc_parts) + "。建议：① 守卫 pending 扣除停滞/挡死格；"
+                    "② day_justified 不采信 day_end.plots[]（观测截断会当满分）；③ 零可执行日走明示收工口径",
+            "lines": [ln for d in gc0["days"] for ln in
+                      [d.get("line")] + (d.get("burst_lines") or [])[:1]][:10],
+        })
     # 0c) 环境挡路 / 没拿到结论（task-22 记账）
     env = report.get("env_inconclusive") or {}
     if env.get("env_fail_events"):
@@ -4254,6 +4293,11 @@ def build_undecidable(rows, sessions, prelude, report):
                 # 的【无法判定】条数被顺手改掉 —— "#无法判定 只允许按新增探针增加"）。
                 absent = not any(isinstance(ev.get("checks"), dict)
                                  and "slept_by_us" in ev["checks"]
+                                 for _, ev in rows if ev.get("event") == "day_end")
+            elif _spec == "day_end.checks.day_justified":
+                # task-17（0.7.44 冒烟）：同 `.checks` 嵌套，单开这一条（旧探针路径不动）
+                absent = not any(isinstance(ev.get("checks"), dict)
+                                 and "day_justified" in ev["checks"]
                                  for _, ev in rows if ev.get("event") == "day_end")
             elif _spec.startswith("ui."):
                 # task-246：`ui` 是每行观测里的嵌套 dict，要真去找键（不能拿 "ui.eventId" 当整串文本找）
@@ -6688,8 +6732,13 @@ def build_report(rows, path, args, bad_lines):
             if not isinstance(_st, dict) or "alloc_capped_tiles" not in _st:
                 continue
             _sr_mechanism = True
-            _sr_stage_capped += 1
-            for _t in as_list(_st.get("alloc_capped_tiles")):
+            _cap_field = as_list(_st.get("alloc_capped_tiles"))
+            if _cap_field:
+                # task-17 修正：`stage_capped` 的语义是「当天真被封格的阶段数」。
+                # 0.7.44 起阶段记录**恒带** `alloc_capped_tiles` 键（多数是天天空列表），
+                # 若按「键在场」计数，会把 47 段全部误算成「封格 47 段」（0.7.44 冒烟账本实测）。
+                _sr_stage_capped += 1
+            for _t in _cap_field:
                 if isinstance(_t, list) and len(_t) == 2 and _t not in _stage_tiles:
                     _stage_tiles.append([_t[0], _t[1]])
         if _caps or _stage_tiles:
@@ -6976,6 +7025,182 @@ def build_report(rows, path, args, bad_lines):
     # 旧键名保留（外部脚本/既有用例在用），语义不变
     decision_counts["llm_used"] = decision_counts["decisions_llm_used"]
     decision_counts["llm_fallback"] = decision_counts["decisions_llm_fallback"]
+    # J) 【task-17 / 0.7.44 真机冒烟】守卫计数口径（**只 info、不进 rc**）：
+    #    `day_end.verified=false` + `checks.day_justified=false` + 日级 `plot_pending*`=0（取每阶段种类
+    #    **最后一轮**）却 `checks.no_unmet_stages=true`、stages[] 中间轮 leftover/executable/blocked>0，
+    #    守卫原文还报「今天早些时候还有 N 格没做完（跨片地…）」⇒ 这是**三套口径不一致**
+    #    （守卫 `_pending_work()` 的 leftover_targets 累计 vs `day_end.plot_pending*` 取最后一轮 vs
+    #    `stage_midway_leftover` 警告的「最后一轮遮蔽」），不是农务失败。
+    #    并列读数：守卫 pending / 已标记停滞(stalled_total) / 残余 / 中间轮余格 max / 观测截断 plot 次数。
+    #    任何一侧缺失 ⇒【无法判定】，绝不默认 0（缺失 ≠ 通过）。
+    _gc_days = []
+    _gc_undec = []
+    _gc_has_dj = False
+    _gc_has_pp = False
+    for _gc_sess in sessions:
+        _gc_ends = _gc_sess.get("day_ends") or []
+        if not _gc_ends:
+            continue
+        _gc_ln, _gc_end = _gc_ends[-1]
+        _gc_start = as_dict(_gc_sess.get("start"))
+        _gc_lbl = day_label(_gc_end) or day_label(_gc_start) or "<无日>"
+        _gc_chk = as_dict(_gc_end.get("checks"))
+        _gc_dj = _gc_chk.get("day_justified")
+        _gc_nus = _gc_chk.get("no_unmet_stages")
+        _gc_dj_here = "day_justified" in _gc_chk
+        _gc_pp_here = "plot_pending" in _gc_end
+        _gc_pe_here = "plot_pending_executable" in _gc_end
+        if _gc_dj_here:
+            _gc_has_dj = True
+        if _gc_pp_here:
+            _gc_has_pp = True
+        _gc_reason = str(_gc_end.get("ended_reason") or "")
+        if _gc_reason.startswith("resume_exhausted"):
+            _gc_prefix = "resume_exhausted"
+        elif _gc_reason.startswith("stuck"):
+            _gc_prefix = "stuck"
+        elif _gc_reason:
+            _gc_prefix = "other"
+        else:
+            _gc_prefix = "none"
+        _gc_guard = None
+        _gc_m = GUARD_PENDING_RE.search(_gc_reason)
+        if _gc_m:
+            _gc_guard = int(_gc_m.group(1))
+        _gc_ex_lines = []
+        _gc_burst_lines = []
+        _gc_stalled = []
+        _gc_trunc = 0
+        _gc_plot_events = 0
+        _gc_capped_lines = []
+        _gc_plots_today = None
+        _gc_plots_limit = None
+        _gc_midway = []
+        _gc_no_target = 0
+        for _gc_eln, _gc_ev in _gc_sess.get("events") or []:
+            _gc_nm = _gc_ev.get("event")
+            if _gc_nm == "plot_exhausted":
+                _gc_ex_lines.append(_gc_eln)
+                _gc_pv = as_int(_gc_ev.get("pending"), None)
+                if _gc_pv is not None and (_gc_guard is None or _gc_pv > _gc_guard):
+                    _gc_guard = _gc_pv
+                _gc_sv = as_int(_gc_ev.get("stalled_total"), None)
+                if _gc_sv is not None:
+                    _gc_stalled.append(_gc_sv)
+            elif _gc_nm == "no_progress_burst":
+                _gc_burst_lines.append(_gc_eln)
+                _gc_sv = as_int(_gc_ev.get("stalled_tiles"), None)
+                if _gc_sv is not None:
+                    _gc_stalled.append(_gc_sv)
+            elif _gc_nm == "plot":
+                _gc_plot_events += 1
+                if PLOT_TRUNC_MARK in str(_gc_ev.get("note") or ""):
+                    _gc_trunc += 1
+            elif _gc_nm == "plots_capped":
+                _gc_capped_lines.append(_gc_eln)
+                _gc_plots_today = as_int(_gc_ev.get("plots_today"), None)
+                _gc_plots_limit = as_int(_gc_ev.get("limit"), None)
+            elif _gc_nm == "stage_midway_leftover":
+                _gc_midway.append({"line": _gc_eln,
+                                   "stage": _gc_ev.get("stage"),
+                                   "round": as_int(_gc_ev.get("round"), None),
+                                   "leftover": as_int(_gc_ev.get("leftover"), None),
+                                   "note": str(_gc_ev.get("note") or "")})
+            elif _gc_nm == "stage_no_target":
+                _gc_no_target += 1
+        _gc_stages = as_list(_gc_end.get("stages"))
+        _gc_max = {"leftover": None, "leftover_executable": None, "leftover_blocked": None}
+        _gc_last = {"leftover": None, "leftover_executable": None, "leftover_blocked": None}
+        for _gc_st in _gc_stages:
+            if not isinstance(_gc_st, dict):
+                continue
+            for _gc_f in _gc_max:
+                _gc_v = as_int(_gc_st.get(_gc_f), None)
+                if _gc_v is None:
+                    continue
+                if _gc_max[_gc_f] is None or _gc_v > _gc_max[_gc_f]:
+                    _gc_max[_gc_f] = _gc_v
+                _gc_last[_gc_f] = _gc_v
+        _gc_pp = as_int(_gc_end.get("plot_pending"), None)
+        _gc_pe = as_int(_gc_end.get("plot_pending_executable"), None)
+        _gc_pb = as_int(_gc_end.get("plot_pending_blocked"), None)
+        if not (_gc_dj_here and _gc_pp_here and _gc_pe_here):
+            _gc_missing = []
+            if not _gc_dj_here:
+                _gc_missing.append("checks.day_justified")
+            if not _gc_pp_here:
+                _gc_missing.append("day_end.plot_pending")
+            if not _gc_pe_here:
+                _gc_missing.append("day_end.plot_pending_executable")
+            _gc_undec.append({"label": _gc_lbl, "line": _gc_ln,
+                              "why": "缺 " + " / ".join(_gc_missing) + "（缺失 ≠ 0）"})
+            continue
+        _gc_matched = (
+            _gc_dj is False and _gc_end.get("verified") is False
+            and _gc_pp == 0 and _gc_pe == 0
+            and _gc_nus is True
+            and (_gc_max["leftover"] or 0) > 0
+        )
+        if not _gc_matched:
+            continue
+        _gc_stalled_max = max(_gc_stalled) if _gc_stalled else None
+        _gc_residual = (max(0, _gc_guard - _gc_stalled_max)
+                        if (_gc_guard is not None and _gc_stalled_max is not None) else None)
+        _gc_masked = ((_gc_last["leftover"] or 0) == 0 and (_gc_max["leftover"] or 0) > 0)
+        _gc_days.append({
+            "label": _gc_lbl, "line": _gc_ln,
+            "ended_by": _gc_end.get("ended_by"),
+            "reason_prefix": _gc_prefix,
+            "verified": _gc_end.get("verified"),
+            "day_justified": _gc_dj,
+            "no_unmet_stages": _gc_nus,
+            "plot_pending": _gc_pp,
+            "plot_pending_executable": _gc_pe,
+            "plot_pending_blocked": _gc_pb,
+            "stage_count": len(_gc_stages),
+            "stage_leftover_max": _gc_max["leftover"],
+            "stage_leftover_exec_max": _gc_max["leftover_executable"],
+            "stage_leftover_blocked_max": _gc_max["leftover_blocked"],
+            "stage_leftover_last": _gc_last["leftover"],
+            "midway_masked": _gc_masked,
+            "midway_events": _gc_midway,
+            "guard_pending": _gc_guard,
+            "stalled_marked": _gc_stalled_max,
+            "residual": _gc_residual,
+            "plot_exhausted_lines": _gc_ex_lines,
+            "burst_lines": _gc_burst_lines,
+            "plots_capped_lines": _gc_capped_lines,
+            "plots_today": _gc_plots_today,
+            "plots_limit": _gc_plots_limit,
+            "truncated_plot_events": _gc_trunc,
+            "plot_events": _gc_plot_events,
+            "stage_no_target_events": _gc_no_target,
+        })
+    if _gc_days:
+        _gc_state = "found"
+    elif _gc_undec or not (_gc_has_dj and _gc_has_pp):
+        _gc_state = "undecidable"
+    else:
+        _gc_state = "zero"
+    guard_count = {
+        "state": _gc_state,
+        "days": _gc_days,
+        "days_count": len(_gc_days),
+        "labels": [d["label"] for d in _gc_days],
+        "undecidable_days": _gc_undec,
+        "has_day_justified": _gc_has_dj,
+        "has_plot_pending": _gc_has_pp,
+        "has_day_end": bool(days),
+        "guard_pending_max": max([d["guard_pending"] for d in _gc_days
+                                  if d["guard_pending"] is not None], default=None),
+        "stalled_marked_max": max([d["stalled_marked"] for d in _gc_days
+                                   if d["stalled_marked"] is not None], default=None),
+        "residual_max": max([d["residual"] for d in _gc_days
+                             if d["residual"] is not None], default=None),
+        "midway_events": sum(len(d["midway_events"]) for d in _gc_days),
+        "plots_capped_events": sum(len(d["plots_capped_lines"]) for d in _gc_days),
+        "truncated_plot_events": sum(d["truncated_plot_events"] for d in _gc_days),
+    }
     report = {
         "journal": path,
         "lines": max((ln for ln, _ in rows), default=0),
@@ -7363,6 +7588,8 @@ def build_report(rows, path, args, bad_lines):
     report["slept_ok"] = slept_ok
     report["budget_suppressed"] = budget_suppressed
     report["already_aware"] = already_aware
+    # 【task-17】守卫计数口径（0.7.44 真机冒烟）：day_justified=false 但当前观测无可执行待做，只 info
+    report["guard_count"] = guard_count
     # task-88：`cat_self_report` 要按**目标窗口**（`--window N`）而不是 `finish.days` 判自洽。
     report["window_days"] = as_int(getattr(args, "window", 3), 3)
     self_report = cat_self_report(report)
@@ -7840,6 +8067,13 @@ MAPPING_TEXT = [
      "**真世界变化数**（task-242），`already` = 本来就不用做的格（`already_tiles`，含 "
      "`cleared_by_neighbor`/`no_target` 成因）⇒ **ok=0 不代表白干**，A9 判决必须两列并读，"
      "不许用「ok 跨版本不可比」的单列数下结论；字段缺失 ⇒【无法判定】（缺失 ≠ 0）"),
+    ("守卫计数口径（task-17，0.7.44 真机冒烟）",
+     "0.7.44 收工口径·**info、不进 rc**：`day_end.verified=false` + `checks.day_justified=false` + "
+     "日级 `plot_pending*`=0（取每阶段种类**最后一轮**）却 `checks.no_unmet_stages=true`、stages[] 中间轮 "
+     "leftover/executable/blocked>0，守卫原文还报「今天早些时候还有 N 格没做完（跨片地…）」⇒ 三套口径"
+     "不一致（守卫 `_pending_work()` 累计 vs 日级取最后一轮 vs `stage_midway_leftover` 遮蔽警告）。"
+     "报告并列给：守卫 pending / 已标记停滞 / 残余 / 中间轮余格 max / 观测截断 plot 数；"
+     "缺任一字段 ⇒【无法判定】，绝不默认 0（缺失 ≠ 通过）"),
 
     ("idle", "辅助：一整轮没动作（acted/rounds）⇒ 空转，常与'该做没做'并看"),
 ]
@@ -8141,6 +8375,39 @@ def render_text(report, top):
             add(f"    · {_d['label']} ok=0 且 already>0：{_d['ok0_already']} 段"
                 f"（{_d.get('names')[:4]}；格 {json.dumps((_d.get('coords') or [])[:6], ensure_ascii=False)}；"
                 f"ok 合计 {_d.get('ok_sum')} / already 合计 {_d.get('already_sum')}）")
+    # J) 【task-17】守卫计数口径（0.7.44 真机冒烟）：`day_justified=false` 但当前观测已无可执行目标。
+    _gcv = report.get("guard_count") or {}
+    _gcud = _gcv.get("undecidable_days") or []
+    if not _gcv.get("has_day_end"):
+        add("守卫计数口径（day_justified=false 但无待做，task-17）: <缺失>（本账本没有 day_end ⇒ 无法判定）")
+    elif _gcv.get("state") == "undecidable":
+        add(f"守卫计数口径（day_justified=false 但无待做，task-17）: 【无法判定】{len(_gcud)} 天缺字段"
+            + (f"（{_gcud[0]['label']}: {_gcud[0]['why']}）" if _gcud else "（缺 checks.day_justified / "
+               "day_end.plot_pending*）") + "；缺失 ≠ 0，绝不默认无此形态")
+    elif _gcv.get("state") == "zero":
+        add("守卫计数口径（day_justified=false 但无待做，task-17）: 0 天（day_justified/plot_pending* 在场且"
+            "无「verified=false + day_justified=false + plot_pending*=0 + no_unmet_stages=true + 中间轮余格>0」"
+            " ⇒ 0 是真实读数）")
+    else:
+        add(f"守卫计数口径（day_justified=false 但无待做，task-17）: {_gcv.get('days_count', 0)} 天"
+            f"（守卫 pending 最多 {_gcv.get('guard_pending_max')} 格 / 已标记停滞 "
+            f"{_gcv.get('stalled_marked_max')} / 残余 {_gcv.get('residual_max')}；三联口径不一致 ⇒ "
+            "**只 info、不进 rc**：守卫 `_pending_work()` 累计 ≠ 日级 `plot_pending*`（取每阶段最后一轮）"
+            + (f"；观测截断 plot {_gcv.get('truncated_plot_events', 0)} 条"
+               if _gcv.get("truncated_plot_events") else "")
+            + (f"；plots_capped {_gcv.get('plots_capped_events', 0)} 条"
+               if _gcv.get("plots_capped_events") else "")
+            + "）")
+        for _d in (_gcv.get("days") or []):
+            add(f"    · {_d['label']}（L{_d['line']}，前缀 {_d['reason_prefix']}）: 守卫 pending "
+                f"{_d.get('guard_pending')} / 停滞 {_d.get('stalled_marked')} / 残余 {_d.get('residual')}；"
+                f"日级 plot_pending {_d.get('plot_pending')}（exec {_d.get('plot_pending_executable')} / "
+                f"blocked {_d.get('plot_pending_blocked')}）但 stages[] 中间轮最大 leftover "
+                f"{_d.get('stage_leftover_max')}（exec {_d.get('stage_leftover_exec_max')} / blocked "
+                f"{_d.get('stage_leftover_blocked_max')}）；最后一轮 leftover {_d.get('stage_leftover_last')}"
+                + (" ⇒ **最后一轮遮蔽**（中间轮>0 未进日级字段）" if _d.get("midway_masked") else "")
+                + (f"；stage_midway_leftover {'/'.join(str(m['line']) for m in _d['midway_events'])}"
+                   if _d.get("midway_events") else ""))
     # task-32：两种新事件形态的计数（信息项）；task-38：跨日证据覆盖度
     # task-102（`9b09735`）：**背包空格闭环**一行 —— free_slots / buy 尝试 / buy_no_space /
     # 腾格卖出（`why=need_slot`）/ 当日钱变化 / `slept_without_work` / `modal_dismiss_failed`。

@@ -5696,5 +5696,172 @@ class TestRealRunA8Task13(unittest.TestCase):
             self.assertFalse([s for s in self.rep["red"]["subjects"] if name in s])
 
 
+# ---------------------------------------------------------------- task-17（0.7.44 真机冒烟：守卫计数口径）
+#: 冒烟账本冬 26 的守卫原文（`day_end.ended_reason`）——263 格是守卫 `_pending_work()` 的累计账。
+T17_REASON_STUCK = ("stuck:同一秒连发 5 次换片都没有目标"
+                    "（守卫仍说还有活：今天早些时候还有 263 格没做完（跨片地，最近的是 [12, 17]））")
+T17_REASON_RESUME = ("resume_exhausted:回片区 217 格都回去看过、换片 4 次，"
+                     "当前观测里没有可执行目标（守卫仍说：今天早些时候还有 217 格没做完"
+                     "（跨片地，最近的是 [38, 36]））")
+
+
+def t17_checks(**kw):
+    chk = {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+           "unreachable_within_bound": True, "refused_within_bound": True,
+           "no_unmet_stages": True, "crops_watered": True, "watered_outdoor": True,
+           "day_justified": False}
+    chk.update(kw)
+    return chk
+
+
+def t17_stage(*, leftover=0, exec_=0, blocked=0, **kw):
+    st = t13_stage(leftover=leftover, leftover_executable=exec_, leftover_blocked=blocked)
+    st.update(kw)
+    return st
+
+
+def t17_ledger(*, reason=T17_REASON_STUCK, stages=(), extra_events=(),
+               checks=None, overrides=None, drop=()):
+    """task-17：造「守卫说还有活、日级却说 0」的一天（默认带中间轮余格 223 的遮蔽形态）。"""
+    end = {}
+    if checks is not None:
+        end["checks"] = checks
+    else:
+        end["checks"] = t17_checks()
+    if overrides:
+        end.update(overrides)
+    return t13_ledger(stages=stages, extra_events=extra_events,
+                      day_end_overrides=dict(end, ended_reason=reason), drop=drop)
+
+
+class TestGuardCountOnly(unittest.TestCase):
+    """task-17：`checks.day_justified=false` 但当前观测已无可执行待做（三套口径不一致）。
+
+    口径：**只 info、不进 rc** —— 守卫 `_pending_work()` 累计 ≠ 日级 `plot_pending*`（每阶段最后一轮）;
+    缺失字段 ⇒【无法判定】，缺失 ≠ 0。六本旧账本 rc/红数不变（新键只 info）。
+    """
+
+    def _report(self, events, name="gc.jsonl", days=1):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=days)
+
+    def _found_events(self):
+        return t17_ledger(
+            stages=[t17_stage(leftover=223, exec_=211, blocked=12, assigned=12,
+                              stopped="unreachable"),
+                    t17_stage(leftover=0)],
+            extra_events=[
+                {"event": "plot_exhausted", "t": 300.0, "day": MODAL_DAY, "zone": "field_sw",
+                 "source": "resume_ledger", "recovered": 1, "pending": 263,
+                 "stalled_total": 261},
+                {"event": "stage_midway_leftover", "t": 389.0, "day": MODAL_DAY,
+                 "stage": "clear_area", "round": 3, "leftover": 2},
+                {"event": "plots_capped", "t": 104.0, "day": MODAL_DAY,
+                 "plots_today": 10, "limit": 10},
+                {"event": "plot", "t": 5.0, "day": MODAL_DAY, "zone": "field_sw",
+                 "note": "tilesTruncated=true（观测截断到 400 格）"},
+            ],
+            overrides={"verified": False, "plot_pending": 0,
+                       "plot_pending_executable": 0, "plot_pending_blocked": 0},
+        )
+
+    def test_found_day_with_guard_numbers(self):
+        rep = self._report(self._found_events())
+        gc = rep["guard_count"]
+        self.assertEqual((gc["state"], gc["days_count"]), ("found", 1))
+        d = gc["days"][0]
+        self.assertEqual(d["guard_pending"], 263, "守卫 pending 从原文解析")
+        self.assertEqual((d["stalled_marked"], d["residual"]), (261, 2))
+        self.assertEqual((d["stage_leftover_max"], d["stage_leftover_exec_max"]), (223, 211))
+        self.assertEqual(d["stage_leftover_last"], 0)
+        self.assertTrue(d["midway_masked"], "最后一轮 leftover=0 且中间轮>0 ⇒ 最后一轮遮蔽")
+        self.assertEqual(len(d["midway_events"]), 1)
+        self.assertEqual((d["truncated_plot_events"], len(d["plots_capped_lines"])), (1, 1))
+        self.assertIn("守卫计数口径（day_justified=false 但无待做，task-17）: 1 天",
+                      mod.render_text(rep, 50))
+        self.assertIn("最后一轮遮蔽", mod.render_text(rep, 50))
+        self.assertFalse([s for s in rep["red"]["subjects"] if "守卫" in s or "guard" in s],
+                         "该形态只 info，绝不进 rc")
+
+    def test_zero_when_day_justified_true(self):
+        ev = t17_ledger(reason="night", checks=t17_checks(day_justified=True),
+                        overrides={"verified": True, "plot_pending": 0,
+                                   "plot_pending_executable": 0, "plot_pending_blocked": 0})
+        rep = self._report(ev, "zero.jsonl")
+        self.assertEqual((rep["guard_count"]["state"], rep["guard_count"]["days_count"]),
+                         ("zero", 0))
+        self.assertIn("守卫计数口径（day_justified=false 但无待做，task-17）: 0 天",
+                      mod.render_text(rep, 50))
+
+    def test_undecidable_when_checks_day_justified_missing(self):
+        ev = t17_ledger(checks={"slept_by_us": True}, overrides={
+            "verified": False, "plot_pending": 0, "plot_pending_executable": 0,
+            "plot_pending_blocked": 0})
+        rep = self._report(ev, "nochk.jsonl")
+        gc = rep["guard_count"]
+        self.assertEqual(gc["state"], "undecidable")
+        self.assertEqual(len(gc["undecidable_days"]), 1)
+        text = mod.render_text(rep, 50)
+        self.assertIn("【无法判定】", text)
+        self.assertIn("缺失 ≠ 0", text)
+
+    def test_undecidable_when_plot_pending_executable_missing(self):
+        ev = t17_ledger(overrides={"verified": False, "plot_pending": 0})
+        rep = self._report(ev, "nope.jsonl")
+        gc = rep["guard_count"]
+        self.assertEqual(gc["state"], "undecidable")
+        self.assertEqual(gc["days_count"], 0, "缺字段不得当成 0 天命中")
+
+    def test_field_present_but_form_absent_is_zero_not_undecidable(self):
+        rep = self._report(t17_ledger(checks=None, overrides={
+            "verified": False, "plot_pending": 0, "plot_pending_executable": 0,
+            "plot_pending_blocked": 0}), "ok.jsonl")
+        self.assertFalse([s for s in rep["red"]["subjects"] if "守卫" in s])
+        self.assertEqual(rep["guard_count"]["state"], "zero",
+                         "字段在场、只是当天没命中该形态 ⇒ 0 是真实读数，不是【无法判定】")
+
+
+class TestStageCappedEmptyFieldIsZero(unittest.TestCase):
+    """task-17 修 bug：`alloc_capped_tiles=[]`（字段在场但空）≠ 封格。
+
+    旧实现把「键在场」当「封过格」⇒ 冒烟账本误报 `stage_capped=47`（实际 0 次封格）。
+    """
+
+    def test_empty_capped_tiles_not_counted(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ev = t13_ledger(stages=[t13_stage(alloc_capped_tiles=[])],
+                        extra_events=[{"event": "blocked", "t": 7.0, "day": MODAL_DAY,
+                                       "tile": [37, 35], "action": "stage_realloc",
+                                       "alloc_no_progress": 3, "limit": 3}])
+        rep = report_for(write_ledger(tmp.name, "cap.jsonl", ev), days=1)
+        sr = rep["stage_realloc"]
+        self.assertEqual((sr["events"], sr["stage_capped"]), (1, 0),
+                         "封格事件 1 次但 alloc_capped_tiles 为空 ⇒ 阶段封格数必须是 0")
+        self.assertEqual(sr["state"], "found")
+
+
+class TestTask17Probes(unittest.TestCase):
+    """task-17 新增探针必须真的在 `FIELD_PROBES` 里（缺失 ⇒【无法判定】，不许当 0）。"""
+
+    def test_probes_registered(self):
+        labels = [p[0] for p in mod.FIELD_PROBES]
+        probes = [p[1] for p in mod.FIELD_PROBES]
+        for probe in ("day_end.verified", "day_end.checks.day_justified",
+                      "day_end.plot_pending"):
+            self.assertIn(probe, probes)
+        self.assertTrue(any("verified" in lb for lb in labels))
+
+    def test_a8_old_ledger_guard_count_undecidable(self):
+        rep = report_for(RUN_A8, days=3)
+        gc = rep["guard_count"]
+        self.assertEqual(gc["state"], "undecidable",
+                         "A8（0.7.43）没有 plot_pending_executable ⇒ 只能【无法判定】")
+        self.assertEqual(len(gc["undecidable_days"]), 12,
+                         "12 天全缺字段 ⇒ 逐天【无法判定】，不许压成 0 天")
+        self.assertIn("【无法判定】", mod.render_text(rep, 20))
+
+
 if __name__ == "__main__":
     unittest.main()

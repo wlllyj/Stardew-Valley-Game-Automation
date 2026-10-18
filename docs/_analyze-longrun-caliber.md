@@ -1406,6 +1406,43 @@ python scratch\_t3_cmp.py
 python -m unittest tests.test_analyze_longrun.TestResumeExhaustedPrefix tests.test_analyze_longrun.TestStageReallocBlocked tests.test_analyze_longrun.TestLeftoverSplit tests.test_analyze_longrun.TestSleptOkField tests.test_analyze_longrun.TestBudgetSuppressed tests.test_analyze_longrun.TestAlreadyAwareDualColumn tests.test_analyze_longrun.TestTask13ProbesFailClosed tests.test_analyze_longrun.TestRealRunA8Task13
 ```
 
+## 3.37 0.7.44 首个真机冒烟的「守卫计数口径」（task-17，2026-10-18）
+
+**背景**：0.7.44 首个真机冒烟账本 `logs/longrun-smoke-0744.jsonl`（308 行/2 天，winter 26/27）两天都
+`verified=false / checks.day_justified=false` 被判红（rc=1、红 33），dev-coder 定位根因（task-15）时需要 analyzer
+的 canonical 数字。实测结论：**不是农务失败**，而是三套计数口径不一致 ——
+| 口径 | 数据源 | 冬 26 / 冬 27 | 能否证明「没活」 |
+| --- | --- | --- | --- |
+| A 守卫 | `work_reasons` 的 `_pending_work()` 累计（账本原文「今天早些时候还有 N 格没做完（跨片地…）」） | **263 / 217**（换片过程中不变） | 否：当天累计账，含停滞/已回去看过的格 |
+| B 日级 | `day_end.plot_pending*` = 每阶段种类**最后一条** leftover 之和（brain `:8813-8829`） | **0 / 0**（中间轮 223/220 被遮蔽） | 否：`stage_midway_leftover`（L238/L304）就是为此警告 |
+| C 观测 | `day_end.plots[]`（每片 25 格）+ `plot` note | 10 片 / 4 片，15 条 `plot` 全带 `tilesTruncated=true`（**note 原文，非结构键**） | 否：400 格截断，无法逐格核对 |
+
+**263/217 归属**（详见 `docs\_analyze-smoke-0744.md` §2）：冬 27 精确 = 220（round 0 片外累计）− 3 格挡死
+`[39,32]/[39,31]/[40,32]`（L294/296/298）= 217，且 217/217 全已标停滞；冬 26 的 263 里可核部分 = 停滞标记 261
+（=263−残余 2），**40 格（263−223）无坐标/无来源 ⇒【无法判定】**（10 片×25=250 也小于 263）。挡死 17 格可逐格
+核对（`gaps.json` tree 12/grass 3/stone 1/twig 1，`first_seen` 全冬 26）；走不到 16 格（去重 16，与挡死有重叠，不相加）。
+
+**新增聚合 `guard_count`**（**只 info /【无法判定】，不进 rc**）：判据 = `day_end.verified=false` +
+`checks.day_justified=false` + 日级 `plot_pending*`=0 + `checks.no_unmet_stages=true` + stages[] 中间轮
+leftover>0。报告键：`state(found/zero/undecidable)`、`days[]{label,line,reason_prefix,guard_pending,stalled_marked,
+residual,stage_leftover_max/exec_max/blocked_max,stage_leftover_last,midway_masked,midway_events,plots_capped_lines,
+truncated_plot_events,…}`、`days_count`、`undecidable_days`、`guard_pending_max/stalled_marked_max/residual_max`、
+`midway_events/plots_capped_events/truncated_plot_events`。渲染行：`守卫计数口径（day_justified=false 但无待做，
+task-17）:` + 每日明细；advice `0s-12`；`MAPPING_TEXT` 新增 1 条。缺失任一字段 ⇒【无法判定】，缺失 ≠ 0。
+
+**新探针 3 条**（`#无法判定` 的唯一合法增量）：`day_end.verified`、`day_end.checks.day_justified`（**新增嵌套
+dict 分支**）、`day_end.plot_pending`；`build_undecidable` 其余旧路径未动。
+
+**回归口径（2026-10-18 实测，`scratch\_t17_cmp.py`：HEAD `a1d23b8` vs 本卡）**：
+- 六本旧账本 rc / 红数**一字未变** —— runA 1/117、runB 1/84、run9 1/84、run9b 1/45、run9c 0/0、run9d 1/29；
+  `#无法判定` 仅 run9/run9b 各 **+1**（新探针 `day_end.plot_pending` 缺失 ⇒ 如实【无法判定】）。
+- A8（0.7.43）rc=1/红 35/#无法判定 118 **不变**；`guard_count=undecidable`（12 天缺 `plot_pending_executable`）。
+- 冒烟账本 rc=1/红 33/#无法判定 105 **不变**；`guard_count=found` 2 天（本卡不新增任何红）。
+- 修 bug：`stage_realloc.stage_capped` 原把「`alloc_capped_tiles` 键在场」当封过格（冒烟误报 47）⇒ 改为只数**非空**
+  列表（冒烟实际 0 次封格）。
+- 单测：`tests.test_analyze_longrun` **Ran 316 / OK**（+8 条：guard_count 五态 + stage_capped 空字段 + 探针注册 +
+  A8 fail-closed）；全量 `discover -s tests` **Ran 1311 / OK**。
+
 ## 4. 复核命令
 
 ```
@@ -1439,4 +1476,8 @@ python -m unittest tests.test_analyze_longrun  # task-13 后：Ran 308 / OK（ta
 python -m unittest discover -s tests           # task-13 后：Ran 1303 / OK（0 红，须 PYTHONUTF8=1）
 python tools\analyze-longrun.py --journal logs\longrun-runA8-0743.jsonl --days 12  # A8：rc=1/红 35/【无法判定】118；0.7.44 六聚合 + already 双列见 docs\_analyze-0.7.44.md
 python scratch\_t3_cmp.py                       # 六账本 HEAD vs task-13 版并排：rc/红数一字不变；#无法判定 每本 +17（新增 18 探针，旧账本缺 17；A8 +15）
+python -m unittest tests.test_analyze_longrun  # task-17 后：Ran 316 / OK（task-13 的 308 + task-17 新增 8 条）
+python -m unittest discover -s tests           # task-17 后：Ran 1311 / OK（0 红，须 PYTHONUTF8=1）
+python tools\analyze-longrun.py --journal logs\longrun-smoke-0744.jsonl --days 5  # 0.7.44 冒烟：rc=1/红 33/#无法判定 105；guard_count found 2 天（守卫 263/217、停滞 261/217、残余 2/0）；详见 docs\_analyze-smoke-0744.md
+python scratch\_t17_cmp.py                     # HEAD(a1d23b8) vs task-17 版并排：六账本 rc/红一字不变；#无法判定 仅 run9/run9b 各 +1（新探针 plot_pending 缺失）
 ```
