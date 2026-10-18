@@ -5411,6 +5411,136 @@ class TestTask6CloseoutCaliber(unittest.TestCase):
         self.assertNotIn("deferred_by_budget_suppressed", rep.stamina_budget)
 
 
+class TestTask11UnifiedResumeClose(unittest.TestCase):
+    """【task-11 / 0.7.44】两条老 resume 入口（deputy GAP-1/GAP-2）统一路由到卡 1 的诚实口径。
+
+    病灶：`_review_only_fallback`（review 独苗兜底）与 `guard_leftover`（守卫说活但本片没意图）
+    在"回片区连续拿不出目标"触顶时直接 `_no_progress_stop(stuck:)` —— 那是卡 1 已判定
+    **"没有可执行目标 ≠ 卡死"** 的形态。新口径：两条入口都调用
+    `_resume_switch_or_exhaust`（换片 → 观测清一格 → `resume_exhausted:` 诚实收工），
+    不再写 `stuck:`；真没活就不 VERIFIED。
+    """
+
+    TILE_A = (60, 10)
+    TILE_B = (85, 10)
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list:
+        return [e for e in run.entries if e.get("event") == name]
+
+    def _run(self, w: FakeWorld):
+        run = make_run(w, target_days=1, max_days=1)
+        run.worker = FakeWorker(w, log=lambda *_: None)
+        run.client = FakeClient(w)
+        return run
+
+    def _rep(self) -> DayReport:
+        return DayReport(day_key=("winter", 1, 9), started_at=0.0)
+
+    def _two_area_ledger(self, run: LongRun) -> None:
+        run.leftover_targets = {self.TILE_A, self.TILE_B}
+        run.leftover_area = {self.TILE_A: "field_nw", self.TILE_B: "field_ne"}
+
+    def test_review_fallback_switches_plot_at_burst(self):
+        """GAP-1：review 兜底触顶时先**换到另一片**（卡 1 路由），不写 stuck。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = self._run(w)
+        self._two_area_ledger(run)
+        run.no_progress_cycles = PLOT_EXHAUSTED_BURST - 1
+        rep = self._rep()
+
+        forced, walked = run._review_only_fallback(w.obs(), rep)
+
+        self.assertIsNone(forced)
+        self.assertTrue(walked, "换片成功 ⇒ 调用方 continue 重新决策")
+        self.assertFalse(rep.ended_by, "换片成功不许收工")
+        self.assertIsNotNone(run.plot)
+        self.assertEqual(tuple(run.plot["tiles"][0]), self.TILE_B)
+        ev = [e for e in self._events(run, "plot_exhausted") if e.get("source") == "resume_ledger"]
+        self.assertEqual(len(ev), 1, run.entries)
+        self.assertEqual(ev[0]["to_anchor"], list(self.TILE_B))
+        self.assertFalse(self._events(run, "no_progress_burst"), "换片成功不许记『无产出触顶』")
+
+    def test_review_fallback_ends_honestly_when_only_dead_left(self):
+        """GAP-1：真没活（只剩被围住的格、也无可清障格）⇒ `resume_exhausted:` 诚实收工。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = self._run(w)
+        run.leftover_targets = {self.TILE_A}
+        run.leftover_area = {self.TILE_A: "field_nw"}
+        run.encircled_day = {self.TILE_A}
+        run.no_progress_cycles = PLOT_EXHAUSTED_BURST - 1
+        run.farm_actions_today = 46
+        rep = self._rep()
+
+        forced, walked = run._review_only_fallback(w.obs(), rep)
+
+        self.assertIsNone(forced)
+        self.assertFalse(walked)
+        self.assertEqual(rep.ended_by, "sleep", rep.ended_reason)
+        self.assertTrue(str(rep.ended_reason).startswith("resume_exhausted:"), rep.ended_reason)
+        self.assertFalse(str(rep.ended_reason).startswith("stuck:"), rep.ended_reason)
+        burst = [e for e in self._events(run, "no_progress_burst") if e.get("exhausted")]
+        self.assertEqual(len(burst), 1, run.entries)
+        self.assertEqual(burst[0]["encircled_pending"], 1, burst[0])
+
+    def test_guard_leftover_resume_switches_plot_at_burst(self):
+        """GAP-2：守卫说活但本片没意图、回片区触顶 ⇒ 先换到另一片，不写 stuck。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = self._run(w)
+        self._two_area_ledger(run)
+        run.no_progress_cycles = PLOT_EXHAUSTED_BURST - 1
+        rep = self._rep()
+
+        action, walked = run._guard_leftover_resume(w.obs(), rep, text="field_sw还有地要清/开/种")
+
+        self.assertEqual(action, "walked", rep.notes)
+        self.assertTrue(walked)
+        self.assertFalse(rep.ended_by, "换片成功不许收工")
+        self.assertIsNotNone(run.plot)
+        self.assertEqual(tuple(run.plot["tiles"][0]), self.TILE_B)
+        ev = [e for e in self._events(run, "plot_exhausted") if e.get("source") == "resume_ledger"]
+        self.assertEqual(len(ev), 1, run.entries)
+        self.assertFalse(self._events(run, "no_progress_burst"), run.entries)
+
+    def test_guard_leftover_ends_honestly_when_no_executable_target(self):
+        """GAP-2：真没活（只剩被围住的格）⇒ `resume_exhausted:` 诚实收工（不是 `stuck:`）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = self._run(w)
+        run.leftover_targets = {self.TILE_A}
+        run.leftover_area = {self.TILE_A: "field_nw"}
+        run.encircled_day = {self.TILE_A}      # 只剩挡死格 ⇒ `_resume_plot` 拿不出目标
+        run.no_progress_cycles = PLOT_EXHAUSTED_BURST - 1
+        run.farm_actions_today = 46
+        rep = self._rep()
+
+        action, walked = run._guard_leftover_resume(w.obs(), rep, text="field_nw还有地要清/开/种")
+
+        self.assertEqual(action, "ended", rep.notes)
+        self.assertFalse(walked)
+        self.assertEqual(rep.ended_by, "sleep", rep.ended_reason)
+        self.assertTrue(str(rep.ended_reason).startswith("resume_exhausted:"), rep.ended_reason)
+        self.assertFalse(str(rep.ended_reason).startswith("stuck:"), rep.ended_reason)
+        self.assertEqual(len([e for e in self._events(run, "no_progress_burst")
+                              if e.get("exhausted")]), 1, run.entries)
+
+    def test_guard_leftover_still_walks_before_burst(self):
+        """回归：没触顶时 `guard_leftover` 保持原语义（走回 leftover 旁边再看一次）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = self._run(w)
+        run.leftover_targets = {self.TILE_A}
+        run.leftover_area = {self.TILE_A: "field_nw"}
+        rep = self._rep()
+
+        action, walked = run._guard_leftover_resume(w.obs(), rep, text="守卫说有活")
+
+        self.assertEqual(action, "walked")
+        self.assertTrue(walked)
+        self.assertEqual(run.resume_walks, 1)
+        self.assertIsNotNone(run.plot)
+        self.assertFalse(self._events(run, "no_progress_burst"), run.entries)
+        self.assertEqual(len(self._events(run, "resume_walk")), 1, run.entries)
+
+
 class _SurplusWorker(FakeWorker):
     """task-55：给假执行层补 `sell(slot, *, whitelist=…)`（真 `FarmWorker.sell` 的最小替身）。
 
@@ -7757,24 +7887,28 @@ class TestTask134AssignedVsPlotPending(unittest.TestCase):
         self.assertEqual(len(ev), 1, run.entries)
         self.assertEqual(ev[0]["where"], "unit")
 
-    def test_repeated_resume_without_output_is_bounded_and_ends_stuck(self):
-        """A 段：回片区连续拿不出目标 ⇒ 到 burst 上界**立刻**诚实收尾 `stuck:`，不熬 idle 3 轮。"""
+    def test_repeated_resume_without_output_ends_honestly_not_stuck(self):
+        """A 段 + task-11：回片区连续拿不出目标 ⇒ 到 burst 上界**立刻**走卡 1 的诚实收工
+        （`resume_exhausted:` / sleep），不再写 `stuck:`（deputy GAP-1）。"""
         w = FakeWorld(weeds=0, seeds=0, money=0)
         run, _client = self._run_with(w)
         run.leftover_targets = {(60, 10)}
         run.no_target = {"till_area"}
         run.no_progress_cycles = PLOT_EXHAUSTED_BURST - 1
+        run.farm_actions_today = 46              # 真机形态：收工前已做成几十步
         rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
 
         forced, walked = run._review_only_fallback(w.obs(), rep)
 
         self.assertIsNone(forced)
         self.assertFalse(walked)
-        self.assertTrue(str(rep.ended_reason or "").startswith("stuck:"), rep.ended_reason)
-        self.assertEqual(rep.ended_by, "stuck",
-                         "有界收尾必须如实记 stuck（不是 sleep/收工，更不许洗成 no_work）")
+        self.assertTrue(str(rep.ended_reason or "").startswith("resume_exhausted:"),
+                        rep.ended_reason)
+        self.assertEqual(rep.ended_by, "sleep",
+                         "真没有可执行目标 ⇒ 诚实收工（不再写 stuck）")
+        self.assertFalse(str(rep.ended_reason).startswith("stuck:"), rep.ended_reason)
         self.assertTrue(run.leftover_targets, "leftover 不许被清成空（不许洗白）")
-        bursts = self._events(run, "no_progress_burst")
+        bursts = [e for e in self._events(run, "no_progress_burst") if e.get("exhausted")]
         self.assertEqual(len(bursts), 1, run.entries)
         self.assertGreaterEqual(bursts[0]["count"], PLOT_EXHAUSTED_BURST)
         self.assertFalse(rep.checks.get("day_justified", False), rep.checks)

@@ -67,9 +67,10 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
     ),
     (
         "m5_dead_only_keeps_churning",
-        "                    dead_pending = self._dead_end_pending()",
-        "                    dead_pending = []",
-        "整片只剩挡死格时不再走卡 1 换片/诚实收工 ⇒ should kill 日终用例",
+        "        self._resume_exhausted(obs, rep, plot=plot, where=where, marked=marked)",
+        "        rep.ended_by, rep.ended_reason = self._do_sleep("
+        "obs, rep, \"stuck:回片区连续拿不出目标（变异）\")",
+        "整片只剩挡死格时不再走『resume_exhausted 诚实收工』而退回 stuck ⇒ should kill 日终用例",
     ),
 ]
 

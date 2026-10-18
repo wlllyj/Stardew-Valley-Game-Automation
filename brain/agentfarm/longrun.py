@@ -4915,30 +4915,6 @@ class LongRun:
                                "参与取目标（否则意图被滤空 ⇒ 走路→空转→再走路的死循环）")
         return cleared
 
-    def _no_progress_stop(self, obs: dict[str, Any], rep: DayReport, *,
-                          source: str, tiles: int) -> tuple[str, str]:
-        """回片区/换作业区**连续**无产出触顶 ⇒ 按既有诚实口径收尾（task-134 A）。
-
-        与 `plot_exhausted_burst`（墙钟同一秒窗口）互补：这条是确定性上界，慢速空转也一样拦。
-        收尾理由必须是 `stuck:`（leftover 一个字不动、绝不洗成 `no_work`）。
-        """
-        reasons = self.work_reasons(obs)[:3]
-        self._journal("no_progress_burst", count=self.no_progress_cycles, source=source,
-                      tiles=tiles, reasons=reasons,
-                      note="回片区/换作业区连续无产出（run9b：2.6 秒 10 次、一格动作没做）"
-                           "⇒ 按既有有界机制诚实收尾，不再空转；leftover 如实保留")
-        rep.notes.append(f"{source} 连续 {self.no_progress_cycles} 次没产出目标 ⇒ 停止空转")
-        ended_by, ended_reason = self._do_sleep(
-            obs, rep,
-            f"stuck:{source} 连续 {self.no_progress_cycles} 次都拿不出目标"
-            f"（守卫仍说还有活：{'；'.join(reasons) or '（无）'}）" + self._not_on_farm_suffix())
-        if ended_by == "slept_without_work":
-            # 【task-102】守卫仍说有活 ⇒ `_do_sleep` 拦住了"0 动作就想睡"（本日不推进）。
-            # 这条路径要的终态是**如实的 `stuck`**（不是"收工"、更不是靠睡觉翻篇把空转洗掉）：
-            # 保持 ended_by=stuck + `stuck:` 理由，让总控/账本一眼看出这一天没做成事。
-            ended_by = "stuck"
-        return ended_by, ended_reason
-
     def _review_only_fallback(self, obs: dict[str, Any],
                               rep: DayReport) -> tuple[Any | None, bool]:
         """review 独苗 + 守卫说还有活 ⇒ 换成能落地的意图，或把人带回那片地（task-124）。
@@ -4983,14 +4959,38 @@ class LongRun:
         if pending and self.resume_walks < self.max_plots_per_day:
             self._resume_reevaluate(where="review_only_fallback")     # 【task-134 A】
             resume = self._resume_plot(obs)
+            if resume is None:
+                # 【task-11 / 0.7.44】pending 非空却全是"挡死/已停滞"格 ⇒ 同样走卡 1 的
+                # `_resume_switch_or_exhaust`（换片→观测清一格→`resume_exhausted:`），
+                # 不再直接落回调用方的 `stuck:` 收尾（deputy GAP-1）。
+                dead = self._dead_end_pending()
+                if dead:
+                    action, alt = self._resume_switch_or_exhaust(
+                        obs, rep,
+                        plot={"zone": "", "label": "", "area": "",
+                              "anchor": list(dead[0]), "tiles": dead,
+                              "note": "只剩挡死格（review 兜底）"},
+                        where="review_only_fallback")
+                    if action == "ended":
+                        return None, False
+                    if action == "acted":
+                        return None, True
+                    resume = alt
             if resume is not None:
                 self.resume_walks += 1
                 self.no_progress_cycles += 1                          # 【task-134 A】
                 if self.no_progress_cycles >= PLOT_EXHAUSTED_BURST:
-                    rep.ended_by, rep.ended_reason = self._no_progress_stop(
-                        obs, rep, source="review_only_fallback 回片区",
-                        tiles=len(resume["tiles"]))
-                    return None, False
+                    # 【task-11 / 0.7.44】不再直接 `_no_progress_stop(stuck:)`：统一路由到
+                    # 卡 1 的 `_resume_switch_or_exhaust`（换片 → 观测清一格 → `resume_exhausted:
+                    # 诚实收工），"拿不出目标"不许被判成卡死（deputy GAP-1）。
+                    action, alt = self._resume_switch_or_exhaust(
+                        obs, rep, plot=resume, where="review_only_fallback")
+                    if action == "ended":
+                        return None, False
+                    if action == "acted":
+                        return None, True       # 本轮已清一格；调用方 `continue` 重新决策
+                    if alt is not None:
+                        resume = alt
                 walked = self._walk_into_plot(obs, resume)
                 self._journal("review_only_fallback", source="pending_walk",
                               tiles=len(resume["tiles"]), walked=bool(walked),
@@ -5025,6 +5025,69 @@ class LongRun:
         if pending:
             rep.notes.append(f"确定性计划也没有目标：{len(pending)} 格今天放弃（次日重试）")
         return len(pending)
+
+    def _guard_leftover_resume(self, obs: dict[str, Any], rep: DayReport,
+                               *, text: str) -> tuple[str, bool]:
+        """守卫说还有活、本片却没意图 ⇒ 回跨片区 leftover 看一眼（task-49 主修）。
+
+        【task-11 / 0.7.44】连续无产出触顶时**不再** `_no_progress_stop(stuck:)`：统一路由到
+        卡 1 的 `_resume_switch_or_exhaust`（换片 → 观测清一格 → `resume_exhausted:` 诚实收工），
+        把"拿不出目标"与"卡死"分开（deputy GAP-2）。返回 `(action, walked)`：
+
+        * `"walked"` ⇒ 已走回（调用方 `continue` 重新决策）；
+        * `"acted"`  ⇒ 本轮已清一格（调用方 `continue`）；
+        * `"ended"`  ⇒ 已按诚实口径收工（调用方 `break`）；
+        * `"none"`   ⇒ 没走成/没得走（调用方落回既有"换片/recovered"路径）。
+        """
+        if not (self._pending_work() and self.resume_walks < self.max_plots_per_day):
+            return "none", False
+        self._resume_reevaluate(where="guard_leftover")               # 【task-134 A】
+        resume = self._resume_plot(obs)
+        if resume is None:
+            # 【task-11 / 0.7.44】pending 非空却全是挡死/停滞格 ⇒ 走卡 1 的诚实收口（GAP-2）。
+            dead = self._dead_end_pending()
+            if not dead:
+                return "none", False
+            action, alt = self._resume_switch_or_exhaust(
+                obs, rep,
+                plot={"zone": "", "label": "", "area": "",
+                      "anchor": list(dead[0]), "tiles": dead,
+                      "note": "只剩挡死格（guard_leftover）"},
+                where="guard_leftover")
+            if action == "ended":
+                return "ended", False
+            if action == "acted":
+                return "acted", False
+            resume = alt
+            if resume is None:
+                return "none", False
+        self.resume_walks += 1
+        self.no_progress_cycles += 1                                  # 【task-134 A】
+        if self.no_progress_cycles >= PLOT_EXHAUSTED_BURST:
+            action, alt = self._resume_switch_or_exhaust(
+                obs, rep, plot=resume, where="guard_leftover")
+            if action == "ended":
+                return "ended", False
+            if action == "acted":
+                return "acted", False
+            if alt is not None:
+                resume = alt
+        walked = self._walk_into_plot(obs, resume)
+        self._journal("resume_walk", zone=self.zone_name,
+                      tiles=len(resume["tiles"]), walked=bool(walked),
+                      attempt=self.resume_walks,
+                      note="守卫说还有活但本片没意图 ⇒ 回去看今天没做完的格子")
+        if not walked:
+            return "none", False
+        self._actions += 1
+        rep.notes.append(
+            f"守卫说还有活（{text}）⇒ 回到没做完的 "
+            f"{len(resume['tiles'])} 格旁边再看一次"
+            f"（resume_walk {self.resume_walks}/{self.max_plots_per_day}）")
+        self.plot = resume
+        self.zone_name = ""
+        self.idle_rounds = 0
+        return "walked", True
 
     def _frontier_clear(self, obs: dict[str, Any], rep: DayReport) -> bool:
         """【task-68】"一轮不许零动作"：世界没变化、但仍有**可达 + 可清障**的地 ⇒ 至少清一格。
@@ -8582,32 +8645,17 @@ class LongRun:
                     # 【task-49 主修】守卫说还有活，而**本片**拿不出意图 ⇒ 先用"今天还没做完的
                     #   格子"（可能整片都在玩家窗口之外）回头看一眼，而不是直接换片地/攒 recovered。
                     #   run5 第 1 天：field_nw 还剩 9 格未开垦，人站在 field_se 就以为"没活"。
-                    if self._pending_work() and self.resume_walks < self.max_plots_per_day:
-                        self._resume_reevaluate(where="guard_leftover")   # 【task-134 A】
-                        resume = self._resume_plot(obs)
-                        if resume is not None:
-                            self.resume_walks += 1
-                            self.no_progress_cycles += 1                  # 【task-134 A】
-                            if self.no_progress_cycles >= PLOT_EXHAUSTED_BURST:
-                                rep.ended_by, rep.ended_reason = self._no_progress_stop(
-                                    obs, rep, source="回片区（guard_leftover）",
-                                    tiles=len(resume["tiles"]))
-                                break
-                            walked = self._walk_into_plot(obs, resume)
-                            self._journal("resume_walk", zone=self.zone_name,
-                                          tiles=len(resume["tiles"]), walked=bool(walked),
-                                          attempt=self.resume_walks,
-                                          note="守卫说还有活但本片没意图 ⇒ 回去看今天没做完的格子")
-                            if walked:
-                                self._actions += 1
-                                rep.notes.append(
-                                    f"守卫说还有活（{text}）⇒ 回到没做完的 "
-                                    f"{len(resume['tiles'])} 格旁边再看一次"
-                                    f"（resume_walk {self.resume_walks}/{self.max_plots_per_day}）")
-                                self.plot = resume
-                                self.zone_name = ""
-                                self.idle_rounds = 0
-                                continue
+                    # 【task-11 / 0.7.44】连续无产出触顶时统一路由到卡 1 的
+                    # `_resume_switch_or_exhaust`（换片 → 观测清一格 → `resume_exhausted:` 诚实
+                    # 收工），不再直接 `_no_progress_stop(stuck:)`（deputy GAP-2）。
+                    action, _walked = self._guard_leftover_resume(obs, rep, text=text)
+                    if action == "ended":
+                        break
+                    if action == "acted":
+                        self.idle_rounds = 0
+                        continue
+                    if action == "walked":
+                        continue
                     recovered += 1
                     self.plot_exhausted_today += 1     # 【task-122】当日计数（喂当晚教训）
                     self._journal("plot_exhausted", recovered=recovered, zone=self.zone_name,
