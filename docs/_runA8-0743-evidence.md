@@ -119,7 +119,7 @@ A8 起点 = **winter 7**；A9/B9 已改为新起点 **winter 26**（`docs/00-开
 
 **逐日复核要点**
 
-- 12 天 `ok_steps` 合计 **328**、`skipped_steps=0`、`failed_steps=0`；`finish.actions=536`（含移动/观测动作，与 ok 不同口径）。
+- 12 天 `ok_steps` 合计 **289**、`skipped_steps=0`、`failed_steps=0`；`finish.actions=536`（含移动/观测动作，与 ok 不同口径）。
 - 7 天 VERIFIED = winter 8/10/11/13/15/16/17；这 7 天的收尾理由全部是 `no_work:当季（winter）没有可种的种子…`，`verify-run3` 同时给「VERIFIED 但只涉及一个阶段（['clear_area']）⇒ 供复核」的 info（冬季无作物，农务腿结构性缺席，见 §7）。
 - **winter 9 / winter 14 的 `ended_by=stuck` 却 `checks.slept_by_us=false`，但账本随后确实有 `sleep` 且 `day_after` +1**（`logs\longrun-runA8-0743.jsonl:512`、`:1194`，`sleep.ok=true` 原文「已跨日：winter 9日 → winter 10日」「winter 14日 → winter 15日」）⇒ 这是**收工路径 checks 快照滞后**（已另立 task-6 缺陷 B）。本文件如实记录，不据此改判、也不拿它洗白。
 - day 3（winter 9）`unmet` 来自 `stage_shortfall_day`（账本 `:514` `{"unmet":1,"assigned":1,"undone":1,"leftover":1}`）；day 8（winter 14）的 `no_unmet_stages=true` 是两笔豁免扣完的结果（`:1197` `unreachable_summary{count:2,bound:11,exempted:2}` + `:1198` `encircled_summary{count:1}`），但 `day_justified=false` 仍使整天不 VERIFIED。
