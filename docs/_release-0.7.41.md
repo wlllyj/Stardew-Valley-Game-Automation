@@ -58,3 +58,29 @@
 - 冒烟只有 2 天，`harvest` 是否真收成受种子/体力/背包共同影响；若 2 天都不出现 harvest ok，需在证据里如实写"能力未验证"而不是判 PASS。
 - `save-chain-check.py` 只判"次数配对"，不判"存档内容"；内容正确性仍靠存档四件 size/mtime 与 `after save, starting <season> <day>` 原文。
 - `slot_relief` 卖掉的是"收获产物"，若当天无收获产物则只能卖盈余材料（仍受白名单与建造预留约束）。
+
+## §6 冻结与装机执行记录（2026-10-18）
+
+| 步 | 读数 |
+| --- | --- |
+| 1 note | `tools/_note-0741.txt` 首行 `v0.7.41（2026-10-18）：全脑侧修复批次（0.7.40 七步冒烟抓出的三处真缺陷），Mod 无代码变更（dll 与 0.7.40 同源重建）`，9 行，Python 验 UTF-8 通过 |
+| 2 bump | `_bump-mod-version.py 0.7.41 --note-file tools\_note-0741.txt` ⇒ manifest `0.7.40 → 0.7.41` |
+| 3 brain | `brain/agentfarm/bridge.py:39 MOD_VERSION_EXPECTED = "0.7.41"`（注释写三条修复 + `--- 历史 ---` 保留 v0.7.40 原文） |
+| 4 build | `dotnet build -c Release --no-incremental` **0 警 0 错**；dll **281088 B**（与 0.7.40 字节相同，Mod 确无变更）、manifest **66623 B**；C# 自检 85 断言 |
+| 5 冻结提交 | **`7e6bf55`**（`chore(release): 冻结 0.7.41（落盘守卫 + 腾格力度 + §8 兜底）`；3 files +29/−3；未 amend） |
+| 6 check-release | `--expect 0.7.41` **六项全绿**：manifest==brain、版本==期望、dll 不比源码旧、py_compile 22 文件、**`Ran 1199 tests / OK`**、树干净 |
+| 7 装机 | `deploy-mod.py --no-quit` ⇒ `0.7.40 → 0.7.41`，桥 `modVersion=0.7.41 port=17890`，自动读档（FarmHouse 9,9） |
+| 8 goto Farm | ok，`hop1 FarmHouse → Farm source=[3,12] landing=[64,15]` **7625ms** |
+| 9 preflight | ✅ `logs\run10i-baseline.json` —— **第 1 年 冬 1 日 06:10 sunny** / Farm(64,15) / 体力 270/270 / 血 100 / **钱 2767g** / 农场[草 0 / 石 106 / 枝 74 / **树 804** / 耕地 18 / 作物 0] / `farmScanSeq 10` / `waterLeft 13` / `tillableCount 173` / `tileCount 400 truncated` / 无模态 / `worldAdvancing true` |
+
+**0.7.41 五文件指纹**（`git archive` / 冒烟逐字比对用）：
+
+```
+longrun.py  A728888FEF02ED170C3B81315C8A35E5F41D443DBCAB071D4CA9537A3896C59C   564473
+farmwork.py 7DA3D549E23798200307F49F87C17F5E45828DA3BC78B22713242CF8B8086B42   224375
+bridge.py   6AED9E257E0DD697D40CF80400E2FD4145C8F1D8FFD6F0285D97B05CE4D230D4    66642
+dll         FF05225C6846D80C6CCF4E8B16A15F399FACCBED572705DF886486A8E419BD08   281088
+manifest    B0257AFBC4898F45AB7EDC5583C726AC0981A420F98CD1C7EB7ECE3C91191B09    66623
+```
+
+**结构限制（冒烟判据按它调整，不改结论）**：装机时是**冬季第 1 天、农场 0 作物** ⇒ §3 步 7 的「至少一天 `harvest` ok>0」物理上不可能出现，记 **【无法判定·无作物】**；步 7 的判红只认 ①零 `missed:intent_no_reason:*` ②`slot_relief` 带 `demand/demand_basis/target_free/reached`。步 5 若 `clear_area` ok=0 同样如实【无法判定】（冬 0 草，但石/枝/树可清，ok 应为正 —— 若为 0 需查清障能力是否又静默缩水）。
