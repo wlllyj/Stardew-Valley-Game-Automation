@@ -84,3 +84,25 @@ manifest    B0257AFBC4898F45AB7EDC5583C726AC0981A420F98CD1C7EB7ECE3C91191B09    
 ```
 
 **结构限制（冒烟判据按它调整，不改结论）**：装机时是**冬季第 1 天、农场 0 作物** ⇒ §3 步 7 的「至少一天 `harvest` ok>0」物理上不可能出现，记 **【无法判定·无作物】**；步 7 的判红只认 ①零 `missed:intent_no_reason:*` ②`slot_relief` 带 `demand/demand_basis/target_free/reached`。步 5 若 `clear_area` ok=0 同样如实【无法判定】（冬 0 草，但石/枝/树可清，ok 应为正 —— 若为 0 需查清障能力是否又静默缩水）。
+
+## §7 七步冒烟结果（2026-10-18，machine-runner，`629af9f` / 证据 `docs/_smoke-0741.md`）
+
+**6 PASS / 1 无法判定 / 0 FAIL**（`logs/longrun-smoke-0741.jsonl`，253 行 / 8.67 分钟 / 157 动作 / `finish.code=1`）：
+
+| 步 | 结论 | 关键读数 |
+| --- | --- | --- |
+| 1 | PASS | `crafting_recipes/Furnace` `matchedCount=1`，无 `unknown_skill` |
+| 2 | PASS | `trigger_actions` 可读，无 `InvalidCastException`（0.7.37 那个强类型资产面彻底过） |
+| 3 | PASS（A2） | 树 `(38,14)` 只 1 次 `use_tool(axe)` ⇒ `kind tree → None`，`calls=1` |
+| 4 | PASS | `finish` 出现；`cleanup_modal_stuck=false / cleanup_attempts=0`（task-236 字段真机在场且未触发） |
+| 5 | PASS | `clear_area` **8/8** 个 ok 动作带逐格 `cleared_tiles` |
+| 6 | PASS | `save-chain-check`：六串 **4/4/4/4/4/4** 全配对 + 链内顺序 4 链 + 末次跨日（winter 4→5）落盘；SMAPI 时点冻结 `208849 B / 2401 行 / SHA256 EF13FD52…FABF6 / BYTE_IDENTICAL=True` |
+| 7 | 无法判定（rc=12） | §8 管道全绿：`意图 68 / 0 步 40 / 其中无原因码 0 / 计划无对账 0`、`missed:intent_no_reason:*` 消失、gaps 在场；两项缺真机读数：`slot_relief` 0 次（背包没满未触发）、`harvest` 无作物 |
+
+**步 4 的 4 个日报告**：`ended_by=sleep`、`verified=false`、`ended_reason` **全部以 `stuck:回片区（guard_leftover）连续 5 次都拿不出目标` 开头**；`day_after` 逐日 +1（winter 2→5）、`no_progress_burst{count 5}` ×4（有界机制在跑）、`intent_coverage` 在场（10/37/12/9 条）。
+
+**收尾**：存档四件退前=退后（size+mtime+SHA256）；`stop-game.py` rc=0 ⇒ 进程 0 / `bridge.json` 已删 / 17890 无 LISTENING。
+
+**冒烟抓出的两条真缺陷（0.7.42 门禁）**：
+- **task-240**：`plant_area` 季节闸门 + 守卫「该去种」必须有可执行目标 —— 冬季 0 作物 + `Wheat Seeds×10` ⇒ 守卫宣称「29 格耕地空着该去种」而目标池 0 ⇒ 每天 `stuck`、`day_justified=false` ⇒ **冬季永远拿不到 VERIFIED**。
+- **task-241**：树类清障要有界多次 `use_tool` + 预算改体力驱动 —— 9 条 `blocked` 全是单发 `tool_ineffective` 封格（A2 证明同类树 1–3 次必倒），且树有硬编码 2 棵/天（874 棵树要 400 天 ⇒ 目标 1 不可达）。
