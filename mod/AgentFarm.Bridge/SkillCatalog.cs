@@ -33,6 +33,7 @@ namespace AgentFarm.Bridge
             "select_item", "plant", "sleep", "buy", "sell", "dismiss_modal",
             "upgrade_tool", "pickup_tool", "debug_dump", "add_missed_recipes",
             "craft_item", "place_object", "machine", "advance_dialogue",
+            "talk",
         };
 
         /// <summary>
@@ -41,7 +42,7 @@ namespace AgentFarm.Bridge
         /// </summary>
         internal static readonly string[] Planned =
         {
-            "exit_building", "harvest", "pickup_debris", "collect_machine", "refill_watering_can", "talk",
+            "exit_building", "harvest", "pickup_debris", "collect_machine", "refill_watering_can",
         };
 
         /// <summary>

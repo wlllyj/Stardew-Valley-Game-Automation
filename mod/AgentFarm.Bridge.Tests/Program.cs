@@ -645,6 +645,77 @@ namespace AgentFarm.Bridge.Tests
                   && EventRules.IdFor(false, null) == null,
                   "没有事件 ⇒ null（哪怕调用方传了 id，也不许把旧事件的 id 挂上来）");
 
+            // ---------------- task-33：`talk` 原语（契约 docs/_release-0.7.46.md §8.4） ----------------
+            // 背包升级 = Pierre 对话式购买；0.7.45 前技能表没有 talk、interact 只走格子动作
+            // ⇒ task-32 六条通道全败。这里把纯规则（名字匹配/相邻/回执分类）行为化，并把
+            // "只许调游戏 checkAction、不许改钱/背包/合成键鼠"的红线钉成源码断言。
+            Check("t233_name_matching_is_case_insensitive_and_trimmed",
+                  TalkRules.NameMatches("Pierre", "Pierre", "Pierre")
+                  && TalkRules.NameMatches("pierre", "Pierre", "Pierre")
+                  && TalkRules.NameMatches("  PIERRE  ", "Pierre", "Pierre")
+                  && TalkRules.NameMatches("Pierre", "pierre", "pierre")
+                  && TalkRules.NameMatches("Pierre", "pierre", "Pierre")
+                  && !TalkRules.NameMatches("Pier", "Pierre", "Pierre")
+                  && !TalkRules.NameMatches("", "Pierre", "Pierre")
+                  && !TalkRules.NameMatches(null, "Pierre", "Pierre"),
+                  "名字匹配：大小写不敏感 + trim；内部名/显示名任一相等；空查询/部分匹配 ⇒ false（fail-closed，不猜最近的人）");
+
+            Check("t233_adjacency_is_chebyshev_le_one",
+                  TalkRules.IsAdjacent(0, 0) && TalkRules.IsAdjacent(1, 0) && TalkRules.IsAdjacent(-1, 1)
+                  && TalkRules.IsAdjacent(0, -1) && !TalkRules.IsAdjacent(2, 0) && !TalkRules.IsAdjacent(0, 2)
+                  && !TalkRules.IsAdjacent(2, 1) && !TalkRules.IsAdjacent(-2, -2)
+                  && TalkRules.ChebyshevDistance(3, -4) == 4 && TalkRules.ChebyshevDistance(0, 0) == 0,
+                  "相邻 = 切比雪夫距离 ≤1（八方向）；距离 2 一律 not_adjacent（由脑先 move_to，技能不代走）");
+
+            Check("t233_code_classification_is_fail_closed",
+                  TalkRules.DecideCode(false, false, false, null, false) == TalkRules.CodeNpcNotFound
+                  && TalkRules.DecideCode(true, false, false, null, false) == TalkRules.CodeNotAdjacent
+                  && TalkRules.DecideCode(true, true, false, "DialogueBox", false) == TalkRules.CodeNoAction
+                  && TalkRules.DecideCode(true, true, true, null, false) == TalkRules.CodeNotSupported
+                  && TalkRules.DecideCode(true, true, true, "", true) == TalkRules.CodeOk
+                  && TalkRules.DecideCode(true, true, true, "ShopMenu", false) == TalkRules.CodeOk
+                  && !TalkRules.HasDialogueEvidence(false, "DialogueBox", true)
+                  && TalkRules.HasDialogueEvidence(true, "DialogueBox", false)
+                  && TalkRules.HasDialogueEvidence(true, null, true)
+                  && !TalkRules.IsOkCode(TalkRules.CodeNotSupported),
+                  "分类顺序：找不到 > 不相邻 > 游戏没认领(no_action) > applied 却无 UI 证据(not_supported) > ok；"
+                  + "applied 必须带 activeMenu 或提问才算 ok");
+
+            Check("t233_talk_is_executable_and_not_long_task",
+                  Array.IndexOf(SkillCatalog.Executable, "talk") >= 0
+                  && Array.IndexOf(SkillCatalog.Planned, "talk") < 0
+                  && !SkillCatalog.IsLongTask("talk")
+                  && SkillCatalog.IsKnown("talk"),
+                  "talk 必须从 Planned 搬到 Executable；单 tick（checkAction 同步返回）⇒ 不进 LongTask");
+
+            string talkPath = repoRoot == null ? null : Path.Combine(repoRoot, "mod", "AgentFarm.Bridge", "TalkSkill.cs");
+            string talksText = talkPath != null && File.Exists(talkPath) ? File.ReadAllText(talkPath) : "";
+            Check("t233_talk_source_uses_game_entry_only",
+                  talksText.Length > 0
+                  && talksText.Contains("found.checkAction(who, loc)")
+                  && talksText.Contains("UiRead.DialogueIsQuestion()")
+                  && talksText.Contains("UiRead.DialogueResponseTexts()")
+                  && !talksText.Contains("Money =")
+                  && !talksText.Contains("MaxItems =")
+                  && !talksText.Contains(".increaseBackpackSize(")
+                  && !talksText.Contains("pressActionButton")
+                  && !talksText.Contains("new Money"),
+                  "talk 只调游戏 NPC.checkAction + 读 UiRead；禁写 Money/MaxItems、禁 increaseBackpackSize、禁合成键鼠");
+
+            string contractsPath = repoRoot == null ? null : Path.Combine(repoRoot, "mod", "AgentFarm.Bridge", "Contracts.cs");
+            string contractsText = contractsPath != null && File.Exists(contractsPath) ? File.ReadAllText(contractsPath) : "";
+            Check("t233_contract_fields_are_declared",
+                  contractsText.Contains("[JsonPropertyName(\"npc\")]")
+                  && contractsText.Contains("[JsonPropertyName(\"npcTile\")]")
+                  && contractsText.Contains("[JsonPropertyName(\"code\")]")
+                  && contractsText.Contains("[JsonPropertyName(\"applied\")]")
+                  && contractsText.Contains("[JsonPropertyName(\"distance\")]")
+                  && contractsText.Contains("[JsonPropertyName(\"available\")]")
+                  && contractsText.Contains("[JsonPropertyName(\"activeMenu\")]")
+                  && contractsText.Contains("[JsonPropertyName(\"dialogueIsQuestion\")]")
+                  && contractsText.Contains("[JsonPropertyName(\"dialogueResponses\")]"),
+                  "ExecArgs/ExecResponse 必须声明契约 §8.4 的全部字段（null 省略，其它技能回执形状不变）");
+
             Console.WriteLine(_failed == 0
                 ? $"OK {_total} 断言全部通过"
                 : $"FAILED {_failed} 条断言不通过（共 {_total} 条）");

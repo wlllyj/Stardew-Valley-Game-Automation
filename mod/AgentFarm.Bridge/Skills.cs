@@ -530,6 +530,15 @@ namespace AgentFarm.Bridge
                 case "advance_dialogue":
                     return new DialogueAdvanceSkill(req, world, monitor).Step;
 
+                // 【task-33】`talk`：按名字找同地点 NPC → 相邻校验 → 调游戏自己的
+                // `NPC.checkAction(Farmer, GameLocation)`（背包升级=Pierre 对话式购买，唯一入口）。
+                //
+                // 【纪律】不写 Money/Items/MaxItems、不调 increaseBackpackSize、不合成键鼠；
+                // 选项留给 `dismiss_modal{answerText|answerIndex}`（本技能只"开对话"，不代答）。
+                // 单 tick 同步（checkAction 立即返回，打开对话是它的副作用）⇒ 不加入 IsLongTaskSkill。
+                case "talk":
+                    return new TalkSkill(req, world, monitor).Step;
+
                 default:
                     // 未实现的技能：合法请求但还没有实现（区别于 unknown_skill）。
                     return () => new ExecResponse
@@ -540,7 +549,7 @@ namespace AgentFarm.Bridge
                         Reason = $"技能“{skill}”尚未实现（已实现：noop、move_to、move_to_location、"
                                + "dismiss_modal、load_save、quit_game、interact、use_tool、select_item、plant、"
                                + "sleep、buy、sell、upgrade_tool、pickup_tool、debug_dump、add_missed_recipes、"
-                               + "craft_item、place_object、machine、advance_dialogue）",
+                               + "craft_item、place_object、machine、advance_dialogue、talk）",
                     };
             }
         }

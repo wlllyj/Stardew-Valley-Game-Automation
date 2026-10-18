@@ -1079,6 +1079,15 @@ namespace AgentFarm.Bridge
         /// <summary>move_to / move_to_location 的目标格 [x, y]。</summary>
         [JsonPropertyName("tile")] public int[] Tile { get; set; }
 
+        /// <summary>talk 专用：NPC 所在格 [x, y]（可选；同名 NPC 多条时用来消歧）。</summary>
+        [JsonPropertyName("npcTile")] public int[] NpcTile { get; set; }
+
+        /// <summary>
+        /// talk 专用：要对话的 NPC 名字（大小写不敏感；内部名 `Name` 或显示名 `displayName` 任一命中即可）。
+        /// 【契约 §8.4】空名字 ⇒ `npc_not_found`（fail-closed，不拿"最近的人"去猜）。
+        /// </summary>
+        [JsonPropertyName("npc")] public string Npc { get; set; }
+
         /// <summary>
         /// <c>move_to_location</c> 专用：目标**地点名**（如 <c>"Farm"</c>）。
         ///
@@ -1350,6 +1359,43 @@ namespace AgentFarm.Bridge
         /// 【可选字段】null 时序列化省略 ⇒ 其它技能回执形状不变。
         /// </summary>
         [JsonPropertyName("availableItems")] public ShopItemView[] AvailableItems { get; set; }
+
+        // ------------------------------------------------------------------
+        //  task-33（0.7.46 卡 A 前置）新增：`talk` 原语回执（契约 docs/_release-0.7.46.md §8.4）
+        //
+        //  形状（全可选、null 省略）：
+        //    {ok, applied, code, npc, npcTile, distance, available(仅 npc_not_found),
+        //     activeMenu, dialogueIsQuestion, dialogueResponses}
+        //  `code=="ok" && applied==true` **必须**同时有 `activeMenu` 或 `dialogueIsQuestion`，
+        //  否则判实现缺陷（`not_supported`，不许当成功）。
+        // ------------------------------------------------------------------
+
+        /// <summary>`talk` 专用：机器可读原因（`ok` / `npc_not_found` / `not_adjacent` / `no_action` / `not_supported`）。【可选字段】</summary>
+        [JsonPropertyName("code")] public string Code { get; set; }
+
+        /// <summary>`talk` 专用：游戏 `NPC.checkAction` 的返回值（true = 游戏认领了这次交互）。【可选字段】</summary>
+        [JsonPropertyName("applied")] public bool? Applied { get; set; }
+
+        /// <summary>`talk` 专用：实际命中的 NPC 内部名（失败时也带查询名，便于对账）。【可选字段】</summary>
+        [JsonPropertyName("npc")] public string Npc { get; set; }
+
+        /// <summary>`talk` 专用：命中的 NPC 所在格 [x, y]。【可选字段】</summary>
+        [JsonPropertyName("npcTile")] public int[] NpcTile { get; set; }
+
+        /// <summary>`talk` 专用：玩家与 NPC 的切比雪夫距离（八方向相邻=1）。【可选字段】</summary>
+        [JsonPropertyName("distance")] public int? Distance { get; set; }
+
+        /// <summary>`talk` 专用：`npc_not_found` 时给出当前地点的 NPC 名字清单（可审计）。【可选字段】</summary>
+        [JsonPropertyName("available")] public string[] Available { get; set; }
+
+        /// <summary>`talk` 专用：调用后活动菜单的类型名（`DialogueBox`/`ShopMenu`/…；无菜单 ⇒ null）。【可选字段】</summary>
+        [JsonPropertyName("activeMenu")] public string ActiveMenu { get; set; }
+
+        /// <summary>`talk` 专用：调用后是否有提问对话框（无对话框 ⇒ null）。【可选字段】</summary>
+        [JsonPropertyName("dialogueIsQuestion")] public bool? DialogueIsQuestion { get; set; }
+
+        /// <summary>`talk` 专用：调用后对话框的选项文本（无选项 ⇒ 空数组）。【可选字段】</summary>
+        [JsonPropertyName("dialogueResponses")] public string[] DialogueResponses { get; set; }
 
         // ------------------------------------------------------------------
         //  0.7.29（task-129）新增：`dismiss_modal` 走"出货 → 日切保存 → 换天"链时的回执
