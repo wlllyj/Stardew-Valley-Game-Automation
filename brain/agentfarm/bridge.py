@@ -36,7 +36,30 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.43"   # v0.7.43：事件有界等待 + 清障逐格证据口径（0.7.42 八步冒烟抓出的两条）——
+MOD_VERSION_EXPECTED = "0.7.44"   # v0.7.44：两条收工/分配死循环修复 + 收工口径（A8 臂 12 天暴露）——
+                                  # ①回片区拿不出目标不许判 stuck（task-4）：`_leftover` 按片区归属
+                                  #   （`leftover_area`）替代全场 tmap；`resume_stall_tiles` 记停滞邻域；
+                                  #   `_resume_switch_or_exhaust` 三档：换另一片账本待做格 → 当前观测
+                                  #   `frontier_clear` 清一格 → `resume_exhausted:` 诚实收工
+                                  #   （`day_justified=false`，不再写 `stuck:回片区…`）；journal 新字段
+                                  #   `plot_exhausted{source,from_area,to_area,stalled_tiles,switches,…}`、
+                                  #   `no_progress_burst{exhausted,…}`、`resume_walk{switched}`；
+                                  # ②挡死格当天不再重分配（task-5）：`_dead_tile_set()` = blocked ∪
+                                  #   encircled_day，阶段目标池/片区有活判据/回片区挑格全部扣掉；`leftover`
+                                  #   拆 `leftover_executable/leftover_blocked`；同格重分无产出有界
+                                  #   `MAX_ALLOC_NO_PROGRESS=3`（`blocked{action:"stage_realloc",
+                                  #   alloc_no_progress,limit}`）；`day_end` 新字段
+                                  #   `plot_pending_executable/plot_pending_blocked`；
+                                  # ③收工口径（task-6）：`checks.slept_by_us` 取 `rep.slept_ok` 真值
+                                  #   （`day_end.slept_ok`，不再用 `ended_by==sleep` 冒充「我们睡的」）；
+                                  #   `deferred_by_budget` 改日终按浇水证据落账，浇水达标日压制为
+                                  #   `stamina_budget.deferred_by_budget_suppressed` ⇒「只因预算延后」
+                                  #   与「户外浇水达标」永不同真；
+                                  # ④同形态入口统一（task-11）：`review_only_fallback` /
+                                  #   `guard_leftover` 触顶或只剩挡死格时统一走换片/诚实收工，删除
+                                  #   `_no_progress_stop`，不再写 `stuck:`（无新事件名/字段）。
+                                  # --- 历史 ---
+                                  # v0.7.43：事件有界等待 + 清障逐格证据口径（0.7.42 八步冒烟抓出的两条）——
                                   # ①事件有界等待（task-245）：Mod `UiView.eventId`（三态：真值 /
                                   #   null=读不到 / 缺失=旧 Mod）+ `EventRules.IdFor`（1.6.15 走
                                   #   static `Game1.CurrentEvent`）；脑侧 `eventUp` 且无对话盒 ⇒
@@ -48,7 +71,6 @@ MOD_VERSION_EXPECTED = "0.7.43"   # v0.7.43：事件有界等待 + 清障逐格�
                                   #   `already` 步单列（`stage.already_tiles/already_cause`），
                                   #   `ok == attempted_ok == ok_tiles` 三口径对齐（修 0.7.42 冒烟
                                   #   步 5 抓出的「75 次尝试 / 62 格实清」13 步差额）。
-                                  # --- 历史 ---
                                   # v0.7.42：冬季可验证性 + 清障吞吐批次（0.7.41 七步冒烟抓出的两条
                                   # A″ 门禁级缺陷）——
                                   # ①种子季节闸门（task-240）：Mod `PlayerView.seeds[]`

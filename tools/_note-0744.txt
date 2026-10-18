@@ -1,0 +1,7 @@
+v0.7.44（2026-10-18）：两条收工/分配死循环修复 + 收工口径（A8 臂 12 天暴露）
+1) 脑侧（task-4）：回片区（work_spot_resume）拿不出目标时按序 ①换到另一片账本的待做格（leftover_area 片区归属，坐标只取账本记账）②当前观测 frontier_clear 清一格 ③`resume_exhausted:` 诚实收工；不再写 `stuck:回片区…`。
+2) 脑侧（task-5）：挡死格（blocked ∪ encircled_day）当天不再进阶段目标池；leftover 拆 `leftover_executable/leftover_blocked`；同格重分无产出有界 `MAX_ALLOC_NO_PROGRESS=3`（`blocked{action:"stage_realloc"}` 留痕）。
+3) 脑侧（task-6）：`checks.slept_by_us` 取 `rep.slept_ok` 真值（`day_end.slept_ok`）；`deferred_by_budget` 改日终按浇水证据落账（浇水达标日压制为 `stamina_budget.deferred_by_budget_suppressed`）⇒「只因预算延后」与「户外浇水达标」永不同真。
+4) 脑侧（task-11）：`review_only_fallback` / `guard_leftover` 同形态入口统一走换片/诚实收工，删除 `_no_progress_stop`，不再写 `stuck:`。
+5) 判据/工具（非 Mod）：analyzer 收 A8 三类新形态（stage_churn / work_spot_resume_exhausted / stuck_without_sleep）+ 长跑看护 `tools/run-guardian.py`（脑死自动优雅退）。
+6) 冻结前置：`check-release --expect 0.7.44` 六项全绿（全量单测 0 红、树干净、C# 自检 0 警 0 错）。
