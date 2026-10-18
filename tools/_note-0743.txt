@@ -1,0 +1,6 @@
+v0.7.43（2026-10-18）：事件有界等待 + clear_area 逐格证据口径对齐
+1) Mod：`UiView.eventId` 暴露当前事件 id（三态：真值 / null=读不到 / 缺失=旧 Mod）+ `EventRules.IdFor`（1.6.15 走 static Game1.CurrentEvent）。
+2) 脑侧（task-245）：事件 `eventUp` 且无对话盒时先做有界等待 4×15s（journal `event_wait{tries,limit,eventId,eventUp,hasDialogue,worldSeq,waitSeconds}`），等待超时才 `event_blocked`（带 eventId/eventWaitTries/eventWaitSeconds）；有提问/职业选择立即硬停，绝不 dismiss。
+3) 脑侧（task-242）：`clear_area` 的 `ok` 只计真变化步，`already` 步单列（`stage.already_tiles/already_cause`），`ok == attempted_ok == ok_tiles` 三口径对齐（修 75 尝试 / 62 实清 的 13 步差额）。
+4) 判据/工具（task-246，非 Mod）：analyzer 收 `event_wait` 桶 + `event_blocked` 三字段 + `ui.eventId`，判红 `manual:event_blocked_without_wait`。
+5) 冻结前置：`check-release --expect 0.7.43` 六项全绿（全量单测 0 红、树干净、C# 自检 0 警 0 错）。

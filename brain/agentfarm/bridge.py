@@ -36,7 +36,20 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.42"   # v0.7.42：冬季可验证性 + 清障吞吐批次（0.7.41 七步冒烟抓出的两条
+MOD_VERSION_EXPECTED = "0.7.43"   # v0.7.43：事件有界等待 + 清障逐格证据口径（0.7.42 八步冒烟抓出的两条）——
+                                  # ①事件有界等待（task-245）：Mod `UiView.eventId`（三态：真值 /
+                                  #   null=读不到 / 缺失=旧 Mod）+ `EventRules.IdFor`（1.6.15 走
+                                  #   static `Game1.CurrentEvent`）；脑侧 `eventUp` 且无对话盒 ⇒
+                                  #   有界等待 4×15s（journal `event_wait{tries,limit,eventId,
+                                  #   eventUp,hasDialogue,worldSeq,waitSeconds}`），超时才
+                                  #   `event_blocked`（带 eventId/eventWaitTries/eventWaitSeconds）；
+                                  #   有提问/职业选择立刻硬停，绝不 dismiss/替游戏选；
+                                  # ②清障逐格证据（task-242）：`clear_area` 的 `ok` 只计真变化步，
+                                  #   `already` 步单列（`stage.already_tiles/already_cause`），
+                                  #   `ok == attempted_ok == ok_tiles` 三口径对齐（修 0.7.42 冒烟
+                                  #   步 5 抓出的「75 次尝试 / 62 格实清」13 步差额）。
+                                  # --- 历史 ---
+                                  # v0.7.42：冬季可验证性 + 清障吞吐批次（0.7.41 七步冒烟抓出的两条
                                   # A″ 门禁级缺陷）——
                                   # ①种子季节闸门（task-240）：Mod `PlayerView.seeds[]`
                                   #   `{id,name,stack,seasons,plantableNow}`（三态可辨）+ `SeedRules`
