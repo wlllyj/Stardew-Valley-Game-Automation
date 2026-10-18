@@ -45,6 +45,7 @@ from agentfarm.longrun import (  # noqa: E402
     FRONTIER_CLEAR_MAX, INTENT_REASON_CODES, JUSTIFIED_END_REASONS, MAX_BUY_TRIES_PER_DAY,
     MAX_ENV_ATTEMPTS,
     MAX_STUCK_FLUSH, MAX_TILE_ATTEMPTS, PLOT_EXHAUSTED_BURST, READY_FAR_MAX_TRIES,
+    NON_PLOT_INTENT_TASKS,
     SLOT_RELIEF_MAX, SLOT_RESERVE, STEP_CODE_TO_REASON, TREE_CLEAR_MAX_PER_DAY,
     DayReport, LongRun,
     _intent_coverage_ok, _till_blocked_by, is_justified_end, plot_observe,
@@ -11132,6 +11133,114 @@ class TestTask230ReasonAndGapsIntegrity(unittest.TestCase):
         run._gaps_merge([((60, 10), "tool_level", "stump", "axe")], rep)
         run._gaps_flush(rep)
         self.assertEqual(len(run.lessons), before, "gaps 绝不许变成 lessons")
+
+
+class _NoLootWorker(FakeWorker):
+    """假 worker：`sell_loot` 永远"没有可出货的东西"（返回空列表）。
+
+    用来复现真机 `logs/longrun-smoke-0739.jsonl` 的形态：`ship` 意图跑完一圈
+    什么都没卖出去 ⇒ 执行对账必须记 `unknown_evidence`（**不是**裸 `no_target`）。
+    """
+
+    def __init__(self, world) -> None:
+        super().__init__(world)
+        self.sell_loot_calls = 0
+
+    def sell_loot(self, *, timeout_ms: int = 8000, max_items: int = 24):
+        self.sell_loot_calls += 1
+        return []
+
+
+class TestTask233NonPlotEvidence(unittest.TestCase):
+    """【task-233】非片区意图（`ship`/`sell`…）不许裸用 `no_target`（§8.2b/§8.3.7）。
+
+    真机事故（`logs/longrun-smoke-0739.jsonl`）：`ship` 的失败原因写成裸
+    `{"no_target": 1}`，而 `no_target` 的证据 schema 是**片区口径**
+    （`evidence.stage_tiles_empty`），`ship` 没有作业区 ⇒ 套不上 ⇒ analyzer 红
+    `missed:intent_no_target_evidence:ship`。
+
+    修法（本卡）：非片区任务失败 ⇒ `unknown_evidence` + `unknown_why`
+    （`non_plot_task`/`no_plot`/`obs_unavailable`）+ 它**自己的**可判证据
+    （白名单数 / 空格数）。片区任务取消路径一字未改（仍 `no_target` + `stage_tiles_empty`）。
+    """
+
+    def _run(self) -> tuple[FakeWorld, LongRun, _NoLootWorker]:
+        w = FakeWorld(weeds=0, seeds=10, money=500)
+        run = make_run(w, target_days=1, max_days=1)
+        run.client = FakeClient(w)
+        run.worker = _NoLootWorker(w)
+        run.started = 0.0
+        return w, run, run.worker
+
+    def test_ship_without_loot_uses_unknown_evidence_not_bare_no_target(self):
+        """`ship` 卖不出东西 ⇒ `unknown_evidence` + 非片区证据；**没有** `no_target`。"""
+        _w, run, worker = self._run()
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        obs = run._snap()
+        intent = TaskIntent("ship", "inventory", "把今天收的货放进出货箱", "shipping>0")
+        run._plan_intents(SimpleNamespace(intents=[intent], source="llm", boundary="daily"))
+        self.assertFalse(run._execute(SimpleNamespace(intents=[intent]), obs, None, rep))
+        self.assertEqual(worker.sell_loot_calls, 1, "ship 必须真的试过一次")
+        rec = [r for r in run.intent_coverage if r["task"] == "ship"]
+        self.assertEqual(len(rec), 1, run.intent_coverage)
+        rec = rec[0]
+        self.assertEqual(rec["reasons"], {"unknown_evidence": 1}, rec)
+        self.assertNotIn("no_target", rec["reasons"], "非片区任务禁止裸用 no_target")
+        ev = rec["evidence"]
+        self.assertEqual(ev["unknown_why"], "non_plot_task", ev)
+        # 证据必须是**可判事实**：白名单数 + 空格数（真机形态：空格 0/白名单 0）
+        self.assertEqual(ev["whitelist_count"], 0, ev)
+        self.assertEqual(ev["inventory_full"], ev["free_slots"] <= 0, ev)
+        self.assertIn("不冒充", rec["note"], rec)
+        self.assertTrue(_intent_coverage_ok(rec), rec)
+
+    def test_analyzer_accepts_non_plot_evidence_and_flags_bare_no_target(self):
+        """analyzer 的 §8.3.7 判红：裸 `no_target` 红、非片区 `unknown_evidence` 不红。"""
+        import importlib.util
+        root = Path(__file__).resolve().parents[1]
+        spec = importlib.util.spec_from_file_location(
+            "analyze_longrun_task233", root / "tools" / "analyze-longrun.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        base = {
+            "intent_id": "spring 9#01", "task": "ship", "area_hint": "inventory",
+            "area": "", "source": "llm", "boundary": "daily",
+            "requested_tiles": 0, "ok_tiles": 0, "failed_tiles": 0, "unexecuted_tiles": 0,
+            "executed_steps": 0, "actionless": False, "reasons_are_intent_level": True,
+        }
+        bare = dict(base, reasons={"no_target": 1})
+        # `cat_intent` 自己从 session 的 `day_end` 事件里收对账记录（`rows` 参数不参与判定），
+        # 所以这里造一条只含 `day_end` 的会话即可。
+        bare_sessions = [{"events": [(1, {"event": "day_end", "intent_coverage": [bare]})]}]
+        findings = mod.cat_intent([], bare_sessions, [], 10)
+        self.assertTrue(any(str(f.get("subject") or "").startswith(
+            "missed:intent_no_target_evidence:") for f in findings), findings)
+        fixed = dict(base, reasons={"unknown_evidence": 1},
+                     evidence={"unknown_why": "non_plot_task", "whitelist_count": 0,
+                               "free_slots": 0, "inventory_full": True,
+                               "no_sellable_stack": True})
+        fixed_sessions = [{"events": [(1, {"event": "day_end", "intent_coverage": [fixed]})]}]
+        findings = mod.cat_intent([], fixed_sessions, [], 10)
+        self.assertFalse(any(str(f.get("subject") or "").startswith(
+            "missed:intent_no_target_evidence:") for f in findings), findings)
+
+
+class TestTask233PlotNoTargetUnchanged(unittest.TestCase):
+    """【task-233】片区任务的 `no_target` 口径**一字未改**：仍带 `stage_tiles_empty`。"""
+
+    def test_plot_task_cancel_keeps_no_target_with_stage_tiles_empty(self):
+        w = FakeWorld(weeds=0, seeds=10, money=500)
+        run = make_run(w, target_days=1,
+                       planner=FakePlanner(TaskIntent("harvest", "tiles.ripe", "收成熟的", "ripe>0")))
+        code = run.run()
+        self.assertEqual(code, 0, run.logs)
+        recs = [r for r in run.days[0].intent_coverage
+                if r["task"] == "harvest" and "no_target" in r["reasons"]]
+        self.assertTrue(recs, run.days[0].intent_coverage)
+        for rec in recs:
+            ev = rec["evidence"]
+            self.assertIs(ev.get("stage_tiles_empty"), True, rec)
+            self.assertTrue(_intent_coverage_ok(rec), rec)
 
 
 if __name__ == "__main__":  # pragma: no cover

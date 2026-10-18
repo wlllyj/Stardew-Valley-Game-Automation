@@ -98,6 +98,16 @@ TREE_CLEAR_MAX_PER_DAY = 2
 #: `docs/_run10-criteria.md` §8.2c（0.7.39 P0-3）点名要求这四个必须在 ACTIONLESS_TASKS 里。
 ACTIONLESS_TASKS: tuple[str, ...] = ("sleep", "review", "wait_for_save", "recover_stamina")
 
+#: 【task-233】**非片区**意图：它们没有"作业区"⇒ §8 的 `no_target` 证据 schema
+#: （`evidence.stage_tiles_empty`）**根本不适用**。按 §8.2b/§8.3.7：证据不可用 ⇒
+#: **禁止裸用 `no_target`**，必须降级 `unknown_evidence` + `unknown_why`。
+#: 真机事故（`logs/longrun-smoke-0739.jsonl`）：`ship` 用了裸 `no_target` ⇒ analyzer
+#: 红 `missed:intent_no_target_evidence:ship`。这组任务失败时改用它们**自己的**证据
+#: （`_non_plot_evidence`：白名单/空格等可判事实）+ `unknown_evidence`，绝不冒充"没目标"。
+NON_PLOT_INTENT_TASKS: tuple[str, ...] = (
+    "ship", "sell", "sleep", "review", "recover_stamina", "wait_for_save",
+)
+
 #: 【task-219】意图未执行的**原因码闭合集**（`docs/_run10-criteria.md` §8.2 + 0.7.39 P0-3）：
 #: 集外一律算缺陷（analyzer 判红）。P0-3 的拆分：
 #:  * `cancelled_by_verify` 拆成 ⇒ cancel 用 `no_target`、unknown 用 `unknown_evidence`；
@@ -1371,6 +1381,37 @@ class LongRun:
         # 序号与计数**一个都没有** ⇒ 证据不可用（不许靠"stage_tiles_empty"单独硬撑）。
         if "obs_seq" not in evidence and counts is None:
             return None
+        return evidence
+
+    def _non_plot_evidence(self, task: str, obs: Mapping[str, Any]) -> dict[str, Any] | None:
+        """【task-233】非片区意图（`ship`/`sell`）的"确实没做成"证据包。
+
+        为什么单独一套：`_no_target_evidence()` 的 schema 是**片区口径**
+        （`stage_tiles_empty`），`ship`/`sell` 没有作业区 ⇒ 套不上。按 `docs/_run10-criteria.md`
+        §8.2b：证据不可用**禁止裸用 `no_target`**。所以这里给它们自己的 schema：
+          * `ship`：`whitelist_count`（今天有格子级证据的可出货 qid 数）+ `free_slots`
+            + `inventory_full`（"没有可出货的叠" / "背包满"是可判事实）；
+          * 其它非片区任务：没有通用可判证据 ⇒ `None`（调用方必须降级 `unknown_evidence`）。
+        只读观测，不改任何判定（原因码只影响"这一轮还要不要做它"）。
+        """
+        if task != "ship":
+            return None
+        if not isinstance(obs, Mapping) or not obs:
+            return None
+        player = FarmWorker.player_of(obs)
+        free_slots, status = player_free_slots(player or {})
+        if status != "ok":
+            return None
+        whitelist = sorted(getattr(self.worker, "harvested", None) or {})
+        seq = obs.get("worldSeq")
+        evidence: dict[str, Any] = {
+            "no_sellable_stack": len(whitelist) == 0,
+            "whitelist_count": len(whitelist),
+            "free_slots": int(free_slots),
+            "inventory_full": int(free_slots) <= 0,
+        }
+        if isinstance(seq, int) and not isinstance(seq, bool):
+            evidence["obs_seq"] = seq
         return evidence
 
     def _record_stage_intent(self, intent: Any, rep: DayReport) -> None:
@@ -6663,8 +6704,27 @@ class LongRun:
             if task == "ship":
                 shipped = self._ship_loot(obs, rep)
                 acted = shipped or acted
-                self._record_intent(intent, task=task, executed_steps=1 if shipped else 0,
-                                    reasons={} if shipped else {"no_target": 1})
+                if shipped:
+                    self._record_intent(intent, task=task, executed_steps=1)
+                else:
+                    # 【task-233】`ship` 是**非片区**意图：§8 的 `no_target` 证据 schema
+                    # （`stage_tiles_empty`）不适用 ⇒ 按 §8.2b **禁止裸用 no_target**，
+                    # 统一降级 `unknown_evidence` + `unknown_why`，并把它自己的可判证据
+                    # （白名单数/空格）带上；analyzer 的
+                    # `missed:intent_no_target_evidence:ship` 因此消失。
+                    evidence = self._non_plot_evidence(task, obs)
+                    if evidence is None:
+                        evidence = {"unknown_why": "obs_unavailable"}
+                        note = "出货失败，且拿不到背包/白名单证据 ⇒ 无法判定（不给 no_target）"
+                    else:
+                        evidence = {"unknown_why": "non_plot_task", **evidence}
+                        note = ("本轮没有出货成功（可判证据：白名单 "
+                                f"{evidence.get('whitelist_count')} 项、空格 "
+                                f"{evidence.get('free_slots')}）⇒ 非片区任务按 unknown_evidence 记"
+                                "（§8.2b：不冒充「没目标」）")
+                    self._record_intent(intent, task=task, executed_steps=0,
+                                        reasons={"unknown_evidence": 1},
+                                        evidence=evidence, note=note)
                 obs = self._snap()
                 continue
             if task in STAGE_ACTION:
@@ -7424,6 +7484,16 @@ class LongRun:
                     evidence = self._no_target_evidence(str(v.get("task") or ""), obs, plot)
                     if evidence is None:
                         reason = "unknown_evidence"   # 证据不可用 ⇒ 不许说"没目标"
+                if reason == "unknown_evidence" and evidence is None:
+                    # 【task-233】§8.2b：降级也要写清**为什么**判不了，并带上该任务
+                    # 自己的可判证据（非片区任务没有 `stage_tiles_empty` 这套 schema）。
+                    task_name = str(v.get("task") or "")
+                    why = ("non_plot_task" if task_name in NON_PLOT_INTENT_TASKS
+                           else ("no_plot" if plot is None else "obs_unavailable"))
+                    non_plot = self._non_plot_evidence(task_name, obs)
+                    evidence = {"unknown_why": why}
+                    if non_plot is not None:
+                        evidence.update(non_plot)
                 self._record_intent(intent_id=str(v.get("intent_id") or ""),
                                     task=str(v.get("task") or ""),
                                     reasons={reason: 1}, evidence=evidence,
