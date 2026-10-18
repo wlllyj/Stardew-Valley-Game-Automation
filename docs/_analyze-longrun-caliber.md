@@ -1256,6 +1256,46 @@ python scratch\_t194_undec.py    # HEAD 导出 vs 新版：六账本 rc/红/#无
 （`gaps_file_for()` 的 `NameError` 被 `except Exception` 静默吞掉 ⇒ `<journal>-gaps.json` 永远读不到，
 功能等于没接上）。已补 import，单测 `test_gaps_file_is_parsed_and_aggregated` 抓到。
 
+## 3.34 事件闸门：`event_wait` 有界等待 + `event_blocked` 事件归因（task-245 `0a13973`，task-246 收录）
+
+**脑侧口径（唯一权威）**：`ui.eventUp == true` 且**没有可推进的对话盒**时，不再"立刻硬停"，而是
+**有界等待** `EVENT_WAIT_TRIES=4` × `EVENT_WAIT_SECONDS=15.0`（`brain/agentfarm/longrun.py:465-466`）：
+
+- `_wait_event_up()`（`longrun.py:7471-7503`）：每轮 sleep 15s → 重观测 → journal
+  `event_wait{tries,limit,eventId,eventUp,hasDialogue,worldSeq,waitSeconds,note}`（`:7495-7500`）；
+  事件结束或对话盒出现 ⇒ 回日循环；等满仍挂住 ⇒ `_event_blocked(event_wait_tries=N)` 诚实收尾。
+- 等待期间**一次都不动手**（不 dismiss / 不 sleep / 不 load_save）；有对话盒但推不动（提问/职业选择/
+  额度用尽）仍按 task-41 立刻硬停 —— **有界等待只覆盖"没有对话盒"的形态**（`longrun.py:7539-7556`）。
+- `event_blocked` 新增三字段（`longrun.py:7638-7658`）：`eventId`（三态）、
+  `eventWaitTries`、`eventWaitSeconds`（= 4×15 的兜底，以账本落值为准）。
+
+**`eventId` 三态**（task-245 Mod `ui.eventId`）：`有值`（能归因）/ `null`（读不到）/
+`缺字段`（0.7.43 之前的旧 Mod）⇒ 缺字段只能【无法判定】，**不许猜**。
+
+**analyzer 覆盖**：`EVENT_BUCKETS` 新增 `event_wait → event_waits`（`info`/环境类，**不进 rc**）；
+`FIELD_PROBES` +6（`event:event_wait`、`event:event_wait.eventId`、`event:event_blocked.eventId`、
+`event:event_blocked.eventWaitTries`、`event:event_blocked.eventWaitSeconds`、`ui.eventId`，后者走
+`ui.<键>` 专用解析 —— 嵌套 dict 不能当整串文本找）；`report["event_gate"]` 聚合；头部一行
+「事件等待: N 轮 / 阻断 M 次（eventId=…）」；第 8 个报告节「事件闸门」；建议 0s-9；两条【无法判定】行。
+
+**判红 / 判 info 三列**：
+
+| 形态 | 结论 | 依据 |
+|---|---|---|
+| `event_blocked` 的 `eventWaitTries` **有键且 0**，且整本 0 条 `event_wait` | **红**（`manual:event_blocked_without_wait`，进 rc / 需人工） | 没走 task-245 等待路径 = 0.7.42 冬 7"白烧 4.92 分钟"原样复现（`longrun.py:7547-7556`） |
+| 有 `event_wait`（无论是否随后 `event_blocked`） | **info**（头部计数；无 `event_blocked` = 事件自行结束，正常） | 等待是自愈过程，不是失败、不是豁免 |
+| `eventWaitTries` **整键缺失**（旧 Mod） | **【无法判定】**（进 `event_id_undecidable` + 建议，**不判红**） | 缺失 ≠ 通过，也不许当失败；六本旧账本据此不翻红 |
+| `eventId` 缺失 / `null` | 缺失 ⇒【无法判定】；`null` ⇒ 显示"无法归因" | 三态如实呈现 |
+
+**回归口径**：六本旧账本 rc/红数**一字不变**（runA 1/117、runB 1/84、run9d 1/29、run9c 0/0、
+run9b 1/45、run9 1/84），`#无法判定` 每本 **+7**（6 条新探针 + 1 条"整本没有 event_wait/event_blocked"）；
+`tools/verify-run3.py` 对这两个事件**只作 info**（Lead 裁定，本工具的这条红是补充、不改它）。
+
+```
+python tools\analyze-longrun.py --journal logs\longrun-runA-0732.jsonl --days 6 | rg "事件等待"
+python -m unittest tests.test_analyze_longrun.TestEventWaitAccounting   # 7 条（红/info/三态/旧账本）
+```
+
 ## 4. 复核命令
 
 ```
@@ -1269,8 +1309,8 @@ python tools\analyze-longrun.py --journal logs\longrun-3day-llm-run9d.jsonl --da
 python tools\verify-run3.py      --journal logs\longrun-3day-llm-run7.jsonl   # 判决权威（同一尾部窗口口径）
 python scratch\_mk_refused.py                                               # 造 refused 界内/越界两态夹具
 python tools\analyze-longrun.py --journal scratch\_t111_demo.jsonl  # task-111 合成：复盘 notes + 教训库正常形态
-python -m unittest tests.test_analyze_longrun  # 当前 257 OK（task-231：§8 gaps 读写失败红 + no_target 证据红 + 12 码漂移 10 条）
-python -m unittest discover -s tests           # 当前 Ran 1153 tests / OK（0 红，须 PYTHONUTF8=1）
+python -m unittest tests.test_analyze_longrun  # 当前 264 OK（task-246：event_wait/event_blocked 事件闸门 7 条）
+python -m unittest discover -s tests           # 当前 Ran 1236 tests / OK（0 红，须 PYTHONUTF8=1）
 python scratch\_t194_undec.py                   # 六账本 HEAD 导出 vs 新版并排读数：
                                                #   rc/红数**一字未变** —— runA 1/117、runB 1/84、run9 1/84、
                                                #   run9b 1/45、run9c 0/0、run9d 1/29；

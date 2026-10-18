@@ -4845,5 +4845,132 @@ class TestTask231GapsProblemAndNoTargetEvidence(unittest.TestCase):
                          ("deferred_capability", "tool_level"))
 
 
+class TestEventWaitAccounting(unittest.TestCase):
+    """task-246（dev task-245 `0a13973`）：`event_wait` 有界等待 + `event_blocked` 事件归因。
+
+    口径：`event_wait` 是 **info**（不是失败、不是豁免）；唯一可判红 = `event_blocked` 的
+    `eventWaitTries` **有键且 0** 且整本 0 条 `event_wait`（没走等待路径 ⇒ 0.7.42 冬 7 白烧复现）；
+    `eventWaitTries` **整键缺失** = task-245 之前的旧 Mod ⇒ 只【无法判定】，绝不判红；
+    `eventId` 三态（有值 / null=读不到 / 缺字段=旧 Mod）如实呈现，缺失不许猜。
+    """
+
+    def _events(self, *, wait=2, blocked=True, blocked_kind="waited", event_id="992553",
+                event_id_key="present", with_ui_id=True):
+        day = [1, "fall", 7]
+        evs = [day_start(day)]
+        if with_ui_id:
+            evs[-1]["ui"] = {"eventId": event_id}
+
+        def _put_id(d):
+            if event_id_key == "absent":
+                return
+            d["eventId"] = None if event_id_key == "null" else event_id
+
+        for i in range(wait):
+            ev = {"event": "event_wait", "t": 300.0 + i, "tries": i + 1, "limit": 4,
+                  "eventUp": True, "hasDialogue": False, "worldSeq": 602 + i,
+                  "waitSeconds": 15.0,
+                  "note": "事件进行中但没有对话盒：有界等待"}
+            _put_id(ev)
+            evs.append(ev)
+        if blocked:
+            ev = {"event": "event_blocked", "t": 340.0, "activeMenu": None,
+                  "activeMenuText": None, "dialogueIsQuestion": False,
+                  "dialogueResponses": [], "tile": [64, 15], "timeOfDay": 600,
+                  "worldSeq": 606, "advance_steps": 0, "advance_calls": 0,
+                  "stall_streak": 0, "note": "游戏事件挂住（ui.eventUp=true）"}
+            _put_id(ev)
+            if blocked_kind == "waited":
+                ev["eventWaitTries"] = max(wait, 1)
+                ev["eventWaitSeconds"] = 15.0 * max(wait, 1)
+            elif blocked_kind == "zero":
+                ev["eventWaitTries"] = 0
+                ev["eventWaitSeconds"] = 0.0
+            evs.append(ev)
+        evs.append({"event": "day_end", "t": 900.0, "day": day, "day_text": "1年 fall 7日",
+                    "ended_by": "blocked_event" if blocked else "sleep",
+                    "ended_reason": "night", "verified": False,
+                    "checks": {"slept_by_us": False, "no_blocking_modal": False,
+                               "no_hard_failures": True, "crops_watered": True,
+                               "day_justified": True, "no_unmet_stages": True},
+                    "stages": [], "outcomes": [], "ok_steps": 0, "skipped_steps": 0,
+                    "failed_steps": 0, "notes": [], "final": final([1, "fall", 8])})
+        return evs
+
+    def _report(self, events, name):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=1)
+
+    def test_event_wait_has_bucket_and_is_info(self):
+        """`event_wait` 有桶、有头部行、是 info：**不许**因为它多出一条红。"""
+        rep = self._report(self._events(wait=2, blocked=False), "ew.jsonl")
+        self.assertIn("event_waits", mod.NEW_EVENT_BUCKETS)
+        self.assertEqual(rep["event_gate"]["wait_events"], 2)
+        self.assertEqual(rep["event_gate"]["wait_ids"], ["992553"])
+        text = mod.render_text(rep, 50)
+        self.assertIn("事件等待: 2 轮", text)
+        self.assertIn("事件已自行结束（正常）", text)
+        self.assertNotIn("manual:event_blocked_without_wait", rep["red"]["subjects"])
+        self.assertEqual(rep["categories_total"]["event"], 0,
+                         "有 event_wait 无 event_blocked = 事件自行结束，不是问题")
+
+    def test_blocked_without_wait_path_is_red(self):
+        """`eventWaitTries=0` 且整本无 `event_wait` ⇒ 没走等待路径 ⇒ 红（手动介入）。"""
+        rep = self._report(self._events(wait=0, blocked_kind="zero", event_id_key="null"),
+                           "nowait.jsonl")
+        self.assertEqual(rep["event_gate"]["no_wait_path_lines"], [2],
+                         "event_blocked 在第 2 行（第 1 行是 day_start）")
+        self.assertIn("manual:event_blocked_without_wait", subjects(rep["categories"]["event"]))
+        self.assertIn("manual:event_blocked_without_wait", rep["red"]["subjects"])
+        self.assertTrue(any("没走有界等待" in a["text"] for a in rep["advice"]))
+        self.assertTrue(any("task-245" in a["hint"] for a in rep["categories"]["event"]))
+
+    def test_blocked_after_wait_is_not_red(self):
+        """等过再收尾 = task-245 的正常形态：只有 info（头部两数），没有红。"""
+        rep = self._report(self._events(wait=3, blocked_kind="waited"), "waited.jsonl")
+        self.assertEqual(rep["event_gate"]["blocked_tries"], [3])
+        self.assertEqual(rep["event_gate"]["blocked_seconds_max"], 45.0)
+        self.assertEqual(rep["event_gate"]["no_wait_path_lines"], [])
+        self.assertNotIn("manual:event_blocked_without_wait", rep["red"]["subjects"])
+        text = mod.render_text(rep, 50)
+        self.assertIn("阻断 1 次", text)
+        self.assertIn("eventId=992553", text)
+
+    def test_legacy_blocked_without_wait_key_is_undecidable_not_red(self):
+        """`eventWaitTries` 整键缺失（task-245 之前的旧 Mod）⇒【无法判定】，不许判红。"""
+        rep = self._report(self._events(wait=0, blocked_kind="legacy", event_id_key="absent"),
+                           "legacy.jsonl")
+        und = " ".join(rep["undecidable"])
+        self.assertIn("task-245 之前的旧 Mod", und)
+        self.assertTrue(rep["event_gate"]["event_id_undecidable"])
+        self.assertNotIn("manual:event_blocked_without_wait", rep["red"]["subjects"])
+        self.assertEqual(rep["categories_total"]["event"], 0)
+
+    def test_event_id_null_is_not_guessed(self):
+        """`eventId: null`（读不到）⇒ 显示"无法归因"，只进【无法判定】，不许猜 id。"""
+        rep = self._report(self._events(wait=1, blocked=False, event_id_key="null"), "eid.jsonl")
+        eg = rep["event_gate"]
+        self.assertEqual(eg["wait_id_states"]["null"], 1)
+        self.assertEqual(eg["id_text"], "无法归因")
+        self.assertIn("eventId=无法归因", mod.render_text(rep, 50))
+        self.assertNotIn("manual:event_blocked_without_wait", rep["red"]["subjects"])
+
+    def test_ui_event_id_probe(self):
+        """`ui.eventId` 探针：有 ui 块 ⇒ 不出【无法判定】；没有 ⇒ 出。"""
+        rep_has = self._report(self._events(wait=1, blocked=False, with_ui_id=True), "has.jsonl")
+        self.assertFalse(any("本账本没有 ui.eventId" in u for u in rep_has["undecidable"]))
+        rep_no = self._report(self._events(wait=1, blocked=False, with_ui_id=False), "no.jsonl")
+        self.assertTrue(any("本账本没有 ui.eventId" in u for u in rep_no["undecidable"]))
+
+    def test_old_ledger_without_event_events_is_undecidable(self):
+        """没有 event_wait/event_blocked 的旧账本：只出【无法判定】，不判红、不加头部行。"""
+        rep = self._report(integrity_ledger(), "old.jsonl")
+        self.assertIn("没有任何 event_wait / event_blocked",
+                      " ".join(rep["undecidable"]))
+        self.assertNotIn("事件等待:", mod.render_text(rep, 50))
+        self.assertNotIn("manual:event_blocked_without_wait", rep["red"]["subjects"])
+
+
 if __name__ == "__main__":
     unittest.main()

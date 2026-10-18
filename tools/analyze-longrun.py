@@ -18,6 +18,7 @@
   6. 意图-执行对账（§8，`docs/_run10-criteria.md` §8）：每个策略意图都必须有执行对账
      （`decision.plans[]` ↔ `day_end.intent_coverage[]`）与**闭合集**原因码；**对账记录不是豁免**，
      能力缺口（`deferred_capability`/`tool_level`）必须落进 `<journal>-gaps.json` 并被追修复卡。
+`eventUp` 且无对话盒 ⇒ 有界等待 `event_wait`（info）；`event_blocked` 没走等待路径 ⇒ 红（task-246）。
      判红 9 条（§8.3）：有计划无对账 / 0 步无原因码 / 原因码出集 / 能力缺口没落盘 /
      gaps kind 不在 DEFERRED_KINDS / 瓦片不变式不符 / `no_target` 无证据；≥3 天未修=⚠；
      旧账本缺字段=【无法判定】。另：gaps 读/写失败（`gaps_load_failed`/`gaps_write_failed`、
@@ -730,6 +731,21 @@ FIELD_PROBES = [
      "day_end.intent_coverage[*].evidence.stage_tiles_empty",
      "`no_target` 的证据包（task-230 P0-3.3：`stage_tiles_empty` + `obs_seq`/`counts`；"
      "**没有证据的 no_target 一律判红**）"),
+    # task-246（dev task-245 `0a13973`）：`eventUp` 且无对话盒 ⇒ **有界等待 4×15s** 的逐轮留痕，
+    # 以及事件归因 `eventId` 的**三态**（有值 / null=读不到 / 缺字段=旧 Mod）。都属 info，不进 rc。
+    ("event:event_wait", "event_wait",
+     "事件进行中的有界等待（tries/limit/eventId/eventUp/hasDialogue/worldSeq/waitSeconds）："
+     "**不是失败、不是豁免**；有 event_blocked 却一条 event_wait 都没有 ⇒ 没走等待路径（可判红）"),
+    ("event:event_wait.eventId", "event_wait_event_id",
+     "等待时读到的事件 id（三态：有值 / null=读不到 / 缺字段=旧 Mod）；缺失 ⇒【无法判定】不许猜"),
+    ("event:event_blocked.eventId", "event_blocked_event_id",
+     "事件阻断时的事件 id（三态同上；缺失 ⇒【无法判定】）"),
+    ("event:event_blocked.eventWaitTries", "event_blocked_wait_tries",
+     "event_blocked 前等了几轮（缺字段=旧 Mod ⇒【无法判定】；有键且 0 且整本无 event_wait ⇒ 没走等待路径 ⇒ 红）"),
+    ("event:event_blocked.eventWaitSeconds", "event_blocked_wait_seconds",
+     "event_blocked 前等了多久（秒；brain = EVENT_WAIT_TRIES×EVENT_WAIT_SECONDS，task-245）"),
+    ("ui.eventId", "ui.eventId",
+     "观测 `ui` 块里的事件 id（task-245 Mod 新增，三态：有值 / null=读不到 / 缺字段=旧 Mod）"),
 ]
 OUTCOME_RE = re.compile(
     r"目标\s*(\d+)\s*步：做成\s*(\d+)、跳过\s*(\d+)、失败\s*(\d+)"
@@ -999,6 +1015,8 @@ EVENT_BUCKETS = {
     #   写盘失败同样写 `gaps_problem`。缺文件 = 旧账本 ⇒ 缺失 ≠ 通过（走【无法判定】）。
     "gaps_load_failed": "gaps_load_failures",
     "gaps_write_failed": "gaps_write_failures",
+    # task-246（dev task-245）：`eventUp` 且无对话盒 ⇒ **有界等待**（info / 环境类，不是失败、不进 rc）。
+    "event_wait": "event_waits",
 }
 
 #: 结构性事件：由报告的其他字段单独统计（day_start/day_end 切会话与验收、finish 自述），
@@ -1080,6 +1098,8 @@ NEW_EVENT_BUCKETS = (
     "tool_upgrades", "tool_pickups", "tool_upgrade_skips", "tool_upgrade_blocks",
     # task-231（dev task-230）：gaps 读/写失败（可判红问题；一眼看到几次读失败/写失败）
     "gaps_load_failures", "gaps_write_failures",
+    # task-246（dev task-245）：事件进行中的有界等待（4×15s；info，不进 rc）
+    "event_waits",
 )
 
 
@@ -2841,6 +2861,35 @@ def cat_self_report(report):
     return out
 
 
+def cat_event(rows, top):
+    """【task-246】第 8 类：事件闸门（`eventUp` 的有界等待 / 事件归因）。
+
+    唯一可判红：`event_blocked` 里 `eventWaitTries` **有键且 0**，同时整本没有任何 `event_wait`
+    ⇒ 没走 task-245 的「有界等待」路径（等于又回到 0.7.42 冬 7 的"立刻硬停、白烧一整天"）。
+    旧 Mod（整键缺失）只走【无法判定】，绝不判红（缺失 ≠ 通过，也不许当失败）。
+    """
+    out = []
+    has_wait = any(ev.get("event") == "event_wait" for _, ev in rows)
+    if has_wait:
+        return out
+    for ln, ev in rows:
+        if ev.get("event") != "event_blocked":
+            continue
+        tries = as_int(ev.get("eventWaitTries"), -1)
+        if tries != 0:
+            continue
+        _id = ev.get("eventId")
+        out.append(finding(
+            ln, "manual",
+            "事件阻断没走「有界等待」路径：`eventWaitTries=0` 且整本 0 条 `event_wait`"
+            f"（eventId={_id if _id else '未知（无法归因）'}）⇒ task-245 之前的旧行为会立刻硬停，"
+            "把一整天白烧（0.7.42 冬 7 事故原样复现）",
+            hint="task-245 口径：`eventUp` 且无对话盒 ⇒ 先 `_wait_event_up`（4×15s，不 dismiss/不 sleep/"
+                 "不 load_save）再诚实收尾；这条是**问题**不是 info",
+            subject="manual:event_blocked_without_wait"))
+    return out[:top] if top else out
+
+
 def build_advice(report, top=8):
     advice = []
     events = report["events"]
@@ -3528,6 +3577,20 @@ def build_advice(report, top=8):
                     + "；".join(_int_parts),
             "lines": (it.get("lines") or [])[:10],
         })
+    # 0s-9（task-246，dev task-245）：事件闸门 —— event_wait 是 info；唯一可判红 = 没走等待路径
+    eg = report.get("event_gate") or {}
+    if eg.get("no_wait_path_lines"):
+        advice.append({
+            "text": f"事件阻断没走有界等待 ×{len(eg['no_wait_path_lines'])}"
+                    "（task-245：eventUp 且无对话盒 ⇒ 先等 4×15s 再诚实收尾；直接硬停会白烧一整天）",
+            "lines": (eg.get("no_wait_path_lines") or [])[:10],
+        })
+    if eg.get("event_id_undecidable"):
+        advice.append({
+            "text": "事件记录缺 `eventId`（task-245 之前的旧 Mod）：挂了也答不出「是哪个事件」"
+                    "⇒ 升级 Mod 后重跑才有归因",
+            "lines": ((eg.get("wait_lines") or [])[:5] + (eg.get("blocked_lines") or [])[:5]),
+        })
     # 0c) 环境挡路 / 没拿到结论（task-22 记账）
     env = report.get("env_inconclusive") or {}
     if env.get("env_fail_events"):
@@ -3734,6 +3797,9 @@ def build_undecidable(rows, sessions, prelude, report):
             # ⇒ 以前只会拿"蛇形标签"去整本 JSON 里找字符串，恒判缺失、事件与键都在也被误报。
             # 这里统一改成按 `<事件名>.<键>` 真去事件里找键。
             _spec = label.split(":", 1)[1]
+        elif probe.startswith("ui."):
+            # task-246：`ui.eventId` 这类观测块字段（旧账本没有 ui 块 ⇒ 缺失 = 旧 Mod）
+            _spec = probe
         if _spec is not None:
             if _spec == "day_end.intent_coverage[*].evidence.stage_tiles_empty":
                 # task-231：证据包挂在 intent_coverage 的**数组元素**里，要真去找键（不是只看数组在不在）
@@ -3750,6 +3816,11 @@ def build_undecidable(rows, sessions, prelude, report):
                 _decs = [ev for _, ev in rows if ev.get("event") == "decision"]
                 absent = not any(isinstance(_pl, dict) and str(_pl.get("intent_id") or "")
                                  for ev in _decs for _pl in as_list(ev.get("plans")))
+            elif _spec.startswith("ui."):
+                # task-246：`ui` 是每行观测里的嵌套 dict，要真去找键（不能拿 "ui.eventId" 当整串文本找）
+                _uk = _spec.split(".", 1)[1]
+                absent = not any(isinstance(ev.get("ui"), dict) and _uk in ev["ui"]
+                                 for _, ev in rows)
             elif "." in _spec:
                 _evname, _field = _spec.split(".", 1)
                 _hits = [ev for _, ev in rows if ev.get("event") == _evname]
@@ -4046,6 +4117,14 @@ def build_undecidable(rows, sessions, prelude, report):
     if not (report.get("gaps") or {}).get("exists"):
         out.append("本账本没有 `<journal>-gaps.json`（能力缺口清单）：无法判定「缺口是否已落盘 / "
                    "是否被追成修复卡」（缺失 ≠ 0）")
+    # task-246：事件闸门（旧账本没有 event_wait / event_wait_tries ⇒ 只能【无法判定】）
+    _eg = report.get("event_gate") or {}
+    if _eg.get("event_id_undecidable"):
+        out.append("本账本有 event_wait/event_blocked，但事件记录里没有 `eventId` 键（task-245 之前的旧 Mod）："
+                   "无法判定「是哪个事件挂住了长跑」（缺失 ≠ 无法归因 ⇒ 不许猜）")
+    if not _eg.get("has_events"):
+        out.append("本账本没有任何 event_wait / event_blocked（0.7.42 之前）："
+                   "无法判定「事件进行中是否走了有界等待」—— 缺失 ≠ 没发生")
     return out
 
 
@@ -5791,6 +5870,68 @@ def build_report(rows, path, args, bad_lines):
                   "schema": run.get("schema"), "error": run.get("error")} for run in _gaps_runs][: max(1, args.top)],
         "repairs": [x.strip() for x in str(getattr(args, "repairs", "") or "").split(",") if x.strip()],
     }
+    # 【task-246】事件闸门（dev task-245 `0a13973`）：`eventUp` 且无对话盒 ⇒ 有界等待 4×15s。
+    # 口径：`event_wait` = 等待的逐轮留痕（**info**：不是失败、不是豁免）；`event_blocked` = 等满仍挂住
+    # 或推不动 ⇒ 诚实收尾（当天不判 VERIFIED）。唯一可判红 = 「event_blocked 里 `eventWaitTries` **有键
+    # 且 0**，同时整本没有任何 `event_wait`」⇒ 没走等待路径（= 0.7.42 冬 7 白烧 4.92 分钟的行为）。
+    # `eventWaitTries` **整键缺失**是 task-245 之前的旧 Mod ⇒ 只能【无法判定】（缺失 ≠ 通过，也不许当红）。
+    # `eventId` 三态：有值 / null=读不到 / 缺字段=旧 Mod ⇒ 缺字段只能【无法判定】。
+    def _event_id_tri(event_name):
+        _vals, _states = [], {"value": 0, "null": 0, "missing": 0}
+        for _ln, _ev in rows:
+            if _ev.get("event") != event_name:
+                continue
+            if "eventId" not in _ev:
+                _states["missing"] += 1
+                continue
+            _v = _ev.get("eventId")
+            if _v is None or str(_v) == "":
+                _states["null"] += 1
+            else:
+                _states["value"] += 1
+                if str(_v) not in _vals:
+                    _vals.append(str(_v))
+        return _vals, _states
+
+    _ew_lines = [ln for ln, ev in rows if ev.get("event") == "event_wait"]
+    _eb_pairs = [(ln, ev) for ln, ev in rows if ev.get("event") == "event_blocked"]
+    _eb_lines = [ln for ln, _ev in _eb_pairs]
+    _ew_ids, _ew_id_states = _event_id_tri("event_wait")
+    _eb_ids, _eb_id_states = _event_id_tri("event_blocked")
+    _ew_tries = sorted({as_int(ev.get("tries"), 0)
+                        for _ln, ev in rows if ev.get("event") == "event_wait"})
+    _ew_seq = {ev.get("worldSeq") for _ln, ev in rows if ev.get("event") == "event_wait"}
+    _eb_tries = [as_int(ev.get("eventWaitTries"), -1) for _ln, ev in _eb_pairs]
+    _eb_secs = []
+    for _ln, ev in _eb_pairs:
+        try:
+            _eb_secs.append(float(ev.get("eventWaitSeconds") or 0))
+        except (TypeError, ValueError):
+            pass
+    _no_wait_path_lines = [ln for ln, ev in _eb_pairs
+                           if as_int(ev.get("eventWaitTries"), -1) == 0] if not _ew_lines else []
+    _id_known = _ew_ids + _eb_ids
+    _event_gate = {
+        "wait_events": len(_ew_lines),
+        "wait_lines": _ew_lines,
+        "wait_tries": _ew_tries,
+        "wait_seconds": as_int(((_ew_tries or [0])[-1]), 0),
+        "wait_worldseq_moved": len({s for s in _ew_seq if s is not None}) > 1,
+        "wait_ids": _ew_ids,
+        "wait_id_states": _ew_id_states,
+        "blocked_events": len(_eb_lines),
+        "blocked_lines": _eb_lines,
+        "blocked_tries": sorted({t for t in _eb_tries if t >= 0}),
+        "blocked_seconds_max": max(_eb_secs) if _eb_secs else 0.0,
+        "blocked_ids": _eb_ids,
+        "blocked_id_states": _eb_id_states,
+        "no_wait_path_lines": _no_wait_path_lines,
+        # 旧 Mod（task-245 之前）才有事件却缺 eventId：判不了"是哪个事件"
+        "event_id_undecidable": bool((_ew_lines or _eb_lines)
+                                     and (_ew_id_states["missing"] or _eb_id_states["missing"])),
+        "id_text": "、".join(_id_known[:3]) if _id_known else "无法归因",
+        "has_events": bool(_ew_lines or _eb_lines),
+    }
     # 0 步 VERIFIED 的弱日（已有 task-88 口径）；这里只做信息项。
     sleep_ok = sum(1 for _, ev in rows if ev.get("event") == "sleep" and ev.get("ok"))
     sleep_failed = sum(1 for _, ev in rows if ev.get("event") == "sleep" and not ev.get("ok"))
@@ -6217,6 +6358,8 @@ def build_report(rows, path, args, bad_lines):
     # 【task-220】意图对账 / 能力缺口（上面在 report 建好之前算好，这里挂进去）
     report["intent"] = _intent_report
     report["gaps"] = _gaps_report
+    # 【task-246】事件闸门（eventUp 的有界等待 / 事件归因）—— info 为主，唯一红见 cat_event
+    report["event_gate"] = _event_gate
     # task-88：`cat_self_report` 要按**目标窗口**（`--window N`）而不是 `finish.days` 判自洽。
     report["window_days"] = as_int(getattr(args, "window", 3), 3)
     self_report = cat_self_report(report)
@@ -6228,6 +6371,7 @@ def build_report(rows, path, args, bad_lines):
         "sleep": cat_sleep(sessions, args.top, args.stamina_full, args.sleep_pct),
         "environment": cat_environment(all_sessions, args.top),
         "intent": cat_intent(rows, sessions, _gaps_merged, args.top),
+        "event": cat_event(rows, args.top),
     }
     report["categories_total"] = {
         "manual": len(manual_all),
@@ -6237,6 +6381,7 @@ def build_report(rows, path, args, bad_lines):
         "sleep": len(cat_sleep(sessions, 0, args.stamina_full, args.sleep_pct)),
         "environment": len(env_all),
         "intent": len(cat_intent(rows, sessions, _gaps_merged, 0)),
+        "event": len(cat_event(rows, 0)),
     }
     report["advice"] = build_advice(report)
     report["undecidable"] = build_undecidable(rows, sessions, prelude, report)
@@ -6278,7 +6423,8 @@ def build_report(rows, path, args, bad_lines):
     for items in (cat_manual(all_sessions, 0),
                   cat_missed(sessions, 0) + llm_reds,
                   cat_wasted(sessions, 0) + cat_self_report(report),
-                  cat_intent(rows, sessions, _gaps_merged, 0)):
+                  cat_intent(rows, sessions, _gaps_merged, 0),
+                  cat_event(rows, 0)):
         for item in items:
             if not is_red_finding(item):
                 continue
@@ -6628,6 +6774,15 @@ MAPPING_TEXT = [
      "`deferred_capability`/`tool_level` = 能力缺口（不是“没活”，也不是豁免额度）；"
      "`--gaps-dir` 可跨 run 只读聚合；同一缺口 first_seen→last_seen ≥3 天 ⇒ ⚠（Lead 复核，不自动判红）；"
      "文件缺失 ⇒ `<缺失>` +【无法判定】（缺失 ≠ 0）"),
+    ("event:event_wait / event_blocked.eventId/eventWaitTries/eventWaitSeconds（task-245/task-246）",
+     "5 环境挡路（信息项）：`event_wait` = 事件进行中的**有界等待**（4×15s；不 dismiss / 不 sleep / "
+     "不 load_save），**不是失败、不是豁免**；`event_blocked` = 等满仍挂住或推不动 ⇒ 诚实收尾"
+     "（当天不判 VERIFIED）。唯一可证伪红 = 「`event_blocked` 的 `eventWaitTries` **有键且 0**，"
+     "且整本没有任何 `event_wait`」⇒ 没走等待路径（0.7.42 冬 7 白烧 4.92 分钟的行为）；"
+     "`eventWaitTries` 整键缺失 = task-245 之前的旧 Mod ⇒【无法判定】只记信息，绝不判红；"
+     "`eventId` 三态（有值 / null=读不到 / 缺字段=旧 Mod），缺失 ⇒【无法判定】不许猜；"
+     "`verify-run3.py` 对两事件只作 info，本工具的这条红是补充、不与其冲突"),
+
     ("idle", "辅助：一整轮没动作（acted/rounds）⇒ 空转，常与'该做没做'并看"),
 ]
 
@@ -6725,6 +6880,18 @@ def render_text(report, top):
     if gp.get("io_events") or gp.get("gaps_problem_days"):
         add(f"    ⚠ gaps 读写失败 {gp.get('io_events', 0)} 次 / `gaps_problem` "
             f"{gp.get('gaps_problem_days', 0)} 天（P0-4.5：**problem，不是 info** ⇒ 判红）")
+    # task-246：事件闸门一行（event_wait 有界等待 / event_blocked 收尾 / eventId 三态）
+    eg = report.get("event_gate") or {}
+    if eg.get("wait_events") or eg.get("blocked_events"):
+        _eg_txt = (f"事件等待: {eg.get('wait_events', 0)} 轮 / 阻断 {eg.get('blocked_events', 0)} 次"
+                   f"（eventId={eg.get('id_text') or '无法归因'}")
+        if eg.get("wait_events") and not eg.get("blocked_events"):
+            _eg_txt += "；事件已自行结束（正常）"
+        if eg.get("no_wait_path_lines"):
+            _eg_txt += f"；⚠ 阻断没走等待路径（行 {(eg.get('no_wait_path_lines') or [])[:8]}）"
+        if eg.get("event_id_undecidable"):
+            _eg_txt += "；eventId 缺失 ⇒【无法判定】"
+        add(_eg_txt + "）")
     # task-32：两种新事件形态的计数（信息项）；task-38：跨日证据覆盖度
     # task-102（`9b09735`）：**背包空格闭环**一行 —— free_slots / buy 尝试 / buy_no_space /
     # 腾格卖出（`why=need_slot`）/ 当日钱变化 / `slept_without_work` / `modal_dismiss_failed`。
@@ -7381,6 +7548,8 @@ def render_text(report, top):
         # task-88：窗口外的历史问题与"瞬间态已结清"逐条列出（都不进退出码）
         ("6 历史问题（窗口外，info 不进 rc）", "history", "历史问题（窗口外）"),
         ("7 已结清（瞬间态事件，info）", "settled", "已结清（瞬间态）"),
+        # task-246：事件闸门（eventUp 的有界等待 / 事件归因）—— 只有"没走等待路径"才是红
+        ("8 事件闸门（eventUp 有界等待）", "event", "事件闸门（eventUp 有界等待）"),
     ]
     for title, key, _ in sections:
         items = report["categories"][key]
