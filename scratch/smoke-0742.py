@@ -852,7 +852,11 @@ def _load_obs_doc(path: Path) -> dict | None:
 
 
 def _step8_trees(obs_files: list[Path]) -> dict:
-    """8.2② 清障吞吐：farm.trees 日降幅 > 2 棵（只用 observe?detail=full 的全场计数）。"""
+    """8.2② 清障吞吐：farm.trees 日降幅 > 2 棵（只用 observe?detail=full 的全场计数）。
+
+    排序按快照里的 `captured_at`（退化到文件 mtime）——**不能按文件名**：
+    `-t0` 是起跑前基线，`-07120` 是 07:12:00 那份，文件名排序会把两者弄反。
+    """
     rows: list[dict] = []
     for p in sorted(obs_files):
         o = _load_obs_doc(p)
@@ -861,12 +865,23 @@ def _step8_trees(obs_files: list[Path]) -> dict:
         trees = (o.get("farm") or {}).get("trees")
         if not isinstance(trees, int):
             continue
+        cap = ""
+        try:
+            cap = str(json.loads(p.read_text(encoding="utf-8")).get("captured_at") or "")
+        except Exception:  # noqa: BLE001
+            cap = ""
+        if not cap:
+            try:
+                cap = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(p.stat().st_mtime))
+            except OSError:
+                cap = ""
         rows.append({"path": p.name, "day": _obs_day_key(o), "trees": trees,
-                     "worldSeq": o.get("worldSeq")})
+                     "worldSeq": o.get("worldSeq"), "captured_at": cap})
     if not rows:
         return {"observations": 0, "status": "无法判定",
                 "reason": ("没有可用的 observe?detail=full 快照（farm.trees 是全场计数，账本 day_end 里没有）"
                            "⇒ 清障吞吐无法判定（缺失≠通过）；wait/launch 请带 --capture-observe")}
+    rows.sort(key=lambda r: (str(r["day"]), str(r["captured_at"]), str(r["path"])))
     per_day: dict[str, list[dict]] = {}
     for r in rows:
         per_day.setdefault(str(r["day"]), []).append(r)
@@ -920,7 +935,8 @@ def step8(rec: dict, args) -> dict:
     recs = _journal_records(journal)
     w = _step8_winter(recs)
     c = _step8_clear_illegal(recs)
-    t = _step8_trees(sorted(LOGS.glob("smoke-0742-observe-*.json")))
+    t = _step8_trees(sorted(set(LOGS.glob("smoke-0742-observe-*.json"))
+                            | set(HERE.glob("smoke-0742-observe-*.json"))))
     b = _step8_budget(recs)
     rec["evidence"] = {"winter": w, "clear_throughput": c, "trees": t, "budget_reason": b,
                        "inherit_0741": ("步 3 A2 / 步 6 只认 save-chain-check verdict / harvest 冬季【无法判定·无作物】"
