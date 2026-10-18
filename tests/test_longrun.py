@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "brain"))
 from agentfarm.bridge import MOD_VERSION_EXPECTED, BridgeError  # noqa: E402
 from agentfarm.llm import LlmError  # noqa: E402
 from agentfarm import longrun as longrun_mod  # noqa: E402  （task-5：按模块取新增常量，保持旧树可导入）
+from agentfarm import farmwork as farmwork_mod  # noqa: E402  （task-28：白名单表级判据）
 from agentfarm.farmwork import (  # noqa: E402
     MAX_CLEAR_SWINGS, NO_SLOT_CODE, STEP_RESULT_CODES, FarmWorker, STAGE_ACTION, StepResult,
     StageResult, harvest_tool, player_free_slots, seed_items, tile_ready,
@@ -5658,15 +5659,17 @@ class TestTask55SurplusSell(unittest.TestCase):
         return [e for e in run.entries if e.get("event") == name]
 
     def test_gate_sells_surplus_materials_and_writes_journal(self):
-        w = self._world(materials=(self._material(6, "388", "Wood", 25),
-                                   self._material(7, "388", "Wood", 5),
-                                   self._material(8, "390", "Stone", 3)))
+        # 【task-28】建材/矿石移出可卖表后，"换种子钱"仍可卖的是树液/史莱姆/作物/晶洞；
+        # 这里用史莱姆（怪物副产品）保持本用例"卖盈余材料"的原意。
+        w = self._world(materials=(self._material(6, "766", "Slime", 25),
+                                   self._material(7, "766", "Slime", 5),
+                                   self._material(8, "92", "Sap", 3)))
         run = self._run(w)
         rep = DayReport(day_key=("summer", 1, 7), started_at=0.0)
         run._preconditions(w.obs(), rep)
         # 只有"卖掉后仍 >= K"的那叠（5 件）进白名单；整叠出货 ⇒ 卖 5 留 25
         self.assertEqual(run.worker.sell_calls,
-                         [{"slot": 7, "whitelist": ["(O)388"]}])
+                         [{"slot": 7, "whitelist": ["(O)766"]}])
         self.assertIsNone(run.worker._slot_item(7), "卖出去的那叠要从背包消失")
         self.assertEqual(len(run.worker.shipped), 1)
         self.assertEqual(w.money, 14, "出货当天钱不变（NewDay 才由游戏结算）")
@@ -5674,7 +5677,7 @@ class TestTask55SurplusSell(unittest.TestCase):
         self.assertEqual(len(sells), 1, run.entries)
         self.assertEqual(sells[0]["strategy"], "surplus_materials")
         self.assertEqual(sells[0]["keep"], self.K)
-        self.assertEqual(sells[0]["qid"], "(O)388")
+        self.assertEqual(sells[0]["qid"], "(O)766")
         self.assertEqual(sells[0]["trigger"]["money"], 14)
         self.assertEqual(sells[0]["trigger"]["threshold"], 5 * 20)
         summary = self._events(run, "surplus_sell")
@@ -5700,9 +5703,9 @@ class TestTask55SurplusSell(unittest.TestCase):
             self.assertFalse(run.surplus_sold_today, why)
 
     def test_sells_at_most_once_per_day(self):
-        # 两叠 Wood：第 1 轮卖 5（留 25）；若"当天只卖一次"的守卫失效，第 2 轮会把 25 也卖掉
-        w = self._world(materials=(self._material(6, "388", "Wood", 25),
-                                   self._material(7, "388", "Wood", 5)))
+        # 两叠 Slime：第 1 轮卖 5（留 25）；若"当天只卖一次"的守卫失效，第 2 轮会把 25 也卖掉
+        w = self._world(materials=(self._material(6, "766", "Slime", 25),
+                                   self._material(7, "766", "Slime", 5)))
         run = self._run(w)
         rep = DayReport(day_key=("summer", 1, 7), started_at=0.0)
         run._preconditions(w.obs(), rep)
@@ -5716,7 +5719,7 @@ class TestTask55SurplusSell(unittest.TestCase):
         self.assertGreater(len(run.worker.sell_calls), 1)
 
     def test_lone_oversized_stack_is_sold_and_flagged_honestly(self):
-        w = self._world(materials=(self._material(6, "390", "Stone", 200),))
+        w = self._world(materials=(self._material(6, "766", "Slime", 200),))
         run = self._run(w)
         rep = DayReport(day_key=("summer", 1, 7), started_at=0.0)
         run._preconditions(w.obs(), rep)
@@ -5732,7 +5735,7 @@ class TestTask55SurplusSell(unittest.TestCase):
         钱 0g、缺口 20g、一大叠 11 件 ⇒ 最低价下界只有 11g < 20g ⇒ skip，并把缺口原文写进
         `surplus_sell_skip`（`short`/`reason`），不要制造"卖了还是买不起"的假动作。
         """
-        w = self._world(money=0, materials=(self._material(6, "390", "Stone", 11),))
+        w = self._world(money=0, materials=(self._material(6, "766", "Slime", 11),))
         run = self._run(w)
         rep = DayReport(day_key=("summer", 1, 7), started_at=0.0)
         run._preconditions(w.obs(), rep)
@@ -5747,8 +5750,8 @@ class TestTask55SurplusSell(unittest.TestCase):
         self.assertTrue(any("买不起" in n or "补不上" in n for n in rep.notes), rep.notes)
 
     def test_sell_failure_is_recorded_but_never_a_hard_failure(self):
-        w = self._world(materials=(self._material(6, "388", "Wood", 25),
-                                   self._material(7, "388", "Wood", 5)))
+        w = self._world(materials=(self._material(6, "766", "Slime", 25),
+                                   self._material(7, "766", "Slime", 5)))
         run = self._run(w)
         run.worker.mode = "not_whitelisted"
         rep = DayReport(day_key=("summer", 1, 7), started_at=0.0)
@@ -5760,7 +5763,7 @@ class TestTask55SurplusSell(unittest.TestCase):
         self.assertEqual(self._events(run, "sell_failed")[0]["strategy"], "surplus_materials")
         self.assertEqual(w.money, 14)
         self.assertFalse(self._events(run, "surplus_sell")[0]["ok"])
-        self.assertEqual(run.worker.sell_calls, [{"slot": 7, "whitelist": ["(O)388"]}] * 1)
+        self.assertEqual(run.worker.sell_calls, [{"slot": 7, "whitelist": ["(O)766"]}] * 1)
 
     def test_cannot_afford_trail_is_written_once_with_the_shortfall(self):
         w = self._world()          # 没材料、没货架、钱 14 < seed_price 20
@@ -5776,7 +5779,7 @@ class TestTask55SurplusSell(unittest.TestCase):
         self.assertEqual(self._events(run, "sell_failed"), [])
 
     def test_money_arrived_next_day_then_buys_and_never_calls_it_a_failure(self):
-        w = self._world(materials=(self._material(6, "390", "Stone", 200),))
+        w = self._world(materials=(self._material(6, "766", "Slime", 200),))
         run = self._run(w)
         rep = DayReport(day_key=("summer", 1, 7), started_at=0.0)
         run._preconditions(w.obs(), rep)                    # 第 1 天：卖；钱当天没到账
@@ -6298,7 +6301,7 @@ class TestTask102BuySlotDeadlock(unittest.TestCase):
     # ------------------------------------------------------------------ ③ 空格死锁 ⇒ 卖一叠腾格
     def test_slot_deadlock_sells_a_stack_then_buys_once(self):
         """钱够但 0 空格 ⇒ 先卖一叠盈余材料腾格（`why="need_slot"`），再照常走一次 buy。"""
-        w = self._world(materials=(self._material(6, "390", "Stone", 200),))
+        w = self._world(materials=(self._material(6, "766", "Slime", 200),))
         w.inventory_capacity = len(w.inventory)          # 0 空格（run8 形态）
         run = self._run(w)
         rep = self._rep()
@@ -6307,7 +6310,7 @@ class TestTask102BuySlotDeadlock(unittest.TestCase):
         sells = self._events(run, "sell")
         self.assertEqual(len(sells), 1)
         self.assertEqual(sells[0]["why"], "need_slot")
-        self.assertEqual(sells[0]["qid"], "(O)390")
+        self.assertEqual(sells[0]["qid"], "(O)766")
         summary = self._events(run, "surplus_sell")
         self.assertEqual(len(summary), 1)
         self.assertEqual(summary[0]["why"], "need_slot")
@@ -10552,8 +10555,12 @@ class TestTask198SlotRelief(unittest.TestCase):
         for _ in range(SLOT_RELIEF_MAX + 2):
             self.assertFalse(run._slot_relief(w.obs(), rep))
         self.assertLessEqual(worker.ship_calls, 1, "腾不出就该立刻停手，不许按轮数空转")
+        # 【task-28 卡 D】腾格事件仍只有 1 条；`inventory_blocked` 最多 2 条：
+        # 第一条是"轮数没到顶、证据还没齐"的拒绝留痕，封板后第二条才可能四门槛全过。
         self.assertEqual(len(self._events(run, "slot_relief")), 1)
-        self.assertLessEqual(len(self._events(run, "inventory_blocked")), 1)
+        blocked = self._events(run, "inventory_blocked")
+        self.assertLessEqual(len(blocked), 2)
+        self.assertLessEqual(len([e for e in blocked if e.get("accepted")]), 1)
         # 再显式调用：早退，不再发请求
         calls = worker.ship_calls
         self.assertFalse(run._slot_relief(w.obs(), rep))
@@ -10714,7 +10721,11 @@ class TestTask198InventoryDay(unittest.TestCase):
         self.assertNotIn("stuck", rep.ended_by)
         self.assertEqual(rep.failed_steps, 0, "no_slot 不算硬失败")
         self.assertTrue(rep.checks["no_hard_failures"])
-        self.assertFalse(rep.checks["day_justified"])
+        # 【task-28 卡 D 口径】`inventory_blocked` 过了四门槛（0 空格/腾格手段用尽/
+        # pending_executable=0/pending_malformed=0）⇒ 诚实收工**可** justified；
+        # 但这天 harvest 阶段还有 8 格 leftover（未分派）⇒ `no_unmet_stages` 仍 false，
+        # 所以整体 VERIFIED 依旧 false（不是洗白）。
+        self.assertTrue(rep.checks["day_justified"], rep.checks)
         self.assertFalse(rep.verified, "背包堵住当天不许假 VERIFIED")
         stage = [s for s in rep.stages if s["stage"] == "harvest"][-1]
         self.assertEqual(stage["leftover"], self.RIPE_TILES, "_leftover 仍如实")
@@ -10756,7 +10767,11 @@ class TestTask198InventoryDay(unittest.TestCase):
         self.assertEqual(rep.ended_by, "inventory_blocked")
         self.assertEqual(rep.failed_steps, 0)
         self.assertTrue(rep.checks["no_hard_failures"])
-        self.assertFalse(rep.verified)
+        # 【task-28 卡 D 口径】四门槛齐全的 `inventory_blocked` 现在是诚实收工（day_justified
+        # 可为 true）；本形态 assigned 全部完成（leftover ≤2 被容量挡住、未分派）⇒ no_unmet_stages
+        # 为真，于是整体 VERIFIED 也为真。这是卡 D 的证据门槛带来的**口径后果**，不是放宽。
+        self.assertTrue(rep.checks["day_justified"], rep.checks)
+        self.assertTrue(rep.verified)
         self.assertNotIn("守卫仍说还有活", rep.ended_reason)
         stage = [s for s in rep.stages if s["stage"] == "harvest"][-1]
         self.assertEqual(len(w.crops), stage["leftover"])
@@ -12210,13 +12225,14 @@ class TestTask232SpacePressure(unittest.TestCase):
                self._row(1, "(T)Hoe", "Hoe", 1, tool=True),
                self._row(2, "(T)WateringCan", "Watering Can", 1, tool=True)]
         if surplus:
-            inv += [self._row(3, "(O)388", "Wood", 99),
-                    self._row(4, "(O)388", "Wood", 99),      # 真盈余：卖一叠仍留 99 ≥ K
+            # 【task-28】可卖表 = 树液/史莱姆 + 作物 + 晶洞/矿物晶石；Wood/Stone 等建材矿石已移出。
+            inv += [self._row(3, "(O)766", "Slime", 99),
+                    self._row(4, "(O)766", "Slime", 99),      # 真盈余：卖一叠仍留 99 ≥ K
                     self._row(5, "(O)535", "Geode", 3),
                     self._row(6, "(O)262", "Wheat", 10),
                     self._row(7, "(O)178", "Hay", 5),
                     self._row(8, "(O)Moss", "Moss", 2),
-                    self._row(10, "(O)390", "Stone", 3),
+                    self._row(10, "(O)766", "Slime", 3),
                     self._row(11, "(O)535", "Geode", 3)]
         else:
             # 表外物品（Hay/Moss/未知 id）⇒ 空格压力通道没有可卖叠 ⇒ 必须如实 blocked。
@@ -12256,11 +12272,11 @@ class TestTask232SpacePressure(unittest.TestCase):
         rep = DayReport(day_key=("summer", 3, 1), started_at=0.0)
         self.assertTrue(run._slot_relief(w.obs(), rep))
         self.assertGreaterEqual(len(worker.sell_calls), 1)
-        # 先卖真盈余（Wood 两叠各 99）；真盈余卖光后按既有"整叠卖空"退路卖最小一叠
+        # 先卖真盈余（Slime 两叠各 99）；真盈余卖光后按既有"整叠卖空"退路卖最小一叠
         # （Wheat 10 → 卖空，`belowKeep=True` 如实记账）。两条路都只碰已知表。
         sold_qids = [c["whitelist"][0] for c in worker.sell_calls]
-        self.assertIn("(O)388", sold_qids)
-        self.assertTrue(set(sold_qids) <= {"(O)388", "(O)262"}, sold_qids)
+        self.assertIn("(O)766", sold_qids)
+        self.assertTrue(set(sold_qids) <= {"(O)766", "(O)262", "(O)535"}, sold_qids)
         ev = self._events(run, "slot_relief")
         self.assertEqual(len(ev), 1, ev)
         self.assertEqual(ev[0]["trigger"], "space_pressure")
@@ -12275,19 +12291,19 @@ class TestTask232SpacePressure(unittest.TestCase):
         self.assertLess(ev[0]["rows_after"], ev[0]["rows_before"])
         self.assertFalse(ev[0]["failed"])
         self.assertFalse(run.inventory_blocked_today)
-        # 保留 K 的不变量：真盈余那档卖完后 Wood 总量仍 ≥ K。
+        # 保留 K 的不变量：真盈余那档卖完后 Slime 总量仍 ≥ K。
         left = sum(int(r.get("stack") or 0) for r in w.inventory
-                   if str(r.get("qualifiedId")) == "(O)388")
+                   if str(r.get("qualifiedId")) == "(O)766")
         self.assertGreaterEqual(left, SLOT_RELIEF_KEEP)
 
     def test_demand_drives_multi_stack_relief_to_target(self):
         """【task-237】需求水位驱动：可收 6 格 ⇒ 目标 7 格，一次腾格卖多叠直到达标。"""
         w = self._world(ripe=6)
-        # 加足真盈余叠（Wood 8 叠 ×99）：逐个扣减后仍 ≥K ⇒ 目标 7 格可一次卖到。
-        inv = [r for r in w.inventory if not str(r.get("qualifiedId", "")).startswith("(O)388")]
+        # 加足真盈余叠（Slime 8 叠 ×99）：逐个扣减后仍 ≥K ⇒ 目标 7 格可一次卖到。
+        inv = [r for r in w.inventory if not str(r.get("qualifiedId", "")).startswith("(O)766")]
         base = max([int(r.get("slot") or 0) for r in inv] + [0]) + 1
-        inv += [{"slot": base + i, "id": "388", "qualifiedId": "(O)388",
-                 "name": "Wood", "stack": 99, "isTool": False} for i in range(8)]
+        inv += [{"slot": base + i, "id": "766", "qualifiedId": "(O)766",
+                 "name": "Slime", "stack": 99, "isTool": False} for i in range(8)]
         w.inventory = inv
         w.inventory_capacity = max(12, len(w.inventory))
         worker = _SpaceWorker(w)
@@ -12301,7 +12317,7 @@ class TestTask232SpacePressure(unittest.TestCase):
         self.assertGreaterEqual(ev["freed"], 7)
         self.assertEqual(ev["freed"], len(worker.sell_calls))
         left = sum(int(r.get("stack") or 0) for r in w.inventory
-                   if str(r.get("qualifiedId")) == "(O)388")
+                   if str(r.get("qualifiedId")) == "(O)766")
         self.assertGreaterEqual(left, SLOT_RELIEF_KEEP)
 
     def test_harvest_demand_falls_back_conservatively_without_evidence(self):
@@ -13353,12 +13369,12 @@ class TestTask16InventoryFull(unittest.TestCase):
         return w
 
     def _full_with_surplus(self) -> FakeWorld:
-        """满包、有一叠**已知表真盈余**（Wood 99 > 保留 K）—— 压力通道应当卖它腾格。"""
+        """满包、有一叠**已知表真盈余**（Slime 99 > 保留 K）—— 压力通道应当卖它腾格。"""
         w = FakeWorld(seeds=0, money=500, weeds=0)
         inv = [self._row(0, "(T)Axe", "Axe", 1, tool=True),
                self._row(1, "(T)Hoe", "Hoe", 1, tool=True),
                self._row(2, "(T)WateringCan", "Watering Can", 1, tool=True)]
-        inv += [self._row(3 + i, "(O)388", "Wood", 99) for i in range(9)]
+        inv += [self._row(3 + i, "(O)766", "Slime", 99) for i in range(9)]
         w.inventory = inv[:12]
         return w
 
@@ -13525,8 +13541,10 @@ class TestTask16InventoryFull(unittest.TestCase):
 
     # ---- 5) 日终 trace + 不因掉落判失败 ----
     def test_day_end_traces_loot_lost_without_touching_checks(self):
-        """端到端：满包 clear 仍照常清格（掉落拒收只留证）——日终 trace 有 loot/free_slots，
-        `checks` 10 键与 `day_justified` 口径不被 loot 连坐（loot 只 info，不算失败）。"""
+        """端到端：满包 + 腾不出 ⇒ 卡 D 的满包清障闸**不新开 clear_area**（落地即丢），
+        于是 `loot_lost_steps=0`（不白丢战利品），并留 `clear_gate` 痕迹；日终仍如实带
+        free_slots；`checks` 10 键不被背包/loot 连坐。`clear()` 自身的掉落留痕由
+        `test_clear_marks_loot_lost_when_inventory_full` 单测钉死（闸负责"别再新开清障"）。"""
         w = self._full_with_seeds()
         worker = _LootMarkingWorker(w)
         run = self._run(w, worker)
@@ -13549,30 +13567,33 @@ class TestTask16InventoryFull(unittest.TestCase):
 
         rep = run.days[0]
         self.assertGreaterEqual(calls["n"], 1)
-        self.assertGreaterEqual(rep.loot_lost_steps, 1, rep.notes)
-        self.assertTrue(rep.loot_lost_tiles, rep.notes)
-        self.assertTrue(rep.loot_lost_items, rep.notes)
+        # 卡 D C：满包 + 腾不出 ⇒ 清障池为空 ⇒ 没有 ok clear、也没有掉落丢失
+        self.assertEqual(rep.loot_lost_steps, 0, rep.notes)
+        self.assertFalse(rep.loot_lost_tiles)
+        self.assertFalse(rep.loot_lost_items)
+        self.assertTrue(any("满包清障闸" in n for n in rep.notes), rep.notes)
+        gate = [e for e in self._events(run, "slot_relief")
+                if e.get("trigger") == "clear_gate"]
+        # `run.run()` 会跑到"次日"再停（每模拟日重置闸门标记），所以按事件内容断言；
+        # 单日只留痕一次由 `clear_area_bag_gate_noted` 保证（见 longrun.py:6372）。
+        self.assertGreaterEqual(len(gate), 1)
+        self.assertEqual(gate[0].get("loot_lost_limit"),
+                         longrun_mod.CLEAR_LOOT_LOSS_MAX_STEPS)
+        self.assertEqual(gate[0].get("stage"), "clear_area")
+        # 日终 trace 仍如实（容量−行数；不猜）
         self.assertEqual(rep.free_slots_status, "ok")
-        self.assertIsNotNone(rep.free_slots_last)
-        self.assertLessEqual(int(rep.free_slots_min), int(rep.free_slots_last))
+        self.assertEqual(int(rep.free_slots_last), 0)
         d = rep.as_dict()
-        self.assertEqual(d["loot_lost_steps"], rep.loot_lost_steps)
-        self.assertEqual([[int(t[0]), int(t[1])] for t in d["loot_lost_tiles"]],
-                         [[int(t[0]), int(t[1])] for t in rep.loot_lost_tiles])
-        self.assertEqual(d["loot_lost_items"], rep.loot_lost_items)
-        self.assertEqual(d["free_slots_min"], rep.free_slots_min)
+        self.assertEqual(d["loot_lost_steps"], 0)
+        self.assertEqual(d["free_slots_last"], rep.free_slots_last)
+        self.assertEqual(list(d["loot_lost_items"]), [])
         # checks 仍是 10 键、loot 只 info 不进 checks
         self.assertEqual(len(rep.checks), 10, rep.checks)
         self.assertNotIn("loot_lost", rep.checks)
         self.assertTrue(rep.checks.get("no_hard_failures", False), rep.checks)
-        # 背包满不是这一天的收工理由（不许被当成 inventory_blocked/stuck 连坐）
+        # 背包满不是这一天的收工理由（不许被 loot 连坐）
         self.assertNotIn("inventory_blocked", str(rep.ended_by))
         self.assertNotIn("inventory_blocked", str(rep.ended_reason))
-        # 阶段账也带掉落证据（既有 stage 事件加字段，不新增事件名）
-        stage = [s for s in rep.stages if str(s.get("stage")) == "clear_area"]
-        self.assertTrue(stage, rep.stages)
-        self.assertGreaterEqual(sum(int(s.get("loot_lost", 0)) for s in stage), 1,
-                                stage[-1])
 
 
 class TestTask22MalformedTiles(unittest.TestCase):
@@ -14138,6 +14159,255 @@ class TestTask27EnclosedBatch(unittest.TestCase):
         self.assertEqual(st.get("reasons"), {"blocked_tile": 1}, st)
         self.assertGreaterEqual(int(st.get("assigned_undone") or 0), 1, st)
         self.assertEqual(st.get("ok"), 0, "挡死格绝不许记成 already/ok（那是洗白）")
+
+
+class TestTask28BagEvidence(unittest.TestCase):
+    """【task-28 / 0.7.46 卡 D】售材白名单纪律 + `inventory_blocked` 四门槛 + 满包清障有界。
+
+    卡面三段（Lead m03409）：
+      A) 建材/锭类移出可卖白名单（Wood 388/Stone 390/Clay 330/Fiber 771/Coal 382/
+         Copper 378/Iron 380/Gold 384/Iridium 386/Radioactive 909），只留 Sap 92/Slime 766
+         + 作物/采集/矿物（含 Geode）；结构 `SLOT_RELIEF_KEEP/MAX_STACKS/RESERVES` 保留。
+         后果如实：可腾格项变少 ⇒ 更常走到"无可腾"。
+      B) `inventory_blocked` 诚实收工必须四条件全满足：`free_slots==0`、
+         `relief_exhausted`（卖单尝试 + 保留规则算出）、`pending_executable==0`、
+         `pending_malformed==0`；`stuck:` 永不认；真剩 exec>0 必须 False。
+      C) 满包清障有界：`free_slots==0` 且 `relief_exhausted` ⇒ 不新开 `clear_area`（开路必要
+         前置仍允许），全天 `loot_lost_steps <= CLEAR_LOOT_LOSS_MAX_STEPS`（=5）；loot 只 info。
+    """
+
+    CHECKS_KEYS = {
+        "slept_by_us", "no_blocking_modal", "no_hard_failures",
+        "unreachable_within_bound", "refused_within_bound", "no_unmet_stages",
+        "crops_watered", "watered_outdoor", "day_justified", "zero_action_evidenced",
+    }
+    MATERIAL_ROWS = (
+        ("(O)388", "Wood"), ("(O)390", "Stone"), ("(O)330", "Clay"),
+        ("(O)771", "Fiber"), ("(O)382", "Coal"), ("(O)378", "Copper Ore"),
+        ("(O)380", "Iron Ore"), ("(O)384", "Gold Ore"), ("(O)386", "Iridium Ore"),
+    )
+
+    def _row(self, slot: int, qid: str, name: str, stack: int, *,
+             tool: bool = False) -> dict:
+        item_id = qid.rsplit(")", 1)[-1] if qid.startswith("(") else qid
+        return {"slot": slot, "id": item_id, "qualifiedId": qid, "name": name,
+                "stack": stack, "isTool": tool}
+
+    def _full(self, rows=(), *, weeds: int = 0, seeds: int = 0,
+              money: int = 3000) -> FakeWorld:
+        """满包 12/12：3 件工具 + `rows`，其余用 Hay 填满（Hay 不可卖：不在任何允许表）。"""
+        w = FakeWorld(seeds=seeds, money=money, weeds=weeds)
+        inv = [self._row(0, "(T)Axe", "Axe", 1, tool=True),
+               self._row(1, "(T)Hoe", "Hoe", 1, tool=True),
+               self._row(2, "(T)WateringCan", "Watering Can", 1, tool=True)]
+        for i, (qid, name) in enumerate(rows):
+            inv.append(self._row(3 + i, qid, name, 30))
+        while len(inv) < 12:
+            inv.append(self._row(len(inv), "(O)178", "Hay", 5))
+        w.inventory = inv[:12]
+        return w
+
+    def _run(self, w: FakeWorld, worker, **kw) -> LongRun:
+        run = make_run(w, **kw)
+        client = FakeClient(w)
+        run.client = client
+        run.worker = worker
+        run.client_factory = lambda: client
+        run.worker_factory = lambda _c: worker
+        return run
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list:
+        return [e for e in run.entries if e.get("event") == name]
+
+    @staticmethod
+    def _rep() -> DayReport:
+        return DayReport(day_key=("winter", 26, 1), started_at=0.0)
+
+    def _plot(self, tiles) -> dict:
+        return {"zone": "", "label": "", "area": "field_nw", "anchor": list(tiles[0]),
+                "tiles": list(tiles), "note": ""}
+
+    # ---- A) 白名单纪律 ----
+    def test_building_materials_never_sold_under_full_bag_pressure(self):
+        """十个建材/矿锭 qid 满包时**一次卖单都不发**（旧白名单会把 Wood/Stone 卖走）。"""
+        w = self._full(rows=self.MATERIAL_ROWS)
+        worker = _SpaceWorker(w)
+        run = self._run(w, worker)
+        self.assertEqual(player_free_slots(FarmWorker.player_of(w.obs()))[0], 0)
+
+        self.assertFalse(run._slot_relief(w.obs(), self._rep()))
+        self.assertEqual(worker.sell_calls, [], "建材/锭类不许进卖单")
+        self.assertFalse(run.inventory_blocked_today,
+                         "压力通道腾不出不是失败（task-16 口径）")
+        ev = run._bag_relief_evidence(w.obs())
+        self.assertEqual(int(ev["sellable_above_keep"]), 0, ev)
+        self.assertTrue(ev["exhausted"], ev)
+        # 只有"真满且腾不出"的留痕，没有卖单
+        evs = self._events(run, "slot_relief")
+        self.assertTrue(evs, "腾不出要留痕")
+        self.assertFalse(any(e.get("trigger") == "space_pressure" for e in evs), evs)
+
+    def test_sellable_whitelists_are_fail_closed_for_building_materials(self):
+        """卡 A 的**表级**判据：建材/矿石/锭类不在任何可卖并集里；Sap/Slime/作物/Geode 在。
+
+        为什么单列：`slot_relief_plan()`（压力通道）用分档表 `SLOT_RELIEF_MATERIAL_IDS`/
+        `HIGH_VALUE_IDS`，而换种子钱的 `surplus_sell_plan()` 用 `SELLABLE_SURPLUS_IDS`
+        （= `SURPLUS_MATERIAL_IDS|作物|晶石`）——两处都必须 fail-closed，任何一处把 Wood 加回
+        都要被这条钉住（变异 m1/m5）。
+        """
+        banned = ("388", "390", "330", "771", "382", "378", "380", "384", "386", "909", "709")
+        for qid in banned:
+            self.assertNotIn(qid, farmwork_mod.SURPLUS_MATERIAL_IDS, qid)
+            self.assertNotIn(qid, farmwork_mod.SLOT_RELIEF_MATERIAL_IDS, qid)
+            self.assertNotIn(qid, farmwork_mod.SLOT_RELIEF_HIGH_VALUE_IDS, qid)
+            self.assertNotIn(qid, farmwork_mod.SELLABLE_SURPLUS_IDS, qid)
+        for qid in ("92", "766"):
+            self.assertIn(qid, farmwork_mod.SURPLUS_MATERIAL_IDS, qid)
+            self.assertIn(qid, farmwork_mod.SLOT_RELIEF_MATERIAL_IDS, qid)
+            self.assertIn(qid, farmwork_mod.SELLABLE_SURPLUS_IDS, qid)
+        for qid in ("24", "535", "72"):
+            self.assertIn(qid, farmwork_mod.SELLABLE_SURPLUS_IDS, qid)
+            self.assertNotIn(qid, farmwork_mod.SURPLUS_MATERIAL_IDS, qid)
+        # 结构保留（卡 A 要求）：KEEP/MAX_STACKS/RESERVES 三个名字还在（reserve 表清空）
+        self.assertEqual(farmwork_mod.SLOT_RELIEF_KEEP, 10)
+        self.assertEqual(farmwork_mod.SLOT_RELIEF_MAX_STACKS, 5)
+        self.assertEqual(farmwork_mod.SLOT_RELIEF_RESERVES, {})
+
+    def test_crops_and_geodes_still_sellable_via_worker_diff(self):
+        """允许类（作物 + Geode）仍能按白名单卖叠腾格：走 `worker.sell`，钱不动、行数减少。"""
+        w = self._full(rows=[("(O)24", "Parsnip"), ("(O)535", "Geode")])
+        worker = _SpaceWorker(w)
+        run = self._run(w, worker)
+        money_before = w.money
+        rows_before = len(w.inventory)
+
+        self.assertTrue(run._slot_relief(w.obs(), self._rep()), "有允许盈余 ⇒ 必须能腾格")
+        self.assertTrue(worker.sell_calls, worker.sell_calls)
+        self.assertLess(len(w.inventory), rows_before)
+        self.assertEqual(w.money, money_before, "假世界里卖叠不当场改钱（等 NewDay）")
+        ev = [e for e in self._events(run, "slot_relief")
+              if e.get("trigger") == "space_pressure"]
+        self.assertTrue(ev, self._events(run, "slot_relief"))
+        self.assertGreaterEqual(int(ev[0].get("freed") or 0), 1, ev[0])
+
+    # ---- B) inventory_blocked 四门槛 ----
+    def _note_case(self, *, snapshot_exec: int = 0, snapshot_malformed: int = 0,
+                   free: int | None = None, sellable: bool = False):
+        rows = [("(O)766", "Slime")] * 9 if sellable else self.MATERIAL_ROWS
+        w = self._full(rows=rows)
+        run = self._run(w, FakeWorker(w))
+        obs = w.obs()
+        if free is not None:
+            # 只留 free 个空格：删掉若干行
+            w.inventory = w.inventory[:12 - free - 1] if free < 12 else []
+            obs = w.obs()
+        run._pending_snapshot = lambda _obs: {
+            "ledger": int(snapshot_exec), "guard": int(snapshot_exec),
+            "stalled": 0, "blocked": 0, "unobserved": 0,
+            "executable": int(snapshot_exec), "malformed": int(snapshot_malformed),
+            "executable_tiles": [], "stalled_tiles": [], "malformed_tiles": [],
+        }
+        rep = self._rep()
+        run._note_inventory_blocked(obs, rep, free_slots=0, reason="单测")
+        return run, rep
+
+    def test_inventory_blocked_gate_accepts_only_with_all_four_evidence(self):
+        run, rep = self._note_case()
+        self.assertTrue(run.inventory_blocked_today)
+        ev = [e for e in self._events(run, "inventory_blocked") if e.get("accepted")]
+        self.assertEqual(len(ev), 1, self._events(run, "inventory_blocked"))
+        self.assertEqual(ev[0]["gate_gaps"], [])
+        self.assertTrue(rep.relief_exhausted)
+        self.assertTrue(rep.bag_evidence.get("exhausted"))
+
+        for kw, gap in (({"snapshot_exec": 2}, "pending_executable"),
+                        ({"snapshot_malformed": 1}, "pending_malformed"),
+                        ({"free": 1}, "free_slots"),
+                        ({"sellable": True}, "relief_not_exhausted")):
+            run2, _rep2 = self._note_case(**kw)
+            self.assertFalse(run2.inventory_blocked_today, f"{kw} ⇒ 不得认")
+            evs = [e for e in self._events(run2, "inventory_blocked")]
+            self.assertTrue(evs, f"{kw} 要留痕")
+            self.assertFalse(any(e.get("accepted") for e in evs), evs)
+            gaps = [g for e in evs for g in (e.get("gate_gaps") or [])]
+            self.assertTrue(any(str(g).startswith(gap) for g in gaps), (gap, gaps))
+
+    def test_stuck_is_never_accepted_and_exec_blocks_inventory_blocked(self):
+        self.assertFalse(is_justified_end("stuck", "stuck:x",
+                                          pending_executable=0, malformed_tiles=0))
+        self.assertTrue(is_justified_end("inventory_blocked", "inventory_blocked:x",
+                                         pending_executable=0, malformed_tiles=0))
+        self.assertFalse(is_justified_end("inventory_blocked", "inventory_blocked:x",
+                                          pending_executable=2, malformed_tiles=0))
+        self.assertFalse(is_justified_end("inventory_blocked", "inventory_blocked:x",
+                                          pending_executable=0, malformed_tiles=1))
+        self.assertFalse(is_justified_end("sleep", "inventory_blocked:x",
+                                          pending_executable=0, malformed_tiles=0))
+
+    # ---- C) 满包清障有界 ----
+    def test_full_bag_does_not_open_new_clear_area(self):
+        w = self._full(rows=self.MATERIAL_ROWS, weeds=4)
+        run = self._run(w, FakeWorker(w))
+        self.assertEqual(run._stage_tiles("clear_area", w.obs(),
+                                          self._plot([(60, 10), (61, 10)])), [])
+        gate = [e for e in self._events(run, "slot_relief")
+                if e.get("trigger") == "clear_gate"]
+        self.assertEqual(len(gate), 1, self._events(run, "slot_relief"))
+        self.assertEqual(gate[0]["stage"], "clear_area")
+        self.assertEqual(int(gate[0]["loot_lost_limit"]), 5)
+
+    def test_full_bag_loot_lost_steps_capped(self):
+        self.assertEqual(longrun_mod.CLEAR_LOOT_LOSS_MAX_STEPS, 5)
+        w = self._full(rows=self.MATERIAL_ROWS, weeds=0)
+        w.dirt = {(60 + i, 10) for i in range(4)}
+        w.crops = {t: {"ripe": False, "watered": True, "dead": True}
+                   for t in w.dirt}
+        plot = self._plot(sorted(w.dirt))
+        run = self._run(w, FakeWorker(w))
+        run.loot_lost_steps_today = 5
+        self.assertEqual(run._stage_tiles("clear_dead", w.obs(), plot), [])
+        self.assertTrue([e for e in self._events(run, "slot_relief")
+                         if e.get("trigger") == "clear_gate"])
+        run2 = self._run(w, FakeWorker(w))
+        run2.loot_lost_steps_today = 3
+        self.assertLessEqual(len(run2._stage_tiles("clear_dead", w.obs(), plot)), 2,
+                             "剩余额度=5-3=2 ⇒ 池子最多 2 格")
+
+    # ---- 日终：证据进 day_end，checks 10 键不动 ----
+    def test_day_end_carries_bag_evidence_and_checks_stay_ten(self):
+        """满了且腾不出 ⇒ 诚实收尾 `inventory_blocked`；日终把证据落到只读字段、checks 10 键
+        不动。本形态里还有 1 格"真可执行"的熟作物剩余（exec=1）⇒ `day_justified` 必须仍是
+        False（卡 D B 的反向：真剩 exec>0 不许认）；exec==0 时的放行由
+        `test_stuck_is_never_accepted_and_exec_blocks_inventory_blocked` 单测钉住。"""
+        w = self._full(rows=self.MATERIAL_ROWS)
+        w.tillable = set()
+        w.blockers = {}
+        w.dirt = {(60, 10)}
+        w.crops = {(60, 10): {"ripe": True, "watered": True}}
+        worker = _SlotReliefWorker(w)
+        # 不排任务（`work_reasons` 只剩背包堵住的信号）⇒ `sleep_guard` 才会走
+        # "背包满 + 腾不出 ⇒ inventory_blocked" 那条带证据的诚实收工。
+        run = self._run(w, worker, planner=FakePlanner())
+        run.run()
+
+        rep = run.days[0]
+        self.assertEqual(rep.ended_by, "inventory_blocked", rep.notes)
+        accepted = [e for e in self._events(run, "inventory_blocked") if e.get("accepted")]
+        self.assertEqual(len(accepted), 1, self._events(run, "inventory_blocked"))
+        # 反向保护：日终快照里还有可执行格 ⇒ 不许 day_justified
+        self.assertGreaterEqual(int(rep.pending_executable), 1, rep.notes)
+        self.assertFalse(rep.checks["day_justified"], rep.checks)
+        self.assertEqual(set(rep.checks), self.CHECKS_KEYS)
+        self.assertTrue(rep.relief_exhausted)
+        self.assertEqual(int(rep.bag_evidence.get("free_slots")), 0)
+        self.assertTrue(rep.bag_evidence.get("exhausted"))
+        d = rep.as_dict()
+        self.assertEqual(d["relief_exhausted"], True)
+        self.assertIsInstance(d["bag_evidence"], dict)
+        self.assertIn("free_slots", d["bag_evidence"])
+        # `stuck:` 永远不在这条路径上
+        self.assertFalse(str(rep.ended_reason).startswith("stuck:"))
 
 
 if __name__ == "__main__":  # pragma: no cover

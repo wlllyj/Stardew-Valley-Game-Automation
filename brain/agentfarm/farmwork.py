@@ -1329,22 +1329,19 @@ SURPLUS_MIN_UNIT_PRICE = 1
 #: 为什么用 id 表而不是游戏分类：`mod\AgentFarm.Bridge\Contracts.cs` 的 `ItemView` 只有
 #: `slot/id/qualifiedId/name/stack/isTool` —— 既没有 `category` 也没有 `sellToStorePrice`，
 #: 而本卡是 brain-only（不动 Mod）⇒ 脑侧无法按游戏分类判断"这是不是材料"。
-#: 于是只认这份**已知资源 id 表**，表外一律视为"不许卖"：种子（名字含 seed/种子）、
-#: 作物/工匠品/鱼/矿物、工具武器、可放置物**自然全部落在外侧**（沿用 task-42 铁律）。
-#: 名字也不能当判据：中文环境显示名是「石头/木材」，英文才是 Stone/Wood。
+#:
+#: 【task-28 判据变更】按 Lead 卡 D 要求，**建材/矿石/锭类一律移出可卖表**：
+#: 木材 388 / 石头 390 / 纤维 771 / 粘土 330 / 煤 382 / 铜 378 / 铁 380 / 金 384 /
+#: 铱 386 / 放射性矿 909 / 硬木 709 —— 它们要么是建造/升级材料，要么是熔锭原料；
+#: 满包时宁可如实 `inventory_blocked` 收尾，也不卖（见 `slot_relief_plan`）。
+#: 仍可卖的（`SELLABLE_SURPLUS_IDS`）只有：
+#:   * `92` 树液 / `766` 史莱姆 —— 农场/怪物副产品，**不是**建造或熔炼材料（归类依据）；
+#:   * 作物（`SLOT_RELIEF_CROP_IDS`）与矿物晶石/晶洞（`SLOT_RELIEF_HIGH_VALUE_IDS`）——
+#:     它们是"收成/战利品"，卖出不破坏建造与工具升级。
+#: 名字也不能当判据：中文环境显示名是「木材/石头」，英文才是 Wood/Stone。
 SURPLUS_MATERIAL_IDS = frozenset({
-    "388",   # Wood
-    "390",   # Stone
-    "771",   # Fiber
-    "330",   # Clay
-    "382",   # Coal
-    "378",   # Copper Ore
-    "380",   # Iron Ore
-    "384",   # Gold Ore
-    "386",   # Iridium Ore
-    "909",   # Radioactive Ore
-    "92",    # Sap
-    "766",   # Slime
+    "92",    # Sap（树液，树桶副产品）
+    "766",   # Slime（史莱姆掉落）
 })
 
 
@@ -1478,22 +1475,18 @@ SLOT_RELIEF_CROP_IDS = frozenset({
     "889",   # Qi Fruit
 })
 
-#: 材料类（第二档；**不含矿石** —— 矿石/晶洞属 high_value，最后才卖）。
+#: 材料类（第二档）。【task-28】建材/矿石/硬木已全部移出可卖表（见 `SURPLUS_MATERIAL_IDS`
+#: 上方判据）：满包时宁可如实 `inventory_blocked`，也不卖建造/熔炼材料。这一档只剩
+#: 树液/史莱姆两种"副产品"。
 SLOT_RELIEF_MATERIAL_IDS = frozenset({
-    "388",   # Wood
-    "390",   # Stone
-    "771",   # Fiber
-    "330",   # Clay
-    "382",   # Coal
     "92",    # Sap
     "766",   # Slime
-    "709",   # Hardwood
 })
 
-#: 高价值（第三档，**最后**才卖；Geode/矿）。
+#: 高价值（第三档，**最后**才卖）。【task-28】矿石已移出（378/380/384/386/909 是熔锭原料，
+#: 不再可卖）；只剩矿物晶石/晶洞这类"战利品"，卖出不影响建造与工具升级。
 SLOT_RELIEF_HIGH_VALUE_IDS = frozenset({
     "535", "536", "537", "538", "749",   # Geode / Frozen / Magma / Omni Geode
-    "378", "380", "384", "386", "909",   # Copper/Iron/Gold/Iridium/Radioactive Ore
     "72",    # Diamond
     "74",    # Prismatic Shard
 })
@@ -1505,16 +1498,23 @@ SLOT_RELIEF_NEVER_SELL_IDS = frozenset({
     "787",   # Battery Pack
 })
 
+#: 空格压力/换种子钱时**允许卖**的全部 id（fail-closed：不在并集里的一件都不卖）。
+#:
+#: 【task-28】= 副产品材料（树液/史莱姆）+ 作物 + 矿物晶石/晶洞。建材/矿石/锭类不在其中，
+#: 满包时更常走到「没有可腾的格」⇒ 如实 `inventory_blocked`（不是 bug，是判据变更）。
+SELLABLE_SURPLUS_IDS = frozenset(
+    set(SURPLUS_MATERIAL_IDS) | set(SLOT_RELIEF_CROP_IDS) | set(SLOT_RELIEF_HIGH_VALUE_IDS)
+)
+
 #: 【task-232 增量・Lead m21874】**建造预留**：这几个 qid 的保留量覆盖 `K=10`
 #: （"卖到只剩 reserve 为止"），否则空格压力会把马上要用的熔炉材料卖掉（目标③ 工具升级：
 #: 熔炉 20 铜矿 + 25 石、熔 5 锭再 5 铜矿 + 5 煤）。
 #: 注意游戏**只会整叠卖**：所以 reserve 只会让"卖这叠后该 qid 仍 ≥ reserve"的叠可卖；
 #: 单叠数量 < reserve 时宁可腾不出格子（如实 inventory_blocked），也不动建造材料。
-SLOT_RELIEF_RESERVES: dict[str, int] = {
-    "(O)378": 25,   # 铜矿：熔炉 20 + 5 锭
-    "(O)390": 30,   # 石头：熔炉 25 + 余量
-    "(O)382": 5,    # 煤：5 锭各 1
-}
+#:
+#: 【task-28】铜矿/石头/煤已整体移出可卖表（见 `SURPLUS_MATERIAL_IDS` 注释）⇒ 预留表清空：
+#: 结构保留（调用方仍按 qid→保留量查表），但当前没有任何需要预留的可卖 id。
+SLOT_RELIEF_RESERVES: dict[str, int] = {}
 
 
 def slot_relief_plan(
@@ -1753,8 +1753,8 @@ def surplus_sell_plan(
             continue
         qid = str(it.get("qualifiedId") or it.get("id") or "").strip()
         bare = _bare_item_id(qid)
-        if not bare or bare not in SURPLUS_MATERIAL_IDS:
-            continue                      # fail-closed：表外一律不卖（种子/作物/工匠品/工具…）
+        if not bare or bare not in SELLABLE_SURPLUS_IDS:
+            continue                      # fail-closed：表外一律不卖（种子/工具/建材/矿石/锭…）
         name = str(it.get("name") or "")
         if any(hint in name.lower() for hint in SEED_NAME_HINTS):
             continue                      # 双保险：名字像种子的一律不卖
@@ -1815,8 +1815,8 @@ def surplus_sell_plan(
             picked = [min(stacks, key=lambda s: (int(s["stack"]), int(s["slot"])))]
             below_keep = True
         else:
-            skip_reason = ("背包里没有可卖的盈余材料（只走 SURPLUS_MATERIAL_IDS 白名单，"
-                           "种子/工具/作物/工匠品一律不卖）⇒ 腾不出格子")
+            skip_reason = ("背包里没有可卖的盈余（只走 SELLABLE_SURPLUS_IDS 白名单：树液/史莱姆/"
+                           "作物/矿物晶石；种子/工具/工匠品/建材/矿石/锭一律不卖）⇒ 腾不出格子")
         picked.sort(key=lambda s: s["slot"])
     why = ""
     if picked:

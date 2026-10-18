@@ -293,6 +293,16 @@ SLOT_RESERVE = 1
 #: 腾到"低水位之上 1 格"就停手 —— 收货/掉落一次可能进多件，追清空背包既没必要也浪费时间。
 SLOT_RELIEF_TARGET_FREE = SLOT_RESERVE + 1
 
+#: 【task-28 卡 D】满包清障的日级损失上界：`free_slots == 0` 且已经证明「腾格手段用尽」
+#: 时，**已经开出去的 clear_area 阶段**仍会继续清几格（阶段不会半路撤回），而每清一格
+#: 都可能白丢一次掉落。取 5 的理由：
+#:   * 0.7.45 冬26 冒烟 `loot_lost_steps=21`、冬27 `205/210` —— 后者正是一整天白清；
+#:   * 一个阶段最多分配 `per_stage_tiles=12` 格，5 步 ≈ 半阶段，足够收掉"已经在路上"的
+#:     尾巴，又不会让一整天继续往 200+ 步的坑里走；
+#:   * 常量只约束**新分配**（`_stage_tiles` 按剩余额度收窄 `limit`），不追溯已经发生的步；
+#:     它只影响"今天还清不清"，不改任何 checks/leftover/assigned 口径。
+CLEAR_LOOT_LOSS_MAX_STEPS = 5
+
 #: 【task-68】"一轮不许零动作"（Lead m06336）：当**本轮所有指定目标都够不着/被围住**、但世界里
 #: 仍有"可达 + 可清障"的格子（杂草/石头/树枝/草）时，至少清掉一格 —— 否则 idle 计数攒够 3 轮
 #: 就判 stuck、整天报废（run6 只跑 19 秒的直接原因之一）。
@@ -567,14 +577,22 @@ SCOPE_SHED_MAX_FRACTION = 0.34
 #: `resume_exhausted:` 就绿，不看当天还有没有真能干的活（洗白通道）。
 HONEST_EXHAUSTED_END_REASONS = ("resume_exhausted",)
 
+#: 【task-28 / 0.7.46 卡 D】`inventory_blocked` 也走"有证据的诚实收工"：0.7.45 冬26 的
+#: `inventory_blocked` 是诚实的（背包 0 格、没可卖的叠、也没有可执行待做格），却因为不在
+#: 任何白名单里而 `day_justified=False` ⇒ 永远不 VERIFIED。判据必须带四条独立证据（见
+#: `LongRun._bag_relief_evidence` 与 `_note_inventory_blocked`），单靠"写了
+#: `inventory_blocked` 前缀"**不放行**——那会变成新的洗白通道（卡面 B 段明确禁止）。
+HONEST_INVENTORY_END_REASONS = ("inventory_blocked",)
+
 
 def is_justified_end(ended_by: str, ended_reason: str, *,
                      pending_executable: int | None = None,
                      malformed_tiles: int = 0) -> bool:
-    """这一天是不是以**正当理由**收工（`day_justified` 的判据，task-32 / task-15 / task-22）。
+    """这一天是不是以**正当理由**收工（`day_justified` 的判据，task-32 / task-15 / task-22 / task-28）。
 
     口径：
-    * `ended_by` 必须是 `sleep`（我们真的让游戏日翻篇了）；
+    * `ended_by` 必须是 `sleep` 或**【task-28】带证据的 `inventory_blocked`**（后者只有
+      `_end_inventory_blocked` 在四门槛全过时才会写）；
     * 【task-22】`malformed_tiles > 0` ⇒ **一律不放行**（fail-closed）：观测 `tiles[]` 里
       出现了**字段残缺**的 tile 记录（只有 `tile`、缺 `kind`/`crop` 等工作种类字段）说明
       "看不见"是**观测坏了**，不是"没有活"；若把它当 unobserved，Mod 字段一改名就能让
@@ -585,20 +603,25 @@ def is_justified_end(ended_by: str, ended_reason: str, *,
       `pending_executable == 0` ⇒ 正当。"换片/回片区/当前观测都拿不出目标"本来就是诚实收工，
       但必须带独立证据：日终"当前可执行且可达"的待做格确实是 0。`pending_executable is None`
       （观测证据不可用）一律按"不确定"处理 ⇒ 不放行（fail-closed，绝不把"没看到"当成"没有"）；
-    * 其余前缀（`stuck` / `inventory_blocked` / `gave_up_*` / `no_water` / `no_plot` …）照旧不放行。
-
-    旧口径逐字保留在第一条白名单分支上（单测可直接钉死"`no_plot` 不在里面"）。
+    * 【task-28】前缀在 `HONEST_INVENTORY_END_REASONS`（`inventory_blocked`）**且**
+      `ended_by == "inventory_blocked"` **且** `pending_executable == 0` ⇒ 正当（另三条证据
+      在 `_note_inventory_blocked` 里已逐条核过：free_slots==0 / relief_exhausted /
+      pending_malformed==0）。`stuck` 等其余前缀照旧不放行。
     """
     # 【task-22】残缺 tile 记录 = 观测不可信 ⇒ 无论什么理由都不判"正当"（防洗白）。
     if int(malformed_tiles) > 0:
         return False
-    if ended_by != "sleep":
+    if ended_by not in ("sleep", "inventory_blocked"):
         return False
     prefix = str(ended_reason or "").split(":", 1)[0]
     if prefix in JUSTIFIED_END_REASONS:
-        return True
+        return ended_by == "sleep"
     if prefix in HONEST_EXHAUSTED_END_REASONS:
-        return pending_executable is not None and int(pending_executable) == 0
+        return (ended_by == "sleep" and pending_executable is not None
+                and int(pending_executable) == 0)
+    if prefix in HONEST_INVENTORY_END_REASONS:
+        return (ended_by == "inventory_blocked" and pending_executable is not None
+                and int(pending_executable) == 0)
     return False
 
 
@@ -818,6 +841,12 @@ class DayReport:
     loot_lost_steps: int = 0
     loot_lost_tiles: list[Any] = field(default_factory=list)
     loot_lost_items: list[str] = field(default_factory=list)
+    #: 【task-28 卡 D】`inventory_blocked` 的**证据快照**（只读 info，不进 checks）：
+    #: * `relief_exhausted` = 当天是否已证明"腾格手段用尽"（没可卖叠/轮数/叠数到顶）；
+    #: * `bag_evidence` = `_bag_relief_evidence()` 原文（free_slots / sellable_above_keep /
+    #:   relief_rounds / sold_stacks / exhausted …），供 analyzer/事后复核"凭什么认腾不出"。
+    relief_exhausted: bool = False
+    bag_evidence: dict[str, Any] = field(default_factory=dict)
     deferred_tiles: int = 0
     #: 【task-158】当天的**浇水优先体力预算**（`stamina_budget` journal 的同名快照）：
     #: `{max, stamina, live_crops, dry, water_reserve, water_cost_est, path_allowance,
@@ -955,6 +984,9 @@ class DayReport:
             "loot_lost_steps": self.loot_lost_steps,
             "loot_lost_tiles": [list(t) for t in self.loot_lost_tiles],
             "loot_lost_items": list(self.loot_lost_items),
+            # 【task-28 卡 D】`inventory_blocked` 的四门槛证据（只读 info；checks 仍 10 键）
+            "relief_exhausted": self.relief_exhausted,
+            "bag_evidence": dict(self.bag_evidence),
             "deferred_tiles": self.deferred_tiles,
             # 【task-168】主动认输的片区（只 info：不进 checks、不扣 plot_pending/assigned_undone）
             "scope_shed": dict(self.scope_shed),
@@ -1394,6 +1426,18 @@ class LongRun:
         self.loot_lost_noted = False
         self.slot_pressure_noted = False
         self.buy_full_noted = False
+        #: 【task-28 卡 D】`inventory_blocked` 的证据门槛 + 满包清障闸（每日重置）：
+        #:  * `bag_evidence_today` —— 最近一次算出的 `_bag_relief_evidence()`（free_slots /
+        #:    free_slots_status / sellable_above_keep / relief_rounds / sold_stacks / exhausted），
+        #:    日终原样进 `day_end.bag_evidence`（只读 info，不参与 checks）；
+        #:  * `bag_relief_exhausted_today` —— 已证明"腾格手段用尽"（没可卖叠 / 轮数或叠数到顶，
+        #:    且 free_slots 证据可信）；`free_slots==0` 时用于拦新开的 clear_area；
+        #:  * `clear_area_bag_gate_noted` —— 满包清障闸每天只留痕一次（防刷屏）。
+        #:  * `bag_gate_reject_noted` —— "证据不足不认"的拒绝留痕每天也只写一次（防每轮刷屏）。
+        self.bag_evidence_today: dict[str, Any] = {}
+        self.bag_relief_exhausted_today = False
+        self.clear_area_bag_gate_noted = False
+        self.bag_gate_reject_noted = False
         #: 【task-218】今天砍倒了几棵树 + 预算挡下时"每天只记一次"的 note 标记。
         #: 每日重置；判据见 `_tree_budget_left()`（日上限 + 浇水预备线，绝不为砍树漏浇）。
         self.trees_cleared_today = 0
@@ -4654,6 +4698,27 @@ class LongRun:
                                        tiles=self._leftover(task, obs, plot))
             return []
 
+        # 【task-28 卡 D C】满包清障有界 + 满包不再新开 clear_area：
+        #   ① 背包 0 空格且腾格手段用尽（`_bag_relief_evidence().exhausted`）⇒ `clear_area`
+        #      目标池直接空（清障掉落必丢；开路必要前置在 `_ensure_reachable`/`open_way`
+        #      内部，不经过本池，仍允许），日终由 `slot_relief{trigger=clear_gate}` 留痕；
+        #   ② 全天 `loot_lost_steps` 有硬上界 `CLEAR_LOOT_LOSS_MAX_STEPS`（=5）：背包 0 空格时
+        #      按剩余额度收窄阶段 limit。`loot_lost` 只是 info（task-16 口径），**绝不进 checks**。
+        if task in ("clear_area", "clear_dead"):
+            _bag = self._bag_relief_evidence(obs)
+            _bag_free = _bag.get("free_slots")
+            if task == "clear_area":
+                _gate_why = self._clear_bag_gate_reason(obs)
+                if _gate_why:
+                    self._note_clear_area_bag_gate(task, _gate_why)
+                    return []
+            if _bag_free is not None and int(_bag_free) <= 0:
+                _left = max(0, CLEAR_LOOT_LOSS_MAX_STEPS - int(self.loot_lost_steps_today))
+                if _left <= 0:
+                    self._note_clear_area_bag_gate(task, "loot_lost_steps 已到全天上限")
+                    return []
+                limit = min(limit, _left)
+
         if task == "water_area":
             # 【task-84】**枯死作物不浇水**（用户 m11003）：死苗格从目标池里剔掉。
             # 两道防线：Mod 0.7.27 起 `tiles[].tool` 对死苗不再返回 `"can"`，且
@@ -5757,15 +5822,17 @@ class LongRun:
                 return False, "keep_working", (
                     f"账本还剩 {len(_dead_pending)} 格挡死格（被围 / 回去看过拿不出目标）⇒ "
                     "按换片/诚实收工收口（这不是「没活可做」，不许判 no_work）")
-            # 【task-198】背包满 + 今天已证明腾不出格子 ⇒ 熟作物的理由已由 `work_reasons` 闭嘴，
-            # 但**不许**洗成 `no_work`：那不是"没活可做"，是"活被背包堵住、腾不出格"。
-            # 用 `inventory_blocked` 如实收尾（不在 `JUSTIFIED_END_REASONS` ⇒ `day_justified=False`
-            # ⇒ 当天 `verified=false`；`no_slot` 不是 failed ⇒ 不算 hard failure）。
+            # 【task-198 / task-28 卡 D】背包满 + 今天已证明腾不出格子 ⇒ 熟作物的理由已由
+            # `work_reasons` 闭嘴，但**不许**洗成 `no_work`：那不是"没活可做"，是"活被背包
+            # 堵住、腾不出格"。用 `inventory_blocked` 如实收尾；【task-28】该 flag 只在
+            # `_note_inventory_blocked` 四门槛全过时才置位（free_slots==0 / relief_exhausted /
+            # exec==0 / malformed==0）⇒ 此时 `day_justified` 可按证据放行（`stuck` 永不认）。
             if self.inventory_blocked_today:
                 free_slots, _need, _status = self._bag_state(obs)
                 return True, "inventory_blocked", (
-                    f"背包满（空格 {free_slots}）且今天已经腾不出格子（没有可出货/可卖的叠）⇒ "
-                    "熟作物收不进来；这不是「没活可做」，当天按 needs_review 如实收尾")
+                    f"背包满（空格 {free_slots}）且今天已经腾不出格子（可卖叠见 bag_evidence）⇒ "
+                    "熟作物收不进来；这不是「没活可做」，当天按带证据的诚实收工处理"
+                    "（不是 failed、不是 stuck、不是豁免）")
             # 【task-149 C】走到这里说明"没活"有**独立证据**：farm 证据齐备（否则上一段
             # fail-closed 已经给了理由）、窗口与农场口径都没给出任何活。日终 checks 用
             # `zero_action_evidenced` 拦住"0 动作却 VERIFIED"的假绿灯。
@@ -6235,27 +6302,142 @@ class LongRun:
             rep.notes.append(f"掉落拒收判据：{reason}")
         self._say(f"  ! 背包 0 空格 ⇒ 掉落可能被游戏拒收（{len(lost)} 步已留痕，不判失败）")
 
+    def _bag_relief_evidence(self, obs: dict[str, Any]) -> dict[str, Any]:
+        """【task-28 卡 D】"腾不出格子"的**可复核证据**（纯决策，不发请求）。
+
+        返回并缓存到 `self.bag_evidence_today`（`day_end.bag_evidence` 原样引用）。字段：
+          * `free_slots`/`free_slots_status` —— 空格口径 = 容量 − 非空行数（`player_free_slots`）；
+          * `sellable_above_keep` —— 用 `slot_relief_plan`（KEEP / MAX_STACKS / RESERVES 同一套
+            规则）此刻算出的"真能卖"的叠数（不是散文：卖单要真发得出去才算）；
+          * `relief_rounds`/`relief_round_limit`、`sold_stacks`/`sold_stack_limit` —— 当天已用量/上界；
+          * `plan_pressure`/`skip_reason` —— 决策层原始读数，便于事后解释"为什么没可卖的"；
+          * `exhausted` —— 语义 = 「证据可信 + free_slots==0 + (没有可卖叠 或 轮数到顶 或 叠数到顶)」。
+            **证据不可信（`free_slots_status != "ok"`）⇒ 一律 False**：读不到 ≠ 腾不出（fail-closed）。
+        """
+        if not isinstance(obs, dict):
+            obs = {}
+        player = FarmWorker.player_of(obs)
+        free, status = player_free_slots(player)
+        rounds_left = self.slot_relief_today < SLOT_RELIEF_MAX
+        stacks_left = self.slot_relief_stacks_today < SLOT_RELIEF_MAX_STACKS_TOTAL
+        plan: dict[str, Any] = {}
+        if status == "ok":
+            # 【task-28 卡 D】必须把**本次观测的空格/状态**显式喂给 `slot_relief_plan`；
+            # 它的默认参数是 `free_slots=None`（pressure=False）⇒ 不喂就永远算"没有可卖叠"，
+            # 把"其实卖得动"误判成 `exhausted`（B 门槛/清障闸都会假绿）。
+            plan = slot_relief_plan(obs, free_slots=free, free_slots_status=status,
+                                    trigger_free_slots=SLOT_RESERVE,
+                                    max_stacks=SLOT_RELIEF_MAX_STACKS_TOTAL)
+        sellable = len(plan.get("slots") or []) if plan else 0
+        exhausted = bool(
+            status == "ok" and free is not None and int(free) <= 0
+            and (sellable == 0 or not rounds_left or not stacks_left)
+        )
+        ev: dict[str, Any] = {
+            "free_slots": (None if free is None else int(free)),
+            "free_slots_status": str(status),
+            "sellable_above_keep": int(sellable),
+            "relief_rounds": int(self.slot_relief_today),
+            "relief_round_limit": int(SLOT_RELIEF_MAX),
+            "sold_stacks": int(self.slot_relief_stacks_today),
+            "sold_stack_limit": int(SLOT_RELIEF_MAX_STACKS_TOTAL),
+            "plan_pressure": bool(plan.get("pressure")) if plan else False,
+            "skip_reason": str(plan.get("skipReason") or "") if plan else "free_slots 证据不可用",
+            "reserve": int(SLOT_RESERVE),
+            "exhausted": exhausted,
+        }
+        self.bag_evidence_today = dict(ev)
+        self.bag_relief_exhausted_today = exhausted
+        return ev
+
+    def _clear_bag_gate_reason(self, obs: dict[str, Any]) -> str:
+        """【task-28 卡 D C】`clear_area` 是否该被"满包"闸住（返回非空即闸住）。
+
+        闸门只看**可复核证据**：`free_slots == 0` 且 `_bag_relief_evidence().exhausted`
+        （没有可卖叠 / 轮数或叠数到顶）。证据不可读（`free_slots_status != "ok"`）⇒ 不闸
+        （fail-open，宁可少闸也不拿"读不到"当"腾不出"）；`loot_lost_steps` 上界是另一道
+        独立兜底，不依赖本闸。
+        """
+        ev = self._bag_relief_evidence(obs)
+        free = ev.get("free_slots")
+        if free is None or int(free) > 0:
+            return ""
+        if not ev.get("exhausted"):
+            return ""
+        return "背包 0 空格且腾格手段用尽"
+
+    def _note_clear_area_bag_gate(self, task: str, why: str) -> None:
+        """【task-28 卡 D C】满包清障闸留痕（复用既有 `slot_relief` 事件名 + 新字段，不新增事件）。
+
+        语义：**不是失败、不是豁免**，只说明"今天不再新开 clear_area"；`_leftover` 照旧如实，
+        `day_end.bag_evidence` 给出可复核读数。开路必要前置（`_ensure_reachable`/`open_way`
+        内部的单格清障）不经过本池，仍允许。
+        """
+        if self.clear_area_bag_gate_noted:
+            return
+        self.clear_area_bag_gate_noted = True
+        self._journal("slot_relief", pressure=True, need=0, demand=0,
+                      demand_basis="space_pressure", trigger="clear_gate",
+                      target_free=SLOT_RELIEF_TARGET_FREE, freed=0, stage=task,
+                      reason=why, loot_lost_steps=int(self.loot_lost_steps_today),
+                      loot_lost_limit=int(CLEAR_LOOT_LOSS_MAX_STEPS),
+                      note=("满包清障闸：不新开 clear_area（落地即丢；开路必要前置仍允许）"
+                            " —— 不是失败/豁免；次日背包腾出后恢复"))
+
     def _note_inventory_blocked(self, obs: dict[str, Any], rep: DayReport, *,
                                 free_slots: int, reason: str) -> None:
-        """【task-198】今天已经证明"腾不出格子"：记一次账，守卫从此不再拿熟作物当活。
+        """【task-198 / task-28 卡 D】"腾不出格子"必须过**四门槛**才认（否则只留痕、不认）。
 
-        语义边界（卡面硬要求）：
-          * `no_slot` 不是 hard failure（`farmwork` 里它是 env/阻塞类，不计 `failed_steps`）；
-          * 但当天也**不许**假 VERIFIED：`inventory_blocked` 不在 `JUSTIFIED_END_REASONS` 里
-            ⇒ `day_justified=False` ⇒ `verified=False`；
-          * 每天只 journal 一次（`inventory_blocked_noted`），不刷屏。
+        四条独立证据全部成立才置 `inventory_blocked_today`：
+          ① `free_slots == 0`（口径 = 容量 − 非空行数，**不是** `inventoryCount` 本身）；
+          ② `relief_exhausted`：`_bag_relief_evidence` 用卖单规则算出（没有可卖叠 / 轮数 /
+             叠数到顶），不是"我们觉得卖不动"；
+          ③ `pending_executable == 0`：日终快照里"当前可执行且可达"的待做格确实为 0；
+          ④ `pending_malformed == 0`：观测没有残缺 tile 记录（缺失 ≠ 通过）。
+        任一不成立 ⇒ journal `accepted=false` + `gate_gaps` 留痕，**不置 flag**（不空转、不洗白）；
+        诚实收尾仍由 `sleep_guard`/`_end_inventory_blocked` 在 flag 置位后走。
+        **`stuck:` 永远不会从这条路径产生**；真剩 `exec>0` 时必须保持 False（卡面 B）。
         """
+        ev = self._bag_relief_evidence(obs)
+        snap = self._pending_snapshot(obs)
+        free_now = ev.get("free_slots")
+        if free_now is None:
+            free_now = int(free_slots)
+        gaps: list[str] = []
+        if int(free_now) > 0:
+            gaps.append(f"free_slots={int(free_now)}>0")
+        if not ev.get("exhausted"):
+            gaps.append("relief_not_exhausted")
+        if int(snap.get("executable") or 0) > 0:
+            gaps.append(f"pending_executable={int(snap.get('executable') or 0)}")
+        if int(snap.get("malformed") or 0) > 0:
+            gaps.append(f"pending_malformed={int(snap.get('malformed') or 0)}")
+        accepted = not gaps
+        rep.bag_evidence = dict(ev)
+        rep.relief_exhausted = bool(ev.get("exhausted"))
+        if not accepted and self.bag_gate_reject_noted:
+            # 拒绝留痕每天只写一次：`_slot_relief` 每轮都会走到这里，刷屏没有信息增量。
+            return
+        if not accepted:
+            self.bag_gate_reject_noted = True
+        self._journal("inventory_blocked", free_slots=int(free_now), reserve=SLOT_RESERVE,
+                      rounds=self.slot_relief_today, limit=SLOT_RELIEF_MAX,
+                      accepted=bool(accepted), relief_exhausted=bool(ev.get("exhausted")),
+                      evidence=dict(ev), gate_gaps=list(gaps), reason=reason,
+                      note=("背包 0 空格 + 腾格手段用尽 + 没有可执行待做格 ⇒ 当天如实收尾"
+                            "（不是 hard failure；stuck 不认；接受时 day_justified 按证据判）"
+                            if accepted else
+                            "证据不足，不认'腾不出格子'（继续干活/如实收尾，不空转不洗白）"))
+        if not accepted:
+            rep.notes.append(f"inventory_blocked 证据不足（{'、'.join(gaps)}）⇒ 不认：{reason}")
+            self._say(f"  ! 背包满但证据不足（{'、'.join(gaps)}）⇒ 不按'腾不出'收工")
+            return
         self.inventory_blocked_today = True
         if self.inventory_blocked_noted:
             return
         self.inventory_blocked_noted = True
-        self._journal("inventory_blocked", free_slots=int(free_slots), reserve=SLOT_RESERVE,
-                      rounds=self.slot_relief_today, limit=SLOT_RELIEF_MAX, reason=reason,
-                      note="背包满且腾不出格子（没有可出货/可卖的叠）⇒ 当天如实收尾："
-                           "不算 hard failure（no_slot 不是 failed），但 verified=false；"
-                           "守卫不再把「还有熟作物」当还能干活的理由")
-        rep.notes.append(f"背包满且腾不出格子：{reason}")
-        self._say(f"  × 背包满且腾不出格子：{reason}")
+        rep.notes.append(f"背包满且腾不出格子（四门槛全过）：{reason}")
+        self._say(f"  × 背包满且腾不出格子（四门槛全过）：{reason}")
 
     def _slot_relief(self, obs: dict[str, Any], rep: DayReport) -> bool:
         """【task-198】"腾格收敛回路"：背包低于**需求水位**时先把格子腾出来，再回去干活。
@@ -6441,6 +6623,9 @@ class LongRun:
         if failed:
             self._note_inventory_blocked(obs, rep, free_slots=after_slots,
                                          reason=blocked_reason)
+            # 本轮 0 格 ⇒ 封板（不拿"再试一次"烧轮数）；封板 ≠ 认"腾不出"，
+            # `inventory_blocked` 仍只由四门槛决定（卡 D B）。
+            self.slot_relief_today = max(int(self.slot_relief_today), int(SLOT_RELIEF_MAX))
             return False
         if reached:
             rep.notes.append(f"腾格到需求水位：空格 {free_slots} → {after_slots}"
@@ -6474,6 +6659,11 @@ class LongRun:
         elif sold:
             rep.notes.append(f"腾格未达需求水位：空格 {after_slots} / 目标 {target_free}"
                              f"（还有可用空格，先继续干活）")
+        # 【task-198 钉死 / task-28 卡 D】本轮腾出 0 格 ⇒ 立刻封板，绝不按轮数空转。
+        # 封板只代表"今天不再试腾格"，**不**等于认 `inventory_blocked` —— 那条仍由四门槛
+        # （free==0 / relief_exhausted / exec==0 / malformed==0）逐条裁决；`stuck:` 永不产生。
+        if freed <= 0:
+            self.slot_relief_today = max(int(self.slot_relief_today), int(SLOT_RELIEF_MAX))
         return False
 
     def _end_inventory_blocked(self, obs: dict[str, Any], rep: DayReport) -> str:
@@ -6483,13 +6673,20 @@ class LongRun:
         否则"背包满 + 多格熟作物"会被报成 `no_work`（假达标）或 `stuck`（误报卡死），
         而真实情况是"不是没活，是背包堵住"。
 
-        语义边界：`inventory_blocked` **不在** `JUSTIFIED_END_REASONS` 里 ⇒ `day_justified=False`
-        ⇒ 当天如实不判 VERIFIED；`no_slot` 不是 hard failure（`failed_steps` 不计）⇒
-        `no_hard_failures` 仍为真。返回值 = 最终的 `ended_by`。
+        语义边界（【task-28 卡 D】更新）：本方法**只能**在 `_note_inventory_blocked` 四门槛
+        全过、`inventory_blocked_today` 已置位后被调用（调用点都先过那个门槛）；因此
+        `ended_by=inventory_blocked` 本身即"带证据的诚实收工"。`day_justified` 由
+        `is_justified_end()` 的 `HONEST_INVENTORY_END_REASONS` 分支判：**要求 `ended_by` 是
+        `inventory_blocked` 且 `pending_executable==0`**（`stuck` 永不认）。`no_slot` 不是 hard
+        failure（`failed_steps` 不计）⇒ `no_hard_failures` 仍为真。返回值 = 最终的 `ended_by`。
         """
         free_slots, _need, _status = self._bag_state(obs)
+        ev = self.bag_evidence_today or self._bag_relief_evidence(obs)
         why = (f"背包满（空格 {free_slots}）且今天已经腾不出格子：不是没活、也不是 stuck —— "
-               f"是背包堵住（先去出货/卖材料腾格，明天再收）")
+               f"是背包堵住（可卖叠 {int(ev.get('sellable_above_keep') or 0)} 叠、"
+               f"轮数 {int(ev.get('relief_rounds') or 0)}/{int(ev.get('relief_round_limit') or 0)}、"
+               f"叠数 {int(ev.get('sold_stacks') or 0)}/{int(ev.get('sold_stack_limit') or 0)}）"
+               f"；证据门槛 4/4 已过（free_slots==0 / relief_exhausted / exec==0 / malformed==0）")
         slept_by, slept_reason = self._do_sleep(obs, rep, f"inventory_blocked:{why}")
         if slept_by == "sleep_failed":
             rep.ended_by, rep.ended_reason = slept_by, slept_reason
@@ -8898,6 +9095,11 @@ class LongRun:
         self.loot_lost_noted = False
         self.slot_pressure_noted = False
         self.buy_full_noted = False
+        # 【task-28 卡 D】`inventory_blocked` 证据 / 满包清障闸的日级状态每天清零。
+        self.bag_evidence_today = {}
+        self.bag_relief_exhausted_today = False
+        self.clear_area_bag_gate_noted = False
+        self.bag_gate_reject_noted = False
         # 【task-218】砍树日预算：每天清零（日上限 + 浇水预备线，见 `_tree_budget_left`）。
         self.trees_cleared_today = 0
         self.tree_budget_noted = False
@@ -9773,6 +9975,19 @@ class LongRun:
         # `pending_stalled_tiles` 让"停滞/挡死"能逐格对账（不是只报一个数）。
         rep.pending_executable_tiles = list(snap.get("executable_tiles") or [])[:8]
         rep.pending_stalled_tiles = list(snap.get("stalled_tiles") or [])[:8]
+        # 【task-28 卡 D B】"腾不出"证据快照（只读）：即使当天没走 `_note_inventory_blocked`
+        # （例如从未满包），日终也留一份可复核读数 —— `relief_exhausted` + `bag_evidence`。
+        # 判据语义不动：只有 ended_by=inventory_blocked 且 exec/malformed==0 时 day_justified 才认。
+        if not rep.bag_evidence:
+            rep.bag_evidence = self._bag_relief_evidence(outdoor_obs)
+        rep.relief_exhausted = bool(rep.bag_evidence.get("exhausted"))
+        # 【task-28 卡 D C】满包清障闸也在日终 notes 里留一句（journal 里已有 slot_relief
+        # trigger=clear_gate；这里让人读 day_end 文本就能看到"今天没新开清障"）。
+        if self.clear_area_bag_gate_noted:
+            rep.notes.append(
+                f"满包清障闸：背包 0 空格且腾格手段用尽 ⇒ 今天不新开 clear_area"
+                f"（loot_lost_steps={int(self.loot_lost_steps_today)}/"
+                f"{int(CLEAR_LOOT_LOSS_MAX_STEPS)}，落地丢失只 info 不进 checks）")
         if rep.pending_ledger or rep.pending_stalled or rep.pending_blocked:
             rep.notes.append(
                 f"日终账本：原始 {rep.pending_ledger} 格（守卫口径 {rep.pending_guard} 格、"
@@ -9798,8 +10013,9 @@ class LongRun:
         rep.checks = {
             # 【task-198】`inventory_blocked` 也是"我们睡下去让游戏日翻篇了"（`_do_sleep` 成功），
             # 只是收尾原因写成了背包堵住 —— 所以 `slept_by_us` 必须为真，否则报告会说谎。
-            # 它**不会**因此算达标：`day_justified` 只认 `is_justified_end()` 的白名单，
-            # `inventory_blocked` 不在其中 ⇒ 当天如实不判 VERIFIED。
+            # 【task-28 卡 D】它是否算达标只看 `is_justified_end()` 的**证据门槛**：
+            # `inventory_blocked` 已进诚实收工白名单，但必须 `pending_executable==0` 且
+            # `pending_malformed==0`（四门槛在 `_note_inventory_blocked` 已先过）；`stuck:` 永不认。
             "slept_by_us": self._slept_by_us(rep),
             # task-11：被不可逆/不敢关的模态挡住（职业选择、存档超时）时，这一天**不算数**。
             # 用户 m03224 拍板了职业路线：宁可停下等人，也不静默丢档。

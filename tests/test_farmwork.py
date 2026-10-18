@@ -25,7 +25,7 @@ from agentfarm.bridge import BridgeError  # noqa: E402
 from agentfarm.farmwork import (  # noqa: E402
     NEIGHBORS, NO_SLOT_CODE, FarmWorker, KIND_TOOL, LOOT_CONFIRM_TRIES, LOOT_CONFIRM_WAIT_S,
     MAX_CLEAR_SWINGS, TREE_SWING_CALLS, StepResult as SR, StageResult,
-    SURPLUS_MATERIAL_IDS, buy_count_for, farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles,
+    SURPLUS_MATERIAL_IDS, SELLABLE_SURPLUS_IDS, buy_count_for, farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles,
     farm_empty_dirt, has_seed_metadata, is_seed_offer, plantable_seeds, seed_season_state,
     is_unreachable, pick_seed_offer, player_free_slots, seed_offers_from, surplus_sell_plan,
     SLOT_RELIEF_CROP_IDS, SLOT_RELIEF_HIGH_VALUE_IDS, SLOT_RELIEF_KEEP,
@@ -2239,6 +2239,12 @@ class TestTask55SurplusPlan(unittest.TestCase):
     "卖哪几叠、留多少"算清楚（整叠出货没有"卖一部分"的能力）。四条纪律各有对应用例：
     三条门闸、fail-closed 白名单、留够 K、以及"唯一一大叠"时的如实标记。
 
+    【task-28 卡 D 口径收敛】白名单只留**作物/树液/史莱姆/矿物晶石**；Wood/Stone/Clay/
+    Fiber/Coal/Copper·Iron·Gold·Iridium·Radioactive Ore 及锭类**全部移出**（它们是建材/升级
+    材料，卖了一时腾格、长期更贵）。所以本类夹具从"木材/石头/纤维"改为"作物/树液"，断言
+    语义不变（留够 K、整叠、门闸、下界估计）；另加一条"建材/矿石永不进名单"的反向用例见
+    `TestTask232SlotReliefPlan`。
+
     变异自检（`%TEMP%\\t55_mutate.py`，复制 brain+tests 到临时目录做文本替换、跑完即弃）：
     基线 14/14 绿；**m55a**（去掉门闸里的 `money < threshold` 条件）⇒ 红 2
     （`test_no_sell_when_money_seeds_or_dirt_are_fine` + `test_three_gates_decide_whether_to_sell`）；
@@ -2246,11 +2252,11 @@ class TestTask55SurplusPlan(unittest.TestCase):
     **m55c**（`cannot_afford` 事件改名藏证据）⇒ 红 1。
     """
 
-    #: 材料叠（`ItemView` 形态）。Wood 25 / Stone 3 / Fiber 10。
+    #: 可卖叠（`ItemView` 形态）。Parsnip 25 / Wheat 3 / Sap 10（task-28 后建材不再可卖）。
     MATERIALS = [
-        {"slot": 6, "id": "388", "qualifiedId": "(O)388", "name": "Wood", "stack": 25, "isTool": False},
-        {"slot": 7, "id": "390", "qualifiedId": "(O)390", "name": "Stone", "stack": 3, "isTool": False},
-        {"slot": 8, "id": "771", "qualifiedId": "(O)771", "name": "Fiber", "stack": 10, "isTool": False},
+        {"slot": 6, "id": "24", "qualifiedId": "(O)24", "name": "Parsnip", "stack": 25, "isTool": False},
+        {"slot": 7, "id": "262", "qualifiedId": "(O)262", "name": "Wheat", "stack": 3, "isTool": False},
+        {"slot": 8, "id": "92", "qualifiedId": "(O)92", "name": "Sap", "stack": 10, "isTool": False},
     ]
     FARM = {"loaded": True, "complete": True, "emptyDirt": 40, "hoeDirt": 0, "crops": 0}
 
@@ -2279,24 +2285,24 @@ class TestTask55SurplusPlan(unittest.TestCase):
     def test_sells_only_the_excess_above_keep(self):
         """每 id 留够 K=10：**整叠**出货 ⇒ 只有"卖掉这叠后仍 >=K"的叠才进名单。
 
-        Wood 共 30（25 + 5 两叠）⇒ 卖 5 那叠、留 25；Stone 3、Fiber 恰好 10 一件不动。
+        Parsnip 共 30（25 + 5 两叠）⇒ 卖 5 那叠、留 25；Wheat 3、Sap 恰好 10 一件不动。
         """
         inv = [
-            {"slot": 6, "id": "388", "qualifiedId": "(O)388", "name": "Wood", "stack": 25, "isTool": False},
-            {"slot": 7, "id": "388", "qualifiedId": "(O)388", "name": "Wood", "stack": 5, "isTool": False},
-            {"slot": 8, "id": "390", "qualifiedId": "(O)390", "name": "Stone", "stack": 3, "isTool": False},
-            {"slot": 9, "id": "771", "qualifiedId": "(O)771", "name": "Fiber", "stack": 10, "isTool": False},
+            {"slot": 6, "id": "24", "qualifiedId": "(O)24", "name": "Parsnip", "stack": 25, "isTool": False},
+            {"slot": 7, "id": "24", "qualifiedId": "(O)24", "name": "Parsnip", "stack": 5, "isTool": False},
+            {"slot": 8, "id": "262", "qualifiedId": "(O)262", "name": "Wheat", "stack": 3, "isTool": False},
+            {"slot": 9, "id": "92", "qualifiedId": "(O)92", "name": "Sap", "stack": 10, "isTool": False},
         ]
         plan = surplus_sell_plan(self._world(inventory=inv).obs())
         self.assertTrue(plan["should"])
         self.assertEqual(plan["slots"], [7])
-        self.assertEqual(plan["whitelist"], ["(O)388"])
+        self.assertEqual(plan["whitelist"], ["(O)24"])
         self.assertFalse(plan["belowKeep"])
         by_id = {i["id"]: i for i in plan["items"]}
-        self.assertEqual((by_id["(O)388"]["total"], by_id["(O)388"]["sell"],
-                          by_id["(O)388"]["left"]), (30, 5, 25))
-        self.assertEqual(by_id["(O)390"]["sell"], 0)
-        self.assertEqual((by_id["(O)771"]["total"], by_id["(O)771"]["sell"]), (10, 0))
+        self.assertEqual((by_id["(O)24"]["total"], by_id["(O)24"]["sell"],
+                          by_id["(O)24"]["left"]), (30, 5, 25))
+        self.assertEqual(by_id["(O)262"]["sell"], 0)
+        self.assertEqual((by_id["(O)92"]["total"], by_id["(O)92"]["sell"]), (10, 0))
         self.assertEqual(plan["trigger"], {"money": 14, "seeds": 0, "emptyDirt": 40,
                                            "emptyDirtStatus": "ok", "seedPrice": 20,
                                            "threshold": 100, "keep": 10,
@@ -2305,10 +2311,11 @@ class TestTask55SurplusPlan(unittest.TestCase):
                                            "freeSlots": None, "freeSlotsStatus": "unavailable",
                                            "slotsNeeded": 1})
 
-    def test_never_offers_tools_seeds_crops_or_artisan_goods(self):
-        """fail-closed：材料 id 表外的一律不卖（工具/种子/作物/工匠品）。
+    def test_never_offers_tools_seeds_or_artisan_goods(self):
+        """fail-closed：可卖 id 表外的一律不卖（工具/种子/工匠品）。
 
-        账本 `items` 只列**材料表里出现过的 id**；工具/种子/作物/工匠品连条目都不该有。
+        【task-28 卡 D】作物/矿物晶石在表内（本用例里 Geode 可卖）；工具、种子、工匠品
+        （Wine）连条目都不该有。账本 `items` 只列表里出现过的 id。
         """
         inv = [
             {"slot": 0, "id": "Axe", "qualifiedId": "(T)Axe", "name": "Axe", "stack": 1, "isTool": True},
@@ -2317,16 +2324,19 @@ class TestTask55SurplusPlan(unittest.TestCase):
              "stack": 0, "isTool": False},
             {"slot": 6, "id": "24", "qualifiedId": "(O)24", "name": "Parsnip", "stack": 50, "isTool": False},
             {"slot": 7, "id": "348", "qualifiedId": "(O)348", "name": "Wine", "stack": 60, "isTool": False},
-            {"slot": 8, "id": "390", "qualifiedId": "(O)390", "name": "Stone", "stack": 99, "isTool": False},
+            {"slot": 8, "id": "535", "qualifiedId": "(O)535", "name": "Geode", "stack": 99, "isTool": False},
         ]
         plan = surplus_sell_plan(self._world(inventory=inv).obs())
         self.assertTrue(plan["gate"])
-        # 只有材料表里的 Stone 能卖；99-99=0 < K ⇒ 走"唯一一大叠"的如实标记路径
-        self.assertEqual(plan["whitelist"], ["(O)390"])
+        # 只有表内 id 能进名单：唯一一大叠的破例路径选中最大的一叠（Geode 99）
+        self.assertEqual(plan["whitelist"], ["(O)535"])
         self.assertEqual(plan["slots"], [8])
         self.assertTrue(plan["belowKeep"])
-        self.assertEqual({i["id"] for i in plan["items"]}, {"(O)390"})
-        for foreign in ("(O)24", "(O)348", "(O)472", "(T)Axe", "(W)47"):
+        self.assertEqual({i["id"] for i in plan["items"]}, {"(O)24", "(O)535"})
+        by_id = {i["id"]: i for i in plan["items"]}
+        self.assertEqual(by_id["(O)535"]["sell"], 99)      # 破例整叠卖的是 Geode
+        self.assertEqual(by_id["(O)24"]["sell"], 0)        # 作物留着（本路径只挑最大一叠）
+        for foreign in ("(T)Axe", "(W)47", "(O)472", "(O)348"):
             self.assertNotIn(foreign, plan["whitelist"], foreign)
             self.assertNotIn(foreign, [i["id"] for i in plan["items"]], foreign)
 
@@ -2336,7 +2346,7 @@ class TestTask55SurplusPlan(unittest.TestCase):
         这里钉死选"卖"并把"卖完低于 K"如实标进账本 —— 而不是悄悄留着不卖（run7 里那 5 次
         `seed_gate {seeds:0, money:14}` 就是这么来的）。
         """
-        inv = [{"slot": 6, "id": "390", "qualifiedId": "(O)390", "name": "Stone",
+        inv = [{"slot": 6, "id": "262", "qualifiedId": "(O)262", "name": "Wheat",
                 "stack": 200, "isTool": False}]
         plan = surplus_sell_plan(self._world(inventory=inv).obs())
         self.assertEqual(plan["slots"], [6])
@@ -2344,11 +2354,11 @@ class TestTask55SurplusPlan(unittest.TestCase):
         self.assertEqual(plan["items"][0]["left"], 0)
         self.assertTrue(plan["items"][0]["keptBelowKeep"])
         # 小叠（< K）不动：12 件分成 4+4+4 ⇒ 没有任何一叠大到值得破坏保留线
-        small = [{"slot": 6, "id": "390", "qualifiedId": "(O)390", "name": "Stone",
+        small = [{"slot": 6, "id": "262", "qualifiedId": "(O)262", "name": "Wheat",
                   "stack": 4, "isTool": False},
-                 {"slot": 7, "id": "390", "qualifiedId": "(O)390", "name": "Stone",
+                 {"slot": 7, "id": "262", "qualifiedId": "(O)262", "name": "Wheat",
                   "stack": 4, "isTool": False},
-                 {"slot": 8, "id": "390", "qualifiedId": "(O)390", "name": "Stone",
+                 {"slot": 8, "id": "262", "qualifiedId": "(O)262", "name": "Wheat",
                   "stack": 4, "isTool": False}]
         plan2 = surplus_sell_plan(self._world(inventory=small).obs())
         self.assertEqual(plan2["should"], False)
@@ -2356,21 +2366,21 @@ class TestTask55SurplusPlan(unittest.TestCase):
         self.assertFalse(plan2["belowKeep"])
 
     def test_keep_line_is_respected_when_a_small_stack_can_be_sold(self):
-        """多叠时优先卖**大叠**、但绝不跌破 K（Stone 190+10 ⇒ 卖 190、留 10 == K）。"""
-        inv = [{"slot": 6, "id": "390", "qualifiedId": "(O)390", "name": "Stone",
+        """多叠时优先卖**大叠**、但绝不跌破 K（Wheat 190+10 ⇒ 卖 190、留 10 == K）。"""
+        inv = [{"slot": 6, "id": "262", "qualifiedId": "(O)262", "name": "Wheat",
                 "stack": 190, "isTool": False},
-               {"slot": 7, "id": "390", "qualifiedId": "(O)390", "name": "Stone",
+               {"slot": 7, "id": "262", "qualifiedId": "(O)262", "name": "Wheat",
                 "stack": 10, "isTool": False}]
         plan = surplus_sell_plan(self._world(inventory=inv).obs())
         self.assertEqual(plan["slots"], [6])
         self.assertFalse(plan["belowKeep"])
         by_id = {i["id"]: i for i in plan["items"]}
-        self.assertEqual((by_id["(O)390"]["total"], by_id["(O)390"]["sell"],
-                          by_id["(O)390"]["left"]), (200, 190, 10))
+        self.assertEqual((by_id["(O)262"]["total"], by_id["(O)262"]["sell"],
+                          by_id["(O)262"]["left"]), (200, 190, 10))
         # 反过来：只有小叠能卖（25 + 5 两叠）⇒ 卖 5、留 25（保住 K 且尽量少动材料）
-        inv2 = [{"slot": 6, "id": "390", "qualifiedId": "(O)390", "name": "Stone",
+        inv2 = [{"slot": 6, "id": "262", "qualifiedId": "(O)262", "name": "Wheat",
                  "stack": 25, "isTool": False},
-                {"slot": 7, "id": "390", "qualifiedId": "(O)390", "name": "Stone",
+                {"slot": 7, "id": "262", "qualifiedId": "(O)262", "name": "Wheat",
                  "stack": 5, "isTool": False}]
         plan2 = surplus_sell_plan(self._world(inventory=inv2).obs())
         self.assertEqual(plan2["slots"], [7])
@@ -2401,7 +2411,7 @@ class TestTask55SurplusPlan(unittest.TestCase):
         就干脆不动，并把缺口原文写进 `skipReason`（fail-closed：宁可少卖，不做"卖了还是买不起"）。
         反过来，下界够得上时仍照旧整叠卖并标 `belowKeep`（见下一条断言）。
         """
-        tiny = [{"slot": 6, "id": "390", "qualifiedId": "(O)390", "name": "Stone",
+        tiny = [{"slot": 6, "id": "262", "qualifiedId": "(O)262", "name": "Wheat",
                  "stack": 11, "isTool": False}]
         plan = surplus_sell_plan(self._world(money=0, inventory=tiny).obs())
         self.assertTrue(plan["gate"])
@@ -2412,7 +2422,7 @@ class TestTask55SurplusPlan(unittest.TestCase):
         self.assertIn("补不上", plan["skipReason"])
         self.assertIn("缺口 20g", plan["skipReason"])
         # 够得上：同样钱 0g、一大叠 30 件 ⇒ 30g >= 20g ⇒ 卖
-        enough = [{"slot": 6, "id": "390", "qualifiedId": "(O)390", "name": "Stone",
+        enough = [{"slot": 6, "id": "262", "qualifiedId": "(O)262", "name": "Wheat",
                    "stack": 30, "isTool": False}]
         plan2 = surplus_sell_plan(self._world(money=0, inventory=enough).obs())
         self.assertTrue(plan2["should"])
@@ -2438,32 +2448,41 @@ class TestTask55SurplusPlan(unittest.TestCase):
         self.assertFalse(plan["should"])
         self.assertEqual(plan["slots"], [])
         self.assertEqual(plan["whitelist"], [])
-        # ② 名字像种子的材料 id（"Stone Seeds" + (O)390）⇒ 同样按种子计数 ⇒ 门闸关闭
+        # ② 名字像种子的**可卖 id**（"Parsnip Seeds" + (O)24）⇒ 同样按种子计数 ⇒ 门闸关闭
         fake = self._world(inventory=[
-            {"slot": 6, "id": "390", "qualifiedId": "(O)390", "name": "Stone Seeds",
+            {"slot": 6, "id": "24", "qualifiedId": "(O)24", "name": "Parsnip Seeds",
              "stack": 99, "isTool": False}])
         plan2 = surplus_sell_plan(fake.obs())
         self.assertFalse(plan2["gate"])
         self.assertEqual(plan2["slots"], [])
         self.assertEqual([i["id"] for i in plan2["items"]], [])
-        # ③ 只有真材料才算：工具（isTool=True，id 388）+ Stone 99 ⇒ 白名单只有 Stone
+        # ③ 只有真可卖叠才算：工具（isTool=True，可卖 id 24）+ Wheat 99 ⇒ 白名单只有 Wheat
         mixed = self._world(inventory=[
-            {"slot": 5, "id": "388", "qualifiedId": "(O)388", "name": "Wood",
+            {"slot": 5, "id": "24", "qualifiedId": "(O)24", "name": "Parsnip",
              "stack": 99, "isTool": True},
-            {"slot": 8, "id": "390", "qualifiedId": "(O)390", "name": "Stone",
+            {"slot": 8, "id": "262", "qualifiedId": "(O)262", "name": "Wheat",
              "stack": 99, "isTool": False}])
         plan3 = surplus_sell_plan(mixed.obs())
         self.assertTrue(plan3["gate"])
-        self.assertEqual(plan3["whitelist"], ["(O)390"])
+        self.assertEqual(plan3["whitelist"], ["(O)262"])
         self.assertEqual(plan3["slots"], [8])
-        self.assertEqual({i["id"] for i in plan3["items"]}, {"(O)390"})
+        self.assertEqual({i["id"] for i in plan3["items"]}, {"(O)262"})
 
-    def test_material_id_table_is_documented_and_small(self):
-        """白名单表必须是"已知资源 id"的小表（防止有人顺手加个通配规则把种子也算进去）。"""
-        self.assertIn("390", SURPLUS_MATERIAL_IDS)
-        self.assertIn("388", SURPLUS_MATERIAL_IDS)
+    def test_sellable_id_table_is_documented_and_small(self):
+        """【task-28 卡 D】可卖表只剩"作物/树液/史莱姆/矿物晶石"的已知 id：
+
+        建材/矿石/锭类（Wood/Stone/Clay/Fiber/Coal/ores/bars）**结构性地**不在表里；
+        作物/树液/晶石在表里。防止有人顺手加个通配规则把矿石/建材又算回去。
+        """
+        self.assertIn("92", SURPLUS_MATERIAL_IDS)      # Sap
+        self.assertIn("766", SURPLUS_MATERIAL_IDS)     # Slime
+        for banned in ("388", "390", "771", "330", "382", "378", "380", "384", "386", "909"):
+            self.assertNotIn(banned, SURPLUS_MATERIAL_IDS, banned)
         self.assertNotIn("472", SURPLUS_MATERIAL_IDS)     # 防风草种子
-        self.assertNotIn("24", SURPLUS_MATERIAL_IDS)      # 防风草（作物）
+        # 作物/晶石走独立的 id 表，但同样是"可卖"集合的一部分
+        self.assertIn("24", SELLABLE_SURPLUS_IDS)       # Parsnip
+        self.assertIn("262", SELLABLE_SURPLUS_IDS)      # Wheat
+        self.assertIn("535", SELLABLE_SURPLUS_IDS)      # Geode
 
 
 class TestTask102PlayerFreeSlots(unittest.TestCase):
@@ -3513,14 +3532,14 @@ class TestTask232SlotReliefPlan(unittest.TestCase):
         self.assertEqual(self._plan(inv, free=0, status="unavailable")["items"], [])
 
     def test_true_surplus_is_sold_and_keep_is_preserved(self):
-        inv = [self._row(0, "(O)388", "Wood", 99), self._row(1, "(O)388", "Wood", 99)]
+        inv = [self._row(0, "(O)262", "Wheat", 99), self._row(1, "(O)262", "Wheat", 99)]
         plan = self._plan(inv)
         self.assertTrue(plan["pressure"])
         self.assertTrue(plan["slots"])
         item = plan["items"][0]
-        self.assertEqual(item["qid"], "(O)388")
+        self.assertEqual(item["qid"], "(O)262")
         self.assertFalse(item["belowKeep"])
-        total = sum(int(r.get("stack") or 0) for r in inv if r.get("qualifiedId") == "(O)388")
+        total = sum(int(r.get("stack") or 0) for r in inv if r.get("qualifiedId") == "(O)262")
         self.assertGreaterEqual(total - int(item["stack"]), self.K)
 
     def test_tier_priority_crop_then_material_then_high_value(self):
@@ -3559,9 +3578,9 @@ class TestTask232SlotReliefPlan(unittest.TestCase):
         self.assertIn("below_keep_whole_stack", item["why"])
 
     def test_max_stacks_limits_the_plan(self):
-        inv = [self._row(0, "(O)388", "Wood", 99), self._row(1, "(O)388", "Wood", 99),
-               self._row(2, "(O)390", "Stone", 99), self._row(3, "(O)390", "Stone", 99),
-               self._row(4, "(O)771", "Fiber", 99), self._row(5, "(O)771", "Fiber", 99)]
+        inv = [self._row(0, "(O)262", "Wheat", 99), self._row(1, "(O)262", "Wheat", 99),
+               self._row(2, "(O)92", "Sap", 99), self._row(3, "(O)92", "Sap", 99),
+               self._row(4, "(O)535", "Geode", 99), self._row(5, "(O)535", "Geode", 99)]
         plan = self._plan(inv, max_stacks=2)
         self.assertLessEqual(len(plan["items"]), 2)
         self.assertLessEqual(len(plan["items"]), SLOT_RELIEF_MAX_STACKS)
@@ -3572,56 +3591,61 @@ class TestTask232SlotReliefPlan(unittest.TestCase):
 
         红线：旧版按原始总量逐叠判"卖后 ≥K"，会同时选中两叠 ⇒ 卖完剩 0 < K。
         """
-        inv = [self._row(0, "(O)388", "Wood", 99), self._row(1, "(O)388", "Wood", 99)]
+        inv = [self._row(0, "(O)262", "Wheat", 99), self._row(1, "(O)262", "Wheat", 99)]
         plan = self._plan(inv, max_stacks=5)
         self.assertEqual(len(plan["items"]), 1)        # 只许卖一叠（卖两叠会剩 0 < K）
         left = 2 * 99 - sum(int(it["stack"]) for it in plan["items"])
         self.assertGreaterEqual(left, self.K)
         # 三叠各 99 时可以卖两叠（剩 99 ≥ K）
-        inv3 = inv + [self._row(2, "(O)388", "Wood", 99)]
+        inv3 = inv + [self._row(2, "(O)262", "Wheat", 99)]
         plan3 = self._plan(inv3, max_stacks=5)
         self.assertEqual(len(plan3["items"]), 2)
         left3 = 3 * 99 - sum(int(it["stack"]) for it in plan3["items"])
         self.assertGreaterEqual(left3, self.K)
 
     def test_prefer_qids_puts_todays_harvest_first(self):
-        """【task-237】`prefer_qids`（今天亲手收获的作物）排在材料档之前。"""
+        """【task-237】`prefer_qids`（今天亲手收获的作物）排在高价值晶石之前。"""
         inv = [self._row(0, "(O)262", "Wheat", 30),     # crop（tier1）
                self._row(1, "(O)262", "Wheat", 30),
-               self._row(2, "(O)388", "Wood", 99),      # material（tier2）
-               self._row(3, "(O)388", "Wood", 99)]
+               self._row(2, "(O)535", "Geode", 99),      # high_value（tier3）
+               self._row(3, "(O)535", "Geode", 99)]
         plan = self._plan(inv, max_stacks=1)
         self.assertEqual(plan["items"][0]["qid"], "(O)262")   # 无偏好：作物档优先
-        plan_pref = self._plan(inv, max_stacks=1, prefer_qids=["(O)388"])
-        self.assertEqual(plan_pref["items"][0]["qid"], "(O)388")  # 有偏好 ⇒ 今天的收获先卖
+        plan_pref = self._plan(inv, max_stacks=1, prefer_qids=["(O)535"])
+        self.assertEqual(plan_pref["items"][0]["qid"], "(O)535")  # 有偏好 ⇒ 今天的收获先卖
 
-    # ---- 【task-232 增量・Lead m21874】建造预留覆盖 K ----
-    def test_reserve_table_overrides_keep_for_building_materials(self):
-        """铜矿 30（25+5 两叠）⇒ 只卖那 5 个，卖完仍留 25（熔炉 20 + 5 锭）。"""
-        self.assertEqual(SLOT_RELIEF_RESERVES.get("(O)378"), 25)
+    # ---- 【task-28 卡 D】建材/矿石/锭类**结构性**不进可卖白名单 ----
+    def test_building_materials_and_ores_are_never_candidates_even_above_keep(self):
+        """Wood/Stone/Copper Ore 再多也不卖：腾格只动作物/树液/晶石。
+
+        旧口径下铜矿走"建造预留 25"、石头走"预留 30"；卡 D 把它们**整体移出**白名单
+        （预留表清空）⇒ 即使每种 30 件，`slot_relief_plan` 也一格不选、明说不在表内。
+        """
+        self.assertEqual(SLOT_RELIEF_RESERVES, {})
         inv = [self._row(0, "(O)378", "Copper Ore", 25),
-               self._row(1, "(O)378", "Copper Ore", 5)]
+               self._row(1, "(O)378", "Copper Ore", 5),
+               self._row(2, "(O)390", "Stone", 30),
+               self._row(3, "(O)390", "Stone", 5),
+               self._row(4, "(O)388", "Wood", 99)]
         plan = self._plan(inv)
-        self.assertEqual(len(plan["items"]), 1, plan)
-        item = plan["items"][0]
-        self.assertEqual(item["qid"], "(O)378")
-        self.assertEqual(int(item["stack"]), 5)          # 只卖超出预留的 5 个
-        self.assertFalse(item["belowKeep"])
-        self.assertTrue(item["reserved"])
-        self.assertEqual(int(item["keep"]), 25)          # 用 reserve 覆盖了 K=10
+        self.assertTrue(plan["pressure"])
+        self.assertEqual(plan["items"], [])
+        self.assertEqual(plan["slots"], [])
+        self.assertTrue(plan["skipReason"])
 
     def test_reserved_material_below_reserve_is_never_sold(self):
-        """石头 28 < 预留 30：整叠卖空会破坏熔炉计划 ⇒ 宁可不腾格。"""
-        self.assertEqual(SLOT_RELIEF_RESERVES.get("(O)390"), 30)
+        """【task-28】就算有"建造预留"记忆也不再回头卖：Stone 28 不进候选（不在白名单）。
+
+        保留这条用例是钉口径：卡的 A 段要求**结构上**移出，而不是"只在超预留时卖"。
+        """
         inv = [self._row(0, "(O)390", "Stone", 28)]
         plan = self._plan(inv)
         self.assertTrue(plan["pressure"])
         self.assertEqual(plan["items"], [])
         self.assertEqual(plan["slots"], [])
-        self.assertIn("建造预留", plan["skipReason"])
 
     def test_reserved_material_single_stack_over_reserve_is_not_sold_whole(self):
-        """铜矿单叠 30 > 预留 25：卖这一叠剩 0 < 25 ⇒ 也不许卖（游戏只能整叠卖）。"""
+        """【task-28】铜矿单叠 30 也不卖（旧口径"超预留"分支随预留表一起清空）。"""
         inv = [self._row(0, "(O)378", "Copper Ore", 30)]
         plan = self._plan(inv)
         self.assertEqual(plan["items"], [])
