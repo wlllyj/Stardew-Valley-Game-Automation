@@ -623,6 +623,28 @@ namespace AgentFarm.Bridge.Tests
                      == "spring,summer,fall",
                   "0.7.41 冒烟 day1 的真实形态：Wheat Seeds 在 winter 判 false（守卫据此闭嘴，诚实 no_work）");
 
+            // ---------------- task-245：`ui.eventId` 的三态归一 ----------------
+            // 0.7.42 冒烟冬 7 开局：`eventUp=true` 但读不到/没记事件 id ⇒ 无法归因"是哪条事件"，
+            // 只能写"event_wait 等满 60s 后 blocked"。这里钉住三件事：
+            //   ①有事件 + 有 id ⇒ 原样（去空白）；
+            //   ②有事件 + id 读不到 ⇒ null（**不能**用空串冒充"有值"）；
+            //   ③没有事件 ⇒ null，即使调用方传了 id（不许把上一个事件的 id 挂到空事件上）。
+            Check("t245_event_id_keeps_real_id",
+                  EventRules.IdFor(true, "900553") == "900553"
+                  && EventRules.IdFor(true, "  900553  ") == "900553",
+                  "有事件 + 真实 id ⇒ 原样返回（首尾空白去掉）");
+
+            Check("t245_event_id_unknown_is_null_not_empty",
+                  EventRules.IdFor(true, null) == null
+                  && EventRules.IdFor(true, "") == null
+                  && EventRules.IdFor(true, "   ") == null,
+                  "有事件但 id 读不到/为空 ⇒ null（脑侧三态里的「未知」，绝不当空串有值）");
+
+            Check("t245_no_event_means_no_id",
+                  EventRules.IdFor(false, "900553") == null
+                  && EventRules.IdFor(false, null) == null,
+                  "没有事件 ⇒ null（哪怕调用方传了 id，也不许把旧事件的 id 挂上来）");
+
             Console.WriteLine(_failed == 0
                 ? $"OK {_total} 断言全部通过"
                 : $"FAILED {_failed} 条断言不通过（共 {_total} 条）");

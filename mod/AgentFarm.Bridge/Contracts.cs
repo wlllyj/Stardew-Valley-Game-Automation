@@ -1008,6 +1008,22 @@ namespace AgentFarm.Bridge
         [JsonPropertyName("eventUp")] public bool EventUp { get; set; }
 
         /// <summary>
+        /// 【task-245】当前事件 id（<c>Game1.currentEvent?.id</c>），用于归因"是哪条事件把自己挂住了"。
+        ///
+        /// **三态**（脑侧必须分清）：
+        ///   * 有值（例 <c>"900553"</c>）⇒ 事件在跑且读到了 id；
+        ///   * <c>null</c> ⇒ 事件在跑或不在跑，但**读不到 id**（旧版本/构造中的事件）⇒ 无法归因；
+        ///   * 字段缺失 ⇒ 旧 Mod（&lt; 0.7.43）⇒ 无法归因。
+        ///
+        /// 为什么用 <see cref="JsonIgnoreCondition.Never"/> 强制序列化：全局
+        /// <c>DefaultIgnoreCondition = WhenWritingNull</c> 会把 null 键整块省掉，
+        /// 于是"有事件但 id=null"与"旧 Mod 缺字段"再也分不开（task-176 踩过一次）。
+        /// </summary>
+        [JsonPropertyName("eventId")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+        public string EventId { get; set; }
+
+        /// <summary>
         /// <c>Game1.onScreenMenus.Count</c>。
         /// ⚠️ 这**不是**“对话框数量”：onScreenMenus 是常驻 HUD（时钟、体力条、金钱、任务提示等），
         /// 实测恒为 4。v1 的 dialogsOnScreen 字段名误导过“脑”，v2 已改名。

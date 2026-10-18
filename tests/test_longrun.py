@@ -42,6 +42,7 @@ from agentfarm.longrun import (  # noqa: E402
     ACTIONLESS_TASKS, CLEANUP_DISMISS_MAX, CLEARABLE_KINDS, DEFAULT_LLM_MAX_TOKENS,
     ENDED_BY_EVENT, ENDED_BY_MODAL,
     EVENT_ADVANCE_DAY_STEPS, EVENT_ADVANCE_MAX_STEPS, EVENT_STALL_GIVE_UP,
+    EVENT_WAIT_SECONDS, EVENT_WAIT_TRIES,
     FAR_DRY_MAX_TRIES, FAR_DRY_OPEN_MAX, FAR_DRY_REFILL_MAX,
     FRONTIER_CLEAR_MAX, INTENT_REASON_CODES, JUSTIFIED_END_REASONS, MAX_BUY_TRIES_PER_DAY,
     MAX_ENV_ATTEMPTS,
@@ -12168,6 +12169,170 @@ class TestTask242ClearAreaEvidence(unittest.TestCase):
                 self.assertEqual(stage["already"], delta, "旧账本差额 = already 步数")
                 self.assertEqual(stage["attempted_ok"], delta)
                 self.assertEqual(stage["unclear"], 0)
+
+
+class TestTask245EventWait(unittest.TestCase):
+    """task-245：`eventUp=true` 但**没有对话盒**时先有界等待，别一开局就白收尾。
+
+    0.7.42 冒烟冬 7 开局（`docs/_smoke-0742.md`）：`ui.eventUp=true`、事件对话盒还没开
+    ⇒ 旧政策立刻 `event_blocked`，整条长跑 4.92 分钟白收尾，账本连"是哪条事件"都写不出来。
+    修法 = `EVENT_WAIT_TRIES × EVENT_WAIT_SECONDS`（4×15s = 60s）有界等待 + Mod 的
+    `ui.eventId` 归因；等待期间**一次都不动手**（不 dismiss / 不 sleep / 不 load_save）。
+
+    边界（task-41 / task-228 不回归）：
+      * 有对话盒但推不动（提问 / 职业选择 / 连续 stalled）⇒ **立刻**硬停，0 轮等待；
+      * 事件在等待中自己结束 ⇒ 回日循环继续干活，不 blocked；
+      * 对话盒在等待中出现 ⇒ 交回 task-228 的受控推进（不 dismiss、不 blocked）；
+      * 等满仍挂住 ⇒ `event_blocked` 带 `eventId` / `eventWaitTries` / `worldSeq`。
+
+    变异自检（2026-10-18，`scratch\\_t245_mutate.py`，实测杀数）：基线 7/7 绿；
+    m245a（去掉等待、退回立刻 `_event_blocked`）红 4；m245b（journal 不写 `eventId`）红 1；
+    m245c（等满仍返回 `still_blocked=False`）红 3。
+    """
+
+    def _run(self, w: FakeWorld) -> LongRun:
+        run = make_run(w, target_days=1)
+        run.worker = FakeWorker(w)
+        run.client = FakeClient(w)
+        return run
+
+    @staticmethod
+    def _rep() -> DayReport:
+        return DayReport(day_key=("spring", 1, 9), started_at=0.0)
+
+    @staticmethod
+    def _events(run: LongRun, event: str) -> list[dict]:
+        return [e for e in run.entries if e["event"] == event]
+
+    def test_event_without_dialogue_waits_bounded_then_blocks_with_event_id(self):
+        """①`eventUp=true` + 无对话盒 ⇒ 有界等 4 轮、带上 eventId 才诚实收尾。"""
+        w = FakeWorld(weeds=0)
+        w.ui_script = [{"activeMenu": "", "activeMenuText": "", "eventUp": True,
+                        "eventId": "900553"}]
+        run = self._run(w)
+        rep = self._rep()
+
+        obs, blocked = run._clear_modals(w.obs(), rep)
+
+        self.assertTrue(blocked)
+        waits = self._events(run, "event_wait")
+        self.assertEqual(len(waits), EVENT_WAIT_TRIES, run.entries)
+        self.assertEqual([e["tries"] for e in waits], list(range(1, EVENT_WAIT_TRIES + 1)))
+        for e in waits:
+            self.assertEqual(e["eventId"], "900553", e)
+            self.assertEqual(e["limit"], EVENT_WAIT_TRIES, e)
+            self.assertEqual(e["waitSeconds"], EVENT_WAIT_SECONDS, e)
+            self.assertTrue(e["eventUp"], e)
+        ev = self._events(run, "event_blocked")
+        self.assertEqual(len(ev), 1, run.entries)
+        self.assertEqual(ev[0]["eventId"], "900553", ev[0])
+        self.assertEqual(ev[0]["eventWaitTries"], EVENT_WAIT_TRIES, ev[0])
+        self.assertAlmostEqual(ev[0]["eventWaitSeconds"],
+                               EVENT_WAIT_TRIES * EVENT_WAIT_SECONDS)
+        self.assertIsNotNone(ev[0]["worldSeq"], ev[0])
+        self.assertEqual(w.dismiss_calls, 0, "事件等待期间绝不许关框")
+        self.assertEqual(w.sleeps, 0, "事件等待期间绝不许睡觉")
+        self.assertEqual(rep.ended_by, ENDED_BY_EVENT, rep.ended_reason)
+        self.assertIn("900553", rep.ended_reason)
+        self.assertIn("60s", rep.ended_reason)
+        self.assertFalse(rep.verified)
+
+    def test_event_ending_during_wait_is_not_blocked(self):
+        """②事件在等待中自己结束 ⇒ 回日循环，不写 `event_blocked`。"""
+        w = FakeWorld(weeds=0)
+        w.ui_script = [{"activeMenu": "", "eventUp": True, "eventId": "900553",
+                        "_autoGoneAfterPolls": 1}]
+        run = self._run(w)
+        rep = self._rep()
+
+        obs, blocked = run._clear_modals(w.obs(), rep)
+
+        self.assertFalse(blocked, rep.ended_reason)
+        self.assertEqual(len(self._events(run, "event_wait")), 1, run.entries)
+        self.assertEqual(len(self._events(run, "event_blocked")), 0, run.entries)
+        self.assertEqual(rep.ended_by, "")
+        self.assertEqual(w.dismiss_calls, 0)
+
+    def test_dialogue_appearing_during_wait_is_left_to_advance(self):
+        """③等待中出现非提问对话盒 ⇒ 交回 task-228 受控推进（不 dismiss / 不 blocked）。"""
+        w = FakeWorld(weeds=0)
+        w.ui_script = [
+            {"activeMenu": "", "eventUp": True, "eventId": "900553",
+             "_autoGoneAfterPolls": 1},
+            {"activeMenu": "DialogueBox", "activeMenuText": "开场白", "eventUp": True,
+             "dialogueResponses": [], "dialogueIsQuestion": False},
+        ]
+        run = self._run(w)
+        rep = self._rep()
+
+        obs, blocked = run._clear_modals(w.obs(), rep)
+
+        self.assertFalse(blocked, rep.ended_reason)
+        self.assertEqual(len(self._events(run, "event_wait")), 1, run.entries)
+        self.assertEqual(len(self._events(run, "event_blocked")), 0, run.entries)
+        self.assertTrue(run._event_advance_possible(obs), run._modal_info(obs))
+        self.assertEqual(w.dismiss_calls, 0)
+
+    def test_question_with_dialogue_stops_immediately_without_waiting(self):
+        """④提问对话 ⇒ 立刻硬停、0 轮等待（等待不能成为"碰一下"的借口）。"""
+        w = FakeWorld(weeds=0)
+        w.ui_script = [{"activeMenu": "DialogueBox", "eventUp": True,
+                        "dialogueIsQuestion": True, "dialogueResponses": ["Yes", "No"]}]
+        run = self._run(w)
+        rep = self._rep()
+
+        obs, blocked = run._clear_modals(w.obs(), rep)
+
+        self.assertTrue(blocked)
+        self.assertEqual(len(self._events(run, "event_wait")), 0,
+                         "有对话盒时不许用等待掩盖（提问必须立刻停）")
+        self.assertEqual(w.dismiss_calls, 0)
+        self.assertEqual(len(self._events(run, "event_blocked")), 1, run.entries)
+
+    def test_missing_event_id_is_recorded_as_unknown_not_empty(self):
+        """⑤旧 Mod / 读不到 id ⇒ eventId 落 None（三态的"未知"），reason 明说无法归因。"""
+        w = FakeWorld(weeds=0)
+        w.ui_script = [{"activeMenu": "", "eventUp": True}]     # 没有 eventId 字段
+        run = self._run(w)
+        rep = self._rep()
+
+        obs, blocked = run._clear_modals(w.obs(), rep)
+
+        self.assertTrue(blocked)
+        ev = self._events(run, "event_blocked")
+        self.assertEqual(len(ev), 1, run.entries)
+        self.assertIsNone(ev[0]["eventId"], ev[0])
+        self.assertIn("无法归因", rep.ended_reason)
+
+    def test_full_run_with_persistent_event_never_sleeps_or_dismisses(self):
+        """⑥整条 `run()`：事件挂住 ⇒ 有界等待后早退，0 次 dismiss / 0 次睡觉。"""
+        w = FakeWorld(weeds=4)
+        w.ui_script = [{"activeMenu": "", "eventUp": True, "eventId": "900553"}]
+        run = self._run(w)
+
+        code = run.run()
+
+        self.assertEqual(code, 1, run.logs)
+        self.assertEqual(len(run.days), 1, [d.day_text for d in run.days])
+        self.assertEqual(w.dismiss_calls, 0)
+        self.assertEqual(w.sleeps, 0)
+        self.assertEqual(len(self._events(run, "event_wait")), EVENT_WAIT_TRIES)
+        self.assertEqual(len(self._events(run, "event_blocked")), 1, run.entries)
+        self.assertEqual(run.days[0].checks.get("no_blocking_modal"), False)
+
+    def test_eventup_false_never_triggers_the_wait(self):
+        """⑦回归：`eventUp=false` 的普通对话 ⇒ 0 轮 `event_wait`，老处置一字不改。"""
+        w = FakeWorld(weeds=0)
+        w.ui_script = [{"activeMenu": "DialogueBox", "activeMenuText": "普通对话",
+                        "eventUp": False}]
+        run = self._run(w)
+        rep = self._rep()
+
+        obs, blocked = run._clear_modals(w.obs(), rep)
+
+        self.assertFalse(blocked, rep.ended_reason)
+        self.assertEqual(len(self._events(run, "event_wait")), 0, run.entries)
+        self.assertEqual(w.dismiss_calls, 1)
 
 
 if __name__ == "__main__":  # pragma: no cover

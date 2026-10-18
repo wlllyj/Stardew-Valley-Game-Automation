@@ -61,6 +61,10 @@
     <!-- task-240：种子季节判定（"有种子" ≠ "当季能种"）是纯逻辑 ⇒ 直接编译同一份源码跑行为断言；
          0.7.41 冒烟 day1 的 `stuck` 就是这条判据缺失（小麦冬季不可种、守卫却一直说该去种）。 -->
     <Compile Include="..\AgentFarm.Bridge\SeedRules.cs" />
+    <!-- task-245：`ui.eventId` 的三态归一（没有事件 ⇒ null / 有事件但读不到 id ⇒ null /
+         有 id ⇒ 去空白）是纯逻辑 ⇒ 直接编译同一份源码跑行为断言。
+         ReadUi 吃 Game1.currentEvent，判据留在那里就只能做源码文本断言（task-182 GAP-1 教训）。 -->
+    <Compile Include="..\AgentFarm.Bridge\EventRules.cs" />
   </ItemGroup>
 
 </Project>

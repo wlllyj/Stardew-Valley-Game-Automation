@@ -452,6 +452,19 @@ EVENT_ADVANCE_DAY_STEPS = 60
 EVENT_STALL_GIVE_UP = 2
 EVENT_ADVANCE_TIMEOUT_MS = 60000
 
+#: 【task-245】`eventUp=true` 但**没有可推进的对话盒**时的有界等待：4 × 15s ≈ 60s。
+#:
+#: 为什么需要它（0.7.42 冒烟冬 7 开局，`docs/_smoke-0742.md`）：开局事件刚切进来时
+#: `ui.eventUp=true` 但 `DialogueBox` 还没开（脚本在跑开场动画/等 pause），旧政策立刻
+#: `event_blocked` ⇒ 整条长跑 4.92 分钟白收尾，A″/B″ 一个臂就这么烧掉。
+#:
+#: 边界（task-41 不回归）：
+#:   * 等待期间**绝不** dismiss / sleep / load_save（一次都不动手）；
+#:   * 每轮重新观测：事件自己结束 ⇒ 回日循环继续干活；对话盒出现 ⇒ 交回 task-228 的受控推进；
+#:   * 等满 `EVENT_WAIT_TRIES` 仍挂住 ⇒ 才 `event_blocked`（带上 `eventId`/等了几轮/世界序号）。
+EVENT_WAIT_TRIES = 4
+EVENT_WAIT_SECONDS = 15.0
+
 
 def _dist(a: tuple[int, int], b: tuple[int, int]) -> int:
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
@@ -7455,6 +7468,40 @@ class LongRun:
                           status=status, reason=str(receipt.get("reason") or "")[:200])
         return obs
 
+    def _wait_event_up(self, obs: dict[str, Any]) -> tuple[dict[str, Any], bool, int]:
+        """【task-245】`eventUp=true` 且没有对话盒：**有界等待**事件自己开出对话盒。
+
+        返回 `(最新 obs, still_blocked, tries)`：
+
+          * `still_blocked=True` ⇒ 等满 :data:`EVENT_WAIT_TRIES` 仍 `eventUp` 且无对话盒
+            （调用方走 `_event_blocked` 诚实收尾，并把 `tries` 写进账）；
+          * `still_blocked=False` ⇒ 事件自己结束了，或者对话盒已经出现
+            （调用方回日循环：下一秒 `_advance_event_dialogue` 会接手非提问对话）。
+
+        每轮 journal `event_wait`（`tries/limit/eventId/eventUp/hasDialogue/worldSeq/
+        waitSeconds/note`），这样账本能回答"到底等了多久、事件 id 是什么、
+        等的时候世界序号有没有动"——0.7.42 冒烟冬 7 的教训：缺 `eventId` 时
+        连"是哪条事件"都说不出来。
+
+        为什么用 `self.sleep_fn`：长跑的等待一律走可注入的 sleep（测试里被替换成 no-op，
+        真机是 `time.sleep`），既不阻塞回合边界，也让单测保持毫秒级。
+        """
+        tries = 0
+        for tries in range(1, EVENT_WAIT_TRIES + 1):
+            self.sleep_fn(EVENT_WAIT_SECONDS)
+            obs = self._snap_or(obs)
+            ui = obs.get("ui") or {}
+            event_up, _is_question, _menu, has_dialogue = self._event_dialogue_state(obs)
+            self._journal("event_wait", tries=tries, limit=EVENT_WAIT_TRIES,
+                          eventId=ui.get("eventId"), eventUp=bool(event_up),
+                          hasDialogue=bool(has_dialogue), worldSeq=obs.get("worldSeq"),
+                          waitSeconds=EVENT_WAIT_SECONDS,
+                          note="事件进行中但没有对话盒：有界等待（**不** dismiss / **不** sleep / "
+                               "**不** load_save；事件结束或对话盒出现就回日循环）")
+            if not event_up or has_dialogue:
+                return obs, False, tries
+        return obs, True, tries
+
     def _clear_modals(self, obs: dict[str, Any], rep: DayReport) -> tuple[dict[str, Any], bool]:
         """日循环每一步之前的**模态守卫**：把挡路的模态按三种处置清掉（task-11）。
 
@@ -7492,7 +7539,21 @@ class LongRun:
             if ui.get("eventUp") is True:
                 if self._event_advance_possible(obs):
                     return obs, False
-                return self._event_blocked(obs, rep)
+                _up, _is_q, _ev_menu, has_dialogue = self._event_dialogue_state(obs)
+                if has_dialogue:
+                    # 有对话盒但推不动（提问 / 职业选择 / 连续 stalled / 额度用尽）⇒ **立刻**
+                    # 硬停（task-41/task-228 语义一字不改）：既不等，也绝不碰。
+                    return self._event_blocked(obs, rep)
+                # 【task-245】没有可推进的对话盒（开场动画/脚本 pause 期间）⇒ 先**有界等待**：
+                # 0.7.42 冒烟冬 7 开局就因"立刻硬停"把整条长跑白烧 4.92 分钟。等待期间一次
+                # 都不动手（不 dismiss/不 sleep/不 load_save），只重观测：事件结束或对话盒出现
+                # ⇒ 交回日循环；等满仍挂住 ⇒ 才诚实收尾。
+                obs, still_blocked, wait_tries = self._wait_event_up(obs)
+                if not still_blocked:
+                    rounds += 1
+                    continue
+                self._event_blocked(obs, rep, event_wait_tries=wait_tries)
+                return obs, True
 
             # ① 提问（DialogueBox 开着提问时 isModal 为真）：走 Mod 的“选否”口径，绝不注入确认键
             if ui.get("dialogueIsQuestion") or ui.get("dialogueResponses"):
@@ -7557,7 +7618,8 @@ class LongRun:
         self._say(f"× 被模态挡住，停下等人：{reason}")
         return obs, True
 
-    def _event_blocked(self, obs: dict[str, Any], rep: DayReport) -> tuple[dict[str, Any], bool]:
+    def _event_blocked(self, obs: dict[str, Any], rep: DayReport, *,
+                       event_wait_tries: int = 0) -> tuple[dict[str, Any], bool]:
         """游戏事件挂住（`ui.eventUp=true`）：**绝不代游戏做决定** ⇒ 当天停下等人（task-41）。
 
         为什么连“关一下框”都不许（真机，2026-10-13 19:19，run4 起跑前）：
@@ -7580,6 +7642,13 @@ class LongRun:
                       tile=list(tile) if tile else None,
                       timeOfDay=FarmWorker.time_of_day(obs),
                       worldSeq=obs.get("worldSeq"),
+                      # 【task-245】事件归因：0.7.42 冒烟冬 7 的账本缺这一项 ⇒ 事后无法回答
+                      # "是哪条事件把我挂住了"。`eventId` 三态（有值 / null=读不到 / 缺字段=旧 Mod）
+                      # 由 Mod 的 EventRules 归一，这里原样落账。
+                      eventId=ui.get("eventId"),
+                      eventWaitTries=event_wait_tries,
+                      eventWaitSeconds=(EVENT_WAIT_TRIES * EVENT_WAIT_SECONDS
+                                        if event_wait_tries else 0.0),
                       # 【task-228】事件对话推进的当日账：`event_blocked` 到底是因为
                       # "提问/职业选择"还是"推了 N 步之后点不动"——账本必须能分清。
                       advance_steps=self.event_advance_steps_today,
@@ -7588,11 +7657,18 @@ class LongRun:
                       note="游戏事件挂住（ui.eventUp=true）：关框会替游戏推进剧情/默认选否 ⇒ "
                            "不 dismiss / 不 sleep / 不 load_save，当天不判 VERIFIED，等人处理")
         rep.ended_by = ENDED_BY_EVENT
+        event_id = ui.get("eventId")
+        waited = (EVENT_WAIT_TRIES * EVENT_WAIT_SECONDS if event_wait_tries else 0.0)
         rep.ended_reason = (f"游戏事件挂住（eventUp=true）：{menu or '?'}"
-                            + (f"「{text}」" if text else ""))
-        rep.notes.append("游戏事件挂住（eventUp），按政策停下等人：不 dismiss / 不 sleep / 不 load_save")
+                            + (f"「{text}」" if text else "")
+                            + (f"；eventId={event_id}" if event_id else "；eventId=未知（无法归因）")
+                            + (f"；已等待 {waited:.0f}s（{event_wait_tries} 轮）"
+                               if event_wait_tries else ""))
+        rep.notes.append("游戏事件挂住（eventUp），按政策停下等人：不 dismiss / 不 sleep / 不 load_save"
+                         + (f"；等待期间曾空等 {event_wait_tries} 轮" if event_wait_tries else ""))
         self._say(f"× 游戏事件挂住（eventUp）⇒ 停下等人：{menu or '?'}"
-                  + (f"「{text}」" if text else ""))
+                  + (f"「{text}」" if text else "")
+                  + (f"；eventId={event_id}" if event_id else ""))
         return obs, True
 
     # ------------------------------------------------------------------ 一天

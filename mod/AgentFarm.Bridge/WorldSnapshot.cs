@@ -1314,6 +1314,11 @@ namespace AgentFarm.Bridge
             var v = new UiView();
             try { v.ActiveMenu = Game1.activeClickableMenu?.GetType().Name; } catch { }
             try { v.EventUp = Game1.eventUp; } catch { }
+            // 【task-245】事件 id：三态由 EventRules.IdFor 归一（没有事件 ⇒ null；
+            // 有事件但读不到 id ⇒ null = 无法归因）。必须显式写 null ⇒ 契约里强制序列化。
+            // 1.6.15 上 getter 是静态属性 `Game1.CurrentEvent`（IL 实证：`call ... get_CurrentEvent()`），
+            // 旧写法 `Game1.currentEvent` 字段在该版本不存在（CS0117）。
+            try { v.EventId = EventRules.IdFor(v.EventUp, Game1.CurrentEvent == null ? null : Game1.CurrentEvent.id); } catch { }
             try { v.OnScreenMenus = Game1.onScreenMenus?.Count ?? 0; } catch { }
 
             // 模态里的文字 + 对话框选项：无人值守时脑必须读到这些内容才能决定
