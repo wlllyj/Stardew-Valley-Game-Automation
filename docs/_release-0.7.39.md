@@ -12,8 +12,10 @@
 | 3 | task-223 结果 | Furnace 配方 1.6 合法授予路径定案 | ✅ `fb275a8`（`docs/_il-furnace-unlock.md`） |
 | 4 | task-219 | **意图-执行对账闭环**（`intent_coverage` + 12 码闭合集 + `<journal>-gaps.json` + `Brief.recent_gaps`） | ✅ `fc147a7`（5 files +950/−22） |
 | 5 | task-210 | 机器链技能层 `craft_item`/`place_object`/`machine`（策略层并入 task-227） | ✅ `2dde12e`（3 files +613） |
-| 6 | task-228 | Mod `advance_dialogue`：**只推进非提问对话**（用户 `m19382` 授权；无人值守跑批前提） | dev-coder 在制 |
-| 7 | task-220 | analyzer 收 `intent_coverage`/gaps + §8 判红 + 跨 run `gaps-registry.json` | log-analyst 在制 |
+| 6 | task-228 | Mod `advance_dialogue`：**只推进非提问对话**（用户 `m19382` 授权；无人值守跑批前提） | ✅ `3dc4b1e`（13 files +1204/−9；C# 85 断言、全量 1132 OK） |
+| 7 | task-220 | analyzer 收 `intent_coverage`/gaps + §8 判红 + 跨 run `gaps-registry.json` | ✅ `19b2827`+`fac6a29`（247 OK） |
+| 8 | task-230 | **P0 收口**：`FarmView` 五项农场计数 / 12 码 + 映射表 + `no_target` 证据 / gaps 坏档归档 + 写失败判问题 + 禁转 lessons | dev-coder 在制 |
+| 9 | task-231 | analyzer 口径对齐（`ok_tiles`/判红编号/§8.6 backlog），`blocked_by task-230` | 待 230 落地后 GO |
 
 **本批不进**（0.7.40+）：task-227 铜斧全链路、task-229 床上睡觉坑、task-195/196/193/197 遗留、task-151/221（目标 1 的田区清空与余力多清）。
 
@@ -69,6 +71,7 @@
    - **task-229**（sleep 床上坑：读档即在床上 ⇒ 先下床再睡）；
    - **task-227**（铜斧全链路：攒钱 6300g → 买 45 铜矿+6 煤 → 造熔炉 → 炼 5 铜锭 → 买铜斧 → 2 天后取回 → 	oolOk false→true）；
    - **task-151 rev5**（指定作业区清空 + zone_cleared + 连续 2 天复核）与 **task-221 rev2**（余力多清）—— 目标 1 的验收面。
-4. 目标 1 的"钱在作物再投资与工具升级间平衡"由 task-227 的 eserve_for_upgrade 落地后再跑 3–5 天真机核账。
+4. 目标 1 的"钱在作物再投资与工具升级间平衡"由 task-227 的 
+eserve_for_upgrade 落地后再跑 3–5 天真机核账。
 
 **已知不阻塞项**（0.7.40+）：task-195/196/193/197 遗留、task-16 常设、task-82/111/112 复盘进化（task-58/59 已交付）。
