@@ -13266,5 +13266,293 @@ class TestTask15PendingCaliber(unittest.TestCase):
         self.assertEqual(ev["source"], "回片区（plot_exhausted_burst）", ev)
 
 
+class _LootMarkingWorker(FakeWorker):
+    """【task-16 测试】模拟 `farmwork.clear()` 的掉落证据：世界背包 0 空格时，
+    清成功也带 `loot_lost`（游戏拒收掉落 / `Inventory Full`），除此之外行为与 `FakeWorker` 一致。"""
+
+    def run_stage(self, stage, tiles, *, min_stamina=12.0, max_steps=200):
+        res = super().run_stage(stage, tiles, min_stamina=min_stamina, max_steps=max_steps)
+        free = player_free_slots(FarmWorker.player_of(self.w.obs()))[0]
+        for st in res.steps:
+            if (st.ok and str(getattr(st, "action", "")) == "clear"
+                    and int(free) <= 0):
+                st.loot_lost = True
+                st.loot_free_slots = 0
+                st.loot_items = ["木材", "树液"]
+                st.loot_reason = ("背包没有空格（free_slots=0）⇒ 游戏拒绝接收掉落"
+                                  "（vanilla Inventory Full）；战利品可能留在原地/丢失")
+        return res
+
+
+class _NoCapacityWorld(FakeWorld):
+    """【task-16 测试】旧桥/截断形态：观测里**没有** `player.inventoryCount`
+    ⇒ 空格状态 `unavailable`，不许猜成 0（fail-closed）。"""
+
+    def obs(self) -> dict:
+        o = super().obs()
+        o["player"].pop("inventoryCount", None)
+        return o
+
+
+class TestTask16InventoryFull(unittest.TestCase):
+    """【task-16 / 0.7.45 卡 B】背包满（容量 12、`free_slots=0`）无察觉 —— 战利品丢失、无腾格、无留痕。
+
+    根因（`docs/_review-product-gaps.md` §1#3/§3，commit `defe2e4`）：
+    * `WorldSnapshot.cs:261` 的 `InventoryCount` 是**容量**（`p.Items?.Count`），不是占用；
+      `farmwork.py:1353-1367` 的空格口径 = 容量 − `len(inventory[])`；存档无背包升级 ⇒ 容量 12
+      且背包恰好 12 行 ⇒ `free_slots=0`；
+    * `FarmWorker.clear()`（`farmwork.py:2298-2568`）全程**没有** free_slots/`no_slot` 判据
+      （harvest 有 `NO_SLOT_CODE` :2997-3010）⇒ 清成照样 `ok`，掉落被游戏拒收却无声；
+    * 0.7.44 冒烟 ledger 零条 inventory 事件 ⇒ clear-only 日循环从未算过背包。
+
+    本类钉死（卡面要求）：
+    1) 每次观测都算空格（容量 − 行数），**不把容量当占用**；
+    2) `clear()` 在 0 空格时清成也留 `loot_lost` 证据（free_slots/近似掉落/人话原因），
+       不进 ok/code/failed/no_slot；
+    3) 满包压力通道走**既有** `_slot_relief` 白名单卖叠/出货（钱只走游戏入口、当天不动），
+       腾不出就留痕（复用 `slot_relief` 事件，`pressure=True`）但**不判失败**；
+    4) 买种子前空格=0 先腾格；腾不出就不买并留痕（不白撞 `no_inventory_space`）；
+    5) 日终 trace：`free_slots_start/last/min/status` + `loot_lost_steps/tiles/items`
+       进 `day_end`，**不改 checks 10 键**（loot 不算失败）。
+    """
+
+    def _row(self, slot: int, qid: str, name: str, stack: int, *, tool: bool = False) -> dict:
+        item_id = qid.rsplit(")", 1)[-1] if qid.startswith("(") else qid
+        return {"slot": slot, "id": item_id, "qualifiedId": qid, "name": name,
+                "stack": stack, "isTool": tool}
+
+    def _full_unsellable(self, *, weeds: int = 4) -> FakeWorld:
+        """满包、而且**没有**可卖/可出货的叠（真满 + 无可腾：卡面第二种形态）。"""
+        w = FakeWorld(seeds=0, money=500, weeds=weeds)
+        w.inventory = [self._row(0, "(T)Axe", "Axe", 1, tool=True),
+                       self._row(1, "(T)Hoe", "Hoe", 1, tool=True),
+                       self._row(2, "(T)WateringCan", "Watering Can", 1, tool=True)]
+        while len(w.inventory) < 12:
+            w.inventory.append(self._row(len(w.inventory), "(O)178", "Hay", 5))
+        return w
+
+    def _full_with_surplus(self) -> FakeWorld:
+        """满包、有一叠**已知表真盈余**（Wood 99 > 保留 K）—— 压力通道应当卖它腾格。"""
+        w = FakeWorld(seeds=0, money=500, weeds=0)
+        inv = [self._row(0, "(T)Axe", "Axe", 1, tool=True),
+               self._row(1, "(T)Hoe", "Hoe", 1, tool=True),
+               self._row(2, "(T)WateringCan", "Watering Can", 1, tool=True)]
+        inv += [self._row(3 + i, "(O)388", "Wood", 99) for i in range(9)]
+        w.inventory = inv[:12]
+        return w
+
+    def _full_with_seeds(self) -> FakeWorld:
+        """满包（12/12）但**手上有当季种子**：白天可照常清/锄/种，掉落被拒收。"""
+        w = FakeWorld(seeds=10, money=500, weeds=4)
+        inv = [self._row(0, "(T)Axe", "Axe", 1, tool=True),
+               self._row(1, "(T)Hoe", "Hoe", 1, tool=True),
+               self._row(2, "(T)WateringCan", "Watering Can", 1, tool=True),
+               self._row(5, f"(O){SEED_ID}", SEED_NAME, 10)]
+        while len(inv) < 12:
+            inv.append(self._row(len(inv), "(O)178", "Hay", 5))
+        w.inventory = inv[:12]
+        return w
+
+    def _run(self, w: FakeWorld, worker):
+        run = make_run(w)
+        client = FakeClient(w)
+        run.client = client
+        run.worker = worker
+        # `run.run()` 会重建 client/worker（longrun.py:9766/9772 走工厂）；
+        # 测试里必须把工厂钉到同一个 world/worker 上，否则注入的假工人会被换掉。
+        run.client_factory = lambda: client
+        run.worker_factory = lambda _c: worker
+        return run
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list:
+        return [e for e in run.entries if e.get("event") == name]
+
+    @staticmethod
+    def _rep() -> DayReport:
+        return DayReport(day_key=("winter", 26, 1), started_at=0.0)
+
+    # ---- 1) 空格口径 + 日终 trace ----
+    def test_free_slots_is_capacity_minus_rows_not_capacity(self):
+        w = FakeWorld(weeds=0)                       # 默认 4 行（3 工具 + 种子）⇒ 12-4=8
+        self.assertEqual(player_free_slots(FarmWorker.player_of(w.obs())), (8, "ok"))
+        w = self._full_unsellable(weeds=0)
+        self.assertEqual(player_free_slots(FarmWorker.player_of(w.obs())), (0, "ok"))
+        self.assertEqual(int(FarmWorker.player_of(w.obs())["inventoryCount"]), 12,
+                         "容量 12 ≠ 占用 12；空格必须按 容量 − 行数 算")
+
+        run = self._run(w, FakeWorker(w))
+        rep = self._rep()
+        self.assertEqual(run._observe_free_slots(rep, w.obs()), (0, "ok"))
+        self.assertEqual(rep.free_slots_start, 0)
+        self.assertEqual(rep.free_slots_last, 0)
+        self.assertEqual(rep.free_slots_min, 0)
+        self.assertEqual(rep.free_slots_status, "ok")
+        # 多观测几张：min 记最低水位、last 记最新
+        w.inventory.pop()
+        run._observe_free_slots(rep, w.obs())
+        self.assertEqual(rep.free_slots_last, 1)
+        self.assertEqual(rep.free_slots_min, 0)
+
+    # ---- 2) clear() 的 loot_lost 证据（真 FarmWorker + FakeClient）----
+    def test_clear_marks_loot_lost_when_inventory_full(self):
+        w = self._full_unsellable(weeds=4)
+        worker = FarmWorker(FakeClient(w), log=lambda *_: None)
+        self.assertEqual(player_free_slots(FarmWorker.player_of(w.obs()))[0], 0)
+        st = worker.clear((60, 10))                 # 默认 weeds=(60,10)..(60,13)
+        self.assertTrue(st.ok, st.reason)
+        self.assertEqual(st.code, "ok", "掉落入不了包 ≠ 清障失败")
+        self.assertTrue(getattr(st, "loot_lost", False), st)
+        self.assertEqual(getattr(st, "loot_free_slots", None), 0)
+        self.assertTrue(list(getattr(st, "loot_items", []) or []), st)
+        self.assertIn("Inventory Full", getattr(st, "loot_reason", ""))
+        d = st.as_dict()
+        self.assertIs(d.get("loot_lost"), True)
+        self.assertEqual(d.get("loot_free_slots"), 0)
+        self.assertNotIn("no_slot", d)
+        self.assertNotIn("failed", d)
+
+    def test_clear_with_free_slots_does_not_mark_loot_lost(self):
+        w = FakeWorld(weeds=4)                      # 8 空格 ⇒ 掉得进去
+        worker = FarmWorker(FakeClient(w), log=lambda *_: None)
+        st = worker.clear((60, 10))
+        self.assertTrue(st.ok, st.reason)
+        self.assertFalse(getattr(st, "loot_lost", False))
+        self.assertNotIn("loot_lost", st.as_dict())
+
+    def test_clear_with_unavailable_inventory_never_guesses(self):
+        """读不到 `inventoryCount`（旧桥/室内）⇒ 不猜 0 空格、不置 loot_lost（fail-closed）。"""
+        w = _NoCapacityWorld(weeds=4)
+        for row in w.inventory:
+            row.pop("isTool", None)
+        worker = FarmWorker(FakeClient(w), log=lambda *_: None)
+        self.assertEqual(player_free_slots(FarmWorker.player_of(w.obs())),
+                         (0, "unavailable"))
+        st = worker.clear((60, 10))
+        self.assertTrue(st.ok, st.reason)
+        self.assertFalse(getattr(st, "loot_lost", False),
+                         "读不到空格 ⇒ 不许猜成 0 空格")
+
+    # ---- 3) 压力腾格通道（无收获需求，只因为真满）----
+    def test_space_pressure_relief_sells_known_surplus_when_truly_full(self):
+        w = self._full_with_surplus()
+        worker = _SpaceWorker(w)
+        run = self._run(w, worker)
+        self.assertEqual(run._bag_state(w.obs())[:2], (0, 0),
+                         "没有熟作物 ⇒ need=0，走压力通道（不是 task-198 收获需求）")
+        rep = self._rep()
+        self.assertTrue(run._slot_relief(w.obs(), rep))
+        self.assertGreaterEqual(len(worker.sell_calls), 1)
+        self.assertFalse(run.inventory_blocked_today,
+                         "压力通道腾格不许置 inventory_blocked（清障日不算堵死）")
+        ev = self._events(run, "slot_relief")
+        self.assertEqual(len(ev), 1, ev)
+        self.assertIs(ev[0].get("pressure"), True, ev)
+        self.assertEqual(ev[0].get("demand"), 0)
+        self.assertEqual(ev[0].get("demand_basis"), "space_pressure")
+        self.assertGreaterEqual(ev[0].get("freed"), 1)
+        self.assertEqual(ev[0].get("money_before"), ev[0].get("money_after"),
+                         "卖叠只走游戏入口，钱当天不动")
+        self.assertLess(ev[0].get("rows_after"), ev[0].get("rows_before"))
+        self.assertEqual(ev[0].get("trigger"), "space_pressure", ev[0])
+
+    def test_space_pressure_cannot_free_is_bounded_and_not_failure(self):
+        w = self._full_unsellable(weeds=0)
+        worker = _SpaceWorker(w)
+        run = self._run(w, worker)
+        rep = self._rep()
+        for _ in range(SLOT_RELIEF_MAX + 2):
+            self.assertFalse(run._slot_relief(w.obs(), rep))
+        self.assertEqual(worker.sell_calls, [], "没有可卖叠 ⇒ 不许空转卖货请求")
+        self.assertFalse(run.inventory_blocked_today, "腾不出 ≠ 背包堵死（不许判失败）")
+        ev = self._events(run, "slot_relief")
+        self.assertEqual(len(ev), 1, f"每天只留痕一次：{ev}")
+        self.assertIs(ev[0].get("pressure"), True)
+        self.assertEqual(ev[0].get("freed"), 0)
+        self.assertEqual(ev[0].get("trigger"), "none")
+        self.assertEqual(ev[0].get("demand_basis"), "space_pressure")
+        self.assertIn("不判失败", ev[0].get("note", ""))
+        self.assertFalse(self._events(run, "inventory_blocked"))
+
+    # ---- 4) 买种子前先腾格 ----
+    def test_buy_path_frees_slot_before_buying(self):
+        w = self._full_with_surplus()
+        w.player_seeds = []                          # 新 Mod：当季可种 0
+        worker = _SpaceWorker(w)
+        run = self._run(w, worker)
+        rep = self._rep()
+        changed = run._preconditions_apply(w.obs(), rep)
+        self.assertTrue(changed, rep.notes)
+        self.assertGreaterEqual(len(worker.sell_calls), 1,
+                                "空格=0 买种子前必须先腾格（卡面硬要求）")
+        self.assertTrue(w.buy_calls, "腾出格后应当真的去买了种子")
+
+    def test_buy_path_skips_honestly_when_bag_cannot_be_freed(self):
+        w = self._full_unsellable(weeds=0)
+        w.player_seeds = []                          # 当季可种 0 ⇒ 走到买种子门闸
+        worker = _SpaceWorker(w)
+        run = self._run(w, worker)
+        rep = self._rep()
+        self.assertFalse(run._preconditions_apply(w.obs(), rep))
+        self.assertEqual(worker.sell_calls, [])
+        self.assertEqual(w.buy_calls, [], "腾不出就不买：不许白撞 no_inventory_space")
+        ev = self._events(run, "slot_relief")
+        self.assertEqual(len(ev), 1, ev)
+        self.assertEqual(ev[0].get("demand_basis"), "buy_full")
+        self.assertIs(ev[0].get("pressure"), True)
+        self.assertIn("不是任务失败", ev[0].get("note", ""))
+
+    # ---- 5) 日终 trace + 不因掉落判失败 ----
+    def test_day_end_traces_loot_lost_without_touching_checks(self):
+        """端到端：满包 clear 仍照常清格（掉落拒收只留证）——日终 trace 有 loot/free_slots，
+        `checks` 10 键与 `day_justified` 口径不被 loot 连坐（loot 只 info，不算失败）。"""
+        w = self._full_with_seeds()
+        worker = _LootMarkingWorker(w)
+        run = self._run(w, worker)
+        plot = {"zone": "", "label": "", "area": "field_nw", "anchor": [60, 10],
+                "tiles": [(60, 10), (61, 10), (62, 10), (63, 10)], "note": ""}
+        calls = {"n": 0}
+
+        def ensure(obs, rep):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                run._step_stage("clear_area", w.obs(), plot, rep)
+            return None                              # 之后本片拿不出目标
+
+        run._ensure_plot = ensure
+        run.sleep_guard = lambda obs: (False, "guard", "守卫仍说还有活")
+        run._guard_leftover_resume = lambda obs, rep, *, text="": ("none", False)
+        run._do_sleep = lambda obs, rep, why, **kw: ("sleep", why)
+
+        run.run()
+
+        rep = run.days[0]
+        self.assertGreaterEqual(calls["n"], 1)
+        self.assertGreaterEqual(rep.loot_lost_steps, 1, rep.notes)
+        self.assertTrue(rep.loot_lost_tiles, rep.notes)
+        self.assertTrue(rep.loot_lost_items, rep.notes)
+        self.assertEqual(rep.free_slots_status, "ok")
+        self.assertIsNotNone(rep.free_slots_last)
+        self.assertLessEqual(int(rep.free_slots_min), int(rep.free_slots_last))
+        d = rep.as_dict()
+        self.assertEqual(d["loot_lost_steps"], rep.loot_lost_steps)
+        self.assertEqual([[int(t[0]), int(t[1])] for t in d["loot_lost_tiles"]],
+                         [[int(t[0]), int(t[1])] for t in rep.loot_lost_tiles])
+        self.assertEqual(d["loot_lost_items"], rep.loot_lost_items)
+        self.assertEqual(d["free_slots_min"], rep.free_slots_min)
+        # checks 仍是 10 键、loot 只 info 不进 checks
+        self.assertEqual(len(rep.checks), 10, rep.checks)
+        self.assertNotIn("loot_lost", rep.checks)
+        self.assertTrue(rep.checks.get("no_hard_failures", False), rep.checks)
+        # 背包满不是这一天的收工理由（不许被当成 inventory_blocked/stuck 连坐）
+        self.assertNotIn("inventory_blocked", str(rep.ended_by))
+        self.assertNotIn("inventory_blocked", str(rep.ended_reason))
+        # 阶段账也带掉落证据（既有 stage 事件加字段，不新增事件名）
+        stage = [s for s in rep.stages if str(s.get("stage")) == "clear_area"]
+        self.assertTrue(stage, rep.stages)
+        self.assertGreaterEqual(sum(int(s.get("loot_lost", 0)) for s in stage), 1,
+                                stage[-1])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

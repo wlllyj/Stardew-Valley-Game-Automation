@@ -679,6 +679,17 @@ class StepResult:
     #: `tool_min_level` 是观测给的 `minLevel`（`null` 原样是 `None`，**不许**当 0）。
     tool_need: str = ""
     tool_min_level: int | None = None
+    #: 【task-16】这一刀**清成了**，但背包当时**没有空格**（`free_slots == 0`）⇒ 游戏会拒绝
+    #: 把掉落塞进背包（vanilla 红字 `Inventory Full`），战利品可能留在原地/丢失。
+    #: **只作 info 证据**：`ok`/`code` 不变、不进 `failed`/`env_block`/`no_slot` 任何判据，
+    #: 也**不会**让当天不 VERIFIED（冬季 clear 照常算做成；由 `longrun` 汇总进 day_end 留痕）。
+    loot_lost: bool = False
+    #: 【task-16】判 `loot_lost` 时的空格数（容量 − 背包非空行数；观测拿不到时为 `None`）。
+    loot_free_slots: int | None = None
+    #: 【task-16】**近似**掉落物名（Mod 观测不提供掉落表：只从这一格 kind 推，绝不假装精确）。
+    loot_items: list[str] = field(default_factory=list)
+    #: 【task-16】`loot_lost` 的人话判据（进逐格 step dict / 日级 journal）。
+    loot_reason: str = ""
 
     @property
     def skipped(self) -> bool:
@@ -746,6 +757,14 @@ class StepResult:
             d["blocked_by_tool"] = True
         if self.available:
             d["available"] = self.available
+        if self.loot_lost:
+            d["loot_lost"] = True
+        if self.loot_free_slots is not None:
+            d["loot_free_slots"] = int(self.loot_free_slots)
+        if self.loot_items:
+            d["loot_items"] = list(self.loot_items)
+        if self.loot_reason:
+            d["loot_reason"] = self.loot_reason
         return d
 
 
@@ -1368,6 +1387,29 @@ def player_free_slots(player: dict[str, Any]) -> tuple[int, str]:
     if not isinstance(inv, list) or not isinstance(cap, int) or cap <= 0:
         return 0, "unavailable"
     return max(0, int(cap) - len(inv)), "ok"
+
+
+def _loot_approx(kind: str) -> list[str]:
+    """【task-16】从被清掉的 kind **近似**推掉落物名（只给留痕看，不参与任何判据）。
+
+    为什么是近似：`mod\\AgentFarm.Bridge` 的观测只有格子的 `kind`，没有掉落表，也没有
+    "这一刀到底掉了几件"；所以这里只写**这一类障碍最常见**的产出，并且 `loot_reason`
+    里明确写「近似」。绝不把近似值当成箱子/背包的真实增量。
+    """
+    k = str(kind or "")
+    if k == "tree":
+        return ["木材", "树液", "（可能）硬木"]
+    if k == "twig":
+        return ["木材", "树液"]
+    if k == "stone":
+        return ["石头", "（可能）矿石"]
+    if k == "weed":
+        return ["纤维"]
+    if k == GRASS_KIND:
+        return ["纤维", "（可能）干草"]
+    if k in CLUMP_KINDS:
+        return ["石头/矿石（近似）"]
+    return ["（未知掉落：kind=%s）" % (k or "未知")]
 
 
 def _bare_item_id(value: Any) -> str:
@@ -2424,6 +2466,13 @@ class FarmWorker:
         if not self._ensure_reachable(tile, r):
             return r
 
+        # 【task-16】清掉之后**会掉东西**：先记下动手前的背包空格（容量 − 非空行数）。
+        # 空格 0 ⇒ 游戏会把掉落拒收（vanilla 红字 `Inventory Full`），战利品可能留在原地/丢失。
+        # 这是**全局**事实（与这一格能不能清无关）：清成功照样 `ok`，只额外留 `loot_lost` 证据；
+        # `unavailable`（旧桥/室内）一律不猜（`loot_free_slots=None`、不置 `loot_lost`）。
+        free0, free_status0 = player_free_slots(self.player_of(obs))
+        loot_risk = free_status0 == "ok" and int(free0) <= 0
+
         # 【task-218】多刀类（树 / 够格的 clump）用 `MAX_TREE_SWINGS`：树要砍倒+清桩，
         # 巨石要连敲；草仍是 `MAX_CLEAR_SWINGS=4`。判据一律"**kind 离开这一类**"。
         cap = MAX_TREE_SWINGS if multi else MAX_CLEAR_SWINGS
@@ -2478,6 +2527,17 @@ class FarmWorker:
                 gone = kind_now not in DEBRIS_KINDS
             if gone:
                 r.ok = True
+                # 【task-16】成功步 = 这一格掉落了：若背包当时 0 空格，游戏拒收掉落
+                # （`Inventory Full`）⇒ 只作 info 留痕，**不改** ok/code。
+                if loot_risk:
+                    r.loot_lost = True
+                    r.loot_free_slots = int(free0)
+                    r.loot_items = _loot_approx(kind)
+                    r.loot_reason = (
+                        f"背包没有空格（free_slots={int(free0)}，容量 "
+                        f"{self.player_of(obs).get('inventoryCount')}）⇒ 游戏拒绝接收掉落"
+                        f"（vanilla `Inventory Full`）；战利品可能留在原地/丢失 "
+                        f"（掉落物为近似：{kind}）")
                 # 【task-218 / 0.7.39 P0-1】成功步必须**自带该格的 before/after kind**：
                 # 护栏 B 的判据是"逐格 kind 真的变了"（tree→stump 也算 progress），
                 # 不是"挥过刀"、也不依赖观测里根本不存在的 `farm.blockers`。
