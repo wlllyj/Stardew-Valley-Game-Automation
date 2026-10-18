@@ -46,7 +46,8 @@ from agentfarm.longrun import (  # noqa: E402
     MAX_ENV_ATTEMPTS,
     MAX_STUCK_FLUSH, MAX_TILE_ATTEMPTS, PLOT_EXHAUSTED_BURST, READY_FAR_MAX_TRIES,
     NON_PLOT_INTENT_TASKS,
-    SLOT_RELIEF_MAX, SLOT_RESERVE, STEP_CODE_TO_REASON, TREE_CLEAR_MAX_PER_DAY,
+    SLOT_RELIEF_MAX, SLOT_RELIEF_KEEP, SLOT_RELIEF_MAX_STACKS_TOTAL, SLOT_RESERVE,
+    STEP_CODE_TO_REASON, TREE_CLEAR_MAX_PER_DAY,
     DayReport, LongRun,
     _intent_coverage_ok, _till_blocked_by, is_justified_end, plot_observe,
 )
@@ -9966,8 +9967,10 @@ class TestTask198InventoryDay(unittest.TestCase):
                {"slot": 1, "id": "Hoe", "qualifiedId": "(T)Hoe", "name": "Hoe",
                 "stack": 1, "isTool": True}]
         while len(inv) < rows:
-            inv.append({"slot": len(inv), "id": "388", "qualifiedId": "(O)388",
-                        "name": "Wood", "stack": 99, "isTool": False})
+            # 【task-232】填**表外**物品（`(O)999` 不在任何卖叠白名单里）⇒ 本形态的语义仍是
+            # "腾不出"：空格压力通道没有可卖叠，只能如实 `inventory_blocked`。
+            inv.append({"slot": len(inv), "id": "999", "qualifiedId": "(O)999",
+                        "name": "Mystery Thing", "stack": 99, "isTool": False})
         w.inventory = inv[:rows]
         run = make_run(w, max_days=1, target_days=1)
         client = _LootClient(w)
@@ -11241,6 +11244,187 @@ class TestTask233PlotNoTargetUnchanged(unittest.TestCase):
             ev = rec["evidence"]
             self.assertIs(ev.get("stage_tiles_empty"), True, rec)
             self.assertTrue(_intent_coverage_ok(rec), rec)
+
+
+class _SpaceWorker(FakeWorker):
+    """【task-232】`sell(slot, whitelist=[qid])` 真的把整叠从背包里搬走（钱当天不动）。
+
+    真机 `logs/longrun-smoke-0739.jsonl` day1：背包 12/12 满（Wheat×10 / Wheat Seeds×10 /
+    Geode×3 / Stone×3 / Hay×5 / Moss×2 + 五件工具）、钱 1977g ⇒ 旧两条卖叠通道（出货白名单 =
+    今日亲手收获；材料通道要"没种子+钱够买"）都不触发 ⇒ `_slot_relief` 3 轮 `freed=0` ⇒
+    整天 `inventory_blocked`、12 格熟作物全 `no_slot`。这里给假执行层一个"搬得动"的 `sell`。
+    """
+
+    def __init__(self, world: FakeWorld, *, move: bool = True) -> None:
+        super().__init__(world)
+        self.move = move
+        self.sell_calls: list[dict] = []
+
+    def sell(self, slot, *, whitelist=None, timeout_ms=8000):
+        self.sell_calls.append({"slot": int(slot), "whitelist": [str(w) for w in (whitelist or [])]})
+        row = next((r for r in self.w.inventory if int(r.get("slot") or 0) == int(slot)), None)
+        if row is None or not self.move:
+            return StepResult("sell", None, ok=False, code="not_whitelisted",
+                              reason="假世界：这格没卖掉")
+        self.w.inventory.remove(row)
+        st = StepResult("sell", None, ok=True, code="ok", reason="假世界：卖出整叠（钱等 NewDay）")
+        st.before = {"slot": int(slot), "qid": row.get("qualifiedId"), "stack": row.get("stack")}
+        st.after = {"slot": int(slot), "qid": row.get("qualifiedId"), "stack": 0}
+        return st
+
+
+class TestTask232SpacePressure(unittest.TestCase):
+    """【task-232】空格压力通道：背包低水位时按**已知盈余**卖一叠腾格，否则如实 blocked。
+
+    判据（Lead m21658）：白名单只认已知表且每 qid 留 K；工具/种子/升级锭永不卖；
+    每轮 1 叠、每天 ≤ `SLOT_RELIEF_MAX_STACKS_TOTAL` 叠；卖前/卖后**钱 + 背包行数双差分**；
+    只走 `worker.sell()`（绝不自己加钱）；`slot_relief` 事件加字段、不新增事件名。
+    """
+
+    def _row(self, slot: int, qid: str, name: str, stack: int, *, tool: bool = False) -> dict:
+        item_id = qid.rsplit(")", 1)[-1] if qid.startswith("(") else qid
+        return {"slot": slot, "id": item_id, "qualifiedId": qid, "name": name,
+                "stack": stack, "isTool": tool}
+
+    def _world(self, *, surplus: bool = True, ripe: int = 3) -> FakeWorld:
+        # 起始形态尽量贴真机 day1：钱 1977g、有种子 10、背包 12/12。
+        w = FakeWorld(seeds=10, money=1977, weeds=0)
+        tiles = [(60 + i, 10) for i in range(ripe)]
+        w.dirt = set(tiles)
+        w.crops = {t: {"ripe": True, "watered": True} for t in tiles}
+        inv = [self._row(0, "(T)Axe", "Axe", 1, tool=True),
+               self._row(1, "(T)Hoe", "Hoe", 1, tool=True),
+               self._row(2, "(T)WateringCan", "Watering Can", 1, tool=True)]
+        if surplus:
+            inv += [self._row(3, "(O)388", "Wood", 99),
+                    self._row(4, "(O)388", "Wood", 99),      # 真盈余：卖一叠仍留 99 ≥ K
+                    self._row(5, "(O)535", "Geode", 3),
+                    self._row(6, "(O)262", "Wheat", 10),
+                    self._row(7, "(O)178", "Hay", 5),
+                    self._row(8, "(O)Moss", "Moss", 2),
+                    self._row(10, "(O)390", "Stone", 3),
+                    self._row(11, "(O)535", "Geode", 3)]
+        else:
+            # 表外物品（Hay/Moss/未知 id）⇒ 空格压力通道没有可卖叠 ⇒ 必须如实 blocked。
+            inv += [self._row(3, "(O)178", "Hay", 5),
+                    self._row(4, "(O)Moss", "Moss", 2),
+                    self._row(5, "(O)999", "Mystery Thing", 1),
+                    self._row(6, "(O)999", "Mystery Thing", 2),
+                    self._row(7, "(O)178", "Hay", 5),
+                    self._row(8, "(O)Moss", "Moss", 2),
+                    self._row(10, "(O)999", "Mystery Thing", 1),
+                    self._row(11, "(O)178", "Hay", 5)]
+        inv.append(self._row(9, "(O)472", "Wheat Seeds", 10))
+        w.inventory = inv[:12]
+        return w
+
+    def _run(self, w: FakeWorld, worker: _SpaceWorker) -> LongRun:
+        run = make_run(w)
+        run.client = FakeClient(w)
+        run.worker = worker
+        return run
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list[dict]:
+        return [e for e in run.entries if e["event"] == name]
+
+    def test_space_pressure_sells_one_known_surplus_stack(self):
+        w = self._world()
+        worker = _SpaceWorker(w)
+        run = self._run(w, worker)
+        self.assertEqual(player_free_slots(FarmWorker.player_of(w.obs()))[0], 0)
+        rep = DayReport(day_key=("summer", 3, 1), started_at=0.0)
+        self.assertTrue(run._slot_relief(w.obs(), rep))
+        self.assertEqual(len(worker.sell_calls), 1)
+        # 只卖"真盈余"那一档：Wood 两叠各 99 ⇒ 卖一叠仍留 99 ≥ K(10)。
+        self.assertEqual(worker.sell_calls[0]["whitelist"], ["(O)388"])
+        ev = self._events(run, "slot_relief")
+        self.assertEqual(len(ev), 1, ev)
+        self.assertEqual(ev[0]["trigger"], "space_pressure")
+        self.assertEqual(ev[0]["freed"], 1)
+        self.assertEqual(ev[0]["before_free"], 0)
+        self.assertEqual(ev[0]["after_free"], 1)
+        self.assertEqual([it["qid"] for it in ev[0]["sold"]], ["(O)388"])
+        self.assertEqual(ev[0]["money_before"], ev[0]["money_after"])
+        self.assertLess(ev[0]["rows_after"], ev[0]["rows_before"])
+        self.assertFalse(ev[0]["failed"])
+        self.assertFalse(run.inventory_blocked_today)
+        # 保留 K 的不变量：卖完后 Wood 总量仍 ≥ K。
+        left = sum(int(r.get("stack") or 0) for r in w.inventory
+                   if str(r.get("qualifiedId")) == "(O)388")
+        self.assertGreaterEqual(left, SLOT_RELIEF_KEEP)
+
+    def test_harvest_is_no_longer_no_slot_after_relief(self):
+        w = self._world()
+        worker = _SpaceWorker(w)
+        run = self._run(w, worker)
+        rep = DayReport(day_key=("summer", 3, 1), started_at=0.0)
+        self.assertTrue(run._slot_relief(w.obs(), rep))
+        farmer = FarmWorker(FakeClient(w), log=lambda *_: None)
+        st = farmer.harvest((60, 10))
+        self.assertNotEqual(st.code, NO_SLOT_CODE, st.reason)
+        self.assertTrue(st.ok, st.reason)
+
+    def test_no_known_surplus_stays_honestly_blocked(self):
+        w = self._world(surplus=False)
+        worker = _SpaceWorker(w)
+        run = self._run(w, worker)
+        rep = DayReport(day_key=("summer", 3, 1), started_at=0.0)
+        self.assertFalse(run._slot_relief(w.obs(), rep))
+        self.assertEqual(worker.sell_calls, [])
+        self.assertTrue(run.inventory_blocked_today)
+        self.assertEqual(len(self._events(run, "inventory_blocked")), 1)
+        last = rep.stages
+        self.assertEqual(last, [])
+        # 如实：没有 hard failure，但也不能自称收工 justified
+        self.assertFalse(is_justified_end("inventory_blocked", "inventory_blocked:背包满"))
+        reason = self._events(run, "inventory_blocked")[0]["reason"]
+        self.assertIn("没有可卖的盈余叠", reason)
+
+    def test_tools_seeds_and_upgrade_bars_are_never_sold(self):
+        w = FakeWorld(seeds=0, money=0, weeds=0)
+        w.dirt = {(60, 10)}
+        w.crops = {(60, 10): {"ripe": True, "watered": True}}
+        w.inventory = [self._row(0, "(T)Axe", "Axe", 1, tool=True),
+                       self._row(1, "(T)Pickaxe", "Pickaxe", 1, tool=True),
+                       self._row(2, "(O)472", "Wheat Seeds", 10),
+                       self._row(3, "(O)334", "Copper Bar", 5),
+                       self._row(4, "(O)178", "Hay", 5),
+                       self._row(5, "(O)Moss", "Moss", 2),
+                       self._row(6, "(O)178", "Hay", 5),
+                       self._row(7, "(O)Moss", "Moss", 2),
+                       self._row(8, "(O)334", "Copper Bar", 5),
+                       self._row(9, "(O)999", "Mystery Thing", 1),
+                       self._row(10, "(O)999", "Mystery Thing", 1),
+                       self._row(11, "(O)178", "Hay", 5)]
+        run = self._run(w, _SpaceWorker(w))
+        rep = DayReport(day_key=("summer", 3, 1), started_at=0.0)
+        self.assertFalse(run._slot_relief(w.obs(), rep))
+        self.assertTrue(run.inventory_blocked_today)
+
+    def test_relief_is_bounded_per_day(self):
+        w = self._world()
+        worker = _SpaceWorker(w)
+        run = self._run(w, worker)
+        rep = DayReport(day_key=("summer", 3, 1), started_at=0.0)
+        for _ in range(SLOT_RELIEF_MAX + 2):
+            if not run._slot_relief(w.obs(), rep):
+                break
+        self.assertLessEqual(run.slot_relief_today, SLOT_RELIEF_MAX)
+        self.assertLessEqual(run.slot_relief_stacks_today, SLOT_RELIEF_MAX_STACKS_TOTAL)
+        self.assertLessEqual(len(worker.sell_calls), SLOT_RELIEF_MAX_STACKS_TOTAL)
+
+    def test_no_pressure_keeps_the_old_behavior(self):
+        w = self._world()
+        # 腾出 3 格 ⇒ 不在低水位 ⇒ 一个卖货请求都不该发。
+        del w.inventory[3:6]
+        worker = _SpaceWorker(w)
+        run = self._run(w, worker)
+        rep = DayReport(day_key=("summer", 3, 1), started_at=0.0)
+        self.assertGreaterEqual(player_free_slots(FarmWorker.player_of(w.obs()))[0], 2)
+        self.assertFalse(run._slot_relief(w.obs(), rep))
+        self.assertEqual(worker.sell_calls, [])
+        self.assertEqual(self._events(run, "slot_relief"), [])
 
 
 if __name__ == "__main__":  # pragma: no cover

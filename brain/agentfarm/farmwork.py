@@ -53,6 +53,12 @@ __all__ = [
     "SEED_KEEP_FACTOR",
     "SEED_NAME_HINTS",
     "SKIP_KINDS",
+    "SLOT_RELIEF_CROP_IDS",
+    "SLOT_RELIEF_HIGH_VALUE_IDS",
+    "SLOT_RELIEF_KEEP",
+    "SLOT_RELIEF_MATERIAL_IDS",
+    "SLOT_RELIEF_MAX_STACKS",
+    "SLOT_RELIEF_NEVER_SELL_IDS",
     "STAGE_ACTION",
     "STEP_RESULT_CODES",
     "STAMINA_COST_CLEAR",
@@ -85,6 +91,7 @@ __all__ = [
     "pick_seed_offer",
     "seed_items",
     "seed_offers_from",
+    "slot_relief_plan",
     "surplus_sell_plan",
     "till_blocked_by",
     "tile_ready",
@@ -1268,6 +1275,201 @@ def _bare_item_id(value: Any) -> str:
     if s.startswith("(") and ")" in s:
         return s.split(")", 1)[1].strip()
     return s
+
+
+# ======================================================================
+#  空格压力通道：背包堵住时卖"已知盈余"叠腾格（task-232）
+# ======================================================================
+
+#: 每个 qid 至少留这么多件（只卖超出部分；整叠卖空也算守住不变量 —— 见 `slot_relief_plan`）。
+SLOT_RELIEF_KEEP = 10
+
+#: 每天最多卖几叠（硬上界；与 `longrun.SLOT_RELIEF_MAX` 的"轮数"是两个独立界）。
+SLOT_RELIEF_MAX_STACKS = 5
+
+#: 作物产物 id（**crop overflow 优先级最高**：超过 K 的余量先卖）。
+#:
+#: 为什么脑侧要自己维护这张表：`mod\AgentFarm.Bridge\Contracts.cs` 的 `ItemView` 只有
+#: `slot/id/qualifiedId/name/stack/isTool` —— 没有 `category`（task-232 是 brain-only，
+#: 不动 Mod）。名字也不能当判据（中文环境是「小麦」、英文是 Wheat）⇒ 只认**已知 id 表**，
+#: 表外一律不卖（fail-closed，沿用 task-42/55 的铁律）。这里只收常见作物（季节无关）。
+SLOT_RELIEF_CROP_IDS = frozenset({
+    "24",    # Parsnip
+    "188",   # Green Bean
+    "190",   # Cauliflower
+    "192",   # Potato
+    "194",   # Potato（旧 id 兼容）
+    "248",   # Garlic
+    "250",   # Kale
+    "254",   # Melon
+    "256",   # Tomato
+    "258",   # Blueberry
+    "260",   # Hot Pepper
+    "262",   # Wheat
+    "264",   # Radish
+    "266",   # Red Cabbage
+    "268",   # Starfruit
+    "270",   # Corn
+    "271",   # Rice
+    "272",   # Eggplant
+    "274",   # Artichoke
+    "276",   # Pumpkin
+    "278",   # Bok Choy
+    "280",   # Yam
+    "282",   # Cranberry
+    "284",   # Beet
+    "300",   # Amaranth
+    "304",   # Hops
+    "398",   # Grapes
+    "417",   # Sweet Gem Berry
+    "421",   # Sunflower
+    "427",   # Tulip
+    "433",   # Coffee Bean
+    "454",   # Ancient Fruit
+    "593",   # Summer Spangle
+    "595",   # Fairy Rose
+    "597",   # Blue Jazz
+    "815",   # Tea Leaves
+    "830",   # Taro
+    "832",   # Pineapple
+    "889",   # Qi Fruit
+})
+
+#: 材料类（第二档；**不含矿石** —— 矿石/晶洞属 high_value，最后才卖）。
+SLOT_RELIEF_MATERIAL_IDS = frozenset({
+    "388",   # Wood
+    "390",   # Stone
+    "771",   # Fiber
+    "330",   # Clay
+    "382",   # Coal
+    "92",    # Sap
+    "766",   # Slime
+    "709",   # Hardwood
+})
+
+#: 高价值（第三档，**最后**才卖；Geode/矿）。
+SLOT_RELIEF_HIGH_VALUE_IDS = frozenset({
+    "535", "536", "537", "538", "749",   # Geode / Frozen / Magma / Omni Geode
+    "378", "380", "384", "386", "909",   # Copper/Iron/Gold/Iridium/Radioactive Ore
+    "72",    # Diamond
+    "74",    # Prismatic Shard
+})
+
+#: **永远不卖**（升级材料/任务相关/建材级贵重块；工具/武器/种子另有 `isTool`+名字判据）。
+SLOT_RELIEF_NEVER_SELL_IDS = frozenset({
+    "334", "335", "336", "337",   # Copper/Iron/Gold/Iridium Bar（升级要 5 锭）
+    "338",   # Refined Quartz
+    "787",   # Battery Pack
+})
+
+
+def slot_relief_plan(
+    obs: dict[str, Any],
+    *,
+    keep: int = SLOT_RELIEF_KEEP,
+    free_slots: int | None = None,
+    free_slots_status: str = "unavailable",
+    trigger_free_slots: int = 1,
+    max_stacks: int = 1,
+) -> dict[str, Any]:
+    """【task-232】背包空格压力 ⇒ 卖哪几叠"已知盈余"来腾格。**纯决策，不发请求。**
+
+    真机死锁（`logs/longrun-smoke-0739.jsonl` day1）：背包 12/12 满，但既没有
+    harvest-bound 白名单（今天还没收货），也不满足 task-55 的"缺种子钱"门闸（钱 1977g 够）
+    ⇒ 三条腾格通道全空 ⇒ `inventory_blocked` 三天。本函数补的就是**空格压力**通道。
+
+    白名单纪律（fail-closed，卡面 + Lead m21658）：
+      * 只认三张**已知表**：`SLOT_RELIEF_CROP_IDS`（作物，最先卖）、
+        `SLOT_RELIEF_MATERIAL_IDS`（材料）、`SLOT_RELIEF_HIGH_VALUE_IDS`（矿/晶洞，最后卖）；
+      * `isTool`（工具/武器）、名字像种子（`SEED_NAME_HINTS`）、`SLOT_RELIEF_NEVER_SELL_IDS`
+        （升级锭等）**一律不卖**；
+      * 表外的未知物品**一律不卖**（不知道就别动）。
+    卖法：整叠卖（游戏没有"卖一部分"的能力）。优先"卖掉后该 qid 仍 ≥ keep"的真盈余叠；
+    一个都没有时退而卖**最小的一叠并整叠卖空**（`belowKeep=True`，剩余 0 件 ⇒ 不变量
+    "卖出后仍 ≥keep 或整叠卖空"成立；这是唯一的清路，否则全背包 ≤keep 时永远腾不出格子）。
+
+    返回：`pressure`（是否真的处于空格压力）、`slots`/`whitelist`（要卖的槽位与 qid）、
+    `items`（逐叠账本：qid/stack/tier/belowKeep/why）、`trigger`（读数原文）、
+    `skipReason`（不卖的原因原文）。
+    """
+    player = FarmWorker.player_of(obs)
+    trigger = {
+        "freeSlots": (None if free_slots is None else int(free_slots)),
+        "freeSlotsStatus": str(free_slots_status),
+        "triggerFreeSlots": int(trigger_free_slots),
+        "keep": int(keep),
+        "maxStacks": int(max_stacks),
+    }
+    pressure = bool(
+        free_slots_status == "ok" and free_slots is not None
+        and int(free_slots) <= int(trigger_free_slots)
+    )
+    result: dict[str, Any] = {
+        "pressure": pressure, "slots": [], "whitelist": [], "items": [],
+        "trigger": trigger, "skipReason": "",
+    }
+    if not pressure:
+        result["skipReason"] = "空格足够（没有空格压力）⇒ 不动背包"
+        return result
+    stacks: list[dict[str, Any]] = []
+    for it in (player.get("inventory") or []):
+        if not isinstance(it, dict) or it.get("isTool"):
+            continue
+        qid = str(it.get("qualifiedId") or it.get("id") or "").strip()
+        bare = _bare_item_id(qid)
+        if not bare:
+            continue
+        name = str(it.get("name") or "")
+        if any(hint in name.lower() for hint in SEED_NAME_HINTS):
+            continue                          # 种子永远不卖（下一天还要种）
+        if bare in SLOT_RELIEF_NEVER_SELL_IDS:
+            continue                          # 升级材料/任务相关
+        if bare in SLOT_RELIEF_CROP_IDS:
+            tier, why = 1, "crop_overflow"    # 作物余量最先卖
+        elif bare in SLOT_RELIEF_MATERIAL_IDS:
+            tier, why = 2, "material"
+        elif bare in SLOT_RELIEF_HIGH_VALUE_IDS:
+            tier, why = 3, "high_value"       # 矿/晶洞最后卖
+        else:
+            continue                          # 表外一律不卖（fail-closed）
+        try:
+            stack, slot = int(it.get("stack") or 0), int(it.get("slot"))
+        except (TypeError, ValueError):
+            continue
+        if stack <= 0:
+            continue
+        stacks.append({"slot": slot, "qid": qid, "bareId": bare, "name": name,
+                       "stack": stack, "tier": tier, "why": why})
+    if not stacks:
+        result["skipReason"] = ("背包里没有可卖的盈余叠（只认已知作物/材料/矿表，"
+                                "工具/武器/种子/升级材料/未知物品一律不卖）⇒ 腾不出格子")
+        return result
+    # 同一 qid 可能有多叠：先按 qid 汇总，判断"卖掉该叠后仍 ≥ keep"（真盈余）。
+    totals: dict[str, int] = {}
+    for st in stacks:
+        totals[st["qid"]] = totals.get(st["qid"], 0) + int(st["stack"])
+    surplus = [st for st in stacks if totals[st["qid"]] - int(st["stack"]) >= int(keep)]
+    below_keep = False
+    chosen: list[dict[str, Any]] = []
+    if surplus:
+        surplus.sort(key=lambda s: (int(s["tier"]), int(s["stack"]), int(s["slot"])))
+        chosen = [surplus[0]]
+    else:
+        # 一个真盈余叠都没有（整包每 qid 都 ≤ keep）⇒ 整叠卖空最小的那叠清路。
+        smallest = sorted(stacks, key=lambda s: (int(s["tier"]), int(s["stack"]), int(s["slot"])))[0]
+        chosen = [smallest]
+        below_keep = True
+    chosen = chosen[: max(1, int(max_stacks))]
+    for st in chosen:
+        st["belowKeep"] = bool(below_keep)
+        if below_keep:
+            st["why"] = f"{st['why']}:below_keep_whole_stack"
+    result["slots"] = [int(s["slot"]) for s in chosen]
+    result["whitelist"] = [str(s["qid"]) for s in chosen]
+    result["items"] = [{"slot": int(s["slot"]), "qid": str(s["qid"]), "stack": int(s["stack"]),
+                        "tier": int(s["tier"]), "belowKeep": bool(s["belowKeep"]),
+                        "why": str(s["why"])} for s in chosen]
+    return result
 
 
 def surplus_sell_plan(

@@ -28,6 +28,9 @@ from agentfarm.farmwork import (  # noqa: E402
     SURPLUS_MATERIAL_IDS, buy_count_for, farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles,
     farm_empty_dirt, is_seed_offer,
     is_unreachable, pick_seed_offer, player_free_slots, seed_offers_from, surplus_sell_plan,
+    SLOT_RELIEF_CROP_IDS, SLOT_RELIEF_HIGH_VALUE_IDS, SLOT_RELIEF_KEEP,
+    SLOT_RELIEF_MATERIAL_IDS, SLOT_RELIEF_MAX_STACKS, SLOT_RELIEF_NEVER_SELL_IDS,
+    slot_relief_plan,
     farm_ready_tiles, known_crafting_recipes,
     till_blocked_by, tool_missing_reason, tool_presence,
 )
@@ -3456,6 +3459,86 @@ class TestTask210MachineChain(unittest.TestCase):
         st5 = worker.machine((60, 10), "collect")
         self.assertTrue(st5.ok, st5.reason)
         self.assertIn(self.BAR["id"], [i.get("qualifiedId") for i in w.inventory if i])
+
+
+class TestTask232SlotReliefPlan(unittest.TestCase):
+    """【task-232】空格压力通道的纯计划：只卖**已知盈余**，工具/种子/升级锭永不卖。
+
+    真机死锁（`logs/longrun-smoke-0739.jsonl` day1）：背包 12/12 满、钱 1977g、种子 10 ⇒
+    旧的白名单（今日收获）+ 材料通道闸门（`seeds_total == 0`）都不触发 ⇒ 腾不出格子。
+    """
+
+    K = SLOT_RELIEF_KEEP
+
+    @staticmethod
+    def _row(slot: int, qid: str, name: str, stack: int, *, tool: bool = False) -> dict:
+        item_id = qid.rsplit(")", 1)[-1] if qid.startswith("(") else qid
+        return {"slot": slot, "id": item_id, "qualifiedId": qid, "name": name,
+                "stack": stack, "isTool": tool}
+
+    def _plan(self, inv, *, free=0, status="ok", **kw):
+        obs = {"player": {"inventoryCount": max(len(inv), 12), "inventory": inv}}
+        return slot_relief_plan(obs, free_slots=free, free_slots_status=status, **kw)
+
+    def test_no_pressure_when_slots_are_available_or_status_unknown(self):
+        inv = [self._row(0, "(O)388", "Wood", 99), self._row(1, "(O)388", "Wood", 99)]
+        self.assertFalse(self._plan(inv, free=3)["pressure"])
+        self.assertFalse(self._plan(inv, free=0, status="unavailable")["pressure"])
+        self.assertEqual(self._plan(inv, free=0, status="unavailable")["items"], [])
+
+    def test_true_surplus_is_sold_and_keep_is_preserved(self):
+        inv = [self._row(0, "(O)388", "Wood", 99), self._row(1, "(O)388", "Wood", 99)]
+        plan = self._plan(inv)
+        self.assertTrue(plan["pressure"])
+        self.assertTrue(plan["slots"])
+        item = plan["items"][0]
+        self.assertEqual(item["qid"], "(O)388")
+        self.assertFalse(item["belowKeep"])
+        total = sum(int(r.get("stack") or 0) for r in inv if r.get("qualifiedId") == "(O)388")
+        self.assertGreaterEqual(total - int(item["stack"]), self.K)
+
+    def test_tier_priority_crop_then_material_then_high_value(self):
+        inv = [self._row(0, "(O)262", "Wheat", 30),            # crop（tier1）
+               self._row(1, "(O)262", "Wheat", 30),
+               self._row(2, "(O)388", "Wood", 99),             # material（tier2）
+               self._row(3, "(O)388", "Wood", 99),
+               self._row(4, "(O)535", "Geode", 5),             # high_value（tier3）
+               self._row(5, "(O)535", "Geode", 5)]
+        plan = self._plan(inv)
+        self.assertEqual(plan["items"][0]["tier"], 1)
+        self.assertEqual(plan["items"][0]["qid"], "(O)262")
+
+    def test_tools_seeds_upgrade_bars_and_unknown_items_are_never_candidates(self):
+        inv = [self._row(0, "(T)Axe", "Axe", 1, tool=True),
+               self._row(1, "(O)472", "Wheat Seeds", 10),
+               self._row(2, "(O)334", "Copper Bar", 5),
+               self._row(3, "(O)178", "Hay", 5),
+               self._row(4, "(O)999", "Mystery Thing", 1)]
+        plan = self._plan(inv)
+        self.assertTrue(plan["pressure"])
+        self.assertEqual(plan["items"], [])
+        self.assertEqual(plan["slots"], [])
+        self.assertTrue(plan["skipReason"])
+        # 三张表的 id 本身也不该包含被禁 id
+        self.assertFalse(SLOT_RELIEF_NEVER_SELL_IDS & SLOT_RELIEF_CROP_IDS)
+        self.assertFalse(SLOT_RELIEF_NEVER_SELL_IDS & SLOT_RELIEF_MATERIAL_IDS)
+        self.assertFalse(SLOT_RELIEF_NEVER_SELL_IDS & SLOT_RELIEF_HIGH_VALUE_IDS)
+
+    def test_below_keep_falls_back_to_whole_stack(self):
+        inv = [self._row(0, "(O)535", "Geode", 3)]   # 单叠 3 < K ⇒ 无真盈余
+        plan = self._plan(inv)
+        item = plan["items"][0]
+        self.assertTrue(item["belowKeep"])
+        self.assertEqual(int(item["stack"]), 3)        # 整叠卖空（游戏没有"卖一部分"）
+        self.assertIn("below_keep_whole_stack", item["why"])
+
+    def test_max_stacks_limits_the_plan(self):
+        inv = [self._row(0, "(O)388", "Wood", 99), self._row(1, "(O)388", "Wood", 99),
+               self._row(2, "(O)390", "Stone", 99), self._row(3, "(O)390", "Stone", 99),
+               self._row(4, "(O)771", "Fiber", 99), self._row(5, "(O)771", "Fiber", 99)]
+        plan = self._plan(inv, max_stacks=2)
+        self.assertLessEqual(len(plan["items"]), 2)
+        self.assertLessEqual(len(plan["items"]), SLOT_RELIEF_MAX_STACKS)
 
 
 if __name__ == "__main__":  # pragma: no cover
