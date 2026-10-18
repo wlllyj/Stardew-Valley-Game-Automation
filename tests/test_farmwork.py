@@ -3540,6 +3540,35 @@ class TestTask232SlotReliefPlan(unittest.TestCase):
         self.assertLessEqual(len(plan["items"]), 2)
         self.assertLessEqual(len(plan["items"]), SLOT_RELIEF_MAX_STACKS)
 
+    # ---- 【task-237】需求驱动：多叠选取 + 今天的收获产物优先 ----
+    def test_multi_stack_selection_keeps_each_qid_above_keep(self):
+        """同 qid 多叠：可以卖到目标水位，但**选中的叠一起卖完**仍须 ≥ K。
+
+        红线：旧版按原始总量逐叠判"卖后 ≥K"，会同时选中两叠 ⇒ 卖完剩 0 < K。
+        """
+        inv = [self._row(0, "(O)388", "Wood", 99), self._row(1, "(O)388", "Wood", 99)]
+        plan = self._plan(inv, max_stacks=5)
+        self.assertEqual(len(plan["items"]), 1)        # 只许卖一叠（卖两叠会剩 0 < K）
+        left = 2 * 99 - sum(int(it["stack"]) for it in plan["items"])
+        self.assertGreaterEqual(left, self.K)
+        # 三叠各 99 时可以卖两叠（剩 99 ≥ K）
+        inv3 = inv + [self._row(2, "(O)388", "Wood", 99)]
+        plan3 = self._plan(inv3, max_stacks=5)
+        self.assertEqual(len(plan3["items"]), 2)
+        left3 = 3 * 99 - sum(int(it["stack"]) for it in plan3["items"])
+        self.assertGreaterEqual(left3, self.K)
+
+    def test_prefer_qids_puts_todays_harvest_first(self):
+        """【task-237】`prefer_qids`（今天亲手收获的作物）排在材料档之前。"""
+        inv = [self._row(0, "(O)262", "Wheat", 30),     # crop（tier1）
+               self._row(1, "(O)262", "Wheat", 30),
+               self._row(2, "(O)388", "Wood", 99),      # material（tier2）
+               self._row(3, "(O)388", "Wood", 99)]
+        plan = self._plan(inv, max_stacks=1)
+        self.assertEqual(plan["items"][0]["qid"], "(O)262")   # 无偏好：作物档优先
+        plan_pref = self._plan(inv, max_stacks=1, prefer_qids=["(O)388"])
+        self.assertEqual(plan_pref["items"][0]["qid"], "(O)388")  # 有偏好 ⇒ 今天的收获先卖
+
     # ---- 【task-232 增量・Lead m21874】建造预留覆盖 K ----
     def test_reserve_table_overrides_keep_for_building_materials(self):
         """铜矿 30（25+5 两叠）⇒ 只卖那 5 个，卖完仍留 25（熔炉 20 + 5 锭）。"""

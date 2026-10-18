@@ -241,13 +241,26 @@ MAX_ENV_ATTEMPTS = 2
 #: 59 次 `harvest_gave_up`、`no_hard_failures=false`，而 `sell`/`ship` 明明一直在跑 ——
 #: 缺的不是能力，而是"**先腾格再收**"的次序。回路每轮至少腾 1 格；用满本上限还腾不出
 #: （没有可卖/可出货的叠）⇒ 如实 `inventory_blocked` 收尾（不进 `JUSTIFIED_END_REASONS`）。
-SLOT_RELIEF_MAX = 3
+#: 【task-237】轮数从 3 放宽到 6：0.7.40 A2 冒烟里 `harvest` 每天需要 **12 格**，而
+#: 旧口径"目标 = SLOT_RESERVE + 1 = 2 格"每轮只腾 1 格 ⇒ 腾出来立刻被塞满、
+#: 3/3 天仍然 `inventory_blocked`。现在目标水位由当天收获需求算（见 `_harvest_demand`），
+#: 6 轮 × 最多 10 叠是硬上界，防止"卖穿背包"那种反向事故。
+SLOT_RELIEF_MAX = 6
 
 #: 【task-232】空格压力通道：`_slot_relief` 每轮最多卖 1 叠、每天最多卖这么多叠
 #: （与"轮数"是两个独立界：一轮可能先出货箱再卖材料）。
-#: 为什么还要一个"叠数"界：`SLOT_RELIEF_MAX=3` 只管轮数，如果每轮卖一叠，
-#: 一天最多 3 叠——但将来若允许多层并行，没有叠数界就可能把背包清空（那是另一回事）。
-SLOT_RELIEF_MAX_STACKS_TOTAL = 5
+#: 【task-237】5 → 10：需求驱动后一天可能要腾到 12 格，叠数界必须比轮数宽，
+#: 否则"卖 5 叠就停"会卡在目标水位之下（0.7.40 实测的另一个卡点）。
+SLOT_RELIEF_MAX_STACKS_TOTAL = 10
+
+#: 【task-237】**需求驱动**：当天"可收格数"的上界（harvest 阶段每轮最多分配 12 格）。
+HARVEST_DEMAND_CAP = 12
+
+#: 【task-237】背包空格的目标上限：目标水位 = `min(SLOT_RESERVE + harvest_demand, SLOT_FREE_CAP)`。
+SLOT_FREE_CAP = 12
+
+#: 【task-237】可收格数**读不到**时的保守需求（fail-closed：不猜 12，也绝不当作 0）。
+SLOT_RELIEF_DEMAND_FALLBACK = 3
 
 #: 【task-232】空格压力的目标水位：腾到 `SLOT_RESERVE + 1` 格就停手（Lead m21658）。
 #: 低水位只有 1 格余量时，收货/掉落立刻又填满 ⇒ 只腾到"够用"再评估，不追求清空背包。
@@ -4967,8 +4980,10 @@ class LongRun:
         return bool(good)
 
     # ------------------------------------------------------------------ 背包/腾格（task-198）
-    def _sell_surplus_for_space(self, obs: dict[str, Any], rep: DayReport) -> list[dict[str, Any]]:
-        """【task-232】空格压力通道：卖一叠**已知盈余**腾格（不看在不在凑种子钱）。
+    def _sell_surplus_for_space(self, obs: dict[str, Any], rep: DayReport, *,
+                                max_stacks: int = 1,
+                                prefer_harvested: bool = True) -> list[dict[str, Any]]:
+        """【task-232】空格压力通道：卖**已知盈余**腾格（不看在不在凑种子钱）。
 
         与 `_sell_surplus_for_slot()`（task-102）的分工：
 
@@ -4977,6 +4992,10 @@ class LongRun:
             `farmwork.slot_relief_plan()` 的三档白名单（作物余量 → 材料 → 矿/晶洞）
             卖**一叠**。真机死锁（`logs/longrun-smoke-0739.jsonl` day1：背包 12/12、钱 1977g、
             种子 10）两条旧通道都不触发 ⇒ 整天 `inventory_blocked`；缺的就是这条。
+
+        【task-237】需求驱动：`max_stacks` 由调用方按"目标水位 − 当前空格"给（一次最多
+        卖几叠）；`prefer_harvested` 把**今天亲手收获的作物**排在最前（它们本来就是为卖而
+        收的产物，比动库存材料更合理）。
 
         纪律（卡面 + Lead m21658）：只认已知表、`isTool`/种子/升级锭/未知物品一律不卖；
         每 qid 留 K（或整叠卖空，见 `slot_relief_plan`）；每天 ≤ `SLOT_RELIEF_MAX_STACKS_TOTAL`
@@ -4989,8 +5008,13 @@ class LongRun:
         if self.slot_relief_stacks_today >= SLOT_RELIEF_MAX_STACKS_TOTAL:
             return []
         free_slots, fs_status = player_free_slots(FarmWorker.player_of(obs))
+        prefer: tuple[str, ...] = ()
+        if prefer_harvested:
+            prefer = tuple(sorted(getattr(self.worker, "harvested", None) or {}))
         plan = slot_relief_plan(obs, free_slots=free_slots, free_slots_status=fs_status,
-                                trigger_free_slots=SLOT_RESERVE, max_stacks=1)
+                                trigger_free_slots=SLOT_RESERVE,
+                                max_stacks=max(1, int(max_stacks)),
+                                prefer_qids=prefer)
         if not plan["pressure"]:
             return []
         if not plan["slots"]:
@@ -5043,6 +5067,41 @@ class LongRun:
                 return int(total)
         return int(window)
 
+    def _harvest_demand(self, obs: dict[str, Any]) -> tuple[int, str]:
+        """【task-237】当天"可收格数"的需求估计 + 口径来源（只用来定腾格目标水位）。
+
+        为什么需要"需求"而不是固定 `SLOT_RESERVE + 1`：0.7.40 A2 冒烟里 `harvest` 阶段
+        每轮要分配 **12 格**（`intent_coverage`: `req=12/ok=0/reasons={"no_slot":12}`），
+        而旧口径每轮只腾 1–3 格 ⇒ 腾出来立刻被塞满、3/3 天 `inventory_blocked`。
+        目标水位必须**按当天要收多少格**算。
+
+        口径（三态，绝不把"读不到"当 0）：
+          * 窗口内 `ready` 的活苗格数；
+          * 窗口外熟作物坐标（`readyTiles`，task-199）的条数；
+          * farm 级 `readyCrops` 计数；
+          三者取最大，封顶 `HARVEST_DEMAND_CAP`；**三路全不可用** ⇒ 保守
+          `SLOT_RELIEF_DEMAND_FALLBACK`（`demand_basis="conservative"`）。
+        """
+        tmap = FarmWorker.tiles_of(obs)
+        window = sum(1 for t, tv in tmap.items()
+                     if tv.get("crop") and not tv.get("dead") and tile_ready(tv)
+                     and t not in self.harvest_gave_up and t not in self.blocked)
+        outside, status = self._ready_far_outside(obs)
+        farm = obs.get("farm") or {}
+        farm_ok = farm.get("complete") is True and farm.get("loaded") is not False
+        farm_count = self._farm_count(obs, "readyCrops")
+        if not tmap and not farm_ok and status == "unavailable":
+            return int(SLOT_RELIEF_DEMAND_FALLBACK), "conservative"
+        demand = max(int(window), len(outside), int(farm_count or 0))
+        demand = max(0, min(int(HARVEST_DEMAND_CAP), int(demand)))
+        if status in ("ok", "truncated") and outside:
+            basis = "readyTiles"
+        elif farm_ok and isinstance(farm_count, int):
+            basis = "farm"
+        else:
+            basis = "window"
+        return int(demand), basis
+
     def _bag_state(self, obs: dict[str, Any]) -> tuple[int, int, str]:
         """背包空格行数、**是否到了该腾格的信号**（0/1）、以及空槽读数的状态。
 
@@ -5089,46 +5148,76 @@ class LongRun:
         self._say(f"  × 背包满且腾不出格子：{reason}")
 
     def _slot_relief(self, obs: dict[str, Any], rep: DayReport) -> bool:
-        """【task-198】"腾格收敛回路"：背包满/将满时**先把格子腾出来**，再回去干活。
+        """【task-198】"腾格收敛回路"：背包低于**需求水位**时先把格子腾出来，再回去干活。
 
         返回 True = 这一轮真的腾出了格子（调用方 `continue`，重新观测/决策）；
         False = 不需要腾格，或腾不出来（已置 `inventory_blocked_today`，当天如实收尾）。
 
+        【task-237 需求驱动】目标水位 = `min(SLOT_RESERVE + harvest_demand, SLOT_FREE_CAP)`，
+        其中 `harvest_demand` 由 `_harvest_demand(obs)` 按"当天可收格数"估（窗口 ready /
+        `readyTiles` / farm `readyCrops` 取最大，三路全不可用 ⇒ 保守 3）。
+        为什么：0.7.40 A2 里 `harvest` 每天需 12 格，旧口径只腾到 2 格 ⇒ 腾出来立刻塞满、
+        3/3 天 `inventory_blocked`。
+
         次序（每一层都留 journal）：
-          1. `_ship_loot()`：把**今天亲手收货、且绑格子证据**的成品放进出货箱 —— 最直接、
-             白名单最严的腾格方式（绝不"看到背包里有东西就卖"）；
-          2. 仍不够 ⇒ `_sell_surplus_for_slot()`：按 `surplus_sell_plan(need_slot=True)` 卖一叠
-             盈余材料（只走 `SURPLUS_MATERIAL_IDS` 白名单、每 id 留 K 件）；
-          3. 都腾不出来（没有可出货/可卖的叠）⇒ 记一次 `inventory_blocked`、置
-             `inventory_blocked_today`，当天不再白跑。
+          1. **卖之前先清模态**（`_dismiss_stray_menu`）：模态挡着时 `sell` 会被 `ui_modal`
+             拒绝（task-235 并入本卡）；清不掉 ⇒ 不卖、如实 blocked（不空转）。
+          2. `_ship_loot()`：把**今天亲手收货、且绑格子证据**的成品放进出货箱；
+          3. `_sell_surplus_for_slot()`（task-102）：缺种子钱时卖盈余材料；
+          4. **空格压力通道**：按 `slot_relief_plan()` 三档白名单卖叠，**优先今天的收获产物**，
+             每叠一卖、每次重观测，卖到目标水位为止（受轮数/叠数两个硬界约束）。
+          都不是可腾 ⇒ 记一次 `inventory_blocked`（reason 区分"没有可卖叠"与"卖满上限仍不够"）。
 
-        界（卡面硬要求）：每天最多 `SLOT_RELIEF_MAX` 轮、**每轮必须腾 ≥1 格**；
-        本轮腾 0 格 ⇒ 立刻判定"腾不出来"，绝不无限自旋。`no_slot` 本身不占每格配额
-        （见 `_count_attempts`），所以这条回路是它**唯一**的界。
-
-        为什么落在"掉落预算"上：`clear`/`till`/`water` 的掉落也会填包 —— 低水位（
-        `SLOT_RESERVE`）就提前腾格，能让腾格发生在这些动作**之前**，而不是等背包 0 格时
-        才发现收不进来（run A′ 的形态）。
+        界（卡面硬要求）：每天最多 `SLOT_RELIEF_MAX`(=6) 轮、最多
+        `SLOT_RELIEF_MAX_STACKS_TOTAL`(=10) 叠；本轮腾 0 格 ⇒ 立刻判定"腾不出来"，绝不空转。
         """
         assert self.worker is not None
         free_slots, need, status = self._bag_state(obs)
-        if status != "ok" or need <= 0:
+        if status != "ok":
+            return False
+        demand, demand_basis = self._harvest_demand(obs)
+        target_free = min(SLOT_RESERVE + max(0, int(demand)), SLOT_FREE_CAP)
+        # 【task-237】触发条件 = 低水位/0 空格（`need` 信号）—— 需求水位只决定"这一轮腾到多少"。
+        # 为什么不按"free < 需求"提前腾：腾格本身要花请求/时间，而收获可以先塞进现有空格、
+        # 出货再跟上；0.7.40 A2 的真形态是 `freeSlots_before: 0`（真堵死），不是"空格略少"。
+        if need <= 0:
             return False
         if self.inventory_blocked_today:
             return False
+        # 【task-237】先判"这一轮到底有没有可腾的东西"：没有就先回去干活（还有空格时），
+        # **不消耗轮数**——0.7.40 A2 里"空格 1、没有可卖叠"的无效轮会把 6 轮预算烧光。
+        harvested_now = tuple(sorted(getattr(self.worker, "harvested", None) or {}))
+        pre_plan = slot_relief_plan(obs, free_slots=free_slots, free_slots_status=status,
+                                    trigger_free_slots=SLOT_RESERVE, max_stacks=1,
+                                    prefer_qids=harvested_now)
+        if not harvested_now and not pre_plan.get("slots"):
+            if int(free_slots) <= 0:
+                self._note_inventory_blocked(
+                    obs, rep, free_slots=int(free_slots),
+                    reason=str(pre_plan.get("skipReason") or "没有可腾的来源（出货/卖出都空）"))
+            return False
         if self.slot_relief_today >= SLOT_RELIEF_MAX:
             self._note_inventory_blocked(
-                obs, rep, free_slots=free_slots,
-                reason=f"腾格回路已用满 {SLOT_RELIEF_MAX} 轮，背包仍然满")
+                obs, rep, free_slots=int(free_slots),
+                reason=f"腾格回路已用满 {SLOT_RELIEF_MAX} 轮（目标 {target_free} 格、"
+                       f"现有 {free_slots} 格）")
+            return False
+        # 【task-235 并入】卖之前先清模态：模态挡着时 sell 会被 ui_modal 拒，白跑一轮。
+        obs = self._dismiss_stray_menu(obs, rep, where="slot_relief")
+        is_modal, menu, _ui = self._modal_info(obs)
+        if is_modal:
+            self._note_inventory_blocked(
+                obs, rep, free_slots=int(free_slots),
+                reason=f"卖之前模态关不掉（{menu!r}）⇒ 这一轮不卖，如实收尾")
             return False
         self.slot_relief_today += 1
         self._space_skip_reason = ""
-        if need not in self.slot_relief_noted:
-            self.slot_relief_noted.add(need)
-            self._journal("slot_relief_noted", free_slots=int(free_slots), reserve=SLOT_RESERVE,
-                          round=self.slot_relief_today, limit=SLOT_RELIEF_MAX,
-                          note="背包到低水位 ⇒ collect/清障/浇水之前先腾格"
-                               "（掉落与收获也会填包，等 0 格才动会像 run A′ 那样收不进来）")
+        self._journal("slot_relief_noted", free_slots=int(free_slots), reserve=SLOT_RESERVE,
+                      demand=int(demand), demand_basis=str(demand_basis),
+                      target_free=int(target_free), round=self.slot_relief_today,
+                      limit=SLOT_RELIEF_MAX,
+                      note="背包低于当天收获需求的水位 ⇒ collect/清障/浇水之前先腾格"
+                           "（掉落与收获也会填包，等 0 格才动会像 run A′ 那样收不进来）")
         shipped = False
         trigger = ""
         money_before = FarmWorker.money(obs)
@@ -5140,25 +5229,37 @@ class LongRun:
         if shipped:
             trigger = "harvest_bound"
             obs = self._snap_or(obs)
-        if self._bag_state(obs)[1] > 0:
+        free_now = int(self._bag_state(obs)[0])
+        if need > 0:
             try:
                 if self._sell_surplus_for_slot(obs, rep):
                     trigger = trigger or "short_money"
                     obs = self._snap_or(obs)
             except Exception:                   # 卖货失败同样不打断（腾不出来会如实记账）
                 pass
-        # 【task-232】空格压力通道：上面两条都腾不出来时（真机 day1 形态：钱够、有种子、
-        # 今天还没收货），按"已知盈余"三档白名单卖一叠腾格 —— 否则背包满就永远收不进来。
-        if int(self._bag_state(obs)[0]) <= SLOT_RESERVE:
+            free_now = int(self._bag_state(obs)[0])
+        # 空格压力通道（task-232 + task-237）：卖到目标水位，每叠一卖、每次重观测。
+        while (int(free_now) < int(target_free)
+               and self.slot_relief_stacks_today < SLOT_RELIEF_MAX_STACKS_TOTAL):
+            want = min(int(target_free) - int(free_now),
+                       SLOT_RELIEF_MAX_STACKS_TOTAL - int(self.slot_relief_stacks_today))
+            if want <= 0:
+                break
             try:
-                sold_now = self._sell_surplus_for_space(obs, rep)
-                if sold_now:
-                    trigger = trigger or "space_pressure"
-                    obs = self._snap_or(obs)
-            except Exception:                   # 白名单/观测异常不打断（会如实 blocked）
-                pass
-        after_slots = self._bag_state(obs)[0]
+                sold_now = self._sell_surplus_for_space(obs, rep, max_stacks=want)
+            except Exception:               # 白名单/观测异常不打断（会如实 blocked）
+                sold_now = []
+            if not sold_now:
+                break
+            trigger = trigger or "space_pressure"
+            obs = self._snap_or(obs)
+            after = int(self._bag_state(obs)[0])
+            if after <= int(free_now):          # 卖了但空格没增 ⇒ 不再重复请求（下面双差分判 failed）
+                break
+            free_now = after
+        after_slots = int(self._bag_state(obs)[0])
         freed = max(0, int(after_slots) - int(free_slots))
+        reached = bool(int(after_slots) >= int(target_free))
         # 【task-232】双差分复核：卖出去的东西必须让**背包行数真的减少**，且钱**当天不变**
         # （钱只由下一次 NewDay 结算；钱变了说明有谁在脑侧写钱 —— 那是红线）。
         money_after = FarmWorker.money(obs)
@@ -5185,25 +5286,43 @@ class LongRun:
                       rows_before=int(rows_before), rows_after=int(rows_after),
                       failed=bool(failed), blocked_reason=blocked_reason,
                       round=self.slot_relief_today, max_rounds=SLOT_RELIEF_MAX,
-                      reserve=SLOT_RESERVE, target_free=SLOT_RELIEF_TARGET_FREE,
+                      reserve=SLOT_RESERVE, demand=int(demand),
+                      demand_basis=str(demand_basis), target_free=int(target_free),
+                      reached=bool(reached),
                       note="腾出格子后重新决策（先腾格、再收/清/浇）；腾 0 格 ⇒ 立刻如实 "
                            "inventory_blocked，不空转")
         if failed:
             self._note_inventory_blocked(obs, rep, free_slots=after_slots,
                                          reason=blocked_reason)
             return False
+        if reached:
+            rep.notes.append(f"腾格到需求水位：空格 {free_slots} → {after_slots}"
+                             f"（目标 {target_free}，第 {self.slot_relief_today} 轮，"
+                             f"trigger={trigger or 'none'}）")
+            return True
         if freed >= 1:
             rep.notes.append(f"腾格：空格 {free_slots} → {after_slots}"
-                             f"（第 {self.slot_relief_today} 轮，trigger={trigger or 'none'}）")
+                             f"（目标 {target_free}，第 {self.slot_relief_today} 轮，"
+                             f"trigger={trigger or 'none'}）")
             return True
         if sold:
-            no_candidate = f"卖了 {len(sold)} 叠仍满（空格 {after_slots}）"
+            no_candidate = (f"卖了 {len(sold)} 叠仍不够（空格 {after_slots} / 目标 {target_free}）")
+            if self.slot_relief_stacks_today >= SLOT_RELIEF_MAX_STACKS_TOTAL:
+                no_candidate += f"；叠数已用满 {SLOT_RELIEF_MAX_STACKS_TOTAL}"
         else:
             no_candidate = ("没有可卖的盈余叠（出货箱白名单空 + 已知盈余表里没有超 K 的叠）"
                             "⇒ 腾不出格子")
             if getattr(self, "_space_skip_reason", ""):
                 no_candidate = f"{no_candidate}；空格压力通道：{self._space_skip_reason}"
-        self._note_inventory_blocked(obs, rep, free_slots=after_slots, reason=no_candidate)
+        # 【task-237】关键边界：**还有空格**时腾不出来 ≠ 背包堵死 —— 收获仍可先塞进现有空格、
+        # 出货/卖出再跟上（0.7.40 A2 是真堵死：0 空格且无可卖叠）。只有 0 空格才算
+        # `inventory_blocked`（否则会把"边收边腾"的正常日误判成堵死，task-198 用例钉死）。
+        if int(free_slots) <= 0:
+            self._note_inventory_blocked(obs, rep, free_slots=after_slots,
+                                         reason=no_candidate)
+        elif sold:
+            rep.notes.append(f"腾格未达需求水位：空格 {after_slots} / 目标 {target_free}"
+                             f"（还有可用空格，先继续干活）")
         return False
 
     def _end_inventory_blocked(self, obs: dict[str, Any], rep: DayReport) -> str:

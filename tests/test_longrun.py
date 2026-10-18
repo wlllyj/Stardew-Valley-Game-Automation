@@ -10019,20 +10019,30 @@ class TestTask198InventoryDay(unittest.TestCase):
         self.assertNotIn("inventory_blocked", rep.ended_by)
 
     def test_one_free_slot_with_many_ripe_reliefs_then_blocks_honestly(self):
-        """1 空格 + 8 熟 ⇒ 先腾格（`freeSlots_before==1`）、收不进来的部分如实 `inventory_blocked`。"""
+        """1 空格 + 8 熟 ⇒ 需求驱动腾格（`freeSlots_before` 从 1 或 0 起），收不进来的部分如实收尾。
+
+        【task-237 修订】旧版断言"只收进 1 格 + leftover == RIPE - ok"；需求驱动后同一夹具能
+        收进 6–7 格（6 轮腾格预算 × 每轮出货 1 叠；w.crops 只剩 1–2 格），所以改成：
+          * 先腾格（第一轮 `freeSlots_before in (0, 1)`）；
+          * 收进显著更多（`ok_steps >= RIPE_TILES - 2`）；
+          * 仍如实 `inventory_blocked`（腾格预算用满，不是假 VERIFIED）；
+          * `len(w.crops) == 最后一条 harvest 阶段 leftover`（账本与观测一致）。
+        """
         run, w, _client = self._day(rows=11, ripe=self.RIPE_TILES)
         rep = run.days[0]
         relief = self._events(run, "slot_relief")
         self.assertGreaterEqual(len(relief), 1)
-        self.assertEqual(relief[0]["freeSlots_before"], 1, "低水位就要腾格，不是等 0 格")
+        self.assertIn(relief[0]["freeSlots_before"], (0, 1), "低水位就要腾格，不是等 0 格")
+        self.assertGreaterEqual(rep.ok_steps, self.RIPE_TILES - 2,
+                                f"需求驱动应比 task-198 时收得更多：{rep.ok_steps}")
         self.assertEqual(rep.ended_by, "inventory_blocked")
         self.assertEqual(rep.failed_steps, 0)
         self.assertTrue(rep.checks["no_hard_failures"])
         self.assertFalse(rep.verified)
         self.assertNotIn("守卫仍说还有活", rep.ended_reason)
         stage = [s for s in rep.stages if s["stage"] == "harvest"][-1]
-        self.assertEqual(stage["leftover"], self.RIPE_TILES - stage["ok"])
         self.assertEqual(len(w.crops), stage["leftover"])
+        self.assertLessEqual(stage["leftover"], 2)
 
     def test_no_form_ever_reports_guard_complaint_with_stuck(self):
         """四种构造都不许出现「守卫仍说还有活」+ `stuck` 组合（deputy 的四条 FAIL）。"""
@@ -11329,31 +11339,89 @@ class TestTask232SpacePressure(unittest.TestCase):
     def _events(run: LongRun, name: str) -> list[dict]:
         return [e for e in run.entries if e["event"] == name]
 
-    def test_space_pressure_sells_one_known_surplus_stack(self):
+    def test_space_pressure_sells_known_surplus_stacks(self):
+        """【task-237 修订】空格压力通道卖到**需求水位**（多叠），不再固定只卖 1 叠。
+
+        旧版（task-232）断言"卖一叠"；0.7.40 A2 证明 1 叠不够（harvest 每天要 12 格）。
+        现在：`demand = 可收格数`（=3）⇒ `target_free = SLOT_RESERVE + 3 = 4`，
+        一次最多卖到这个水位（受叠数界约束）。红线不变：只卖已知表真盈余、每 qid 留 K。
+        """
         w = self._world()
         worker = _SpaceWorker(w)
         run = self._run(w, worker)
         self.assertEqual(player_free_slots(FarmWorker.player_of(w.obs()))[0], 0)
         rep = DayReport(day_key=("summer", 3, 1), started_at=0.0)
         self.assertTrue(run._slot_relief(w.obs(), rep))
-        self.assertEqual(len(worker.sell_calls), 1)
-        # 只卖"真盈余"那一档：Wood 两叠各 99 ⇒ 卖一叠仍留 99 ≥ K(10)。
-        self.assertEqual(worker.sell_calls[0]["whitelist"], ["(O)388"])
+        self.assertGreaterEqual(len(worker.sell_calls), 1)
+        # 先卖真盈余（Wood 两叠各 99）；真盈余卖光后按既有"整叠卖空"退路卖最小一叠
+        # （Wheat 10 → 卖空，`belowKeep=True` 如实记账）。两条路都只碰已知表。
+        sold_qids = [c["whitelist"][0] for c in worker.sell_calls]
+        self.assertIn("(O)388", sold_qids)
+        self.assertTrue(set(sold_qids) <= {"(O)388", "(O)262"}, sold_qids)
         ev = self._events(run, "slot_relief")
         self.assertEqual(len(ev), 1, ev)
         self.assertEqual(ev[0]["trigger"], "space_pressure")
-        self.assertEqual(ev[0]["freed"], 1)
+        self.assertEqual(ev[0]["demand"], 3)
+        self.assertEqual(ev[0]["demand_basis"], "window")
+        self.assertEqual(ev[0]["target_free"], 4)
         self.assertEqual(ev[0]["before_free"], 0)
-        self.assertEqual(ev[0]["after_free"], 1)
-        self.assertEqual([it["qid"] for it in ev[0]["sold"]], ["(O)388"])
+        self.assertEqual(ev[0]["freed"], len(worker.sell_calls))
+        self.assertEqual(ev[0]["after_free"], len(worker.sell_calls))
+        self.assertEqual([it["qid"] for it in ev[0]["sold"]], sold_qids)
         self.assertEqual(ev[0]["money_before"], ev[0]["money_after"])
         self.assertLess(ev[0]["rows_after"], ev[0]["rows_before"])
         self.assertFalse(ev[0]["failed"])
         self.assertFalse(run.inventory_blocked_today)
-        # 保留 K 的不变量：卖完后 Wood 总量仍 ≥ K。
+        # 保留 K 的不变量：真盈余那档卖完后 Wood 总量仍 ≥ K。
         left = sum(int(r.get("stack") or 0) for r in w.inventory
                    if str(r.get("qualifiedId")) == "(O)388")
         self.assertGreaterEqual(left, SLOT_RELIEF_KEEP)
+
+    def test_demand_drives_multi_stack_relief_to_target(self):
+        """【task-237】需求水位驱动：可收 6 格 ⇒ 目标 7 格，一次腾格卖多叠直到达标。"""
+        w = self._world(ripe=6)
+        # 加足真盈余叠（Wood 8 叠 ×99）：逐个扣减后仍 ≥K ⇒ 目标 7 格可一次卖到。
+        inv = [r for r in w.inventory if not str(r.get("qualifiedId", "")).startswith("(O)388")]
+        base = max([int(r.get("slot") or 0) for r in inv] + [0]) + 1
+        inv += [{"slot": base + i, "id": "388", "qualifiedId": "(O)388",
+                 "name": "Wood", "stack": 99, "isTool": False} for i in range(8)]
+        w.inventory = inv
+        w.inventory_capacity = max(12, len(w.inventory))
+        worker = _SpaceWorker(w)
+        run = self._run(w, worker)
+        rep = DayReport(day_key=("summer", 3, 1), started_at=0.0)
+        self.assertTrue(run._slot_relief(w.obs(), rep))
+        ev = self._events(run, "slot_relief")[0]
+        self.assertEqual(ev["demand"], 6)
+        self.assertEqual(ev["target_free"], 7)
+        self.assertTrue(ev["reached"], ev)
+        self.assertGreaterEqual(ev["freed"], 7)
+        self.assertEqual(ev["freed"], len(worker.sell_calls))
+        left = sum(int(r.get("stack") or 0) for r in w.inventory
+                   if str(r.get("qualifiedId")) == "(O)388")
+        self.assertGreaterEqual(left, SLOT_RELIEF_KEEP)
+
+    def test_harvest_demand_falls_back_conservatively_without_evidence(self):
+        """【task-237】三路口径全不可用 ⇒ 保守 3 + `demand_basis="conservative"`（绝不当 0）。"""
+        w = FakeWorld(seeds=10, money=1977, weeds=0)
+        w.tillable = set()
+        w.crops = {}
+        w.farm = {"loaded": False, "complete": False}
+        obs = w.obs()
+        run = make_run(w)
+        self.assertEqual(run._harvest_demand(obs), (3, "conservative"))
+
+    def test_harvest_demand_uses_ready_tiles_outside_window(self):
+        """【task-237】`readyTiles`（窗口外熟作物）也计入需求（取最大口径）。"""
+        w = self._world(ripe=2)
+        w.farm = {"loaded": True, "complete": True, "readyCrops": 5,
+                  "readyTiles": [[70, 20], [71, 20], [72, 20], [73, 20], [74, 20]],
+                  "readyTilesTruncated": False}
+        obs = w.obs()
+        run = make_run(w)
+        demand, basis = run._harvest_demand(obs)
+        self.assertEqual(demand, 5)
+        self.assertIn(basis, ("readyTiles", "farm"))
 
     def test_harvest_is_no_longer_no_slot_after_relief(self):
         w = self._world()
