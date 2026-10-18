@@ -13,7 +13,8 @@
 | 卡 | 优先级 | 内容 | 归属 | 状态 |
 | --- | --- | --- | --- | --- |
 | task-15 | P0 | **守卫只对当前可执行/可达待做格敏感**：`_pending_work()` 剔 `resume_stall_tiles`/`encircled_day`，原始账本另存 `_ledger_pending()`；`_pending_snapshot` 六口径并列；`is_justified_end` 增证据门槛（`resume_exhausted` 仅 `pending_executable==0` 才认，`stuck:` 永不认，观测缺失 fail-closed）；burst/换片上限改走诚实收工；sleep_guard no_work 防白拿；day_end 并列留痕 + `stage_midway_leftover`；checks 10 键不变 | dev-coder | `e347aaa`（定向 6/6 OK、自报全量 1317 OK、变异 4/4） |
-| task-16 | P1 | **背包满留痕/腾格**：每次观测算 `free_slots = inventoryCount − len(inventory[])`；`<=SLOT_RESERVE` 走 slot_relief（白名单/建造预留/每 qid 下限；工具/武器/种子/建材/锭永不卖；卖走 `Farm.shipItem`/`sell` + 观测差分）；清障掉落被拒留 `loot_lost`（info）；买种前满包先腾格；不因背包满判失败；Deluxe Backpack 2000g 交 task-14 评估 | dev-coder | 在做（Lead 放行中） |
+| task-16 | P1 | **背包满留痕/腾格**：每次观测算 `free_slots = inventoryCount − len(inventory[])`；`free_slots==0` 走 slot_relief 压力通道（白名单/建造预留/每 qid 下限；工具/武器/种子/建材/锭永不卖；卖走 `Farm.shipItem`/`sell` + 观测差分）；清障掉落被拒留 `loot_lost`（info）；买种前满包先腾格；不因背包满判失败；Deluxe Backpack 2000g 交 task-14 评估 | dev-coder | `3a5d24c`（定向 9+57 OK、自报全量 1326 OK、变异 5/5） |
+| task-22 | P0 | **残缺 tile 不得算 unobserved 放行**（deputy NIT-1 fail-open）：观测 `tiles[]` 里出现但缺 kind/crop 的残缺记录 ⇒ fail-closed（计 executable 或 `malformed_tiles>0` 且 `day_justified` 必 false）；账本格不在观测 tiles[] 的仍算 unobserved（冬26 的 2 格）；冬26/27 重放语义不变 | dev-coder | 在做（0.7.45 冻结前最后一卡） |
 
 ## §2 冻结九步（Lead 独占）
 
@@ -54,6 +55,7 @@
 - 背包容量仍为 12（未买升级）；腾格上限约 3 格（Clay/Geode/Wheat）；背包升级 2000g 交 task-14 评估。
 - 冬 26 的 40 格账本无坐标（观测 10 片×25=250<263 截断）⇒ 逐格归属【无法判定】；冬 27 的 217 精确闭合（220−3 挡死）。
 - `no_work` VERIFIED 日证据力弱（见 §3 附则）；L2/L3 对照需要春季作物面，冬季尾巴无面可测。
+- **边界裁决（task-16，Lead 2026-10-18）**：槽位压力通道按 `free_slots==0` 触发，不按卡面字面 `<=SLOT_RESERVE(1)`——因为 `TestTask198SlotRelief.test_one_free_slot_and_one_ripe_crop_does_not_relief` 钉死「1 空格 + 1 熟作物不许白卖腾格」（0.7.40 边界），而缺的正是「真满 0 格 + 无收获需求」这条；买种需求（需要 1 格）由买种前腾格路径独立覆盖。腾格上限约 3 格（Clay/Geode/Wheat）如实报。
 - LLM 输入仍缺容量/当季性/工具等级，取消原因不回灌 ⇒ L3/L4「据结果优化」证据不足，task-20（卡 C，0.7.46）补齐。
 
 ## §6 冻结记录（待冻结后由 Lead 填实测原文）
