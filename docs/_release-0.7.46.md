@@ -25,11 +25,11 @@
 
 | 卡 | 任务 | 优先级 | 提交 | 读数 |
 |---|---|---|---|---|
-| A-前置 | task-33 Mod 新增 `talk` 原语：按 NPC 名找 `characters` → 相邻校验（否则回 `not_adjacent`+`npcTile`）→ 调游戏 `NPC.checkAction(Farmer,GameLocation)`；禁合成键鼠/禁改 Money/Items/MaxItems | P0 | 待填 | 待填（真机探针 task-34 验收：talk 能否开 Pierre 背包对话） |
+| A-前置 | task-33 Mod 新增 `talk` 原语：按 NPC 名找 `characters` → 相邻校验（否则回 `not_adjacent`+`npcTile`）→ 调游戏 `NPC.checkAction(Farmer,GameLocation)`；禁合成键鼠/禁改 Money/Items/MaxItems | P0 | `8f33e94`（7 files +495/−2） | C# 构建隔离 `-o` 0 警 0 错；C# 自检 **OK 97 断言**（+7 talk：名字匹配/相邻 `not_adjacent`/回执分类 fail-closed/catalog 注册/只调 checkAction/契约字段）；红线 grep 干净（新文件仅注释提及 money）；`bin\Release` 未被覆盖 |
 | A | task-25 背包升级经济动作（12→24，Pierre 2000g）。**Plan A（按货架买）已否证**；真机探针又证**无 talk 原语** ⇒ 分两步：task-33 加 `talk` + 本卡脑侧 `talk Pierre` → observe `ui.dialogueResponses` → `dismiss_modal{answerText:"Purchase"}` → 差分判据：钱−2000 且 inventoryCount 12→24；含 Town 事件卡死自愈（≤90s + load_save(force) 兜底） | P0 | 待填 | 待填（task-34 探针通过后实现） |
 | B | task-26 冬27 形态：`resume_walks` 先加后走（失败步行烧成功预算）+ `_resume_exhausted` 无条件宣称无目标 ⇒ 改为 attempts/walks 拆分 + `claim_exhausted=(exec==0 and malformed==0)`，假则写 `resume_budget_exhausted:`；未放宽 `is_justified_end` | P0 | `002afdb`（3 files +476/−28） | 定向 `TestTask26ResumeBudget` Ran 6 OK；全量 Ran 1354 OK；变异 3/3 被杀；Lead 亲跑 6/6 OK |
 | C | task-27 挡死格证据口径收口：目标池前置过滤（`_known_enclosed`/`_prefilter_known_enclosed`）+ 执行层 `_observed_foothold` 判"本该可达"、无落脚点证据归 encircled；判死格仍进 assigned/assigned_undone（不洗成没活）；bound 公式与 20% 未动；附带 `pending_executable_tiles[:8]`/`pending_stalled_tiles[:8]` | P1 | `acf2f6c`（5 files +628/−24）+ `1800ef1`（3 files +70/−1） | 定向 `TestTask27EnclosedBatch` Ran 9 OK（总 195 OK）；全量 Ran 1363 OK；变异 8/8 被杀（worktree+冻结 HEAD 双跑）；Lead 核公式与 `:9811` 未动、测试 195 OK |
-| D | task-28 售材白名单收紧（建材/锭类全部移出）+ inventory_blocked 证据门槛 + 满包清障有界（loot_lost_steps ≤ 常量，留痕） | P1 | 待填 | 待填 |
+| D | task-28 售材白名单收紧（建材/锭类全部移出）+ inventory_blocked 证据门槛 + 满包清障有界（loot_lost_steps ≤ 常量，留痕） | P1 | `21be1e1`（5 files +908/−197）+ `4ace97b`（E5 只读证据 2 files +34） | 定向 `TestTask28BagEvidence` Ran 9 OK；长跑+农务 712 OK；全量 **Ran 1372 OK**；变异 5/5 被杀（含冻结 HEAD 双跑）；Lead 亲核 stat 与 8 单测 OK |
 
 ## 2. 冻结九步（沿用 0.7.44/0.7.45 口径）
 
