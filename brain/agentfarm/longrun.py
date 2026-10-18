@@ -293,6 +293,23 @@ SLOT_RESERVE = 1
 #: 腾到"低水位之上 1 格"就停手 —— 收货/掉落一次可能进多件，追清空背包既没必要也浪费时间。
 SLOT_RELIEF_TARGET_FREE = SLOT_RESERVE + 1
 
+#: 【task-25 rev4 / 0.7.46】Pierre 背包升级（12→24 格 / 2000g）的**对话购买**参数。
+#: 为什么必须走对话：0.7.46 的 Mod `talk` 原语让 NPC 用游戏自己的 `checkAction` 开对话，
+#: 选项由 `dismiss_modal{answerText:"Purchase"}` 走 task-208 的 `answerDialogue` 车道；
+#: 扣钱/扩容由**游戏代码自己**做（SDV #US 串 `SeedShop_BuyBackpack_Response2000/…/Backpack`）。
+#: 判据**只看观测差分**：`money_after == money_before - 2000` 且 `inventoryCount 12→24`。
+BACKPACK_BASE_CAPACITY = 12
+BACKPACK_UPGRADE_CAPACITY = 24
+BACKPACK_UPGRADE_PRICE = 2000
+BACKPACK_UPGRADE_MAX_ATTEMPTS = 2
+#: 整条购买流程（去店 → talk → 应答 → 回农场）的总墙钟预算：超时按 `timeout` 失败码收口，
+#: 绝不允许把当天农务拖死（0.7.46 卡 A 的硬要求）。
+BACKPACK_UPGRADE_DEADLINE_S = 90.0
+BACKPACK_UPGRADE_SHOP = "SeedShop"
+BACKPACK_UPGRADE_NPC = "Pierre"
+BACKPACK_UPGRADE_ANSWER = "Purchase"
+BACKPACK_TALK_TIMEOUT_MS = 15000
+
 #: 【task-28 卡 D】满包清障的日级损失上界：`free_slots == 0` 且已经证明「腾格手段用尽」
 #: 时，**已经开出去的 clear_area 阶段**仍会继续清几格（阶段不会半路撤回），而每清一格
 #: 都可能白丢一次掉落。取 5 的理由：
@@ -847,6 +864,20 @@ class DayReport:
     #:   relief_rounds / sold_stacks / exhausted …），供 analyzer/事后复核"凭什么认腾不出"。
     relief_exhausted: bool = False
     bag_evidence: dict[str, Any] = field(default_factory=dict)
+    #: 【task-25 rev4 / 0.7.46】Pierre 背包升级（对话购买 12→24 / 2000g）的日级留痕
+    #: （**只作 info**：不改 `checks` 10 键、不参与 day_justified；购买失败也算正常一天）：
+    #: * `backpack_capacity_before/after` = 当天首次尝试前/尝试后观测到的 `player.inventoryCount`；
+    #: * `backpack_upgrade_ok` = **观测差分**成立（钱 −2000 且容量 12→24），不是"回执说成功"；
+    #: * `backpack_upgrade_attempts` = 当天真的发出 `talk` 的次数（上界 `BACKPACK_UPGRADE_MAX_ATTEMPTS`）；
+    #: * `backpack_upgrade_failures` = 失败码序列（`money_not_deducted`/`capacity_not_changed`/
+    #:   `response_not_found`/`money_diff_ambiguous`/`npc_not_found`/`no_action`/…）；
+    #: * `backpack_upgrade_skip` = 今天为什么根本没试（`already_upgraded`/`cannot_afford`/…）。
+    backpack_capacity_before: int | None = None
+    backpack_capacity_after: int | None = None
+    backpack_upgrade_ok: bool = False
+    backpack_upgrade_attempts: int = 0
+    backpack_upgrade_failures: list[str] = field(default_factory=list)
+    backpack_upgrade_skip: str = ""
     deferred_tiles: int = 0
     #: 【task-158】当天的**浇水优先体力预算**（`stamina_budget` journal 的同名快照）：
     #: `{max, stamina, live_crops, dry, water_reserve, water_cost_est, path_allowance,
@@ -987,6 +1018,13 @@ class DayReport:
             # 【task-28 卡 D】`inventory_blocked` 的四门槛证据（只读 info；checks 仍 10 键）
             "relief_exhausted": self.relief_exhausted,
             "bag_evidence": dict(self.bag_evidence),
+            # 【task-25 rev4 / 0.7.46】Pierre 背包升级（对话购买）的观测差分留痕（只 info）
+            "backpack_capacity_before": self.backpack_capacity_before,
+            "backpack_capacity_after": self.backpack_capacity_after,
+            "backpack_upgrade_ok": self.backpack_upgrade_ok,
+            "backpack_upgrade_attempts": self.backpack_upgrade_attempts,
+            "backpack_upgrade_failures": list(self.backpack_upgrade_failures),
+            "backpack_upgrade_skip": self.backpack_upgrade_skip,
             "deferred_tiles": self.deferred_tiles,
             # 【task-168】主动认输的片区（只 info：不进 checks、不扣 plot_pending/assigned_undone）
             "scope_shed": dict(self.scope_shed),
@@ -1438,6 +1476,16 @@ class LongRun:
         self.bag_relief_exhausted_today = False
         self.clear_area_bag_gate_noted = False
         self.bag_gate_reject_noted = False
+        #: 【task-25 rev4 / 0.7.46】Pierre 背包升级（对话购买）的日级状态（每日重置）：
+        #:  * `backpack_attempts_today` —— 今天真的发出 `talk` 的次数（≤ `BACKPACK_UPGRADE_MAX_ATTEMPTS`）；
+        #:  * `backpack_ok_today` —— 今天已经买成（成功后再也不试/不重复扣钱）；
+        #:  * `backpack_tried_today` —— 今天已经走过一次完整流程（**一天只试一个回合**；
+        #:    回合内部最多 2 次 talk：`not_adjacent` 走一步再重试一次）；
+        #:  * `backpack_skip_noted` —— "今天为什么没买"（钱不够/talk 不可用）每天只留痕一次。
+        self.backpack_attempts_today = 0
+        self.backpack_ok_today = False
+        self.backpack_tried_today = False
+        self.backpack_skip_noted = False
         #: 【task-218】今天砍倒了几棵树 + 预算挡下时"每天只记一次"的 note 标记。
         #: 每日重置；判据见 `_tree_budget_left()`（日上限 + 浇水预备线，绝不为砍树漏浇）。
         self.trees_cleared_today = 0
@@ -6701,6 +6749,393 @@ class LongRun:
             rep.ended_by, rep.ended_reason = "inventory_blocked", f"inventory_blocked:{why}"
         return rep.ended_by
 
+    # ------------------------------------------------------------------ task-25 rev4
+    #: Pierre 背包升级（12→24 / 2000g）的**对话购买**。判据只看观测差分：
+    #:   * 成功 ⇔ `money_after == money_before - 2000` 且 `inventoryCount 12→24`；
+    #:   * 失败码单列（`money_not_deducted` / `capacity_not_changed` / `money_diff_ambiguous` /
+    #:     `response_not_found` / `dialogue_not_question` / `npc_not_found` / `no_action` /
+    #:     `not_supported` / `not_adjacent_unreachable` / `event_hang` / `goto_shop_failed` / `timeout`）；
+    #:   * 一切走游戏入口：`talk`（Mod 调 `NPC.checkAction`）+ `dismiss_modal{answerText:"Purchase"}`
+    #:     （Mod 调 `DialogueBox.answerDialogue`）；**绝不**直写 money/Items/MaxItems、
+    #:     绝不调 `increaseBackpackSize`、绝不合成键鼠。
+    #: 安全降级：talk 不可用/失败一律记失败码后继续农务；一天只走一个回合、回合内 ≤2 次 talk；
+    #: 整条流程 ≤ `BACKPACK_UPGRADE_DEADLINE_S` 秒；失败**不**影响 `checks`/`day_justified`。
+
+    @staticmethod
+    def _obs_player_int(obs: Mapping[str, Any], key: str) -> int | None:
+        player = obs.get("player") if isinstance(obs, Mapping) else None
+        if not isinstance(player, Mapping):
+            return None
+        raw = player.get(key)
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            return None
+        return int(raw)
+
+    def _backpack_capacity(self, obs: Mapping[str, Any]) -> int | None:
+        cap = self._obs_player_int(obs, "inventoryCount")
+        return cap if cap is not None and cap > 0 else None
+
+    def _backpack_gate(self, obs: Mapping[str, Any]) -> tuple[bool, str]:
+        """今天该不该试买背包升级（fail-closed：任何证据缺失都不试）。"""
+        cap = self._backpack_capacity(obs)
+        if cap is None:
+            return False, "capacity_unknown"
+        if cap >= BACKPACK_UPGRADE_CAPACITY:
+            return False, "already_upgraded"
+        if cap != BACKPACK_BASE_CAPACITY:
+            return False, "capacity_unexpected"
+        if self.backpack_ok_today:
+            return False, "upgraded_today"
+        if self.backpack_tried_today or self.backpack_attempts_today >= BACKPACK_UPGRADE_MAX_ATTEMPTS:
+            return False, "attempt_limit"
+        money = self._obs_player_int(obs, "money")
+        if money is None:
+            return False, "money_unknown"
+        if money < BACKPACK_UPGRADE_PRICE:
+            return False, "cannot_afford"
+        if getattr(self.client, "talk", None) is None:
+            return False, "talk_unavailable"
+        return True, ""
+
+    def _backpack_skip(self, rep: DayReport, why: str, obs: Mapping[str, Any]) -> None:
+        rep.backpack_upgrade_skip = str(why)
+        # 只在"值得知道"的跳过原因上留一条（每天最多一条）：钱不够 / 桥没有 talk 原语。
+        if why in ("cannot_afford", "talk_unavailable") and not self.backpack_skip_noted:
+            self.backpack_skip_noted = True
+            self._journal(
+                "buy", source="backpack_dialogue", item="Backpack",
+                purpose="backpack_upgrade", shop=BACKPACK_UPGRADE_SHOP,
+                npc=BACKPACK_UPGRADE_NPC, ok=False, code=str(why), status="skipped",
+                reason=("钱不够升级（需要 2000g）" if why == "cannot_afford"
+                        else "桥没有 talk 原语（Mod < 0.7.46）⇒ 不试对话购买"),
+                money_before=self._obs_player_int(obs, "money"),
+                capacity_before=self._backpack_capacity(obs),
+                attempts=self.backpack_attempts_today,
+                limit=BACKPACK_UPGRADE_MAX_ATTEMPTS,
+            )
+            rep.notes.append(
+                "背包升级今天不试：" + ("钱不够 2000g" if why == "cannot_afford"
+                                        else "桥没有 talk 原语（安全降级，不影响农务/判据）"))
+
+    def _backpack_journal(self, rep: DayReport, *, ok: bool, code: str, status: str,
+                          reason: str, money_before: int | None, money_after: int | None,
+                          cap_before: int | None, cap_after: int | None,
+                          answer_text: str = "", talk: Mapping[str, Any] | None = None,
+                          elapsed_ms: float = 0.0,
+                          extra: Mapping[str, Any] | None = None) -> None:
+        """失败/成功都复用既有 `buy` 事件名（不新增 journal 事件；analyzer 桶不漂移）。"""
+        fields: dict[str, Any] = dict(
+            source="backpack_dialogue", item="Backpack", purpose="backpack_upgrade",
+            shop=BACKPACK_UPGRADE_SHOP, npc=BACKPACK_UPGRADE_NPC,
+            ok=bool(ok), code=str(code), status=str(status), reason=str(reason),
+            money_before=money_before, money_after=money_after,
+            capacity_before=cap_before, capacity_after=cap_after,
+            answer_text=str(answer_text or ""),
+            attempts=int(self.backpack_attempts_today),
+            limit=int(BACKPACK_UPGRADE_MAX_ATTEMPTS),
+            elapsed_ms=int(round(float(elapsed_ms))),
+        )
+        if isinstance(talk, Mapping):
+            for key in ("applied", "npcTile", "distance", "activeMenu",
+                        "dialogueIsQuestion", "dialogueResponses"):
+                if key in talk:
+                    fields[key] = talk[key]
+        if extra:
+            fields.update(dict(extra))
+        self._journal("buy", **fields)
+
+    def _backpack_fail(self, rep: DayReport, *, code: str, reason: str,
+                       money_before: int | None, money_after: int | None,
+                       cap_before: int | None, cap_after: int | None,
+                       answer_text: str = "", talk: Mapping[str, Any] | None = None,
+                       elapsed_ms: float = 0.0,
+                       extra: Mapping[str, Any] | None = None) -> None:
+        code = str(code or "failed")
+        if code not in rep.backpack_upgrade_failures:
+            rep.backpack_upgrade_failures.append(code)
+        if rep.backpack_capacity_before is None:
+            rep.backpack_capacity_before = cap_before
+        rep.backpack_capacity_after = cap_after
+        self._backpack_journal(
+            rep, ok=False, code=code, status="failed", reason=reason,
+            money_before=money_before, money_after=money_after,
+            cap_before=cap_before, cap_after=cap_after,
+            answer_text=answer_text, talk=talk, elapsed_ms=elapsed_ms, extra=extra)
+        rep.notes.append(
+            f"背包升级失败（{code}）：{reason} —— 不是任务失败，不影响农务/判据")
+
+    def _backpack_talk_once(self) -> dict[str, Any]:
+        try:
+            res = self.client.talk(  # type: ignore[attr-defined]
+                BACKPACK_UPGRADE_NPC, timeout_ms=BACKPACK_TALK_TIMEOUT_MS)
+        except Exception as exc:  # noqa: BLE001 - 失败要落码，不能把当天拖死
+            return {"ok": False, "code": "talk_error", "status": "talk_error",
+                    "reason": f"talk 抛错：{exc}"}
+        if not isinstance(res, Mapping):
+            return {"ok": False, "code": "talk_bad_receipt", "status": "talk_bad_receipt",
+                    "reason": "talk 回执不是对象"}
+        return dict(res)
+
+    def _backpack_walk_adjacent(self, npc_tile: Any) -> bool:
+        """`not_adjacent` ⇒ 脑自己走到 NPC 四邻之一（≤2 次 move_to；Mod 从不替脑移动）。"""
+        if not isinstance(npc_tile, (list, tuple)) or len(npc_tile) < 2:
+            return False
+        try:
+            nx, ny = int(npc_tile[0]), int(npc_tile[1])
+        except (TypeError, ValueError):
+            return False
+        moved = 0
+        for dx, dy in ((0, 1), (1, 0), (0, -1), (-1, 0)):
+            if moved >= 2:
+                break
+            moved += 1
+            try:
+                st = self.worker.move_to((nx + dx, ny + dy))
+            except Exception:  # noqa: BLE001 - 走不过去就换一格/放弃这回合
+                continue
+            if getattr(st, "ok", False):
+                return True
+        return False
+
+    def _backpack_recover_event_hang(self, obs: Mapping[str, Any]) -> tuple[bool, dict[str, Any]]:
+        """事件卡死自愈：连续 ≤10 次受控推进都没把 `eventUp` 推走 ⇒ 认 `event_hang`。
+
+        只对**非提问**的 `eventUp` 动手（提问/职业选择一律不碰，交给既有事件政策诚实收尾）；
+        本身不改任何经济状态，也不替游戏选选项。
+        """
+        last: dict[str, Any] = dict(obs) if isinstance(obs, Mapping) else {}
+        for _ in range(10):
+            try:
+                self.client.advance_dialogue(max_steps=1)
+            except Exception:  # noqa: BLE001 - 推进不了就按卡死收口
+                return False, last
+            try:
+                last = self._snap()
+            except Exception:  # noqa: BLE001
+                return False, last
+            ui = last.get("ui") or {}
+            if not ui.get("eventUp") and not ui.get("isModal"):
+                return True, last
+        return False, last
+
+    def _backpack_return_to_farm(self) -> None:
+        """买完/失败后先回农场（失败不吞：回不去只留 note，主循环下一轮再兜）。"""
+        try:
+            st = self.worker.ensure_location(self.farm)
+        except Exception:  # noqa: BLE001
+            return
+        if not getattr(st, "ok", True):
+            self._say(f"[backpack] 购买流程后回农场失败：{getattr(st, 'reason', '')}")
+
+    def _backpack_escape_dialogue(self) -> None:
+        """失败但对话已经开出来了：把**我们自己开的**那个对话关掉。
+
+        为什么必须关：`TalkSkill` 调的是游戏 `NPC.checkAction`，Pierre 的背包升级对话是
+        一个"一问一答"的 `DialogueBox`；如果我们读了选项但**答不了**（没匹配文本/歧义/
+        回执不成立），把提问对话原样留在场上，下一轮模态守卫会把它当**事件提问**处理 ⇒
+        `blocked_event` 整天停摆。这里只关 UI、不替游戏选任何选项（`dismiss_modal` 无
+        `answer_text` ⇒ Mod 走 `closeDialogue`，不是 `answerDialogue`）。
+        """
+        try:
+            self.client.dismiss_modal(timeout_ms=5000)
+        except Exception:  # noqa: BLE001 - 关不掉也只是留痕，不把当天拖死
+            pass
+
+    def _maybe_buy_backpack_upgrade(self, obs: Mapping[str, Any], rep: DayReport) -> bool:
+        """开工前试买 Pierre 背包升级；返回 True = 本轮已处理（成功完成），主循环 continue。"""
+        if self.backpack_tried_today:
+            return False
+        ok, why = self._backpack_gate(obs)
+        cap_before = self._backpack_capacity(obs)
+        money_before = self._obs_player_int(obs, "money")
+        if not ok:
+            self._backpack_skip(rep, why, obs)
+            return False
+        start = time.monotonic()
+        self.backpack_tried_today = True
+        rep.backpack_capacity_before = cap_before
+        rep.backpack_upgrade_attempts = 0
+
+        def _elapsed_ms() -> float:
+            return (time.monotonic() - start) * 1000.0
+
+        st = self.worker.ensure_location(BACKPACK_UPGRADE_SHOP)
+        if not getattr(st, "ok", False):
+            self._backpack_fail(
+                rep, code="goto_shop_failed",
+                reason=f"去 {BACKPACK_UPGRADE_SHOP} 失败：{getattr(st, 'reason', '')}",
+                money_before=money_before, money_after=money_before,
+                cap_before=cap_before, cap_after=cap_before, elapsed_ms=_elapsed_ms())
+            self._backpack_return_to_farm()
+            return False
+        obs = self._snap_or(dict(obs) if isinstance(obs, Mapping) else {})
+
+        talk = self._backpack_talk_once()
+        self.backpack_attempts_today += 1
+        rep.backpack_upgrade_attempts = self.backpack_attempts_today
+        code = str(talk.get("code") or talk.get("status") or "")
+        if code == "not_adjacent":
+            # 安全降级：脑自己走一步到相邻格；≤2 次 talk/天、≤90s 总预算。
+            within = (self.backpack_attempts_today < BACKPACK_UPGRADE_MAX_ATTEMPTS
+                      and _elapsed_ms() < BACKPACK_UPGRADE_DEADLINE_S * 1000.0)
+            if within and self._backpack_walk_adjacent(
+                    talk.get("npcTile") or talk.get("npc_tile")):
+                talk = self._backpack_talk_once()
+                self.backpack_attempts_today += 1
+                rep.backpack_upgrade_attempts = self.backpack_attempts_today
+                code = str(talk.get("code") or talk.get("status") or "")
+            else:
+                code = "not_adjacent_unreachable"
+
+        ui = obs.get("ui") or {}
+        if (code in ("no_action", "not_supported") and ui.get("eventUp")
+                and not ui.get("isModal")):
+            recovered, obs = self._backpack_recover_event_hang(obs)
+            within = (self.backpack_attempts_today < BACKPACK_UPGRADE_MAX_ATTEMPTS
+                      and _elapsed_ms() < BACKPACK_UPGRADE_DEADLINE_S * 1000.0)
+            if recovered and within:
+                talk = self._backpack_talk_once()
+                self.backpack_attempts_today += 1
+                rep.backpack_upgrade_attempts = self.backpack_attempts_today
+                code = str(talk.get("code") or talk.get("status") or "")
+            else:
+                code = "event_hang"
+
+        if code != "ok" or not talk.get("applied"):
+            if not code:
+                code = "talk_failed"
+            self._backpack_fail(
+                rep, code=code,
+                reason=str(talk.get("reason") or f"talk 失败（code={code}）"),
+                money_before=money_before,
+                money_after=self._obs_player_int(obs, "money"),
+                cap_before=cap_before, cap_after=self._backpack_capacity(obs),
+                talk=talk, elapsed_ms=_elapsed_ms())
+            self._backpack_return_to_farm()
+            return False
+
+        question = bool(talk.get("dialogueIsQuestion"))
+        raw_responses = talk.get("dialogueResponses") or []
+        responses = [str(r) for r in raw_responses if isinstance(r, (str, int))]
+        if not question:
+            self._backpack_fail(
+                rep, code="dialogue_not_question",
+                reason=(f"talk 开了对话却没有提问（activeMenu={talk.get('activeMenu')!r}，"
+                        f"responses={responses}）⇒ 不猜选项"),
+                money_before=money_before,
+                money_after=self._obs_player_int(obs, "money"),
+                cap_before=cap_before, cap_after=self._backpack_capacity(obs),
+                talk=talk, elapsed_ms=_elapsed_ms())
+            self._backpack_escape_dialogue()
+            self._backpack_return_to_farm()
+            return False
+        needle = BACKPACK_UPGRADE_ANSWER.strip().casefold()
+        matches = [r for r in responses if r.strip().casefold() == needle]
+        if not matches:
+            self._backpack_fail(
+                rep, code="response_not_found",
+                reason=(f"对话选项里没有精确匹配「{BACKPACK_UPGRADE_ANSWER}」的项"
+                        f"（实际 {responses}）⇒ 不发应答、不猜选项"),
+                money_before=money_before,
+                money_after=self._obs_player_int(obs, "money"),
+                cap_before=cap_before, cap_after=self._backpack_capacity(obs),
+                answer_text=BACKPACK_UPGRADE_ANSWER, talk=talk,
+                elapsed_ms=_elapsed_ms())
+            self._backpack_escape_dialogue()
+            self._backpack_return_to_farm()
+            return False
+        if len(matches) > 1:
+            self._backpack_fail(
+                rep, code="response_ambiguous",
+                reason=f"「{BACKPACK_UPGRADE_ANSWER}」命中 {len(matches)} 个选项 ⇒ 不替游戏猜",
+                money_before=money_before,
+                money_after=self._obs_player_int(obs, "money"),
+                cap_before=cap_before, cap_after=self._backpack_capacity(obs),
+                answer_text=BACKPACK_UPGRADE_ANSWER, talk=talk,
+                elapsed_ms=_elapsed_ms())
+            self._backpack_escape_dialogue()
+            self._backpack_return_to_farm()
+            return False
+
+        # ---- 应答 + 观测差分窗口（同天、不跨 NewDay；窗口里出现 sell/ship/NewDay ⇒ 歧义失败） ----
+        obs2 = self._snap_or(dict(obs))
+        money_b = self._obs_player_int(obs2, "money")
+        cap_b = self._backpack_capacity(obs2)
+        day_key = FarmWorker.day_key(obs2)
+        window_start = len(self.entries)
+        try:
+            self.client.dismiss_modal(
+                answer_text=BACKPACK_UPGRADE_ANSWER, timeout_ms=20000)
+        except Exception as exc:  # noqa: BLE001 - 应答失败也要落码
+            self._backpack_fail(
+                rep, code="answer_failed", reason=f"dismiss_modal 应答抛错：{exc}",
+                money_before=money_b, money_after=self._obs_player_int(obs2, "money"),
+                cap_before=cap_b, cap_after=self._backpack_capacity(obs2),
+                answer_text=BACKPACK_UPGRADE_ANSWER, talk=talk,
+                elapsed_ms=_elapsed_ms())
+            self._backpack_escape_dialogue()
+            self._backpack_return_to_farm()
+            return False
+        obs3 = self._snap_or(obs2)
+        money_a = self._obs_player_int(obs3, "money")
+        cap_a = self._backpack_capacity(obs3)
+        ambiguous = False
+        if FarmWorker.day_key(obs3) != day_key:
+            ambiguous = True
+        for entry in self.entries[window_start:]:
+            if str(entry.get("event")) in ("sell", "ship", "day_start", "day_end"):
+                ambiguous = True
+                break
+        if ambiguous:
+            self._backpack_fail(
+                rep, code="money_diff_ambiguous",
+                reason=("购买窗口里出现了 sell/ship/跨日事件 ⇒ 钱的变化无法归因给背包升级"
+                        f"（money {money_b}→{money_a}，capacity {cap_b}→{cap_a}）"),
+                money_before=money_b, money_after=money_a,
+                cap_before=cap_b, cap_after=cap_a,
+                answer_text=BACKPACK_UPGRADE_ANSWER, talk=talk,
+                elapsed_ms=_elapsed_ms())
+            self._backpack_escape_dialogue()
+            self._backpack_return_to_farm()
+            return False
+        money_ok = (money_b is not None and money_a is not None
+                    and money_a == money_b - BACKPACK_UPGRADE_PRICE)
+        cap_ok = (cap_b == BACKPACK_BASE_CAPACITY
+                  and cap_a == BACKPACK_UPGRADE_CAPACITY)
+        if money_ok and cap_ok:
+            self.backpack_ok_today = True
+            rep.backpack_upgrade_ok = True
+            rep.backpack_capacity_after = cap_a
+            rep.backpack_upgrade_attempts = self.backpack_attempts_today
+            self._backpack_journal(
+                rep, ok=True, code="ok", status="ok",
+                reason=(f"背包升级成功（观测差分）：钱 {money_b}→{money_a}"
+                        f"（−{int(money_b) - int(money_a)}），容量 {cap_b}→{cap_a}"),
+                money_before=money_b, money_after=money_a,
+                cap_before=cap_b, cap_after=cap_a,
+                answer_text=BACKPACK_UPGRADE_ANSWER, talk=talk,
+                elapsed_ms=_elapsed_ms())
+            rep.notes.append(
+                f"背包升级成功：容量 {cap_b}→{cap_a}，钱 {money_b}→{money_a}（对话购买，游戏代码扣钱）")
+            self._backpack_return_to_farm()
+            return True
+
+        if not money_ok:
+            code2 = ("money_not_deducted" if money_a == money_b
+                     else "money_unexpected")
+            detail = f"钱 {money_b}→{money_a}（期望 −{BACKPACK_UPGRADE_PRICE}）"
+        else:
+            code2 = "capacity_not_changed"
+            detail = f"钱已扣但容量 {cap_b}→{cap_a}（期望 12→24）"
+        self._backpack_fail(
+            rep, code=code2, reason=f"观测差分不成立：{detail}",
+            money_before=money_b, money_after=money_a,
+            cap_before=cap_b, cap_after=cap_a,
+            answer_text=BACKPACK_UPGRADE_ANSWER, talk=talk,
+            elapsed_ms=_elapsed_ms())
+        self._backpack_return_to_farm()
+        return False
+
     def _tool_upgrade_plan(self, obs: dict[str, Any]) -> dict[str, Any] | None:
         """【task-205】今天该不该去铁匠铺：返回 `{"action": "pickup"|"upgrade", ...}` 或 None。
 
@@ -9107,6 +9542,11 @@ class LongRun:
         self.bag_relief_exhausted_today = False
         self.clear_area_bag_gate_noted = False
         self.bag_gate_reject_noted = False
+        # 【task-25 rev4 / 0.7.46】背包升级（对话购买）的日级状态每天清零（一天一个回合、≤2 次 talk）。
+        self.backpack_attempts_today = 0
+        self.backpack_ok_today = False
+        self.backpack_tried_today = False
+        self.backpack_skip_noted = False
         # 【task-218】砍树日预算：每天清零（日上限 + 浇水预备线，见 `_tree_budget_left`）。
         self.trees_cleared_today = 0
         self.tree_budget_noted = False
@@ -9276,6 +9716,15 @@ class LongRun:
             # 【task-16 / 0.7.45】每次观测都重算背包空格（只记 trace，不发请求）：
             # `day_end.free_slots_*` / `loot_lost` 的证据都靠这张读数，不靠"事后猜"。
             self._observe_free_slots(rep, obs)
+
+            # 【task-25 rev4 / 0.7.46】开工前先试买 Pierre 背包升级（对话购买）：
+            # 只在「容量 12 且钱够 2000g」的当天走**一个**回合；成功/失败/跳过都只是 info，
+            # 不改 `checks`/`day_justified`。失败时已由 helper 自己回农场，这里只需刷新观测。
+            if self._maybe_buy_backpack_upgrade(obs, rep):
+                obs = self._snap_or(obs)
+                last_obs = obs
+                self._observe_free_slots(rep, obs)
+                continue
 
             allow, code, text = self.sleep_guard(obs)
             if allow:

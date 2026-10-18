@@ -779,7 +779,13 @@ class BridgeClient:
     def noop(self) -> dict[str, Any]:
         return self.exec_skill("noop", timeout_ms=1000)
 
-    def dismiss_modal(self, *, timeout_ms: int = 5000) -> dict[str, Any]:
+    def dismiss_modal(
+        self,
+        *,
+        answer_index: int | None = None,
+        answer_text: str | None = None,
+        timeout_ms: int = 5000,
+    ) -> dict[str, Any]:
         """关闭当前挡路的模态（dismiss_modal）。
 
         成功后请**务必检查 `worldResumed`**：它为 False 时说明模态关了但世界没恢复
@@ -788,8 +794,20 @@ class BridgeClient:
         ⚠️ 它**不是**"推进对话"：对 `DialogueBox` 它走 `closeDialogue()`（= `exitActiveMenu()`），
         会**跳过当前句的显示时机**、把事件停在半截（后续 `addCraftingRecipe` 之类仍会执行，
         但对话语义丢了）。事件对话的受控推进见 :meth:`advance_dialogue`（task-228）。
+
+        【task-25 rev4 / 0.7.46】`answer_index` / `answer_text` 走 task-208 的**显式应答**
+        通道（`DialogueBox` 提问时按给定选项替游戏调用 `answerDialogue(Response)`）。纪律：
+          * `answer_text` 必须**唯一命中**一个选项（大小写不敏感、去空白后**精确**匹配）；
+          * 命中 0 项 ⇒ Mod 回 `choice_not_found`；命中多项 ⇒ `choice_ambiguous`；
+          * 脑**绝不许**"猜一个看起来像的选项"——不在观测 `dialogueResponses` 里的文本
+            一律不发（背包装备固定用 `"Purchase"`，见协议 §8.4）。
         """
-        return self.exec_skill("dismiss_modal", timeout_ms=timeout_ms)
+        args: dict[str, Any] = {}
+        if answer_index is not None:
+            args["answerIndex"] = int(answer_index)
+        if answer_text is not None:
+            args["answerText"] = str(answer_text)
+        return self.exec_skill("dismiss_modal", args or None, timeout_ms=timeout_ms)
 
     def advance_dialogue(
         self,
@@ -937,6 +955,31 @@ class BridgeClient:
         if tile is not None:
             args["tile"] = [int(tile[0]), int(tile[1])]
         return self.exec_skill("interact", args, timeout_ms=timeout_ms)
+
+    def talk(
+        self,
+        npc: str,
+        *,
+        npc_tile: tuple[int, int] | None = None,
+        timeout_ms: int = 15000,
+    ) -> dict[str, Any]:
+        """和指定 NPC 对话（talk，0.7.46+ 的新原语，协议 §8.4）。
+
+        实现上 Mod 只调**游戏自己的** `NPC.checkAction(Game1.player, Game1.currentLocation)`
+        —— 不合成键鼠、不代选选项；问答留给 `dismiss_modal(answer_text=...)`。
+
+        回执（与 `docs/_release-0.7.46.md` §8.4 对齐）：
+          * `code=="ok" && applied` ⇒ 必须带 `activeMenu`（`DialogueBox`/`ShopMenu`）或
+            `dialogueIsQuestion=true`；否则是**实现缺陷**，脑侧按 `not_supported` fail-closed；
+          * `code=="not_adjacent"` ⇒ 带 `npcTile`/`distance`，脑自己 `move_to` 相邻格；
+          * `code=="npc_not_found"` ⇒ 带 `available`（当前地点里的 NPC 名单）；
+          * `code=="no_action"` / `not_supported` / `talk_error` ⇒ 不认任何经济结果，
+            按失败码留痕（当天 ≤2 次，安全降级继续农务）。
+        """
+        args: dict[str, Any] = {"npc": str(npc)}
+        if npc_tile is not None:
+            args["npcTile"] = [int(npc_tile[0]), int(npc_tile[1])]
+        return self.exec_skill("talk", args, timeout_ms=timeout_ms)
 
     def use_tool(
         self,

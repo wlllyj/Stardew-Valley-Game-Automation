@@ -190,6 +190,24 @@ class FakeWorld:
         self.tool_upgrade_days_left: int | None = None
         self.upgrade_calls: list[str] = []
         self.pickup_calls = 0
+        # ---- task-25 rev4：Pierre 背包升级的**对话购买**假世界 ----
+        #: `talk_mode` 决定 `talk` 回执形态（`ok` / `npc_not_found` / `no_action` /
+        #: `not_supported` / `not_adjacent` / `not_adjacent_once` / `no_question` /
+        #: `response_missing` / `response_ambiguous`）。
+        #: 默认 `not_supported`：**旧世界夹具**（0.7.45 之前没有 talk 原语）在钱够 2000g 时
+        #: 只会走"安全降级"失败留痕，不会真的扣钱/扩容而改变既有用例的世界走向；
+        #: task-25 自己的用例显式改成 `ok` 或其它模式。
+        self.talk_mode = "not_supported"
+        #: NPC 所在格（默认就在玩家四邻内 ⇒ 默认相邻）。测试 `not_adjacent` 时挪远。
+        self.npc_tile = [63, 13]
+        self.talk_calls: list[dict] = []
+        #: 应答后的购买结果：`ok`（钱 −2000、容量 24）/ `money_unchanged`（只关对话）/
+        #: `capacity_unchanged`（扣钱不扩容）/ `dismiss_new_day`（应答导致跨日 ⇒ 差分歧义）。
+        self.purchase_mode = "ok"
+        self.dialogue_responses: list[str] = ["Purchase", "No"]
+        self.answer_calls: list[dict] = []
+        #: 对话打开后的 `ui.activeMenuText`（证据用）。
+        self.dialogue_question_text = "想把背包扩大到 24 格吗？（2000g）"
         self.inventory = [
             {"slot": 0, "id": "Axe", "qualifiedId": "(T)Axe", "name": "Axe", "stack": 1, "isTool": True},
             {"slot": 1, "id": "Hoe", "qualifiedId": "(T)Hoe", "name": "Hoe", "stack": 1, "isTool": True},
@@ -368,19 +386,75 @@ class FakeWorld:
         ui.setdefault("eventUp", False)
         return ui
 
-    def dismiss(self) -> dict:
+    # ---- task-25 rev4：NPC 对话（talk）与显式应答（dismiss_modal{answerText}）----
+    def talk(self, npc, *, npc_tile=None, timeout_ms=None) -> dict:
+        """`talk` 的假世界版：默认只有**相邻**才开对话；回执形状对齐协议 §8.4。"""
+        self.talk_calls.append({"npc": str(npc), "npc_tile": npc_tile,
+                                "timeout_ms": timeout_ms, "mode": self.talk_mode})
+        px, py = self.player_tile
+        nx, ny = self.npc_tile
+        distance = max(abs(int(nx) - int(px)), abs(int(ny) - int(py)))
+        base = {"npc": str(npc), "npcTile": list(self.npc_tile), "distance": distance}
+        mode = str(self.talk_mode)
+        if mode == "npc_not_found":
+            return dict(base, ok=False, status="npc_not_found", code="npc_not_found",
+                        applied=False, available=["Abigail", "Robin"],
+                        reason="当前地点没有这个 NPC")
+        if mode == "not_supported":
+            return dict(base, ok=False, status="not_supported", code="not_supported",
+                        applied=False, reason="假世界：talk 未实现")
+        if distance > 1:
+            return dict(base, ok=False, status="not_adjacent", code="not_adjacent",
+                        applied=False, reason=f"切比雪夫距离 {distance} > 1，不相邻")
+        if mode == "no_action":
+            return dict(base, ok=False, status="no_action", code="no_action",
+                        applied=False, reason="checkAction 返回 false（没开任何 UI）")
+        question = mode not in ("no_question",)
+        responses = list(self.dialogue_responses)
+        if mode == "no_question":
+            responses = []
+        elif mode == "response_missing":
+            responses = ["No"]
+        elif mode == "response_ambiguous":
+            responses = ["Purchase", "purchase"]
+        self.ui_script = [{
+            "activeMenu": "DialogueBox",
+            "activeMenuText": self.dialogue_question_text,
+            "eventUp": False,
+            "dialogueIsQuestion": bool(question),
+            "dialogueResponses": responses,
+        }]
+        return dict(base, ok=True, status="ok", code="ok", applied=True,
+                    activeMenu="DialogueBox", activeMenuText=self.dialogue_question_text,
+                    dialogueIsQuestion=bool(question), dialogueResponses=responses)
+
+    def dismiss(self, *, answer_index=None, answer_text=None) -> dict:
         """`dismiss_modal` 的假世界版：关掉队首模态（露出下一个）并如实返回回执。
+
+        【task-25 rev4】`answer_text` 非空 = 显式应答：按 `purchase_mode` 真的改/不改世界
+        （`ok` = 游戏代码扣 2000g + 容量 12→24；`money_unchanged` = 只关对话；…）。
 
         【task-129】`dismiss_receipt` 非空时把它并进回执（模拟真桥跨 tick 走
         "反射 okClicked → 等游戏自己走完"这条路时带回的 `dismissPath`/`waitedMs`/`menuGone`）。
         """
         self.dismiss_calls += 1
+        self.answer_calls.append({"answer_index": answer_index,
+                                  "answer_text": answer_text})
         name = ""
         if self.ui_script:
             name = str(self.ui_script[0].get("activeMenu") or "")
             self.ui_script.pop(0)
         self.modal_polls = 0
         self.dismissed.append(name)
+        if answer_text is not None:
+            mode = str(self.purchase_mode)
+            if mode == "ok":
+                self.money -= 2000
+                self.inventory_capacity = 24
+            elif mode == "capacity_unchanged":
+                self.money -= 2000
+            elif mode == "dismiss_new_day":
+                self.sleep()
         out = {"ok": True, "status": "ok", "worldResumed": True, "worldSeq": self.seq}
         if self.dismiss_receipt:
             out.update(self.dismiss_receipt)
@@ -700,9 +774,17 @@ class FakeClient:
         return self.w.use_tool(tuple(tile), tool)
 
     # ---- task-11：模态守卫用 ----
-    def dismiss_modal(self, *, timeout_ms=5000):
+    def dismiss_modal(self, *, answer_index=None, answer_text=None, timeout_ms=5000):
         self.dismiss_timeouts.append(timeout_ms)
-        return self.w.dismiss()
+        # 【task-25 rev4】只有**显式应答**才需要把参数传到假世界；其它调用保持旧形态
+        # （大量子类世界只实现 `dismiss(self)`，不能被新参数打破）。
+        if answer_index is None and answer_text is None:
+            return self.w.dismiss()
+        return self.w.dismiss(answer_index=answer_index, answer_text=answer_text)
+
+    # ---- task-25 rev4：NPC 对话（talk）----
+    def talk(self, npc, *, npc_tile=None, timeout_ms=None):
+        return self.w.talk(npc, npc_tile=npc_tile, timeout_ms=timeout_ms)
 
     # ---- task-228：事件对话推进 ----
     def advance_dialogue(self, *, max_steps=None, timeout_ms=60000):
@@ -14435,6 +14517,204 @@ class TestTask28BagEvidence(unittest.TestCase):
         self.assertIn("free_slots", d["bag_evidence"])
         # `stuck:` 永远不在这条路径上
         self.assertFalse(str(rep.ended_reason).startswith("stuck:"))
+
+
+class TestTask25BackpackUpgrade(unittest.TestCase):
+    """【task-25 rev4 / 0.7.46 卡 A】Pierre 背包升级的**对话购买**（脑侧）。
+
+    判据纪律（卡面 §8.2/§8.4）：
+      * 成功**只看观测差分**：`money_after == money_before - 2000` **且** `inventoryCount 12→24`；
+        回执说成功不算、进背包计数不算（升级不占格）；
+      * 一切走游戏入口：`talk`（Mod `NPC.checkAction`）+ `dismiss_modal{answerText:"Purchase"}`
+        （Mod `answerDialogue`）；脑侧绝不直写钱/容量；
+      * 失败码单列、一天 ≤2 次 `talk`、整条流程有墙钟预算；失败**不**改 `checks`/`day_justified`。
+    """
+
+    @staticmethod
+    def _rep(day: int = 6) -> DayReport:
+        return DayReport(day_key=("spring", 1, day), started_at=0.0)
+
+    @staticmethod
+    def _run(w: FakeWorld) -> LongRun:
+        run = make_run(w)
+        run.client = FakeClient(w)
+        run.worker = FakeWorker(w)
+        return run
+
+    @staticmethod
+    def _events(run: LongRun, name: str = "buy") -> list[dict]:
+        return [e for e in run.entries if e.get("event") == name]
+
+    # ---- 成功：钱 −2000 且容量 12→24（观测差分，不是回执） ----
+    def test_success_is_observation_diff_money_minus_2000_capacity_12_to_24(self):
+        w = FakeWorld(money=3264)          # 冬27 冒烟的钱，刚好够 2000g
+        w.talk_mode = "ok"
+        run, rep = self._run(w), self._rep()
+        self.assertTrue(run._maybe_buy_backpack_upgrade(w.obs(), rep))
+
+        self.assertEqual(w.money, 1264, "钱必须真的少 2000g")
+        self.assertEqual(w.inventory_capacity, 24, "容量必须真的 12→24")
+        self.assertTrue(rep.backpack_upgrade_ok)
+        self.assertEqual(rep.backpack_upgrade_attempts, 1)
+        self.assertEqual(rep.backpack_capacity_before, 12)
+        self.assertEqual(rep.backpack_capacity_after, 24)
+        self.assertEqual(rep.backpack_upgrade_failures, [])
+        # 走的是游戏入口：talk → dismiss_modal{answerText:"Purchase"}，没有猜选项
+        self.assertEqual([c["npc"] for c in w.talk_calls], ["Pierre"])
+        self.assertEqual(w.answer_calls[-1]["answer_text"], "Purchase")
+        # 失败/成功都复用既有 `buy` 事件（不新增事件名），字段齐
+        ev = self._events(run)
+        self.assertEqual(len(ev), 1, ev)
+        e = ev[0]
+        self.assertEqual(e["source"], "backpack_dialogue")
+        self.assertEqual(e["purpose"], "backpack_upgrade")
+        self.assertTrue(e["ok"])
+        self.assertEqual(e["code"], "ok")
+        self.assertEqual(e["money_before"], 3264)
+        self.assertEqual(e["money_after"], 1264)
+        self.assertEqual(e["capacity_before"], 12)
+        self.assertEqual(e["capacity_after"], 24)
+        self.assertEqual(e["answer_text"], "Purchase")
+        self.assertEqual(rep.checks, {}, "购买只留痕，不写 checks")
+
+    # ---- 负对照：不买（钱不够）时 observe 两次钱/容量都不变 ----
+    def test_negative_control_two_observations_do_not_change_money(self):
+        w = FakeWorld(money=1000)
+        run, rep = self._run(w), self._rep()
+        before = (w.money, w.inventory_capacity)
+        self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
+        self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
+        self.assertEqual((w.money, w.inventory_capacity), before, "没买就不许动钱/容量")
+        self.assertEqual(w.talk_calls, [])
+        self.assertEqual(rep.backpack_upgrade_skip, "cannot_afford")
+        skipped = [e for e in self._events(run) if e.get("status") == "skipped"]
+        self.assertEqual(len(skipped), 1, "跳过原因每天只留一条痕")
+
+    # ---- 回执说成功但钱没少 ⇒ money_not_deducted ----
+    def test_money_not_deducted_is_failure_not_success(self):
+        w = FakeWorld(money=3264)
+        w.talk_mode = "ok"
+        w.purchase_mode = "money_unchanged"
+        run, rep = self._run(w), self._rep()
+        self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
+        self.assertEqual(w.money, 3264)
+        self.assertEqual(w.inventory_capacity, 12)
+        self.assertEqual(rep.backpack_upgrade_failures, ["money_not_deducted"])
+        e = self._events(run)[-1]
+        self.assertFalse(e["ok"])
+        self.assertEqual(e["code"], "money_not_deducted")
+        self.assertFalse(rep.backpack_upgrade_ok)
+
+    # ---- 钱扣了但容量没变 ⇒ capacity_not_changed（核心反向：不按"进背包计数"判） ----
+    def test_capacity_not_changed_is_failure(self):
+        w = FakeWorld(money=3264)
+        w.talk_mode = "ok"
+        w.purchase_mode = "capacity_unchanged"
+        run, rep = self._run(w), self._rep()
+        self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
+        self.assertEqual(w.money, 1264, "钱被扣了（游戏语义允许）")
+        self.assertEqual(w.inventory_capacity, 12)
+        self.assertEqual(rep.backpack_upgrade_failures, ["capacity_not_changed"])
+        e = self._events(run)[-1]
+        self.assertEqual(e["code"], "capacity_not_changed")
+        self.assertFalse(e["ok"])
+
+    # ---- fail-closed：选项里没有精确的 "Purchase" ⇒ 不发应答、不猜 ----
+    def test_response_not_found_never_guesses_and_closes_own_dialogue(self):
+        w = FakeWorld(money=3264)
+        w.talk_mode = "response_missing"
+        run, rep = self._run(w), self._rep()
+        self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
+        self.assertEqual(rep.backpack_upgrade_failures, ["response_not_found"])
+        self.assertFalse([c for c in w.answer_calls if c["answer_text"]],
+                         "没匹配选项就一个应答都不许发")
+        self.assertEqual(w.money, 3264)
+        self.assertEqual(w.inventory_capacity, 12)
+        self.assertEqual(w.ui_script, [], "自己开的对话必须关掉（否则下一轮模态守卫整天停摆）")
+        self.assertTrue(any("不是任务失败" in n for n in rep.notes))
+
+    # ---- 差分歧义：应答跨日 ⇒ money_diff_ambiguous ----
+    def test_money_diff_ambiguous_when_window_crosses_new_day(self):
+        w = FakeWorld(money=3264)
+        w.talk_mode = "ok"
+        w.purchase_mode = "dismiss_new_day"
+        run, rep = self._run(w), self._rep()
+        self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
+        self.assertNotEqual(w.day, 6, "应答把游戏日翻篇了（歧义场景）")
+        self.assertEqual(rep.backpack_upgrade_failures, ["money_diff_ambiguous"])
+        self.assertFalse(rep.backpack_upgrade_ok)
+
+    # ---- talk 不可用安全降级：失败码 + 继续农务（不卡死） ----
+    def test_talk_not_supported_degrades_with_code_and_no_retry(self):
+        w = FakeWorld(money=3264)
+        w.talk_mode = "not_supported"
+        run, rep = self._run(w), self._rep()
+        self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
+        self.assertEqual(rep.backpack_upgrade_failures, ["not_supported"])
+        self.assertEqual(len(w.talk_calls), 1)
+        self.assertFalse([c for c in w.answer_calls if c["answer_text"]])
+        # 当天只剩一个回合：再调也不会再 talk
+        self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
+        self.assertEqual(len(w.talk_calls), 1)
+
+    # ---- not_adjacent：脑自己走过去再谈（Mod 从不替脑移动） ----
+    def test_not_adjacent_walks_toward_npc_then_buys(self):
+        w = FakeWorld(money=3264)
+        w.talk_mode = "not_adjacent"
+        w.npc_tile = [64, 10]
+        w.player_tile = [62, 14]
+        run, rep = self._run(w), self._rep()
+        self.assertTrue(run._maybe_buy_backpack_upgrade(w.obs(), rep), rep.notes)
+        self.assertEqual(len(w.talk_calls), 2, "第一次 not_adjacent，走一步后第二次成功")
+        self.assertGreaterEqual(run.worker.walk_steps, 1)
+        self.assertEqual(w.money, 1264)
+        self.assertEqual(w.inventory_capacity, 24)
+        self.assertTrue(rep.backpack_upgrade_ok)
+
+    # ---- 事件卡死：连续 10 次 advance 无果 ⇒ event_hang（不硬做题） ----
+    def test_event_hang_is_recorded_without_faking_success(self):
+        w = FakeWorld(money=3264)
+        w.talk_mode = "no_action"
+        w.ui_script = [{"activeMenu": "DialogueBox", "eventUp": True,
+                        "isModal": False, "dialogueIsQuestion": False}]
+        w.advance_outcomes = [{"ok": False, "status": "stalled", "stepped": 0,
+                               "stalled": True} for _ in range(10)]
+        run, rep = self._run(w), self._rep()
+        self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
+        self.assertIn("event_hang", rep.backpack_upgrade_failures)
+        self.assertEqual(w.advance_calls, 10)
+        self.assertEqual(w.money, 3264)
+        self.assertEqual(w.inventory_capacity, 12)
+
+    # ---- 一天 ≤2 次 talk：回合用掉后 gate 直接跳过 ----
+    def test_attempts_are_bounded_per_day(self):
+        w = FakeWorld(money=3264)
+        w.talk_mode = "no_action"
+        run, rep = self._run(w), self._rep()
+        self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
+        self.assertEqual(run.backpack_attempts_today, 1)
+        self.assertTrue(run.backpack_tried_today)
+        # 模拟同一回合里已经用满两次 talk 的边界：gate 必须直接跳过、不再发请求
+        run.backpack_tried_today = False
+        run.backpack_attempts_today = 2
+        rep2 = self._rep()
+        self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep2))
+        self.assertEqual(rep2.backpack_upgrade_skip, "attempt_limit")
+        self.assertEqual(len(w.talk_calls), 1)
+
+    # ---- day_end 只读字段齐（as_dict 能直接看出来） ----
+    def test_day_report_as_dict_exposes_backpack_trace(self):
+        w = FakeWorld(money=3264)
+        w.talk_mode = "ok"
+        run, rep = self._run(w), self._rep()
+        self.assertTrue(run._maybe_buy_backpack_upgrade(w.obs(), rep))
+        d = rep.as_dict()
+        self.assertTrue(d["backpack_upgrade_ok"])
+        self.assertEqual(d["backpack_capacity_before"], 12)
+        self.assertEqual(d["backpack_capacity_after"], 24)
+        self.assertEqual(d["backpack_upgrade_attempts"], 1)
+        self.assertEqual(d["backpack_upgrade_failures"], [])
+        self.assertEqual(d["backpack_upgrade_skip"], "")
 
 
 if __name__ == "__main__":  # pragma: no cover
