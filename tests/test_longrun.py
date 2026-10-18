@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "brain"))
 
 from agentfarm.bridge import MOD_VERSION_EXPECTED, BridgeError  # noqa: E402
 from agentfarm.llm import LlmError  # noqa: E402
+from agentfarm import longrun as longrun_mod  # noqa: E402  （task-5：按模块取新增常量，保持旧树可导入）
 from agentfarm.farmwork import (  # noqa: E402
     MAX_CLEAR_SWINGS, NO_SLOT_CODE, STEP_RESULT_CODES, FarmWorker, STAGE_ACTION, StepResult,
     StageResult, harvest_tool, player_free_slots, seed_items, tile_ready,
@@ -4915,12 +4916,17 @@ class TestTask78BoundBasis(unittest.TestCase):
     修法：`bound_basis = Σ(阶段里 attempted 且**不是** encircled 的步数)`，两套 bound 改用它；
     `attempted` 的语义一字不动（它仍是"发起过的步数"的**证据**）。
 
-    本用例把两个数**都造出来**：20 格被围住（`encircled`，会被重试 ⇒ 实际几十次）+ 2 格真
-    不可达 ⇒ 按 `bound_basis`（=2）算界是 `max(5, 0) = 5`，按旧的 `attempted` 算界会到 8+。
+    本用例把两个数**都造出来**：120 格被围住（`encircled`）+ 2 格真不可达 ⇒ 按 `bound_basis`
+    （=2）算界是 `max(5, 0) = 5`，按旧的 `attempted` 算界会到 `max(5, 24) = 24`。
+
+    【task-5 / 0.7.44】夹具修订：旧版用 20 格 + "同格被反复重试几十轮"把 `attempted` 抬到 8+
+    来证伪旧公式；task-5 起挡死格**当天不再被重新分配**（A8 冬 9/14 的 1 格阶段死循环），
+    所以夹具改成**一轮内 120 格 encircled** 来抬高 `attempted`（不再依赖被修复掉的空转形态），
+    断言本身一条没放松。`_ensure_plot` 也只喂第一轮，避免后续"0 目标"阶段记录遮蔽日级口径。
     """
 
     def _world(self):
-        enclosed = [(60 + 3 * i, 30) for i in range(20)]
+        enclosed = [(60 + 3 * i, 30) for i in range(120)]
         w = EncircledWorld(enclosed=enclosed, seeds=0, money=0)
         # 2 格真不可达：目标格周围**没有观测**（`_standable_near` 为真 ⇒ 不是 encircled），
         # 但四邻都在 `_UnreachableClient` 的"移动必被拒"名单里 ⇒ 开路也没得清 ⇒ `exhausted`
@@ -4934,6 +4940,17 @@ class TestTask78BoundBasis(unittest.TestCase):
             for dx, dy in _NB4:
                 blocked_moves.add((t[0] + dx, t[1] + dy))
         return w, set(far), blocked_moves
+
+    @staticmethod
+    def _one_shot_plot(run, targets):
+        """只给第一轮喂作业区：后续轮次返回 None，免得"0 目标"阶段记录遮住日级口径。"""
+        plot = {"zone": "", "label": "", "anchor": list(targets[0]),
+                "tiles": list(targets), "note": ""}
+
+        def ensure(obs, rep):
+            return plot if not rep.stages else None
+
+        return ensure
 
     def _run(self, w, blocked_moves):
         # `_UnreachableClient` 会把名单里每一格的**四邻**也拉黑 ⇒ 把被围住的也算进去，
@@ -4955,9 +4972,7 @@ class TestTask78BoundBasis(unittest.TestCase):
         w, far, blocked = self._world()
         run = self._run(w, blocked)
         targets = sorted(w.enclosed | far)
-        run._ensure_plot = lambda obs, rep: {"zone": "", "label": "",
-                                             "anchor": list(targets[0]),
-                                             "tiles": targets, "note": ""}
+        run._ensure_plot = self._one_shot_plot(run, targets)
         run.run()
         rep = run.days[0]
         attempted = sum(int(st.get("attempted") or 0) for st in rep.stages)
@@ -4976,9 +4991,7 @@ class TestTask78BoundBasis(unittest.TestCase):
         w, far, blocked = self._world()
         run = self._run(w, blocked)
         targets = sorted(w.enclosed | far)
-        run._ensure_plot = lambda obs, rep: {"zone": "", "label": "",
-                                             "anchor": list(targets[0]),
-                                             "tiles": targets, "note": ""}
+        run._ensure_plot = self._one_shot_plot(run, targets)
         run.run()
         rep = run.days[0]
         day_end = self._events(run, "day_end")[-1]
@@ -5003,9 +5016,7 @@ class TestTask78BoundBasis(unittest.TestCase):
         w, far, blocked = self._world()
         run = self._run(w, blocked)
         targets = sorted(w.enclosed | far)
-        run._ensure_plot = lambda obs, rep: {"zone": "", "label": "",
-                                             "anchor": list(targets[0]),
-                                             "tiles": targets, "note": ""}
+        run._ensure_plot = self._one_shot_plot(run, targets)
         run.run()
         rep = run.days[0]
         attempted = sum(int(st.get("attempted") or 0) for st in rep.stages)
@@ -5096,6 +5107,172 @@ class TestTask78HonestEncircledWording(unittest.TestCase):
         self.assertEqual(summary[0]["tried_open_steps"], 0, "开路尝试次数要能被复核")
         self.assertIn("bound_basis", summary[0])
         self.assertNotIn("树/桩/大石", str(summary[0].get("note") or ""))
+
+
+class _EncircleWorker(FakeWorker):
+    """【task-5】把指定格子的动作返回 `encircled`（复刻 A8 冬 9/14 的 `[37,35]`）。
+
+    真机形态（`logs/longrun-runA8-0743.jsonl`）：`encircled` 步既不是 `failed` 也不是
+    `proven_inert`（task-68 刻意不封格）⇒ 旧代码里它不吃 `tile_attempts` 配额、也不进
+    `blocked`，于是每一轮都被重新分配：冬 9 同格 28 次、冬 14 63 次 ⇒ 3 轮 idle 判 stuck。
+    """
+
+    def __init__(self, world: FakeWorld, enclosed) -> None:
+        super().__init__(world, log=lambda *_: None)
+        self.enclosed = {tuple(t) for t in enclosed}
+
+    def run_stage(self, stage, tiles, *, min_stamina=12.0, max_steps=200):
+        res = StageResult(stage=stage, tiles=list(tiles))
+        for i, tile in enumerate(tiles):
+            if i >= max_steps:
+                res.stopped, res.stopped_reason = "budget", f"达到格数上限 {max_steps}"
+                break
+            if tuple(tile) in self.enclosed:
+                res.steps.append(StepResult(
+                    stage, tuple(tile), code="encircled",
+                    reason="四邻没有「可清障 + 自己够得着」的突破口（测试注入）"))
+                continue
+            res.steps.append(self.w.clear(tuple(tile)))
+        return res
+
+
+class TestTask5EncircledRealloc(unittest.TestCase):
+    """【task-5 / 0.7.44】A8 冬 9/14：被围住的 1 格被**当天反复重新分配** ⇒ 1 格阶段 28/62 轮、
+    世界不变 ⇒ 3 轮 idle 判 stuck。本类钉死修法（卡 2）：
+
+    * 「挡死格」（`blocked` ∪ `encircled_day`）**不再进下一轮分配**（含换田区后重新分配）；
+    * `_plot_has_work` / 收尾作业区不再把挡死格算"活"/"收尾活"（守卫不再被它钉住）；
+    * `leftover` 拆「可执行余格 vs 物理挡死格」两个**只作 info** 的数（判据/checks 不动）；
+    * 同格"重分无产出"**有界**（`MAX_ALLOC_NO_PROGRESS`）+ 逐格 `blocked{action=stage_realloc}` 留痕；
+    * 整片只剩挡死格 ⇒ 走卡 1 的换片 / `resume_exhausted:` 诚实收工，不空转、不 stuck。
+
+    修前红复跑：`tests\\_repro_t5_encircled.py --rev b702708`（卡 1 提交，默认）⇒ 本类必红；
+    `--rev HEAD` ⇒ 绿（脚本细节见该文件 docstring）。
+    """
+
+    TILE = (60, 10)
+
+    @staticmethod
+    def _events(run: LongRun, event: str) -> list:
+        return [e for e in run.entries if e.get("event") == event]
+
+    @staticmethod
+    def _plot(*tiles) -> dict:
+        tiles = list(tiles) or [(60, 10)]
+        return {"zone": "", "label": "", "anchor": list(tiles[0]), "tiles": tiles, "note": ""}
+
+    def _world(self) -> FakeWorld:
+        # 一格普通的可清障格（会被 `_EncircleWorker` 判成 encircled），玩家站在附近。
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[self.TILE] = "weed"
+        w.player_tile = [62, 14]
+        return w
+
+    def _run(self, w: FakeWorld, *, worker=None):
+        client = _CountingClient(w)
+        worker = worker or _EncircleWorker(w, [self.TILE])
+        run = make_run(w, target_days=1, max_days=1,
+                       client_factory=lambda: client, worker_factory=lambda c: worker)
+        run.worker = worker
+        run.client = client
+        return run
+
+    def _rep(self) -> DayReport:
+        return DayReport(day_key=("winter", 1, 9), started_at=0.0)
+
+    def test_stage_tiles_excludes_encircled_tiles(self):
+        """挡死格不再进目标池（换田区/换容器后重新分配也一样排除）。"""
+        w = self._world()
+        run = self._run(w)
+        self.assertIn(self.TILE, run._stage_tiles("clear_area", w.obs(), self._plot()),
+                      "前提：没被围住时这一格是合法目标")
+        run.encircled_day.add(self.TILE)
+        self.assertEqual(run._stage_tiles("clear_area", w.obs(), self._plot()), [],
+                         "被围住的格今天不许再分配（A8 的 1 格阶段死循环）")
+        wider = self._plot((60, 10), (61, 10), (62, 10))
+        self.assertEqual(run._stage_tiles("clear_area", w.obs(), wider), [],
+                         "换一片作业区重新分配同样要排除（含换田区）")
+
+    def test_plot_has_work_ignores_encircled_tiles(self):
+        """守卫口径：只有被围住的格时**不算"还有活"**（否则一整天不放行）。"""
+        w = self._world()
+        run = self._run(w)
+        self.assertTrue(run._plot_has_work(w.obs(), [self.TILE]))
+        run.encircled_day.add(self.TILE)
+        self.assertFalse(run._plot_has_work(w.obs(), [self.TILE]),
+                         "被围住的格今天不算活")
+
+    def test_leftover_is_split_into_executable_and_blocked(self):
+        """`leftover` 两个数：可执行余格 vs 物理挡死格（`leftover` 语义本身不动）。"""
+        w = self._world()
+        run = self._run(w)
+        rep = self._rep()
+
+        run._step_stage("clear_area", w.obs(), self._plot(), rep)
+
+        st = rep.stages[-1]
+        self.assertEqual(st["leftover"], 1, st)
+        self.assertEqual(st["leftover_blocked"], 1, st)
+        self.assertEqual(st["leftover_executable"], 0, st)
+        self.assertEqual(st["leftover_blocked_tiles"], [[60, 10]], st)
+        self.assertIn(self.TILE, run.encircled_day)
+        self.assertNotIn(self.TILE, run.blocked,
+                         "encircled 仍不写 blocked（task-68 不封格语义不动）")
+
+    def test_same_tile_reallocation_is_bounded_and_journalled(self):
+        """同格"重分无产出"有界：到 `MAX_ALLOC_NO_PROGRESS` 后当天不再选它，并留痕。"""
+
+        class _NoOutputWorker(FakeWorker):
+            """分配到了格、却一个 step 都不回（"1 格阶段零产出"的最坏形态，且没被挡死集合覆盖）。"""
+
+            def run_stage(self, stage, tiles, *, min_stamina=12.0, max_steps=200):
+                return StageResult(stage=stage, tiles=list(tiles))
+
+        limit = longrun_mod.MAX_ALLOC_NO_PROGRESS
+        w = self._world()
+        run = self._run(w, worker=_NoOutputWorker(w))
+        rep = self._rep()
+        for _ in range(limit):
+            run._step_stage("clear_area", w.obs(), self._plot(), rep)
+
+        self.assertEqual(run.alloc_no_progress.get(self.TILE), limit, run.alloc_no_progress)
+        self.assertIn(self.TILE, run.blocked, "到界后当天不再选它")
+        capped = [e for e in self._events(run, "blocked") if e.get("action") == "stage_realloc"]
+        self.assertEqual(len(capped), 1, run.entries)
+        self.assertEqual(capped[0]["tile"], [60, 10])
+        self.assertEqual(capped[0]["alloc_no_progress"], limit)
+        self.assertEqual(capped[0]["limit"], limit)
+        self.assertEqual(run._stage_tiles("clear_area", w.obs(), self._plot()), [],
+                         "到界后目标池里不能再出现它")
+        self.assertTrue(rep.stages[-1]["alloc_capped_tiles"], rep.stages[-1])
+
+    def test_day_with_only_encircled_leftover_ends_honestly(self):
+        """端到端：整片只剩挡死格 ⇒ `resume_exhausted:` 诚实收工；不重分、不空转、不 stuck。"""
+        w = self._world()
+        run = self._run(w)
+
+        code = run.run()
+
+        rep = run.days[0]
+        self.assertEqual(code, 1, "不 VERIFIED 就不许返 0")
+        self.assertFalse(rep.verified, rep.checks)
+        self.assertEqual(rep.ended_by, "sleep", rep.ended_reason)
+        self.assertTrue(str(rep.ended_reason).startswith("resume_exhausted:"), rep.ended_reason)
+        self.assertFalse(str(rep.ended_reason).startswith("stuck:"),
+                         f"只剩挡死格 ≠ 卡死：{rep.ended_reason}")
+        self.assertFalse(rep.checks.get("day_justified", True), rep.checks)
+        self.assertEqual(len(self._events(run, "encircled")), 1,
+                         "被围住的格只该被分配一次（旧代码会重分几十轮）")
+        self.assertLessEqual(len(self._events(run, "idle")), 2,
+                             "不许再攒到 3 轮 idle 判 stuck")
+        # leftover 拆分落进 day_end，且和恒等于 plot_pending（只 info、不改判据）
+        self.assertEqual(rep.plot_pending,
+                         rep.plot_pending_executable + rep.plot_pending_blocked,
+                         (rep.plot_pending, rep.plot_pending_executable,
+                          rep.plot_pending_blocked))
+        day_end = self._events(run, "day_end")[-1]
+        for key in ("plot_pending_executable", "plot_pending_blocked"):
+            self.assertIn(key, day_end, f"day_end 缺 {key}")
 
 
 class _SurplusWorker(FakeWorker):

@@ -231,6 +231,18 @@ WIDE_TASKS = ("water_area", "harvest")
 #: 任何一条没被 `blocked` 覆盖的失败路径（例如世界变了但没做成）也不许把同一格磨到天亮。
 MAX_TILE_ATTEMPTS = 2
 
+#: 【task-5 / 0.7.44】同一格当天被**重新分配**却每次都没有产出的次数上界。
+#:
+#: A8 冬 9/14 的 1 格余量死循环：被围住的 `[37,35]` 在一天里被重新分配了 28/63 次（日志里
+#: `encircled` 同格 28/63 条、`stage_shortfall` 同数）——因为 `encircled` 步既不是 `failed`
+#: 也不是 `proven_inert`（task-68 刻意不封格），既不吃 `tile_attempts` 配额、也不进 `blocked`，
+#: 于是 `_stage_tiles` 每一轮都把它重新分下去，世界不变 ⇒ 3 轮 idle 判 stuck、一整天报废。
+#: 修法有两层：① `encircled_day`/`blocked` 直接不进下一轮目标池（`_stage_tiles`）；② 本常量是
+#: **兜底不变量**——任何"分配了但没产出、又没被挡死集合覆盖"的格子，到界后当天也不再选它，
+#: 并逐格 journal `blocked{action=stage_realloc, alloc_no_progress, limit}` 留痕。
+#: **只影响"今天还分不分它"，`leftover`/`assigned_undone`/`no_unmet_stages` 一个字不动**。
+MAX_ALLOC_NO_PROGRESS = 3
+
 #: 【task-28 防自旋】同一格同一天**连续被环境挡住**（`env_block`：`busy`/`ui_modal`/`no_save`/
 #: `world_fading`）超过这个次数以后，就**不再免费**：从下一次起按"没结论"占 `MAX_TILE_ATTEMPTS`
 #: 配额。理由：`env_block` 不占配额是刻意的（环境抖动不该封格），但"Mod 一直回 busy"这种
@@ -714,6 +726,14 @@ class DayReport:
     assigned_undone: int = 0
     plot_pending: int = 0
     plot_pending_by_kind: dict[str, int] = field(default_factory=dict)
+    #: 【task-5 / 0.7.44】`plot_pending` 的**拆分口径**（**只作 info**，不进 `checks`、不做任何豁免）：
+    #: `plot_pending_executable` = 当日"每个阶段种类最后一条记录"里**还值得再试**的余格；
+    #: `plot_pending_blocked` = 其中已判**物理/判据挡死**的格数（`blocked` ∪ `encircled_day`：
+    #: 试过干不动 / 走不到 / 被拒 / 工具不够格 / 被围住）。二者之和恒等于 `plot_pending`
+    #: （`leftover` 语义一个字没动）。**诚实优先**：`no_unmet_stages` 仍只看 `assigned_undone`，
+    #: 绝不拿这两个数放宽判据 —— 该做没做照旧如实、当天仍可不 VERIFIED。
+    plot_pending_executable: int = 0
+    plot_pending_blocked: int = 0
     deferred_tiles: int = 0
     #: 【task-158】当天的**浇水优先体力预算**（`stamina_budget` journal 的同名快照）：
     #: `{max, stamina, live_crops, dry, water_reserve, water_cost_est, path_allowance,
@@ -823,6 +843,9 @@ class DayReport:
             "assigned_undone": self.assigned_undone,
             "plot_pending": self.plot_pending,
             "plot_pending_by_kind": dict(self.plot_pending_by_kind),
+            # 【task-5 / 0.7.44】可执行余格 vs 物理挡死格（只 info；和恒等于 plot_pending）
+            "plot_pending_executable": self.plot_pending_executable,
+            "plot_pending_blocked": self.plot_pending_blocked,
             "deferred_tiles": self.deferred_tiles,
             # 【task-168】主动认输的片区（只 info：不进 checks、不扣 plot_pending/assigned_undone）
             "scope_shed": dict(self.scope_shed),
@@ -1029,6 +1052,11 @@ class LongRun:
         # `blocked` 是"判据证明干不动"，这里是**不变量**：哪怕判据漏了某种情况，
         # 同一格一天也不会被发起第 3 次（用户 m01804 要的"不要白白浪费体力"）。
         self.tile_attempts: dict[tuple[int, int], int] = {}
+        # 【task-5 / 0.7.44】本日每格"被分配进阶段、但没有产出（未做成/未按规跳过）"的次数。
+        # 兜底不变量：到 `MAX_ALLOC_NO_PROGRESS` 后当天不再选它（逐格 journal `blocked`）。
+        # 与 `tile_attempts` 刻意分开：`tile_attempts` 只数"发起过且有代价"的失败/无结论，
+        # 而本计数连"分配了、执行层却一个 step 都没回"的 1 格阶段也能界住。
+        self.alloc_no_progress: dict[tuple[int, int], int] = {}
         # 本日每格"连续被环境挡住"的次数（task-28 防自旋）：超过 `MAX_ENV_ATTEMPTS` 后
         # 不再免费，改为占 `tile_attempts` 配额 ⇒ 持续 `busy` 时请求次数有界、当天 needs_review。
         # ⚠️ 键是**格子**，不是"格子+动作"：同一格上 `clear_area` 与 `water_area`（或 `till_area`）
@@ -3595,8 +3623,11 @@ class LongRun:
         free_slots, bag_need, bag_status = self._bag_state(obs)
         bag_blocked = self.inventory_blocked_today or (bag_status == "ok" and bag_need > 0)
         for t in tiles:
-            if t in self.blocked or t in shed:
-                continue  # 今天已经证明"动了没用" / 今天已主动认输
+            if t in self.blocked or t in shed or t in self.encircled_day:
+                # 今天已经证明"动了没用" / 今天已主动认输 / 【task-5】被围住的格今天也不再算"活"。
+                # 后者是 A8 冬 9/14 的病灶之一：`[37,35]` 被围住却仍被算成"field_sw 还有地要清"，
+                # 守卫因此一整天不放行、而执行层每轮又拿它当目标（世界不变）⇒ 3 轮 idle 判 stuck。
+                continue
             tv = tmap.get(t)
             if tv is None:
                 # 没动过的格子在 tiles[] 里根本不存在，只能靠 tillable[] 认。
@@ -3700,7 +3731,12 @@ class LongRun:
         tiles = [t for t, v in tmap.items()
                  if v.get("crop") and (not v.get("watered") or tile_ready(v) or v.get("dead"))]
         # 【task-168】认输片区的格子不算"收尾活"（主动放弃 ≤ 一天 1 个区，有界）。
+        # 【task-5 / 0.7.44】被围住 / 今天已挡死的格也不算"收尾活"：否则收尾作业区会拿着
+        # 一个执行层永远做不成的格每轮重来（A8 冬 9/14 的 1 格阶段死循环）。
         if tiles:
+            dead = self._dead_tile_set()
+            if dead:
+                tiles = [t for t in tiles if t not in dead]
             shed = self._shed_tile_set()
             if shed:
                 tiles = [t for t in tiles if t not in shed]
@@ -4472,6 +4508,13 @@ class LongRun:
             pool = [t for t in pool
                     if t not in self.blocked
                     and self.tile_attempts.get(t, 0) < MAX_TILE_ATTEMPTS]
+        # 【task-5 / 0.7.44】被围住的格今天**不再进任何阶段的目标池**：A8 冬 9/14 的 1 格余量
+        # 死循环就是它——`encircled` 步既不是 `failed` 也不是 `proven_inert`（task-68 刻意不封格），
+        # 不吃 `tile_attempts` 配额、也不进 `blocked`，于是每一轮都被重新分配、世界不变 ⇒ stuck。
+        # 只排除"今天还分不分它"：`_leftover`/`assigned_undone` 一个字不改 ⇒ 该做没做照旧如实，
+        # 当日仍可不 VERIFIED（诚实优先，绝不为 no_unmet_stages 变绿放宽判据）。
+        if self.encircled_day:
+            pool = [t for t in pool if t not in self.encircled_day]
         # 【task-168】今天主动认输的片区**一格都不再进目标池**（防 task-124/163 那种
         # "守卫说有活、执行层又去碰"的错配复发）；`_leftover` 一个字不改 ⇒ 认输格仍算未完成。
         shed = self._shed_tile_set()
@@ -4739,6 +4782,36 @@ class LongRun:
         return sorted(t for t in self.leftover_targets
                       if t not in self.blocked and t not in defer
                       and t not in self.harvest_gave_up and t not in shed)
+
+    def _dead_tile_set(self) -> set[tuple[int, int]]:
+        """【task-5 / 0.7.44】今天**"物理/判据挡死"**的格子：`blocked` ∪ `encircled_day`。
+
+        用途只有两个：
+        * `_stage_tiles`：这些格今天不再进任何阶段的目标池（否则 1 格阶段会被一轮轮重分）；
+        * `_step_stage`/日终：把 leftover 拆成"可执行余格 vs 物理挡死格"两个**只作 info** 的数。
+
+        `blocked` 已经含"动了没用"、`unreachable`（task-52）、`refused`（task-63）、
+        `blocked_by_tool`（task-20，含 `backlog`）；`encircled`（task-68）刻意**不写 blocked**
+        （不封格：开路后/次日可能可达），所以这里显式并进来 —— **只用于"今天不再分配/不可执行"
+        这一层，不等于把 encircled 封格**：`blocked` 本身一个字没动，`_leftover` 也照旧如实计。
+        """
+        return set(self.blocked) | set(self.encircled_day)
+
+    def _dead_end_pending(self) -> list[tuple[int, int]]:
+        """【task-5 / 0.7.44】账本里**只剩"挡死"余格**时返回它们，否则 `[]`。
+
+        判据只看"还能不能执行"：`_pending_work()` 的格必须**全部**落在 `encircled_day`
+        （四邻没突破口）或 `resume_stall_tiles`（卡 1：回去看过、仍然拿不出目标）；`blocked`
+        的格本来就被 `_pending_work` 排除。这种日子再按窗口候选分配只会重分同一个做不成的格
+        （A8 冬 9/14：1 格阶段 28/62 轮、世界不变 ⇒ 3 轮 idle 判 stuck）⇒ 调用方应走卡 1 的
+        换片/`resume_exhausted` 诚实收工。
+        """
+        pending = self._pending_work()
+        if not pending:
+            return []
+        if not all(t in self.encircled_day or t in self.resume_stall_tiles for t in pending):
+            return []
+        return [t for t in pending if t not in self.blocked]
 
     # ------------------------------------------------ task-124：review 独苗的对账路径
 
@@ -6850,6 +6923,38 @@ class LongRun:
                                         if s.tile and tuple(s.tile) in set(undone_tiles)}),
                           note="阶段自然结束却仍有分配未成事的格 ⇒ 补一个如实 stop 原因"
                                "（`stopped=\"\"` 与 `assigned_undone>0` 不再共存）")
+        # 【task-5 / 0.7.44】把 leftover 拆成"可执行余格 vs 物理挡死格"（**只作 info**，
+        # `leftover` 语义一字不动）。"挡死" = `blocked` ∪ `encircled_day`（见 `_dead_tile_set`）。
+        dead_set = self._dead_tile_set()
+        leftover_blocked = [t for t in leftover if t in dead_set]
+        leftover_exec = [t for t in leftover if t not in dead_set]
+        # 【task-5 / 0.7.44】有界保护：同一格当天被**重新分配** N 次仍没有产出 ⇒ 当天不再选它。
+        # A8 冬 9/14：[37,35] 被围住后被重分 28/63 次（encircled 步不吃 tile_attempts 配额）。
+        # 这里兜底任何"分配了却没产出、又没被挡死集合覆盖"的格子；留痕走既有 `blocked` 事件
+        # （不加新事件名，防 analyzer 的机械枚举漂移）。
+        alloc_capped_today: list[tuple[int, int]] = []
+        for _t in sorted(assigned - assigned_done):
+            key = tuple(_t)
+            if key in dead_set:
+                continue                    # 物理挡死格由 blocked/encircled_day 排除，不进"重分"计数
+            steps_here = [s for s in all_steps if s.tile and tuple(s.tile) == key]
+            # 环境挡路 / 背包满 / 体力用尽 / 阶段预算收工 = 世界或资源**暂时**不让做，
+            # 条件好了还要重试（task-198 腾格后要把熟作物收进来、task-158 体力/预算会重算）
+            # ⇒ 不占"重分无产出"额度（否则会把 slot_relief/预算重试的格子误封）。
+            if any(s.env_block or getattr(s, "no_slot", False) for s in steps_here):
+                continue
+            if stopped in ("stamina", "budget"):
+                continue
+            n = self.alloc_no_progress.get(key, 0) + 1
+            self.alloc_no_progress[key] = n
+            if n >= MAX_ALLOC_NO_PROGRESS and key not in self.blocked:
+                self.blocked[key] = f"当天被重新分配 {n} 次仍无产出"
+                alloc_capped_today.append(key)
+                self._journal("blocked", tile=list(key), action="stage_realloc",
+                              no_effect=False, stage=task, zone=self.zone_name,
+                              alloc_no_progress=n, limit=MAX_ALLOC_NO_PROGRESS,
+                              reason=(f"同一格当天被重新分配 {n} 次、每次都没有产出"
+                                      f"（未做成/未按规跳过）⇒ 今天不再选它（有界保护）"))
         # "还可能再试"的剩余：既没被封格、也没到本日尝试上限。
         retryable = [t for t in leftover
                      if t not in self.blocked and self.tile_attempts.get(t, 0) < MAX_TILE_ATTEMPTS]
@@ -7087,6 +7192,14 @@ class LongRun:
             # 是 `bound_basis`）。
             "engaged": sum(1 for s in all_steps if s.attempted and s.stood),
             "stopped": stopped, "leftover": len(leftover),
+            # 【task-5 / 0.7.44】leftover 拆两个**只作 info** 的数：可执行余格 vs 物理挡死格。
+            # 二者之和恒等于 `leftover`；`no_unmet_stages` 仍只看 `assigned_undone`，
+            # 绝不拿这里的分拆去放宽判据（诚实优先：该做没做照旧 unmet、当天可不 VERIFIED）。
+            "leftover_executable": len(leftover_exec),
+            "leftover_blocked": len(leftover_blocked),
+            "leftover_blocked_tiles": [list(t) for t in leftover_blocked[:12]],
+            # 【task-5 / 0.7.44】本阶段到"重分无产出"上界、当天不再选的格（逐格 journal `blocked`）。
+            "alloc_capped_tiles": [list(t) for t in alloc_capped_today[:12]],
             # 【task-218 ⑧ / 0.7.39 P0-1】逐格清障证据：真正发生 kind 变化的格子（坐标）。
             # 护栏 B 的判据就是这份清单非空；`blocker_drop` 只是 farm 级 info（字段不存在 ⇒ None）。
             "cleared_tiles": [list(t) for t in cleared_tiles],
@@ -7920,6 +8033,8 @@ class LongRun:
         self.idle_rounds = 0
         self.blocked = {}
         self.tile_attempts = {}
+        # 【task-5 / 0.7.44】"同格重分无产出"的当日计数同样每天清零（次日世界变了重新判）。
+        self.alloc_no_progress = {}
         self.env_streak = {}
         self.env_spin_noted = set()
         self.seed_gate_noted = set()
@@ -8153,6 +8268,35 @@ class LongRun:
                 # （可能整片都在玩家窗口之外，例如 run5 的 field_nw）。
                 work_spot = self._work_spot_plot(obs)
                 picked = work_spot if work_spot is not None else self._resume_plot(obs)
+                # 【task-5 / 0.7.44】整片只剩"挡死格"（被围 / 回去看过没产出）⇒ 走卡 1 的
+                # 换片/`resume_exhausted` 诚实收工，别再用窗口里"看起来有活"的假候选一轮轮重分
+                # 同一个做不成的格（A8 冬 9/14 的 1 格阶段死循环就是这么把整天耗掉的）。
+                if picked is None:
+                    dead_pending = self._dead_end_pending()
+                    near = self._near_player_plot(obs)
+                    if dead_pending and (near is None
+                                         or not self._plot_has_work(obs, near["tiles"])):
+                        dead_plot = {"zone": "", "label": "", "area": "",
+                                     "anchor": list(dead_pending[0]), "tiles": dead_pending,
+                                     "note": "只剩挡死格（被围 / 回去看过没产出）"}
+                        action, alt = self._resume_switch_or_exhaust(
+                            obs, rep, plot=dead_plot, where="dead_only")
+                        if action == "ended":
+                            break
+                        if action == "acted":
+                            self.idle_rounds = 0
+                            continue
+                        if alt is not None:            # 防御性：dead-only 一般拿不出 alt
+                            walked = self._walk_into_plot(obs, alt)
+                            self._journal("resume_walk", zone=self.zone_name,
+                                          tiles=len(alt["tiles"]), walked=bool(walked),
+                                          attempt=self.resume_walks, switched=True,
+                                          note="只剩挡死格 ⇒ 换到另一片的账本待做格")
+                            if walked:
+                                self._actions += 1
+                                self.resume_last_anchor = self._resume_anchor(alt)
+                                self.idle_rounds = 0
+                                continue
                 spot = picked or self._near_player_plot(obs)
                 if spot is None:
                     reasons = self.work_reasons(obs)
@@ -8563,6 +8707,15 @@ class LongRun:
         raw_unmet = sum(plot_pending_by_kind.values())
         rep.plot_pending = raw_unmet
         rep.plot_pending_by_kind = plot_pending_by_kind
+        # 【task-5 / 0.7.44】把 `plot_pending` 拆成"可执行余格 vs 物理挡死格"两个**只作 info** 的数
+        # （取自每个阶段种类最后一条记录的 `leftover_executable`/`leftover_blocked`）。
+        # 和恒等于 `plot_pending`；`checks`/豁免/`no_unmet_stages` 一个字不看它们。
+        rep.plot_pending_executable = sum(
+            int(s.get("leftover_executable") or 0) for s in last_by_stage.values()
+            if int(s.get("tiles") or 0) > 0)
+        rep.plot_pending_blocked = sum(
+            int(s.get("leftover_blocked") or 0) for s in last_by_stage.values()
+            if int(s.get("tiles") or 0) > 0)
         # 【task-158】日终把预算快照落到 `day_end`（含当天"因预算推迟"的记录）：
         # 它**只**用于解释"为什么有些没浇完/没种上"，绝不参与 `checks`。
         if self.budget_today:
