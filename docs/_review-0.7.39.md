@@ -10,7 +10,9 @@
 
 **PASS-WITH-NITS（无阻塞必修项）⇒ 0.7.39 可以据此放行 A″/B″。**
 四条主通道（护栏 A 不静默缩水、护栏 B 逐格证据、§8 意图-执行对账/能力缺口、advance_dialogue 选项红线）在冻结树上全部有实测证据；
-发现 1 个 GAP（task-228 作者变异脚本在冻结树不可复跑）与 5 条 NIT（详见 §9），均不阻塞。
+发现 1 个 GAP（task-228 作者变异脚本在冻结树不可复跑）与 5 条 NIT（详见 §9），均不阻塞；
+另有 **1 条必修（文档口径级，不阻塞代码与 A″/B″）**：`docs/_run10-criteria.md` §9.2 的 `blocker_drop` 判据
+与 `docs/_release-0.7.39.md` §3 / 冻结树实现不一致（§11 必修-1）。
 
 > **D 段必写句（Lead m09338）**：advance_dialogue 的选项红线：**未替游戏做过任何选择** ——
 > 证据：`D228-3`（规则/技能内 `answerDialogue`/`answerDialogueAction`/`selectOption`/`chooseProfession` 等
@@ -172,3 +174,52 @@ python "$env:TEMP\t224_frozen\tools\analyze-longrun.py" --journal scratch/_t224_
 ## §10 边界
 
 只写 `docs/` + `scratch/`；未改生产码/游戏/桥/板面；未 bump、未装机、未跑真机；所有正式读数来自 `git archive cea9c0f` 冻结树（§8 命令可复跑）。
+
+## §11 跨卡一致性对账（卡面"必须做 4"：判据文档 × 两套工具实现）
+
+对账来源：`docs/_run10-criteria.md` §8（意图对账）/ §9（`clear_area` 有效性）、`docs/_release-0.7.39.md` §3；
+实现来源（均取自冻结树 `cea9c0f`）：`tools/analyze-longrun.py`（§8 判红的唯一责任人）、`brain/agentfarm/longrun.py`（护栏 B / 原因码 / gaps）、
+`tools/verify-run3.py`（按 P0-5 对 §8 只出 info）。
+
+| # | 判据（文档） | 实现证据 | 结论 |
+|---|---|---|---|
+| 1 | §8.1 三挂载点 `decision.plans[]` / `day_end.intent_coverage[]` / `<journal>-gaps.json` | `analyze-longrun.py:1392-1408` 同时读 `plans`（判"有计划无对账"）与 `intent_coverage`；P0-3 全绿 | ✅ |
+| 2 | §8.2 12 码闭合集，集外 ⇒ 红 | `longrun.py:106 INTENT_REASON_CODES`(12) 与 `analyze-longrun.py:1184` 一致；集外进 `bad_reasons` ⇒ `intent_bad_reason`（`:1430-1439`） | ✅ |
+| 3 | §8.2b 瓦片不变式 `requested=ok+failed+unexecuted`、`Σreasons=failed+unexecuted` | `analyze-longrun.py:1441-1462`；`reasons_are_intent_level` 时改判 `requested==0 ⇒ Σreasons>=1` | ✅ |
+| 4 | §8.2c ACTIONLESS 白名单 | 两侧 `ACTIONLESS_TASKS` 一致；记录侧 `actionless` 字段（`:1418`、`:1441`） | ✅ |
+| 5 | §8.3.1 有计划无对账 ⇒ 红 | `missed:intent_no_execution`（`:1409-1416`） | ✅ |
+| 6 | §8.3.2 `executed_steps==0` 无原因 ⇒ 红（actionless 豁免） | `missed:intent_no_reason`（`:1421-1428`） | ✅ |
+| 7 | §8.3.3 集外码 ⇒ 红 | `missed:intent_bad_reason`（`:1430-1439`） | ✅ |
+| 8 | §8.3.4 能力缺口未落盘 ⇒ 红（**`deferred_capability`/`tool_level` 两码**） | `CAPABILITY_REASON_CODES=("deferred_capability","tool_level")`（`:1199`）+ `missed:intent_gap_missing`（`:1475-1483`） | ✅ |
+| 9 | §8.3.5 gaps 里 `deferred_capability` 的 kind 不在 `DEFERRED_KINDS` ⇒ 红 | `missed:gap_kind_not_deferred`（`:1486-1495`，对照 `planner.DEFERRED_KINDS`） | ✅ |
+| 10 | §8.3.6 瓦片/原因计数不符 ⇒ 红 | `missed:intent_tiles_invariant` / `missed:intent_reason_count`（`:1441-1462`） | ✅ |
+| 11 | §8.3.7 `no_target` 无 `evidence.stage_tiles_empty` ⇒ 红 | `missed:intent_no_target_evidence`（`:1464-1473`） | ✅ |
+| 12 | §8.3.8 同 `(kind,reason)` 连续 ≥3 天 ⇒ **⚠ 人工复核，不自动判红** | 未自动判红 —— 与"⚠"措辞一致；但也没有自动统计 ≥3 天的清单（只有"能力缺口条目 N 条"总览 `:3520`）⇒ **NIT-6**：建议 0.7.40 加一张 `(kind,reason,count,days)` info 表，否则该条只能人工翻 `-gaps.json` | ⚠ NIT-6 |
+| 13 | §8.3.9 旧账本无字段 ⇒ 【无法判定】（缺失 ≠ 通过） | `build_undecidable` 路线；`cat_intent` 对旧账本不产红（文档串 `:1383-1384`） | ✅ |
+| 14 | patches P0-4.5 gaps 读写失败 ⇒ 红（§8.3 原列表之外的增补） | `gaps_load_failed`/`gaps_write_failed` ⇒ `missed:gaps_io_failed:*`；`day_end.gaps_problem` ⇒ `missed:gaps_problem`（`:1500-1521`） | ✅ |
+| 15 | §9.1 护栏 A（`SKIP_KINDS ⊆ DEFERRED_KINDS`、快照 `{fruitTree,bush}`、6 层覆盖矩阵、tiles 缺失 announce） | P0-2 全绿（冻结树探针 P0-2-1..8）；快照/漂移测试在 `tests/test_analyze_longrun.py:4563-4567`、`tests/test_longrun.py:10541` | ✅ |
+| 16 | **§9.2 护栏 B：目标格障碍消失 **或 `blocker_drop` 为正** 才算有效；`stage_stop_named` 要"带 `blocker_drop`"** | 实现（`longrun.py:6188-6230`）判据**完全不看** `blocker_drop`，journal 也**不带**该字段；而 `_release-0.7.39.md` §3 明写"farm 级聚合只作 info、不进判红（观测里没有 `farm.blockers`）" ⇒ 同一判据在"criteria / release / 实现"之间三种状态 | ❌ **必修-1**（文档级） |
+| 17 | §9.3 体力预算（`TREE_CLEAR_MAX_PER_DAY=2`、`TREE_STAMINA_ESTIMATE=100`、预算挡下不进目标池/不算 leftover/不记 hard failure） | 实现与文档一致；P0-2-6 等断言覆盖 | ✅ |
+| 18 | release §3 P0-5："`verify-run3` 对 §8 只出 info（白名单不扩）" | `git grep -c "intent_coverage|intent_execution|gaps_problem|intent_no_" tools/verify-run3.py` = **0 命中** ⇒ 它**一行 info 都不出**（不是"只出 info"，是"完全不参与"）。不违反红线（不会误判红），但与文档措辞不符 ⇒ **NIT-7**（0.7.40 把措辞改成"不参与 §8"，或工具补一条汇总 info） | ⚠ NIT-7 |
+
+**必修-1（文档）**：`docs/_run10-criteria.md` §9.2 → 改成与 release §3/实现同义（"有效性 = 目标格 kind 变化/`cleared_tiles`；`blocker_drop` 只作 info、不参与判红；`stage_stop_named` 不带该字段"）。
+或反向：实现补 `blocker_drop` 字段并在证据里接受它。**影响面**：真机 `blocker_drop` 恒 `None`（观测无 `farm.blockers` 聚合）⇒ 行为无差，**不阻塞 A″/B″**；但按卡面"任一处口径不一致 ⇒ 列为必修"，必须在 0.7.40 文档批次修掉，否则下一轮验收会拿旧文本再核出同一矛盾。
+
+小结：**17/18 一致；1 条必修（§9.2 blocker_drop，文档级）+ 2 条 NIT（§8.3.8 统计缺失、verify-run3 措辞不符）**。
+
+## §12 "0.7.40 队列还差什么"（卡面"必须做 5"）
+
+**队列本体**（`docs/_release-0.7.39.md` §6 第 3 步，卡面已齐）：
+`task-229`（sleep 床上坑）→ `task-227`（铜斧全链路：攒 6300g → 买 45 铜矿+6 煤 → 造熔炉 → 炼 5 铜锭 → 买铜斧 → 2 天后取回 → `toolOk` false→true）→
+`task-151 rev5`（指定作业区清空 + `zone_cleared` + 连续 2 天复核）→ `task-221 rev2`（余力多清）；四张都属"目标 1 的验收面"。
+已知不阻塞遗留：task-195/196/193/197、task-16、task-82/111/112。
+
+**还差的（按本报告证据逐条）**：
+1. **A″/B″ 读数本身**（§6 第 2 步：0.7.39 上各 5 个游戏日 + 字节拷贝教训库 + `compare-runs` L0–L5；跑批期间 brain 三文件冻结）—— 0.7.40 四张卡都要以它为前置。
+2. **必修-1 文档修订**（§11，`_run10-criteria.md` §9.2 的 `blocker_drop`）。
+3. **NIT-4 补测**：本次 7 步冒烟第 6 步【无法判定】（smoke 仅 2 天、满包 `inventory_blocked` 收尾、无跨日六串）⇒ A″/B″ 正式跑必须覆盖。
+4. **§8.6 backlog**：\"`DEFERRED_KINDS` 里的 kind 出现可执行目标却一次都没执行 ⇒ 红\" 需 brain 侧导出证据，0.7.40 再评估（与 task-151/221 的田区工作一起）。
+5. **NIT-6 统计面**：analyzer 加 `(kind,reason,count,days)` info 表，让 §8.3.8 的 ≥3 天人工复核有据可查。
+6. **升级链真机复核**：本批无真机 `tool_upgrade`/`pickup_tool` 证据（GAP-1 的机制面只能靠 C# 自检 + 离线探针）⇒ 0.7.40 用 `task-227` 的真机链路顺带复核 `task-216` 的 F3 修复回归。
+
+一句话：**0.7.40 的"卡面队列"已经齐了，缺的是 (a) A″/B″ 读数、(b) §9.2 文本修订、(c) §8.3.8/§8.6 两个 backlog 项的落地评估 + 升级链真机复核**。
