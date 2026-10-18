@@ -4665,6 +4665,8 @@ class TestIntentCoverageAndGaps(unittest.TestCase):
         self.assertEqual(rep["red"]["total"], 0, "缺失 ≠ 0：旧账本不许因§8判红")
         und = " ".join(rep.get("undecidable") or [])
         self.assertIn("intent_coverage", und)
+        self.assertIn("intent_coverage[*].executed_steps", und, "FIELD_PROBES 自动探针行（缺失 ≠ 0）")
+        self.assertIn("decision.plans[*].intent_id", und)
         self.assertIn("gaps", und)
         rc, _ = self._run(["--journal", path, "--days", "1"])
         self.assertEqual(rc, 0)
@@ -4678,6 +4680,10 @@ class TestIntentCoverageAndGaps(unittest.TestCase):
         rep = report_for(path, days=1)
         self.assertEqual(rep["red"]["total"], 0)
         self.assertEqual(rep["intent"]["rows"], 1)
+        und = " ".join(rep.get("undecidable") or [])
+        self.assertNotIn("intent_coverage[*].executed_steps", und,
+                         "有对账记录时 FIELD_PROBES 不该再报缺失")
+        self.assertNotIn("decision.plans[*].intent_id", und)
 
     def test_cli_accepts_gaps_dir_and_repairs(self):
         args = mod.parse_args(["--journal", "x.jsonl", "--gaps-dir", "logs",

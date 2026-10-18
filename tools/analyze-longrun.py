@@ -701,6 +701,16 @@ FIELD_PROBES = [
     ("event:tool_upgrade_blocked_work", "tool_upgrade_blocked_work",
      "在途升级期间被工具缺失/等级阻塞的农活阶段（task-205：stages/being/note；每天只记一次）"
      "⇒ **如实跳过，不是硬失败**；若同期自称 VERIFIED 才是互斥组合"),
+    # task-220（task-219 `fc147a7`）：意图-执行对账 + 能力缺口
+    ("day_end.intent_coverage[*].executed_steps", "day_end.intent_coverage[*].executed_steps",
+     "每个意图的执行对账记录（task-219：intent_id/task/requested_tiles/ok_tiles/failed_tiles/"
+     "unexecuted_tiles/executed_steps/reasons）⇒ **对账记录不是豁免额度**"),
+    ("day_end.intent_coverage[*].reasons", "day_end.intent_coverage[*].reasons",
+     "意图未执行的原因码（brain `longrun.py:101` 的 11 码闭合集；集外码一律判红，"
+     "**缺口原因不是「没活」**）"),
+    ("event:decision.plans[*].intent_id", "decision.plans[*].intent_id",
+     "计划里每个意图的 `intent_id`（task-219 ⇒ 必须与 `day_end.intent_coverage` 一一对上；"
+     "「计划有、对账没有」= 无声缩水 ⇒ 判红）"),
 ]
 OUTCOME_RE = re.compile(
     r"目标\s*(\d+)\s*步：做成\s*(\d+)、跳过\s*(\d+)、失败\s*(\d+)"
@@ -3643,13 +3653,25 @@ def build_undecidable(rows, sessions, prelude, report):
         _spec = None
         if probe.startswith("event:"):
             _spec = probe.split(":", 1)[1]
+        elif probe.startswith("day_end."):
+            # task-220：`day_end.intent_coverage[*].*` 这类深层探针（probe 直接写路径）
+            _spec = probe
         elif label.startswith("event:") and "." in label:
             # task-194：老写法把子字段探针写成 `("event:名字.键", "蛇形标签", …)`（第二项不含 `event:`）
             # ⇒ 以前只会拿"蛇形标签"去整本 JSON 里找字符串，恒判缺失、事件与键都在也被误报。
             # 这里统一改成按 `<事件名>.<键>` 真去事件里找键。
             _spec = label.split(":", 1)[1]
         if _spec is not None:
-            if "." in _spec:
+            if _spec.startswith("day_end.intent_coverage[*]."):
+                # task-220：`day_end.intent_coverage[]` 是数组，只要某天有这条记录就算在场
+                _ends_ic = [ev for _, ev in rows if ev.get("event") == "day_end"]
+                absent = (not _ends_ic) or (not any("intent_coverage" in ev for ev in _ends_ic))
+            elif _spec.startswith("decision.plans[*]."):
+                # task-220：`decision.plans[]` 里要有带 `intent_id` 的元素（计划才有对账义务）
+                _decs = [ev for _, ev in rows if ev.get("event") == "decision"]
+                absent = not any(isinstance(_pl, dict) and str(_pl.get("intent_id") or "")
+                                 for ev in _decs for _pl in as_list(ev.get("plans")))
+            elif "." in _spec:
                 _evname, _field = _spec.split(".", 1)
                 _hits = [ev for _, ev in rows if ev.get("event") == _evname]
                 absent = (not _hits) or (not any(_field in ev for ev in _hits))

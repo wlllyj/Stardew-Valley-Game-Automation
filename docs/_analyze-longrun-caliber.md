@@ -1190,6 +1190,9 @@ python scratch\_t194_undec.py    # HEAD 导出 vs 新版：六账本 rc/红/#无
 requested_tiles/ok_tiles/failed_tiles/unexecuted_tiles/executed_steps/reasons/reasons_are_intent_level`，
 brain `longrun.py:1200-1271`）+ `<journal>-gaps.json`（schema `agentfarm-gaps/1`，按
 `(kind,tool,reason)` 聚合 `count/first_seen/last_seen/sample_tiles`）。
+`FIELD_PROBES` 有 3 条自动探针：`day_end.intent_coverage[*].executed_steps` /
+`day_end.intent_coverage[*].reasons` / `event:decision.plans[*].intent_id`（旧账本 ⇒【无法判定】行，
+**缺失 ≠ 0**）。
 
 **判红 7 条（`docs/_run10-criteria.md` §8.3，第 7 类）**：
 
