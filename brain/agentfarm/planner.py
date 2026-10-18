@@ -1050,12 +1050,37 @@ def _sanitize_gap(item: Any, notes: list[str]) -> dict[str, Any] | None:
     }
 
 
+def _archive_bad_gaps_file(path: Path, *, report: dict[str, Any] | None = None) -> str:
+    """【task-230 P0-4.4】把坏掉的 `<journal>-gaps.json` 改名成 `<name>.bad.<ts>`。
+
+    为什么必须归档而不是静默丢弃：坏文件是**事故证据**（并发写/磁盘/被外部改），
+    静默丢会让"为什么缺口永远不累积"永远查不出来。归档**不覆盖**原文件内容，
+    只把它挪开，下一次写盘会在原路径重建（新 run 从空开始，符合"run 边界不继承"）。
+
+    返回归档后的路径字符串；失败返回 `""`（并把失败原因写进 `report["archive_failed"]`，
+    绝不抛 —— 与整个 gaps 层"不影响判定"的纪律一致）。
+    """
+    try:
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        dest = path.with_name(f"{path.name}.bad.{stamp}")
+        path.replace(dest)
+        if report is not None:
+            report["archived_to"] = str(dest)
+        return str(dest)
+    except Exception as exc:  # noqa: BLE001 - 归档失败也不许影响主流程
+        if report is not None:
+            report["archive_failed"] = f"{type(exc).__name__}: {exc}"
+        return ""
+
+
 def load_gaps_file(path: Any,
                    *, report: dict[str, Any] | None = None) -> tuple[dict[str, dict[str, Any]], str]:
-    """读本 run 的能力缺口清单（task-219，`<journal>-gaps.json`）。**绝不抛**。
+    """读本 run 的能力缺口清单（task-219/230，`<journal>-gaps.json`）。**绝不抛**。
 
     返回 `{(kind, tool, reason): {...}}`；缺文件 ⇒ `({}, "")`；坏 JSON / schema 不符 /
     条目类型错 ⇒ **整份丢弃**并把原因回填 `report["reason"]`（调用方记一笔 journal 后照常跑）。
+    【task-230 P0-4.4】坏 JSON / 坏 schema 还会**归档成 `<name>.bad.<ts>`**
+    （`report["archived_to"]` 报给调用方记 journal），绝不静默覆盖或删除。
     与教训库同一条信任边界：磁盘文件**绝不许决定任何判定**，只用来填提示词。
     """
     if report is not None:
@@ -1070,12 +1095,18 @@ def load_gaps_file(path: Any,
     try:
         raw = json.loads(p.read_text(encoding="utf-8"))
     except Exception as exc:  # noqa: BLE001
-        return {}, f"read_failed:{type(exc).__name__}: {exc}"
+        archived = _archive_bad_gaps_file(p, report=report)
+        tail = f"（已归档到 {archived}）" if archived else "（归档失败，文件保留原样）"
+        return {}, f"read_failed:{type(exc).__name__}: {exc}{tail}"
     if not isinstance(raw, Mapping) or raw.get("schema") != GAPS_SCHEMA:
-        return {}, "bad_schema"
+        archived = _archive_bad_gaps_file(p, report=report)
+        tail = f"（已归档到 {archived}）" if archived else "（归档失败，文件保留原样）"
+        return {}, f"bad_schema{tail}"
     items = raw.get("gaps")
     if not isinstance(items, list):
-        return {}, "not_a_list"
+        archived = _archive_bad_gaps_file(p, report=report)
+        tail = f"（已归档到 {archived}）" if archived else "（归档失败，文件保留原样）"
+        return {}, f"not_a_list{tail}"
     out: dict[str, dict[str, Any]] = {}
     dropped = 0
     reasons: list[str] = []

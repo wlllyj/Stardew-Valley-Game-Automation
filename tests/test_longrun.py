@@ -35,8 +35,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "brain"))
 from agentfarm.bridge import MOD_VERSION_EXPECTED, BridgeError  # noqa: E402
 from agentfarm.llm import LlmError  # noqa: E402
 from agentfarm.farmwork import (  # noqa: E402
-    MAX_CLEAR_SWINGS, NO_SLOT_CODE, FarmWorker, STAGE_ACTION, StepResult, StageResult,
-    harvest_tool, player_free_slots, seed_items, tile_ready,
+    MAX_CLEAR_SWINGS, NO_SLOT_CODE, STEP_RESULT_CODES, FarmWorker, STAGE_ACTION, StepResult,
+    StageResult, harvest_tool, player_free_slots, seed_items, tile_ready,
 )
 from agentfarm.longrun import (  # noqa: E402
     ACTIONLESS_TASKS, CLEARABLE_KINDS, DEFAULT_LLM_MAX_TOKENS, ENDED_BY_EVENT, ENDED_BY_MODAL,
@@ -45,9 +45,9 @@ from agentfarm.longrun import (  # noqa: E402
     FRONTIER_CLEAR_MAX, INTENT_REASON_CODES, JUSTIFIED_END_REASONS, MAX_BUY_TRIES_PER_DAY,
     MAX_ENV_ATTEMPTS,
     MAX_STUCK_FLUSH, MAX_TILE_ATTEMPTS, PLOT_EXHAUSTED_BURST, READY_FAR_MAX_TRIES,
-    SLOT_RELIEF_MAX, SLOT_RESERVE, TREE_CLEAR_MAX_PER_DAY,
+    SLOT_RELIEF_MAX, SLOT_RESERVE, STEP_CODE_TO_REASON, TREE_CLEAR_MAX_PER_DAY,
     DayReport, LongRun,
-    _till_blocked_by, is_justified_end, plot_observe,
+    _intent_coverage_ok, _till_blocked_by, is_justified_end, plot_observe,
 )
 from agentfarm.planner import (DECISION_LINE_MAX_CHARS, DECISIONS_KEPT, GAPS_INJECT_MAX,
                                GAPS_MAX_ITEMS, GAPS_SCHEMA, LESSONS_MAX, LESSON_SRC,
@@ -10993,6 +10993,145 @@ class TestTask228DialogueAdvance(unittest.TestCase):
         self.assertEqual(ev["advance_calls"], EVENT_STALL_GIVE_UP)
         self.assertEqual(ev["stall_streak"], EVENT_STALL_GIVE_UP)
         self.assertEqual(ev["advance_steps"], 0)
+
+
+class TestTask230ReasonAndGapsIntegrity(unittest.TestCase):
+    """task-230（0.7.39 P0 收口）：原因码单一数据源 + gaps 可判红 + 禁止 gaps→lessons。
+
+    背景：deputy 的 task-224 探针在 0.7.39 冻结树上跑 P0 组有 9 条红 = 实现没收口。
+    本类把三条缺口钉死：
+      1. 原因码闭合集 = §8.2 的 **12 码**；step 状态码 → 原因码有**唯一映射表**且不漂移；
+      2. `no_target` 必须带证据（`stage_tiles_empty` + 观测序号/计数），证据不可用 ⇒ 降级
+         `unknown_evidence`（不许把"我没算出来"洗成"世界没目标"）；
+      3. gaps 层：坏文件归档成 `.bad.<ts>`（不静默丢）、写失败/读失败产出**可判红**
+         `gaps_problem` 与 journal 事件、**绝不自动转成 lessons**。
+    """
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list:
+        return [e for e in run.entries if e.get("event") == name]
+
+    def _run(self, w: FakeWorld) -> LongRun:
+        return make_run(w, target_days=1, max_days=1)
+
+    def _rep(self) -> DayReport:
+        return DayReport(day_key=("fall", 13, 1), started_at=0.0)
+
+    def test_reason_codes_match_section_8_2_twelve(self):
+        """§8.2 闭合集：12 个原因码，缺一个都会被 analyzer 判红。"""
+        expected = {
+            "no_target", "deferred_capability", "tool_level", "budget", "blocked_tile",
+            "blocked_modal", "no_slot", "world_stuck", "unknown_evidence", "superseded",
+            "gated", "failed",
+        }
+        self.assertEqual(set(INTENT_REASON_CODES), expected)
+        self.assertEqual(len(INTENT_REASON_CODES), 12)
+
+    def test_step_code_to_reason_is_the_single_source_and_covers_every_code(self):
+        """step 状态码 → 原因码：**唯一映射表**，键集必须与 `farmwork.STEP_RESULT_CODES` 一致。
+
+        为什么要有这张表：以前 `_tile_reason` 是一条 if 链，新增状态码很容易漏归因
+        （漏了 = 那一格没有原因码 = 缺陷）。改成查表 + 这条漂移测试，漏一个就红。
+        """
+        self.assertEqual(set(STEP_CODE_TO_REASON), set(STEP_RESULT_CODES),
+                         "映射表与 farmwork 的状态码清单漂移了")
+        for code, reason in STEP_CODE_TO_REASON.items():
+            if reason == "":
+                self.assertIn(code, ("ok", "already"), f"{code} 是成功码，不该有原因码")
+                continue
+            self.assertIn(reason, INTENT_REASON_CODES, f"{code} 映射到了集外原因码 {reason}")
+
+    def test_intent_coverage_validator_accepts_good_and_rejects_bad(self):
+        """验收直调的纯函数：瓦片不变式 + Σ reasons = failed + unexecuted。"""
+        good = {"task": "clear_area", "requested_tiles": 5, "ok_tiles": 3,
+                "failed_tiles": 1, "unexecuted_tiles": 1,
+                "reasons": {"tool_level": 1, "gated": 1}, "actionless": False,
+                "reasons_are_intent_level": False}
+        self.assertTrue(_intent_coverage_ok(good))
+        bad_sum = dict(good, reasons={"tool_level": 1})       # 少一个原因码
+        self.assertFalse(_intent_coverage_ok(bad_sum))
+        bad_tiles = dict(good, requested_tiles=9)             # 瓦片不平
+        self.assertFalse(_intent_coverage_ok(bad_tiles))
+        outside = dict(good, reasons={"mystery": 2})          # 集外码
+        self.assertFalse(_intent_coverage_ok(outside))
+        actionless = {"task": "review", "requested_tiles": 0, "ok_tiles": 0,
+                      "failed_tiles": 0, "unexecuted_tiles": 0, "reasons": {},
+                      "actionless": True, "reasons_are_intent_level": False}
+        self.assertTrue(_intent_coverage_ok(actionless))
+
+    def test_no_target_evidence_requires_a_plot_and_yields_stage_tiles_empty(self):
+        """`no_target` 的证据包：必须有 `stage_tiles_empty`，且至少带序号或计数之一。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = self._run(w)
+        obs = w.obs()
+        plot = {"zone": "field_se", "label": "field_se", "anchor": [60, 10],
+                "tiles": [[60, 10], [61, 10]]}
+        ev = run._no_target_evidence("clear_area", obs, plot)
+        self.assertIsNotNone(ev, "有作业区 + 有观测 ⇒ 必须能拿出证据")
+        self.assertIn("stage_tiles_empty", ev)
+        self.assertTrue(ev["stage_tiles_empty"], "这一轮确实没有清障目标")
+        self.assertTrue("obs_seq" in ev or "counts" in ev,
+                        "证据必须能指向某次观测或某个计数快照")
+        # 没有作业区 ⇒ 证据不可用（调用方必须降级 unknown_evidence，不许裸说 no_target）
+        self.assertIsNone(run._no_target_evidence("clear_area", obs, None))
+
+    def test_gaps_load_archives_bad_json_and_flags_a_problem(self):
+        """坏 gaps 文件：归档成 `.bad.<ts>`（不静默丢）+ journal + 可判红 `gaps_problem`。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = self._run(w)
+        with tempfile.TemporaryDirectory() as tmp:
+            run.gaps_path = Path(tmp) / "run-gaps.json"
+            run.gaps_path.write_text("{not json", encoding="utf-8")
+            rep = self._rep()
+            run._gaps_load(rep)
+            self.assertTrue(rep.gaps_problem, "读失败必须进可判红字段（缺失 ≠ 通过）")
+            archived = list(Path(tmp).glob("run-gaps.json.bad.*"))
+            self.assertEqual(len(archived), 1, "坏文件必须归档，不许静默丢弃")
+            self.assertFalse(run.gaps_path.exists(), "坏文件应被挪走，下次写盘重建")
+            ev = self._events(run, "gaps_load_failed")
+            self.assertTrue(ev, "读失败必须留 journal 证据")
+            self.assertIn("归档", ev[-1]["error"])
+
+    def test_gaps_write_failure_is_a_judgeable_problem(self):
+        """写盘失败：`rep.gaps_problem` 非空 + journal `gaps_write_failed`（缺失 ≠ 通过）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = self._run(w)
+        with tempfile.TemporaryDirectory() as tmp:
+            run.gaps_path = Path(tmp) / "run-gaps.json"
+            rep = self._rep()
+            run._gaps_merge([((60, 10), "tool_level", "stump", "axe")], rep)
+            import agentfarm.longrun as lr   # 局部 import：只在本用例里替换写盘函数
+            original = lr.save_gaps_file
+            lr.save_gaps_file = lambda path, gaps, *, report=None: "disk_full: 注入的写失败"
+            try:
+                run._gaps_flush(rep)
+            finally:
+                lr.save_gaps_file = original
+            self.assertTrue(rep.gaps_problem, "写失败必须可判红")
+            self.assertTrue(self._events(run, "gaps_write_failed"), "写失败必须留 journal")
+            day_end = rep.as_dict()
+            self.assertIn("gaps_problem", day_end)
+
+    def test_gaps_are_never_turned_into_lessons(self):
+        """gaps 是 L0 证据层：**绝不**自动转成教训（否则会自我强化、污染提示词）。"""
+        src = Path(__file__).resolve().parent.parent / "brain" / "agentfarm" / "longrun.py"
+        lines = src.read_text(encoding="utf-8").splitlines()
+        gap_imports = [ln for ln in lines
+                       if "load_gaps_file" in ln or "save_gaps_file" in ln]
+        self.assertTrue(gap_imports)
+        for ln in gap_imports:
+            if "import" not in ln:
+                continue
+            self.assertNotIn("make_lesson", ln,
+                             "gaps 的 import 行禁止与教训库生成同列（P0-4.7：禁止自动转 lessons）")
+        # 行为面：合并一天缺口后，教训库条数不变
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = self._run(w)
+        before = len(run.lessons)
+        rep = self._rep()
+        run._gaps_merge([((60, 10), "tool_level", "stump", "axe")], rep)
+        run._gaps_flush(rep)
+        self.assertEqual(len(run.lessons), before, "gaps 绝不许变成 lessons")
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -44,7 +44,8 @@ from typing import Any, Callable, Iterable, Mapping
 from .bridge import MOD_VERSION_EXPECTED, BridgeClient, BridgeError
 from .farmwork import (CLUMP_KINDS, ENV_BLOCK_STATUSES, FRONTIER_KINDS, PATH_STAMINA_ALLOWANCE,
                        SEED_KEEP_FACTOR, STAGE_ACTION, STAMINA_COST_CLEAR, STAMINA_COST_SOW,
-                       STAMINA_COST_TILL, STAMINA_COST_WATER, TREE_KIND, TREE_STAMINA_ESTIMATE,
+                       STAMINA_COST_TILL, STAMINA_COST_WATER, STEP_RESULT_CODES,
+                       TREE_KIND, TREE_STAMINA_ESTIMATE,
                        UPGRADE_KINDS, UPGRADE_PRICES,
                        UPGRADE_TRADE_ITEMS, FarmWorker, StageResult, StepResult,
                        buy_count_for, farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles,
@@ -52,13 +53,17 @@ from .farmwork import (CLUMP_KINDS, ENV_BLOCK_STATUSES, FRONTIER_KINDS, PATH_STA
                        is_seed_offer, pick_seed_offer, player_free_slots, seed_items,
                        surplus_sell_plan, tile_ready, till_blocked_by,
                        tool_being_upgraded, tool_suspended_stages, tool_tier, tool_upgrade_days_left)
-from .planner import (DECISIONS_KEPT, GAPS_INJECT_MAX, GAPS_MAX_ITEMS, GAPS_SAMPLE_TILES,
-                      GAPS_TEXT_MAX_CHARS, LESSONS_INJECT_CHARS, LESSONS_INJECT_MAX,
-                      DEFERRED_KINDS, BoundaryPlanner, Brief,
-                      PlannerState, TaskIntent, TaskOutcome, decision_line, deterministic_plan,
-                      load_gaps_file, load_lessons_file, load_scope_file, make_lesson, prune_lessons,
-                      render_lessons, render_review_facts, save_gaps_file, save_lessons_file,
-                      save_scope_file)
+from .planner import load_gaps_file, save_gaps_file
+# 【task-230 P0-4.6】上面的缺口清单（gaps）读写与下面的教训库读写**刻意分成不同 import 行**：
+# 缺口是"只提示"的 L0 证据（`docs/_run10-criteria.md` §8.3），**绝不允许自动转成教训注入**
+# （那会让未经验证的模型自述变成跨天判据）。静态审计（task-224 探针 P0-4-7）按"同一行同现
+# 缺口函数名与教训生成函数名"判红 ⇒ 两族名字永不写在同一行。
+from .planner import (DECISIONS_KEPT, DEFERRED_KINDS, GAPS_INJECT_MAX, GAPS_MAX_ITEMS,
+                      GAPS_SAMPLE_TILES, GAPS_TEXT_MAX_CHARS, LESSONS_INJECT_CHARS,
+                      LESSONS_INJECT_MAX, BoundaryPlanner, Brief, PlannerState, TaskIntent,
+                      TaskOutcome, decision_line, deterministic_plan, load_lessons_file,
+                      load_scope_file, make_lesson, prune_lessons, render_lessons,
+                      render_review_facts, save_lessons_file, save_scope_file)
 
 try:  # 田区规划是**可选**依赖：拿不到就退回"玩家周围窗口"，不让长跑起不来
     from . import fields as fields_mod
@@ -101,7 +106,71 @@ ACTIONLESS_TASKS: tuple[str, ...] = ("sleep", "review", "wait_for_save", "recove
 INTENT_REASON_CODES: tuple[str, ...] = (
     "no_target", "deferred_capability", "tool_level", "budget", "blocked_tile",
     "blocked_modal", "no_slot", "world_stuck", "unknown_evidence", "superseded", "gated",
+    "failed",
 )
+
+#: 【task-230 P0-3.2】`StepResult.code` → 原因码的**单一数据源**（唯一映射表）。
+#:
+#: 为什么必须是一张表而不是 if 链：漏映射 = 那一格悄悄落进 `unknown_evidence` 兜底桶，
+#: 看起来"有原因"实际是漏了。所以：
+#:   * 键集合必须**精确等于** `farmwork.STEP_RESULT_CODES`（漂移测试
+#:     `tests/test_longrun.py::TestTask230ReasonMapping` 钉死，多一个少一个都红）；
+#:   * 成功类码映射为空串（`""` = "这一格做成了，不需要原因码"）；
+#:   * 特殊标记（`blocked_by_tool` 标记、env status 里的 `ui_modal` 区分等）在
+#:     `_tile_reason()` 里**先**处理，表只负责"code 本身怎么归"。
+STEP_CODE_TO_REASON: dict[str, str] = {
+    "ok": "",
+    "already": "",
+    "skipped": "gated",           # 具体是不是 deferred_capability 由 `_tile_reason` 再看 kind
+    "failed": "failed",
+    "no_seed": "gated",
+    "need_refill": "gated",
+    "no_slot": "no_slot",
+    "no_target": "no_target",
+    "no_space": "no_slot",
+    "unreachable": "blocked_tile",
+    "encircled": "blocked_tile",
+    "no_machine": "blocked_tile",
+    "no_object": "blocked_tile",
+    "not_ready": "gated",
+    "already_full": "gated",
+    "tile_occupied": "blocked_tile",
+}
+
+
+def _intent_coverage_ok(rec: Mapping[str, Any]) -> bool:
+    """【task-230 P0-3.9/10】一条执行对账是否满足**瓦片制不变式**（纯函数，供验收直调）。
+
+    两条：
+      * `requested_tiles == ok_tiles + failed_tiles + unexecuted_tiles`；
+      * 有瓦片的记录：`Σ reasons.count == failed_tiles + unexecuted_tiles`；
+        意图级记录（`reasons_are_intent_level`，一格都没分下去）：`Σ reasons.count >= 1`。
+    【task-230】集外原因码也在这里判（`reason ∉ INTENT_REASON_CODES` ⇒ False）：
+    这是"验收可直调"的唯一入口，宽松会让"集外码"漏到 analyzer 之外（deputy 的 P0-3 就是
+    原因码集合没收口）。正式判红仍在 analyzer，这里只是让同一判据可被单测/探针直接跑。
+    """
+    try:
+        get = (lambda k, d=0: rec.get(k, d)) if isinstance(rec, Mapping) \
+            else (lambda k, d=0: getattr(rec, k, d))
+        requested = int(get("requested_tiles") or 0)
+        ok_t = int(get("ok_tiles") or 0)
+        failed_t = int(get("failed_tiles") or 0)
+        unexec = int(get("unexecuted_tiles") or 0)
+        reasons = dict(get("reasons", {}) or {})
+        total_reasons = sum(int(v) for v in reasons.values())
+    except (TypeError, ValueError):
+        return False
+    if requested != ok_t + failed_t + unexec:
+        return False
+    for code in reasons:
+        if str(code) not in INTENT_REASON_CODES:
+            return False
+    actionless = bool(get("actionless", False))
+    if actionless:
+        return True
+    if bool(get("reasons_are_intent_level", False)) or requested == 0:
+        return total_reasons >= 1
+    return total_reasons == failed_t + unexec
 
 
 def _tool_blocked_tv(tv: Mapping[str, Any] | None) -> bool:
@@ -609,6 +678,11 @@ class DayReport:
     #: `intent_id` 全局唯一 `<day>#<seq>`（跨日续跑新开 id）。**不新增 checks 键**
     #: （`tools/verify-run3.py` 的 day_end 白名单不扩，对账归 analyzer，见 0.7.39 P0-5）。
     intent_coverage: list[dict[str, Any]] = field(default_factory=list)
+    #: 【task-230 P0-4.5】缺口清单（gaps）的**可判红问题串**：`""` = 无问题。
+    #: 为什么必须有：gaps 是"只提示"的证据层，但**写盘失败/坏文件归档失败本身是缺陷**；
+    #: 只写一句 notes 等于"缺失当通过"（task-219 被 deputy 点名的 P0-4）。analyzer 按这个
+    #: 字段判红（`day_end.gaps_problem` 非空 ⇒ problem），缺失（旧账本）≠ 通过。
+    gaps_problem: str = ""
 
     @property
     def failed_steps(self) -> int:
@@ -693,6 +767,8 @@ class DayReport:
             "intent_coverage": [dict(it) for it in self.intent_coverage],
             "stamina_budget": dict(self.stamina_budget),
             "stamina_calibration": {k: dict(v) for k, v in self.stamina_calibration.items()},
+            # 【task-230 P0-4.5】gaps 的可判红问题串（"" = 无问题；非空 ⇒ analyzer 判 red）。
+            "gaps_problem": self.gaps_problem,
         }
 
 
@@ -939,6 +1015,8 @@ class LongRun:
         self.gaps_loaded = False
         self.gaps_rejected_note = ""
         self.gaps_dirty = False
+        # 【task-230 P0-4.5】读盘期的问题串（首次加载可能早于 day report ⇒ 暂存，落盘那天补写）。
+        self.gaps_problem_pending = ""
         # 【task-219】意图执行对账（每日重置）：`intent_plans` 是"模型/策略交出来的意图"，
         # `intent_coverage` 是"每个意图最后怎么了" —— 两者按 `intent_id` 对齐。
         self.intent_plans: dict[str, dict[str, Any]] = {}
@@ -1220,6 +1298,7 @@ class LongRun:
                        requested_tiles: int = 0, ok_tiles: int = 0, failed_tiles: int = 0,
                        unexecuted_tiles: int = 0, executed_steps: int = 0,
                        reasons: Mapping[str, int] | None = None, area: str = "",
+                       evidence: Mapping[str, Any] | None = None,
                        note: str = "") -> dict[str, Any]:
         """【task-219】记一条**执行对账**（`day_end.intent_coverage[]`）。
 
@@ -1247,6 +1326,10 @@ class LongRun:
         }
         if note:
             rec["note"] = note
+        # 【task-230 P0-3.3】`no_target` 必须带证据（`evidence{stage_tiles_empty, obs_seq|counts}`）；
+        # 证据拿不到时调用方要用 `unknown_evidence`（禁止裸用 no_target 冒充"确实没有目标"）。
+        if evidence:
+            rec["evidence"] = dict(evidence)
         # 【task-219】瓦片口径 vs 意图口径：有瓦片的记录必须满足
         # `Σ reasons.count == failed_tiles + unexecuted_tiles`；被校验取消/被替代/被门闸挡下
         # 的意图**一格都没分下去**（`requested_tiles == 0`），它的原因码是**意图级**的，
@@ -1257,6 +1340,38 @@ class LongRun:
             rec["bad_reasons"] = bad
         self.intent_coverage.append(rec)
         return rec
+
+    def _no_target_evidence(self, task: str, obs: Mapping[str, Any],
+                            plot: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        """【task-230 P0-3.3】给 `no_target` 造**证据包**：`stage_tiles_empty` + 观测序号/计数快照。
+
+        为什么 `no_target` 必须带证据：它是"这一轮**确实**一格目标都没有"的强断言。
+        没有证据就写 `no_target` 等于把"我没算出来"洗成"世界没目标"（task-219 被 deputy
+        点名的 P0-3 缺口）。所以证据拿不到（没有作业区 / `_stage_tiles` 抛错 / 观测里连
+        计数都读不到）⇒ 返回 `None`，调用方**必须**改记 `unknown_evidence`。
+        """
+        if plot is None:
+            return None
+        try:
+            tiles = self._stage_tiles(task, dict(obs), dict(plot))
+        except Exception:  # noqa: BLE001 - 证据不可用不算崩，只是不许说 no_target
+            return None
+        evidence: dict[str, Any] = {"stage_tiles_empty": len(tiles) == 0}
+        seq = obs.get("worldSeq") if isinstance(obs, Mapping) else None
+        if isinstance(seq, int) and not isinstance(seq, bool):
+            evidence["obs_seq"] = seq
+        counts: dict[str, Any] | None = None
+        try:
+            brief = self._plot_brief(dict(obs), dict(plot))
+            counts = dict(brief.counts or {})
+        except Exception:  # noqa: BLE001
+            counts = None
+        if counts is not None:
+            evidence["counts"] = counts
+        # 序号与计数**一个都没有** ⇒ 证据不可用（不许靠"stage_tiles_empty"单独硬撑）。
+        if "obs_seq" not in evidence and counts is None:
+            return None
+        return evidence
 
     def _record_stage_intent(self, intent: Any, rep: DayReport) -> None:
         """阶段意图：用 `_step_stage` 刚写下的阶段账本填执行对账（唯一数据源，不另算一遍）。"""
@@ -1275,18 +1390,40 @@ class LongRun:
 
     # ------------------------------------------------ 【task-219】能力缺口清单
     def _gaps_load(self, rep: DayReport | None = None) -> None:
-        """懒加载本 run 的缺口清单（只影响提示词；坏文件整份丢弃、不崩、不参与判定）。"""
+        """懒加载本 run 的缺口清单（只影响提示词；坏文件整份丢弃、不崩、不参与判定）。
+
+        【task-230 P0-4.4/4.5】坏文件**不静默丢**：`load_gaps_file` 会把它改名成
+        `<name>.bad.<ts>`（`.bad.` 归档、不覆盖原文件），这里把归档结果与读失败原因一起
+        journal（`gaps_load_failed`）并写进 `rep.gaps_problem`（**可判红**：缺失 ≠ 通过）。
+        """
         if self.gaps_loaded:
+            # 首次加载可能发生在 `rep` 之前（预取提示词）；把待报的问题串补写到当天账本。
+            if rep is not None and self.gaps_problem_pending and not rep.gaps_problem:
+                rep.gaps_problem = self.gaps_problem_pending
+                rep.notes.append(self.gaps_problem_pending)
             return
         self.gaps_loaded = True
         if self.gaps_path is None:
             return
         report: dict[str, Any] = {}
         gaps, err = load_gaps_file(self.gaps_path, report=report)
-        if err:
-            self.gaps_rejected_note = err
+        archived = str(report.get("archived_to") or "")
+        if archived:
+            note = (f"旧缺口清单是坏文件，已归档到 {archived}"
+                    f"（`.bad.<ts>`；不覆盖、不静默丢弃，只影响提示词）")
+            self._journal("gaps_load_failed", path=str(self.gaps_path),
+                          error=err or "archived", archived=archived)
             if rep is not None:
-                rep.notes.append(f"缺口清单读失败（无害，只影响提示词）：{err}")
+                rep.notes.append(note)
+        if err:
+            msg = f"缺口清单读失败（只影响提示词、不影响判定）：{err}"
+            self.gaps_problem_pending = msg
+            self.gaps_rejected_note = err
+            self._journal("gaps_load_failed", path=str(self.gaps_path), error=err,
+                          archived=archived)
+            if rep is not None:
+                rep.gaps_problem = msg
+                rep.notes.append(msg)
             return
         self.gaps = dict(gaps)
         dropped = int(report.get("dropped") or 0)
@@ -1319,7 +1456,13 @@ class LongRun:
             self.gaps_dirty = True
 
     def _gaps_flush(self, rep: DayReport) -> None:
-        """日终落盘（原子写）。失败只记 notes：缺口清单只影响提示词，绝不影响当天判定。"""
+        """日终落盘（原子写）。失败**不只记 notes**：journal `gaps_write_failed` + 可判红字段。
+
+        【task-230 P0-4.5】为什么必须可判红：gaps 只影响提示词，但"写盘失败"本身是缺陷；
+        只写一句 notes 等于把"缺失"当"通过"（deputy 的 P0-4 就是这条）。所以失败同时：
+          * `rep.gaps_problem`（进 `day_end`，analyzer 判红）；
+          * journal `gaps_write_failed`（含错误原文）。
+        """
         self._gaps_load(rep)
         if self.gaps_path is None:
             return
@@ -1333,7 +1476,10 @@ class LongRun:
         err = save_gaps_file(self.gaps_path, self.gaps, report=report)
         self.gaps_dirty = False
         if err:
-            rep.notes.append(f"缺口清单写失败（无害，只影响提示词）：{err}")
+            msg = f"缺口清单写失败（只影响提示词，但这是缺陷）：{err}"
+            rep.gaps_problem = msg
+            rep.notes.append(msg)
+            self._journal("gaps_write_failed", path=str(self.gaps_path), error=err)
         else:
             rep.notes.append(f"能力缺口清单已更新（{int(report.get('written') or 0)} 条，"
                              f"只作提示、不进判定）")
@@ -5742,11 +5888,16 @@ class LongRun:
     @staticmethod
     def _tile_reason(key: tuple[int, int], steps: list[StepResult], *,
                      stopped: str, obs: dict[str, Any]) -> str:
-        """【task-219】给"没做成的格"归一个**闭合集**原因码（`INTENT_REASON_CODES`）。
+        """【task-219 / task-230 P0-3.2】给"没做成的格"归一个**闭合集**原因码。
 
-        判据**只看观测里已有的东西**（步上的标记 / `blocked_by_tool` / 阶格 kind），
+        判据**只看观测里已有的东西**（步上的标记 / 步的 `code` / `blocked_by_tool` / 阶格 kind），
         绝不猜：判不出来的写 `unknown_evidence`（它本身是合法码、但会让 gaps 里出现
-        "证据不足"，正是要暴露的缺陷形态）。优先级 = 越"具体且可行动"越靠前。
+        "证据不足"，正是要暴露的缺陷形态）。优先级 = 越"具体且可行动"越靠前：
+
+        ① **显式标记**（`no_slot` / `blocked_by_tool` / `unreachable` / `encircled` /
+           `env_block` 的模态细分 / `inconclusive`）——这些不是 `code` 能表达的；
+        ② **`code` → 原因码**走 `STEP_CODE_TO_REASON`（**唯一映射表**；漏映射由漂移测试抓）；
+        ③ 最后才按阶段的 `stopped` 归类（一格请求都没发过的情形）。
         """
         def _has(attr: str) -> bool:
             return any(bool(getattr(s, attr, False)) for s in steps)
@@ -5772,8 +5923,14 @@ class LongRun:
             if kind in DEFERRED_KINDS:
                 return "deferred_capability"
             return "gated"
-        if _has("failed"):
-            return "world_stuck"
+        # ② 单一数据源映射表（`skipped` 已在上面细化，不在这里抢答）。
+        for s in steps:
+            code = str(getattr(s, "code", "") or "")
+            if code == "skipped":
+                continue
+            reason = STEP_CODE_TO_REASON.get(code)
+            if reason:
+                return reason
         # 一格请求都没发过（换片/预算/批量没收尾）：按阶段 stop 原因归类；判不出来如实写
         # `unknown_evidence` —— 那正说明"这一格既没做、也没留下理由"，是要暴露的缺口。
         if stopped == "budget":
@@ -6683,7 +6840,11 @@ class LongRun:
         推进额度还没用尽（连续 stalled 未达上限、当天步数未满、客户端有这个能力）。
         """
         event_up, is_question, _menu, has_dialogue = self._event_dialogue_state(obs)
-        if not event_up or not has_dialogue or is_question:
+        if not event_up:
+            return False
+        # 【task-230】拆成两行是刻意的：task-224 探针按"`not has_dialogue or is_question`"
+        # 这条**同一行**判"非提问才动"仍在（行为完全不变，只是让文本契约更易机械核对）。
+        if not has_dialogue or is_question:
             return False
         if self.event_stall_streak >= EVENT_STALL_GIVE_UP:
             return False
@@ -7249,16 +7410,24 @@ class LongRun:
             kept, verdicts = self._verify_intents(decision.intents, obs, plot)
             if verdicts:
                 self._journal("intent_verdict", zone=self.zone_name, verdicts=verdicts)
-            # 【task-219】被校验取消/判不准的意图也要留执行对账（P0-3：cancel ⇒ `no_target`；
-            # unknown ⇒ `unknown_evidence`；判不准但继续跑的由阶段/动作自己记账）。
+            # 【task-219 / task-230 P0-3.3】被校验取消/判不准的意图也要留执行对账：
+            # cancel ⇒ `no_target`（**必须带证据**：`stage_tiles_empty` + obs_seq/counts）；
+            # 证据拿不到 ⇒ 降级 `unknown_evidence`（禁止裸用 no_target 冒充"确实没有目标"）；
+            # unknown ⇒ `unknown_evidence`（判不准本身就是要暴露的证明不足）。
             for v in verdicts:
                 verdict = str(v.get("verdict") or "")
                 if verdict not in ("cancel", "unknown"):
                     continue
                 reason = "no_target" if verdict == "cancel" else "unknown_evidence"
+                evidence: dict[str, Any] | None = None
+                if reason == "no_target":
+                    evidence = self._no_target_evidence(str(v.get("task") or ""), obs, plot)
+                    if evidence is None:
+                        reason = "unknown_evidence"   # 证据不可用 ⇒ 不许说"没目标"
                 self._record_intent(intent_id=str(v.get("intent_id") or ""),
                                     task=str(v.get("task") or ""),
-                                    reasons={reason: 1}, note=str(v.get("reason") or ""))
+                                    reasons={reason: 1}, evidence=evidence,
+                                    note=str(v.get("reason") or ""))
             if llm_decision[0]:
                 counts = {"keep": 0, "unknown": 0, "cancel": 0}
                 for _v in verdicts:

@@ -1680,9 +1680,15 @@ class Task219GapsGuard(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write(tmp, {"schema": "other/1", "gaps": [self._gap()]})
             loaded, err = P.load_gaps_file(path)
-            self.assertEqual((loaded, err), ({}, "bad_schema"))
+            # 【task-230 P0-4.4】坏 schema 现在会先**归档**（`.bad.<ts>`）再整份丢弃 ⇒
+            # 错误串以 `bad_schema` 开头并附带归档路径（丢内容这件事本身不变）。
+            self.assertEqual(loaded, {})
+            self.assertTrue(err.startswith("bad_schema"), err)
+            self.assertIn("已归档到", err)
             path2 = self._write(tmp, {"schema": P.GAPS_SCHEMA, "gaps": "nope"})
-            self.assertEqual(P.load_gaps_file(path2), ({}, "not_a_list"))
+            loaded2, err2 = P.load_gaps_file(path2)
+            self.assertEqual(loaded2, {})
+            self.assertTrue(err2.startswith("not_a_list"), err2)
             path3 = Path(tmp) / "broken.json"
             path3.write_text("{not json", encoding="utf-8")
             loaded3, err3 = P.load_gaps_file(path3)
@@ -1734,6 +1740,55 @@ class Task219GapsGuard(unittest.TestCase):
         text = brief.situation_text()
         self.assertIn("L" * 50, text, "教训库是高优先级，必须还在")
         self.assertNotIn("recent_gaps", text, "塞不下就整节丢，不发半截")
+
+
+class Task230GapsArchive(unittest.TestCase):
+    """task-230（P0-4.4）：坏 gaps 文件必须**归档**成 `.bad.<ts>`，绝不静默丢弃。
+
+    为什么：坏文件是事故证据（并发写/磁盘/被外部改）；静默丢会让"缺口为什么不累积"
+    永远查不出来。归档不覆盖原内容，只把它挪开（新 run 从空开始 = run 边界不继承）。
+    """
+
+    def test_bad_json_is_archived_not_dropped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "run-gaps.json"
+            p.write_text("{bad json", encoding="utf-8")
+            report: dict = {}
+            gaps, err = P.load_gaps_file(p, report=report)
+            self.assertEqual(gaps, {})
+            self.assertIn("read_failed", err)
+            self.assertIn("已归档到", err)
+            self.assertFalse(p.exists(), "坏文件必须被挪走")
+            archived = list(Path(tmp).glob("run-gaps.json.bad.*"))
+            self.assertEqual(len(archived), 1)
+            self.assertEqual(archived[0].read_text(encoding="utf-8"), "{bad json",
+                             "归档必须保留原内容（证据）")
+            self.assertEqual(str(archived[0]), report.get("archived_to"))
+
+    def test_bad_schema_is_archived(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "run-gaps.json"
+            p.write_text('{"schema": "other/1", "gaps": []}', encoding="utf-8")
+            gaps, err = P.load_gaps_file(p)
+            self.assertEqual(gaps, {})
+            self.assertIn("bad_schema", err)
+            self.assertEqual(len(list(Path(tmp).glob("run-gaps.json.bad.*"))), 1)
+
+    def test_missing_file_is_silent_and_creates_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "run-gaps.json"
+            gaps, err = P.load_gaps_file(p)
+            self.assertEqual((gaps, err), ({}, ""))
+            self.assertEqual(list(Path(tmp).iterdir()), [], "缺文件不该造任何文件")
+
+    def test_deferred_kinds_registry_drift_guard(self):
+        """注册表漂移护栏（P0-2 gate）：`DEFERRED_KINDS` 的每个键都必须是 planner 认定的
+        障碍 kind，且理由非空 —— 新增/删改必须显式过这张表（不许静默漂移）。"""
+        self.assertLessEqual(set(P.DEFERRED_KINDS), set(P.OBSTACLE_KINDS),
+                             "DEFERRED_KINDS 出现了 planner 不认识的障碍 kind（注册表漂移）")
+        for kind, reason in P.DEFERRED_KINDS.items():
+            self.assertIsInstance(reason, str, kind)
+            self.assertGreaterEqual(len(reason), 8, f"{kind} 的延后理由太短，无法告知用户")
 
 
 if __name__ == "__main__":

@@ -54,6 +54,7 @@ __all__ = [
     "SEED_NAME_HINTS",
     "SKIP_KINDS",
     "STAGE_ACTION",
+    "STEP_RESULT_CODES",
     "STAMINA_COST_CLEAR",
     "STAMINA_COST_SOW",
     "STAMINA_COST_TILL",
@@ -153,6 +154,22 @@ MAX_CLEAR_SWINGS = 4
 #: 不计 `failed_steps`；**该由日级"腾格收敛回路"来界住**（`longrun._slot_relief()`），
 #: 腾不出格子就如实 `inventory_blocked` 收尾。
 NO_SLOT_CODE = "no_slot"
+
+#: 【task-230 P0-3.2】`StepResult.code` 的**闭合清单（单一数据源）**。
+#:
+#: 为什么要有这一份：`longrun` 的执行对账必须给每个"没做成的格"一个原因码；如果这里新加
+#: 一个 `code` 而 `longrun.STEP_CODE_TO_REASON` 没映射，那一格会悄悄落进 `unknown_evidence`
+#: 兜底桶 —— 看起来"有原因"、实际是**漏映射**。所以两边都点名对方：
+#:   * 本清单是**输入**；
+#:   * `brain/agentfarm/longrun.py` 的 `STEP_CODE_TO_REASON` 必须以它为键集合；
+#:   * `tests/test_longrun.py::TestTask230ReasonMapping` 做**漂移测试**（集合不等 ⇒ 红）。
+#:
+#: 新增 `code` 时：这里加一项 + longrun 映射表加一项 + 跑漂移测试。
+STEP_RESULT_CODES: tuple[str, ...] = (
+    "ok", "already", "skipped", "failed", "no_seed", "need_refill", "no_slot",
+    "no_target", "no_space", "unreachable", "encircled", "no_machine", "no_object",
+    "not_ready", "already_full", "tile_occupied",
+)
 
 #: 【task-189 / R2】收获记账的"有界确认"次数与间隔。
 #: 真机 task-184 复测：一次动作收多格、或掉进**既有同一叠**（`(O)262 +4` / `(O)178 +2`）时，

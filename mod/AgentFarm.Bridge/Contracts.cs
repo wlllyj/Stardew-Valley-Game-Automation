@@ -930,6 +930,16 @@ namespace AgentFarm.Bridge
         [JsonPropertyName("clumpsTotal")] public int ClumpsTotal { get; set; }
 
         /// <summary>
+        /// 【task-230 P0-1b】`ResourceClump` 的**聚合总数**（与 <see cref="ClumpsTotal"/> 同源同值）。
+        ///
+        /// 为什么还要这一份：`docs\_run10-criteria.md` 与验收探针按
+        /// `weeds/stones/twigs/trees/clumps` 这五个名字读"农场级障碍计数"，而 `clumpsTotal`
+        /// 是 task-155 留下的旧名。两者**同一次扫描、同一个 `scanSeq`、同一个值**，不是两套口径；
+        /// `clumpsTotal` 保留给旧账本对账，新代码读 <see cref="Clumps"/>。
+        /// </summary>
+        [JsonPropertyName("clumps")] public int Clumps { get; set; }
+
+        /// <summary>
         /// **显式"未归类"**：`ResourceClump` 存在但 `parentSheetIndex` 读不到或不在已知表里。
         /// 绝不静默并进 <see cref="Stones"/> —— 这就是 task-151/156 要的那 2 个残差。
         /// </summary>

@@ -390,6 +390,9 @@ namespace AgentFarm.Bridge
                 try { index = clump.parentSheetIndex.Value; } catch { }
 
                 _acc.ClumpsTotal++;
+                // 【task-230 P0-1b】聚合别名同源同值（`clumps` 是验收/判据读的名字，
+                // `clumpsTotal` 是 task-155 的旧名）：同一次扫描、同一个 scanSeq，不存在第二套口径。
+                _acc.Clumps = _acc.ClumpsTotal;
                 switch (ClumpMeta.KindOf(index))
                 {
                     case "stump":
