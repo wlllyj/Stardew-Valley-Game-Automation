@@ -33,6 +33,8 @@ RUN1 = os.path.join(ROOT, "logs", "longrun-3day-llm-run1.jsonl")
 RUN2 = os.path.join(ROOT, "logs", "longrun-3day-llm-run2.jsonl")
 RUN5 = os.path.join(ROOT, "logs", "longrun-3day-llm-run5.jsonl")
 RUN_A8 = os.path.join(ROOT, "logs", "longrun-runA8-0743.jsonl")
+#: task-24：0.7.44 首个真机冒烟账本（无 0.7.45 字段 ⇒ 新聚合只能【无法判定】）。
+SMOKE_0744 = os.path.join(ROOT, "logs", "longrun-smoke-0744.jsonl")
 GREEN = os.path.join(ROOT, "scratch", "_ledger_green.jsonl")
 FALLBACK = os.path.join(ROOT, "scratch", "_ledger_fallback.jsonl")
 WASH = os.path.join(ROOT, "scratch", "_ledger_leftover_verified.jsonl")
@@ -5861,6 +5863,268 @@ class TestTask17Probes(unittest.TestCase):
         self.assertEqual(len(gc["undecidable_days"]), 12,
                          "12 天全缺字段 ⇒ 逐天【无法判定】，不许压成 0 天")
         self.assertIn("【无法判定】", mod.render_text(rep, 20))
+
+
+# ---------------------------------------------------------------- task-24（0.7.45 新字段/形态）
+#: 0.7.45 的 pending 七口径（`day_end.pending_*`，信息项）。
+T24_PENDING = {
+    "pending_ledger": 265, "pending_guard": 263, "pending_stalled": 261,
+    "pending_executable": 260, "pending_blocked": 2, "pending_unobserved": 2,
+    "pending_malformed": 1,
+}
+
+
+def t24_ledger(**kw):
+    """task-24：造一天带 0.7.45 字段的账本（默认 checks.day_justified=false）。"""
+    kw.setdefault("day_end_overrides", {})
+    return t13_ledger(**kw)
+
+
+class TestPendingCaliber(unittest.TestCase):
+    """task-24 ①：pending 七口径并排 + 两条不变式（**只 info /【无法判定】、不进 rc**）。
+
+    口径：`day_justified` 只认 `pending_executable`（brain `is_justified_end`）；
+    其余六列只作证据。不变式违背只 ⚠ 计数，不改判。
+    """
+
+    def _report(self, events, name="pc.jsonl"):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=1)
+
+    def test_found_seven_columns_and_invariants_hold(self):
+        end = dict(T24_PENDING, checks=t17_checks(day_justified=False))
+        rep = self._report(t24_ledger(day_end_overrides=end))
+        pc = rep["pending_caliber"]
+        self.assertEqual((pc["state"], pc["days_count"]), ("found", 1))
+        self.assertEqual(pc["max"]["ledger"], 265)
+        self.assertEqual((pc["violations_ledger"], pc["violations_guard"]), (0, 0),
+                         "ledger==guard+blocked 且 guard==exec+unobs+malformed 都必须成立")
+        d = pc["days"][0]
+        self.assertEqual((d["ledger"], d["guard"], d["blocked"]), (265, 263, 2))
+        self.assertEqual((d["stalled"], d["executable"], d["malformed"]), (261, 260, 1))
+        text = mod.render_text(rep, 50)
+        self.assertIn("pending 七口径（0.7.45）: 1 天", text)
+        self.assertIn("day_justified 只认 pending_executable", text)
+        self.assertFalse([s for s in rep["red"]["subjects"] if "pending" in s],
+                         "七口径只作证据，绝不进 rc")
+
+    def test_ledger_invariant_violation_flagged_not_red(self):
+        end = dict(T24_PENDING, pending_guard=250, pending_ledger=263,
+                   pending_executable=250, pending_unobserved=0, pending_malformed=0,
+                   checks=t17_checks(day_justified=False))
+        rep = self._report(t24_ledger(day_end_overrides=end))
+        pc = rep["pending_caliber"]
+        self.assertEqual(pc["violations_ledger"], 1, "263 != 250+2 ⇒ ledger 不变式违背")
+        self.assertEqual(pc["violations_guard"], 0)
+        self.assertIn("⚠ 不变式违背 ledger!=guard+blocked", mod.render_text(rep, 50))
+        self.assertFalse([s for s in rep["red"]["subjects"] if "pending" in s])
+
+    def test_guard_invariant_violation_flagged(self):
+        end = dict(T24_PENDING, pending_guard=263, pending_executable=10,
+                   pending_unobserved=0, pending_malformed=0,
+                   checks=t17_checks(day_justified=True))
+        rep = self._report(t24_ledger(day_end_overrides=end))
+        pc = rep["pending_caliber"]
+        self.assertEqual(pc["violations_guard"], 1, "263 != 10+0+0 ⇒ guard 不变式违背")
+        self.assertIn("⚠ guard!=exec+unobs+malformed", mod.render_text(rep, 50))
+
+    def test_executable_none_is_observation_unavailable_not_zero(self):
+        end = dict(T24_PENDING, pending_guard=0, pending_ledger=0, pending_stalled=0,
+                   pending_executable=None, pending_blocked=0, pending_unobserved=0,
+                   pending_malformed=0, checks=t17_checks(day_justified=True))
+        rep = self._report(t24_ledger(day_end_overrides=end))
+        d = rep["pending_caliber"]["days"][0]
+        self.assertIsNone(d["executable"], "观测不可用时 executable=None，绝不猜 0")
+        self.assertTrue(d["guard_ok"], "文档口径：unobserved==0 且 malformed==0 ⇒ 不变式成立")
+        self.assertIn("可执行 None", mod.render_text(rep, 50))
+
+    def test_missing_fields_undecidable(self):
+        rep = self._report(t13_ledger(), "missing.jsonl")
+        pc = rep["pending_caliber"]
+        self.assertEqual(pc["state"], "undecidable")
+        self.assertEqual(pc["days_count"], 0, "缺字段不得当成 0 天命中")
+        self.assertEqual(len(pc["undecidable_days"]), 1)
+        text = mod.render_text(rep, 50)
+        self.assertIn("pending 七口径（0.7.45）: <缺失>", text)
+        self.assertIn("缺失 ≠ 0", text)
+
+
+class TestJustifiedEvidence(unittest.TestCase):
+    """task-24 ②：`day_justified` 与 exec/malformed 联合读数（只点名、不改判）。"""
+
+    def _report(self, events, name="je.jsonl"):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=1)
+
+    def test_suspicious_unjustified_when_no_work(self):
+        end = dict(T24_PENDING, pending_ledger=2, pending_guard=0, pending_stalled=0,
+                   pending_executable=0, pending_blocked=2, pending_unobserved=0,
+                   pending_malformed=0, checks=t17_checks(day_justified=False))
+        rep = self._report(t24_ledger(day_end_overrides=end))
+        je = rep["justified_evidence"]
+        self.assertEqual((je["suspicious_unjustified_no_work"], je["days_count"]), (1, 1))
+        self.assertEqual(je["suspicious_days"], ["1年 spring 12日"])
+        text = mod.render_text(rep, 50)
+        self.assertIn("justified 证据（day_justified × exec/malformed，0.7.45）: 1 天可判", text)
+        self.assertIn("人工核对证据链", text)
+        base = self._report(t24_ledger(day_end_overrides={
+            "checks": t17_checks(day_justified=False)}), "base.jsonl")
+        self.assertEqual(rep["red"]["subjects"], base["red"]["subjects"],
+                         "新聚合只 info：红清单必须与不带字段的对照本完全一致")
+
+    def test_suspicious_justified_with_executable_work(self):
+        end = dict(T24_PENDING, pending_ledger=15, pending_guard=13, pending_stalled=0,
+                   pending_executable=3, pending_blocked=2, pending_unobserved=9,
+                   pending_malformed=1, checks=t17_checks(day_justified=True))
+        rep = self._report(t24_ledger(day_end_overrides=end))
+        je = rep["justified_evidence"]
+        self.assertEqual((je["suspicious_justified_with_work"], je["days_count"]), (1, 1))
+        self.assertIn("true 却 exec>0或None 1 天", mod.render_text(rep, 50))
+
+    def test_coherent_day_not_suspicious(self):
+        end = dict(T24_PENDING, pending_guard=0, pending_ledger=0, pending_stalled=0,
+                   pending_executable=0, pending_blocked=0, pending_unobserved=0,
+                   pending_malformed=0, checks=t17_checks(day_justified=True))
+        rep = self._report(t24_ledger(day_end_overrides=end))
+        je = rep["justified_evidence"]
+        self.assertEqual((je["suspicious_unjustified_no_work"],
+                          je["suspicious_justified_with_work"]), (0, 0))
+        self.assertEqual(je["suspicious_days"], [])
+
+    def test_missing_executable_undecidable(self):
+        rep = self._report(t13_ledger(), "missing.jsonl")
+        je = rep["justified_evidence"]
+        self.assertEqual((je["state"], je["days_count"]), ("undecidable", 0))
+        self.assertEqual(len(je["undecidable_days"]), 1)
+        self.assertIn("【无法判定】", mod.render_text(rep, 50))
+
+
+class TestBagPressure(unittest.TestCase):
+    """task-24 ③：背包压力留痕（空格读数 + 掉落被拒收 + 压力通道），只 info、不算失败。"""
+
+    def _report(self, events, name="bp.jsonl"):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=1)
+
+    def _pressure(self, **kw):
+        ev = {"event": "slot_relief", "t": 9.0, "day": MODAL_DAY, "pressure": True,
+              "need": 0, "freed": 0, "trigger": "none",
+              "demand_basis": "space_pressure", "target_slots": 1}
+        ev.update(kw)
+        return ev
+
+    def test_found_free_slots_and_loot(self):
+        end = dict(checks=t17_checks(day_justified=False), free_slots_start=3,
+                   free_slots_last=0, free_slots_min=0, free_slots_status="ok",
+                   loot_lost_steps=2, loot_lost_tiles=[[12, 17], [38, 36]],
+                   loot_lost_items=["Clay", "Stone"])
+        ev = t24_ledger(day_end_overrides=end,
+                        extra_events=[self._pressure(), self._pressure(need=0)])
+        rep = self._report(ev)
+        bp = rep["bag_pressure"]
+        self.assertEqual(bp["state"], "found")
+        self.assertEqual(bp["free_slots_min_overall"], 0)
+        self.assertEqual(bp["days_free_slots_zero"], ["1年 spring 12日"])
+        self.assertEqual((bp["loot_lost_steps_total"],
+                          bp["loot_lost_tiles_count"]), (2, 2))
+        self.assertEqual(bp["pressure_events"], 2)
+        self.assertEqual(bp["demand_basis"], {"space_pressure": 2})
+        text = mod.render_text(rep, 50)
+        self.assertIn("背包压力/留痕（0.7.45）: 最低空格 0", text)
+        self.assertIn("压力通道 2 次", text)
+        self.assertIn("不是失败", text)
+        self.assertFalse([s for s in rep["red"]["subjects"] if "背包" in s or "slot" in s])
+
+    def test_unavailable_status_never_treated_as_zero(self):
+        end = dict(checks=t17_checks(day_justified=False), free_slots_status="unavailable")
+        rep = self._report(t24_ledger(day_end_overrides=end), "unavail.jsonl")
+        bp = rep["bag_pressure"]
+        self.assertEqual(bp["state"], "zero", "字段在场但无信号 ⇒ 0 是真实读数")
+        self.assertEqual(bp["unavailable_days"], ["1年 spring 12日"])
+        self.assertIn("status=unavailable", mod.render_text(rep, 50))
+
+    def test_missing_fields_undecidable(self):
+        rep = self._report(t13_ledger(), "missing.jsonl")
+        bp = rep["bag_pressure"]
+        self.assertEqual((bp["state"], bp["days_count"]), ("undecidable", 0))
+        self.assertEqual(len(bp["undecidable_days"]), 1)
+        text = mod.render_text(rep, 50)
+        self.assertIn("背包压力/留痕（0.7.45）: <缺失>", text)
+        self.assertIn("绝不猜", text)
+
+
+class TestMidwayMasking(unittest.TestCase):
+    """task-24 ④：`stage_midway_leftover` 中途遮蔽（只 info，不改日级公式）。"""
+
+    def _report(self, events, name="mm.jsonl"):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=1)
+
+    def test_found_records(self):
+        end = dict(checks=t17_checks(day_justified=False),
+                   stage_midway_leftover=[{"stage": "clear_area", "round": 39, "leftover": 2},
+                                          {"stage": "till_area", "round": 12, "leftover": 1}])
+        rep = self._report(t24_ledger(day_end_overrides=end,
+                                      extra_events=[{"event": "stage_midway_leftover",
+                                                     "t": 389.0, "day": MODAL_DAY,
+                                                     "stage": "clear_area", "round": 39,
+                                                     "leftover": 2}]))
+        mm = rep["midway_masking"]
+        self.assertEqual((mm["state"], mm["records_total"]), ("found", 2))
+        self.assertEqual((mm["max_round"], mm["max_leftover"]), (39, 2))
+        self.assertEqual(mm["days_with_records"], ["1年 spring 12日"])
+        text = mod.render_text(rep, 50)
+        self.assertIn("中途遮蔽（stage_midway_leftover，0.7.45）: 2 条", text)
+        self.assertFalse([s for s in rep["red"]["subjects"] if "midway" in s])
+
+    def test_empty_list_is_zero_not_undecidable(self):
+        rep = self._report(t24_ledger(day_end_overrides={
+            "checks": t17_checks(day_justified=True), "stage_midway_leftover": []}), "zero.jsonl")
+        self.assertEqual(rep["midway_masking"]["state"], "zero",
+                         "字段在场且没有记录 ⇒ 0 是真实读数")
+        self.assertIn("0 条（字段在场", mod.render_text(rep, 50))
+
+    def test_missing_field_undecidable(self):
+        rep = self._report(t13_ledger(), "missing.jsonl")
+        mm = rep["midway_masking"]
+        self.assertEqual((mm["state"], mm["days_count"]), ("undecidable", 0))
+        self.assertIn("【无法判定】", mod.render_text(rep, 50))
+
+
+class TestTask24ProbesAndRealLedgers(unittest.TestCase):
+    """task-24：新探针必须在 `FIELD_PROBES`；旧真账本只能【无法判定】，绝不当 0。"""
+
+    def test_probes_registered(self):
+        probes = [p[1] for p in mod.FIELD_PROBES]
+        for probe in ("day_end.pending_ledger", "day_end.pending_guard",
+                      "day_end.pending_stalled", "day_end.pending_executable",
+                      "day_end.pending_blocked", "day_end.pending_unobserved",
+                      "day_end.pending_malformed", "day_end.stage_midway_leftover",
+                      "day_end.free_slots_min", "day_end.free_slots_status",
+                      "day_end.loot_lost_steps", "day_end.loot_lost_tiles",
+                      "day_end.loot_lost_items", "slot_relief.pressure",
+                      "slot_relief.demand_basis"):
+            self.assertIn(probe, probes)
+
+    def test_a8_new_aggregates_undecidable(self):
+        rep = report_for(RUN_A8, days=3)
+        for key in ("pending_caliber", "justified_evidence", "bag_pressure",
+                    "midway_masking"):
+            self.assertEqual(rep[key]["state"], "undecidable",
+                             f"A8（0.7.43）没有 0.7.45 字段 ⇒ {key} 只能【无法判定】")
+        self.assertEqual(len(rep["pending_caliber"]["undecidable_days"]), 12)
+
+    def test_smoke_0744_new_aggregates_undecidable(self):
+        rep = report_for(SMOKE_0744, days=2)
+        for key in ("pending_caliber", "justified_evidence", "bag_pressure",
+                    "midway_masking"):
+            self.assertEqual(rep[key]["state"], "undecidable",
+                             f"smoke-0744（0.7.44）没有 0.7.45 字段 ⇒ {key} 只能【无法判定】")
+        self.assertEqual(rep["red"]["total"], 33, "smoke-0744 的 33 红必须一字不变")
 
 
 if __name__ == "__main__":

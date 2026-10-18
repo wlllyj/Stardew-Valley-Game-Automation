@@ -56,6 +56,20 @@
       已标记停滞(`stalled_total`)、残余、中间轮余格 max、观测截断 `plot` 次数(`plots[].tiles` 上限)；
       缺任一字段 ⇒【无法判定】，缺失 ≠ 0。（建议侧另给 task-15 的可选修法，仍是 info、不进 rc。）
       另：`stage_midway_leftover` / `plots_capped` / `stage_no_target` 也作为证据行进本聚合。
+【task-24】（0.7.45 新字段/形态，2026-10-18）四类聚合，**默认 info /【无法判定】、不进 rc**：
+      ① `pending_caliber` = 日终「还有活」**七口径并排**：`day_end.pending_ledger/guard/stalled/
+      executable/blocked/unobserved/malformed` + 两种不变式违背计数（ledger==guard+blocked、
+      guard==executable+unobserved+malformed；观测不可用时 executable=None、按 unobserved==0 &
+      malformed==0 校）；`day_justified` 只认 `pending_executable`，其余六列只作证据；
+      ② `justified_evidence` = `checks.day_justified` × `pending_executable` × `pending_malformed`
+      联合读数 + 两种**只点名不改判**的可疑形态（false 且 exec=0 且 malformed=0；true 却 exec>0/None）；
+      ③ `bag_pressure` = 背包压力留痕：`free_slots_start/last/min/status`（status=unavailable ⇒
+      【无法判定】、绝不猜 0）+ `loot_lost_steps/tiles/items`（清障做成但掉落被游戏拒收，只留痕）
+      + 复用事件名 `slot_relief` 的**压力通道**（pressure=true / need=0 / freed=0 / trigger=none /
+      demand_basis=space_pressure）；
+      ④ `midway_masking` = `day_end.stage_midway_leftover` 逐轮留痕（更早轮 leftover>0、最后一轮同种类
+      归零 ⇒ 日级「最后一轮」口径会低估；只 info，不改 no_unmet_stages/plot_pending 公式）。
+      另：`pending_executable=None`（观测不可用）与字段缺失**分开**报（前者仍可判不变式，后者【无法判定】）。
 外加：每天一行摘要、3-9 条带证据行的改进建议、"本账本无法判定"清单。
 
 与 `tools\\verify-run3.py` 的关系：两者**独立读数、交叉核对**。本工具只做分析、不判验收；
@@ -842,6 +856,45 @@ FIELD_PROBES = [
     ("day_end.plot_pending", "day_end.plot_pending",
      "日终片区余格数（task-134 B：每阶段种类最后一条 leftover 之和；与守卫 `_pending_work()` 是"
      "**两个口径**，日级 0 不能证明守卫 0；缺失 ⇒【无法判定】）"),
+    # task-24（0.7.45）：pending 七口径 / 背包留痕 / 中途遮蔽 / 压力通道 —— 全 info /【无法判定】。
+    ("day_end.pending_ledger", "day_end.pending_ledger",
+     "日终**原始账本**口径余格（0.7.45；不变式 ledger == guard + blocked；缺失 ⇒【无法判定】）"),
+    ("day_end.pending_guard", "day_end.pending_guard",
+     "守卫口径 `_pending_work()` 日终读数（0.7.45；0.7.44 冒烟 263/217 的原文数字；缺失 ⇒【无法判定】）"),
+    ("day_end.pending_stalled", "day_end.pending_stalled",
+     "守卫口径里被标成「回去看过、拿不出目标」或被围住的格数（0.7.45；缺失 ⇒【无法判定】）"),
+    ("day_end.pending_executable", "day_end.pending_executable",
+     "最后一张户外观测里**看得见+要做+允许+站得到**的格数（0.7.45；None=观测不可用；"
+     "`day_justified` 只认它为 0；缺失 ⇒【无法判定】）"),
+    ("day_end.pending_blocked", "day_end.pending_blocked",
+     "账本里今天**已判死**的格数（blocked ∪ encircled ∪ 停滞；缺失 ⇒【无法判定】）"),
+    ("day_end.pending_unobserved", "day_end.pending_unobserved",
+     "其余（不在 tiles[]/截断/陈旧/预算延后/工具不够/背包堵/无法判定；缺失 ⇒【无法判定】）"),
+    ("day_end.pending_malformed", "day_end.pending_malformed",
+     "`tiles[]` 里只有坐标、缺 kind/crop 的**残缺记录**数（0.7.45；>0 ⇒ day_justified 必 false；"
+     "缺失 ⇒【无法判定】）"),
+    ("day_end.stage_midway_leftover", "day_end.stage_midway_leftover",
+     "当天「更早轮 leftover>0、最后一轮同种类归零」的逐轮留痕（0.7.45；缺失 ⇒【无法判定】是否遮蔽）"),
+    ("day_end.free_slots_start", "day_end.free_slots_start",
+     "当天第一张**可用**背包空格读数（0.7.45；口径=容量−非空行数；缺失 ⇒【无法判定】）"),
+    ("day_end.free_slots_last", "day_end.free_slots_last",
+     "当天最后一张可用背包空格读数（0.7.45；缺失 ⇒【无法判定】）"),
+    ("day_end.free_slots_min", "day_end.free_slots_min",
+     "当天最低背包空格读数（0.7.45；0 = 背包满；缺失 ⇒【无法判定】）"),
+    ("day_end.free_slots_status", "day_end.free_slots_status",
+     "背包空格读数状态 ok/unavailable（0.7.45：旧桥缺 inventoryCount ⇒ unavailable，**绝不猜 0**）"),
+    ("day_end.loot_lost_steps", "day_end.loot_lost_steps",
+     "清障**清成了**但背包 0 空格、掉落被游戏拒收的步数（0.7.45；只留痕不改 checks）"),
+    ("day_end.loot_lost_tiles", "day_end.loot_lost_tiles",
+     "掉落实体被拒收的逐格坐标（0.7.45；缺失 ⇒【无法判定】丢在哪）"),
+    ("day_end.loot_lost_items", "day_end.loot_lost_items",
+     "被拒收掉落物的近似名（去重，不装精确；0.7.45；缺失 ⇒【无法判定】丢了什么）"),
+    ("event:slot_relief.pressure", "slot_relief.pressure",
+     "压力通道标记：背包真满但客观腾不出 ⇒ 只留痕不判失败（0.7.45；缺失 ⇒【无法判定】通道形态）"),
+    ("event:slot_relief.trigger", "slot_relief.trigger",
+     "腾格触发源（0.7.45 压力通道写 `none`；缺失 ⇒【无法判定】是否压力通道）"),
+    ("event:slot_relief.demand_basis", "slot_relief.demand_basis",
+     "需求依据（0.7.45 压力通道写 `space_pressure`；缺失 ⇒【无法判定】需求是否来自空格压力）"),
 ]
 OUTCOME_RE = re.compile(
     r"目标\s*(\d+)\s*步：做成\s*(\d+)、跳过\s*(\d+)、失败\s*(\d+)"
@@ -852,6 +905,53 @@ STOPPED_RE = re.compile(r"提前停：([^；;]+)")
 GUARD_PENDING_RE = re.compile(r"还有\s*(\d+)\s*格没做完")
 #: task-17：`plot` 事件 note 里的观测截断标记（不是结构键！只是 note 原文，缺结构字段 ⇒ 只作 info）。
 PLOT_TRUNC_MARK = "tilesTruncated=true"
+# ---------------------------------------------------------------- task-24（0.7.45）
+#: 【task-24】日终「还有活」的**七口径**（只 info；`day_justified` 只认 pending_executable）。
+#: 不变式：`pending_ledger == pending_guard + pending_blocked`；
+#:         `pending_guard == pending_executable + pending_unobserved + pending_malformed`
+#:         （观测不可用 `pending_executable is None` ⇒ 文档口径 unobserved==0 且 malformed==0）。
+PENDING_CALIBER_KEYS = (
+    "pending_ledger", "pending_guard", "pending_stalled", "pending_executable",
+    "pending_blocked", "pending_unobserved", "pending_malformed",
+)
+#: 【task-24】背包空格留痕的四个日级键（`status=unavailable` ⇒【无法判定】，绝不猜 0）。
+BAG_FREE_KEYS = ("free_slots_start", "free_slots_last", "free_slots_min", "free_slots_status")
+#: 【task-24】「清障清成了但背包 0 空格、掉落被游戏拒收」的三个日级键（只留痕）。
+BAG_LOOT_KEYS = ("loot_lost_steps", "loot_lost_tiles", "loot_lost_items")
+#: 【task-24】压力通道判据：`slot_relief{pressure=true}` 或 `need=0/freed=0/trigger=none/space_pressure`。
+SLOT_PRESSURE_DEMAND_BASIS = "space_pressure"
+
+
+def pending_caliber_invariants(end):
+    """task-24：pending 七口径的**不变式校验**（只 info，不改任何判据）。
+
+    返回 dict：`complete`（七键是否都在）、`missing`、`ledger_ok`/`guard_ok`
+    （`None` = 该条不变式【无法判定】）、`executable`（可能为 None=观测不可用）、`values`。
+    缺失任何一键 ⇒ `complete=False`（该天【无法判定】，缺失 ≠ 0）。
+    """
+    cal = as_dict(end)
+    missing = [k for k in PENDING_CALIBER_KEYS if k not in cal]
+    values = {k: as_int(cal.get(k), None) for k in PENDING_CALIBER_KEYS}
+    ex_here = "pending_executable" in cal
+    ex = as_int(cal.get("pending_executable"), None) if ex_here else None
+    ledger_ok = None
+    guard_ok = None
+    if not missing:
+        ledger, guard, blocked = (values["pending_ledger"], values["pending_guard"],
+                                  values["pending_blocked"])
+        if None not in (ledger, guard, blocked):
+            ledger_ok = (ledger == guard + blocked)
+        unobserved = values["pending_unobserved"]
+        malformed = values["pending_malformed"]
+        if None not in (guard, unobserved, malformed):
+            if ex is not None:
+                guard_ok = (guard == ex + unobserved + malformed)
+            else:
+                # 观测不可用：brain 文档承诺 executable=guard、unobserved=0、malformed=0
+                guard_ok = (unobserved == 0 and malformed == 0)
+    return {"complete": not missing, "missing": missing,
+            "ledger_ok": ledger_ok, "guard_ok": guard_ok,
+            "executable": ex, "executable_present": ex_here, "values": values}
 
 # ---------------------------------------------------------------- task-11 模态记账
 #: 红（必须人工介入）：这些事件的唯一产生路径是 longrun 的 `_modal_blocked`（不可逆职业选择 /
@@ -4055,6 +4155,51 @@ def build_advice(report, top=9):
             "lines": [ln for d in gc0["days"] for ln in
                       [d.get("line")] + (d.get("burst_lines") or [])[:1]][:10],
         })
+    # 0s-13（task-24，0.7.45）：pending 七口径 / justified 证据 / 背包压力 / 中途遮蔽 —— info，不进 rc
+    pc0 = report.get("pending_caliber") or {}
+    je0 = report.get("justified_evidence") or {}
+    bp0 = report.get("bag_pressure") or {}
+    mm0 = report.get("midway_masking") or {}
+    _t24_parts = []
+    _t24_lines = []
+    if pc0.get("days"):
+        _pcx = pc0.get("max") or {}
+        _t24_parts.append(
+            f"pending 七口径 {pc0.get('days_count')} 天（最大：账本 {_pcx.get('ledger')} / 守卫 "
+            f"{_pcx.get('guard')} / 停滞 {_pcx.get('stalled')} / 可执行 {_pcx.get('executable')} / "
+            f"已判死 {_pcx.get('blocked')} / 看不见 {_pcx.get('unobserved')} / 残缺 "
+            f"{_pcx.get('malformed')}）"
+            + (f"；不变式违背 ledger!=guard+blocked {pc0['violations_ledger']} 天"
+               if pc0.get("violations_ledger") else "")
+            + (f"；guard!=exec+unobs+malformed {pc0['violations_guard']} 天"
+               if pc0.get("violations_guard") else ""))
+        _t24_lines.extend([d.get("line") for d in pc0.get("days") or []])
+    if je0.get("suspicious_days"):
+        _t24_parts.append(
+            f"justified 证据可疑 {len(je0['suspicious_days'])} 天"
+            f"（day_justified 与 exec/malformed 不自洽 ⇒ 人工核对）")
+        _t24_lines.extend([d.get("line") for d in je0.get("days") or []
+                           if d.get("suspicious_unjustified_no_work")
+                           or d.get("suspicious_justified_with_work")])
+    if bp0.get("state") == "found":
+        _t24_parts.append(
+            f"背包压力：最低空格 {bp0.get('free_slots_min_overall')}、0 格 "
+            f"{len(bp0.get('days_free_slots_zero') or [])} 天、掉落被拒收 "
+            f"{bp0.get('loot_lost_steps_total')} 步 / {bp0.get('loot_lost_tiles_count')} 格、"
+            f"压力通道 {bp0.get('pressure_events')} 次（只留痕，不算失败）")
+        _t24_lines.extend([d.get("line") for d in bp0.get("days") or []])
+    if mm0.get("records_total"):
+        _t24_parts.append(
+            f"中途遮蔽 {mm0.get('records_total')} 条（{len(mm0.get('days_with_records') or [])} 天；"
+            f"最大轮 {mm0.get('max_round')}、最大余格 {mm0.get('max_leftover')}）"
+            "⇒ 日级「最后一轮」口径会低估当日剩余")
+        _t24_lines.extend([d.get("event_lines") for d in mm0.get("days") or []])
+    if _t24_parts:
+        advice.append({
+            "text": "0.7.45 新字段/形态（task-24；**全是 info /【无法判定】，不进 rc**）："
+                    + "；".join(_t24_parts),
+            "lines": [ln for ln in _t24_lines if ln is not None][:10],
+        })
     # 0c) 环境挡路 / 没拿到结论（task-22 记账）
     env = report.get("env_inconclusive") or {}
     if env.get("env_fail_events"):
@@ -7201,6 +7346,280 @@ def build_report(rows, path, args, bad_lines):
         "plots_capped_events": sum(len(d["plots_capped_lines"]) for d in _gc_days),
         "truncated_plot_events": sum(d["truncated_plot_events"] for d in _gc_days),
     }
+    # ================================================================ task-24（0.7.45）
+    # K) pending 七口径独立读数（**只 info、不进 rc**）：原始账本 / 守卫 / 停滞 / 当前可执行 /
+    #    已判死 / 看不见 / 观测残缺 七列并排 + 两条不变式违背计数。`day_justified` 只认
+    #    `pending_executable`（brain `is_justified_end`），这里只把「为什么 day_justified 为假/
+    #    为真」的七个数字摆出来，不重算、不改判。任何一键缺失 ⇒ 该天【无法判定】（缺失 ≠ 0）。
+    _pcal_days = []
+    _pcal_undec = []
+    _pcal_viol_ledger = 0
+    _pcal_viol_guard = 0
+    _pcal_has_any = False
+    for _pcal_sess in sessions:
+        _pcal_ends = _pcal_sess.get("day_ends") or []
+        if not _pcal_ends:
+            continue
+        _pcal_ln, _pcal_end = _pcal_ends[-1]
+        if not isinstance(_pcal_end, dict):
+            continue
+        _pcal_lbl = (day_label(_pcal_end) or day_label(as_dict(_pcal_sess.get("start")))
+                     or "<无日>")
+        if any(k in _pcal_end for k in PENDING_CALIBER_KEYS):
+            _pcal_has_any = True
+        _pcal_inv = pending_caliber_invariants(_pcal_end)
+        if not _pcal_inv["complete"]:
+            _pcal_undec.append({"label": _pcal_lbl, "line": _pcal_ln,
+                                "why": "缺 " + " / ".join(_pcal_inv["missing"]) + "（缺失 ≠ 0）"})
+            continue
+        _pcal_v = _pcal_inv["values"]
+        if _pcal_inv["ledger_ok"] is False:
+            _pcal_viol_ledger += 1
+        if _pcal_inv["guard_ok"] is False:
+            _pcal_viol_guard += 1
+        _pcal_days.append({
+            "label": _pcal_lbl, "line": _pcal_ln,
+            "ended_by": _pcal_end.get("ended_by"),
+            "ledger": _pcal_v["pending_ledger"],
+            "guard": _pcal_v["pending_guard"],
+            "stalled": _pcal_v["pending_stalled"],
+            "executable": _pcal_inv["executable"],
+            "blocked": _pcal_v["pending_blocked"],
+            "unobserved": _pcal_v["pending_unobserved"],
+            "malformed": _pcal_v["pending_malformed"],
+            "ledger_ok": _pcal_inv["ledger_ok"],
+            "guard_ok": _pcal_inv["guard_ok"],
+        })
+    _pcal_max = {k: max([d[k] for d in _pcal_days if d.get(k) is not None], default=None)
+                 for k in ("ledger", "guard", "stalled", "executable", "blocked",
+                           "unobserved", "malformed")}
+    if _pcal_days:
+        _pcal_state = ("found" if any((d["ledger"] or 0) > 0 or (d["guard"] or 0) > 0
+                                      or (d["blocked"] or 0) > 0 for d in _pcal_days)
+                       else "zero")
+    else:
+        _pcal_state = "undecidable"
+    pending_caliber = {
+        "state": _pcal_state,
+        "days": _pcal_days,
+        "days_count": len(_pcal_days),
+        "labels": [d["label"] for d in _pcal_days],
+        "undecidable_days": _pcal_undec,
+        "violations_ledger": _pcal_viol_ledger,
+        "violations_guard": _pcal_viol_guard,
+        "max": _pcal_max,
+        "has_fields": _pcal_has_any,
+        "has_day_end": bool(days),
+    }
+    # L) justified 证据联合读数（**只 info**）：`day_justified` × `pending_executable` ×
+    #    `pending_malformed`。两种可疑形态只点名、不改判：
+    #    ① day_justified=false 且 exec=0 且 malformed=0（证据说没活却不判正当 ⇒ 多半是旧口径/缺证据）；
+    #    ② day_justified=true 却 exec>0 或 exec=None（判正当但可执行面不为 0/不可用 ⇒ 人工核对）。
+    _je_days = []
+    _je_undec = []
+    _je_susp_no_work = 0
+    _je_susp_with_work = 0
+    for _je_sess in sessions:
+        _je_ends = _je_sess.get("day_ends") or []
+        if not _je_ends:
+            continue
+        _je_ln, _je_end = _je_ends[-1]
+        if not isinstance(_je_end, dict):
+            continue
+        _je_lbl = day_label(_je_end) or day_label(as_dict(_je_sess.get("start"))) or "<无日>"
+        _je_chk = as_dict(_je_end.get("checks"))
+        _je_missing = []
+        if "day_justified" not in _je_chk:
+            _je_missing.append("checks.day_justified")
+        if "pending_executable" not in _je_end:
+            _je_missing.append("pending_executable")
+        if "pending_malformed" not in _je_end:
+            _je_missing.append("pending_malformed")
+        if _je_missing:
+            _je_undec.append({"label": _je_lbl, "line": _je_ln,
+                              "why": "缺 " + " / ".join(_je_missing) + "（缺失 ≠ 0）"})
+            continue
+        _je_dj = _je_chk.get("day_justified")
+        _je_ex = as_int(_je_end.get("pending_executable"), None)
+        _je_mal = as_int(_je_end.get("pending_malformed"), None)
+        if _je_mal is None:
+            _je_undec.append({"label": _je_lbl, "line": _je_ln,
+                              "why": "pending_malformed 非整数（无法判定）"})
+            continue
+        _je_sno = (_je_dj is False and _je_ex == 0 and _je_mal == 0)
+        _je_sw = (_je_dj is True and (_je_ex is None or _je_ex > 0))
+        if _je_sno:
+            _je_susp_no_work += 1
+        if _je_sw:
+            _je_susp_with_work += 1
+        _je_reason = str(_je_end.get("ended_reason") or "")
+        _je_prefix = ("resume_exhausted" if _je_reason.startswith("resume_exhausted")
+                      else "stuck" if _je_reason.startswith("stuck")
+                      else "other" if _je_reason else "none")
+        _je_days.append({
+            "label": _je_lbl, "line": _je_ln,
+            "day_justified": _je_dj,
+            "executable": _je_ex,
+            "malformed": _je_mal,
+            "reason_prefix": _je_prefix,
+            "suspicious_unjustified_no_work": _je_sno,
+            "suspicious_justified_with_work": _je_sw,
+        })
+    justified_evidence = {
+        "state": "found" if _je_days else "undecidable",
+        "days": _je_days,
+        "days_count": len(_je_days),
+        "labels": [d["label"] for d in _je_days],
+        "undecidable_days": _je_undec,
+        "suspicious_unjustified_no_work": _je_susp_no_work,
+        "suspicious_justified_with_work": _je_susp_with_work,
+        "suspicious_days": [d["label"] for d in _je_days
+                            if d["suspicious_unjustified_no_work"]
+                            or d["suspicious_justified_with_work"]],
+        "has_day_end": bool(days),
+    }
+    # M) 背包压力 / 留痕（**只 info**）：free_slots_start/last/min/status、loot_lost_steps/tiles/items，
+    #    以及复用事件名 `slot_relief` 的**压力通道**（pressure=true / need=0 / freed=0 /
+    #    trigger=none / demand_basis=space_pressure）。`status=unavailable` 单列【无法判定】
+    #    （旧桥缺 inventoryCount ⇒ 绝不猜 0）。A8/smoke-0744 没有这些字段 ⇒ 全【无法判定】。
+    _bp_days = []
+    _bp_undec = []
+    _bp_pressure_lines = []
+    _bp_basis = {}
+    _bp_has_free = False
+    _bp_has_loot = False
+    for _bp_sess in sessions:
+        _bp_ends = _bp_sess.get("day_ends") or []
+        if not _bp_ends:
+            continue
+        _bp_ln, _bp_end = _bp_ends[-1]
+        if not isinstance(_bp_end, dict):
+            continue
+        _bp_lbl = day_label(_bp_end) or day_label(as_dict(_bp_sess.get("start"))) or "<无日>"
+        _bp_free_here = [k for k in BAG_FREE_KEYS if k in _bp_end]
+        _bp_loot_here = [k for k in BAG_LOOT_KEYS if k in _bp_end]
+        if _bp_free_here:
+            _bp_has_free = True
+        if _bp_loot_here:
+            _bp_has_loot = True
+        if not _bp_free_here and not _bp_loot_here:
+            _bp_undec.append({"label": _bp_lbl, "line": _bp_ln,
+                              "why": "缺 free_slots_* / loot_lost_*（缺失 ≠ 0）"})
+            continue
+        _bp_status = (_bp_end.get("free_slots_status")
+                      if "free_slots_status" in _bp_end else None)
+        _bp_min = as_int(_bp_end.get("free_slots_min"), None)
+        _bp_steps = as_int(_bp_end.get("loot_lost_steps"), None)
+        _bp_tiles = [t for t in as_list(_bp_end.get("loot_lost_tiles")) if isinstance(t, list)]
+        _bp_items = [str(x) for x in as_list(_bp_end.get("loot_lost_items"))]
+        for _bp_eln, _bp_ev in _bp_sess.get("events") or []:
+            if _bp_ev.get("event") != "slot_relief":
+                continue
+            _bp_basis_v = str(_bp_ev.get("demand_basis") or "")
+            if _bp_basis_v:
+                _bp_basis[_bp_basis_v] = _bp_basis.get(_bp_basis_v, 0) + 1
+            _bp_need = as_int(_bp_ev.get("need"), None)
+            _bp_freed = as_int(_bp_ev.get("freed"), None)
+            _bp_trig = str(_bp_ev.get("trigger") or "")
+            _bp_pressure = bool(_bp_ev.get("pressure")) or (
+                _bp_trig == "none" and _bp_need == 0 and _bp_freed == 0
+                and _bp_basis_v == SLOT_PRESSURE_DEMAND_BASIS)
+            if _bp_pressure:
+                _bp_pressure_lines.append(_bp_eln)
+        _bp_days.append({
+            "label": _bp_lbl, "line": _bp_ln,
+            "free_slots_start": as_int(_bp_end.get("free_slots_start"), None),
+            "free_slots_last": as_int(_bp_end.get("free_slots_last"), None),
+            "free_slots_min": _bp_min,
+            "free_slots_status": _bp_status,
+            "loot_lost_steps": _bp_steps,
+            "loot_lost_tiles": len(_bp_tiles),
+            "loot_lost_items": _bp_items[:8],
+        })
+    _bp_unavailable = [d for d in _bp_days if d.get("free_slots_status") == "unavailable"]
+    _bp_zero = [d for d in _bp_days if d.get("free_slots_min") == 0]
+    _bp_mins = [d["free_slots_min"] for d in _bp_days if d.get("free_slots_min") is not None]
+    _bp_signal = (bool(_bp_zero) or any((d.get("loot_lost_steps") or 0) > 0
+                                        for d in _bp_days)
+                  or bool(_bp_pressure_lines))
+    bag_pressure = {
+        "state": ("found" if (_bp_days and _bp_signal)
+                  else "zero" if _bp_days else "undecidable"),
+        "days": _bp_days,
+        "days_count": len(_bp_days),
+        "labels": [d["label"] for d in _bp_days],
+        "undecidable_days": _bp_undec,
+        "unavailable_days": [d["label"] for d in _bp_unavailable],
+        "free_slots_min_overall": min(_bp_mins) if _bp_mins else None,
+        "days_free_slots_zero": [d["label"] for d in _bp_zero],
+        "loot_lost_steps_total": sum((d.get("loot_lost_steps") or 0) for d in _bp_days),
+        "loot_lost_tiles_count": sum((d.get("loot_lost_tiles") or 0) for d in _bp_days),
+        "loot_lost_items": sorted({str(x) for d in _bp_days
+                                   for x in (d.get("loot_lost_items") or [])}),
+        "pressure_events": len(_bp_pressure_lines),
+        "pressure_lines": _bp_pressure_lines,
+        "demand_basis": _bp_basis,
+        "has_free_fields": _bp_has_free,
+        "has_loot_fields": _bp_has_loot,
+        "has_day_end": bool(days),
+    }
+    # N) 中途遮蔽（`stage_midway_leftover`，0.7.45）：日级判定取每阶段**最后一轮** leftover，
+    #    更早轮 leftover>0 会被最后一轮 0 遮蔽（0.7.44 冒烟 263/217 的成因之一）。这里把
+    #    day_end.stage_midway_leftover 逐轮记录与同名事件并排计数（只 info，不改公式）。
+    _mm_days = []
+    _mm_undec = []
+    _mm_event_lines = []
+    _mm_has_field = False
+    for _mm_sess in sessions:
+        _mm_ends = _mm_sess.get("day_ends") or []
+        if not _mm_ends:
+            continue
+        _mm_ln, _mm_end = _mm_ends[-1]
+        if not isinstance(_mm_end, dict):
+            continue
+        _mm_lbl = day_label(_mm_end) or day_label(as_dict(_mm_sess.get("start"))) or "<无日>"
+        _mm_evs = []
+        for _mm_eln, _mm_ev in _mm_sess.get("events") or []:
+            if _mm_ev.get("event") == "stage_midway_leftover":
+                _mm_evs.append(_mm_eln)
+                _mm_event_lines.append(_mm_eln)
+        if "stage_midway_leftover" not in _mm_end:
+            _mm_undec.append({"label": _mm_lbl, "line": _mm_ln,
+                              "why": "缺 day_end.stage_midway_leftover（缺失 ≠ 0）"})
+            continue
+        _mm_has_field = True
+        _mm_recs = [r for r in as_list(_mm_end.get("stage_midway_leftover"))
+                    if isinstance(r, dict)]
+        _mm_rounds = [as_int(r.get("round"), None) for r in _mm_recs]
+        _mm_rounds = [r for r in _mm_rounds if r is not None]
+        _mm_left = [as_int(r.get("leftover"), None) for r in _mm_recs]
+        _mm_left = [r for r in _mm_left if r is not None]
+        _mm_days.append({
+            "label": _mm_lbl, "line": _mm_ln,
+            "records": len(_mm_recs),
+            "stages": sorted({str(r.get("stage") or "") for r in _mm_recs}),
+            "max_round": max(_mm_rounds) if _mm_rounds else None,
+            "max_leftover": max(_mm_left) if _mm_left else None,
+            "event_lines": _mm_evs,
+        })
+    _mm_total = sum(d["records"] for d in _mm_days)
+    midway_masking = {
+        "state": ("found" if _mm_total > 0
+                  else "zero" if (_mm_days or _mm_has_field) else "undecidable"),
+        "days": _mm_days,
+        "days_count": len(_mm_days),
+        "labels": [d["label"] for d in _mm_days],
+        "days_with_records": [d["label"] for d in _mm_days if d["records"] > 0],
+        "undecidable_days": _mm_undec,
+        "records_total": _mm_total,
+        "event_lines": _mm_event_lines,
+        "max_round": max([d["max_round"] for d in _mm_days
+                          if d.get("max_round") is not None], default=None),
+        "max_leftover": max([d["max_leftover"] for d in _mm_days
+                             if d.get("max_leftover") is not None], default=None),
+        "has_field": _mm_has_field,
+        "has_day_end": bool(days),
+    }
     report = {
         "journal": path,
         "lines": max((ln for ln, _ in rows), default=0),
@@ -7590,6 +8009,11 @@ def build_report(rows, path, args, bad_lines):
     report["already_aware"] = already_aware
     # 【task-17】守卫计数口径（0.7.44 真机冒烟）：day_justified=false 但当前观测无可执行待做，只 info
     report["guard_count"] = guard_count
+    # task-24（0.7.45）：pending 七口径 / justified 证据 / 背包压力 / 中途遮蔽 —— 全 info、不进 rc。
+    report["pending_caliber"] = pending_caliber
+    report["justified_evidence"] = justified_evidence
+    report["bag_pressure"] = bag_pressure
+    report["midway_masking"] = midway_masking
     # task-88：`cat_self_report` 要按**目标窗口**（`--window N`）而不是 `finish.days` 判自洽。
     report["window_days"] = as_int(getattr(args, "window", 3), 3)
     self_report = cat_self_report(report)
@@ -8075,6 +8499,17 @@ MAPPING_TEXT = [
      "报告并列给：守卫 pending / 已标记停滞 / 残余 / 中间轮余格 max / 观测截断 plot 数；"
      "缺任一字段 ⇒【无法判定】，绝不默认 0（缺失 ≠ 通过）"),
 
+    ("day_end.pending_ledger/pending_guard/pending_stalled/pending_executable/"
+     "pending_blocked/pending_unobserved/pending_malformed（task-24 / 0.7.45）",
+     "顶部统计：pending 七口径并排（只 info、不进 rc）；不变式 ledger==guard+blocked、"
+     "guard==executable+unobserved+malformed 违背 ⇒ ⚠ 人工核对；任何键缺失 ⇒【无法判定】；"
+     "**day_justified 只认 pending_executable** ⇒ 其余六列不得当豁免或判红依据（守护诚实收工口径）"),
+    ("day_end.stage_midway_leftover（task-24 / 0.7.45）",
+     "顶部统计：中途遮蔽 —— 更早轮 leftover>0、最后一轮同种类归零 ⇒ 日级「最后一轮」口径会低估"
+     "当日剩余；只 info，不改 no_unmet_stages/plot_pending 公式"),
+    ("day_end.free_slots_* / loot_lost_* / slot_relief{pressure}（task-24 / 0.7.45）",
+     "顶部统计：背包压力留痕（最低空格 / 0 格天数 / 清障掉落被游戏拒收步数 / 压力通道次数；"
+     "只 info、不进 rc、不算失败；`free_slots_status=unavailable` ⇒【无法判定】，绝不猜 0）"),
     ("idle", "辅助：一整轮没动作（acted/rounds）⇒ 空转，常与'该做没做'并看"),
 ]
 
@@ -8408,6 +8843,92 @@ def render_text(report, top):
                 + (" ⇒ **最后一轮遮蔽**（中间轮>0 未进日级字段）" if _d.get("midway_masked") else "")
                 + (f"；stage_midway_leftover {'/'.join(str(m['line']) for m in _d['midway_events'])}"
                    if _d.get("midway_events") else ""))
+    # K–N) 【task-24 / 0.7.45】pending 七口径 / justified 证据 / 背包压力 / 中途遮蔽（只 info、不进 rc）
+    _pcv = report.get("pending_caliber") or {}
+    if not _pcv.get("has_fields"):
+        add("pending 七口径（0.7.45）: <缺失>（本账本没有 day_end.pending_* 字段 ⇒ 无法判定；缺失 ≠ 0）")
+    elif not _pcv.get("days"):
+        _pcud = _pcv.get("undecidable_days") or []
+        add(f"pending 七口径（0.7.45）: 【无法判定】{len(_pcud)} 天缺字段"
+            + (f"（{_pcud[0]['label']}: {_pcud[0]['why']}）" if _pcud else "（缺 day_end.pending_*）")
+            + "；缺失 ≠ 0")
+    else:
+        _pcm = _pcv.get("max") or {}
+        add(f"pending 七口径（0.7.45）: {_pcv.get('days_count')} 天（最大 账本 {_pcm.get('ledger')} / "
+            f"守卫 {_pcm.get('guard')} / 停滞 {_pcm.get('stalled')} / 可执行 {_pcm.get('executable')} / "
+            f"已判死 {_pcm.get('blocked')} / 看不见 {_pcm.get('unobserved')} / 残缺 {_pcm.get('malformed')}）"
+            + (f"  ⚠ 不变式违背 ledger!=guard+blocked {_pcv['violations_ledger']} 天"
+               if _pcv.get("violations_ledger") else "")
+            + (f"  ⚠ guard!=exec+unobs+malformed {_pcv['violations_guard']} 天"
+               if _pcv.get("violations_guard") else "")
+            + "；day_justified 只认 pending_executable（其余六列只作证据）⇒ info、不进 rc")
+        for _d in (_pcv.get("days") or []):
+            add(f"    · {_d['label']}（L{_d['line']}）: 账本 {_d.get('ledger')} = 守卫 {_d.get('guard')} + "
+                f"已判死 {_d.get('blocked')}；守卫 = 可执行 {_d.get('executable')} + 看不见 "
+                f"{_d.get('unobserved')} + 残缺 {_d.get('malformed')}"
+                + ("" if _d.get("ledger_ok") is not False else "  ⚠ ledger 不变式违背")
+                + ("" if _d.get("guard_ok") is not False else "  ⚠ guard 不变式违背"))
+    _jev = report.get("justified_evidence") or {}
+    if not _jev.get("days"):
+        _jeud = _jev.get("undecidable_days") or []
+        add(f"justified 证据（day_justified × exec/malformed，0.7.45）: 【无法判定】{len(_jeud)} 天缺字段"
+            + (f"（{_jeud[0]['label']}: {_jeud[0]['why']}）" if _jeud else "（缺 day_justified / "
+               "pending_executable / pending_malformed）") + "；缺失 ≠ 0")
+    else:
+        add(f"justified 证据（day_justified × exec/malformed，0.7.45）: {_jev.get('days_count')} 天可判；"
+            f"可疑：false 且 exec=0 且 malformed=0 {_jev.get('suspicious_unjustified_no_work', 0)} 天 / "
+            f"true 却 exec>0或None {_jev.get('suspicious_justified_with_work', 0)} 天"
+            "（只点名，不改判、不进 rc）")
+        for _d in (_jev.get("days") or []):
+            if not (_d.get("suspicious_unjustified_no_work")
+                    or _d.get("suspicious_justified_with_work")):
+                continue
+            add(f"    · {_d['label']}（L{_d['line']}，前缀 {_d['reason_prefix']}）: day_justified="
+                f"{_d.get('day_justified')} / exec={_d.get('executable')} / malformed="
+                f"{_d.get('malformed')} ⇒ 人工核对证据链")
+    _bpv = report.get("bag_pressure") or {}
+    if _bpv.get("state") == "undecidable" and not _bpv.get("days"):
+        add("背包压力/留痕（0.7.45）: <缺失>（本账本没有 day_end.free_slots_* / loot_lost_* ⇒ 无法判定；"
+            "缺失 ≠ 0，绝不猜「没丢东西」）")
+    elif _bpv.get("days"):
+        _bp_extra = []
+        if _bpv.get("unavailable_days"):
+            _bp_extra.append(f"{len(_bpv['unavailable_days'])} 天 status=unavailable（【无法判定】背包空格，"
+                             "绝不猜 0）")
+        add(f"背包压力/留痕（0.7.45）: 最低空格 {_bpv.get('free_slots_min_overall')}；0 格 "
+            f"{len(_bpv.get('days_free_slots_zero') or [])} 天；清障掉落被拒收 "
+            f"{_bpv.get('loot_lost_steps_total')} 步 / {_bpv.get('loot_lost_tiles_count')} 格"
+            + (f"（近似 {(_bpv.get('loot_lost_items') or [])[:4]}）" if _bpv.get("loot_lost_items") else "")
+            + f"；压力通道 {_bpv.get('pressure_events')} 次（need=0/freed=0/trigger=none/"
+              "demand_basis=space_pressure ⇒ 满包但腾不出，不是失败）"
+            + (f"；需求依据 {_bpv.get('demand_basis')}" if _bpv.get("demand_basis") else "")
+            + ("；⚠ " + "；".join(_bp_extra) if _bp_extra else "")
+            + "；info、不进 rc")
+        for _d in (_bpv.get("days") or []):
+            if (_d.get("free_slots_min") is None and not _d.get("loot_lost_steps")):
+                continue
+            add(f"    · {_d['label']}（L{_d['line']}）: 空格 开局 {_d.get('free_slots_start')} / 最低 "
+                f"{_d.get('free_slots_min')} / 日终 {_d.get('free_slots_last')}"
+                f"（状态 {_d.get('free_slots_status')}）；掉落被拒收 {_d.get('loot_lost_steps')} 步 / "
+                f"{_d.get('loot_lost_tiles')} 格")
+    _mmv = report.get("midway_masking") or {}
+    if _mmv.get("state") == "undecidable":
+        _mmud = _mmv.get("undecidable_days") or []
+        add(f"中途遮蔽（stage_midway_leftover，0.7.45）: 【无法判定】{len(_mmud)} 天缺字段"
+            + (f"（{_mmud[0]['label']}: {_mmud[0]['why']}）" if _mmud else "") + "；缺失 ≠ 0")
+    elif _mmv.get("state") == "zero":
+        add("中途遮蔽（stage_midway_leftover，0.7.45）: 0 条（字段在场且当天没有「更早轮 leftover>0、"
+            "最后一轮归零」⇒ 0 是真实读数）")
+    else:
+        add(f"中途遮蔽（stage_midway_leftover，0.7.45）: {_mmv.get('records_total')} 条 / "
+            f"{len(_mmv.get('days_with_records') or [])} 天（最大轮 {_mmv.get('max_round')}、最大余格 "
+            f"{_mmv.get('max_leftover')}）⇒ 日级「最后一轮」口径会低估当日剩余；info、不进 rc")
+        for _d in (_mmv.get("days") or []):
+            if not _d.get("records"):
+                continue
+            add(f"    · {_d['label']}（L{_d['line']}）: {_d.get('records')} 条（阶段 "
+                f"{'/'.join(_d.get('stages') or [])}；最大轮 {_d.get('max_round')}、"
+                f"最大余格 {_d.get('max_leftover')}）")
     # task-32：两种新事件形态的计数（信息项）；task-38：跨日证据覆盖度
     # task-102（`9b09735`）：**背包空格闭环**一行 —— free_slots / buy 尝试 / buy_no_space /
     # 腾格卖出（`why=need_slot`）/ 当日钱变化 / `slept_without_work` / `modal_dismiss_failed`。
