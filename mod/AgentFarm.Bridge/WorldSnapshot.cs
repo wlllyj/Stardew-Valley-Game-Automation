@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using StardewModdingAPI;
 using StardewValley;
+using StardewValley.GameData.Crops;
 using StardewValley.TerrainFeatures;
 
 namespace AgentFarm.Bridge
@@ -265,6 +266,10 @@ namespace AgentFarm.Bridge
                 WateringCan = ReadWateringCan(p),
                 Inventory = ReadInventory(p),
 
+                // 【task-240】种子 + 季节语义：0.7.41 冒烟 day1 的 `stuck` 就是因为脑侧
+                // 只看得见"有 10 粒 Wheat Seeds"、看不见"小麦冬季不可种"。
+                Seeds = ReadSeeds(p),
+
                 // 【task-155】工具升级在途状态（升级链 task-142 的前置/判据）。
                 // IL 实证：`toolBeingUpgraded` 是 `NetRef<Tool>`、`daysLeftForToolUpgrade` 是 `NetInt`
                 // （`scratch/il-155-upg2.txt`：Farmer.showToolUpgradeAvailability 里 ldfld）。
@@ -301,6 +306,140 @@ namespace AgentFarm.Bridge
 
         /// <summary>【task-222】已知配方列表上限（截断有标志，不当"全部"）。</summary>
         private const int KnownRecipesMax = 200;
+
+        // ---- 【task-240】种子 + 季节语义 ----
+
+        /// <summary>`Data/Crops` 的 `SeedItemId → 季节名数组` 映射（懒加载一次）。</summary>
+        private static Dictionary<string, string[]> _seedSeasons;
+
+        /// <summary>懒加载是否已经尝试过（失败也置 true，避免每次 observe 都抛一次）。</summary>
+        private static bool _seedSeasonsTried;
+
+        /// <summary>去掉限定前缀：`"(O)472"` → `"472"`；非限定 id 原样。</summary>
+        private static string StripSeedQualifier(string id)
+        {
+            if (string.IsNullOrEmpty(id)) return "";
+            int close = id.IndexOf(')');
+            if (id.Length > 2 && id[0] == '(' && close > 0 && close + 1 < id.Length)
+            {
+                return id.Substring(close + 1);
+            }
+            return id;
+        }
+
+        /// <summary>
+        /// 建 `SeedItemId → seasons` 映射。**来源只认游戏数据**（`Data/Crops` 每行的
+        /// `SeedItemId` + `Seasons`），不硬编码任何作物表。
+        ///
+        /// 失败（加载抛错 / 字段读不到）⇒ `_seedSeasons = null`，调用方据此给
+        /// `seasons=null` + `plantableNow=null`（判不了，脑侧退回旧行为）。
+        /// </summary>
+        private static void EnsureSeedSeasons()
+        {
+            if (_seedSeasonsTried) return;
+            _seedSeasonsTried = true;
+            try
+            {
+                var crops = Game1.content.Load<Dictionary<string, CropData>>("Data/Crops");
+                if (crops == null) return;
+                var map = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+                foreach (KeyValuePair<string, CropData> kv in crops)
+                {
+                    CropData data = kv.Value;
+                    if (data == null) continue;
+                    // 【task-240】`Data/Crops` 的键就是**种子 id/索引**：
+                    // `Crop.GetData()` 的 IL 实证 —— `cropData.TryGetValue(netSeedIndex.Value, ...)`
+                    // （`scratch/il-probe` 实读：`StardewValley.Crop|GetData`）。
+                    // 所以"某种子能不能种"= 用种子 id 查这张表、读它的 `Seasons`。
+                    string seedId = kv.Key;
+                    if (string.IsNullOrEmpty(seedId)) continue;
+                    string[] seasons = SeedRules.NormalizeSeasons(
+                        ProduceSeasonNames(data.Seasons));
+                    string bare = StripSeedQualifier(seedId);
+                    map[seedId] = seasons;
+                    if (bare.Length > 0) map[bare] = seasons;
+                }
+                _seedSeasons = map;
+            }
+            catch
+            {
+                _seedSeasons = null;
+            }
+        }
+
+        /// <summary>把 `CropData.Seasons`（`HashSet&lt;Season&gt;`）转成名字序列；读不到 ⇒ null。</summary>
+        private static IEnumerable<string> ProduceSeasonNames(object seasons)
+        {
+            if (seasons == null) yield break;
+            var enumerable = seasons as System.Collections.IEnumerable;
+            if (enumerable == null) yield break;
+            foreach (object s in enumerable)
+            {
+                if (s == null) continue;
+                yield return s.ToString();
+            }
+        }
+
+        /// <summary>查某包种子的季节名；读不到 ⇒ **null**（判不了，不是空数组）。</summary>
+        private static string[] SeedSeasonsOf(string itemId, string qualifiedId)
+        {
+            EnsureSeedSeasons();
+            if (_seedSeasons == null) return null;
+            string[] found;
+            if (!string.IsNullOrEmpty(qualifiedId) && _seedSeasons.TryGetValue(qualifiedId, out found))
+            {
+                return found;
+            }
+            string bare = StripSeedQualifier(string.IsNullOrEmpty(qualifiedId) ? itemId : qualifiedId);
+            if (bare.Length > 0 && _seedSeasons.TryGetValue(bare, out found)) return found;
+            if (!string.IsNullOrEmpty(itemId) && _seedSeasons.TryGetValue(itemId, out found))
+            {
+                return found;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// 【task-240】读背包里的**种子类**物品（`Object.SeedsCategory`，即 -74）及季节语义。
+        ///
+        /// 只读：不改任何游戏状态。判不出来时如实给 `seasons=null` / `plantableNow=null`：
+        /// 脑侧只把 `plantableNow === false` 当"当季不能种"，`null` 一律退回旧行为。
+        /// 读不到背包 ⇒ **null**（三态：缺键 / null / 空数组）。
+        /// </summary>
+        private static PlayerSeedView[] ReadSeeds(Farmer p)
+        {
+            try
+            {
+                if (p == null || p.Items == null) return null;
+                string season = SafeString(() => Game1.currentSeason);
+                var list = new List<PlayerSeedView>();
+                foreach (Item item in p.Items)
+                {
+                    if (!(item is StardewValley.Object obj)) continue;
+                    try
+                    {
+                        if (obj.Category != StardewValley.Object.SeedsCategory) continue;
+                    }
+                    catch { continue; }
+                    var row = new PlayerSeedView
+                    {
+                        Id = SafeString(() => obj.QualifiedItemId),
+                        Name = SafeString(() => obj.DisplayName),
+                        Stack = SafeInt(() => obj.Stack),
+                    };
+                    string[] seasons = SeedSeasonsOf(
+                        SafeString(() => obj.ItemId), row.Id);
+                    row.Seasons = seasons;
+                    row.PlantableNow = SeedRules.PlantableNow(seasons, season);
+                    list.Add(row);
+                }
+                return list.ToArray();
+            }
+            catch
+            {
+                return null;
+            }
+        }
 
         /// <summary>
         /// 【task-155】填 `ResourceClump` 的元数据（`clumpIndex/Width/Height/Health/Kind/Target/ToolOk`），

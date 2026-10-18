@@ -50,8 +50,9 @@ from .farmwork import (CLUMP_KINDS, ENV_BLOCK_STATUSES, FRONTIER_KINDS, PATH_STA
                        UPGRADE_KINDS, UPGRADE_PRICES,
                        UPGRADE_TRADE_ITEMS, FarmWorker, StageResult, StepResult,
                        buy_count_for, farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles,
-                       farm_ready_tiles,
-                       is_seed_offer, pick_seed_offer, player_free_slots, seed_items,
+                       farm_ready_tiles, has_seed_metadata,
+                       is_seed_offer, pick_seed_offer, plantable_seeds, player_free_slots,
+                       seed_items, seed_season_state,
                        slot_relief_plan, surplus_sell_plan, tile_ready, till_blocked_by,
                        tool_being_upgraded, tool_suspended_stages, tool_tier, tool_upgrade_days_left)
 from .planner import load_gaps_file, save_gaps_file
@@ -1419,6 +1420,22 @@ class LongRun:
         # 序号与计数**一个都没有** ⇒ 证据不可用（不许靠"stage_tiles_empty"单独硬撑）。
         if "obs_seq" not in evidence and counts is None:
             return None
+        # 【task-240 ②】`plant_area` 零目标时补一条**可读的**因由（原因码仍是闭合集里的
+        # `no_target`，只加 `evidence.why`，不新增原因码/checks 键）：
+        # 冬季手上只有 Wheat Seeds×10 ⇒ 当季一格都种不了 ⇒ `seed_out_of_season`。
+        if task == "plant_area" and evidence.get("stage_tiles_empty") is True:
+            try:
+                state = self._seed_season_state(dict(obs))
+            except Exception:  # noqa: BLE001 - 取证失败不影响 no_target 本身的证据
+                state = None
+            if (state is not None and state.get("metadata")
+                    and int(state.get("plantable") or 0) <= 0
+                    and state.get("out_of_season")):
+                evidence["why"] = "seed_out_of_season"
+                evidence["season"] = state.get("season")
+                evidence["seeds_total"] = state.get("seeds_total")
+                evidence["out_of_season"] = list(state.get("out_of_season") or [])
+                evidence["seeds_metadata"] = True
         return evidence
 
     def _non_plot_evidence(self, task: str, obs: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -3461,8 +3478,27 @@ class LongRun:
                       note="分配额被当天体力预算的容量上限卡住 ⇒ 只分配 capacity 格；"
                            "这不是『没活』，日终按预算延后口径解释")
 
+    def _seed_season_state(self, obs: dict[str, Any]) -> dict[str, Any]:
+        """【task-240】当季"能不能种"的聚合（0.7.41 冒烟 day1：冬天拿小麦宣称"该去种"）。
+
+        口径**只有一份**：`farmwork.seed_season_state(player, season)`（由 Mod 的
+        `player.seeds[]` 逐条 `seasons`/`plantableNow` 汇总）。`player.seeds` 缺字段
+        （旧 Mod）⇒ `metadata=False`，`can_plant` 退回 `seed_items()` 老口径 —— 这是
+        唯一允许 fail-open 的地方（"没有新字段"≠"没有种子"）。
+        """
+        player = FarmWorker.player_of(obs)
+        try:
+            season = str(FarmWorker.day_key(obs)[1] or "")
+        except Exception:  # pragma: no cover - 观测缺 clock 时按"认不出季节"处理
+            season = ""
+        return seed_season_state(player, season)
+
     def _seed_outlook(self, obs: dict[str, Any]) -> tuple[int, int, bool]:
-        """(种子总数, 钱, 还能不能搞到种子)。
+        """(当季可种种子数, 钱, 还能不能搞到种子)。
+
+        【task-240】第一个数从"种子总堆叠"改成**当季可种**（`plantableNow is True`）：
+        冬天拿着 10 粒 Wheat Seeds 时，旧口径会说"有种子 ⇒ 该去种"，下地却 `no_seed`
+        ⇒ 守卫与执行层互相打脸、整天 stuck。旧 Mod（没有 `seeds[]`）仍退回总堆叠。
 
         【task-67】"能不能搞到"必须把**今天已经确认买不到**算进去（`self.seed_dead_today`）：
         否则 run6 的死锁原样复现 —— 守卫每轮都看到"钱够 ⇒ 该去买"，而商店根本没有当季种子。
@@ -3471,8 +3507,8 @@ class LongRun:
         拿不到货架清单才退回 `--seed-price`。run9 的配置价与货架价是两回事，混用会把
         "10g 的 Wheat Seeds 摆在眼前、手上 88g"判成买不起 ⇒ 当天一粒不买。
         """
-        player = FarmWorker.player_of(obs)
-        seeds = sum(n for _i, _nm, n in seed_items(player))
+        state = self._seed_season_state(obs)
+        seeds = int(state["plantable"]) if state["metadata"] else int(state["seeds_total"])
         money = FarmWorker.money(obs)
         can = seeds > 0 or (self.allow_buy and money >= self._seed_price_now()
                             and not self.seed_dead_today)
@@ -4312,6 +4348,16 @@ class LongRun:
         free_slots, bag_need, bag_status = self._bag_state(obs)
         bag_blocked = bag_status == "ok" and bag_need > 0
         ripe_work = bool(ripe)
+        # 【task-240 ③】farm 级"该去种"只在**当前窗口真有 ≥1 个当季可种目标**时才算活。
+        # 反例（0.7.41 冒烟 day1）：farm 口径 29 格空耕地、窗口里一格都没有 ⇒ 守卫说"该去种"、
+        # `plant_area` 却 0 目标 ⇒ 连续 5 轮零变化 ⇒ `stuck:` 把整天判死（根因 B：farm 计数
+        # vs 400 格窗口级目标池，两者永久不一致）。窗口有目标时才允许 farm 级理由出现。
+        window_plantable = [t for t, v in tmap.items()
+                            if v.get("plantable") is True and not v.get("crop")
+                            and t not in self.blocked]
+        # 人不在农场时"先回去"本身是可执行动作（与上面 dry/ripe 的离场口径一致）⇒ 允许；
+        # 人在农场才用"窗口真有目标"卡住它（否则就是 0.7.41 冒烟 day1 的 farm/窗口错配）。
+        farm_plant_reason_ok = (not self._is_farm(obs)) or bool(window_plantable)
         if ripe and not bag_blocked:
             reasons.append(f"有 {len(ripe)} 格作物熟了")
         seeds, money, can_plant = self._seed_outlook(obs)
@@ -4361,9 +4407,13 @@ class LongRun:
             # 雨天作物被浇好之后，run9c 只剩这一条能说明"地里还有活"。
             # 【task-163】`plant_area` 被体力预算延后时这条**也不算活**（今天不打算种）。
             _hoe_f, empty_f, seeds_f = plot_work
-            if empty_f > 0 and seeds_f > 0:
+            # 【task-240 ③】人**在农场**且窗口没有可执行目标 ⇒ farm 计数**不许**变成
+            # "该去种/该去买"（farm 计数 vs 400 格窗口目标池错配 = 根因 B）；人不在农场时
+            # 例外：先回农场是可执行动作（与 batch 里 dry/ripe 的离场口径一致）。
+            if empty_f > 0 and seeds_f > 0 and farm_plant_reason_ok:
                 reasons.append(f"farm 口径还有 {empty_f} 格耕地空着（手上有 {seeds_f} 粒种子）⇒ 该去种")
-            elif empty_f > 0 and seeds <= 0 and can_plant and not self.seed_dead_today:
+            elif (empty_f > 0 and seeds <= 0 and can_plant and not self.seed_dead_today
+                  and farm_plant_reason_ok):
                 reasons.append(f"farm 口径还有 {empty_f} 格耕地空着、但没种子；"
                                f"钱够（{money}g），该去买")
         # 【task-49】人在农场里时也要看全农场读数：窗口只有半径 ~14，农场另一头的干作物
@@ -4835,6 +4885,22 @@ class LongRun:
             if self._tool_upgrade_due(obs):
                 return False, "keep_working", "今天还有一件工具升级/取回要做（铁匠铺），先做完再收工"
             self.no_work_evidence_ok = True
+            # 【task-240】"没活"要说清是不是"有地、但手上的种子都隔季"：0.7.41 冒烟 day1
+            # 是冬天 + Wheat Seeds×10，旧口径宣称"手上有种子 ⇒ 该去种"，下地却 `no_seed`
+            # ⇒ 守卫/执行互相打脸、整天 stuck。这里把它变成**有证据的 `no_work`**
+            # （`no_work` 在 `JUSTIFIED_END_REASONS` ⇒ 当天可 VERIFIED；证据来自
+            # Mod `player.seeds[].plantableNow`，缺字段时 `metadata=False` 不进来）。
+            season_state = self._seed_season_state(obs)
+            if (season_state["metadata"] and int(season_state["plantable"]) <= 0
+                    and season_state["out_of_season"]):
+                plot_work = self._farm_plot_work(obs)
+                empty = int(plot_work[1]) if plot_work is not None else 0
+                names = "、".join(season_state["out_of_season"][:3])
+                extra = f"，而 farm 口径还有 {empty} 格耕地空着" if empty > 0 else ""
+                return True, "no_work", (
+                    f"当季（{season_state['season'] or '?'}）没有可种的种子："
+                    f"手上有 {names} 但都隔季{extra} ⇒ 今天没有可做的活"
+                    "（证据：Mod player.seeds[].plantableNow）")
             return True, "no_work", "确实找不到可做的活（地里的活干完了、也没法/没必要买种子）"
         return False, "keep_working", "；".join(reasons)
 
@@ -5628,7 +5694,13 @@ class LongRun:
         changed = False
         player = FarmWorker.player_of(obs)
         seeds_total = sum(n for _i, _nm, n in seed_items(player))
-        if seeds_total > 0:
+        # 【task-240】早退判据从"背包有没有种子"改成"有没有**当季可种**的种子"：
+        # 冬天拿着 Wheat Seeds×10（`plantableNow=false`）时若按老口径早退，就会整天
+        # "有种子却不种/也不买"；而这时**该买**（商店货架是按季节出的）。
+        # 旧 Mod（没有 `player.seeds[]`）⇒ `plantable` 退回总堆叠 ⇒ 行为不变。
+        season_state = self._seed_season_state(obs)
+        plantable = int(season_state["plantable"]) if season_state["metadata"] else seeds_total
+        if plantable > 0:
             return False
         assert self.worker is not None
         money = FarmWorker.money(obs)
@@ -6309,10 +6381,23 @@ class LongRun:
         # 不是原因）。只播报一次，别每轮刷屏。
         if task in ("till_area", "plant_area") and task not in self.seed_gate_noted:
             seeds, money, can_plant = self._seed_outlook(obs)
+            # 【task-240】把"当季能不能种"的完整证据写进同一事件（不新增事件名）：
+            # 0.7.41 冒烟 day1 的形态是"冬天拿着 Wheat Seeds×10"——`seeds` 现在是
+            # **当季可种**数（旧 Mod 缺 `player.seeds[]` 时退回总堆叠），
+            # `seeds_total`/`out_of_season`/`seeds_metadata` 用来在账本里区分
+            # "真没种子" / "有种子但全隔季" / "旧 Mod 判不了"。
+            season_state = self._seed_season_state(obs)
             if not can_plant:
                 self.seed_gate_noted.add(task)
-                note = (f"没种子也没钱（种子 {seeds} 粒、钱 {money}g < 单价 {self.seed_price}g）"
-                        f"⇒ 今天不再开垦/播种：{task} 没有目标（锄了也种不下去 = 纯烧体力）")
+                if (season_state["metadata"] and int(season_state["plantable"]) <= 0
+                        and season_state["out_of_season"]):
+                    names = "、".join(season_state["out_of_season"][:3])
+                    note = (f"当季（{season_state['season'] or '?'}）没有可种的种子："
+                            f"手上有 {names} 但都隔季（可种 {seeds} 粒、钱 {money}g）"
+                            f"⇒ 今天不再开垦/播种：{task} 没有目标")
+                else:
+                    note = (f"没种子也没钱（种子 {seeds} 粒、钱 {money}g < 单价 {self.seed_price}g）"
+                            f"⇒ 今天不再开垦/播种：{task} 没有目标（锄了也种不下去 = 纯烧体力）")
                 rep.notes.append(note)
                 self._say(f"  · {note}")
                 # task-15 §③：`in_plot` = 撞上这道闸门时**人是不是已经在作业区里**。
@@ -6323,7 +6408,12 @@ class LongRun:
                 pt = FarmWorker.player_tile(obs)
                 in_plot = pt is not None and tuple(pt) in {tuple(t) for t in plot["tiles"]}
                 self._journal("seed_gate", stage=task, seeds=seeds, money=money,
-                              seed_price=self.seed_price, zone=self.zone_name, in_plot=in_plot)
+                              seed_price=self.seed_price, zone=self.zone_name, in_plot=in_plot,
+                              season=season_state["season"],
+                              seeds_metadata=season_state["metadata"],
+                              seeds_total=season_state["seeds_total"],
+                              plantable=season_state["plantable"],
+                              out_of_season=season_state["out_of_season"])
         # 【task-51】清死苗阶段：把"窗口里看得见几格"与"农场口径总共还剩几格"一起记下来。
         # 为什么必须有：窗口（`OBSERVE_REACH` 半径）外的死苗**没有坐标**（Mod 只给
         # `farm.deadCrops` 计数）⇒ 本卡清不到；但绝不许把"看不见"说成"没有了"。

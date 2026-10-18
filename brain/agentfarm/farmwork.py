@@ -91,6 +91,9 @@ __all__ = [
     "is_unreachable",
     "pick_seed_offer",
     "seed_items",
+    "plantable_seeds",
+    "seed_season_state",
+    "has_seed_metadata",
     "seed_offers_from",
     "slot_relief_plan",
     "surplus_sell_plan",
@@ -907,6 +910,93 @@ def seed_items(player: dict[str, Any]) -> list[tuple[str, str, int]]:
         out.append((sid, name, stack))
     out.sort(key=lambda t: (-t[2], t[0]))
     return out
+
+
+def has_seed_metadata(player: dict[str, Any]) -> bool:
+    """【task-240】观测里有没有 Mod 新报的种子明细（`player.seeds[]`）。
+
+    **必须单独判"有没有字段"**：空列表 ≠ 没种子 —— 旧 Mod 不报这个数组，若把"缺字段"
+    当成"背包没种子"，守卫会宣称"该去买"、而买完仍然种不下（0.7.41 冒烟 day1 的冬天
+    小麦是同一类错判）。旧 Mod ⇒ 退回 `seed_items()` 的老口径。
+    """
+    return isinstance(player.get("seeds"), list)
+
+
+def plantable_seeds(player: dict[str, Any]) -> list[dict[str, Any]]:
+    """【task-240】Mod 报的种子明细（`player.seeds[]`，逐条含 `seasons`/`plantableNow`）。
+
+    缺字段（旧 Mod）⇒ 空列表（调用点先用 `has_seed_metadata()` 区分"没报"与"没种子"）。
+    `plantableNow` 三态：`true` 当季可种 / `false` 隔季 / `null` 判不了（fail-closed：
+    既不算"能种"，也不算"隔季"）。
+    """
+    raw = player.get("seeds")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for it in raw:
+        if not isinstance(it, dict):
+            continue
+        try:
+            stack = int(it.get("stack") or 0)
+        except (TypeError, ValueError):
+            stack = 0
+        out.append({
+            "id": str(it.get("id") or ""),
+            "name": str(it.get("name") or ""),
+            "stack": stack,
+            "seasons": it.get("seasons"),
+            "plantable_now": it.get("plantableNow"),
+        })
+    return out
+
+
+def seed_season_state(player: dict[str, Any], season: str) -> dict[str, Any]:
+    """【task-240】当季"能不能种"的三态聚合（0.7.41 冒烟 day1：冬天拿小麦宣称"该去种"）。
+
+    返回字段：
+
+    * `metadata` —— 观测里有没有 `player.seeds[]`（False = 旧 Mod，`can_plant` 退回老口径）；
+    * `season` —— 当前季节名（小写；空串 = 认不出）；
+    * `seeds_total` —— 背包种子的**总堆叠**（老口径，含隔季）；
+    * `plantable` —— `plantableNow is True` 的堆叠数（`can_plant` 的真判据）；
+    * `plantable_stacks` —— 其中"整叠可种"的条目数（与 `plantable` 同值，便于播报）；
+    * `out_of_season` —— 明确隔季的种子名（去重、保序；用于"手上有 N 粒但都隔季"的如实文案）；
+    * `unknown` —— `plantableNow is null` 的堆叠数（判不了 ⇒ 不宣称能种）；
+    * `can_plant` —— `plantable > 0`；旧 Mod ⇒ `seeds_total > 0`（fail-open 只在"没有新字段"时）。
+
+    为什么 `unknown` 不算能种：`plantableNow` 为 null 表示"Mod 判不了这一条"，
+    拿它当"能种"会重复 0.7.41 的错误（宣称该去种、下地却 `no_seed`）；当"隔季"又会
+    在真的能种时白丢一天。诚实做法是既不算、也不拦：把它留给 `_preconditions` 的买种逻辑。
+    """
+    seeds = plantable_seeds(player)
+    stack_total = sum(int(it["stack"]) for it in seeds) if seeds else 0
+    meta = has_seed_metadata(player)
+    plantable = 0
+    out_of_season: list[str] = []
+    unknown = 0
+    for it in seeds:
+        stack = int(it["stack"])
+        if stack <= 0:
+            continue
+        flag = it.get("plantable_now")
+        if flag is True:
+            plantable += stack
+        elif flag is False:
+            name = str(it.get("name") or it.get("id") or "")
+            if name and name not in out_of_season:
+                out_of_season.append(name)
+        else:
+            unknown += stack
+    return {
+        "metadata": meta,
+        "season": str(season or "").strip().lower(),
+        "seeds_total": stack_total if meta else sum(n for _i, _nm, n in seed_items(player)),
+        "plantable": plantable,
+        "plantable_stacks": plantable,
+        "out_of_season": out_of_season,
+        "unknown": unknown,
+        "can_plant": (plantable > 0) if meta else (sum(n for _i, _nm, n in seed_items(player)) > 0),
+    }
 
 
 def farm_dry_tiles(obs: dict[str, Any]) -> tuple[list[tuple[int, int]], str]:

@@ -26,7 +26,7 @@ from agentfarm.farmwork import (  # noqa: E402
     NEIGHBORS, NO_SLOT_CODE, FarmWorker, KIND_TOOL, LOOT_CONFIRM_TRIES, LOOT_CONFIRM_WAIT_S,
     MAX_CLEAR_SWINGS, StepResult as SR, StageResult,
     SURPLUS_MATERIAL_IDS, buy_count_for, farm_dead_crops, farm_dry_dead_crops, farm_dry_tiles,
-    farm_empty_dirt, is_seed_offer,
+    farm_empty_dirt, has_seed_metadata, is_seed_offer, plantable_seeds, seed_season_state,
     is_unreachable, pick_seed_offer, player_free_slots, seed_offers_from, surplus_sell_plan,
     SLOT_RELIEF_CROP_IDS, SLOT_RELIEF_HIGH_VALUE_IDS, SLOT_RELIEF_KEEP,
     SLOT_RELIEF_MATERIAL_IDS, SLOT_RELIEF_MAX_STACKS, SLOT_RELIEF_NEVER_SELL_IDS,
@@ -3600,6 +3600,61 @@ class TestTask232SlotReliefPlan(unittest.TestCase):
         plan = self._plan(inv)
         self.assertEqual(plan["items"], [])
         self.assertEqual(plan["slots"], [])
+
+
+class TestTask240SeedSeasons(unittest.TestCase):
+    """【task-240】`player.seeds[]` 的三态聚合（冬 + Wheat Seeds×10 的真形态）。"""
+
+    @staticmethod
+    def _player(seeds=None, inventory=None) -> dict:
+        p: dict = {"money": 0, "inventory": list(inventory or [])}
+        if seeds is not None:
+            p["seeds"] = seeds
+        return p
+
+    def test_season_state_splits_plantable_out_of_season_and_unknown(self):
+        p = self._player(seeds=[
+            {"id": "(O)472", "name": "Wheat Seeds", "stack": 10,
+             "seasons": ["spring", "summer", "fall"], "plantableNow": False},
+            {"id": "(O)184", "name": "Winter Seeds", "stack": 5,
+             "seasons": ["winter"], "plantableNow": True},
+            {"id": "(O)999", "name": "Mystery Seeds", "stack": 3,
+             "seasons": [], "plantableNow": None},
+        ])
+        state = seed_season_state(p, "winter")
+        self.assertTrue(state["metadata"])
+        self.assertEqual(state["season"], "winter")
+        self.assertEqual(state["seeds_total"], 18)
+        self.assertEqual(state["plantable"], 5)
+        self.assertEqual(state["out_of_season"], ["Wheat Seeds"])
+        self.assertEqual(state["unknown"], 3)
+        self.assertTrue(state["can_plant"])
+
+    def test_empty_metadata_list_is_not_the_same_as_missing_field(self):
+        missing = self._player(seeds=None, inventory=[
+            {"slot": 5, "id": "472", "qualifiedId": "(O)472",
+             "name": "Wheat Seeds", "stack": 10, "isTool": False},
+        ])
+        empty = self._player(seeds=[])
+        self.assertFalse(has_seed_metadata(missing))
+        self.assertTrue(has_seed_metadata(empty))
+        legacy = seed_season_state(missing, "winter")
+        self.assertFalse(legacy["metadata"])
+        self.assertEqual(legacy["seeds_total"], 10)
+        self.assertTrue(legacy["can_plant"], "旧 Mod 退回老口径（有种子 ⇒ 能种）")
+        new = seed_season_state(empty, "winter")
+        self.assertTrue(new["metadata"])
+        self.assertEqual(new["plantable"], 0)
+        self.assertFalse(new["can_plant"], "新 Mod 报空列表 ⇒ 真的没种子")
+
+    def test_plantable_seeds_normalizes_rows(self):
+        p = self._player(seeds=[{"id": "(O)472", "name": "Wheat Seeds", "stack": "10",
+                                 "seasons": ["spring"], "plantableNow": True}])
+        rows = plantable_seeds(p)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["stack"], 10)
+        self.assertTrue(rows[0]["plantable_now"])
+        self.assertEqual(plantable_seeds(self._player(seeds=None)), [])
 
 
 if __name__ == "__main__":  # pragma: no cover

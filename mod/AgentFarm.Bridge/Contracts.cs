@@ -233,6 +233,53 @@ namespace AgentFarm.Bridge
         [JsonPropertyName("knownRecipesTruncated")]
         [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
         public bool? KnownRecipesTruncated { get; set; }
+
+        // ---- 【task-240】观测面：背包里的种子 + 它们各自的**季节语义**（只读）----
+
+        /// <summary>
+        /// **task-240 新增**：背包里**种子类**物品及"当季能不能种"（`Data/Crops` 的
+        /// `CropData.Seasons` → `SeedRules.PlantableNow`）。
+        ///
+        /// 【为什么必须有】0.7.41 冒烟 day 1（冬季 1 日）里，脑侧只看得见"背包有 10 粒
+        /// Wheat Seeds" ⇒ 守卫宣称「该去种」⇒ 而小麦冬季不可种 ⇒ 全天 0 目标 ⇒ `stuck`。
+        /// 季节是**游戏数据**（`Data/Crops`），脑侧离线读不到，只能由 Mod 摊开。
+        ///
+        /// 【三态可辨】整个 `seeds` 键缺失（旧 Mod）/`null`（读不到）/空数组（背包真没种子）；
+        /// 每一行的 `seasons`：`null` = 读不到（判不了）、`[]` = 读到但无季节信息；
+        /// 每一行的 `plantableNow`：`null` = 判不了（**不是** `false`）。
+        ///
+        /// 【纪律】只读观测面：不进任何技能判据，也不改变 `items[]` 的口径。
+        /// </summary>
+        [JsonPropertyName("seeds")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+        public PlayerSeedView[] Seeds { get; set; }
+    }
+
+    /// <summary>
+    /// 【task-240】背包里的一项**种子**：足以回答"当季能不能种"。
+    ///
+    /// `plantableNow` 的三态是最要紧的一条：`true` 能种 / `false` 不能种 / `null` 判不了。
+    /// 脑侧**只把 `false` 当"不能种"**，`null` 一律退回旧行为（当作"有种子"）——
+    /// 判不了就下"不能种"的结论会把该干的活漏掉（反向事故）。
+    /// </summary>
+    internal sealed class PlayerSeedView
+    {
+        [JsonPropertyName("id")] public string Id { get; set; }
+
+        [JsonPropertyName("name")] public string Name { get; set; }
+
+        [JsonPropertyName("stack")] public int Stack { get; set; }
+
+        /// <summary>`CropData.Seasons` 的规范化小写名（`spring/summer/fall/winter`）。
+        /// `null` = 读不到（判不了）；`[]` = 读到但该作物没有季节信息。</summary>
+        [JsonPropertyName("seasons")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+        public string[] Seasons { get; set; }
+
+        /// <summary>`SeedRules.PlantableNow(seasons, 当前季节)`：`true`/`false`/`null`（判不了）。</summary>
+        [JsonPropertyName("plantableNow")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+        public bool? PlantableNow { get; set; }
     }
 
     /// <summary>

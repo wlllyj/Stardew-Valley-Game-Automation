@@ -58,6 +58,9 @@
          事件 pause 的重试策略 / 连续 stalled 的放弃阈值）⇒ 同样直接编译同一份源码跑行为断言。
          技能本体吃 DialogueBox/Game1 类型，判据留在技能里就只能做源码文本断言（task-182 GAP-1 教训）。 -->
     <Compile Include="..\AgentFarm.Bridge\DialogueAdvanceRules.cs" />
+    <!-- task-240：种子季节判定（"有种子" ≠ "当季能种"）是纯逻辑 ⇒ 直接编译同一份源码跑行为断言；
+         0.7.41 冒烟 day1 的 `stuck` 就是这条判据缺失（小麦冬季不可种、守卫却一直说该去种）。 -->
+    <Compile Include="..\AgentFarm.Bridge\SeedRules.cs" />
   </ItemGroup>
 
 </Project>

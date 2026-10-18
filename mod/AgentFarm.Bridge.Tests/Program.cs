@@ -598,6 +598,31 @@ namespace AgentFarm.Bridge.Tests
                   && Array.IndexOf(SkillCatalog.LongTask, "advance_dialogue") >= 0,
                   "advance_dialogue 必须同时进 SkillCatalog.Executable 与 LongTask（跨 tick 等 safetyTimer/pause）");
 
+            // ---- task-240：种子季节判定（"有种子" ≠ "当季能种"）----
+            Check("t240_season_normalization",
+                  SeedRules.NormalizeSeason(" Spring ") == "spring"
+                  && SeedRules.NormalizeSeason("WINTER") == "winter"
+                  && SeedRules.NormalizeSeason("") == ""
+                  && SeedRules.NormalizeSeason("monsoon") == ""
+                  && SeedRules.NormalizeSeasons(null) == null
+                  && SeedRules.NormalizeSeasons(new[] { "summer", "Spring", "bogus" }).Length == 2,
+                  "季节名归一小写；认不出的名字丢弃（不猜）；null 原样返回 null（读不到 ≠ 空列表）");
+
+            Check("t240_plantable_now_three_states",
+                  SeedRules.PlantableNow(new[] { "spring", "summer", "fall" }, "winter") == false
+                  && SeedRules.PlantableNow(new[] { "spring", "summer", "fall" }, "summer") == true
+                  && SeedRules.PlantableNow(null, "winter") == null
+                  && SeedRules.PlantableNow(new string[0], "winter") == null
+                  && SeedRules.PlantableNow(new[] { "spring" }, "monsoon") == null,
+                  "小麦（春/夏/秋）冬季 = false；当季命中 = true；无季节信息/季节读不到 = null（判不了，绝不当 false）");
+
+            Check("t240_wheat_seeds_are_out_of_season_in_winter",
+                  SeedRules.PlantableNow(
+                      SeedRules.NormalizeSeasons(new[] { "spring", "summer", "fall" }), "winter") == false
+                  && SeedRules.DescribeSeasons(SeedRules.NormalizeSeasons(new[] { "spring", "summer", "fall" }))
+                     == "spring,summer,fall",
+                  "0.7.41 冒烟 day1 的真实形态：Wheat Seeds 在 winter 判 false（守卫据此闭嘴，诚实 no_work）");
+
             Console.WriteLine(_failed == 0
                 ? $"OK {_total} 断言全部通过"
                 : $"FAILED {_failed} 条断言不通过（共 {_total} 条）");

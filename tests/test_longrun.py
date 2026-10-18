@@ -143,6 +143,10 @@ class FakeWorld:
         self.buy_fail_status: str = ""
         #: 【task-102】背包容量（`player.inventoryCount`）；占格 = `len(inventory)` ⇒ 空格 = 差。
         self.inventory_capacity = 12
+        #: 【task-240】`player.seeds[]`（Mod 报的种子明细：`seasons`/`plantableNow`）。
+        #: `None` = **旧 Mod（整键缺失）** ⇒ 脑侧退回 `seed_items()` 老口径（"有种子就能种"）；
+        #: 显式 `[]` = 新 Mod 真的没种子。条目形状 `{id,name,stack,seasons,plantableNow}`。
+        self.player_seeds: list[dict] | None = None
         # 睡前那一刻"还有几格没浇" —— 跨日会把 watered 全部清零（世界语义），
         # 所以"这天有没有浇完"只能在睡前问，事后问必然为假。
         self.unwatered_at_sleep: list[int] = []
@@ -256,6 +260,9 @@ class FakeWorld:
                           if self.tool_upgrade_days_left is not None else {}),
                        # 【task-102】`inventoryCount` = 背包**容量**（真机 `WorldSnapshot.cs:260`
                        # 读 `p.Items.Count`）；空格 = `inventoryCount - len(inventory)`。
+                       # 【task-240】`player.seeds[]`（新 Mod 才有；`None` ⇒ 整键缺失 = 旧 Mod）。
+                       **({"seeds": [dict(s) for s in self.player_seeds]}
+                          if self.player_seeds is not None else {}),
                        "inventoryCount": self.inventory_capacity,
                        "wateringCan": {"present": True, "waterLeft": self.water_left,
                                        "max": 40, "bottomless": False, "upgradeLevel": 0}},
@@ -7781,17 +7788,22 @@ class TestTask149FarmPlotWorkAndOffFarm(unittest.TestCase):
         return w
 
     def test_rain_day_empty_dirt_with_seeds_is_not_no_work(self):
-        """雨日 + 有种子 + 有空耕地 ⇒ 必须给出"该去种"的活，不许 `no_work`。"""
+        """雨日 + 有种子 + 有空耕地 ⇒ 当天照样有活，不许 `no_work`。
+
+        【task-240 ③】窗口里**没有**可种目标（唯一一格已种作物）、空耕地在 farm 另一头 ⇒
+        farm 级「耕地空着 ⇒ 该去种」**不再宣称**（那正是 0.7.41 冒烟 day1 的错配：守卫说
+        该去种、目标池 0 格）。但窗口里还有可开垦的耕地 ⇒ 当日仍有可执行活，不许 `no_work`。
+        """
         w = self._farm_world(seeds=5, money=100)
         w.farm = self._summary()
         run = make_run(w)
         obs = w.obs()
         reasons = run.work_reasons(obs)
-        self.assertTrue(any("耕地空着" in r for r in reasons), reasons)
+        self.assertFalse([r for r in reasons if "耕地空着" in r], reasons)
+        self.assertTrue(reasons, "窗口仍有可开垦目标 ⇒ 不能宣称没活")
         allow, code, text = run.sleep_guard(obs)
         self.assertFalse(allow, (code, text))
         self.assertEqual(code, "keep_working")
-        self.assertIn("耕地空着", text)
 
     def test_missing_empty_dirt_is_fail_closed(self):
         """`emptyDirt` 缺失 ⇒ 证据不可用 ⇒ fail-closed（未知 ≠ 没活）。"""
@@ -11727,6 +11739,169 @@ class TestTask236CleanupGuard(unittest.TestCase):
         finish_rows = [e for e in run.entries if e["event"] == "finish"]
         self.assertEqual(len(finish_rows), 1)
         self.assertIs(finish_rows[0]["cleanup_modal_stuck"], False)
+
+
+class TestTask240SeedSeasons(unittest.TestCase):
+    """【task-240】冬天手里的小麦不该被当成"该去种"（0.7.41 冒烟 day1 真形态）。
+
+    真机形态：冬季 + `Wheat Seeds×10` + farm 口径还有空耕地 ⇒ 旧口径宣称"手上有 10 粒
+    ⇒ 该去种"，下地却 `no_seed`（小麦不在 winter）⇒ 守卫与执行层互相打脸、整天 stuck。
+    判据 = Mod 新报的 `player.seeds[]`（逐条 `seasons`/`plantableNow`）：
+      * `plantableNow is True` ⇒ 当季可种（计入"该去种"）；
+      * `False` ⇒ 隔季（**不**算活，但要有证据）；
+      * `None` ⇒ 判不了（既不算能种、也不算隔季）；
+      * **整键缺失（旧 Mod）** ⇒ 退回 `seed_items()` 老口径，不许把"没字段"读成"没种子"。
+    """
+
+    @staticmethod
+    def _seed(qid: str, name: str, stack: int, seasons: list[str], plantable) -> dict:
+        return {"id": qid, "name": name, "stack": stack,
+                "seasons": list(seasons), "plantableNow": plantable}
+
+    def _winter_world(self) -> FakeWorld:
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.season = "winter"
+        w.dirt = {(60, 10)}                     # 一格空耕地（farm 口径 emptyDirt=1）
+        w.farm = w.farm_scan()
+        return w
+
+    def _run(self, w: FakeWorld):
+        run = make_run(w, allow_buy=False)
+        run.client = FakeClient(w)
+        run.worker = FakeWorker(w)
+        return run
+
+    def test_winter_wheat_is_not_claimed_as_work(self):
+        w = self._winter_world()
+        w.player_seeds = [self._seed("(O)472", "Wheat Seeds", 10,
+                                     ["spring", "summer", "fall"], False)]
+        run = self._run(w)
+        obs = w.obs()
+        seeds, _money, can = run._seed_outlook(obs)
+        self.assertEqual(seeds, 0, "隔季种子不算当季可种")
+        self.assertFalse(can)
+        reasons = run.work_reasons(obs)
+        self.assertFalse([r for r in reasons if "该去种" in r or "手上有" in r], reasons)
+        allow, code, text = run.sleep_guard(obs)
+        self.assertTrue(allow)
+        self.assertEqual(code, "no_work")
+        self.assertIn("都隔季", text)
+        self.assertIn("winter", text)
+
+    def test_plantable_seeds_still_drive_plant_work(self):
+        w = self._winter_world()
+        w.player_seeds = [self._seed("(O)184", "Winter Seeds", 10, ["winter"], True)]
+        run = self._run(w)
+        obs = w.obs()
+        seeds, _money, can = run._seed_outlook(obs)
+        self.assertEqual(seeds, 10)
+        self.assertTrue(can)
+        reasons = run.work_reasons(obs)
+        self.assertTrue(any("该去种" in r for r in reasons), reasons)
+
+    def test_old_mod_without_seed_metadata_keeps_legacy_behavior(self):
+        w = self._winter_world()
+        w.player_seeds = None                    # 旧 Mod：`player.seeds[]` 整键缺失
+        # 背包里真有一叠种子（默认 seeds=0 只是"种子堆叠 0"的占位行，seed_items 会过滤掉）
+        w.inventory[3]["stack"] = 7
+        run = self._run(w)
+        obs = w.obs()
+        seeds, _money, can = run._seed_outlook(obs)
+        self.assertGreater(seeds, 0, "旧 Mod 退回 seed_items()：背包里有种子就算有")
+        self.assertTrue(can)
+        reasons = run.work_reasons(obs)
+        self.assertTrue(any("该去种" in r for r in reasons), reasons)
+
+    def test_unknown_plantable_flag_is_not_treated_as_out_of_season(self):
+        w = self._winter_world()
+        w.player_seeds = [self._seed("(O)472", "Mystery Seeds", 10, [], None)]
+        run = self._run(w)
+        obs = w.obs()
+        seeds, _money, _can = run._seed_outlook(obs)
+        self.assertEqual(seeds, 0, "判不了的 plantableNow 不许算当季可种")
+        allow, code, text = run.sleep_guard(obs)
+        self.assertTrue(allow)
+        self.assertEqual(code, "no_work")
+        self.assertNotIn("都隔季", text, "判不了 ≠ 隔季，不能编造理由")
+
+    def test_seed_gate_journal_carries_season_evidence(self):
+        w = self._winter_world()
+        w.player_seeds = [self._seed("(O)472", "Wheat Seeds", 10,
+                                     ["spring", "summer", "fall"], False)]
+        run = self._run(w)
+        obs = w.obs()
+        plot = {"anchor": [60, 10], "tiles": [[60, 10]], "zone": ""}
+        rep = run._new_report() if hasattr(run, "_new_report") else None
+        if rep is None:
+            from agentfarm.longrun import DayReport
+            rep = DayReport(day_key=("winter", 1, 18), started_at=0.0)
+        run._step_stage("plant_area", obs, plot, rep)
+        rows = [e for e in run.entries if e["event"] == "seed_gate"]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["season"], "winter")
+        self.assertIs(row["seeds_metadata"], True)
+        self.assertEqual(row["plantable"], 0)
+        self.assertEqual(row["seeds_total"], 10)
+        self.assertEqual(row["out_of_season"], ["Wheat Seeds"])
+        self.assertTrue(any("都隔季" in note for note in rep.notes), rep.notes)
+
+    def test_winter_day_with_out_of_season_seeds_ends_as_an_honest_no_work(self):
+        # 离线夹具 = `logs/longrun-smoke-0741.jsonl` day1 真形态：冬季 1 日、农场 0 作物、
+        # 背包 Wheat Seeds×10、farm 口径 29 格空耕地（窗口里一格目标都没有）。
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.season = "winter"
+        w.day = 1
+        w.farm = {"loaded": True, "complete": True, "crops": 0, "ripeCrops": 0,
+                  "readyCrops": 0, "deadCrops": 0, "dryCrops": 0, "dryDeadCrops": 0,
+                  "dryTiles": [], "dryTilesTruncated": False, "unwateredCrops": 0,
+                  "hoeDirt": 29, "emptyDirt": 29}
+        w.player_seeds = [self._seed("(O)472", "Wheat Seeds", 10,
+                                     ["spring", "summer", "fall"], False)]
+        run = self._run(w)
+        self.assertEqual(run.work_reasons(w.obs()), [],
+                         "窗口没有可种目标 + 种子全隔季 ⇒ 守卫不许说还有活")
+        run.run()
+        self.assertEqual(len(run.days), 1)
+        day = run.days[0]
+        self.assertEqual(day.ended_by, "sleep")
+        self.assertTrue(str(day.ended_reason).startswith("no_work"), day.ended_reason)
+        self.assertNotIn("stuck", str(day.ended_reason))
+        self.assertTrue(day.verified, day.checks)
+        self.assertIs(run.no_work_evidence_ok, True)
+
+    def test_farm_level_plant_reason_needs_a_window_target(self):
+        """【task-240 ③】当季种子够、farm 口径也有空耕地，但**窗口里一格目标都没有** ⇒
+        farm 计数不许变成「该去种」（farm 计数 vs 400 格窗口目标池错配，冒烟 day1 根因 B）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.season = "winter"
+        w.day = 3
+        w.farm = {"loaded": True, "complete": True, "crops": 0, "ripeCrops": 0,
+                  "readyCrops": 0, "deadCrops": 0, "dryCrops": 0, "dryDeadCrops": 0,
+                  "dryTiles": [], "dryTilesTruncated": False, "unwateredCrops": 0,
+                  "hoeDirt": 29, "emptyDirt": 29}
+        w.player_seeds = [self._seed("(O)184", "Winter Seeds", 5, ["winter"], True)]
+        run = self._run(w)
+        obs = w.obs()
+        self.assertFalse([t for t, v in FarmWorker.tiles_of(obs).items()
+                          if v.get("plantable") is True], "前提：窗口里没有可种目标")
+        reasons = run.work_reasons(obs)
+        self.assertFalse([r for r in reasons if "耕地空着" in r], reasons)
+
+    def test_zero_plant_target_evidence_names_out_of_season(self):
+        w = self._winter_world()
+        w.player_seeds = [self._seed("(O)472", "Wheat Seeds", 10,
+                                     ["spring", "summer", "fall"], False)]
+        run = self._run(w)
+        plot = {"anchor": [60, 10], "tiles": [[60, 10]], "zone": ""}
+        ev = run._no_target_evidence("plant_area", w.obs(), plot)
+        self.assertIsNotNone(ev)
+        self.assertIs(ev["stage_tiles_empty"], True)
+        self.assertEqual(ev["why"], "seed_out_of_season")
+        self.assertEqual(ev["season"], "winter")
+        self.assertEqual(ev["seeds_total"], 10)
+        self.assertEqual(ev["out_of_season"], ["Wheat Seeds"])
+        self.assertIs(ev["seeds_metadata"], True)
 
 
 if __name__ == "__main__":  # pragma: no cover
