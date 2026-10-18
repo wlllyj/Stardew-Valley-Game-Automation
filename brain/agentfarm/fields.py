@@ -38,6 +38,7 @@ from typing import Any
 
 __all__ = [
     "BLOCKER_KINDS",
+    "ZONE_BLOCKER_KINDS",
     "TILE_CAP",
     "TILLABLE_CAP",
     "Zone",
@@ -52,6 +53,10 @@ __all__ = [
 
 #: 需要"先清理再谈耕种"的格：Mod 观测里 kind 的取值（协议 §5）。
 BLOCKER_KINDS = frozenset({"weed", "stone", "twig", "tree", "bush"})
+
+#: 作业区/田区"待清理"口径：在 BLOCKER_KINDS 基础上并入 ResourceClump（树桩/圆木/巨石/石堆/绿雨碎屑）。
+#: 与 farmwork.CLUMP_KINDS 中需清理的项保持一致；toolOk 门控在执行层处理，这里只做计数口径。
+ZONE_BLOCKER_KINDS = frozenset(BLOCKER_KINDS | {"stump", "log", "boulder", "rockPile", "greenRain"})
 
 #: Mod 侧的上限（协议 §5）：达到上限说明快照只是"附近的一片"，不是整个农场。
 TILE_CAP = 400
@@ -69,7 +74,7 @@ class Zone:
     label: str                         # 中文标签，如 "农场西北田区"
     bounds: tuple[int, int, int, int]  # x0, y0, x1, y1（闭区间，游戏格坐标）
     tillable: int                      # 该区里可锄格数（来自 location.tillable[]，不猜）
-    blockers: int                      # 该区里待清理的格数（kind ∈ BLOCKER_KINDS）
+    blockers: int                      # 该区里待清理的格数（kind ∈ ZONE_BLOCKER_KINDS）
     crops: int                         # 该区里已有作物的格数
     unwatered: int                     # 该区里"有作物且 watered=False"的格数
     distance: int                      # 该区中心到玩家的曼哈顿距离
@@ -312,7 +317,7 @@ def zones_from_observe(obs: dict, *, split: int = 2) -> list[Zone]:
         for xy, tv in tiles.items():
             if not (x0 <= xy[0] <= x1 and y0 <= xy[1] <= y1):
                 continue
-            if tv.get("kind") in BLOCKER_KINDS:
+            if tv.get("kind") in ZONE_BLOCKER_KINDS:
                 blockers += 1
             if _crop_id(tv) is not None:
                 crops += 1
@@ -478,7 +483,7 @@ def plot_in_zone(zone: Zone, obs: dict, *, size: int = 5) -> dict:
             tv = tiles.get(c)
             if c in till:                      # tillable = 能锄出耕地的空格，优先按它归类
                 t_in.append(c)
-            elif tv is not None and tv.get("kind") in BLOCKER_KINDS:
+            elif tv is not None and tv.get("kind") in ZONE_BLOCKER_KINDS:
                 b_in.append(c)
             if tv is not None and _crop_id(tv) is not None:
                 c_in.append(c)
