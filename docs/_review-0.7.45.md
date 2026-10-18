@@ -11,7 +11,7 @@
 
 | 问题 | 回答 |
 | --- | --- |
-| task-15 + task-16 + task-22 合并代码面 | **PASS-WITH-NITS**：判据链、背包链路、malformed fail-closed 三块均成立；作者 11/12 条已跑变异实测被杀（t15 脚本 2 条锚点过期，见 §5.1）；我方 11 条独立变异 **11/11 实测被杀** |
+| task-15 + task-16 + task-22 合并代码面 | **PASS-WITH-NITS**：判据链、背包链路、malformed fail-closed 三块均成立；作者脚本可执行的 **10/12** 条变异实测被杀（t15 另 2 条锚点过期未执行，见 §5.1）；我方 11 条独立变异 **11/11 实测被杀** |
 | 0.7.45 能否放行 **smoke-0745 重冒烟** | **可以放行**：冻结树 provenance 744/744、版本载体 0.7.45、定向 Ran 19 OK、全量 **Ran 1324 / OK**、py_compile rc=0、malformed 一票否决在所有白名单之前；0.7.44 冒烟两个 FAIL 形态在账本重放中已转 PASS（B2a2/B2b2） |
 | 能否放行 **A9/B9** | **不能仅凭本报告放行**：代码面/离线判据已绿，但硬门禁未过——`smoke-0745` 真机 ≥1 天 `verified=true` 未跑；0.7.44 两种 `day_justified=false` 形态须在真机账本上实际转 true；A9 账本必须 already 双列（NIT-4） |
 | 差什么 | ① `smoke-0745` 真机 ≥1 天 VERIFIED（0.7.44 两个 FAIL 转 PASS） ② A9 判定并列读 `stages[].already/attempted_ok` ③ NIT-1/NIT-2 两条测试补强（不阻塞重冒烟） |
