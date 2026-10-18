@@ -36,7 +36,37 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.45"   # v0.7.45：诚实收工判据 + 背包满留痕/腾格 + 残缺 tile fail-closed
+MOD_VERSION_EXPECTED = "0.7.46"   # v0.7.46：A9 门禁批——真机冒烟（0.7.45 smoke）暴露的四形态 + 背包升级入口
+                                  # ①售材纪律（task-28）：`SURPLUS_MATERIAL_IDS` 收窄为 {92 Sap,766 Slime}，
+                                  #   建材/锭类（388 Wood/390 Stone/330 Clay/771 Fiber/382 Coal/378 Copper/
+                                  #   380 Iron/384 Gold/386 Iridium/909 Radioactive）永不卖；作物/晶石仍可卖；
+                                  #   `SELLABLE_SURPLUS_IDS` fail-closed，保留规则不变；
+                                  # ②inventory_blocked 证据门槛（task-28）：四门槛（free_slots==0 /
+                                  #   relief_exhausted 由卖单规则算出 / pending_executable==0 /
+                                  #   pending_malformed==0）全过才认诚实收工；`stuck:` 永不认；
+                                  #   满包清障有界 `CLEAR_LOOT_LOSS_MAX_STEPS=5`（结构性封顶、留痕
+                                  #   `slot_relief{trigger:"clear_gate"}`）；`day_end` 新字段 `relief_exhausted`/
+                                  #   `bag_evidence{…loot_lost_steps/loot_lost_limit}`；
+                                  # ③回片区预算（task-26）：`resume_walks` 只数走成、`resume_walk_attempts`
+                                  #   另计（2×上限）；`resume_exhausted` 仅 `pending_executable==0` 时认，
+                                  #   否则写 `resume_budget_exhausted:`（不进白名单，day_justified=false）；
+                                  # ④挡死格证据口径（task-27）：目标池前置过滤 `_known_enclosed`
+                                  #   （四邻全观测、无一可站、无可清障够得着）＋执行层 `_observed_foothold`
+                                  #   （观测到落脚点才算"本该可达"），无证据的归 encircled 不进 unreachable；
+                                  #   判死格仍进 assigned_undone（不洗成没活）；`unreachable_within_bound`
+                                  #   公式与 20% 未动；新 stage 字段 encircled_attempted/prefiltered；
+                                  #   `day_end`/`no_progress_burst` 增 `pending_executable_tiles[:8]`/
+                                  #   `pending_stalled_tiles[:8]`；
+                                  # ⑤Mod talk 原语（task-33，Mod）：`talk {"npc":"Pierre"}` 按名找角色 →
+                                  #   相邻校验（不满足回 `not_adjacent`+npcTile）→ 调游戏 `NPC.checkAction`；
+                                  #   禁合成键鼠、禁改 Money/Items/MaxItems；
+                                  # ⑥背包升级对话购买（task-25）：`talk Pierre` → `dismiss_modal{answerText:
+                                  #   "Purchase"}` → 双差分（钱−2000 且 inventoryCount 12→24）才算成功；
+                                  #   每天 ≤2 次失败、流程 ≤90s、Town 事件卡死 `event_hang` + load_save 自愈；
+                                  #   journal 复用 `buy`（source=backpack_dialogue）无新事件名；
+                                  # checks 10 键语义与 `no_unmet_stages`/护栏 B 公式不变。
+                                  # --- 历史 ---
+                                  # v0.7.45：诚实收工判据 + 背包满留痕/腾格 + 残缺 tile fail-closed
                                   # （0.7.44 真机冒烟 FAIL 暴露：冬26/27 诚实收工日被守卫累积账本误判）——
                                   # ①诚实收工判据（task-15）：`_pending_work()` 剔 `resume_stall_tiles`/
                                   #   `encircled_day`，原始账本口径另存 `_ledger_pending()`；`_pending_snapshot`

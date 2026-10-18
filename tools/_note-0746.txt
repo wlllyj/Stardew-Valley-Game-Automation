@@ -1,0 +1,9 @@
+v0.7.46（2026-10-18）— A9 门禁批：真机冒烟暴露的四个新形态 + 背包升级入口
+1. 售材白名单收口（task-28）：建材/锭类（Wood 388/Stone 390/Clay 330/Fiber 771/Coal 382/Copper 378/Iron 380/Gold 384/Iridium 386/Radioactive 909）移出可卖；仅 Sap/Slime 与作物/晶石可卖。
+2. inventory_blocked 诚实收工证据门槛（task-28）：free_slots==0 + relief_exhausted + pending_executable==0 + pending_malformed==0 才认；stuck: 永不认。
+3. 满包清障有界（task-28）：free_slots==0 且 relief_exhausted 时不再新开 clear_area；loot_lost_steps ≤ 5 结构性封顶并留痕。
+4. 回片区预算与收工理由自洽（task-26）：resume_walks 只数走成、attempts 另计；resume_exhausted 仅 pending_executable==0 时认，否则写 resume_budget_exhausted（不进白名单）。
+5. 挡死格证据口径（task-27）：目标池前置过滤 _known_enclosed + 执行层 _observed_foothold，挡死格归 encircled 不进 unreachable；判死格仍进 assigned_undone；bound 公式未动。
+6. Mod 新原语 talk（task-33）：按 NPC 名找角色 → 相邻校验 → 调游戏 NPC.checkAction 开对话；禁合成键鼠、禁改 Money/Items/MaxItems。
+7. 背包升级对话式购买（task-25）：talk Pierre → dismiss_modal{answerText:"Purchase"} → 观测差分（钱−2000 且 inventoryCount 12→24）；含事件卡死自愈。
+冻结前置（A9 硬门禁）：`dotnet build -c Release --no-incremental` 重建并核 bin\Release dll 哈希后再 deploy；check-release 六项全绿；smoke-0746 六条门禁全满足才放行 A9/B9。
