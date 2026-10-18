@@ -18,7 +18,7 @@
 - 关键新事实：
   1. **12 格背包结构性死锁**：`inventoryCount=12`（未买背包升级），12 格全占（5 工具 + Acorn/Maple Seed/Copper Ore/Stone/Hay/Coal/Wheat Seeds），按纪律无可腾格项 ⇒ 清障掉落永久丢（冬27 205/210 步）。钱 3264 已够 2000g 背包升级。
   2. **售材违反纪律**：slot_relief 真卖了 (O)388 Wood×5 笔、(O)330 Clay×3、(O)92 Sap、(O)262 Wheat×5、(O)535 Geode×3（全走 shipping bin）——AGENTS.md §5 明禁「建材永不卖」。
-  3. **till 批量把 32 个「四邻都站不过去」格记成 unreachable**（冬26 32>bound 15 ⇒ 判据红）；clear 有 encircled 归类，till 没有。
+  3. **批量把 32 个「四邻都站不过去」格记成 unreachable**（冬26 32>bound 15 ⇒ 判据红）。**归属实测更正（task-27 取证，2026-10-18）**：32 格 = till 12（field_nw、t=88.71 同秒）+ clear 20（field_ne 9 / field_sw 7 / field_se 4，t=98.97–212.17）；初版卡面「32 格全在 t=88.71 同一 till 事件」是错的，以 task-27 实测为准。clear 有 encircled 归类，till 没有；且 clear 的 encircled 只在「四邻全观测且都站不了」时才命中，四邻无观测时也落到 unreachable。
   4. **day 级 7 格可执行与守卫口径未闭合**（冬27 守卫仍说剩 7 格、resume 拿不到；`pending_blocked 223 − pending_stalled 218 = 5 格`来源未单列）。
 
 ## 1. 卡片（dev-coder 串行 A→B→C→D）
@@ -26,8 +26,8 @@
 | 卡 | 任务 | 优先级 | 提交 | 读数 |
 |---|---|---|---|---|
 | A | task-25 背包升级经济动作（12→24，Pierre 2000g）。**Plan A（按货架买）已否证** ⇒ 改对话式购买：`interact` Pierre → 按响应文本 `answerDialogue(Response)` → 差分判据：钱−2000 且 inventoryCount 12→24 | P0 | 待填 | 待填（先等 task-32 真机只读对话探针） |
-| B | task-26 冬27 形态 day 级 7 格逐格归因（L641 burst samples 坐标 → 为何 resume 拿不到；5 格未单列；10 格账本差；冬26 plot_pending_executable=3 不同源）；核 ended_by=sleep 与 resume_exhausted 自洽 | P0 | 待填 | 待填 |
-| C | task-27 till_area 32 格前置过滤 + 事后 encircled 归类（不计 rep.unreachable、后续阶段不再选）；bound 公式不动 | P1 | 待填 | 待填 |
+| B | task-26 冬27 形态：`resume_walks` 先加后走（失败步行烧成功预算）+ `_resume_exhausted` 无条件宣称无目标 ⇒ 改为 attempts/walks 拆分 + `claim_exhausted=(exec==0 and malformed==0)`，假则写 `resume_budget_exhausted:`；未放宽 `is_justified_end` | P0 | `002afdb`（3 files +476/−28） | 定向 `TestTask26ResumeBudget` Ran 6 OK；全量 Ran 1354 OK；变异 3/3 被杀；Lead 亲跑 6/6 OK |
+| C | task-27 挡死格证据口径收口：目标池前置过滤（`_known_enclosed`/`_prefilter_known_enclosed`）+ 执行层 `_observed_foothold` 判"本该可达"、无落脚点证据归 encircled；判死格仍进 assigned/assigned_undone（不洗成没活）；bound 公式与 20% 未动；附带 `pending_executable_tiles[:8]`/`pending_stalled_tiles[:8]` | P1 | `acf2f6c`（5 files +628/−24）+ `1800ef1`（3 files +70/−1） | 定向 `TestTask27EnclosedBatch` Ran 9 OK（总 195 OK）；全量 Ran 1363 OK；变异 8/8 被杀（worktree+冻结 HEAD 双跑）；Lead 核公式与 `:9811` 未动、测试 195 OK |
 | D | task-28 售材白名单收紧（建材/锭类全部移出）+ inventory_blocked 证据门槛 + 满包清障有界（loot_lost_steps ≤ 常量，留痕） | P1 | 待填 | 待填 |
 
 ## 2. 冻结九步（沿用 0.7.44/0.7.45 口径）
