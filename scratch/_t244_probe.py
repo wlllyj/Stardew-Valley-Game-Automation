@@ -3,7 +3,11 @@
 用法（切换树）：
     $env:T244_ROOT = "<tree>"; python scratch/_t244_probe.py [--only A,B,C,D,E] [--readings]
 
-- 默认 ROOT = 本仓库（worktree 只作线索）；正式判定用 `git archive <0.7.43 冻结提交>` 的树。
+- 默认 ROOT = 本仓库（worktree 只作线索）；正式判定用 `git archive <0.7.43 冻结提交>` 的树
+  （本次冻结 = `5679562`，冻结树 %TEMP%\\t244_frozen）。
+- 判据口径（修后 `f3fffad`）：`ok` 只数**真世界变化步**；`already` 步单列
+  `stages[i].already/attempted_ok/already_tiles/already_cause`；拿不到 kind 证据的 ok 步
+  记为 `unclear`（落账）⇒ `ok == len(cleared_tiles) + unclear` 必须成立。
 - 只读生产代码；日志/输出只写 stdout（由调用方 Tee 到 scratch/）。
 """
 
@@ -13,6 +17,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -71,11 +76,17 @@ def sh(argv: list[str], *, cwd: Path | None = None, timeout: int = 900) -> tuple
 
 # ---------------------------------------------------------------- 判据（我方独立实现）
 
+# 修后 `unclear` 是唯一合法解释项；`already`/`attempted_ok` 是**另一类成功**（不进 ok），
+# 因此绝不能算进 explainable —— 否则 m242a（把 already 算回 ok）会被误放行。
+EXPLAIN_KEYS = ("unclear", "unclear_steps", "kind_unchanged_steps", "no_kind_change_steps")
+NEW_LEDGER_FIELDS = ("already", "attempted_ok", "already_tiles", "already_cause", "unclear")
+SEMANTIC_KEYS = ("assigned", "assigned_undone", "leftover", "bound_basis", "engaged",
+                 "cleared_tiles", "blocker_drop")
+
+
 def explainable(stage: dict) -> int:
-    """账本里能解释「ok 但不在 cleared_tiles」的显式字段之和（新字段由 task-242 定名）。"""
     total = 0
-    for key in ("unclear_steps", "kind_unchanged_steps", "cleared_unclear",
-                "no_kind_change_steps", "collateral_steps"):
+    for key in EXPLAIN_KEYS:
         try:
             total += int(stage.get(key) or 0)
         except (TypeError, ValueError):
@@ -87,7 +98,7 @@ def judge_stage(stage: dict) -> list[str]:
     """对一条 clear_area 阶段记录做逐格证据完整性判定（返回违规列表；空=绿）。
 
     规则（卡面语义，允许"目标格 + 连带格"显式区分，不允许静默丢 ok）：
-    1) 不得有 ok 步静默缺失：`ok > len(cleared_tiles) + explainable` ⇒ 违规；
+    1) 不得有 ok 步静默缺失：`ok > len(cleared_tiles) + unclear` ⇒ 违规；
     2) 落进清单的格必须真的对应 ok 证据：`len(cleared_tiles) > ok + collateral` ⇒ 违规；
     3) 清单里的格必须属于该阶段分下去的格（或显式 collateral_tiles）：越界 ⇒ 违规。
     """
@@ -97,7 +108,7 @@ def judge_stage(stage: dict) -> list[str]:
     collateral = [tuple(t) for t in (stage.get("collateral_tiles") or [])]
     explained = explainable(stage)
     if ok > len(cleared) + explained:
-        v.append(f"ok={ok} > cleared={len(cleared)} + explained={explained}（有 ok 步没有逐格证据）")
+        v.append(f"ok={ok} > cleared={len(cleared)} + unclear={explained}（有 ok 步没有逐格证据）")
     if len(cleared) > ok + len(collateral):
         v.append(f"cleared={len(cleared)} > ok={ok} + collateral={len(collateral)}（清单多出未 ok 的格）")
     assigned = {tuple(t) for t in (stage.get("tiles_list") or [])}
@@ -108,39 +119,51 @@ def judge_stage(stage: dict) -> list[str]:
     return v
 
 
-def judge_ledger_stage(stage: dict) -> list[str]:
-    """同 judge_stage，但用真账本的键名（ok/cleared_tiles/…）。"""
-    return judge_stage(stage)
-
-
 # ---------------------------------------------------------------- A 段
 
 def case_a(readings: bool) -> None:
-    print("== A 段：范围 / 越界 / 版本 / 读数 ==")
+    print("== A 段：范围 / 版本 / 新字段 / 读数 ==")
     files = ["brain/agentfarm/longrun.py", "brain/agentfarm/farmwork.py", "tests/test_longrun.py"]
     check("A1 关键文件在树内", all((ROOT / f).exists() for f in files), str(ROOT))
     ver_manifest = read("mod/AgentFarm.Bridge/manifest.json")
     bridge = read("brain/agentfarm/bridge.py")
-    info("A2 版本", f"manifest={'0.7.42' if '0.7.42' in ver_manifest else '?'} "
-                    f"bridge={'0.7.42' if '0.7.42' in bridge else '?'}")
-    new_fields = [k for k in ("unclear_steps", "cleared_unclear", "collateral_tiles",
-                              "no_kind_change_steps") if f'"{k}":' in read("brain/agentfarm/longrun.py")]
-    info("A3 task-242 新字段（只许新增、须单列）", new_fields or "（尚未交付/无新账本字段）")
+    check("A2 版本 = 0.7.43（manifest 与 bridge.py 一致）",
+          '"Version": "0.7.43"' in ver_manifest and 'MOD_VERSION_EXPECTED = "0.7.43"' in bridge,
+          f"manifest={'0.7.43' if '0.7.43' in ver_manifest else '?'} "
+          f"bridge={'0.7.43' if '0.7.43' in bridge else '?'}")
+    src = read("brain/agentfarm/longrun.py")
+    missing = [k for k in NEW_LEDGER_FIELDS if f'"{k}"' not in src]
+    check("A3 task-242 新账本字段齐（already/attempted_ok/already_tiles/already_cause/unclear）",
+          not missing, f"缺={missing}" if missing else "5/5")
+    checks_named = [k for k in ("slept_by_us", "no_blocking_modal", "no_hard_failures",
+                                "unreachable_within_bound", "refused_within_bound",
+                                "no_unmet_stages", "crops_watered", "watered_outdoor",
+                                "day_justified", "zero_action_evidenced") if k in src]
+    check("A4 checks 键集 10 键未被改（只许新增账本字段）", len(checks_named) == 10,
+          f"命中 {len(checks_named)}/10")
     if not readings:
-        skip("A4 读数", "加 --readings 才跑（py_compile / 定向 / 全量 / build）")
+        skip("A5 读数", "加 --readings 才跑（py_compile / 定向 / 全量 / build）")
         return
     rc, out = sh([PY, "-W", "error::SyntaxWarning", "-m", "py_compile",
                   "brain/agentfarm/longrun.py", "brain/agentfarm/farmwork.py",
                   "brain/agentfarm/planner.py", "brain/agentfarm/bridge.py"])
-    check("A4a py_compile -W error::SyntaxWarning", rc == 0, f"rc={rc}")
+    check("A5a py_compile -W error::SyntaxWarning", rc == 0, f"rc={rc}")
     rc, out = sh([PY, "-m", "unittest", "tests.test_farmwork", "tests.test_longrun",
                   "tests.test_planner"])
-    ran = [ln for ln in out.splitlines() if ln.startswith("Ran ") or ln.strip() == "OK"]
-    check("A4b 定向单测（以 Ran N / OK 为准）", "OK" in out and "FAILED" not in out, " | ".join(ran[-2:]))
+    ran = [ln for ln in out.splitlines() if ln.startswith("Ran ")]
+    check("A5b 定向单测（以 Ran N / OK 为准）", "OK" in out and "FAILED" not in out,
+          " | ".join(ran[-1:]))
     rc, out = sh([PY, "-m", "unittest", "discover", "-s", "tests"])
     red = out.count("\nFAIL:") + out.count("\nERROR:")
-    check("A4c 全量单测（0 红）", "OK" in out and red == 0,
-          f"{[ln for ln in out.splitlines() if ln.startswith('Ran ')][-1:]}")
+    check("A5c 全量单测（0 红）", "OK" in out and red == 0,
+          f"{[ln for ln in out.splitlines() if ln.startswith('Ran ')][-1:]} red={red}")
+    rc, out = sh(["dotnet", "build", "mod/AgentFarm.Bridge/AgentFarm.Bridge.csproj",
+                  "-c", "Release", "--no-incremental", "--nologo"])
+    zero_warn = (" 0 Warning(s)" in out) or ("0 个警告" in out)
+    zero_err = (" 0 Error(s)" in out) or ("0 个错误" in out)
+    check("A5d dotnet build --no-incremental 0 警 0 错", rc == 0 and zero_warn and zero_err,
+          [ln.strip() for ln in out.splitlines()
+           if "Warning(s)" in ln or "Error(s)" in ln or "个警告" in ln or "个错误" in ln][-3:])
 
 
 # ---------------------------------------------------------------- B 段
@@ -151,7 +174,7 @@ def case_b() -> None:
     rows: list[tuple[int, dict]] = []
     for cand in (ROOT / journal, Path(__file__).resolve().parents[1] / journal):
         if cand.exists():
-            for i, line in enumerate(cand.read_text(encoding="utf-8").splitlines(), 1):
+            for i, line in enumerate(cand.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
                 if line.strip():
                     try:
                         rows.append((i, json.loads(line)))
@@ -159,6 +182,7 @@ def case_b() -> None:
                         pass
             info("B0 夹具来源", str(cand))
             break
+    old_mism = 0
     if not rows:
         skip("B1 0742 账本复现（9 阶段 ok≠cleared）", "logs/longrun-smoke-0742.jsonl 缺失")
     else:
@@ -172,26 +196,36 @@ def case_b() -> None:
                 ok = st.get("ok")
                 cleared = st.get("cleared_tiles")
                 if isinstance(ok, int) and isinstance(cleared, (list, type(None))) and ok != len(cleared or []):
-                    mism.append({"line": i, "day": st.get("day"), "ok": ok,
-                                 "cleared": len(cleared or []), "diff": ok - len(cleared or []),
-                                 "failed": st.get("failed")})
+                    mism.append({"line": i, "ok": ok, "cleared": len(cleared or []),
+                                 "diff": ok - len(cleared or []), "already": st.get("already"),
+                                 "unclear": st.get("unclear")})
+        old_mism = len(mism)
         total_ok = sum(m["ok"] for m in mism)
         total_cleared = sum(m["cleared"] for m in mism)
-        check("B1 0742 账本复现（修前红；修后应被新字段解释或为 0）",
-              len(mism) > 0,
-              f"mismatch={len(mism)} ok={total_ok} cleared={total_cleared} diff={total_ok - total_cleared} "
-              f"样例行={mism[:2]}")
-        if mism:
-            info("B1b 复现的 9 阶段形状", json.dumps(mism, ensure_ascii=False)[:400])
+        check("B1 0742 账本复现 9 阶段 ok≠cleared（旧账本差额 13；新字段**不回溯改写历史**）",
+              len(mism) == 9 and total_ok - total_cleared == 13,
+              f"mismatch={len(mism)} ok={total_ok} cleared={total_cleared} diff={total_ok - total_cleared}")
+        info("B1b 旧账本无新字段（历史不可重写，修的是未来记账）",
+             f"already/unclear 命中={sum(1 for m in mism if m['already'] is not None or m['unclear'] is not None)}")
 
-    # B2/B3：用真代码跑一个 clear_area 阶段（FakeWorker 真的改世界）
+    # B1c：作者离线重放脚本（声称为 9/9 conforming）——我独立复跑核对
+    replay = ROOT / "scratch/_t242_replay.py"
+    if replay.exists():
+        rc, out = sh([PY, str(replay)], cwd=ROOT)
+        tail = [ln for ln in out.splitlines() if ln.strip()][-6:]
+        check("B1c 作者离线重放脚本（0.7.42 账本 9/9 conforming）",
+              rc == 0 and ("9/9" in out or "conforming" in out.lower()),
+              f"rc={rc} | " + " / ".join(tail)[:300])
+    else:
+        skip("B1c 作者离线重放脚本", "scratch/_t242_replay.py 缺失")
+
+    # B2/B3/B5：用真代码跑 clear_area 阶段（真 FarmWorker + FakeClient）
     try:
         sys.path.insert(0, str(ROOT / "tests"))
         sys.path.insert(0, str(ROOT / "brain"))
         sys.path.insert(0, str(ROOT))
         import test_longrun as TL  # noqa: N813
-        from agentfarm import farmwork as FW  # noqa: F401
-        from agentfarm import longrun as LR  # noqa: F401
+        from agentfarm import farmwork as FW
     except Exception as exc:  # noqa: BLE001
         skip("B2 假世界阶段复现", f"夹具 import 失败: {exc}")
         return
@@ -221,8 +255,18 @@ def case_b() -> None:
     stage = run_clear()
     ok = int(stage.get("ok") or 0)
     cleared = len(stage.get("cleared_tiles") or [])
-    check("B2 普通清障阶段：ok 与逐格清单一致（修后必须 ok == cleared + explainable）",
-          ok == cleared + explainable(stage), f"ok={ok} cleared={cleared} explained={explainable(stage)}")
+    check("B2 普通清障阶段：ok == cleared（修后不变式 ok == len(cleared_tiles)）",
+          ok == cleared == 4, f"ok={ok} cleared={cleared} unclear={explainable(stage)}")
+    check("B2b 修后账本带 5 个新字段且 already/attempted_ok 同值",
+          all(k in stage for k in NEW_LEDGER_FIELDS) and stage.get("already") == stage.get("attempted_ok"),
+          f"新字段={[k for k in NEW_LEDGER_FIELDS if k in stage]} already={stage.get('already')} "
+          f"attempted_ok={stage.get('attempted_ok')}")
+    check("B2c 普通阶段 already=0 / unclear=0（没有静默丢）",
+          int(stage.get("already") or 0) == 0 and int(stage.get("unclear") or 0) == 0,
+          f"already={stage.get('already')} unclear={stage.get('unclear')}")
+    check("B2d 语义键未动（assigned/assigned_undone/leftover/bound_basis/engaged/blocker_drop 全在）",
+          all(k in stage for k in SEMANTIC_KEYS),
+          f"缺={[k for k in SEMANTIC_KEYS if k not in stage]}")
 
     class LyingWorker(FW.FarmWorker):
         """(62,10) 回执 ok 但 after 里没有 kind 证据（模拟观测/桥给不出 kind 变化）。"""
@@ -233,27 +277,31 @@ def case_b() -> None:
                 res.after = {"no_kind_evidence": True}
             return res
 
-    stage2 = run_clear(lambda c: LyingWorker(c, log=lambda *_: None, pause=lambda _s: None))
-    ok2 = int(stage2.get("ok") or 0)
-    cleared2 = len(stage2.get("cleared_tiles") or [])
-    explained2 = explainable(stage2)
-    if ok2 > cleared2 + explained2:
-        check("B3 ok 但无 kind 变化的格必须被显式解释（新字段），不许静默丢",
-              False, f"ok={ok2} cleared={cleared2} explained={explained2}（修前即此形态）")
-    else:
-        check("B3 ok 但无 kind 变化的格必须被显式解释（新字段），不许静默丢", True,
-              f"ok={ok2} cleared={cleared2} explained={explained2}")
+    stage3 = run_clear(lambda c: LyingWorker(c, log=lambda *_: None, pause=lambda _s: None))
+    ok3 = int(stage3.get("ok") or 0)
+    cleared3 = len(stage3.get("cleared_tiles") or [])
+    unclear3 = int(stage3.get("unclear") or 0)
+    check("B3 ok 但无 kind 证据的步必须落账为 unclear（不许静默丢）",
+          unclear3 >= 1 and judge_stage({**stage3, "tiles_list": []}) == [],
+          f"ok={ok3} cleared={cleared3} unclear={unclear3}")
 
-    # B4：语义未动（checks 键集 / 事件名 / assigned_undone / plot_pending）
+    # B4：语义未动（checks 键集 / 事件名 / plot_pending）
     base_checks = {"crops_watered", "day_justified", "no_blocking_modal", "no_hard_failures",
                    "no_unmet_stages", "refused_within_bound", "slept_by_us",
                    "unreachable_within_bound", "watered_outdoor", "zero_action_evidenced"}
     de = next((r for _, r in rows if r.get("event") == "day_end"), None) or {}
     if de:
         cur = set(de.get("checks") or {})
-        check("B4 0742 账本 checks 键集 = 10 键基线", cur == base_checks, f"{sorted(cur - base_checks)} / {sorted(base_checks - cur)}")
-    st_keys = set(stage.keys())
-    info("B4b 阶段记录键集（新字段请单列）", sorted(st_keys - {
+        check("B4 0742 账本 checks 键集 = 10 键基线", cur == base_checks,
+              f"{sorted(cur - base_checks)} / {sorted(base_checks - cur)}")
+        check("B4b day_end 仍带 plot_pending（口径未动）", "plot_pending" in de,
+              f"keys 含 plot_pending={'plot_pending' in de}")
+    src = read("brain/agentfarm/longrun.py")
+    journal_names = set(re.findall(r'_journal\(\s*"([a-z_]+)"', src))
+    bad_new = [n for n in journal_names if "already" in n or "cleared_tiles" in n]
+    check("B4c 未新增 already/cleared 类 journal 事件名", not bad_new, f"新增={bad_new}")
+
+    info("B4d 阶段记录新增键（报告须单列）", sorted(set(stage) - {
         "stage", "tiles", "ok", "skipped", "failed", "failed_any", "proven_inert",
         "env_block", "inconclusive", "unreachable", "unreachable_tiles", "unreachable_leftover",
         "refused", "refused_tiles", "refused_leftover", "encircled", "encircled_tiles",
@@ -262,15 +310,51 @@ def case_b() -> None:
         "leftover", "cleared_tiles", "blocker_drop", "assigned", "assigned_undone",
         "stamina_after", "stamina_before", "stamina_spent"}))
 
+    # B5：already 步真的存在（目标格在池里、但动手前被"开路连带清掉"⇒ clear() 回 already）
+    world = TL.FakeWorld(seeds=0, money=0, weeds=0, water_left=40)
+    world.blockers[(60, 10)] = "weed"
+    client = TL.FakeClient(world)
+    obs = world.obs()                       # 池子算之前：格子上还有杂草
+
+    class NeighborOpenWorker(FW.FarmWorker):
+        """模拟开路连带清掉目标格：池子已算好之后、真正动手前该格变空。"""
+
+        def clear(self, tile, *, cut_grass=True):  # noqa: ANN001
+            if tuple(tile) == (60, 10):
+                world.blockers.pop((60, 10), None)
+            return super().clear(tile, cut_grass=cut_grass)
+
+    worker = NeighborOpenWorker(client, log=lambda *_: None, pause=lambda _s: None)
+    run = TL.make_run(world, client_factory=lambda: client, worker_factory=lambda c: worker)
+    run.worker = worker
+    run.client = client
+    plot = {"zone": "field_se", "label": "field_se", "anchor": [60, 10], "tiles": [[60, 10]]}
+    rep = TL.DayReport(day_key=("spring", 1, 10), started_at=0.0)
+    run._step_stage("clear_area", obs, plot, rep)
+    st5 = [s for s in rep.stages if s.get("stage") == "clear_area"][-1]
+    causes = st5.get("already_cause") or {}
+    check("B5 already 步单列（no_target/cleared_by_neighbor），不计 ok、不漏账",
+          int(st5.get("already") or 0) >= 1 and int(st5.get("ok") or 0) == 0
+          and set(causes) == {"cleared_by_neighbor", "no_target"}
+          and causes.get("no_target") == [[60, 10]] and causes.get("cleared_by_neighbor") == [],
+          f"ok={st5.get('ok')} already={st5.get('already')} "
+          f"tiles={st5.get('already_tiles')} cause={causes}")
+    check("B5b 瓦片级 ok_tiles 仍算已达标（already 格不掉出）+ attempted_ok == already",
+          int(st5.get("ok_tiles") or 0) == 1
+          and int(st5.get("attempted_ok") or 0) == int(st5.get("already") or 0),
+          f"ok_tiles={st5.get('ok_tiles')} attempted_ok={st5.get('attempted_ok')} "
+          f"already={st5.get('already')}")
+
 
 # ---------------------------------------------------------------- C 段：四把伪造
 
 def case_c() -> None:
     print("== C 段：四把伪造（伪造阶段记录 → 期望判红/判绿） ==")
-    base = {"stage": "clear_area", "ok": 4, "failed": 0, "cleared_tiles": [[60, 10], [61, 10], [62, 10], [63, 10]],
+    base = {"stage": "clear_area", "ok": 4, "failed": 0, "unclear": 0,
+            "cleared_tiles": [[60, 10], [61, 10], [62, 10], [63, 10]],
             "tiles_list": [[60, 10], [61, 10], [62, 10], [63, 10]], "ok_tiles": 4}
     cases = [
-        ("C1 漏记一个 ok 格（ok=4 / cleared=3）",
+        ("C1 漏记一个 ok 格（ok=4 / cleared=3、unclear=0）",
          {**base, "cleared_tiles": [[60, 10], [61, 10], [62, 10]]}, True),
         ("C2 连带清多格只记目标格（ok=1 / cleared=2 无 collateral 解释）",
          {**base, "ok": 1, "ok_tiles": 1, "cleared_tiles": [[60, 10], [61, 10]]}, True),
@@ -281,6 +365,12 @@ def case_c() -> None:
          {**base, "ok": 3, "ok_tiles": 3, "cleared_tiles": [[60, 10], [61, 10], [62, 10], [63, 10]]}, True),
         ("C4 len==ok 但格子不在阶段 tiles 内（[70,20] 越界）",
          {**base, "cleared_tiles": [[60, 10], [61, 10], [70, 20], [63, 10]]}, True),
+        ("C5 把 already 伪装成 unclear 试图解释差额（ok=4/cleared=2/unclear=2）",
+         {**base, "cleared_tiles": [[60, 10], [61, 10]], "unclear": 2}, False),
+        ("C6 unclear 缺失时差额必须判红（ok=4/cleared=2）",
+         {**base, "cleared_tiles": [[60, 10], [61, 10]]}, True),
+        ("C7 伪造 cleared 格全在 tiles 内但 ok 少（ok=2/cleared=4/无 collateral）",
+         {**base, "ok": 2, "ok_tiles": 2}, True),
     ]
     for tag, stage, want_red in cases:
         v = judge_stage(stage)
@@ -291,30 +381,23 @@ def case_c() -> None:
 # ---------------------------------------------------------------- D 段
 
 def case_d() -> None:
-    print("== D 段：变异实测 ==")
-    author = sorted(glob.glob(str(ROOT / "scratch/_t242_*mutate*.py"))) + \
-             sorted(glob.glob(str(ROOT / "scratch/*_t242_*mutate*.py")))
-    author = [Path(p).name for p in author]
-    if author:
-        info("D0 作者变异脚本", author)
-    else:
-        skip("D0 作者变异脚本", "未找到（GAP：作者自报杀数不可复跑）")
+    print("== D 段：变异实测接口 ==")
+    author = sorted(glob.glob(str(ROOT / "scratch/_t242_mutate*.py")))
+    check("D0 作者变异脚本在树内（可复跑）", bool(author), [Path(p).name for p in author])
     mine = ROOT / "scratch/_t244_mutate.py"
-    if mine.exists():
-        info("D1 自建变异脚本", "scratch/_t244_mutate.py（--base <树> --all）")
-    else:
-        skip("D1 自建变异脚本", "骨架待补")
-    info("D2 复跑命令", "python scratch/_t244_mutate.py --base <tree> --all（冻结树）")
+    check("D1 自建变异脚本在树内", mine.exists(), str(mine))
+    info("D2 复跑命令", "PYTHONUTF8=1 python scratch/_t242_mutate.py（冻结树根） / "
+                        "python scratch/_t244_mutate.py --base <tree> --all")
 
 
 # ---------------------------------------------------------------- E 段
 
 def case_e() -> None:
-    print("== E 段：结论 ==")
+    print("== E 段：结论骨架 ==")
     if FAIL == 0:
-        info("E1", "A/B/C/D 全绿 ⇒ 0.7.43 可以放行 A″/B″（本骨架待冻结树正式读数）")
+        info("E1", "A/B/C/D 全绿 ⇒ 0.7.43 可放行 A″/B″（正式结论以报告为准）")
     else:
-        info("E1", f"仍有 {FAIL} 条红（{FAILS[:5]}）⇒ 需修复/解释后才放行；冻结树正式判定以报告为准")
+        info("E1", f"仍有 {FAIL} 条红（{FAILS[:6]}）⇒ 需修复/解释后才放行")
 
 
 def main() -> int:

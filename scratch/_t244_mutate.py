@@ -31,19 +31,37 @@ CASES: list[tuple[str, str, str | None, str, list[tuple[str, str, str]], str]] =
 
 TEMPLATES: list[tuple[str, str, str | None, str, list[tuple[str, str, str]], str]] = [
     (
-        "m242a_drop_unclear_steps", "242", None, "probe",
-        [("brain/agentfarm/longrun.py", "TODO 交付后填：把 kind 不可判的 ok 步从记账里丢掉", "TODO")],
-        "把「kind 不可判」的 ok 步静默丢掉（修前形态回归）",
+        "m244a_already_counted_as_ok", "242", "作者 m242a 等价", "probe",
+        [("brain/agentfarm/longrun.py",
+          """            oks = [s for s in ok_all
+                   if str(getattr(s, "code", "") or "") != "already"]""",
+          """            oks = ok_all""")],
+        "把 already 步重新算回 ok（修前形态）",
     ),
     (
-        "m242b_no_collateral_split", "242", None, "probe",
-        [("brain/agentfarm/longrun.py", "TODO 交付后填：连带格只记目标格", "TODO")],
-        "连带清多格只记目标格（不许静默）",
+        "m244b_unclear_not_recorded", "242", "无（自建）", "probe",
+        [("brain/agentfarm/longrun.py", '"unclear": unclear_steps,', '"unclear": 0,')],
+        "把 kind 不可判的 ok 步从账本里抹掉（差额重新无痕）",
     ),
     (
-        "m242c_cleared_adds_unok_tile", "242", None, "probe",
-        [("brain/agentfarm/longrun.py", "TODO 交付后填：清单里加一个没 ok 的格", "TODO")],
-        "清单多出未 ok 的格",
+        "m244c_already_cause_always_neighbor", "242", "作者 m242d 等价", "probe",
+        [("brain/agentfarm/longrun.py",
+          'bucket = "cleared_by_neighbor" if key in neighbor_open else "no_target"',
+          'bucket = "cleared_by_neighbor"')],
+        "already 归因全塞 cleared_by_neighbor（no_target 丢失）",
+    ),
+    (
+        "m244d_ok_tiles_drops_already", "242", "作者 m242c 等价", "probe",
+        [("brain/agentfarm/longrun.py",
+          "ok_tiles_set = {tuple(s.tile) for s in ok_all if s.tile} & assigned_set",
+          "ok_tiles_set = {tuple(s.tile) for s in oks if s.tile} & assigned_set")],
+        "瓦片级 ok_tiles 丢掉 already 格（该格掉进 unexecuted）",
+    ),
+    (
+        "m244e_attempted_ok_zero", "242", "无（自建）", "probe",
+        [("brain/agentfarm/longrun.py", '"attempted_ok": len(already_steps),',
+          '"attempted_ok": 0,')],
+        "attempted_ok 不再反映 already 步数（口径自相矛盾）",
     ),
 ]
 
