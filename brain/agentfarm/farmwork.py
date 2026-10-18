@@ -59,6 +59,7 @@ __all__ = [
     "SLOT_RELIEF_MATERIAL_IDS",
     "SLOT_RELIEF_MAX_STACKS",
     "SLOT_RELIEF_NEVER_SELL_IDS",
+    "SLOT_RELIEF_RESERVES",
     "STAGE_ACTION",
     "STEP_RESULT_CODES",
     "STAMINA_COST_CLEAR",
@@ -1362,6 +1363,17 @@ SLOT_RELIEF_NEVER_SELL_IDS = frozenset({
     "787",   # Battery Pack
 })
 
+#: 【task-232 增量・Lead m21874】**建造预留**：这几个 qid 的保留量覆盖 `K=10`
+#: （"卖到只剩 reserve 为止"），否则空格压力会把马上要用的熔炉材料卖掉（目标③ 工具升级：
+#: 熔炉 20 铜矿 + 25 石、熔 5 锭再 5 铜矿 + 5 煤）。
+#: 注意游戏**只会整叠卖**：所以 reserve 只会让"卖这叠后该 qid 仍 ≥ reserve"的叠可卖；
+#: 单叠数量 < reserve 时宁可腾不出格子（如实 inventory_blocked），也不动建造材料。
+SLOT_RELIEF_RESERVES: dict[str, int] = {
+    "(O)378": 25,   # 铜矿：熔炉 20 + 5 锭
+    "(O)390": 30,   # 石头：熔炉 25 + 余量
+    "(O)382": 5,    # 煤：5 锭各 1
+}
+
 
 def slot_relief_plan(
     obs: dict[str, Any],
@@ -1387,6 +1399,10 @@ def slot_relief_plan(
     卖法：整叠卖（游戏没有"卖一部分"的能力）。优先"卖掉后该 qid 仍 ≥ keep"的真盈余叠；
     一个都没有时退而卖**最小的一叠并整叠卖空**（`belowKeep=True`，剩余 0 件 ⇒ 不变量
     "卖出后仍 ≥keep 或整叠卖空"成立；这是唯一的清路，否则全背包 ≤keep 时永远腾不出格子）。
+
+    【task-232 增量】`SLOT_RELIEF_RESERVES` 里的 qid 用**各自的 reserve** 覆盖 `keep`
+    （建造预留：铜矿 25 / 石头 30 / 煤 5）。因为这些 reserve 都 > 0，**只要一侧有预留，
+    就永远不可能走"整叠卖空"那条路**（卖空后剩 0 < reserve）⇒ 宁可腾不出格子。
 
     返回：`pressure`（是否真的处于空格压力）、`slots`/`whitelist`（要卖的槽位与 qid）、
     `items`（逐叠账本：qid/stack/tier/belowKeep/why）、`trigger`（读数原文）、
@@ -1444,19 +1460,43 @@ def slot_relief_plan(
         result["skipReason"] = ("背包里没有可卖的盈余叠（只认已知作物/材料/矿表，"
                                 "工具/武器/种子/升级材料/未知物品一律不卖）⇒ 腾不出格子")
         return result
-    # 同一 qid 可能有多叠：先按 qid 汇总，判断"卖掉该叠后仍 ≥ keep"（真盈余）。
+    # 同一 qid 可能有多叠：先按 qid 汇总，判断"卖掉该叠后仍 ≥ 该 qid 的保留量"（真盈余）。
+    # 保留量 = `SLOT_RELIEF_RESERVES`（建造预留）> `keep`（默认 K=10）。
+    reserves = {str(k): int(v) for k, v in SLOT_RELIEF_RESERVES.items()}
+
+    def keep_for(st: dict[str, Any]) -> tuple[int, bool]:
+        reserve = reserves.get(str(st["qid"]))
+        if reserve is None:
+            reserve = reserves.get(str(st["bareId"]))
+        if reserve is not None:
+            return int(reserve), True
+        return int(keep), False
+
     totals: dict[str, int] = {}
     for st in stacks:
         totals[st["qid"]] = totals.get(st["qid"], 0) + int(st["stack"])
-    surplus = [st for st in stacks if totals[st["qid"]] - int(st["stack"]) >= int(keep)]
+    surplus: list[dict[str, Any]] = []
+    for st in stacks:
+        eff_keep, reserved = keep_for(st)
+        st["keep"] = eff_keep
+        st["reserved"] = bool(reserved)
+        if totals[st["qid"]] - int(st["stack"]) >= eff_keep:
+            surplus.append(st)
     below_keep = False
     chosen: list[dict[str, Any]] = []
     if surplus:
         surplus.sort(key=lambda s: (int(s["tier"]), int(s["stack"]), int(s["slot"])))
         chosen = [surplus[0]]
     else:
-        # 一个真盈余叠都没有（整包每 qid 都 ≤ keep）⇒ 整叠卖空最小的那叠清路。
-        smallest = sorted(stacks, key=lambda s: (int(s["tier"]), int(s["stack"]), int(s["slot"])))[0]
+        # 一个真盈余叠都没有 ⇒ 整叠卖空清路。但**建造预留**的 qid 永远不许卖空
+        # （卖空后剩 0 < reserve ⇒ 直接破坏熔炉/升级计划）；宁可腾不出格子。
+        candidates = [st for st in stacks if not st["reserved"]]
+        if not candidates:
+            result["skipReason"] = ("剩下的可卖叠都是建造预留材料（铜矿/石头/煤），"
+                                    "卖空会破坏熔炉/升级计划 ⇒ 宁可不腾格")
+            return result
+        smallest = sorted(candidates, key=lambda s: (int(s["tier"]), int(s["stack"]),
+                                                    int(s["slot"])))[0]
         chosen = [smallest]
         below_keep = True
     chosen = chosen[: max(1, int(max_stacks))]
@@ -1468,6 +1508,7 @@ def slot_relief_plan(
     result["whitelist"] = [str(s["qid"]) for s in chosen]
     result["items"] = [{"slot": int(s["slot"]), "qid": str(s["qid"]), "stack": int(s["stack"]),
                         "tier": int(s["tier"]), "belowKeep": bool(s["belowKeep"]),
+                        "keep": int(s["keep"]), "reserved": bool(s["reserved"]),
                         "why": str(s["why"])} for s in chosen]
     return result
 

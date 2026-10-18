@@ -30,7 +30,7 @@ from agentfarm.farmwork import (  # noqa: E402
     is_unreachable, pick_seed_offer, player_free_slots, seed_offers_from, surplus_sell_plan,
     SLOT_RELIEF_CROP_IDS, SLOT_RELIEF_HIGH_VALUE_IDS, SLOT_RELIEF_KEEP,
     SLOT_RELIEF_MATERIAL_IDS, SLOT_RELIEF_MAX_STACKS, SLOT_RELIEF_NEVER_SELL_IDS,
-    slot_relief_plan,
+    SLOT_RELIEF_RESERVES, slot_relief_plan,
     farm_ready_tiles, known_crafting_recipes,
     till_blocked_by, tool_missing_reason, tool_presence,
 )
@@ -3539,6 +3539,38 @@ class TestTask232SlotReliefPlan(unittest.TestCase):
         plan = self._plan(inv, max_stacks=2)
         self.assertLessEqual(len(plan["items"]), 2)
         self.assertLessEqual(len(plan["items"]), SLOT_RELIEF_MAX_STACKS)
+
+    # ---- 【task-232 增量・Lead m21874】建造预留覆盖 K ----
+    def test_reserve_table_overrides_keep_for_building_materials(self):
+        """铜矿 30（25+5 两叠）⇒ 只卖那 5 个，卖完仍留 25（熔炉 20 + 5 锭）。"""
+        self.assertEqual(SLOT_RELIEF_RESERVES.get("(O)378"), 25)
+        inv = [self._row(0, "(O)378", "Copper Ore", 25),
+               self._row(1, "(O)378", "Copper Ore", 5)]
+        plan = self._plan(inv)
+        self.assertEqual(len(plan["items"]), 1, plan)
+        item = plan["items"][0]
+        self.assertEqual(item["qid"], "(O)378")
+        self.assertEqual(int(item["stack"]), 5)          # 只卖超出预留的 5 个
+        self.assertFalse(item["belowKeep"])
+        self.assertTrue(item["reserved"])
+        self.assertEqual(int(item["keep"]), 25)          # 用 reserve 覆盖了 K=10
+
+    def test_reserved_material_below_reserve_is_never_sold(self):
+        """石头 28 < 预留 30：整叠卖空会破坏熔炉计划 ⇒ 宁可不腾格。"""
+        self.assertEqual(SLOT_RELIEF_RESERVES.get("(O)390"), 30)
+        inv = [self._row(0, "(O)390", "Stone", 28)]
+        plan = self._plan(inv)
+        self.assertTrue(plan["pressure"])
+        self.assertEqual(plan["items"], [])
+        self.assertEqual(plan["slots"], [])
+        self.assertIn("建造预留", plan["skipReason"])
+
+    def test_reserved_material_single_stack_over_reserve_is_not_sold_whole(self):
+        """铜矿单叠 30 > 预留 25：卖这一叠剩 0 < 25 ⇒ 也不许卖（游戏只能整叠卖）。"""
+        inv = [self._row(0, "(O)378", "Copper Ore", 30)]
+        plan = self._plan(inv)
+        self.assertEqual(plan["items"], [])
+        self.assertEqual(plan["slots"], [])
 
 
 if __name__ == "__main__":  # pragma: no cover

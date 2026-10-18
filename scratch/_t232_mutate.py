@@ -30,13 +30,18 @@ MUTATIONS = {
     ),
     "m232b_ignore_keep": (
         "brain/agentfarm/farmwork.py",
-        '    surplus = [st for st in stacks if totals[st["qid"]] - int(st["stack"]) >= int(keep)]',
-        "    surplus = list(stacks)  # mutation：不看 keep",
+        '        if totals[st["qid"]] - int(st["stack"]) >= eff_keep:',
+        "        if True:  # mutation：不看 keep（任何叠都当盈余）",
     ),
     "m232c_sell_unknown_items": (
         "brain/agentfarm/farmwork.py",
         "        else:\n            continue                          # 表外一律不卖（fail-closed）",
         '        else:\n            tier, why = 9, "unknown"  # mutation：表外也卖（fail-closed 被破坏）',
+    ),
+    "m232d_ignore_building_reserve": (
+        "brain/agentfarm/farmwork.py",
+        '        reserve = reserves.get(str(st["qid"]))',
+        "        reserve = None  # mutation：关掉建造预留覆盖",
     ),
 }
 
