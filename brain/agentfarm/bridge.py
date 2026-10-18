@@ -36,7 +36,32 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.44"   # v0.7.44：两条收工/分配死循环修复 + 收工口径（A8 臂 12 天暴露）——
+MOD_VERSION_EXPECTED = "0.7.45"   # v0.7.45：诚实收工判据 + 背包满留痕/腾格 + 残缺 tile fail-closed
+                                  # （0.7.44 真机冒烟 FAIL 暴露：冬26/27 诚实收工日被守卫累积账本误判）——
+                                  # ①诚实收工判据（task-15）：`_pending_work()` 剔 `resume_stall_tiles`/
+                                  #   `encircled_day`，原始账本口径另存 `_ledger_pending()`；`_pending_snapshot`
+                                  #   六口径并列（ledger/guard/stalled/blocked/executable/unobserved；
+                                  #   不变式 ledger==guard+blocked、guard==executable+unobserved+malformed）；
+                                  #   观测缺失 ⇒ executable=guard（fail-closed）；`is_justified_end` 增证据门槛：
+                                  #   `resume_exhausted` 仅 `pending_executable==0` 才认，`stuck:` 永不认；
+                                  #   burst/换片上限改走 `_resume_exhausted` 诚实收工（不再写 `stuck:`）；
+                                  #   sleep_guard 的 no_work 分支遇只剩挡死格拒绝白拿；`day_end` 新字段
+                                  #   `pending_ledger/pending_guard/pending_stalled/pending_executable/
+                                  #   pending_blocked/pending_unobserved/pending_malformed` +
+                                  #   `stage_midway_leftover`（早轮 leftover 不被末轮 0 遮蔽）；
+                                  # ②背包满（task-16）：每次观测算 `free_slots = inventoryCount −
+                                  #   len(inventory[])`（容量≠件数）；`free_slots==0` 压力通道走既有
+                                  #   slot_relief（白名单/建造预留/每 qid 下限；工具/武器/种子/建材/锭类永不卖；
+                                  #   卖走 `Farm.shipItem`/`sell` + 钱/背包行数双差分）；`clear()` 满包掉落留
+                                  #   `loot_lost`（只 info，不判失败）；买种前先腾格、腾不出诚实不买；
+                                  #   `day_end` 新字段 `free_slots_*`/`loot_lost_*`；
+                                  # ③残缺 tile fail-closed（task-22）：观测 `tiles[]` 里出现但缺 kind/crop
+                                  #   （且不在 tillable[]）的残缺记录单列 `malformed`，`is_justified_end` 在
+                                  #   任何收工理由之前一票否决 `day_justified`（缺失≠通过）；不变式
+                                  #   guard==executable+unobserved+malformed；`day_end.pending_malformed`；
+                                  #   checks 10 键语义不变、无新增 journal 事件名。
+                                  # --- 历史 ---
+                                  # v0.7.44：两条收工/分配死循环修复 + 收工口径（A8 臂 12 天暴露）——
                                   # ①回片区拿不出目标不许判 stuck（task-4）：`_leftover` 按片区归属
                                   #   （`leftover_area`）替代全场 tmap；`resume_stall_tiles` 记停滞邻域；
                                   #   `_resume_switch_or_exhaust` 三档：换另一片账本待做格 → 当前观测
