@@ -1149,6 +1149,19 @@ namespace AgentFarm.Bridge
         /// 或 `"collect"`（取机器的产物）。缺省/其它值 ⇒ `bad_args`（fail-closed，不许猜动作）。
         /// </summary>
         [JsonPropertyName("action")] public string Action { get; set; }
+
+        // ------------------------------------------------------------------
+        //  0.7.39（task-228）新增：`advance_dialogue` 的推进上限
+        // ------------------------------------------------------------------
+
+        /// <summary>
+        /// <c>advance_dialogue</c> 专用：本次最多推进多少"步"（默认 20、上限 60、下限 1）。
+        ///
+        /// 【为什么必须有上限】每次点击后游戏要等 `safetyTimer`（750ms，短句 550ms）走完，
+        /// 20 步 ≈ 11~15s；不设上限就会把"一次只允许一件事"的主线程槽位长期占住，
+        /// 把其它请求全拒成 `busy`（`MainThreadDispatcher` §1）。
+        /// </summary>
+        [JsonPropertyName("maxSteps")] public int? MaxSteps { get; set; }
     }
 
     /// <summary>
@@ -1464,6 +1477,48 @@ namespace AgentFarm.Bridge
 
         /// <summary><c>machine</c> 专用：动作之后 `MinutesUntilReady`。【可选字段】</summary>
         [JsonPropertyName("minutesUntilReady")] public int? MinutesUntilReady { get; set; }
+
+        // ------------------------------------------------------------------
+        //  0.7.39（task-228）新增：`advance_dialogue` 的推进回执
+        //  口径：判据只有观测差分（点击前后 eventUp / 菜单文本 / isQuestion），
+        //  绝不拿"调用成功"当"推进成功"（IL 实证：第一次点击只补完打字、太快会空操作）。
+        // ------------------------------------------------------------------
+
+        /// <summary><c>advance_dialogue</c> 专用：本次实际推进了几步（progress 分类命中次数）。【可选字段】</summary>
+        [JsonPropertyName("stepped")] public int? Stepped { get; set; }
+
+        /// <summary>
+        /// <c>advance_dialogue</c> 专用：**最后一次点击有没有世界变化**（`true` = 点了但什么都没变）。
+        ///
+        /// 【为什么要这个字段（真机补钉 task-226 / d1e085a）】事件脚本里有 `pause`，
+        /// 期间"无变化"是正常的；但脑侧必须能看见"连续 stalled"这种真卡死信号 ——
+        /// 连 2 次 `stalled=true` ⇒ 该事件停止推进、`event_blocked` 诚实收尾。
+        /// 配 `worldSeqBefore/After` 一起看，绝不许靠人工计时救。
+        /// 【可选字段】
+        /// </summary>
+        [JsonPropertyName("stalled")] public bool? Stalled { get; set; }
+
+        /// <summary><c>advance_dialogue</c> 专用：**开动之前**的观测快照（审计用）。【可选字段】</summary>
+        [JsonPropertyName("before")] public DialogueStateView Before { get; set; }
+
+        /// <summary><c>advance_dialogue</c> 专用：**终态**的观测快照（审计用）。【可选字段】</summary>
+        [JsonPropertyName("after")] public DialogueStateView After { get; set; }
+    }
+
+    /// <summary>
+    /// 对话/事件的观测快照（task-228 `advance_dialogue` 的 `before`/`after`）。
+    /// 三个字段都可空：**读不到就是 null，绝不用默认值冒充观测**（fail-closed 口径）。
+    /// </summary>
+    internal sealed class DialogueStateView
+    {
+        /// <summary>`Game1.eventUp`（事件是否仍在跑）。【可选字段】</summary>
+        [JsonPropertyName("eventUp")] public bool? EventUp { get; set; }
+
+        /// <summary>当前模态的类型名/文本（`UiRead.ActiveMenuText()` 同口径）；无模态 ⇒ null。【可选字段】</summary>
+        [JsonPropertyName("menuText")] public string MenuText { get; set; }
+
+        /// <summary>当前 `DialogueBox.isQuestion`（无对话框 ⇒ null）。【可选字段】</summary>
+        [JsonPropertyName("isQuestion")] public bool? IsQuestion { get; set; }
     }
 
     /// <summary>

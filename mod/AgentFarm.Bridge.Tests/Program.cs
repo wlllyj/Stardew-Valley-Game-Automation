@@ -552,6 +552,52 @@ namespace AgentFarm.Bridge.Tests
                   SkillCatalog.LongTask.Length > 0 && OnlyIn(new List<string>(SkillCatalog.LongTask), catalogExec).Count == 0,
                   "LongTask 必须是 Executable 的子集（长任务里出现没实现的名字 ⇒ 永远拿不到结果）");
 
+            // ---- task-228：advance_dialogue 的纯规则（事件 pause 的重试/放弃口径必须行为化） ----
+            Check("t228_max_steps_is_clamped",
+                  DialogueAdvanceRules.ClampMaxSteps(null) == DialogueAdvanceRules.MaxStepsDefault
+                  && DialogueAdvanceRules.ClampMaxSteps(0) == 1
+                  && DialogueAdvanceRules.ClampMaxSteps(-5) == 1
+                  && DialogueAdvanceRules.ClampMaxSteps(7) == 7
+                  && DialogueAdvanceRules.ClampMaxSteps(500) == DialogueAdvanceRules.MaxStepsCap,
+                  "maxSteps 钳制（卡面 1..10）：null⇒默认 1、≤0⇒1、超界⇒10");
+
+            Check("t228_precheck_order_is_fail_closed",
+                  DialogueAdvanceRules.Precheck(true, true, true, true) == DialogueAdvanceRules.StatusIsQuestion
+                  && DialogueAdvanceRules.Precheck(true, false, true, true) == DialogueAdvanceRules.StatusProfessionsPending
+                  && DialogueAdvanceRules.Precheck(false, false, false, true) == DialogueAdvanceRules.StatusNoDialogue
+                  && DialogueAdvanceRules.Precheck(true, false, false, false) == DialogueAdvanceRules.StatusEventNotRunning
+                  && DialogueAdvanceRules.Precheck(true, false, false, true) == "",
+                  "前置顺序必须是 提问 > 职业选择 > 没对话 > 不是事件（越权风险优先；提问/职业一次都不许点）");
+
+            Check("t228_progress_classification",
+                  DialogueAdvanceRules.Classify(false, false, true) == DialogueAdvanceRules.ProgressTyping
+                  && DialogueAdvanceRules.Classify(false, true, false) == DialogueAdvanceRules.ProgressAdvanced
+                  && DialogueAdvanceRules.Classify(false, false, false, menuTextChanged: true) == DialogueAdvanceRules.ProgressAdvanced
+                  && DialogueAdvanceRules.Classify(false, false, false, false, eventUpChanged: true) == DialogueAdvanceRules.ProgressAdvanced
+                  && DialogueAdvanceRules.Classify(true, false, false) == DialogueAdvanceRules.ProgressMenuReplaced
+                  && DialogueAdvanceRules.Classify(false, false, false) == DialogueAdvanceRules.ProgressStalled
+                  && !DialogueAdvanceRules.IsProgress(DialogueAdvanceRules.ProgressStalled)
+                  && DialogueAdvanceRules.IsProgress(DialogueAdvanceRules.ProgressTyping),
+                  "判据只认观测差分：打字补完/文本变/菜单文本变/事件状态变都算 progress，全不中才是 stalled");
+
+            Check("t228_pause_retry_and_giveup_policy",
+                  DialogueAdvanceRules.StallRetryGapMs >= 3000
+                  && DialogueAdvanceRules.StallMaxClicks == 3
+                  && DialogueAdvanceRules.ShouldRetryAfterNoChange(1)
+                  && DialogueAdvanceRules.ShouldRetryAfterNoChange(2)
+                  && !DialogueAdvanceRules.ShouldRetryAfterNoChange(3)
+                  && DialogueAdvanceRules.ShouldGiveUpAfterStalls(2)
+                  && !DialogueAdvanceRules.ShouldGiveUpAfterStalls(1)
+                  && DialogueAdvanceRules.SafetyGapMs(10) == DialogueAdvanceRules.SafetyGapShortMs + DialogueAdvanceRules.SafetyBufferMs
+                  && DialogueAdvanceRules.SafetyGapMs(30) == DialogueAdvanceRules.SafetyGapLongMs + DialogueAdvanceRules.SafetyBufferMs,
+                  "事件 pause：无变化先隔 ≥3000ms 重试、同一处最多 3 次；连续 2 次 stalled 才放弃；"
+                  + "两次点击间隔按 550/750ms + 50ms 容错");
+
+            Check("t228_skill_is_catalogued_as_long_task",
+                  SkillCatalog.Executable != null && Array.IndexOf(SkillCatalog.Executable, "advance_dialogue") >= 0
+                  && Array.IndexOf(SkillCatalog.LongTask, "advance_dialogue") >= 0,
+                  "advance_dialogue 必须同时进 SkillCatalog.Executable 与 LongTask（跨 tick 等 safetyTimer/pause）");
+
             Console.WriteLine(_failed == 0
                 ? $"OK {_total} 断言全部通过"
                 : $"FAILED {_failed} 条断言不通过（共 {_total} 条）");

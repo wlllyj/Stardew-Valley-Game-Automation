@@ -40,6 +40,7 @@ from agentfarm.farmwork import (  # noqa: E402
 )
 from agentfarm.longrun import (  # noqa: E402
     ACTIONLESS_TASKS, CLEARABLE_KINDS, DEFAULT_LLM_MAX_TOKENS, ENDED_BY_EVENT, ENDED_BY_MODAL,
+    EVENT_ADVANCE_DAY_STEPS, EVENT_ADVANCE_MAX_STEPS, EVENT_STALL_GIVE_UP,
     FAR_DRY_MAX_TRIES, FAR_DRY_OPEN_MAX, FAR_DRY_REFILL_MAX,
     FRONTIER_CLEAR_MAX, INTENT_REASON_CODES, JUSTIFIED_END_REASONS, MAX_BUY_TRIES_PER_DAY,
     MAX_ENV_ATTEMPTS,
@@ -163,6 +164,13 @@ class FakeWorld:
         #: 真桥在出货/存档菜单上跨 tick 干活，必须把"怎么推的、等了多久、菜单有没有消失"带回脑；
         #: 假世界默认 `None`（旧口径：一次调用就关掉队首、只回 `ok`）。
         self.dismiss_receipt: dict | None = None
+        # ---- task-228：事件对话推进（advance_dialogue）----
+        #: 队首是 `DialogueBox` 时，`advance_dialogue()` 默认"推开一句"（弹掉队首）；
+        #: `advance_outcomes` 非空时优先按脚本返回回执（用来造 `stalled`/`pause`/`max_steps_reached`）。
+        #: 回执里的 `_pop_ui=True` 表示这条脚本回执真的把队首对话弹掉。
+        self.advance_outcomes: list[dict] = []
+        self.advance_calls = 0
+        self.advance_kwargs: list[dict] = []
         self.scythe = scythe
         #: 【task-205】`player.tools.tools[]`（每件工具的 `kind`/`upgradeLevel`）。默认三件 0 级
         #: （与背包里的 Axe/Hoe/WateringCan 对齐）；`{}` = 旧 Mod（没有该数组 ⇒ `tool_tier()` 一律 -1）。
@@ -364,6 +372,29 @@ class FakeWorld:
         if self.dismiss_receipt:
             out.update(self.dismiss_receipt)
         return out
+
+    def advance_dialogue(self) -> dict:
+        """【task-228】`advance_dialogue` 的假世界版：推开一句事件对话并如实返回回执。
+
+        - 队首是 `DialogueBox` ⇒ 弹掉它（= 推进一句），`stepped=1`；
+        - `advance_outcomes` 非空 ⇒ 优先按脚本回执返回（`_pop_ui=True` 时弹队首）；
+        - 没有对话 ⇒ `no_dialogue`；**不做任何"替游戏选选项"的模拟**（提问由脑侧挡住）。
+        """
+        self.advance_calls += 1
+        if self.advance_outcomes:
+            out = dict(self.advance_outcomes.pop(0))
+            if out.pop("_pop_ui", False) and self.ui_script:
+                self.ui_script.pop(0)
+            out.setdefault("ok", str(out.get("status") or "") in ("ok", "no_dialogue"))
+            out.setdefault("stepped", 0)
+            out.setdefault("stalled", False)
+            return out
+        if self.ui_script and str(self.ui_script[0].get("activeMenu") or "") == "DialogueBox":
+            line = self.ui_script.pop(0)
+            return {"ok": True, "status": "ok", "stepped": 1, "stalled": False,
+                    "before": {"eventUp": True, "menuText": line.get("activeMenuText")},
+                    "after": {"eventUp": bool(self.ui_script), "menuText": ""}}
+        return {"ok": True, "status": "no_dialogue", "stepped": 0, "stalled": True}
 
     def clear(self, tile):
         kind = self.blockers.get(tile)
@@ -659,6 +690,11 @@ class FakeClient:
     def dismiss_modal(self, *, timeout_ms=5000):
         self.dismiss_timeouts.append(timeout_ms)
         return self.w.dismiss()
+
+    # ---- task-228：事件对话推进 ----
+    def advance_dialogue(self, *, max_steps=None, timeout_ms=60000):
+        self.w.advance_kwargs.append({"max_steps": max_steps, "timeout_ms": timeout_ms})
+        return self.w.advance_dialogue()
 
     # ---- 供**真** `FarmWorker.plant`/`sow` 驱动（task-22 的播种/浇水集成用例）----
     def plant(self, seed, tile, *, timeout_ms=None):
@@ -2620,6 +2656,10 @@ class TestTask41EventBlocked(unittest.TestCase):
     ⇒ 政策：`eventUp=true` 时 **一次都不动手**，当天 `blocked_event` 停下等人。
     `eventUp=false` 的老四类行为（提问/普通对话/LevelUpMenu/存档只等）一字不改。
 
+    【task-228 修订】**非提问**的事件 `DialogueBox` 允许受控推进（`advance_dialogue`：
+    每次/每天有限额、点不动连续 2 次就停）。本类钉死"保护面没被削掉"：
+    提问一次不点；非对话事件不动；**推不动的对话**仍回到 `blocked_event` 且 0 次 dismiss。
+
     变异自检（2026-10-13，`%TEMP%\\t41_mutate.py`）：去掉 `eventUp` 判断（`_event_blocked` 直接
     `(obs, False)`）⇒ 本类 `test_event_dialogue_…` 与 `test_event_question_…` **两条皆红**；
     基线（无变异）7/7 绿。
@@ -2640,15 +2680,26 @@ class TestTask41EventBlocked(unittest.TestCase):
         return [e for e in run.entries if e["event"] == event]
 
     def test_event_dialogue_is_never_dismissed_and_day_is_not_verified(self):
-        """①`eventUp=true` + 普通 DialogueBox ⇒ 不 dismiss、`blocked_event`、`run()` 非 0。"""
+        """①`eventUp=true` + **推不动**的普通 DialogueBox ⇒ 不 dismiss、`blocked_event`、`run()` 非 0。
+
+        【task-228 修订】非提问事件对话现在允许受控推进；这条造"点了也没世界变化"（`stalled`）
+        的现场：推进到达上限后必须回到 task-41 的硬停 —— **一次 dismiss 都没有**、
+        `blocked_event`、当天不 VERIFIED、`run()` 早退。
+        """
         w = FakeWorld(weeds=0, seeds=10, money=500)
         w.ui_script = [{"activeMenu": "DialogueBox", "activeMenuText": "Hello Jay!",
                         "dialogueResponses": [], "dialogueIsQuestion": False, "eventUp": True}]
+        w.advance_outcomes = [
+            {"status": "advance_stalled", "stepped": 0, "stalled": True},
+            {"status": "advance_stalled", "stepped": 0, "stalled": True},
+        ]
         run = self._run(w)
 
         code = run.run()
 
         self.assertEqual(code, 1, run.logs)
+        self.assertGreaterEqual(w.advance_calls, EVENT_STALL_GIVE_UP,
+                                "非提问事件对话应该先尝试受控推进")
         self.assertEqual(w.dismiss_calls, 0, "游戏事件一次都不许关（关框=替游戏做选择）")
         ev = self._events(run, "event_blocked")
         self.assertEqual(len(ev), 1, run.entries)
@@ -2656,6 +2707,7 @@ class TestTask41EventBlocked(unittest.TestCase):
                          ("DialogueBox", "Hello Jay!"), ev[0])
         self.assertEqual(ev[0]["dialogueResponses"], [], ev[0])
         self.assertEqual(ev[0]["dialogueIsQuestion"], False, ev[0])
+        self.assertEqual(ev[0]["stall_streak"], EVENT_STALL_GIVE_UP, ev[0])
         self.assertIsNotNone(ev[0]["tile"], ev[0])
         self.assertIsInstance(ev[0]["timeOfDay"], int, ev[0])
         self.assertIsNotNone(ev[0]["worldSeq"], ev[0])
@@ -10808,6 +10860,139 @@ class TestTask219IntentCoverage(unittest.TestCase):
         reason = LongRun._tile_reason(key, [silent], stopped="", obs={})
         self.assertEqual(reason, "unknown_evidence")
         self.assertIn(reason, INTENT_REASON_CODES)
+
+
+class TestTask228DialogueAdvance(unittest.TestCase):
+    """task-228：事件里的**非提问对话**可以受控推进；提问/职业选择/非对话事件一律不动。
+
+    账户模型（`LongRun._advance_event_dialogue`）：
+      * 只在 `ui.eventUp=true` + `activeMenu=="DialogueBox"` + 没有提问时动手；
+      * 每次最多 `EVENT_ADVANCE_MAX_STEPS` 步、每天最多 `EVENT_ADVANCE_DAY_STEPS` 步；
+      * 回执 `stalled=true`（点了没世界变化，事件可能在 `pause`）连续
+        `EVENT_STALL_GIVE_UP` 次 ⇒ 停止推进，交给 `_clear_modals` 的 `event_blocked`。
+    """
+
+    def _run(self, world):
+        run = make_run(world)
+        run.client = FakeClient(world)
+        run.worker = FakeWorker(world)
+        run.started = 0.0
+        run.now = lambda: 0.0
+        return run
+
+    def _world(self, lines: int = 3, **ui_extra) -> FakeWorld:
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.ui_script = [{"activeMenu": "DialogueBox", "eventUp": True,
+                        "activeMenuText": f"line{i}", **ui_extra} for i in range(lines)]
+        return w
+
+    def _rep(self) -> DayReport:
+        return DayReport(day_key=("spring", 1, 9), started_at=0.0)
+
+    def _events(self, run, name: str) -> list[dict]:
+        return [e for e in run.entries if e["event"] == name]
+
+    def test_non_question_dialogue_is_advanced_one_step(self):
+        """正常事件对话：一次调用推一句，并写既有 `modal_dismissed` 事件（不新增事件名）。"""
+        w = self._world(3)
+        run = self._run(w)
+        rep = self._rep()
+        out = run._advance_event_dialogue(run._snap(), rep)
+        self.assertEqual(w.advance_calls, 1)
+        self.assertEqual(run.event_advance_steps_today, 1)
+        self.assertEqual(run.event_advance_calls_today, 1)
+        self.assertEqual(w.advance_kwargs[0]["max_steps"], EVENT_ADVANCE_MAX_STEPS)
+        self.assertEqual(str((out.get("ui") or {}).get("activeMenuText") or ""), "line1")
+        events = self._events(run, "modal_dismissed")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["kind"], "dialogue_advance")
+        self.assertEqual(events[0]["stepped"], 1)
+
+    def test_question_dialogue_is_never_advanced(self):
+        """提问（`dialogueIsQuestion` / `dialogueResponses`）⇒ 一次都不点，交给 event_blocked。"""
+        w = self._world(1, dialogueIsQuestion=True, dialogueResponses=["是", "否"])
+        run = self._run(w)
+        rep = self._rep()
+        run._advance_event_dialogue(run._snap(), rep)
+        self.assertEqual(w.advance_calls, 0)
+        self.assertEqual(run.event_advance_steps_today, 0)
+
+    def test_event_without_dialogue_box_is_not_advanced(self):
+        """`eventUp` 但当前模态不是 `DialogueBox`（过场/脚本）⇒ 不动手。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.ui_script = [{"activeMenu": "EventOverlay", "eventUp": True, "activeMenuText": "过场"}]
+        run = self._run(w)
+        run._advance_event_dialogue(run._snap(), self._rep())
+        self.assertEqual(w.advance_calls, 0)
+
+    def test_no_event_means_no_call(self):
+        """没有事件（`eventUp=false`）⇒ 一次都不调，连续 stalled 计数也清零。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = self._run(w)
+        run.event_stall_streak = EVENT_STALL_GIVE_UP
+        run._advance_event_dialogue(run._snap(), self._rep())
+        self.assertEqual(w.advance_calls, 0)
+        self.assertEqual(run.event_stall_streak, 0)
+
+    def test_stall_twice_stops_advancing(self):
+        """连续 `stalled` 达上限 ⇒ 停止推进（不再发请求），交给 event_blocked 诚实收尾。"""
+        w = self._world(1)
+        w.advance_outcomes = [
+            {"status": "advance_stalled", "stepped": 0, "stalled": True},
+            {"status": "advance_stalled", "stepped": 0, "stalled": True},
+            {"status": "ok", "stepped": 1, "stalled": False},
+        ]
+        run = self._run(w)
+        rep = self._rep()
+        run._advance_event_dialogue(run._snap(), rep)
+        self.assertEqual(run.event_stall_streak, 1)
+        run._advance_event_dialogue(run._snap(), rep)
+        self.assertEqual(run.event_stall_streak, EVENT_STALL_GIVE_UP)
+        run._advance_event_dialogue(run._snap(), rep)   # 已达上限 ⇒ 不再发请求
+        self.assertEqual(w.advance_calls, 2)
+        self.assertTrue(any("停止推进" in n for n in rep.notes))
+
+    def test_daily_step_budget_blocks_further_advance(self):
+        """每天累计步数用满 ⇒ 不再推进（不无限自旋），当天由 event_blocked 收尾。"""
+        w = self._world(1)
+        run = self._run(w)
+        run.event_advance_steps_today = EVENT_ADVANCE_DAY_STEPS
+        run._advance_event_dialogue(run._snap(), self._rep())
+        self.assertEqual(w.advance_calls, 0)
+
+    def test_success_resets_stall_streak(self):
+        """真推进一次就把 `stalled` 连续计数清零（pause 抖动不该把事件判死）。"""
+        w = self._world(2)
+        w.advance_outcomes = [
+            {"status": "advance_stalled", "stepped": 0, "stalled": True},
+            {"status": "ok", "stepped": 1, "stalled": False, "_pop_ui": True},
+        ]
+        run = self._run(w)
+        rep = self._rep()
+        run._advance_event_dialogue(run._snap(), rep)
+        self.assertEqual(run.event_stall_streak, 1)
+        run._advance_event_dialogue(run._snap(), rep)
+        self.assertEqual(run.event_stall_streak, 0)
+        self.assertEqual(run.event_advance_steps_today, 1)
+
+    def test_event_blocked_ledger_carries_advance_fields(self):
+        """`event_blocked` 要能分清"提问/职业选择"与"推了 N 步后点不动"——账本带推进账。"""
+        w = self._world(1)
+        w.advance_outcomes = [
+            {"status": "advance_stalled", "stepped": 0, "stalled": True},
+            {"status": "advance_stalled", "stepped": 0, "stalled": True},
+        ]
+        run = self._run(w)
+        rep = self._rep()
+        for _ in range(EVENT_STALL_GIVE_UP):
+            run._advance_event_dialogue(run._snap(), rep)
+        obs, blocked = run._clear_modals(run._snap(), rep)
+        self.assertTrue(blocked)
+        self.assertEqual(rep.ended_by, ENDED_BY_EVENT)
+        ev = self._events(run, "event_blocked")[-1]
+        self.assertEqual(ev["advance_calls"], EVENT_STALL_GIVE_UP)
+        self.assertEqual(ev["stall_streak"], EVENT_STALL_GIVE_UP)
+        self.assertEqual(ev["advance_steps"], 0)
 
 
 if __name__ == "__main__":  # pragma: no cover

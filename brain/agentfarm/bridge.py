@@ -666,8 +666,41 @@ class BridgeClient:
 
         成功后请**务必检查 `worldResumed`**：它为 False 时说明模态关了但世界没恢复
         （`canMove=false`），此时状态是 `world_stuck`，脑需要重启游戏而不是继续排计划。
+
+        ⚠️ 它**不是**"推进对话"：对 `DialogueBox` 它走 `closeDialogue()`（= `exitActiveMenu()`），
+        会**跳过当前句的显示时机**、把事件停在半截（后续 `addCraftingRecipe` 之类仍会执行，
+        但对话语义丢了）。事件对话的受控推进见 :meth:`advance_dialogue`（task-228）。
         """
         return self.exec_skill("dismiss_modal", timeout_ms=timeout_ms)
+
+    def advance_dialogue(
+        self,
+        *,
+        max_steps: int | None = None,
+        timeout_ms: int = 60000,
+    ) -> dict[str, Any]:
+        """把**非提问**的事件对话受控推进（advance_dialogue，task-228）。
+
+        为什么需要：事件脚本的非提问对话会停在第一句等点击 ⇒ `ui.eventUp=true` +
+        `worldAdvancing=false`，无人值守时永久挂住（真机事故：Clint 送熔炉配方）。
+
+        原语 = `DialogueBox.receiveLeftClick(0, 0, true)`（IL 实证：玩家真实点击走它，
+        右键只是转发，动作键也映射成它）；**不是** `closeDialogue()`（跳句）。
+        不会替游戏选选项：遇到提问/职业选择会 fail-closed 返回 `is_question` /
+        `professions_pending`，一次都不点。
+
+        `max_steps`：本次最多推进几步（Mod 默认 20、上限 60）。
+        `timeout_ms`：默认 60000（每步要等 safetyTimer 750/550ms；事件 `pause` 会以
+        3s 间隔重试，最多 3 次都没变化才 `advance_stalled`）。
+
+        回执字段：`stepped`（推进步数）、`stalled`（最后一次点击有没有世界变化）、
+        `before`/`after`（`eventUp`/`menuText`/`isQuestion` 快照）。
+        判据只看观测差分；`stalled` 连续出现 ⇒ 脑侧停止推进、`event_blocked` 诚实收尾。
+        """
+        args: dict[str, Any] = {}
+        if max_steps is not None:
+            args["maxSteps"] = int(max_steps)
+        return self.exec_skill("advance_dialogue", args or None, timeout_ms=timeout_ms)
 
     def move_to(
         self,

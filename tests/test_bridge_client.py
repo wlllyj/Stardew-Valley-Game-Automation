@@ -522,6 +522,28 @@ class BridgeClientTest(unittest.TestCase):
         self.assertNotIn("args", body)   # 空 args 不发，保持请求最小
         self.assertEqual(body["timeout_ms"], 60000)
 
+    def test_advance_dialogue_request_shape(self) -> None:
+        """advance_dialogue（task-228）：maxSteps 只在显式给出时发；默认 60s 超时。"""
+        c = BridgeClient()
+        c.advance_dialogue()
+        body = FakeBridgeHandler.last_body
+        self.assertEqual(body["skill"], "advance_dialogue")
+        self.assertNotIn("args", body)         # 空 args 不发，保持请求最小
+        self.assertEqual(body["timeout_ms"], 60000)
+
+        c.advance_dialogue(max_steps=5, timeout_ms=120000)
+        body = FakeBridgeHandler.last_body
+        self.assertEqual(body["args"], {"maxSteps": 5})
+        self.assertEqual(body["timeout_ms"], 120000)
+
+    def test_advance_dialogue_failure_surfaces_status(self) -> None:
+        """提问/职业选择/停滞：Mod 报 is_question / professions_pending / advance_stalled，脑必须显式失败。"""
+        for status in ("is_question", "professions_pending", "advance_stalled"):
+            FakeBridgeHandler.exec_status = status
+            with self.assertRaises(BridgeError) as ctx:
+                BridgeClient().advance_dialogue(max_steps=5)
+            self.assertEqual(ctx.exception.status, status)
+
     # ---------- 失败路径（旧方案的教训：失败必须显式） ----------
     def test_unauthorized_surfaces_reason(self) -> None:
         self.bridge_json.write_text(json.dumps({"schema": "agentfarm-bridge/1", "port": self.port,

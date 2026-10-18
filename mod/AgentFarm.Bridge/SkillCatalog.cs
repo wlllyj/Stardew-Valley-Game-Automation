@@ -32,7 +32,7 @@ namespace AgentFarm.Bridge
             "noop", "move_to", "move_to_location", "load_save", "quit_game", "interact", "use_tool",
             "select_item", "plant", "sleep", "buy", "sell", "dismiss_modal",
             "upgrade_tool", "pickup_tool", "debug_dump", "add_missed_recipes",
-            "craft_item", "place_object", "machine",
+            "craft_item", "place_object", "machine", "advance_dialogue",
         };
 
         /// <summary>
@@ -49,7 +49,8 @@ namespace AgentFarm.Bridge
         /// = 本 tick 未完、下 tick 继续）。**判据是"要不要等外部状态"**，不是"重不重"：
         ///
         ///   * 要等：`upgrade_tool`（等 `ShopMenu` 挂上）、`dismiss_modal`（等存档菜单十几秒）、
-        ///     `move_to*`/`load_save`/`use_tool`/`plant`/`sleep`/`buy`（游戏侧动画/过场/保存）。
+        ///     `move_to*`/`load_save`/`use_tool`/`plant`/`sleep`/`buy`（游戏侧动画/过场/保存）、
+        ///     `advance_dialogue`（等 safetyTimer 750/550ms 与事件 pause 的 3s 重试）。
         ///   * 不等（单 tick 必出终态）：`craft_item` / `place_object` / `machine` / `pickup_tool` /
         ///     `debug_dump` / `add_missed_recipes`。标成长任务没有收益，反而会白占"一次只允许
         ///     一件事"的槽位、把其它请求拒成 `busy`（`MainThreadDispatcher.cs` §1）。
@@ -57,7 +58,7 @@ namespace AgentFarm.Bridge
         internal static readonly string[] LongTask =
         {
             "move_to", "move_to_location", "load_save", "use_tool", "plant", "sleep", "buy",
-            "dismiss_modal", "upgrade_tool",
+            "dismiss_modal", "upgrade_tool", "advance_dialogue",
         };
 
         private static readonly HashSet<string> KnownSet = BuildKnown();

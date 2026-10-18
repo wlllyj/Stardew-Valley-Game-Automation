@@ -316,6 +316,22 @@ ENDED_BY_EVENT = "blocked_event"
 #: ⇒ `verified=false`，且 `run()` 当场早退（同一天再跑一遍没有意义）。
 BLOCKING_ENDS = (ENDED_BY_MODAL, ENDED_BY_EVENT)
 
+#: 【task-228】事件里**非提问对话**的受控推进（`advance_dialogue`）每天的有界额度。
+#:
+#: 事件脚本的非提问对话会停在第一句等点击 ⇒ `ui.eventUp=true` + `worldAdvancing=false`，
+#: 无人值守时**永久挂住**（真机事故：Clint 送熔炉配方，2026-10-17）。用户已授权
+#: "只推进非提问对话、永不替游戏选选项"，所以这条路径要和"事件一律硬停（task-41）"
+#: 严格划清：**提问/职业选择 ⇒ 一次都不点**，立刻回到 `event_blocked` 诚实收尾。
+#:
+#: 一次调用最多推 :data:`EVENT_ADVANCE_MAX_STEPS` 步（与 Mod 侧 `maxSteps` 的 1..10 同口径），
+#: 每天累计最多 :data:`EVENT_ADVANCE_DAY_STEPS` 步；`stalled`（点了没世界变化）
+#: 连续 :data:`EVENT_STALL_GIVE_UP` 次 ⇒ 停止推进（可能是事件脚本的 `pause`/等玩家）。
+#: 步长取小（10）是刻意的：每轮只推一小段就重新观测，提问/职业选择一出现就立刻停手。
+EVENT_ADVANCE_MAX_STEPS = 10
+EVENT_ADVANCE_DAY_STEPS = 60
+EVENT_STALL_GIVE_UP = 2
+EVENT_ADVANCE_TIMEOUT_MS = 60000
+
 
 def _dist(a: tuple[int, int], b: tuple[int, int]) -> int:
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
@@ -781,6 +797,14 @@ class LongRun:
         # task-11 模态守卫：等待型模态的墙钟上限、一次最多关几个模态（可注入，便于单测）。
         self.modal_wait_timeout_s = float(modal_wait_timeout_s)
         self.modal_max_dismiss = int(modal_max_dismiss)
+        # 【task-228】事件对话受控推进的当日账（`_advance_event_dialogue` 读写）：
+        #   * `event_advance_steps_today`：今天共推进了几步（跨多次调用累加，硬上限 DAY_STEPS）；
+        #   * `event_advance_calls_today`：今天调了几次（只作账本/播报）；
+        #   * `event_stall_streak`：连续"点了没世界变化"的次数（碰到真推进就清零）。
+        # 三个都在每个游戏日开头重置（见 `_run_day`）。
+        self.event_advance_steps_today = 0
+        self.event_advance_calls_today = 0
+        self.event_stall_streak = 0
         self.report_dir = Path(report_dir) if report_dir else None
         self.journal_path = Path(journal_path) if journal_path else None
         # 【task-56】决策留痕落点 = 与 journal 同前缀的 `<stem>-llm.jsonl`（planner 不知道 journal
@@ -6638,6 +6662,107 @@ class LongRun:
                   f"{'：' + menu_text if menu_text and menu_text != menu else ''}")
         return self._snap()
 
+    @staticmethod
+    def _event_dialogue_state(obs: dict[str, Any]) -> tuple[bool, bool, str, bool]:
+        """只读"事件对话"现场：`(event_up, is_question, menu, has_dialogue)`（task-228）。
+
+        字段缺失一律按 `False` 处理（fail-closed = 不动手）：宁可停手等人，也不能因为
+        "读不到"就去点一下——点错一下可能替游戏选掉一个不可逆选项。
+        """
+        ui = obs.get("ui") or {}
+        event_up = ui.get("eventUp") is True
+        menu = str(ui.get("activeMenu") or "")
+        is_question = (ui.get("dialogueIsQuestion") is True
+                       or bool(ui.get("dialogueResponses")))
+        return event_up, is_question, menu, menu == "DialogueBox"
+
+    def _event_advance_possible(self, obs: dict[str, Any]) -> bool:
+        """【task-228】现在能不能继续推进事件对话（不能 ⇒ 交给 task-41 的硬停）。
+
+        四个条件全部成立才行：`eventUp=true` + 当前是 `DialogueBox` + **不是提问** +
+        推进额度还没用尽（连续 stalled 未达上限、当天步数未满、客户端有这个能力）。
+        """
+        event_up, is_question, _menu, has_dialogue = self._event_dialogue_state(obs)
+        if not event_up or not has_dialogue or is_question:
+            return False
+        if self.event_stall_streak >= EVENT_STALL_GIVE_UP:
+            return False
+        if self.event_advance_steps_today >= EVENT_ADVANCE_DAY_STEPS:
+            return False
+        client = getattr(self, "client", None)
+        return getattr(client, "advance_dialogue", None) is not None
+
+    def _advance_event_dialogue(self, obs: dict[str, Any], rep: DayReport) -> dict[str, Any]:
+        """【task-228】事件里的**非提问对话**受控推进；其它情况一律不动（返回原观测）。
+
+        为什么必须留一条"能动"的路：`ui.eventUp=true` 的既有政策是"硬停等人"（task-41），
+        但事件里的非提问对话天然停在第一句等点击 ⇒ 无人值守时**永久挂住**（真机事故：
+        Clint 送熔炉配方）。用户已授权"只推进非提问对话、永不替游戏选选项"。
+
+        纪律（全部 fail-closed，没有证据就停手）：
+          * 不是事件 / 事件里不是 `DialogueBox` / 是提问 / 有职业选择 ⇒ **一次都不点**；
+          * 每次最多推 :data:`EVENT_ADVANCE_MAX_STEPS` 步、每天累计最多
+            :data:`EVENT_ADVANCE_DAY_STEPS` 步；用满就交给 `_clear_modals` 的
+            `event_blocked` 诚实收尾（**不许**无限自旋）；
+          * 回执 `stalled=true`（点下去没有世界变化；事件可能在 `pause`）连续
+            :data:`EVENT_STALL_GIVE_UP` 次 ⇒ 停止推进，同样交给 `event_blocked`；
+          * 桥异常 / 回执不可解析 ⇒ 记一条既有 `modal_dismiss_failed` 后停手（不猜）。
+        真推进复用既有 `modal_dismissed` 事件（`kind="dialogue_advance"`）——
+        **不新增 journal 事件名**（analyzer 机械枚举的纪律）。
+        """
+        event_up, _is_question, menu, _has_dialogue = self._event_dialogue_state(obs)
+        if not event_up:
+            self.event_stall_streak = 0
+            return obs
+        if not self._event_advance_possible(obs):
+            return obs
+        client = getattr(self, "client", None)
+        advance = getattr(client, "advance_dialogue", None)
+        if advance is None:                       # 旧客户端/假世界没有这个能力 ⇒ 不动手
+            return obs
+        budget = min(EVENT_ADVANCE_MAX_STEPS,
+                     EVENT_ADVANCE_DAY_STEPS - self.event_advance_steps_today)
+        self.event_advance_calls_today += 1
+        try:
+            receipt = advance(max_steps=budget, timeout_ms=EVENT_ADVANCE_TIMEOUT_MS)
+        except BridgeError as exc:
+            self._journal("modal_dismiss_failed", kind="dialogue_advance", menu=menu,
+                          status=str(getattr(exc, "status", "") or ""), reason=str(exc)[:200])
+            self.event_stall_streak += 1
+            return obs
+        if not isinstance(receipt, dict):
+            self.event_stall_streak += 1
+            return obs
+        stepped = int(receipt.get("stepped") or 0)
+        stalled = receipt.get("stalled") is True
+        status = str(receipt.get("status") or "")
+        if stepped > 0:
+            self.event_advance_steps_today += stepped
+            self.event_stall_streak = 0
+            self._journal("modal_dismissed", kind="dialogue_advance", menu=menu,
+                          status=status, stepped=stepped, stalled=False,
+                          before=receipt.get("before"), after=receipt.get("after"),
+                          steps_today=self.event_advance_steps_today)
+            note = (f"事件对话推进 {stepped} 步（今天共 {self.event_advance_steps_today} 步，"
+                    f"上限 {EVENT_ADVANCE_DAY_STEPS}）")
+            rep.notes.append(note)
+            self._say(f"  · {note}")
+            return self._snap_or(obs)
+        if stalled or status == "advance_stalled":
+            self.event_stall_streak += 1
+            self._journal("modal_dismiss_failed", kind="dialogue_advance", menu=menu,
+                          status=status or "advance_stalled", stalled=True,
+                          streak=self.event_stall_streak, limit=EVENT_STALL_GIVE_UP)
+            if self.event_stall_streak >= EVENT_STALL_GIVE_UP:
+                rep.notes.append(
+                    f"事件对话连续 {self.event_stall_streak} 次点不动 ⇒ 停止推进、"
+                    "按 eventUp 诚实收尾（等玩家）")
+            return obs
+        if status:                                # is_question / professions_pending / …
+            self._journal("modal_dismiss_failed", kind="dialogue_advance", menu=menu,
+                          status=status, reason=str(receipt.get("reason") or "")[:200])
+        return obs
+
     def _clear_modals(self, obs: dict[str, Any], rep: DayReport) -> tuple[dict[str, Any], bool]:
         """日循环每一步之前的**模态守卫**：把挡路的模态按三种处置清掉（task-11）。
 
@@ -6668,9 +6793,13 @@ class LongRun:
             if not is_modal:
                 return obs, False
 
-            # ⓪ **游戏事件**（`ui.eventUp == true`）：一律硬停，绝不代游戏做决定（task-41）。
-            # 放在最前面：事件往往就是个 `DialogueBox`，先判提问/普通对话框就会把它关掉。
+            # ⓪ **游戏事件**（`ui.eventUp == true`）：硬停，绝不代游戏做决定（task-41）。
+            # 【task-228】唯一例外：**非提问**的 `DialogueBox` 且推进额度还没用尽 ⇒ 先让日循环
+            # 下一轮去 `_advance_event_dialogue` 推一句（用户已授权"只推非提问对话、永不选选项"）；
+            # 提问 / 非对话事件 / 额度用尽 / 连续点不动 ⇒ 仍按 task-41 硬停等人。
             if ui.get("eventUp") is True:
+                if self._event_advance_possible(obs):
+                    return obs, False
                 return self._event_blocked(obs, rep)
 
             # ① 提问（DialogueBox 开着提问时 isModal 为真）：走 Mod 的“选否”口径，绝不注入确认键
@@ -6759,6 +6888,11 @@ class LongRun:
                       tile=list(tile) if tile else None,
                       timeOfDay=FarmWorker.time_of_day(obs),
                       worldSeq=obs.get("worldSeq"),
+                      # 【task-228】事件对话推进的当日账：`event_blocked` 到底是因为
+                      # "提问/职业选择"还是"推了 N 步之后点不动"——账本必须能分清。
+                      advance_steps=self.event_advance_steps_today,
+                      advance_calls=self.event_advance_calls_today,
+                      stall_streak=self.event_stall_streak,
                       note="游戏事件挂住（ui.eventUp=true）：关框会替游戏推进剧情/默认选否 ⇒ "
                            "不 dismiss / 不 sleep / 不 load_save，当天不判 VERIFIED，等人处理")
         rep.ended_by = ENDED_BY_EVENT
@@ -6825,6 +6959,10 @@ class LongRun:
         # 【task-218】砍树日预算：每天清零（日上限 + 浇水预备线，见 `_tree_budget_left`）。
         self.trees_cleared_today = 0
         self.tree_budget_noted = False
+        # 【task-228】事件对话受控推进的当日额度每天清零（`_advance_event_dialogue`）。
+        self.event_advance_steps_today = 0
+        self.event_advance_calls_today = 0
+        self.event_stall_streak = 0
         # 【task-122】两种退化形态的当日计数，每天清零（只喂教训库，不参与判定）。
         self.plot_exhausted_today = 0
         self.midway_leftover_today = 0
@@ -6955,6 +7093,11 @@ class LongRun:
                 outdoor_obs = obs
                 outdoor_t = self.now() - self.started
                 outdoor_name = str((obs.get("location") or {}).get("name") or "")
+
+            # **事件对话受控推进**（task-228）：只在 `eventUp=true` + `DialogueBox` +
+            # 非提问时点一下（每次/每天都有界）；提问、职业选择、非对话事件一律不动，
+            # 直接落到下面的模态守卫 ⇒ `event_blocked` 诚实收尾。
+            obs = self._advance_event_dialogue(obs, rep)
 
             # **模态守卫**（task-11）：`LevelUpMenu`/存档模态会把时间冻住（`player.freezePause=100`），
             # 不先清掉的话后面所有技能都会被 `ui_modal` 拒绝、整天静默卡死。清到干净才谈决策。

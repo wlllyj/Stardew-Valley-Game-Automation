@@ -108,6 +108,10 @@ namespace AgentFarm.Bridge
                 case "place_object":
                 case "machine":
                     return ClampMachineTimeout(timeoutMs);
+                // 【task-228】推进事件对话：每步要等 safetyTimer(750/550ms)，事件 pause 还要
+                // 3s 重试；默认 60s、上限 120s（暂停/长事件都装得下，但不许无界）
+                case "advance_dialogue":
+                    return ClampDialogueTimeout(timeoutMs);
                 default:
                     return ClampTimeout(timeoutMs);
             }
@@ -135,9 +139,22 @@ namespace AgentFarm.Bridge
             return v;
         }
 
-        /// <summary>【task-205】铁匠铺升级/取回的时间预算：默认 60s、上限 90s（跨 tick 等菜单）。</summary>
-        public static int ClampUpgradeTimeout(int? timeoutMs)
+        /// <summary>
+        /// 【task-228】事件对话推进的时间预算：默认 60s、上限 120s（跨 tick 等 safetyTimer，
+        /// 事件 `pause` 期间还有 3s 级重试；不许无界）。
+        /// </summary>
+        public static int ClampDialogueTimeout(int? timeoutMs)
         {
+            const int def = 60000;
+            const int max = 120000;
+            int v = timeoutMs ?? def;
+            if (v < TimeoutMinMs) v = TimeoutMinMs;
+            if (v > max) v = max;
+            return v;
+        }
+
+        /// <summary>【task-205】铁匠铺升级/取回的时间预算：默认 60s、上限 90s（跨 tick 等菜单）。</summary>
+        public static int ClampUpgradeTimeout(int? timeoutMs)        {
             const int def = 60000;
             const int max = 90000;
             int v = timeoutMs ?? def;
@@ -499,6 +516,20 @@ namespace AgentFarm.Bridge
                 case "machine":
                     return new MachineSkill(req, world, monitor).Step;
 
+                // 【task-228】推进**非提问**的事件对话（真机事故：Clint 送熔炉配方的事件
+                // 停在第一句等点击 ⇒ eventUp=true + worldAdvancing=false，无人值守永久挂住）。
+                //
+                // 原语 = `DialogueBox.receiveLeftClick(0, 0, true)`（IL 实证：玩家真实点击走它、
+                // 右键只是转发、动作键也映射成它）；**不用** `closeDialogue()`（跳句，跳过该句
+                // 显示时机，后续 addCraftingRecipe 仍执行 ⇒ 对话语义丢了，只能作 dismiss_modal 应急）。
+                //
+                // 跨 tick：① transitioning 期调用是空操作；② 第一次点击只"补完打字"；
+                // ③ safetyTimer=750/550 ⇒ 连续有效点击要隔够。事件 `pause` 期间无变化属正常，
+                // 内部会隔 3s 重试、最多 3 次都没变化才 advance_stalled。
+                // ⇒ BridgeHost 的 isLongTask 判据必须包含 "advance_dialogue"（SkillCatalog 单一数据源）。
+                case "advance_dialogue":
+                    return new DialogueAdvanceSkill(req, world, monitor).Step;
+
                 default:
                     // 未实现的技能：合法请求但还没有实现（区别于 unknown_skill）。
                     return () => new ExecResponse
@@ -509,7 +540,7 @@ namespace AgentFarm.Bridge
                         Reason = $"技能“{skill}”尚未实现（已实现：noop、move_to、move_to_location、"
                                + "dismiss_modal、load_save、quit_game、interact、use_tool、select_item、plant、"
                                + "sleep、buy、sell、upgrade_tool、pickup_tool、debug_dump、add_missed_recipes、"
-                               + "craft_item、place_object、machine）",
+                               + "craft_item、place_object、machine、advance_dialogue）",
                     };
             }
         }
