@@ -14539,6 +14539,8 @@ class TestTask25BackpackUpgrade(unittest.TestCase):
         run = make_run(w)
         run.client = FakeClient(w)
         run.worker = FakeWorker(w)
+        # 【task-35】默认关闭；本类验证的是"显式开启后"的 0.7.46 行为，故统一打开。
+        run.backpack_upgrade_enabled = True
         return run
 
     @staticmethod
@@ -14715,6 +14717,143 @@ class TestTask25BackpackUpgrade(unittest.TestCase):
         self.assertEqual(d["backpack_upgrade_attempts"], 1)
         self.assertEqual(d["backpack_upgrade_failures"], [])
         self.assertEqual(d["backpack_upgrade_skip"], "")
+
+
+class TestTask35BackpackGate(unittest.TestCase):
+    """【task-35 / 0.7.47 快修】背包升级对话购买**默认关闭**（opt-in），避免每天进 SeedShop。
+
+    task-34 真机探针（commit 4524665）：`talk` 原语可用，但背包升级对话没取到
+    （进 SeedShop 触发过场事件 3102768，相邻 talk 只得 "Sigh..."，非提问无选项）。
+    ⇒ 默认不发 goto/talk/buy，只留 `backpack_upgrade_skip="disabled"` + 一条 skipped 留痕；
+    显式 `--enable-backpack-upgrade`（或 env）开启后恢复 0.7.46 行为。
+    """
+
+    @staticmethod
+    def _rep(day: int = 6) -> DayReport:
+        return DayReport(day_key=("spring", 1, day), started_at=0.0)
+
+    @staticmethod
+    def _run(w: FakeWorld) -> LongRun:
+        run = make_run(w)
+        run.client = FakeClient(w)
+        run.worker = FakeWorker(w)
+        return run
+
+    @staticmethod
+    def _events(run: LongRun, name: str = "buy") -> list[dict]:
+        return [e for e in run.entries if e.get("event") == name]
+
+    @staticmethod
+    def _load_cli():
+        import importlib.util
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[1] / "tools" / "run-longrun.py"
+        spec = importlib.util.spec_from_file_location("_run_longrun_t35", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        return mod
+
+    # ---- ① 默认关闭：零 goto/talk/buy 请求，只有只读 skip 留痕 ----
+    def test_default_disabled_sends_zero_requests_and_traces_skip(self):
+        w = FakeWorld(money=3264)          # gate 本会满足（capacity 12 + 钱够 2000）
+        w.talk_mode = "ok"                 # 若误发请求，则会真的买成 —— 用来证明"确实没发"
+        run, rep = self._run(w), self._rep()
+        self.assertFalse(run.backpack_upgrade_enabled, "0.7.47 默认必须关闭")
+
+        def _must_not_goto(*_a, **_k):
+            self.fail("默认关闭时不许 goto SeedShop")
+        run.worker.ensure_location = _must_not_goto   # type: ignore[assignment]
+
+        self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
+        self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))  # 再观察一轮也不许发
+
+        self.assertEqual((w.money, w.inventory_capacity), (3264, 12), "默认关闭不许动钱/容量")
+        self.assertEqual(w.talk_calls, [], "不许 talk")
+        self.assertEqual(w.buy_calls, [], "不许走货架 buy")
+        self.assertEqual(rep.backpack_upgrade_attempts, 0)
+        self.assertEqual(rep.backpack_upgrade_failures, [], "默认关闭不是失败")
+        self.assertEqual(rep.backpack_upgrade_skip, "disabled")
+        self.assertFalse(rep.backpack_upgrade_ok)
+        self.assertEqual(rep.checks, {}, "购买只留痕，不写 checks")
+        self.assertEqual(rep.notes, [], "默认关闭不往 day notes 加噪音")
+        ev = self._events(run)
+        self.assertEqual(len(ev), 1, "每天只留一条 skip 痕迹")
+        self.assertEqual(ev[0]["status"], "skipped")
+        self.assertEqual(ev[0]["code"], "disabled")
+        self.assertEqual(ev[0]["purpose"], "backpack_upgrade")
+        self.assertIn("默认关闭", ev[0]["reason"])
+
+    # ---- ② day_end 区分 skipped(disabled) 与失败码 ----
+    def test_day_end_distinguishes_disabled_skip_from_failure_codes(self):
+        w = FakeWorld(money=3264)
+        w.talk_mode = "not_supported"
+        run, rep = self._run(w), self._rep()
+        run.backpack_upgrade_enabled = True
+        self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
+        self.assertEqual(rep.backpack_upgrade_failures, ["not_supported"])
+        self.assertEqual(rep.backpack_upgrade_skip, "", "开启后失败走失败码，不是 disabled skip")
+
+        off, rep_off = self._run(FakeWorld(money=3264)), self._rep()
+        self.assertFalse(off._maybe_buy_backpack_upgrade(w.obs(), rep_off))
+        self.assertEqual(rep_off.backpack_upgrade_skip, "disabled")
+        self.assertEqual(rep_off.backpack_upgrade_failures, [])
+
+        d_on, d_off = rep.as_dict(), rep_off.as_dict()
+        self.assertEqual(d_off["backpack_upgrade_skip"], "disabled")
+        self.assertEqual(d_off["backpack_upgrade_failures"], [])
+        self.assertEqual(d_on["backpack_upgrade_skip"], "")
+        self.assertEqual(d_on["backpack_upgrade_failures"], ["not_supported"])
+
+    # ---- ③ 显式开启后恢复 task-25 行为（双差分成功） ----
+    def test_enabling_restores_task25_double_diff_behavior(self):
+        w = FakeWorld(money=3264)
+        w.talk_mode = "ok"
+        run, rep = self._run(w), self._rep()
+        run.backpack_upgrade_enabled = True
+        self.assertTrue(run._maybe_buy_backpack_upgrade(w.obs(), rep))
+        self.assertEqual((w.money, w.inventory_capacity), (1264, 24))
+        self.assertTrue(rep.backpack_upgrade_ok)
+        self.assertEqual(rep.backpack_upgrade_skip, "")
+        self.assertEqual(len(w.talk_calls), 1)
+        self.assertEqual(self._events(run)[-1]["code"], "ok")
+
+    # ---- ④ CLI 透传 / env 解析 ----
+    def test_cli_flag_and_env_parse_into_longrun_switch(self):
+        import os
+        from unittest import mock
+
+        cli = self._load_cli()
+        # 无 env、无 flag ⇒ 默认关闭
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(cli.BACKPACK_UPGRADE_ENV, None)
+            self.assertFalse(cli.build_parser().parse_args([]).enable_backpack_upgrade)
+            self.assertTrue(
+                cli.build_parser().parse_args(["--enable-backpack-upgrade"]).enable_backpack_upgrade)
+        # env=1 ⇒ 默认开启（不需要 flag）
+        with mock.patch.dict(os.environ, {cli.BACKPACK_UPGRADE_ENV: "1"}):
+            self.assertTrue(cli.build_parser().parse_args([]).enable_backpack_upgrade)
+        # env=0 ⇒ 仍然关闭；显式 flag 可覆盖
+        with mock.patch.dict(os.environ, {cli.BACKPACK_UPGRADE_ENV: "0"}):
+            self.assertFalse(cli.build_parser().parse_args([]).enable_backpack_upgrade)
+            self.assertTrue(
+                cli.build_parser().parse_args(["--enable-backpack-upgrade"]).enable_backpack_upgrade)
+        # 纯函数边界
+        self.assertFalse(cli.backpack_upgrade_enabled_from_env({}))
+        self.assertFalse(cli.backpack_upgrade_enabled_from_env({cli.BACKPACK_UPGRADE_ENV: "0"}))
+        for truthy in ("1", "true", "TRUE", "yes", "on", " On "):
+            self.assertTrue(cli.backpack_upgrade_enabled_from_env({cli.BACKPACK_UPGRADE_ENV: truthy}))
+        self.assertFalse(cli.backpack_upgrade_enabled_from_env({cli.BACKPACK_UPGRADE_ENV: "maybe"}))
+
+    def test_default_switch_reaches_longrun_constructor(self):
+        """命令行开关要真的透传到 LongRun（否则 CLI 开了、脑侧仍关 = 假开关）。"""
+        cli = self._load_cli()
+        src = Path(__file__).resolve().parents[1] / "tools" / "run-longrun.py"
+        text = src.read_text(encoding="utf-8")
+        self.assertIn("backpack_upgrade_enabled=args.enable_backpack_upgrade", text)
+        self.assertIn("backpack_upgrade_enabled: bool = False", (
+            Path(__file__).resolve().parents[1] / "brain" / "agentfarm" / "longrun.py"
+        ).read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":  # pragma: no cover

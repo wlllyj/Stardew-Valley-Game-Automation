@@ -1062,6 +1062,7 @@ class LongRun:
         seed_price: int = 20,
         buy_count: int = 10,
         allow_buy: bool = True,
+        backpack_upgrade_enabled: bool = False,
         shop: str = "SeedShop",
         min_stamina: float = 12.0,
         sleep_at: int = 2200,
@@ -1110,6 +1111,16 @@ class LongRun:
         self.seed_price = int(seed_price)
         self.buy_count = int(buy_count)
         self.allow_buy = bool(allow_buy)
+        # 【task-35 / 0.7.47 快修】Pierre 背包升级对话购买**默认关闭**。
+        # task-34 真机只读探针（commit 4524665）证明 talk 原语本身可用，但**背包升级对话没取到**：
+        # 进 SeedShop 会触发过场事件 3102768，相邻 talk 只拿到 "Sigh..."（非提问、无选项）；
+        # 0.7.46 的 task-25 路径每天都会在 gate 满足（capacity==12 且 money>=2000）时
+        # `goto SeedShop → talk Pierre`，既污染 smoke-0746 / A9 证据，也有过场/卡死风险。
+        # ⇒ 默认关闭，只在 day_end 留只读 `backpack_upgrade_skip="disabled"` 与一条 skipped 留痕，
+        #   不发任何 goto/talk/buy 请求、不写 checks；显式开启方式见 tools/run-longrun.py
+        #   `--enable-backpack-upgrade`（或 AGENTFARM_ENABLE_BACKPACK_UPGRADE=1），开启后行为与
+        #   0.7.46 完全一致（每天 ≤2 次失败、≤90s、钱/容量双差分判据）。
+        self.backpack_upgrade_enabled = bool(backpack_upgrade_enabled)
         self.shop = shop
         self.min_stamina = float(min_stamina)
         self.sleep_at = int(sleep_at)
@@ -6799,23 +6810,33 @@ class LongRun:
 
     def _backpack_skip(self, rep: DayReport, why: str, obs: Mapping[str, Any]) -> None:
         rep.backpack_upgrade_skip = str(why)
-        # 只在"值得知道"的跳过原因上留一条（每天最多一条）：钱不够 / 桥没有 talk 原语。
-        if why in ("cannot_afford", "talk_unavailable") and not self.backpack_skip_noted:
+        # 只在"值得知道"的跳过原因上留一条（每天最多一条）：钱不够 / 桥没有 talk 原语 /
+        # task-35 默认关闭。**默认关闭只留痕、绝不发请求**；也不往 rep.notes 里加噪音。
+        if (why in ("cannot_afford", "talk_unavailable", "disabled")
+                and not self.backpack_skip_noted):
             self.backpack_skip_noted = True
+            if why == "cannot_afford":
+                reason = "钱不够升级（需要 2000g）"
+            elif why == "talk_unavailable":
+                reason = "桥没有 talk 原语（Mod < 0.7.46）⇒ 不试对话购买"
+            else:
+                reason = ("背包升级对话购买默认关闭（task-34 探针：进 SeedShop 触发过场事件 "
+                          "3102768、背包升级入口未取得）⇒ 今天不发 goto/talk；"
+                          "要启用加 --enable-backpack-upgrade 或 AGENTFARM_ENABLE_BACKPACK_UPGRADE=1")
             self._journal(
                 "buy", source="backpack_dialogue", item="Backpack",
                 purpose="backpack_upgrade", shop=BACKPACK_UPGRADE_SHOP,
                 npc=BACKPACK_UPGRADE_NPC, ok=False, code=str(why), status="skipped",
-                reason=("钱不够升级（需要 2000g）" if why == "cannot_afford"
-                        else "桥没有 talk 原语（Mod < 0.7.46）⇒ 不试对话购买"),
+                reason=reason,
                 money_before=self._obs_player_int(obs, "money"),
                 capacity_before=self._backpack_capacity(obs),
                 attempts=self.backpack_attempts_today,
                 limit=BACKPACK_UPGRADE_MAX_ATTEMPTS,
             )
-            rep.notes.append(
-                "背包升级今天不试：" + ("钱不够 2000g" if why == "cannot_afford"
-                                        else "桥没有 talk 原语（安全降级，不影响农务/判据）"))
+            if why != "disabled":
+                rep.notes.append(
+                    "背包升级今天不试：" + ("钱不够 2000g" if why == "cannot_afford"
+                                            else "桥没有 talk 原语（安全降级，不影响农务/判据）"))
 
     def _backpack_journal(self, rep: DayReport, *, ok: bool, code: str, status: str,
                           reason: str, money_before: int | None, money_after: int | None,
@@ -6942,7 +6963,14 @@ class LongRun:
             pass
 
     def _maybe_buy_backpack_upgrade(self, obs: Mapping[str, Any], rep: DayReport) -> bool:
-        """开工前试买 Pierre 背包升级；返回 True = 本轮已处理（成功完成），主循环 continue。"""
+        """开工前试买 Pierre 背包升级；返回 True = 本轮已处理（成功完成），主循环 continue。
+
+        【task-35】默认关闭（`self.backpack_upgrade_enabled=False`）：不发任何 goto/talk/buy，
+        只留 `backpack_upgrade_skip="disabled"` + 一条 skipped 留痕；显式开启后行为与 0.7.46 一致。
+        """
+        if not self.backpack_upgrade_enabled:
+            self._backpack_skip(rep, "disabled", obs)
+            return False
         if self.backpack_tried_today:
             return False
         ok, why = self._backpack_gate(obs)

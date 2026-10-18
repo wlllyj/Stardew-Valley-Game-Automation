@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -38,8 +39,24 @@ from agentfarm.longrun import DEFAULT_LLM_MAX_TOKENS, LongRun  # noqa: E402
 
 ZONE_PREFERS = ("most_tillable", "nearest", "empty")
 
+#: 【task-35 / 0.7.47 快修】背包升级对话购买**默认关闭**的显式开启环境变量。
+#: 为什么默认关闭：task-34 真机只读探针（commit 4524665）证明 `talk` 原语可用，但**背包升级
+#: 对话没取到**——进 SeedShop 触发过场事件 3102768，相邻 talk 只拿到 "Sigh..."（非提问、无选项），
+#: Town 事件 15389722 还 5 进 4 卡死。0.7.46 的 task-25 路径每天 gate 满足就会 goto SeedShop，
+#: 会污染 smoke-0746 / A9 的五日连续证据，还有过场/卡死风险 ⇒ 入口未取证前一律默认关闭。
+BACKPACK_UPGRADE_ENV = "AGENTFARM_ENABLE_BACKPACK_UPGRADE"
+BACKPACK_ENV_TRUTHY = ("1", "true", "yes", "on")
 
-def main() -> int:
+
+def backpack_upgrade_enabled_from_env(env: dict[str, str] | None = None) -> bool:
+    """读 `AGENTFARM_ENABLE_BACKPACK_UPGRADE`（1/true/yes/on 才算开）；未设置 ⇒ False（默认关）。"""
+    values = os.environ if env is None else env
+    raw = values.get(BACKPACK_UPGRADE_ENV, "")
+    return str(raw).strip().lower() in BACKPACK_ENV_TRUTHY
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """长跑 CLI 参数解析器（单独成函数是为了单测能直接验证参数透传）。"""
     ap = argparse.ArgumentParser(description="P3 长跑：连续几个游戏日自主清障/开垦/播种/浇水")
     ap.add_argument("--days", type=int, default=3, help="要求尾部连续这么多天都 VERIFIED（默认 3）")
     ap.add_argument("--size", type=int, default=5, help="作业区边长（默认 5 → 每片 25 格）")
@@ -69,6 +86,13 @@ def main() -> int:
                     help="补种子时用来判断钱够不够的单价（默认 20g）")
     ap.add_argument("--buy-count", type=int, default=10, dest="buy_count", help="每次补几个（默认 10）")
     ap.add_argument("--no-buy", action="store_true", dest="no_buy", help="禁止买种子（只用背包里的）")
+    ap.add_argument("--enable-backpack-upgrade", action="store_true",
+                    default=backpack_upgrade_enabled_from_env(),
+                    dest="enable_backpack_upgrade",
+                    help=("显式开启 Pierre 背包升级对话购买（默认关闭）。task-34 真机探针证明 talk 可用，"
+                          "但背包升级对话没取到（进 SeedShop 触发过场事件 3102768）⇒ 默认关闭，避免每天"
+                          "进店/过场卡死污染冒烟与 A9 证据；也可用环境变量 "
+                          f"{BACKPACK_UPGRADE_ENV}=1 开启"))
     ap.add_argument("--journal", default=None, help="JSONL 账本路径（默认 logs\\longrun-<时间戳>.jsonl）")
     ap.add_argument("--report-dir", default="logs", dest="report_dir",
                     help="watchdog 判 STOP 时事故报告落哪个目录（默认 logs）")
@@ -76,7 +100,11 @@ def main() -> int:
                     help=f"给慢脑的 token 上限（默认 {DEFAULT_LLM_MAX_TOKENS}：8192 在 run2 "
                          f"真机上仍被推理吃光过）")
     ap.add_argument("--timeout", type=float, default=180.0, help="桥的 HTTP 超时（默认 180s）")
-    args = ap.parse_args()
+    return ap
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -85,6 +113,14 @@ def main() -> int:
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     journal = Path(args.journal) if args.journal else Path("logs") / f"longrun-{stamp}.jsonl"
+
+    if args.enable_backpack_upgrade:
+        print("★ 背包升级对话购买已显式开启（--enable-backpack-upgrade / "
+              f"{BACKPACK_UPGRADE_ENV}=1）：gate 满足时会 goto SeedShop → talk Pierre；"
+              "task-34 探针表明背包升级入口未取证，注意过场事件 3102768 的风险。")
+    else:
+        print("i 背包升级对话购买默认关闭（task-34：背包升级入口未取证）⇒ 不发 goto/talk，"
+              "只在 day_end 留 skip=disabled 痕迹；要启用加 --enable-backpack-upgrade。")
 
     if args.boundary_llm:
         print("★ 边界决策的大模型已开启（默认）：只在跨日/连续失败/换阶段时问一次，"
@@ -109,6 +145,7 @@ def main() -> int:
         seed_price=args.seed_price,
         buy_count=args.buy_count,
         allow_buy=not args.no_buy,
+        backpack_upgrade_enabled=args.enable_backpack_upgrade,
         min_stamina=args.min_stamina,
         sleep_at=args.sleep_at,
         max_minutes=args.max_minutes,
