@@ -182,9 +182,29 @@ def step3(rec: dict) -> dict:
         pick, nbrs = sorted(trees, key=lambda x: (x["tile"][0], x["tile"][1]))[0], []
         rec["evidence"]["picked_without_standable_neighbor"] = True
     tile = tuple(pick["tile"])
-    before_kind = pick.get("kind")
     rec["evidence"]["tile"] = list(tile)
     rec["evidence"]["standable_neighbors"] = nbrs
+    # Lead 裁定(A)：先走到可站邻格 —— 行走单独计，**不算「单技能」的结论**。
+    # use_tool 不负责行走；首跑就是因为玩家在 (64,15)、目标在 (39,14)（相距 ~25 格）
+    # 导致 Mod 6 次重试全在「够不着」里空挥、被判 FAIL（那是测试前置不成立，不是技能坏）。
+    if nbrs:
+        nbr = nbrs[0]
+        try:
+            mv = c.move_to(nbr[0], nbr[1], timeout_ms=30000)
+            rec["evidence"]["walk"] = {"to": nbr, "ok": True, "result": mv}
+        except Exception as exc:  # noqa: BLE001
+            rec["evidence"]["walk"] = {"to": nbr, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            rec["verdict"] = "无法判定"
+            rec["reason"] = f"走不到可站邻格 {nbr}（行走单独计，不并入单技能结论）：{type(exc).__name__}: {exc}"
+            return rec
+        obs = c.observe(detail="full")
+        tiles_all = {tuple(x["tile"]): x for x in (((obs.get("location") or {}).get("tiles")) or [])}
+        refreshed = tiles_all.get(tile)
+        if refreshed is not None:
+            pick = refreshed
+        rec["evidence"]["worldSeq_after_walk"] = obs.get("worldSeq")
+        rec["evidence"]["player_after_walk"] = (obs.get("player") or {}).get("tile")
+    before_kind = pick.get("kind")
     rec["evidence"]["worldSeq_before"] = obs.get("worldSeq")
     rec["evidence"]["before"] = {k: pick.get(k) for k in ("kind", "tool", "feature", "objId", "actionable", "standable")}
     try:
@@ -227,7 +247,9 @@ def step4_launch(rec: dict, args) -> dict:
     if not launcher.exists():
         rec["verdict"], rec["reason"] = "无法判定", f"起跑器不存在：{launcher}"
         return rec
-    base = [PY, str(launcher), "--journal", str(SMOKE_JOURNAL), "--expect-version", EXPECT_VERSION]
+    base = [PY, str(launcher), "--journal", str(SMOKE_JOURNAL), "--expect-version", EXPECT_VERSION,
+            "--days", str(args.days), "--size", str(args.size),
+            "--max-minutes", str(int(args.max_minutes)), "--max-days", str(args.max_days)]
     rc, out, err = sh(base + ["--dry-run"], timeout=300)
     rec["evidence"]["dry_run"] = {"rc": rc, "tail": (out + err)[-2500:]}
     if rc != 0:
@@ -332,15 +354,39 @@ def step5(rec: dict) -> dict:
             clear_without.append(r.get("tile") or r.get("tiles") or r.get("t"))
     rec["evidence"].update({"clear_area_ok_steps": clear_ok, "with_tile_evidence": clear_with,
                             "without_tile_evidence": clear_without[:10]})
-    if clear_ok == 0:
+    # 补（Lead 复核后修）：账本没有逐格 clear 事件时，退到 day_end.stages[] 的阶段级证据
+    # —— 阶段里 ok>0 且 cleared_tiles 条数 >= ok 同样证「逐格判据活」。
+    stage_ok, stage_with, stage_without = 0, 0, []
+    for r in rows:
+        if r.get("event") != "day_end":
+            continue
+        for s in (r.get("stages") or []):
+            if s.get("stage") not in ("clear_area", "clear_dead", "clear_neighbor", "frontier_clear"):
+                continue
+            n = int(s.get("ok") or 0)
+            if n <= 0:
+                continue
+            tiles = s.get("cleared_tiles") or []
+            stage_ok += n
+            if len(tiles) >= n:
+                stage_with += n
+            else:
+                stage_without.append({"day": r.get("day"), "stage": s.get("stage"),
+                                      "ok": n, "cleared_tiles": len(tiles)})
+    total_ok, total_with = clear_ok + stage_ok, clear_with + stage_with
+    rec["evidence"].update({"clear_stage_ok_tiles": stage_ok, "clear_stage_with_tiles": stage_with,
+                            "clear_stage_without_tiles": stage_without[:10],
+                            "clear_total_ok": total_ok, "clear_total_with": total_with})
+    if total_ok == 0:
         rec["verdict"] = "无法判定"
-        rec["reason"] = "该日没有 clear_area 的 ok 步 ⇒ 无法验证「逐格判据活」（不是失败，是这天没清障）"
-    elif clear_without:
+        rec["reason"] = "整跑没有 clear_area 的 ok 步/ok 格 ⇒ 无法验证「逐格判据活」（不是失败，是这天/这跑没清障）"
+    elif clear_without or stage_without:
         rec["verdict"] = "FAIL"
-        rec["reason"] = f"{len(clear_without)}/{clear_ok} 个 clear_area ok 步没有逐格证据（cleared_tiles/kind 变化）：{clear_without[:5]}"
+        rec["reason"] = (f"{len(clear_without) + len(stage_without)}/{total_ok} 个 clear_area ok 动作没有逐格证据"
+                         f"（cleared_tiles/kind 变化）：{clear_without[:5] or stage_without[:5]}")
     else:
         rec["verdict"] = "PASS"
-        rec["reason"] = f"{clear_ok}/{clear_ok} 个 clear_area ok 步都带逐格证据"
+        rec["reason"] = f"{total_with}/{total_ok} 个 clear_area ok 动作都带逐格证据（cleared_tiles/kind 变化）"
     return rec
 
 
@@ -417,10 +463,32 @@ def step7(rec: dict) -> dict:
         "intent_coverage_in_journal": _has_intent_coverage(SMOKE_JOURNAL),
     }
     problems: list[str] = []
-    # §8 判红只在 analyzer：意图 executed_steps==0 且无原因码
+    # §8 第 7 类「意图对账」：**从 analyzer 头部「未执行意图:」行取计数**，
+    # 不去 grep 判据说明里的字（首跑就是这么误命中说明行、把「executed_steps=0 无原因码 ⇒ 红」当成真红）。
+    m = re.search(r"未执行意图:\s*意图\s*(\d+)\s*条.*?0 步\s*(\d+)\s*条\s*/\s*其中无原因码\s*(\d+)\s*条；"
+                  r"计划无对账\s*(\d+)\s*条", out_a or "")
+    if not m:
+        problems.append("analyzer 输出里找不到「未执行意图:」对账行 ⇒ §8 【无法判定】")
+    else:
+        intents, zero_step, zero_step_no_reason, no_recon = (int(x) for x in m.groups())
+        rec["evidence"]["intent_reconciliation"] = {
+            "intents": intents, "zero_step": zero_step,
+            "zero_step_no_reason": zero_step_no_reason, "plans_no_reconciliation": no_recon}
+        if zero_step_no_reason > 0:
+            problems.append(f"§8 意图对账有红：0 步且无原因码 {zero_step_no_reason} 条（analyzer 头部计数）")
+        if no_recon > 0:
+            problems.append(f"§8 意图对账有红：计划无对账 {no_recon} 条（analyzer 头部计数）")
+    # analyzer 的红清单里，只有 §8 专属红算冒烟 FAIL（`missed:intent*` / `missed:gaps*`）；
+    # 日级 `missed:check:*` / `missed:env_fail` / `missed:harvest` / `missed:seeds` 等是「当天没达标」，不是 §8 管道问题。
+    s8_bad: list[str] = []
     for ln in (out_a or "").splitlines():
-        if re.search(r"executed_steps\s*[=:]\s*0", ln) and "原因码" in ln and "红" in ln:
-            problems.append("analyzer 把「意图 executed_steps==0 且无原因码」判红：" + ln.strip()[:160])
+        if ln.strip().startswith("退出码:"):
+            s8_bad = [tok.strip() for tok in re.findall(r"missed:(?:intent[^,）\s]*|gaps[^,）\s]*)", ln)]
+            if s8_bad:
+                rec["evidence"]["s8_red_tokens"] = s8_bad
+    if s8_bad:
+        problems.append("§8 专属红（analyzer 红清单）：" + ", ".join(s8_bad)
+                        + "（日级 missed:check:* / env_fail / harvest / seeds 不计入 §8）")
     # verify-run3 对 §8 只许出 info：若出现含 intent_coverage 的 problem 行 ⇒ 分工破坏
     for ln in (out_v or "").splitlines():
         if "intent_coverage" in ln and re.search(r"^\s*[-*]?\s*\[?问题|^\s*问题", ln):
@@ -511,6 +579,11 @@ def main() -> int:
     ap.add_argument("--journal", default=str(SMOKE_JOURNAL))
     ap.add_argument("--smapi", default="", help="SMAPI 窗口文件（默认用冻结的 smoke-0739-smapi-window.txt，退回活的 SMAPI-latest）")
     ap.add_argument("--wait-minutes", type=float, default=40.0)
+    # 步 4 长跑参数（Lead GO 口径：--days 1 --size 5 --max-minutes 40 --max-days 3）
+    ap.add_argument("--days", type=int, default=1)
+    ap.add_argument("--size", type=int, default=5)
+    ap.add_argument("--max-minutes", type=int, default=40)
+    ap.add_argument("--max-days", type=int, default=3)
     ap.add_argument("--json", dest="json_out", default=str(HERE / "smoke-0739.json"))
     args = ap.parse_args()
 
