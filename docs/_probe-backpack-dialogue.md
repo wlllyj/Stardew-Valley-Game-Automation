@@ -1,0 +1,112 @@
+# task-32 只读探针：SeedShop 背包升级（Pierre 对话）入口 —— 0.7.45 真机
+
+> 纪律：只读。不买、不升级、不改世界、不 restore A9。对话一律"不选 Yes"（`dismiss_modal` 无参数 ⇒ 自动挑否）。
+> 游戏：已装冻结 0.7.45（dll `806C1069…B17F` / manifest `DECBA677…6A2E5C`，装机目录 18:54:09 / 18:53:51），本探针**跳过 deploy**（`bin\Release` 被 0.7.46 WIP 污染：291840B / `F05289C9…5B9` / 19:23:25），直接 `Start-Process StardewModdingAPI.exe` 起装好的冻结版。
+> 存档：`Wahaha_450799035`（冬 28 06:00）。探针前后存档四件逐字节一致（§7）。A9-start（`5479354B…988A3D`）未动。
+
+## 0. 结论先行（回答卡面 6 问）
+
+1. **进店是否自动出现背包升级对话：否。** 首次进 SeedShop 触发的是世界事件 `3102768`（店内过场，推进 4 批对话后结束），全程无背包/购买类对话；`ui.dialogueResponses` 始终为空。
+2. **interact Pierre 后是否出现：未取得（未到达触发点）。** 三类阻断：
+   - `observe` 只暴露 `characters` **数量**（`Contracts.cs:372` `int Characters`、`WorldSnapshot.cs:684` `loc.characters?.Count`）⇒ 桥上看不到 NPC 格坐标；
+   - 现有技能表**没有 `talk`**（`SkillCatalog.cs:32-35` Executable 无、`:42-45` Planned 里 `"talk"` 未实现）；`interact` 只调 `GameLocation.checkAction`（`Skills.cs:271-370`），对柜台 10 格实测全部 `no_action`；
+   - 进店路径被 Town 事件 `15389722`（特殊订单板过场）**非确定卡死**阻断（3 次进 Town：1 次走完、2 次卡死，见 §3）。
+3. **响应文本原文：** 只在 Town 事件提问里取到（非背包，§3.3）：`["I look forward to helping!", "Heh... I dunno... we'll see..."]`；背包相关响应 ⇒【无法判定·未取得】。
+4. **bridge 能否读到响应选项：能。** `ui.dialogueIsQuestion=true` + `ui.dialogueResponses` 原文数组（`Contracts.cs:1042`；实拍见 §3.3）；无对话框时为空数组。
+5. **入口结论：未找到可自动化入口（已试 X/Y/Z）。** 已试：①`buy` 结构化货架（20 条全表无背包，commit `27458df`）②进店事件推进（`advance_dialogue` 4 批，事件结束后无对话）③柜台 10 格 `interact`（全 `no_action`）④店内 `move_to` 寻路（[16,14]/[9,16] unreachable，[8,24]/[14,20] 可走）⑤Town 店门 4 格 `interact`（全 `no_action`）⑥像素截图核对（§4.2）。
+   ⇒ 卡 A 若要做，**必须新增 mod 原语**（`talk` 或等效"打开 Pierre 对话"的入口）；已有 `dismiss_modal` 显式应答（`AnswerRules.Pick` / `ModalDismiss.DismissDialogueExplicit`）只解决"答问"，不解决"开对话"。
+6. **Lead 补项：`ui.dialogueResponses` 里 Purchase 类选项的原文与下标 ⇒【无法判定·未取得】**（两处已见提问均非 Purchase；未到达 Pierre 对话；且冻结 0.7.45 无 `talk` 技能）。因此卡 A 用 `answerText` 还是 `answerIndex` **暂无真机依据**。
+
+## 1. 环境与起跑（两次会话）
+
+| 项 | 会话 A（19:30:47 起） | 会话 B（19:50:15 起） |
+|---|---|---|
+| 起法 | `Start-Process StardewModdingAPI.exe`（装好的 0.7.45；跳过 deploy） | 同左 |
+| bridge.json | pid 10856 / token `2bf18e4a…9328` / startedAt 12:30:53Z / modVersion 0.7.45 | pid 15388 / token `4bf6db3e…e913` / startedAt 12:50:15Z / 0.7.45 |
+| load | `python -m agentfarm load` → `Wahaha_450799035` FarmHouse [9,9] 4176ms；冬 28 06:00 sunny，体力 270，钱 3288g | `BridgeClient.load_save(force=True)` → FarmHouse，`eventUp=false`、clock 600（确认 load 是卡死事件的唯一恢复手段） |
+
+时间窗：Pierre 店 9:00–17:00（店门锁时提示原文 `It's locked... (Open 9:00am - 9:00pm)`，实测 clock 750 时触发）。
+
+## 2. 进店路径实测（FarmHouse → SeedShop）
+
+`move_to_location("SeedShop")` 路径：FarmHouse → Farm（hop1 7617ms，落 [64,15]）→ BusStop（hop2 9847ms，落 [11,23]）→ Town（hop3 被 `ui_modal` 打断）。逐跳读数：
+- BusStop 进镇时事件 `520702`（巴士过场）：**无需点击**，等 ~10s 自己结束（`eventUp:true→false`，3–5 轮）。
+- Town 落地即触发事件 `15389722`（特殊订单板安装过场），`worldAdvancing` 先 true 后 false。
+
+## 3. Town 事件 `15389722`：非确定卡死（本探针最大阻断）
+
+### 3.1 三次进 Town 的结果
+| # | 结果 | 关键读数 |
+|---|---|---|
+| 1（会话 A） | 走完（成功样本） | 对话批量推进 `1+3+1+1+1+4+2+6` 次点击后进入提问态（§3.3）；`dismiss_modal` 后 `eventUp:true→false`、canMove 恢复 |
+| 2（会话 B） | 卡死 | 推进 `1,3,2,1,2,4,2` 批后：`eventUp=true eventId=15389722 activeMenu=null isModal=true canMove=false`、`worldAdvancing=false`、clock 610 冻结 |
+| 3（会话 B，reload 后） | 卡死 | 与 #2 同形态；`advance_dialogue` ⇒ `[no_dialogue] 当前没有 DialogueBox`；`dismiss_modal` 无模态可关（no-op）；`move_to*` ⇒ `[ui_modal] 当前有菜单/对话/过场打开` |
+
+### 3.2 卡死态下桥侧原语全部无效（证据）
+- `advance_dialogue`：`BridgeError [no_dialogue] (HTTP 200) 当前没有 DialogueBox ⇒ 无可推进（eventUp=True）`；
+- `dismiss_modal`：无活动模态 ⇒ ok/no-op，事件不动；
+- `move_to_location` / `move_to`：`[ui_modal]` 拒绝；
+- `interact` 店门 4 格（[43,57][43,58][44,57][44,58]）：全部 `[no_action] checkAction 返回 False`；
+- 唯一恢复：`load_save(force=True)`（会话 B 实测回到 FarmHouse、事件消失）。⇒ **A9/长跑若需要进 Town，必须先修这条**（脑侧按 task-41 只能诚实停；不能自愈）。
+
+### 3.3 成功样本的提问态读数（原文）
+```
+ui = {activeMenu:"DialogueBox", isModal:true, eventUp:true, eventId:"15389722",
+      onScreenMenus:5, activeMenuText:"", dialogueIsQuestion:true,
+      dialogueResponses:["I look forward to helping!", "Heh... I dunno... we'll see..."]}
+player = {tile:[61,94], canMove:false, facing:1}  clock = winter 28 720
+```
+`dismiss_modal()`（无参数）回执原文节选：`已关闭对话框（选"Heh... I dunno... we'll see...”：answerDialogue("1")closeDialogue() 关闭…）` + 警告 `游戏仍处于不可控状态（canMove=False…）需要外部恢复`；1.5s 后 `eventUp=false, menu=null, canMove=true, clock 开始走`（7:50→9:00 内推进正常）。**全程未选 Purchase、未指定 answerIndex/answerText。**
+
+## 4. SeedShop 内部观测（会话 A）
+
+### 4.1 位置/世界读数
+- `location.name="SeedShop"`，player 进店落 [6,29]；随后 `move_to [8,24]` ok、`[14,20]` ok；`[16,14]`/`[9,16]` ⇒ `[unreachable] 寻路无法到达（A* 未算出路径）`。
+- `characters=3`（**只有数量**）；`doors=[{tile:[32,3],type:"Sunroom"}]`；`objectList=[]`；`tiles=[]`（室内不暴露 tile 列表）；`tilesTruncated=null`。
+- 入店内事件 `3102768` 推进：`advance_dialogue` 批量 1+6+1+2+2 次点击，约 40s 后 `eventUp:true→false`，canMove=true。
+
+### 4.2 像素截图（只读，PrintWindow/PW_RENDERFULLCONTENT；窗口不在前台会全黑）
+- `scratch/_t18_shop_ui.png`（51587B）店内视图：左墙货架/种子架、柜台区"FOR SALE"装饰牌；
+- `scratch/_t18_shop_pos2.png`（56753B）/`_t18_shop_pos3.png`（60395B）：货架、种子陈列、"FOR SALE" 收银台；
+- `scratch/_t18_shop_counter.png`（61889B）、`scratch/_t18_shop_pos.png`（46849B）：柜台近景；
+- `scratch/_t18_shop_in.png`（8990B）为**黑帧**（PrintWindow 失败样本，如实保留）；`scratch/_t18_town_hung.png`（17692B）为卡死态 Town。
+- 仓库外参考：`scratch/_t18_screen.png`/`_t18_screen2.png`（19:34/19:35，Town 过场首句 `Ah, hello there, Jay. You…`）。
+
+## 5. Pierre 定位与对话尝试
+
+- 存档 XML 解析（只读）：`SeedShop.characters = [Pierre, Abigail, Caroline]`；Pierre `<Position><X>256</X><Y>1088</Y>` ⇒ **tile [4,17]**（/64）。该坐标来自 19:15:01 的存档（冬 28 睡前），不是实时观测。
+- **无 `talk` 原语**：`interact` 调 `checkAction`（`Skills.cs:322`），柜台区 10 格（[6,14]…[8,16]）逐格实测全部 `[no_action]`；"FOR SALE" 收银台不是 `checkAction` 入口。
+- `observe` 的 `characters` 是数量（`Contracts.cs:372`），无法按名查位 ⇒ 桥侧无法"走到 Pierre 旁边再 interact"。
+- 会话 A/B 均**未出现** Pierre 主动对话（进店事件结束后 `ui` 为空壳）。
+
+## 6. 能力面结论（用于卡 A 设计）
+
+| 需要 | 现有能力 | 结论 |
+|---|---|---|
+| 找到 Pierre | `observe.characters`（数量） | 缺：NPC 坐标 |
+| 打开 Pierre 对话 | 技能表无 `talk`（Planned 未实现） | 缺：入口原语 |
+| 读选项文本/下标 | `ui.dialogueResponses` ✅ | 有 |
+| 显式应答 | `dismiss_modal(answerIndex/answerText)` ✅（fail-closed） | 有（但只在对话已打开时可用） |
+| 自动推进非提问对话 | `advance_dialogue` ✅ | 有 |
+
+## 7. 收尾四项与证据
+
+- 优雅退：`stop-game.py --wait 45` → 会话 A `pids=[10856]`、会话 B `pids=[15388]`；两次均 rc=0；退后 `进程数=0`、`bridge.json exists=False`、`17890 LISTENING=False`（仅 TIME_WAIT）。
+- 存档四件（探针前后**逐字节一致**，未落盘任何世界变更）：
+  - `Wahaha_450799035` 2948770B 19:15:01 `6DE8419B098EA16972C7DB761F4080127599523A2C1AD8EC5A6176F86861B594`
+  - `SaveGameInfo` 32264B 19:15:01 `B5B51971BFF129EDE468D2671731A50B0D0A7964755AE7AB5643AEF07A7310A1`
+  - `Wahaha_450799035_old` 3137234B 19:04:33 `1695C1ED3286601FD951837AD0D4363EA45542024E01CD0B4F45B26FD453509D`
+  - `SaveGameInfo_old` 32259B 19:04:33 `BCC85C1B47EE63CE043EDE9668EA44E76D67867DD1C5E1CBCB4392D3AAE57DAA`
+- SMAPI 窗口冻结（源=副本字节一致，`grep Backpack|Pierre` 0 命中）：
+  - 会话 A `logs/probe-backpack-smapi.txt` 192381B / 2379 行 / 18:49? 实际 mtime 19:49:18 / SHA256 `E94B835DDFD75762BCFDA02037976C3D8BEBF6E10A6E8F823AFBAD289D97E5E7`
+  - 会话 B `logs/probe-backpack-smapi-2.txt` 229423B / 3347 行 / 20:05:09 / SHA256 `5F598EE696FE695418F5C475BBF2F2A079A5A08AAF93D95D0934A9283A0C0B7A`
+- 装机目录再核（探针结束）：dll 286208B / `806C1069D217EEEFAB6D3354BA09DA049847D97EE5B4A1D2D65845F1DCB0B17F` / 18:54:09；manifest 73663B / `DECBA6775569D7C42DF910E7E6A72BC2CF59B1E2729C29484E700F6E786A2E5C` / 0.7.45。`bin\Release` 仍为 WIP `F05289C9…5B9`（291840B，19:23:25）。
+- HUD「Inventory Full」：本轮**未复现**（SMAPI 两份窗口 `HUD` 0 命中；`Inventory` 仅命中 Mod 发布说明）。
+
+## 8. 已知限制
+
+1. Town 事件 `15389722` 卡死是**非确定**的：样本 1/3 成功、2/3 卡死（同 argv、同 load 路径），未取得触发条件 ⇒ 定因【无法判定】。
+2. 未取得 Pierre 对话原文；`Purchase` 选项下标/文本、背包升级价格文本均【无法判定】。
+3. `characters` 只有数量（`Contracts.cs:372`），NPC 坐标只能从**存档 XML**旁证（离线、滞后）。
+4. 截图依赖窗口前台（PrintWindow 黑帧样本已保留）；`ui.activeMenu`/`activeMenuText` 仅在模态打开时出现（无模态时为 null）。
+5. 会话 A 的 `world_stuck` 警告（dismiss 后 1.5s 内）是已知形态，事件仍能正常结束；但不能据此认为"卡死可自愈"（3.1 #2/#3 的反例）。
