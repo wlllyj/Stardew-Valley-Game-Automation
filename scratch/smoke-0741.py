@@ -27,7 +27,7 @@
   python scratch\\smoke-0741.py --phase pre               # 步骤 1-3
   python scratch\\smoke-0741.py --phase launch            # 步骤 4 起跑（先 --dry-run）
   python scratch\\smoke-0741.py --phase wait --wait-minutes 40
-  python scratch\\smoke-0741.py --phase post              # 步骤 5-7
+  python scratch\\smoke-0741.py --phase post --freeze-smapi   # 步 5-7（先时点冻结 SMAPI，步 6/7 用副本判）
   python scratch\\smoke-0741.py --phase all --wait-minutes 40   # 一次跑完（分阶段之间不重启游戏）
 
 分阶段跑时结果**按步骤号合并**进 --json（`phases_run` 记录已跑过的 phase），不会互相覆盖；
@@ -40,9 +40,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -62,6 +64,54 @@ SIX = ("newday", "before_save", "save_called", "save_task", "completed", "after_
 
 EXPECT_VERSION = "0.7.41"
 L16_RULE = "有 `[HH:MM:SS LEVEL CHANNEL]` 前缀 且 不含 ` by AgentFarm ` / `| v0.`"
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest().upper()
+
+
+def freeze_smapi(dst: Path, *, refuse_overwrite: bool = True) -> dict:
+    """SMAPI 时点冻结：**一次性读源** → 写副本 → 双侧 SHA256 → BYTE_IDENTICAL。
+
+    Lead m04172：post 一开始就冻结，然后用副本跑步 6/步 7 判据，
+    JSON 记 `smapi_copy`/`smapi_sha256`/`byte_identical`，彻底消掉"跑完源文件还在长"的口径争议。
+    """
+    info: dict = {"smapi_copy": str(dst), "source": str(SMAPI_LATEST), "frozen": False}
+    if refuse_overwrite and dst.exists():
+        info["error"] = f"副本已存在，拒绝覆盖（要覆盖加 --refreeze）：{dst}"
+        return info
+    if not SMAPI_LATEST or not SMAPI_LATEST.exists():
+        info["error"] = f"SMAPI-latest.txt 不存在：{SMAPI_LATEST}"
+        return info
+    try:
+        # 一次性读源（游戏运行时源文件被独占，分两次读会拿到长度不一致的两半）
+        blob = open(SMAPI_LATEST, "rb").read()
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        with open(dst, "wb") as fh:
+            fh.write(blob)
+    except OSError as exc:
+        info["error"] = f"复制失败：{type(exc).__name__}: {exc}"
+        return info
+    src_sha = hashlib.sha256(blob).hexdigest().upper()
+    dst_sha = sha256_file(dst)
+    src_st = SMAPI_LATEST.stat()
+    dst_st = dst.stat()
+    info.update({
+        "frozen": True,
+        "source_size": src_st.st_size,
+        "source_mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(src_st.st_mtime)),
+        "copy_size": dst_st.st_size,
+        "copy_mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(dst_st.st_mtime)),
+        "source_sha256": src_sha,
+        "smapi_sha256": dst_sha,
+        "byte_identical": src_sha == dst_sha,
+        "lines": blob.count(b"\n"),
+    })
+    return info
 
 
 def sh(cmd: list[str], timeout: int = 180) -> tuple[int, str, str]:
@@ -482,6 +532,9 @@ def step6(rec: dict, args) -> dict:
         "smapi_used": str(src), "counts": counts, "checker_reasons": verdict_doc.get("reasons") or [],
         "checker_tail": (out + err)[-2500:],
     }
+    freeze_info = getattr(args, "smapi_freeze", None)
+    if freeze_info:
+        rec["evidence"]["smapi_freeze"] = freeze_info
     if not payload:
         rec["verdict"] = "无法判定"
         rec["reason"] = f"save-chain-check 没有产出 JSON（rc={rc}）⇒ 缺失≠通过"
@@ -711,9 +764,9 @@ def print_plan(env: dict) -> None:
     for k, v in env["env"].items():
         print(f"  {k} = {v}")
     print("-" * 78)
-    print("phase 编排：pre(1-3) → launch(4) → wait(4 完成) → post(5-7)")
+    print("phase 编排：pre(1-3) → launch(4) → wait(4 完成) → post(5-7，建议带 --freeze-smapi 先冻结 SMAPI)")
     print(f"账本：{SMOKE_JOURNAL}")
-    print(f"结果：{HERE / 'smoke-0741.json'}；SMAPI 收尾冻结建议：{SMOKE_SMAPI}")
+    print(f"结果：{HERE / 'smoke-0741.json'}；SMAPI 冻结副本：{SMOKE_SMAPI}")
 
 
 # ---------------------------------------------------------------- main
@@ -726,7 +779,10 @@ def main() -> int:
     ap.add_argument("--dry-run-only", action="store_true", help="launch 阶段只跑起跑器 --dry-run，不真起跑")
     ap.add_argument("--expect-version", default=EXPECT_VERSION)
     ap.add_argument("--journal", default=str(SMOKE_JOURNAL))
-    ap.add_argument("--smapi", default="", help="SMAPI 窗口文件（默认用冻结的 smoke-0741-smapi-window.txt，退回活的 SMAPI-latest）")
+    ap.add_argument("--smapi", default="", help="SMAPI 窗口文件（默认用冻结的 smoke-0741-smapi-window.txt；都没有才退活的 SMAPI-latest）")
+    ap.add_argument("--freeze-smapi", dest="freeze_smapi", action="store_true",
+                    help="phase post 一开始先把 SMAPI-latest 时点冻结成副本（源→副本、双 SHA256、BYTE_IDENTICAL），步 6/7 用副本")
+    ap.add_argument("--refreeze", action="store_true", help="允许覆盖已存在的 SMAPI 副本（默认拒绝，防误复冻）")
     ap.add_argument("--wait-minutes", type=float, default=40.0)
     # 步 4 长跑参数（Lead m04100 口径：--days 2 —— 要跨 2 次日切、验证"跑尾声关框 ⇒ 末次也落盘"）
     ap.add_argument("--days", type=int, default=2)
@@ -778,6 +834,23 @@ def main() -> int:
         results.extend([r for r in recs if want is None or r["step"] in want])
 
     def run_post() -> None:
+        # Lead m04172：post 一开始就做 SMAPI 时点冻结，然后步 6/7 一律用副本判
+        if args.freeze_smapi and not args.smapi:
+            info = freeze_smapi(SMOKE_SMAPI, refuse_overwrite=not args.refreeze)
+            args.smapi_freeze = info
+            if info.get("frozen"):
+                args.smapi = str(SMOKE_SMAPI)
+                print(f"[freeze] SMAPI 已时点冻结 → {SMOKE_SMAPI}")
+                print(f"[freeze] {info.get('copy_size')} B / {info.get('lines')} 行 / mtime {info.get('copy_mtime')}")
+                print(f"[freeze] sha256 src={str(info.get('source_sha256'))[:32]}… copy={str(info.get('smapi_sha256'))[:32]}… "
+                      f"BYTE_IDENTICAL={info.get('byte_identical')}")
+            else:
+                print(f"[freeze][warn] 冻结未完成：{info.get('error')}")
+        elif not args.smapi and SMOKE_SMAPI.exists():
+            args.smapi = str(SMOKE_SMAPI)
+            print(f"[info] 用已有 SMAPI 冻结副本：{SMOKE_SMAPI}")
+        elif not args.smapi:
+            print("[warn] 没有 SMAPI 冻结副本，步 6 会退活的 SMAPI-latest（口径风险；建议加 --freeze-smapi）")
         recs = [step5(step_record(5, PLAN[4][1])), step6(step_record(6, PLAN[5][1]), args),
                 step7(step_record(7, PLAN[6][1]))]
         results.extend([r for r in recs if want is None or r["step"] in want])
@@ -821,6 +894,8 @@ def main() -> int:
 
     payload = {"generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "expect_version": args.expect_version,
                "journal": str(SMOKE_JOURNAL), "phase": args.phase, "phases_run": phases_run,
+               "smapi_used": args.smapi or None,
+               "smapi_freeze": getattr(args, "smapi_freeze", None),
                "env": env, "results": results,
                "results_all_steps": [merged[k] for k in sorted(merged)]}
     try:
