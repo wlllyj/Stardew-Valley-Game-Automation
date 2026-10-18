@@ -104,7 +104,8 @@
 
 ### 7.4 事故风险：Town 事件 `15389722` 非确定卡死（产品缺陷线索）
 
-- task-32 探针 3 次进 Town：1 成功 / 2 卡死；卡死读数 `eventUp=true, eventId=15389722, activeMenu=null, isModal=true, canMove=false, worldAdvancing=false`、clock 冻结 610；`advance_dialogue`→`[no_dialogue]`、`dismiss_modal` no-op、`move_to*`→`[ui_modal]`、店门 interact 全 `no_action`；**唯一恢复 = `load_save(force=True)`**。成功样本：错误推进到提问态后 `dismiss_modal()` 无参选否（`answerDialogue("1")`）→ 1.5s 后事件结束、控制恢复。
+- task-32 探针按 SMAPI 窗口 `Warping to Town` 原文逐段数：**5 次进 Town = 1 成功 / 4 卡死**（A#1 19:32 卡 484s、B#1/B#2/B#3 worldSeq 冻结 262s/360s/131s；唯一成功 A#2 推进到提问态后 `dismiss_modal()` 无参选否即走完；此前口头"3 次"按 goto 尝试估，已按一手数据更正）；卡死读数 `eventUp=true, eventId=15389722, activeMenu=null, isModal=true, canMove=false, worldAdvancing=false`、clock 冻结、worldSeq 不动；`advance_dialogue`→`[no_dialogue]`、`dismiss_modal` no-op、`move_to*`→`[ui_modal]`、店门 interact 全 `no_action`；**唯一恢复 = `load_save(force=True)`**。
+- 卡死门限建议（同探针 §3.4）：`eventUp==true && activeMenu==null` + `advance_dialogue` **连续 10 次 no_dialogue**（≥30–60s）+ worldSeq 无变化/`worldAdvancing==false`（辅助）；**不得单用 clock/worldSeq/worldAdvancing**（成功样本 worldSeq 也冻结 124s 却走完）；默认 60s/10 次，自愈 load_save(force)，同小时 2 次自愈仍复发 ⇒ 诚实收尾；更稳做法是 mod 侧让 `advance_dialogue` 直接回 `stalled=true`。
 - 影响面：农务长跑（A9/B9）不进 Town ⇒ 不触发；任何进城动作（卡 A 买背包）必须带「事件态持续 + 无 worldAdvancing ⇒ 记 `event_hang` + load_save(force) 兜底 / 当日诚实收工」的自愈逻辑（已写进 task-25 卡面）。长期：事件态识别与自愈应单独立卡（backlog）。
 
 ### 7.2 事故：`mod/AgentFarm.Bridge/bin/Release` 被 WIP 构建污染
