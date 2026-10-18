@@ -5275,6 +5275,142 @@ class TestTask5EncircledRealloc(unittest.TestCase):
             self.assertIn(key, day_end, f"day_end 缺 {key}")
 
 
+class TestTask6CloseoutCaliber(unittest.TestCase):
+    """【task-6 / 0.7.44】收工口径两处（A8 账本证据）：
+
+    ① **`checks.slept_by_us` 快照取真值**：冬 9/14 `ended_by=stuck`，但账本随后确有
+       `sleep{ok:true}` 且 `day_after` +1（`logs/longrun-runA8-0743.jsonl:512`、`:1194`）——
+       旧口径只看 `ended_by in (sleep, inventory_blocked)` ⇒ 误报 false。新增 `rep.slept_ok`
+       （`_do_sleep` 里 `st.ok` 的观测真相）并与 `ended_by` 解耦；**stuck 仍不达标**（不动判据）。
+    ② **「只因预算延后」与「户外浇水达标」不得同真**：`deferred_by_budget` 事件不再立即发，
+       日终拿到浇水证据后才落账；浇完的日子降级为 `stamina_budget.deferred_by_budget_suppressed`
+       计数（事件一条不发），两件事实不再同时出现在账本里（analyzer 的 ⚠ 判据不复现）。
+    """
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list:
+        return [e for e in run.entries if e.get("event") == name]
+
+    def _run(self, w: FakeWorld, *, worker=None):
+        client = _CountingClient(w)
+        worker = worker or FakeWorker(w, log=lambda *_: None)
+        run = make_run(w, target_days=1, max_days=1,
+                       client_factory=lambda: client, worker_factory=lambda c: worker)
+        run.worker = worker
+        run.client = client
+        return run
+
+    def _rep(self, day=9) -> DayReport:
+        return DayReport(day_key=("winter", 1, day), started_at=0.0)
+
+    def test_stuck_day_with_real_sleep_has_slept_by_us_true(self):
+        """① stuck + `_stuck_flush` 真睡成功 ⇒ `slept_ok`/`slept_by_us` 取真值；但不洗成达标。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = self._run(w)
+        rep = self._rep(9)
+        rep.ended_by, rep.ended_reason = "stuck", "stuck:连续 3 轮世界没有任何变化"
+
+        self.assertTrue(run._stuck_flush(w.obs(), rep, rep.ended_reason))
+
+        self.assertEqual(rep.ended_by, "stuck", "翻篇不许把 ended_by 洗成 sleep")
+        self.assertIs(rep.slept_ok, True, "stuck 翻篇确实睡成功了")
+        self.assertTrue(run._slept_by_us(rep),
+                        "checks.slept_by_us 必须取观测真值（冬 9/14 的误报）")
+        self.assertIn("slept_ok", rep.as_dict())
+        self.assertFalse(is_justified_end(rep.ended_by, rep.ended_reason),
+                         "slept_by_us 变真不改变 day_justified：stuck 日仍不达标")
+
+    def test_failed_sleep_is_not_counted_as_slept(self):
+        """① 反向：睡失败/没睡 ⇒ `slept_ok=false`，`slept_by_us` 不许假 true。"""
+
+        class _SleepFailWorker(FakeWorker):
+            def sleep(self, *, home="FarmHouse", timeout_ms=180000):
+                return StepResult("sleep", None, ok=False, code="failed", reason="假世界：睡不成")
+
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = self._run(w, worker=_SleepFailWorker(w))
+        run.farm_actions_today = 5
+        rep = self._rep(14)
+        by, _why = run._do_sleep(w.obs(), rep, "night:测试")
+        self.assertEqual(by, "sleep_failed")
+        self.assertIs(rep.slept_ok, False)
+        rep.ended_by = "stuck"
+        self.assertFalse(run._slept_by_us(rep))
+
+    def test_budget_deferrals_are_suppressed_when_watered_outdoor(self):
+        """② 浇水达标 ⇒ `deferred_by_budget` 一条都不落；降级成日级 suppressed 计数。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = self._run(w)
+        run.budget_today = run._stamina_budget(w.obs())
+        rep = self._rep(12)
+        run._note_budget_deferred("till_area", "体力 ≤ 浇水预备（测试）", tiles=[(60, 10)])
+        self.assertEqual(len(run.budget_defer_events), 1, "事件先排队，不立即 emit")
+        self.assertEqual(self._events(run, "deferred_by_budget"), [])
+
+        emitted = run._flush_budget_deferrals(watered_outdoor=True, rep=rep)
+
+        self.assertEqual(emitted, 0)
+        self.assertEqual(self._events(run, "deferred_by_budget"), [],
+                         "「只因预算延后」与「户外浇水达标」不得同真")
+        self.assertEqual(rep.stamina_budget.get("deferred_by_budget_suppressed"), 1)
+        self.assertIs(rep.stamina_budget.get("deferred_by_budget"), False)
+
+    def test_budget_deferrals_flush_when_not_watered(self):
+        """② 反向：没浇完 ⇒ 事件照常落账（延后解释了"为什么有活没干完"）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        run = self._run(w)
+        run.budget_today = run._stamina_budget(w.obs())
+        rep = self._rep(12)
+        run._note_budget_deferred("till_area", "体力 ≤ 浇水预备（测试）", tiles=[(60, 10)])
+
+        emitted = run._flush_budget_deferrals(watered_outdoor=False, rep=rep)
+
+        self.assertEqual(emitted, 1)
+        ev = self._events(run, "deferred_by_budget")
+        self.assertEqual(len(ev), 1, ev)
+        self.assertEqual(ev[0]["task"], "till_area")
+        self.assertNotIn("deferred_by_budget_suppressed", rep.stamina_budget)
+
+    def test_full_day_tree_budget_defer_no_contradiction(self):
+        """② 端到端：A8 冬季形态（砍树预算用满、无作物、户外浇水达标）⇒ 无事件、有 suppressed。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0, stamina=20.0)
+        w.blockers[(60, 10)] = "tree"
+        run = self._run(w)
+        run.trees_cleared_today = MAX_TREES_PER_DAY      # 砍树预算用满 ⇒ 必然触发 deferred
+        run.run()
+        rep = run.days[-1]
+
+        self.assertEqual(self._events(run, "deferred_by_budget"), [],
+                         "户外浇水达标的日子不许出现『只因预算延后』事件")
+        self.assertIs(rep.checks.get("watered_outdoor"), True, rep.checks)
+        self.assertIs(rep.stamina_budget.get("deferred_by_budget"), False)
+        self.assertGreaterEqual(int(rep.stamina_budget.get("deferred_by_budget_suppressed") or 0), 1,
+                                rep.stamina_budget)
+        day_end = self._events(run, "day_end")[-1]
+        self.assertIn("slept_by_us", day_end["checks"], "checks 10 键一个不少")
+        self.assertIn("slept_ok", day_end, "真实睡眠真相进 day_end")
+
+    def test_full_day_not_watered_flushes_budget_events(self):
+        """② 端到端反向：farm 口径还有干作物 ⇒ 预算延后事件照常落账（不被压掉）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0, stamina=10.0)
+        w.dirt = {(60, 10), (61, 10)}
+        w.crops = {(60, 10): {"watered": False, "ripe": False},
+                   (61, 10): {"watered": False, "ripe": False}}
+        w.farm = {"loaded": True, "complete": True, "crops": 20, "dryCrops": 20,
+                  "ripeCrops": 0, "deadCrops": 0, "dryDeadCrops": 0, "dryTiles": [],
+                  "dryTilesTruncated": False, "unwateredCrops": 20,
+                  "hoeDirt": 20, "emptyDirt": 18}
+        run = self._run(w)
+        run.run()
+        rep = run.days[-1]
+
+        self.assertIs(rep.checks.get("watered_outdoor"), False, rep.checks)
+        ev = self._events(run, "deferred_by_budget")
+        self.assertTrue(ev, "没浇完的日子必须留下『只因预算延后』事件")
+        self.assertTrue(all("dry" in e or "why" in e for e in ev), ev)
+        self.assertNotIn("deferred_by_budget_suppressed", rep.stamina_budget)
+
+
 class _SurplusWorker(FakeWorker):
     """task-55：给假执行层补 `sell(slot, *, whitelist=…)`（真 `FarmWorker.sell` 的最小替身）。
 
@@ -8609,6 +8745,9 @@ class TestTask158StaminaBudget(unittest.TestCase):
         self.assertEqual(run._stage_tiles("till_area", w.obs(), plot), [])
         self.assertEqual(run._stage_tiles("clear_area", w.obs(), plot), [])
         self.assertTrue(run.budget_today["deferred_by_budget"])
+        # 【task-6 / 0.7.44】"只因预算延后"事件改为日终落账（与"户外浇水达标"互斥）；
+        # 本单测只驱动了 `_stage_tiles`，显式按"没浇完"口径 flush 出事件。
+        run._flush_budget_deferrals(watered_outdoor=False)
         events = self._events(run, "deferred_by_budget")
         self.assertEqual({e["task"] for e in events}, {"till_area", "clear_area"})
         self.assertIn("留给浇水", events[0]["why"])
@@ -8695,6 +8834,8 @@ class TestTask158StaminaBudget(unittest.TestCase):
         self.assertEqual(run.budget_today["capacity"], 0)
         for task in ("clear_area", "till_area", "plant_area"):
             self.assertEqual(run._stage_tiles(task, w.obs(), plot), [], f"{task} 该被拦")
+        # 【task-6 / 0.7.44】事件改为日终落账：这里按"没浇完"口径 flush 出来看任务集合。
+        run._flush_budget_deferrals(watered_outdoor=False)
         names = {e["task"] for e in self._events(run, "deferred_by_budget")}
         self.assertEqual(names, {"clear_area", "till_area", "plant_area"})
         self.assertTrue(run.budget_today["deferred_by_budget"])
@@ -10993,6 +11134,8 @@ class TestTask218TreeClearing(unittest.TestCase):
         run.trees_cleared_today = MAX_TREES_PER_DAY
         self.assertFalse(run._tree_budget_left(w.obs()))
         self.assertFalse(run._tree_budget_left(w.obs()))
+        # 【task-6 / 0.7.44】"只因预算延后"事件改为日终落账；这里按"没浇完"口径 flush。
+        run._flush_budget_deferrals(watered_outdoor=False)
         ev = self._events(run, "deferred_by_budget")
         self.assertEqual(len(ev), 1, "每天一条（复用既有事件名，不新增 analyzer 桶）")
         self.assertEqual(ev[0]["task"], "clear_area_tree")
@@ -11144,6 +11287,8 @@ class TestTask241TreeBudgetAndBoundaryEvidence(unittest.TestCase):
         self.assertEqual(run._tree_budget_room(w.obs()), 0,
                          "可支配体力不够一棵 ⇒ 0 棵（浇水优先，绝不漏浇）")
         self.assertFalse(run._tree_budget_left(w.obs()))
+        # 【task-6 / 0.7.44】事件改为日终落账；单测按"没浇完"口径显式 flush。
+        run._flush_budget_deferrals(watered_outdoor=False)
         ev = self._events(run, "deferred_by_budget")
         self.assertEqual(len(ev), 1)
         self.assertEqual(ev[0]["task"], "clear_area_tree")

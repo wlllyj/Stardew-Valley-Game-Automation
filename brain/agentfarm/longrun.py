@@ -661,6 +661,12 @@ class DayReport:
     #: 这种日子**不推进**游戏日、`verified=false`，如实留痕（run8 day 12：06:20 起床、0 农场
     #: 动作、直接睡到 day 13）。它和 `ended_by="stuck"`+`stuck_flush` 是两条不同的路径。
     slept_without_work: bool = False
+    #: 【task-6 / 0.7.44】今天是否**真的睡成功了**（`_do_sleep` 里 `st.ok` 的观测真相）。
+    #: 与 `ended_by` **解耦**：stuck 日的有界翻篇（`_stuck_flush`，task-73）确实睡过去了、游戏日
+    #: 也 +1，但 `ended_by` 仍保持 `stuck` ⇒ 旧口径 `checks.slept_by_us=ended_by in (sleep,…)`
+    #: 会误报 false（A8 冬 9/14 现场：`sleep.ok=true` + `day_after` +1，却 `slept_by_us=false`）。
+    #: 新口径：`checks.slept_by_us = rep.slept_ok or ended_by in ("sleep","inventory_blocked")`。
+    slept_ok: bool = False
     verified: bool = False
     #: 【task-52】当天判为"走不到"（四邻都站不过去 / 寻路到不了）的**格数**与**逐格坐标**。
     #: 字段名与 `tools\verify-run3.py` 的交叉核对口径逐字对齐（Lead m04925）：
@@ -830,6 +836,8 @@ class DayReport:
             "stuck_flushed": self.stuck_flushed,
             # 【task-102】"0 农场动作就想睡"被拒绝（本日不推进、不 VERIFIED）—— 只作证据
             "slept_without_work": self.slept_without_work,
+            # 【task-6 / 0.7.44】真实睡眠真相（与 ended_by 解耦；stuck 翻篇日也为 true）
+            "slept_ok": self.slept_ok,
             # 【task-84】枯死作物证据：farm 级计数（**带状态**：0 只代表"没有"当且仅当 ok）
             # + 当天已认输（够不着）的干格坐标。`watered_outdoor`/`final_water.dry` 只按活苗算。
             "dead_crops": self.dead_crops,
@@ -1016,6 +1024,10 @@ class LongRun:
         # 算一次并缓存到这里（`_stage_tiles`/`_budget_gate` 都读它），日终落
         # `day_end.stamina_budget`。`budget_noted` 保证 `stamina_budget` journal 一天只发一条。
         self.budget_today: dict[str, Any] = {}
+        # 【task-6 / 0.7.44】当天"只因预算延后"的 `deferred_by_budget` 事件**排队**：
+        # 日终拿到浇水证据后才决定落不落（「只因预算延后」与「户外浇水达标」不得同真，见
+        # `_flush_budget_deferrals`）。不立即 `_journal` 是为了绝不产生自相矛盾的账本组合。
+        self.budget_defer_events: list[dict[str, Any]] = []
         self.budget_noted = False
         #: 【task-163】当天**因体力预算被显式延后**的任务 → 当时没做完的格子。
         #: 用途只有两个：①守卫（`work_reasons`/`_pending_work`）不许再把它们算成"还有活"；
@@ -3390,18 +3402,52 @@ class LongRun:
                 b.setdefault("deferred_tiles", {})[task] = len(self.budget_deferred_tiles[task])
         if not first and not new_tiles:
             return          # 一天每类只记一次（后来真发现了新的延后格才再记一笔）
-        self._journal("deferred_by_budget", task=task, why=why,
-                      stamina=b.get("stamina"), water_reserve=b.get("water_reserve"),
-                      dry=b.get("dry"), live_crops=b.get("live_crops"),
-                      basis=b.get("basis"), tiles=len(pending),
-                      targets=[list(t) for t in pending[:6]],
-                      note="只因预算而不做（不是没活）；没浇完就是 crops_watered=false")
+        # 【task-6 / 0.7.44】不立即落事件：排到日终 `_flush_budget_deferrals()`，只有当天
+        # **没浇完**才写 `deferred_by_budget`（否则会与"户外浇水达标"同真、被 analyzer 判自相矛盾）。
+        self.budget_defer_events.append(dict(
+            task=task, why=why,
+            stamina=b.get("stamina"), water_reserve=b.get("water_reserve"),
+            dry=b.get("dry"), live_crops=b.get("live_crops"),
+            basis=b.get("basis"), tiles=len(pending),
+            targets=[list(t) for t in pending[:6]],
+            note="只因预算而不做（不是没活）；没浇完就是 crops_watered=false"))
         if pending:
             self._journal("budget_deferred_tiles", task=task, count=len(pending),
                           total=len(self.budget_deferred_tiles[task]),
                           targets=[list(t) for t in pending[:6]],
                           note="这些格子今天被**体力预算**显式延后：守卫不再把它们算作"
                                "『还有活』，但也不参与任何判定扣减（延后≠洗白）")
+
+    def _flush_budget_deferrals(self, *, watered_outdoor: bool,
+                                rep: DayReport | None = None) -> int:
+        """【task-6 / 0.7.44】把排队中的 `deferred_by_budget` 事件**在日终**落账。
+
+        卡面②：「只因预算延后」与「户外浇水达标」**不得同真**（analyzer 的 ⚠ 判据正是
+        `deferred_by_budget` 事件 + `checks.watered_outdoor=true` + `final_water.dry==0`）。
+        所以事件不再立即 emit，而是排进 `budget_defer_events`，等日终拿到浇水证据再决定：
+
+        * `watered_outdoor=False` ⇒ 正常落事件（延后确实解释了"为什么有活没干完"）；
+        * `watered_outdoor=True`  ⇒ **一条都不落**，降级成日级 info：
+          `day_end.stamina_budget.deferred_by_budget_suppressed=<n>` 且该日
+          `deferred_by_budget=False`（analyzer 的"日级>0 却无事件"同一口径也不会红）。
+          留痕不丢：条数仍在 `suppressed` 计数里（队列本身含 task/why/格数；只是不当事件发）。
+
+        返回实际落账的事件条数。`rep=None` 供单测直接驱动（只按 flag 决定落/不落）。
+        """
+        events, self.budget_defer_events = self.budget_defer_events, []
+        if not events:
+            return 0
+        if watered_outdoor:
+            if rep is not None:
+                rep.stamina_budget["deferred_by_budget_suppressed"] = (
+                    int(rep.stamina_budget.get("deferred_by_budget_suppressed") or 0)
+                    + len(events))
+                # 与"当天有 `deferred_by_budget`"的日级自述对齐：浇完了就不算"只因预算延后"。
+                rep.stamina_budget["deferred_by_budget"] = False
+            return 0
+        for ev in events:
+            self._journal("deferred_by_budget", **ev)
+        return len(events)
 
     def _budget_deferred_tasks(self) -> set[str]:
         """【task-163】当天因**体力预算**被显式延后的任务集合（空集 = 没有延后）。
@@ -3467,14 +3513,17 @@ class LongRun:
             discretionary = max(0.0, stam - reserve)
             raw = min(int(MAX_TREES_PER_DAY), int(discretionary // TREE_STAMINA_COST))
             cleared = int(self.trees_cleared_today or 0)
-            self._journal("deferred_by_budget", task="clear_area_tree",
-                          why=(f"预算 {raw} 棵 / 已砍 {cleared} 棵（体力驱动：可支配体力 "
-                               f"{discretionary:g} ÷ 单棵 {TREE_STAMINA_COST:g}，封顶 "
-                               f"{MAX_TREES_PER_DAY}）"),
-                          budget_trees=raw, cleared_trees=cleared,
-                          discretionary_stamina=round(discretionary, 2),
-                          per_tree_stamina=TREE_STAMINA_COST,
-                          note="只因**砍树预算**而不做；不算硬失败、不进 leftover")
+            # 【task-6 / 0.7.44】同样排队到日终（`_flush_budget_deferrals`）：
+            # 与"户外浇水达标"互斥；砍树预算延后也属于"只因预算而不做"。
+            self.budget_defer_events.append(dict(
+                task="clear_area_tree",
+                why=(f"预算 {raw} 棵 / 已砍 {cleared} 棵（体力驱动：可支配体力 "
+                     f"{discretionary:g} ÷ 单棵 {TREE_STAMINA_COST:g}，封顶 "
+                     f"{MAX_TREES_PER_DAY}）"),
+                budget_trees=raw, cleared_trees=cleared,
+                discretionary_stamina=round(discretionary, 2),
+                per_tree_stamina=TREE_STAMINA_COST,
+                note="只因**砍树预算**而不做；不算硬失败、不进 leftover"))
         return False
 
     def _tree_budget_room(self, obs: dict[str, Any]) -> int:
@@ -6264,11 +6313,26 @@ class LongRun:
         self._journal("sleep", ok=st.ok, code=st.code, reason=st.reason,
                       before=st.before, after=st.after, receipt=st.receipt)
         if st.ok:
+            # 【task-6 / 0.7.44】"真的睡成功了"是观测真相，单独记在 `rep.slept_ok`：
+            # `ended_by` 可能被 stuck 等收尾口径占用，不能拿它反推睡眠（A8 冬 9/14 的误报）。
+            rep.slept_ok = True
             self._say(f"  · 睡觉：{st.reason}（{why}）")
             rep.notes.append(f"主动睡觉：{why}；{st.reason}")
             return "sleep", why
         rep.notes.append(f"睡觉失败：{st.reason}（{why}）")
         return "sleep_failed", st.reason
+
+    @staticmethod
+    def _slept_by_us(rep: DayReport) -> bool:
+        """【task-6 / 0.7.44】今天是否**由我们真的睡成功**（观测真相，不靠 `ended_by` 反推）。
+
+        A8 冬 9/14：`ended_by=stuck`（idle 路径 + `_stuck_flush` 有界翻篇）确实睡过去了、
+        `sleep.ok=true`、`day_after` +1；旧口径只看 `ended_by in (sleep, inventory_blocked)`
+        ⇒ `checks.slept_by_us=false`（收工路径 checks 快照滞后）。新口径 = `rep.slept_ok`
+        （`_do_sleep` 里 `st.ok` 置真）**或** ended_by 是正常收工形态。
+        注意：它只描述"有没有睡成功"，**不改变** `day_justified`/`verified`（stuck 日仍不达标）。
+        """
+        return bool(rep.slept_ok or rep.ended_by in ("sleep", "inventory_blocked"))
 
     def _stuck_flush(self, obs: dict[str, Any], rep: DayReport, why: str) -> bool:
         """【task-73】stuck 日**有界翻篇**：睡过去一天，让整轮继续，而不是 19 秒终止。
@@ -8021,6 +8085,7 @@ class LongRun:
         self.day_start_off_farm = False
         # 【task-158】体力预算每天重算（当天活苗数/体力上限都会变）。
         self.budget_today = {}
+        self.budget_defer_events = []      # 【task-6 / 0.7.44】日终才落账的"只因预算延后"队列
         self.budget_noted = False
         # 【task-163】预算延后记账每天重来（`deferred` 只描述"今天"）。
         self.budget_deferred_tiles = {}
@@ -8863,6 +8928,10 @@ class LongRun:
         watered_outdoor, water_info = self._water_evidence(
             last_obs, outdoor_obs=outdoor_obs, outdoor_t=outdoor_t, outdoor_name=outdoor_name)
         rep.final_water = water_info
+        # 【task-6 / 0.7.44】「只因预算延后」与「户外浇水达标」不得同真：日终拿到浇水证据后
+        # 才把排队的 `deferred_by_budget` 落账；浇完的日子降级成 `stamina_budget` 里的
+        # `deferred_by_budget_suppressed` 计数（事件一条不发），两件事实不再同时出现。
+        self._flush_budget_deferrals(watered_outdoor=watered_outdoor, rep=rep)
         # 【task-84】枯死作物的日账本证据（用户 m11003）。**带状态**：0 只代表"没有"当且仅当
         # `ok`；旧 Mod 缺字段 ⇒ `unavailable`（"不知道"，绝不当 0 用，与 `farm_dry_tiles` 同纪律）。
         rep.dead_crops, rep.dead_crops_status = farm_dead_crops(last_obs)
@@ -8892,7 +8961,7 @@ class LongRun:
             # 只是收尾原因写成了背包堵住 —— 所以 `slept_by_us` 必须为真，否则报告会说谎。
             # 它**不会**因此算达标：`day_justified` 只认 `is_justified_end()` 的白名单，
             # `inventory_blocked` 不在其中 ⇒ 当天如实不判 VERIFIED。
-            "slept_by_us": rep.ended_by in ("sleep", "inventory_blocked"),
+            "slept_by_us": self._slept_by_us(rep),
             # task-11：被不可逆/不敢关的模态挡住（职业选择、存档超时）时，这一天**不算数**。
             # 用户 m03224 拍板了职业路线：宁可停下等人，也不静默丢档。
             "no_blocking_modal": rep.ended_by not in BLOCKING_ENDS,
