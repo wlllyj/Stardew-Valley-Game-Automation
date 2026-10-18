@@ -36,7 +36,18 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.47"   # v0.7.47：A9 门禁批快修——背包升级对话购买默认关闭（入口未取证，opt-in）
+MOD_VERSION_EXPECTED = "0.7.48"   # v0.7.48：A9 门禁批快修——slot_relief 字段奇偶补齐（clear_gate 补 reached）
+                                  # ①唯一改动：`_note_clear_area_bag_gate` 的 `slot_relief` 记录补
+                                  #   `reached=False`（语义：clear_gate 是"今天不再新开 clear_area"的闸，
+                                  #   不是"腾到目标水位" ⇒ 绝不谎报达标，与压力通道同口径）；由此
+                                  #   demand/demand_basis/target_free/reached 齐平 task-237 字段集，
+                                  #   analyze-longrun / verify-run3 与探针 smoke-0741/0742 不再 rc=1；
+                                  # ②同类奇偶缺口排查：AST 扫 `longrun.py` 全部 `_journal` 调用点逐事件归类，
+                                  #   除 slot_relief 外无"声明统一必带字段集却个别写入点缺项"的事件；
+                                  # ③本批无 Mod 代码变更：dll 与 0.7.47 逐字节相同（293888B/`C9B3BD6C…`）；
+                                  # checks 10 键语义与 `no_unmet_stages`/护栏 B 公式不变。
+                                  # --- 历史 ---
+                                  # v0.7.47：A9 门禁批快修——背包升级对话购买默认关闭（入口未取证，opt-in）
                                   # ①`backpack_upgrade_enabled` 默认 False：不发任何 goto SeedShop /
                                   #   talk / buy 请求，只留只读 `buy{status:skipped,code:disabled}` 与
                                   #   `day_end.backpack_upgrade_skip="disabled"`，不写 checks、不加 notes；
