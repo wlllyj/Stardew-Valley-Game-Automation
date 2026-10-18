@@ -449,6 +449,18 @@ def smapi_verdict(counts: dict[str, int] | None) -> tuple[list[str], list[str]]:
     return problems, infos
 
 
+def _day_non_empty(d: dict[str, Any]) -> bool:
+    if int(d.get('farm_signals') or 0) > 0:
+        return True
+    stages = d.get('stages') or []
+    if any(int(s.get('ok') or 0) > 0 or int(s.get('assigned') or 0) > 0 for s in stages):
+        return True
+    end = d.get('end') or {}
+    if int(end.get('ok_steps') or 0) > 0:
+        return True
+    return False
+
+
 def report(rows: list[dict[str, Any]], *, target_days: int,
            smapi_counts: dict[str, int] | None = None) -> tuple[bool, dict[str, Any]]:
     bad_lines = [r for r in rows if r.get("event") == "_bad_line"]
@@ -1529,6 +1541,9 @@ def report(rows: list[dict[str, Any]], *, target_days: int,
         # `_run8-evidence.md` §4 必须并列这一行，避免「窗口外不计」变成默认沉默。
         "strict_verdict": "needs_review" if (problems or history_problems) else "VERIFIED",
         "strict_problem_count": len(problems) + len(history_problems),
+        # P0-4 双轨（仅呈现，不参与 rc）：empty_day 单列，不计入严格口径。
+        "empty_days": [d["key"] for d in days if not _day_non_empty(d)],
+        "non_empty_day_count": sum(1 for d in days if _day_non_empty(d)),
     }
     return ok, summary
 
