@@ -65,24 +65,14 @@ player = {tile:[61,94], canMove:false, facing:1}  clock = winter 28 720
 ```
 `dismiss_modal()`（无参数）回执原文节选：`已关闭对话框（选"Heh... I dunno... we'll see...”：answerDialogue("1")closeDialogue() 关闭…）` + 警告 `游戏仍处于不可控状态（canMove=False…）需要外部恢复`；1.5s 后 `eventUp=false, menu=null, canMove=true, clock 开始走`（7:50→9:00 内推进正常）。**全程未选 Purchase、未指定 answerIndex/answerText。**
 
-### 3.4 怎么判定"卡死"：门限建议（给 watchdog / 事件态自愈用）
+### 3.4 怎么判定"卡死"：门限建议（watchdog / 事件态自愈用）
 
-**推荐判据（三条件同时成立才判卡死）**：
-1. `eventUp == true` 且 `activeMenu == null`（事件在跑但已没有可推进的 DialogueBox）；
-2. `advance_dialogue` **连续 10 次**返回 `no_dialogue`（默认每次间隔 3–6s ⇒ 合计 ≥30–60s），且期间没有任何 `ok / stepped>0`；
-3. 期间 `liveness.worldAdvancing == false` **且** `worldSeq` 无变化（辅助条件；见下方"不能单用"）。
+**推荐判据（三条同时成立）**：①`eventUp==true` 且 `activeMenu==null`；②`advance_dialogue` 连续 10 次返回 `no_dialogue`（每次 3–6s ⇒ ≥30–60s）且期间无 `ok/stepped>0`；③期间 `worldSeq` 无变化、`worldAdvancing==false`（辅助）。
+**不能单用 clock/worldSeq/worldAdvancing**：成功样本 A#2 的 `worldSeq=158` 也冻结 124s 却走完并进入提问态；事件态下 clock 本来就不走、`worldAdvancing` 在成功事件期间同样 false；成功样本两次点击最长静默仅 4–8s（SMAPI A:2163–2212）⇒ 门限别低于 30s。
+**卡死持续时长**（`worldSeq` 冻结段）：A#1 484s、B#1 262s、B#2 360s、B#3 131s ⇒ 2–8 分钟内无任何自愈迹象，只能靠 `load_save(force=True)`。
+**自愈建议**：判卡死后记 `eventId/clock/worldSeq/连续 no_dialogue 次数` → `load_save(force=True)`；同小时连续 2 次自愈后仍复发 ⇒ 按 task-41 的 `event_blocked` 诚实收尾。门限可配：默认 60s / 10 次，下限 30s。**mod 侧更稳**：`advance_dialogue` 在"事件仍在 + 连续 no_dialogue"时直接回 `stalled=true`。
 
-**不能单用 clock / worldSeq / worldAdvancing 的理由（一手反例）**：
-- 成功样本 A#2 的 `worldSeq=158` 也**冻结了 124s**（19:42–19:44）却走完并进入提问态 ⇒ worldSeq 冻结本身不是卡死；
-- 事件态下 clock 本来就不走（`secondsSinceClockMoved` 会一路涨，成功事件期间也一样）⇒ clock 不是判据；
-- `liveness.worldAdvancing` 在成功事件期间同样是 false ⇒ 不是充分判据；
-- 成功样本里两次点击之间的最长静默约 4–8s（SMAPI A:2163–2212 段）⇒ 门限必须显著大于它，**不要低于 30s**。
-
-**观测到的卡死持续时长**（`worldSeq` 冻结段）：A#1 **484s**、B#1 **262s**、B#2 **360s**、B#3 **131s** ⇒ 2–8 分钟内**没有任何**自愈迹象，全部只能靠 `load_save(force=True)`。
-**自愈动作建议**：判卡死后 ①记 `eventId/clock/worldSeq/连续 no_dialogue 次数`；②`load_save(force=True)` 重读档（唯一实测有效手段）；③同一小时连续 2 次自愈后仍复发 ⇒ 按 task-41 的 `event_blocked` 诚实收尾，不再盲重试。建议门限做成可配置：默认 60s / 10 次 no_dialogue，下限 30s。
-**更强的做法（mod 侧）**：让 `advance_dialogue` 在"事件仍在 + 连续 no_dialogue"时直接回一个 `stalled=true` 字段，脑侧就不用自己数次数/卡时间。
-
-
+## 4. SeedShop 内部观测（会话 A）
 
 ### 4.1 位置/世界读数
 - `location.name="SeedShop"`，player 进店落 [6,29]；随后 `move_to [8,24]` ok、`[14,20]` ok；`[16,14]`/`[9,16]` ⇒ `[unreachable] 寻路无法到达（A* 未算出路径）`。
@@ -103,17 +93,14 @@ player = {tile:[61,94], canMove:false, facing:1}  clock = winter 28 720
 - `observe` 的 `characters` 是数量（`Contracts.cs:372`），无法按名查位 ⇒ 桥侧无法"走到 Pierre 旁边再 interact"。
 - 会话 A/B 均**未出现** Pierre 主动对话（进店事件结束后 `ui` 为空壳）。
 
-### 5.1 存档 XML 原文（Pierre 坐标的唯一旁证，只读提取）
+### 5.1 存档 XML 原文（Pierre 坐标旁证，只读提取）
 
-来源：`C:\Users\admin\AppData\Roaming\StardewValley\Saves\Wahaha_450799035\Wahaha_450799035`（2948770B / 19:15:01 / `6DE8419B…B594`）。抽取命令：按 `<GameLocation xsi:type="...SeedShop">` 后的 `<characters>` 段截取。原文节选（单行 XML，为阅读折行）：
-
+来源 `C:\Users\admin\AppData\Roaming\StardewValley\Saves\Wahaha_450799035\Wahaha_450799035`（2948770B / 19:15:01 / `6DE8419B…B594`），截 `<characters>` 段（单行 XML，为阅读折行）：
 ```xml
-<characters><NPC><name>Pierre</name>…<Position><X>256</X><Y>1088</Y></Position>
-<Speed>2</Speed><FacingDirection>2</FacingDirection>…</NPC>
+<characters><NPC><name>Pierre</name>…<Position><X>256</X><Y>1088</Y></Position><Speed>2</Speed><FacingDirection>2</FacingDirection>…</NPC>
 <NPC><name>Abigail</name>…</NPC><NPC><name>Caroline</name>…</NPC></characters>
 ```
-
-⇒ Pierre 在 SeedShop 内 tile **[4,17]**（256/64, 1088/64）。注意这是**离线旁证**（19:15:01 睡前存档），不是实时观测，也未驱动任何寻路/交互。
+⇒ Pierre 在 SeedShop 内 tile **[4,17]**（256/64, 1088/64）。这是**离线旁证**（19:15:01 睡前存档），不是实时观测，也未驱动任何寻路/交互。
 
 ### 5.2 已试通道清单（6 条，避免后人重复试）
 
@@ -128,7 +115,7 @@ player = {tile:[61,94], canMove:false, facing:1}  clock = winter 28 720
 
 附带通道（离线，未起游戏）：存档 XML 按名定位 NPC（§5.1）——只能旁证坐标，不能当实时观测。
 
-
+## 6. 能力面结论（用于卡 A 设计）
 
 | 需要 | 现有能力 | 结论 |
 |---|---|---|
