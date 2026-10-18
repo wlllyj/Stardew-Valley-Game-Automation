@@ -60,13 +60,13 @@
 
 ## §6 冻结记录（待冻结后由 Lead 填实测原文）
 
-| 项 | 读数 |
+| 项 | 读数（2026-10-18 实测原文） |
 | --- | --- |
-| 冻结提交 | 待填 |
-| 版本一致性 | 待填 |
-| dll / manifest | 待填 |
-| build / C# 自检 | 待填 |
-| check-release | 待填 |
-| 装机 / goto / preflight | 待填 |
-| 收尾 | 待填 |
-| 冒烟（smoke-0745） | 待填 |
+| 冻结提交 | `2feb1f8d607629b0dabd5694b4d88d261e266983` `chore(release): 冻结 0.7.45（诚实收工判据/背包满留痕/残缺 tile fail-closed）`，3 files +31/−5（brain/agentfarm/bridge.py、mod/AgentFarm.Bridge/manifest.json、tools/_note-0745.txt）；父提交 `18c415e`。 |
+| 版本一致性 | manifest `Version=0.7.45` / brain `MOD_VERSION_EXPECTED="0.7.45"`；manifest 头部 Description=`v0.7.45（2026-10-18）…`。 |
+| dll / manifest | dll 286208B SHA256 `806C1069D217EEEFAB6D3354BA09DA049847D97EE5B4A1D2D65845F1DCB0B17F`（与 0.7.44 逐字节相同 ⇒ Mod 无代码变更，符合预期）；manifest 73663B SHA256 `DECBA6775569D7C42DF910E7E6A72BC2CF59B1E2729C29484E700F6E786A2E5C`；装机后 dll/manifest 与仓库逐字节一致（同长度同哈希）。 |
+| build / C# 自检 | `dotnet build -c Release --no-incremental`（mod/AgentFarm.Bridge）= 0 警告 0 错误（3.20s）；`dotnet run -c Release`（mod/AgentFarm.Bridge.Tests）= `OK 91 断言全部通过`；`python -W error::SyntaxWarning -m py_compile brain\agentfarm\bridge.py` rc=0。 |
+| check-release | `python tools\check-release.py --expect 0.7.45`：六项全绿 —— 版本一致、dll 18:54:09 不比源码旧（最新 WorldSnapshot.cs 14:36:09）、py_compile 30 文件、全量 **Ran 1330 tests / OK**、工作树干净（首跑因 log-analyst 两个未跟踪 scratch 探针红 ⇒ 提交 `1830e28` 后复跑全绿；末行文案仍写「四项全绿」系脚本旧文案）。 |
+| 装机 / goto / preflight | `deploy-mod.py --no-quit`：0.7.44 → 0.7.45，桥 `modVersion=0.7.45 port=17890`，load_save 进 `Wahaha_450799035`（FarmHouse(9,9)）`[OK] 部署闭环完成`；`agentfarm goto Farm` OK（FarmHouse→Farm，landing=[64,15]，7653ms）；`preflight.py --expect 0.7.45 --save-baseline logs\runA9-baseline.json` ⇒ `✅ 可以起跑`（基线 700B SHA256 `141F7EDE8F543F3A85CAE5EFFE9C63939F966EF9D5433BB381A9D08415EA07E7`，冬28 06:00 Farm/钱2767/体力270/种子 483×10/耕地8/作物0/tileCount 400）。**注**：该基线取自当前档（winter 28，冒烟推进后的档）；A9 起跑前 restore `A9-start`（winter 26）后必须按 §4 重跑 preflight 并重写基线，以 restore 后读数为准。 |
+| 收尾 | `stop-game.py --wait 45`：quit_game 回执 ok、原 pids=[10532] 消失 ⇒ 进程 0 / 仓库根 `bridge.json` 不存在 / 17890 无 LISTENING / AppData 无残留。 |
+| 冒烟（smoke-0745） | 待 machine-runner 执行（tag `smoke-0745`；门禁见 §3，≥1 天 VERIFIED 才放行 A9）。 |
