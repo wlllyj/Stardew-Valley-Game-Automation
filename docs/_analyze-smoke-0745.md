@@ -75,6 +75,29 @@
 - 冬 27：`ok0_already=0`（74 段、ok 210 / already 82）。
 - 口径不变（task-13）：`ok` = 真世界变化数、`already` = 本来就不用做的格 ⇒ **`ok=0` 不代表白干**，A9 判决必须两列并读；`window` 两天与总量相同（账本只有 2 天）。
 
+## 5b. 售材白名单纪律冲突证据（Lead m01932 问 ③ 追加；账本侧只报数字）
+
+`strategy=slot_relief_space` / `why=space_pressure` 的 `sell` 事件共 **10 条**（成功 **9**、失败 1）：
+
+| 行 | 天 | qid / 物品 | 叠数 | 结果 | `after.shipping_bin` |
+| --- | --- | --- | --- | --- | --- |
+| L5 | 冬 26 | (O)262 Wheat | 5 | ok | 1 |
+| L8 | 冬 26 | (O)310 Maple Seed（槽位显示 (O)262，Mod `status=not_whitelisted`） | 5 | **failed** | 1 |
+| L35 | 冬 26 | **(O)330 Clay 黏土** | 3 | ok | 2 |
+| L41 | 冬 26 | (O)92 Sap | 1 | ok | 3 |
+| L61 | 冬 26 | **(O)388 Wood 木材** | 1 | ok | 4 |
+| L72 | 冬 26 | **(O)388 Wood 木材** | 31 | ok | 5 |
+| L81 | 冬 26 | **(O)388 Wood 木材** | 2 | ok | 6 |
+| L86 | 冬 26 | **(O)388 Wood 木材** | 46 | ok | 7 |
+| L95 | 冬 26 | (O)535 Geode | 3 | ok | 8 |
+| L238 | 冬 27 | **(O)388 Wood 木材** | 12 | ok | 1（跨日重新计数） |
+
+- **建材被卖合计：Wood 92 件（冬 26 80 / 冬 27 12）+ Clay 3 件（冬 26）= 95 件**；9 叠成功出货里 **5 叠是建材**。
+- `before.whitelist` 原文显示当时 Mod **把 `(O)388`/`(O)330` 列入可卖白名单**（L35 `["(O)330"]`、L61/72/81/86/238 `["(O)388"]`）⇒ 与 AGENTS §5「建材/建造预留永不卖」的纪律冲突（Lead 已裁决为纪律问题，不在本卡改判）。
+- 预留逻辑只在**后段**拦住：L257（冬 27）`reason=剩下的可卖叠都是建造预留材料（铜矿/石头/煤），卖空会破坏熔炉/升级计划 ⇒ 宁可不腾格`；冬 26 与冬 27 早段的 Wood/Clay 已卖出（L35/L61/L72/L81/L86/L238）。
+- 出货箱差分：`after.shipping_bin` 冬 26 依次 1→8（与成功 8 次一致）、冬 27 为 1（1 次）；钱 2767（L1）→3264（L232）= **+497g 于 NewDay 结算**，但账本 `sell` 事件无单价 ⇒「497g 里多少来自建材」**无法判定**。
+- 供 0.7.46 复验：售材白名单收紧后，上述 5 行（L35/L61/L72/L81/L86/L238）的 qid 不应再出现。
+
 ## 6. 其余聚合读数（全 info、不进 rc）
 
 | 聚合 | 读数 |
@@ -112,7 +135,7 @@
 
 1. **`pending` 七口径闭合**：两天不变式 0 违背、字段全在场；但与 task-15 的 263/217 数字**不再对应**（修复后 3/7），且冬 27 仍有 `executable=7` 未消——需要 task-15/16 继续定位「7 格为何仍算可执行」与「加 10 格 `ledger` 来源」。
 2. **`day_justified` 自洽性**：冬 26 false+exec0 是 `inventory_blocked` 白名单设计（info 点名、非 bug）；冬 27 false+exec7 是 fail-closed 正确结果（诚实收工判据没过）；`malformed` 两天 0、无「true 却 exec>0」。
-3. **背包压力留痕**：完整（`free_slots`/`loot_lost`/`slot_relief` 三处一致），两天都是真背包满；冬 26 因此早停，不是失败。
+3. **背包压力留痕**：完整（`free_slots`/`loot_lost`/`slot_relief` 三处一致），两天都是真背包满；冬 26 因此早停，不是失败。**售材纪律冲突见 §5b**：9 叠成功出货中 5 叠为建材（Wood 92 + Clay 3 件，L35/L61/L72/L81/L86/L238），账本侧如实报、由 0.7.46 白名单收紧后复验。
 4. **already 双列**：3 段 / 1 天 / 5 格，`ok=0` 不可单独读；`ok 243 / already 96` 必须并读。
 
 ## 9. 已知限制 /【无法判定】
@@ -120,8 +143,9 @@
 - 冬 27 `blocked(223) − stalled(218) = 5` 格：已判死但未在停滞集合，账本未单列坐标 ⇒【无法判定】。
 - 冬 27 `pending_ledger=230` 比 0.7.44 同玩法 stage 余格 220 多 10 格：来源无标记 ⇒【无法判定】。
 - 冬 26 `plot_pending_executable=3` 与快照 `executable=0` 不同源（阶段末条 vs 日终快照），3 格终态 ⇒【无法判定】。
+- **层级不可对账（Lead m01955 口径增量）**：day 级 `pending_*` 七口径（冬 27：账本 230 / 守卫 7 / 判死 223 / 可执行 7）与 stage 级 `leftover_split`（冬 27：可执行余格 290 / 挡死 19）是**两个层级**，**不可互相加减或对账**；0.7.46 卡 B 对「7 格」逐格归因必须走 day 级 `pending_*`，拿 290/19 对账会误判。
+- 渲染文案缺陷（`afford_blocked` 把「背包 0 种子 / 无当季种子」并进「缺种子钱」旧文案，`tools/analyze-longrun.py:8564-8568`）：Lead 已裁决属 analyser 文案缺陷、登 backlog task-10，**不影响红/rc，本卡不改**。
 - `loot_lost_items` 含「（可能）」= 概率掉落，账本只做近似归因，不能当确定物品清单。
-- 渲染观察项（**非本卡改动**）：`种子经济: 本日缺种子钱（money=3264 < seed_price=20）` 文案与实际数字矛盾——`seed_gate`（L246/L251）`seeds=0 / money=3264 / seed_price=20 / plantable=0 / out_of_season=[Wheat Seeds]`，属 `afford_blocked` 把「背包 0 种子」并进「钱不够」旧文案（task-88 口径，`tools/analyze-longrun.py:8564-8568`）；只影响可读性、不影响红/rc，建议后续卡修文案。
 
 ## 10. 复核命令
 
@@ -132,6 +156,7 @@ python -m unittest discover -s tests                     # Ran 1348 / OK
 python tools\analyze-longrun.py --journal logs\longrun-smoke-0745.jsonl --days 2
 python scratch\_t24_smoke0745.py                          # 六聚合 + 老聚合读数 → scratch\_t24_smoke0745_readings.json
 python scratch\_t24_smoke0745_detail.py                   # day_end 字段/关键事件原文/stage 汇总
-python scratch\_t24_check.py                              # 八账本基线(80488c8~1) vs 新版 rc/红/#无法判定
+python scratch\_t24_check.py                              # 九账本基线(80488c8~1) vs 新版 rc/红/#无法判定
 python scratch\_t24_compare_one.py logs\longrun-smoke-0745.jsonl   # 单账本旧/新 red subjects 逐项对照
+python scratch\_t24_sell_audit.py                         # 出货逐件表 + 建材被卖（Wood/Clay）行号与 shipping_bin 差分
 ```

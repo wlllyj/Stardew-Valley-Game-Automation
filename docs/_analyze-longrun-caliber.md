@@ -1469,6 +1469,10 @@ analyzer 收四块**只 info /【无法判定】、不进 rc** 的聚合（判�
   run9 1/84、run9b 1/45、run9c 0/0、run9d 1/29）；A8 1/35 **不变**、smoke-0744 1/33 **不变**；#无法判定各 **+18**
   （新探针在旧账本 0 命中）；**smoke-0745 1/63/100 均不变（新探针全部命中 ⇒ 0 增量）**。
 - 单测：`tests.test_analyze_longrun` **Ran 334 / OK**；全量 `discover -s tests` **Ran 1348 / OK**；py_compile rc=0。
+- **口径边界（Lead m01955 裁决）**：day 级 `pending_*` 七口径与 stage 级 `leftover_split` 是**两个层级，不可互相加减或对账**（冬 27：day 级账本 230/守卫 7/判死 223/可执行 7，stage 级可执行余格 290/挡死 19）。0.7.46 卡 B 的逐格归因只走 day 级 `pending_*`；拿 290/19 对账会误判。
+- **售材白名单**：本账本 9 叠成功 `sell` 中 5 叠是建材（Wood 92 件 + Clay 3 件，L35/L61/L72/L81/L86/L238），`before.whitelist` 当时含 `(O)388`/`(O)330` ⇒ 与 AGENTS §5 纪律冲突（Lead 已裁决，0.7.46 复验：这些 qid 不应再出现在 `sell`）。
+- **已知文案缺陷（Lead m01955 裁决，登 backlog task-10、本卡不改）**：`种子经济: 本日缺种子钱（money=… < seed_price=…）` 是 `afford_blocked` 把「背包 0 种子 / 无当季种子」并进旧文案（`tools/analyze-longrun.py:8564-8568`）；不影响红/rc，**不得当结论引用**。
+- 层级/文案两条均见 `docs\_analyze-smoke-0745.md` §5b/§9。
 
 ## 4. 复核命令
 
@@ -1512,4 +1516,5 @@ python -m unittest discover -s tests           # task-24 后：Ran 1348 / OK（0
 python tools\analyze-longrun.py --journal logs\longrun-smoke-0745.jsonl --days 2  # 0.7.45 冒烟：rc=1/红 63/#无法判定 100；pending_caliber found 2 天（3/3/0/0/0/3/0 与 230/7/218/7/223/0/0，不变式 0 违背）；justified 可疑 1 天；背包压力 226 步/226 格；详见 docs\_analyze-smoke-0745.md
 python scratch\_t24_check.py                   # 八账本 基线(80488c8~1) vs task-24 版：rc/红数一字不变；#无法判定 各 +18；smoke-0745 +0
 python scratch\_t24_compare_one.py logs\longrun-smoke-0745.jsonl   # 单账本旧/新 red subjects 逐项对照（同 rc/红/无法判定）
+python scratch\_t24_sell_audit.py              # smoke-0745 出货逐件表 + 建材被卖（Wood 92/Clay 3 件）行号与 shipping_bin 差分
 ```
