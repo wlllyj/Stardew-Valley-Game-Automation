@@ -1,0 +1,6 @@
+v0.7.45（2026-10-18）：诚实收工被守卫账本误判 day_justified=false 修复 + 背包满留痕/腾格（0.7.44 真机冒烟暴露）
+1) 脑侧（task-15）：守卫 `_pending_work()` 剔除已标停滞（`resume_stall_tiles`）与被围/挡死格（`encircled_day`），原始账本口径另存 `_ledger_pending()`；新增 `_pending_snapshot` 六口径并列（ledger/guard/stalled/blocked/executable/unobserved，不变式 ledger==guard+blocked、guard==executable+unobserved）；`is_justified_end` 增设证据门槛：`resume_exhausted` 仅在 `pending_executable==0` 时认（`stuck:` 永不认；观测缺失/None fail-closed）。
+2) 脑侧（task-15）：`同一秒连发 5 次换片`/换片上限两处收尾改走 `resume_exhausted:` 诚实收工，不再写 `stuck:`；sleep_guard 的 no_work 分支遇只剩挡死格拒绝 `no_work`；day_end 新字段 `pending_ledger/pending_guard/pending_stalled/pending_executable/pending_blocked/pending_unobserved` + `stage_midway_leftover`（早轮 leftover 不被末轮 0 遮蔽）；checks 10 键语义不变、无新增 journal 事件名。
+3) 脑侧（task-16）：每次观测算 free_slots（`inventoryCount − len(inventory[])`，容量≠件数）；`free_slots<=SLOT_RESERVE` 走既有 slot_relief（白名单/建造预留/每 qid 下限；工具/武器/种子/建材/锭类永不卖；卖必须走 `Farm.shipItem`/`sell` + 观测差分）；清障掉落被拒留 `loot_lost`（info）；买种前满包先腾格；不因背包满判失败。
+4) 判据/工具（非 Mod）：analyzer 收 0.7.44 冒烟新形态（`guard_count` 三口径并列：守卫累计 / 日级最后一轮 / 观测片）。
+5) 冻结前置：`check-release --expect 0.7.45` 六项全绿（全量单测 0 红、树干净、C# 自检 0 警 0 错）。

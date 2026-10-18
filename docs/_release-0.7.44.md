@@ -71,3 +71,14 @@
 | A9-start 备份 | `logs/ab-backup/A9-start/`：`Wahaha_450799035` `053CAA71…`(3141826B) / `SaveGameInfo` `3D964F3F…`(32305B) / MANIFEST `5479354B…`(1222B)；起点 = 第 1 年 **冬 26**（17:03:52 存档，2767g、作物 0、Wheat Seeds 10、waterLeft 13、farmingLevel 3） |
 
 > 缺口/限制（照实）：①真机冒烟（§3）尚未做，未绿则 A9 不放行；②`deploy-mod` 自带的存档备份在 `logs/deploy-*/`，与本表的 A9-start 不是同一个口径，判据以 A9-start MANIFEST 为准；③本表所有哈希均为 2026-10-18 18:2x 实测，未使用任何事后推算值。
+
+## §7 真机冒烟结果（2026-10-18 18:0x–18:16，tag smoke-0744）⇒ **FAIL，不放行 A9/B9**
+
+- **读数**：`finish{code:1, verified_streak:0, target_days:1, actions:156, minutes:8.54}`、`day_cap` 2/2（`logs/longrun-smoke-0744.jsonl` 308 行）；两天 `verified=false`，唯一 false 检查键均为 `checks.day_justified`。
+  - 冬 26（journal:240）：`ended_by=sleep`、做成 71、`ended_reason=stuck:同一秒连发 5 次换片都没有目标（守卫仍说还有活：今天早些时候还有 263 格没做完（跨片地，最近的是 [12, 17]））`；`plot_pending 0/0/0`、走不到 16、`tilesTruncated=true`。
+  - 冬 27（journal:306）：`ended_reason=resume_exhausted:回片区 217 格都回去看过、换片 4 次，当前观测里没有可执行目标（守卫仍说：今天早些时候还有 217 格没做完（跨片地，最近的是 [38, 36]））`、做成 20。
+- **八步冒烟**：1–6 PASS、7【无法判定】（冬季无作物 + 无 slot_relief 路径）、**8.1 FAIL（0/2 天 VERIFIED）**、8.2 砍树 PASS（913→897 n=11、910→896 n=4）。
+- **根因**：`is_justified_end` 白名单只认 `night/stamina/no_work`（`brain/agentfarm/longrun.py:553/563-572`），`stuck:`/`resume_exhausted:` 都不认；`_pending_work()`（旧 `:4816-4833`）未剔停滞/挡死格 ⇒ 守卫读到 263/217；burst 收尾（旧 `:8665-8676`）仍写 `stuck:`。
+- **归属（log-analyst `4f563aa` / deputy `4cb6721` / dev-coder 交叉一致）**：冬 27 精确 220−3 挡死=217（[39,32]/[39,31]/[40,32]）、217/217 全已标停滞；冬 26 可核 261（263−2 无坐标）、**40 格账本无坐标 ⇒【无法判定】**、挡死 17 格逐格可核（gaps.json tree12/grass3/stone1/twig1）；中途轮 leftover 223/220 被末轮 0 遮蔽；`plots_capped` L81（10/10）。
+- **收尾**：guardian 18:16:14 判据成立自动 `stop-game --wait 45`（rc=0）⇒ 18:16:17 进程 0 / bridge.json 已删 / 17890 无 LISTENING；A9-start 备份原样未动，当前档已被冒烟推进 winter 28。
+- **处置**：开 task-15（P0，`e347aaa`，`docs/_release-0.7.45.md` §1）与 task-16（P1 背包满），0.7.45 冻结后重冒烟（tag smoke-0745）⇒ ≥1 天 VERIFIED 才起 A9。证据文档：`docs/_smoke-0744.md`（`2230da6`）、`docs/_analyze-smoke-0744.md`（`4f563aa`）、`docs/_review-0.7.44.md` §7（`4cb6721`）。
