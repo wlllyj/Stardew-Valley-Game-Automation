@@ -36,7 +36,19 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.39"   # v0.7.39：能力覆盖与"意图对账"批次 —— Mod 侧
+MOD_VERSION_EXPECTED = "0.7.40"   # v0.7.40：全脑侧修复批次（Mod 无代码变更，dll 与 0.7.39 同源重建）——
+                                  # ①非片区意图（ship/sell/sleep/review/recover_stamina/
+                                  #   wait_for_save）失败不许裸用 `no_target`，证据不可用 ⇒
+                                  #   `unknown_evidence` + `unknown_why`（non_plot_task/no_plot/
+                                  #   obs_unavailable）；ship 失败带自有证据包（task-233）；
+                                  # ②空格压力通道：`slot_relief` 在 `free_slots <= SLOT_RESERVE` 时
+                                  #   按三档已知表（作物余量→材料→矿/晶洞）卖一叠腾格；`NEVER_SELL`
+                                  #   + 表外 fail-closed + 每 qid 留 K=10；`SLOT_RELIEF_RESERVES`
+                                  #   对建造材料覆盖保留量（铜矿 25 / 石头 30 / 煤 5）且**永不整叠
+                                  #   卖空**；只走 `worker.sell()` + 卖前后钱/背包行数双差分，
+                                  #   腾不出如实 `inventory_blocked`（task-232）。
+                                  # --- 历史 ---
+                                  # v0.7.39：能力覆盖与"意图对账"批次 —— Mod 侧
                                   # ①`debug_dump` 支持 1.6 强类型资产（`trigger_actions`/`objects`/
                                   #   `big_craftables`/`machines`，逐表 fail-closed + `type`/`error` +
                                   #   `matchMode=value_substring`），并暴露 `knownCraftingRecipes`

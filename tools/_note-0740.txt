@@ -1,0 +1,7 @@
+v0.7.40（2026-10-18）：全脑侧修复批次，Mod 无代码变更（dll 与 0.7.39 同源重建）
+
+1. 非片区意图失败不许裸用 no_target（task-233）：`ship/sell/sleep/review/recover_stamina/wait_for_save` 走 `NON_PLOT_INTENT_TASKS`；证据不可用 ⇒ 原因码降级 `unknown_evidence` 并带 `unknown_why`（`non_plot_task`/`no_plot`/`obs_unavailable`）；ship 失败分支不再写死 `no_target`，改带自有证据包（`no_sellable_stack`/`whitelist_count`/`free_slots`/`inventory_full`/`obs_seq`）；片区任务取消路径一字未改（仍 `no_target` + `evidence.stage_tiles_empty`）。
+2. 空格压力通道（task-232）：`slot_relief` 新增第三条通道 —— `free_slots <= SLOT_RESERVE` 时按三档已知表（作物余量 → 材料 → 矿/晶洞）卖一叠腾格；`NEVER_SELL`（工具/武器/种子/升级锭/精炼石英/电池）+ 表外物品一律不卖（fail-closed）；每 qid 保留 K=10；**建造预留覆盖** `SLOT_RELIEF_RESERVES = {"(O)378": 25, "(O)390": 30, "(O)382": 5}`（熔炉与 5 铜锭所需）；每天 ≤3 轮 × ≤5 叠；只走 `worker.sell()`，卖前/卖后做**钱 + 背包行数双差分**，任一不符如实 blocked。
+3. 留痕纪律：不新增 journal 事件名（字段挂既有 `slot_relief`/`sell`）；`checks`/`day_end` 键集未变；腾不出时 `inventory_blocked` 的 reason 区分「没有可卖叠」与「卖了 N 叠仍满」。
+
+判据：全量 `Ran 1168+ tests / OK`；233 变异 m233a/m233b 各杀 1；232 变异 m232a 杀 2 / m232b 杀 2 / m232c 杀 3；冻结前置 = 工作树干净 + `check-release --expect 0.7.40` 六绿。
