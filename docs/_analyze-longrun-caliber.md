@@ -1364,6 +1364,48 @@ python -m unittest tests.test_analyze_longrun.TestStuckWithoutSleep
 python -m unittest tests.test_analyze_longrun.TestRealRunA8Shapes
 ```
 
+## 3.36 0.7.44 新字段/形态六聚合 + already-aware 双列（task-13，2026-10-18）
+
+**背景**：0.7.44 冻结（`37cac51`）新增了换片穷尽/阶段重分配封格/余格拆分/睡成功标志/预算抑制/`already_cause`
+等字段与 `resume_exhausted:` 收工前缀，A9/B9 判决前 analyzer 必须能一眼读出这些形态。本工具新增六类聚合，
+**全部默认 info /【无法判定】、一律不进 rc**（本任务没发现会误进 rc 的硬证据）；唯一例外是结构化字段
+**自相矛盾**时给 ⚠ 提示，仍不进 rc。
+
+| 报告键 | 判据 | 结论 |
+| --- | --- | --- |
+| `resume_exhausted` | `day_end.ended_reason` 前缀 `resume_exhausted:`（`resume_exhausted_form`）；旧前缀 `stuck:回片区（…）` 只计 `legacy_days`、**不吞进新聚合**；`no_progress_burst{exhausted=true}` 旁证 | info /【无法判定】：`found/zero/undecidable` 三态；只有 burst 没原文 ⇒ `burst_mismatch_days`（不编原文） |
+| `stage_realloc` | `blocked{action="stage_realloc"}`（`alloc_no_progress/limit/tile`）+ 阶段 `alloc_capped_tiles` | info /【无法判定】：机制字段在场且 0 命中 ⇒ `zero` 是真实读数；机制缺失 ⇒【无法判定】 |
+| `leftover_split` | 阶段 `leftover_executable/leftover_blocked`；硬不变式 `exec+blocked == leftover` | info /【无法判定】：不变式违反只 ⚠、**不判红**（语义归 brain） |
+| `slept_ok` | `day_end.slept_ok` 三态；与 `checks.slept_by_us` 交叉 | info /【无法判定】：`false` 与 `slept_by_us=true` 自相 ⇒ ⚠ |
+| `budget_suppressed` | `day_end.stamina_budget.deferred_by_budget_suppressed`；与同日 `deferred_by_budget>0` 交叉 | info /【无法判定】：抑制与推迟同日同真 ⇒ ⚠（设计不得同真）、不判红 |
+| `already_aware` | `stage.ok==0 && already>0`（task-10 #1） | **info**：并列读数 `totals{stages,ok0,ok0_already,ok_sum,already_sum,already_stages}` + 尾部窗口 `window{…ok_sum,already_sum}`；0.7.44 起 `ok` = 真世界变化数 ⇒ 判决**禁止只看 ok 一列** |
+
+**新探针 18 条**（`#无法判定` 的唯一合法增量）：`plot_exhausted.source/.switches/.stalled_tiles`、
+`no_progress_burst.exhausted/.switches`、`resume_walk.switched`、`blocked.alloc_no_progress/.limit`、
+`day_end.slept_ok`、`day_end.plot_pending_executable`、`day_end.plot_pending_blocked`、
+`day_end.stamina_budget.deferred_by_budget_suppressed`（**新增嵌套 dict 解析分支**）、
+`day_end.stages[].leftover_executable/.leftover_blocked/.alloc_capped_tiles/.ok/.already/.already_cause`。
+`build_undecidable` 其余旧探针判定路径**未动**。
+
+**回归口径（2026-10-18 实测）**：
+- 六本旧账本 rc / 红数**一字未变** —— runA 1/117、runB 1/84、run9 1/84、run9b 1/45、run9c 0/0、run9d 1/29；
+  `#无法判定` 每本 **+17**（新 18 条探针里旧账本只有 `stages[].ok` 在场 ⇒ 17 条缺失）。
+- A8 真账本（0.7.43）：rc=1 / 红 35 **不变**；`#无法判定` 103→**118（+15）**（A8 另有 `stages[].already`/
+  `stages[].already_cause` 在场 ⇒ 少 2 条缺失）；六类聚合在 A8 上全部走【无法判定】/zero 分支（这是 fail-closed 证据）；
+  already 双列 = **0 段 `ok=0&already>0` / 0 天**、ok 289 / already 50、窗口 3 天 ok 47 / already 3（**A8 预期 0，实测 0**）。
+- 单测：`tests.test_analyze_longrun` **Ran 308 / OK**（新增 26 条、8 个类）；全量 `discover -s tests` **Ran 1303 / OK**；
+  `py_compile` rc=0。
+- 读数明细、逐日 already 表、逐聚合 A8 渲染原文见 `docs\_analyze-0.7.44.md`。
+
+```
+# A8 六聚合 + already 双列
+python tools\analyze-longrun.py --journal logs\longrun-runA8-0743.jsonl --days 12 | rg "回片区穷尽|阶段重分配封格|余格拆分|睡成功标志|预算抑制|already-aware"
+# 六旧账本 HEAD vs 新版（rc/红数必须一字不变）
+python scratch\_t3_cmp.py
+# 定向 task-13 单测（26 条）
+python -m unittest tests.test_analyze_longrun.TestResumeExhaustedPrefix tests.test_analyze_longrun.TestStageReallocBlocked tests.test_analyze_longrun.TestLeftoverSplit tests.test_analyze_longrun.TestSleptOkField tests.test_analyze_longrun.TestBudgetSuppressed tests.test_analyze_longrun.TestAlreadyAwareDualColumn tests.test_analyze_longrun.TestTask13ProbesFailClosed tests.test_analyze_longrun.TestRealRunA8Task13
+```
+
 ## 4. 复核命令
 
 ```
@@ -1393,4 +1435,8 @@ python scratch\_t194_undec.py                   # task-207 完成读数（HEAD �
                                                #   已知授权不同向）；#无法判定 每本 **+7** = task-207 新增 6 条探针
                                                #   + 1 条专行，旧账本对这些事件 0 命中 ⇒ 按「缺失 ⇒【无法判定】
                                                #   （缺失 ≠ 0）」如实报出，不是判据变化
+python -m unittest tests.test_analyze_longrun  # task-13 后：Ran 308 / OK（task-3 的 282 + task-13 新增 26 条）
+python -m unittest discover -s tests           # task-13 后：Ran 1303 / OK（0 红，须 PYTHONUTF8=1）
+python tools\analyze-longrun.py --journal logs\longrun-runA8-0743.jsonl --days 12  # A8：rc=1/红 35/【无法判定】118；0.7.44 六聚合 + already 双列见 docs\_analyze-0.7.44.md
+python scratch\_t3_cmp.py                       # 六账本 HEAD vs task-13 版并排：rc/红数一字不变；#无法判定 每本 +17（新增 18 探针，旧账本缺 17；A8 +15）
 ```

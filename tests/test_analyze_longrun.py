@@ -5273,5 +5273,428 @@ class TestRealRunA8Shapes(unittest.TestCase):
         self.assertIn("stuck 未睡: 2 天", text)
 
 
+# ---------------------------------------------------------------- task-13（0.7.44 新字段/形态）
+#: 0.7.44 的 `ended_reason` 原文（brain：`resume_exhausted:回片区 N 格都回去看过、换片 M 次，…`）。
+T13_REASON = ("resume_exhausted:回片区 7 格都回去看过、换片 2 次，"
+              "当前观测里没有可执行目标（守卫仍说：跨片地还有 3 格没做完）")
+T13_LEGACY_REASON = ("stuck:回片区（work_spot_resume） 连续 5 次都拿不出目标"
+                     "（守卫仍说还有活：跨片地还有 3 格没做完）")
+
+
+def t13_stage(**kw):
+    """task-13：一天的阶段记录（默认：3 格、0 做成、3 余格 —— 与 A8 的「1 格余量」同形）。"""
+    st = {"stage": "clear_area", "tiles": 3, "ok": 0, "skipped": 0, "failed": 0,
+          "proven_inert": 0, "env_block": 0, "inconclusive": 0, "stopped": "",
+          "leftover": 3}
+    st.update(kw)
+    return st
+
+
+def t13_burst(*, count=5, exhausted=True, switches=2, stalled=7):
+    return {"event": "no_progress_burst", "t": 8.0, "day": MODAL_DAY,
+            "source": "回片区（work_spot_resume）", "count": count, "tiles": 3,
+            "exhausted": exhausted, "switches": switches, "stalled_tiles": stalled,
+            "from_area": "field_ne", "pending": 3}
+
+
+def t13_ledger(*, stages=(), extra_events=(), day_end_overrides=None, drop=(),
+               finish=None, verified=False):
+    """task-13：造一天带 0.7.44 字段的账本（默认 ended_reason 用新前缀；`drop` 可删 day_end 键）。"""
+    end = {
+        "event": "day_end", "t": 9.0, "day": MODAL_DAY, "day_text": "1年 spring 12日",
+        "ended_by": "sleep", "ended_reason": T13_REASON, "verified": verified,
+        "checks": {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                   "crops_watered": True, "day_justified": False},
+        "stages": list(stages), "outcomes": [], "ok_steps": 0, "skipped_steps": 0,
+        "failed_steps": 0, "notes": [],
+        "final": final([MODAL_DAY[0], MODAL_DAY[1], MODAL_DAY[2] + 1]),
+    }
+    if day_end_overrides:
+        end.update(day_end_overrides)
+    for key in drop:
+        end.pop(key, None)
+    events = [day_start(MODAL_DAY)]
+    events.extend(extra_events)
+    events.append(end)
+    if finish is not None:
+        events.append(finish)
+    return events
+
+
+class TestResumeExhaustedPrefix(unittest.TestCase):
+    """task-13 D（0.7.44）：`ended_reason` 新前缀 `resume_exhausted:`。
+
+    口径：**info /【无法判定】、不进 rc** —— 换片/回看/清障都用尽后的诚实收工，不是 stuck、不是失败；
+    与 A8/0.7.43 的 `stuck:回片区（work_spot_resume）` **分开计数**（两代形态绝不混算）。
+    """
+
+    def _report(self, events, name):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=1)
+
+    def test_new_prefix_found_and_not_red(self):
+        rep = self._report(t13_ledger(extra_events=[t13_burst()]), "re.jsonl")
+        re_new = rep["resume_exhausted"]
+        self.assertEqual((re_new["state"], re_new["days_count"]), ("found", 1))
+        self.assertEqual(re_new["labels"], ["1年 spring 12日"])
+        self.assertEqual(re_new["days"][0]["switches"], 2, "换片次数从原文解析（缺失才是 None）")
+        self.assertEqual((re_new["burst_exhausted_events"],
+                          re_new["days"][0]["burst_count"]), (1, 5))
+        self.assertEqual(re_new["legacy_count"], 0)
+        text = mod.render_text(rep, 50)
+        self.assertIn("回片区穷尽（resume_exhausted 前缀，0.7.44）: 1 天", text)
+        self.assertIn(T13_REASON, text, "原文必须进报告")
+        self.assertFalse([s for s in rep["red"]["subjects"] if "resume_exhausted" in s],
+                         "新前缀只允许 info /【无法判定】，绝不进 rc")
+
+    def test_legacy_prefix_counted_separately(self):
+        rep = self._report(t13_ledger(day_end_overrides={"ended_reason": T13_LEGACY_REASON}),
+                           "legacy.jsonl")
+        re_new = rep["resume_exhausted"]
+        self.assertEqual((re_new["state"], re_new["days_count"]), ("zero", 0))
+        self.assertEqual(re_new["legacy_count"], 1, "A8 的旧前缀由本块单列，不吞进新前缀")
+        self.assertEqual(re_new["legacy_labels"], ["1年 spring 12日"])
+        self.assertIn("旧 stuck 前缀 1 天", mod.render_text(rep, 50))
+
+    def test_burst_without_new_prefix_is_mismatch(self):
+        """穷尽 burst 在场但原文无新前缀 ⇒ 形态对不上，收工结论只能【无法判定】。"""
+        rep = self._report(t13_ledger(day_end_overrides={"ended_reason": "night:时间到夜里"},
+                                      extra_events=[t13_burst()]), "mismatch.jsonl")
+        self.assertEqual(len(rep["resume_exhausted"]["burst_mismatch_days"]), 1)
+        self.assertIn("无新前缀", mod.render_text(rep, 50))
+
+    def test_missing_ended_reason_is_undecidable(self):
+        rep = self._report(t13_ledger(drop=("ended_reason",)), "missing.jsonl")
+        re_new = rep["resume_exhausted"]
+        self.assertEqual(re_new["state"], "undecidable")
+        self.assertEqual(len(re_new["undecidable_days"]), 1, "缺字段 ⇒ 当天无法判定（缺失 ≠ 0）")
+        self.assertIn("回片区穷尽（resume_exhausted 前缀，0.7.44）: <缺失>",
+                      mod.render_text(rep, 50))
+
+
+class TestStageReallocBlocked(unittest.TestCase):
+    """task-13 E（0.7.44）：`blocked{action=stage_realloc}` + 阶记录 `alloc_capped_tiles`。
+
+    口径：**info、不进 rc** —— 同格重分配仍无产出达 limit ⇒ 封格，是有界保护不是失败。
+    """
+
+    def _report(self, events, name):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=1)
+
+    def test_stage_realloc_found(self):
+        blocked = {"event": "blocked", "t": 7.0, "day": MODAL_DAY, "tile": [37, 35],
+                   "action": "stage_realloc", "no_effect": False, "stage": "clear_area",
+                   "zone": "field_ne", "alloc_no_progress": 3, "limit": 3,
+                   "reason": "同一格当天第 3 次重分配仍无产出"}
+        stage = t13_stage(alloc_capped_tiles=[[37, 35]])
+        rep = self._report(t13_ledger(stages=[stage], extra_events=[blocked]), "realloc.jsonl")
+        sr = rep["stage_realloc"]
+        self.assertEqual((sr["state"], sr["events"], sr["days_count"], sr["stage_capped"]),
+                         ("found", 1, 1, 1))
+        self.assertEqual(sr["days"][0]["events"][0]["alloc_no_progress"], 3)
+        self.assertEqual(sr["days"][0]["events"][0]["limit"], 3)
+        self.assertEqual(sr["days"][0]["stage_capped_tiles"], [[37, 35]])
+        self.assertIn("阶段重分配封格（stage_realloc，0.7.44）: 1 次 / 1 天",
+                      mod.render_text(rep, 50))
+        self.assertFalse([s for s in rep["red"]["subjects"] if "stage_realloc" in s])
+
+    def test_mechanism_absent_is_undecidable_not_zero(self):
+        rep = self._report(t13_ledger(stages=[t13_stage()]), "none.jsonl")
+        self.assertEqual(rep["stage_realloc"]["state"], "undecidable")
+        self.assertEqual(rep["stage_realloc"]["events"], 0)
+        self.assertIn("阶段重分配封格（stage_realloc，0.7.44）: <缺失>",
+                      mod.render_text(rep, 50))
+
+
+class TestLeftoverSplit(unittest.TestCase):
+    """task-13 F（0.7.44）：`leftover_executable` / `leftover_blocked`（leftover 语义不变）。
+
+    硬不变式：`leftover_executable + leftover_blocked == leftover`；日级 `plot_pending_executable +
+    plot_pending_blocked == plot_pending`。违背只警告、**不进 rc**；字段缺失 ⇒【无法判定】（缺失 ≠ 0）。
+    """
+
+    def _report(self, events, name):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=1)
+
+    def test_split_ok(self):
+        stage = t13_stage(leftover=3, leftover_executable=1, leftover_blocked=2,
+                          leftover_blocked_tiles=[[40, 41], [41, 41]])
+        rep = self._report(t13_ledger(stages=[stage], day_end_overrides={
+            "plot_pending": 3, "plot_pending_executable": 1, "plot_pending_blocked": 2,
+        }), "split_ok.jsonl")
+        ls = rep["leftover_split"]
+        self.assertEqual(ls["state"], "ok")
+        self.assertEqual((ls["totals"]["with_split"], ls["totals"]["exec_sum"],
+                          ls["totals"]["blocked_sum"], ls["totals"]["leftover_sum"]),
+                         (1, 1, 2, 3))
+        self.assertEqual(ls["totals"]["mismatch"], 0)
+        self.assertEqual(ls["pending_days"][0]["exec"], 1)
+        self.assertIn("余格拆分（leftover_executable/blocked，0.7.44）: 带拆分 1 段",
+                      mod.render_text(rep, 50))
+        self.assertFalse([s for s in rep["red"]["subjects"] if "leftover" in s])
+
+    def test_split_invariant_violation_is_warning_only(self):
+        stage = t13_stage(leftover=3, leftover_executable=1, leftover_blocked=1)
+        rep = self._report(t13_ledger(stages=[stage]), "split_bad.jsonl")
+        ls = rep["leftover_split"]
+        self.assertEqual((ls["state"], ls["totals"]["mismatch"]), ("violated", 1))
+        text = mod.render_text(rep, 50)
+        self.assertIn("不变式违背 1 段", text)
+        self.assertIn("不进 rc", text)
+        self.assertFalse([s for s in rep["red"]["subjects"] if "leftover_split" in s])
+
+    def test_day_level_plot_pending_invariant(self):
+        stage = t13_stage(leftover=3, leftover_executable=1, leftover_blocked=2)
+        rep = self._report(t13_ledger(stages=[stage], day_end_overrides={
+            "plot_pending": 3, "plot_pending_executable": 1, "plot_pending_blocked": 1,
+        }), "split_day.jsonl")
+        self.assertEqual(len(rep["leftover_split"]["day_invariant_days"]), 1)
+        self.assertIn("日级 plot_pending_executable+blocked != plot_pending",
+                      mod.render_text(rep, 50))
+
+    def test_split_fields_missing_is_undecidable(self):
+        rep = self._report(t13_ledger(stages=[t13_stage()]), "split_missing.jsonl")
+        ls = rep["leftover_split"]
+        self.assertEqual(ls["state"], "undecidable")
+        self.assertFalse(ls["has_split_field"])
+        self.assertEqual(ls["totals"]["missing_split"], 1)
+        self.assertIn("余格拆分（leftover_executable/blocked，0.7.44）: <缺失>",
+                      mod.render_text(rep, 50))
+
+
+class TestSleptOkField(unittest.TestCase):
+    """task-13 G（0.7.44）：`day_end.slept_ok` 与 `checks.slept_by_us` 旁证。
+
+    口径：**info、不进 rc**；字段缺失 ⇒【无法判定】（缺失 ≠ 0）；两字段打架 ⇒ ⚠ 人工核对（不进 rc）。
+    """
+
+    def _report(self, events, name):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=1)
+
+    def test_slept_ok_true_found(self):
+        rep = self._report(t13_ledger(day_end_overrides={"slept_ok": True}), "slept.jsonl")
+        so = rep["slept_ok"]
+        self.assertEqual((so["state"], so["true_count"], so["false_count"]), ("found", 1, 0))
+        self.assertEqual(so["inconsistent_days"], [])
+        self.assertIn("睡成功标志（slept_ok，0.7.44）: true 1 天", mod.render_text(rep, 50))
+
+    def test_slept_ok_conflict_is_warning_only(self):
+        rep = self._report(t13_ledger(day_end_overrides={"slept_ok": False}), "conflict.jsonl")
+        so = rep["slept_ok"]
+        self.assertEqual(so["false_count"], 1)
+        self.assertEqual(len(so["inconsistent_days"]), 1,
+                         "slept_ok=false 而 checks.slept_by_us=true ⇒ 互斥字段打架")
+        self.assertIn("不一致", mod.render_text(rep, 50))
+        self.assertFalse([s for s in rep["red"]["subjects"] if "slept_ok" in s])
+
+    def test_missing_slept_ok_is_undecidable(self):
+        rep = self._report(t13_ledger(), "missing.jsonl")
+        so = rep["slept_ok"]
+        self.assertEqual((so["state"], so["undecidable_count"], so["has_field"]),
+                         ("undecidable", 1, False))
+        self.assertIn("睡成功标志（slept_ok，0.7.44）: <缺失>", mod.render_text(rep, 50))
+        self.assertTrue(any("本账本没有 day_end.slept_ok" in u for u in rep["undecidable"]))
+
+
+class TestBudgetSuppressed(unittest.TestCase):
+    """task-13 H（0.7.44）：`stamina_budget.deferred_by_budget_suppressed`。
+
+    口径：**info、不进 rc** —— 当天已浇完户外水时「只因预算延后」事件一条不发、只留日级计数；
+    所以「日级>0 且无事件」是设计、不是矛盾。与 `deferred_by_budget` 同真 ⇒ ⚠ 人工核对（不进 rc）。
+    """
+
+    def _report(self, events, name):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=1)
+
+    def test_suppressed_found(self):
+        rep = self._report(t13_ledger(day_end_overrides={"stamina_budget": {
+            "deferred_by_budget": False, "deferred_by_budget_suppressed": 3,
+        }}), "budget.jsonl")
+        bs = rep["budget_suppressed"]
+        self.assertEqual((bs["state"], bs["total"], bs["days_count"]), ("found", 3, 1))
+        self.assertEqual(bs["conflict_days"], [], "浇完户外 ⇒ 不发事件是设计，不算矛盾")
+        self.assertIn("预算抑制（deferred_by_budget_suppressed，0.7.44）: 3 条 / 1 天",
+                      mod.render_text(rep, 50))
+
+    def test_suppressed_and_deferred_conflict(self):
+        rep = self._report(t13_ledger(day_end_overrides={"stamina_budget": {
+            "deferred_by_budget": True, "deferred_by_budget_suppressed": 2,
+        }}), "budget_conflict.jsonl")
+        self.assertEqual(len(rep["budget_suppressed"]["conflict_days"]), 1)
+        self.assertIn("本该互斥", mod.render_text(rep, 50))
+        self.assertFalse([s for s in rep["red"]["subjects"] if "budget_suppressed" in s])
+
+    def test_missing_suppressed_field_is_undecidable(self):
+        rep = self._report(t13_ledger(), "budget_missing.jsonl")
+        bs = rep["budget_suppressed"]
+        self.assertEqual((bs["state"], bs["has_field"]), ("undecidable", False))
+        self.assertIn("预算抑制（deferred_by_budget_suppressed，0.7.44）: <缺失>",
+                      mod.render_text(rep, 50))
+        self.assertTrue(any("deferred_by_budget_suppressed" in u for u in rep["undecidable"]))
+
+
+class TestAlreadyAwareDualColumn(unittest.TestCase):
+    """task-13 I / task-10 #1：`stage.ok==0 && stage.already>0` 的**并列读数**。
+
+    口径：0.7.44 起 `ok` = 真世界变化数 ⇒ **ok=0 不代表白干**；already>0 = 那些格本来就不用做。
+    判决必须 ok / already 两列并读（窗口内同时给两列）；字段缺失 ⇒【无法判定】（缺失 ≠ 0）。
+    """
+
+    def _report(self, events, name):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=1)
+
+    def test_dual_column_counts_and_coords(self):
+        stage = t13_stage(already=3, already_tiles=[[40, 40], [41, 40]],
+                          already_cause={"cleared_by_neighbor": 3})
+        rep = self._report(t13_ledger(stages=[stage]), "already.jsonl")
+        aa = rep["already_aware"]
+        self.assertEqual(aa["state"], "ok")
+        self.assertEqual((aa["totals"]["ok0"], aa["totals"]["ok0_already"]), (1, 1))
+        self.assertEqual(aa["days_with_ok0_already"], ["1年 spring 12日"])
+        self.assertEqual(aa["days"][0]["names"], ["clear_area"])
+        self.assertEqual(aa["days"][0]["coords"], [[40, 40], [41, 40]])
+        self.assertEqual(aa["days"][0]["causes"], {"cleared_by_neighbor": 3})
+        self.assertEqual((aa["totals"]["ok_sum"], aa["totals"]["already_sum"]), (0, 3))
+        self.assertEqual(aa["window"]["ok0_already"], 1, "窗口统计必须同时给 ok 与 already 两列")
+        text = mod.render_text(rep, 50)
+        self.assertIn("already-aware 双列（ok=0 且 already>0，0.7.44 口径）: 1 段 / 1 天", text)
+        self.assertIn("**ok=0 不代表白干**", text)
+        self.assertFalse([s for s in rep["red"]["subjects"] if "already" in s])
+
+    def test_ok0_without_already_is_not_flagged(self):
+        """ok=0 但 already 也 0 ⇒ 不是「本来就不用做」，不归入本形态（不做 ok=0 就白干的推断）。"""
+        rep = self._report(t13_ledger(stages=[t13_stage(already=0)]), "ok0.jsonl")
+        aa = rep["already_aware"]
+        self.assertEqual((aa["totals"]["ok0"], aa["totals"]["ok0_already"]), (1, 0))
+        self.assertEqual(aa["days_with_ok0_already"], [])
+        self.assertIn("already-aware 双列（ok=0 且 already>0，0.7.44 口径）: 0 段 / 0 天",
+                      mod.render_text(rep, 50))
+
+    def test_missing_already_is_undecidable(self):
+        rep = self._report(t13_ledger(stages=[t13_stage()]), "no_already.jsonl")
+        aa = rep["already_aware"]
+        self.assertFalse(aa["has_already_field"])
+        self.assertEqual(aa["state"], "undecidable")
+        self.assertIn("already-aware 双列（ok=0 且 already>0，0.7.44 口径）: <缺失>",
+                      mod.render_text(rep, 50))
+        self.assertTrue(any("day_end.stages[].already" in u for u in rep["undecidable"]))
+
+
+class TestTask13ProbesFailClosed(unittest.TestCase):
+    """task-13 探针：0.7.44 字段缺失一律【无法判定】（缺失 ≠ 0），且新聚合绝不进 rc。"""
+
+    def _report(self, events, name):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return report_for(write_ledger(tmp.name, name, events), days=1)
+
+    def test_old_ledger_probes_are_undecidable(self):
+        rep = self._report(integrity_ledger(), "old.jsonl")
+        und = " ".join(rep["undecidable"])
+        for label in ("event:resume_walk.switched", "day_end.slept_ok",
+                      "day_end.stamina_budget.deferred_by_budget_suppressed",
+                      "day_end.stages[].leftover_executable",
+                      "day_end.stages[].alloc_capped_tiles",
+                      "event:blocked.alloc_no_progress", "event:plot_exhausted.source",
+                      "event:no_progress_burst.exhausted"):
+            self.assertIn(f"本账本没有 {label}", und, f"{label} 缺失必须【无法判定】")
+
+    def test_present_074_fields_do_not_emit_probes(self):
+        rep = self._report(t13_ledger(stages=[t13_stage(
+            leftover=3, leftover_executable=1, leftover_blocked=2, already=3,
+            already_tiles=[[40, 40]], alloc_capped_tiles=[],
+        )], extra_events=[t13_burst()], day_end_overrides={
+            "slept_ok": True,
+            "stamina_budget": {"deferred_by_budget": False,
+                               "deferred_by_budget_suppressed": 0},
+            "plot_pending": 3, "plot_pending_executable": 1, "plot_pending_blocked": 2,
+        }), "full.jsonl")
+        und = " ".join(rep["undecidable"])
+        for label in ("day_end.slept_ok",
+                      "day_end.stamina_budget.deferred_by_budget_suppressed",
+                      "day_end.stages[].leftover_executable",
+                      "day_end.stages[].already："):
+            # 注意 `already` 是 `already_cause` 的前缀 ⇒ 必须带冒号/整行判，否则假失败。
+            self.assertNotIn(f"本账本没有 {label}", und)
+        self.assertNotIn("event:no_progress_burst.exhausted",
+                         und, "burst 带 exhausted 字段 ⇒ 该探针不应报缺")
+
+    def test_task13_aggregations_never_enter_red(self):
+        rep = self._report(t13_ledger(stages=[t13_stage(
+            leftover=3, leftover_executable=1, leftover_blocked=1, already=3,
+            already_tiles=[[40, 40]],
+        )], extra_events=[t13_burst(), {
+            "event": "blocked", "t": 7.0, "day": MODAL_DAY, "tile": [37, 35],
+            "action": "stage_realloc", "alloc_no_progress": 3, "limit": 3,
+            "stage": "clear_area",
+        }], day_end_overrides={
+            "slept_ok": False,
+            "stamina_budget": {"deferred_by_budget": False,
+                               "deferred_by_budget_suppressed": 1},
+        }, drop=("ended_reason",)), "allbad.jsonl")
+        # 这里每一条新形态都处于自身「异常/不完整」态：但口径仍是 info/【无法判定】，绝不进 rc。
+        for name in ("resume_exhausted", "stage_realloc", "leftover", "slept_ok",
+                     "budget", "already"):
+            self.assertFalse([s for s in rep["red"]["subjects"] if name in s],
+                             f"{name} 只允许 info /【无法判定】，绝不进 rc")
+        advice = " ".join(a["text"] for a in rep["advice"])
+        self.assertIn("0.7.44 新字段/形态（task-13", advice)
+        self.assertIn("不进 rc", advice)
+
+
+class TestRealRunA8Task13(unittest.TestCase):
+    """task-13：A8 真账本（0.7.43，无 0.7.44 字段）的读数必须如实写成【无法判定】。"""
+
+    @classmethod
+    def setUpClass(cls):
+        if not os.path.isfile(RUN_A8):
+            raise unittest.SkipTest(f"缺少账本 {RUN_A8}")
+        cls.rep = report_for(RUN_A8, days=12)
+
+    def test_resume_exhausted_legacy_form_on_a8(self):
+        re_new = self.rep["resume_exhausted"]
+        self.assertEqual((re_new["state"], re_new["days_count"], re_new["legacy_count"]),
+                         ("zero", 0, 3), "A8 是旧 `stuck:` 前缀 ⇒ 新前缀 0 天、旧前缀 3 天，分开计数")
+        self.assertEqual(re_new["legacy_labels"],
+                         ["1年 winter 7日", "1年 winter 12日", "1年 winter 18日"])
+        self.assertIn("旧 stuck 前缀 3 天", mod.render_text(self.rep, 20))
+
+    def test_074_fields_are_undecidable_on_a8(self):
+        self.assertEqual(self.rep["stage_realloc"]["state"], "undecidable")
+        self.assertEqual(self.rep["stage_realloc"]["events"], 0)
+        self.assertEqual(self.rep["leftover_split"]["state"], "undecidable")
+        self.assertFalse(self.rep["leftover_split"]["has_split_field"])
+        self.assertEqual(self.rep["slept_ok"]["state"], "undecidable")
+        self.assertEqual(self.rep["slept_ok"]["undecidable_count"], 12)
+        self.assertEqual(self.rep["budget_suppressed"]["state"], "undecidable")
+
+    def test_already_aware_dual_column_on_a8(self):
+        aa = self.rep["already_aware"]
+        self.assertEqual(aa["state"], "ok")
+        self.assertEqual(aa["totals"]["ok0_already"], 0,
+                         "A8 预期 0 个 ok=0&already>0（非 0 必须如实报，不许压成 0）")
+        self.assertEqual((aa["totals"]["ok_sum"], aa["totals"]["already_sum"]), (289, 50))
+        self.assertEqual(aa["window"]["ok_sum"], 47, "窗口内必须同时给 ok 与 already 两列")
+        self.assertEqual(aa["window"]["already_sum"], 3)
+        self.assertIn("already-aware 双列（ok=0 且 already>0，0.7.44 口径）: 0 段 / 0 天",
+                      mod.render_text(self.rep, 20))
+
+    def test_new_aggregations_add_no_red_to_a8(self):
+        for name in ("resume_exhausted", "stage_realloc", "leftover", "slept_ok",
+                     "budget", "already"):
+            self.assertFalse([s for s in self.rep["red"]["subjects"] if name in s])
+
+
 if __name__ == "__main__":
     unittest.main()

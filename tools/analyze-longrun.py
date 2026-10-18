@@ -32,6 +32,21 @@
       （info；日级计数 + 原文）；
       ③ `stuck_without_sleep` = `ended_by=stuck` 但 `checks.slept_by_us=false` ⇒ 当天没由我们睡过去，
       「为什么 stuck / 是否真的收工」只能【无法判定】（info；缺 `slept_by_us` ⇒ 无法判定，不当 0）。
+【task-13】（0.7.44 新字段/形态，2026-10-18）六类聚合 + already-aware 双列，**默认 info /【无法判定】、
+不进 rc**（缺失字段 ⇒【无法判定】，缺失 ≠ 0）：
+      ① `resume_exhausted` = `ended_reason` 新前缀 `resume_exhausted:`（0.7.44 取代 A8 的
+      `stuck:回片区（work_spot_resume）`）⇒ 换片/回看/清障都用尽后的诚实收工，**与旧前缀分开计数**；
+      ② `stage_realloc` = `blocked{action=stage_realloc, alloc_no_progress, limit}` + 阶记录
+      `alloc_capped_tiles` ⇒ 同格重分配仍无产出 ⇒ 封格（「1 格余量反复重分」硬刹车）；
+      ③ `leftover_split` = `leftover_executable`/`leftover_blocked`（leftover 语义不变，硬不变式
+      executable+blocked==leftover；日级 executable+blocked==plot_pending）；
+      ④ `slept_ok` = `day_end.slept_ok`（与 ended_by 解耦的睡眠真相；与 `checks.slept_by_us` 旁证）；
+      ⑤ `budget_suppressed` = `stamina_budget.deferred_by_budget_suppressed`（浇完户外水时「只因预算
+      延后」事件一条不发、只留日级计数 ⇒ 日级>0 且无事件是设计，不是矛盾）；
+      ⑥ `already_aware` 双列 = `stage.ok==0 && stage.already>0` 的**并列读数**（0.7.44 起 ok=真世界
+      变化数 ⇒ ok=0 不代表白干，判决必须 ok 与 already 两列并读；窗口内同时给两列）。
+      另：`plot_exhausted{source,switches,stalled_tiles}`、`no_progress_burst{exhausted,switches}`、
+      `resume_walk{switched}`、`blocked{alloc_no_progress,limit}` 全部进了 `FIELD_PROBES`（缺失⇒【无法判定】）。
 外加：每天一行摘要、3-9 条带证据行的改进建议、"本账本无法判定"清单。
 
 与 `tools\\verify-run3.py` 的关系：两者**独立读数、交叉核对**。本工具只做分析、不判验收；
@@ -768,6 +783,47 @@ FIELD_PROBES = [
      "当天收工原文（`work_spot_resume_exhausted`：原文里必须有 work_spot_resume + 连续 N 次拿不出目标）"),
     ("day_end.checks.slept_by_us", "day_end.checks.slept_by_us",
      "当天是否由我们睡过去（`stuck_without_sleep`：ended_by=stuck 且 false ⇒【无法判定】为什么 stuck）"),
+    # task-13（2026-10-18，0.7.44 新字段）：换片穷尽 / 阶段重分配封格 / 余格拆分 / already-aware /
+    # 睡成功标志 / 预算抑制。**全部缺失 ⇒【无法判定】**（缺失 ≠ 0），只出 info 或【无法判定】、
+    # 不进 rc。0.7.43（A8）没有这些字段 ⇒ A8 上这些探针会各多一条「本账本没有 …」。
+    ("event:plot_exhausted.source", "plot_exhausted.source",
+     "换片穷尽的入口（0.7.44：resume_ledger/resume_observation，语义上归 work_spot_resume/"
+     "review_only_fallback/guard_leftover；缺失=旧版字段）"),
+    ("event:plot_exhausted.switches", "plot_exhausted.switches",
+     "当天已换过几片（`plot_exhausted`：换片次数上限 `max_plots_per_day`；缺失 ⇒【无法判定】）"),
+    ("event:plot_exhausted.stalled_tiles", "plot_exhausted.stalled_tiles",
+     "换片时已标记停滞的格数（0.7.44 新增；缺失 ⇒【无法判定】停滞口径）"),
+    ("event:no_progress_burst.exhausted", "no_progress_burst.exhausted",
+     "无进展连发是否到穷尽点（0.7.44：`_resume_exhausted` 唯一写 True；缺失 ⇒【无法判定】是否穷尽）"),
+    ("event:no_progress_burst.switches", "no_progress_burst.switches",
+     "穷尽收工时已换片次数（0.7.44 新增；缺失 ⇒【无法判定】换片是否用尽）"),
+    ("event:resume_walk.switched", "resume_walk.switched",
+     "本次走位是否换到另一片（0.7.44 三态：true/false/缺字段；缺失 ⇒【无法判定】换片动作）"),
+    ("event:blocked.alloc_no_progress", "blocked.alloc_no_progress",
+     "同格当天第 N 次重分配仍无产出（0.7.44 `blocked{action=stage_realloc}` 封格留痕；缺失 ⇒【无法判定】）"),
+    ("event:blocked.limit", "blocked.limit",
+     "重分配封格阈值（brain `MAX_ALLOC_NO_PROGRESS`；缺失 ⇒【无法判定】阈值口径）"),
+    ("day_end.slept_ok", "day_end.slept_ok",
+     "扫钟成功标志（0.7.44 与 ended_by 解耦；缺失 ⇒【无法判定】是否睡成）"),
+    ("day_end.plot_pending_executable", "day_end.plot_pending_executable",
+     "日终可执行余格数（0.7.44；与 plot_pending_blocked 之和恒等于 plot_pending；缺失 ⇒【无法判定】）"),
+    ("day_end.plot_pending_blocked", "day_end.plot_pending_blocked",
+     "日终物理挡死余格数（0.7.44；缺失 ⇒【无法判定】，不许当成 0）"),
+    ("day_end.stamina_budget.deferred_by_budget_suppressed", "day_end.stamina_budget.deferred_by_budget_suppressed",
+     "当天因「已浇过户外水」被抑制的预算推迟数（0.7.44：抑制时不发 deferred_by_budget 事件；"
+     "缺失 ⇒【无法判定】当天的推迟计数）"),
+    ("day_end.stages[].leftover_executable", "day_end.stages[].leftover_executable",
+     "阶段收尾余格里的**可执行**部分（0.7.44；leftover_executable + leftover_blocked == leftover）"),
+    ("day_end.stages[].leftover_blocked", "day_end.stages[].leftover_blocked",
+     "阶段收尾余格里的**物理挡死**部分（0.7.44；缺失 ⇒【无法判定】余格拆分）"),
+    ("day_end.stages[].alloc_capped_tiles", "day_end.stages[].alloc_capped_tiles",
+     "当天因重分配限次被封的格坐标（0.7.44 新增；缺失 ⇒【无法判定】封格留痕）"),
+    ("day_end.stages[].ok", "day_end.stages[].ok",
+     "阶段做成的格数（already-aware 双列之一：ok==0 且 already>0 才是空转形态；缺失 ⇒【无法判定】）"),
+    ("day_end.stages[].already", "day_end.stages[].already",
+     "阶段里本来就不必做的格数（already-aware 双列之一；缺失 ⇒【无法判定】空转判断）"),
+    ("day_end.stages[].already_cause", "day_end.stages[].already_cause",
+     "阶段 why-already 归类（0.7.44 新增；缺失 ⇒【无法判定】空转成因）"),
 ]
 OUTCOME_RE = re.compile(
     r"目标\s*(\d+)\s*步：做成\s*(\d+)、跳过\s*(\d+)、失败\s*(\d+)"
@@ -1762,6 +1818,145 @@ def scan_stage_churn(stages, min_run=STAGE_CHURN_MIN_RUN, small=STAGE_CHURN_SMAL
     stats["runs"] = runs
     return stats
 
+
+# ---------------------------------------------------------------- task-13（0.7.44 新字段/形态）
+#: 0.7.44 的 `ended_reason` 前缀：`resume_exhausted:回片区 … 换片 M 次，当前观测里没有可执行目标`
+#: （取代 A8/0.7.43 的 `stuck:回片区（work_spot_resume）…`）。两种形态都算「回片区收工」，
+#: 但**分开呈现**：旧形态是 task-134 A 的有界诚实收尾；新前缀是 task-10/0.7.44 的换片+穷尽收工。
+RESUME_EXHAUSTED_PREFIX = "resume_exhausted"
+#: `plot_exhausted.source` 的可取值（brain 0.7.44 实写）：换片穷尽的入口。
+PLOT_EXHAUSTED_SOURCES = ("work_spot_resume", "review_only_fallback", "guard_leftover",
+                          "resume_ledger", "resume_observation")
+#: 「同格当天被重新分配 N 次仍没有产出 ⇒ 封格」的留痕事件（`blocked{action=stage_realloc}`）。
+ALLOC_NO_PROGRESS_ACTIONS = ("stage_realloc",)
+
+
+def resume_exhausted_form(reason):
+    """把 `day_end.ended_reason` 归成回片区收工形态（task-13 B）。
+
+    返回 `"resume_exhausted"`（0.7.44 新前缀）/ `"legacy"`（A8 的 `stuck:回片区（work_spot_resume）`）/
+    `""`（不是这个形态）。**只做归类，不猜内容**：空/非字符串一律 `""`。
+    """
+    if not isinstance(reason, str):
+        return ""
+    text = reason.strip()
+    if not text:
+        return ""
+    low = text
+    if low.startswith(RESUME_EXHAUSTED_PREFIX) or f" {RESUME_EXHAUSTED_PREFIX}:" in low:
+        return "resume_exhausted"
+    if "work_spot_resume" in low and "拿不出目标" in low:
+        return "legacy"
+    return ""
+
+
+_RE_SWITCHES = re.compile(r"换片\s*(\d+)\s*次")
+_RE_LOOKED = re.compile(r"回片区\s*(\d+)\s*格")
+_RE_CONSEC = re.compile(r"连续\s*(\d+)\s*次")
+
+
+def scan_stage_leftover_split(stages):
+    """拆一天 `day_end.stages[]` 的 `leftover_executable/leftover_blocked`（task-13 / 0.7.44）。
+
+    口径（brain 0.7.44，`brain/agentfarm/longrun.py:7053-7057` 写）：`leftover` 语义**一字不动**，
+    只把 leftover 拆成「可执行余格 vs 物理挡死格」：`leftover_executable + leftover_blocked == leftover`。
+    本函数只汇报事实与缺字段，**不判红**：
+
+      * `stages` / `with_split` / `missing_split`（有 stages 记录但缺拆分字段的段数）；
+      * `exec_sum` / `blocked_sum` / `leftover_sum`（仅统计**同时**有拆分字段的段）；
+      * `mismatch`：同时有拆分字段的段里 `exec+blocked != leftover` 的段数（硬不变式，主报告只给 ⚠）；
+      * `cap_tiles`：`alloc_capped_tiles` 的结构化坐标并集（0.7.44 有界保护封掉的格）；
+      * `cap_stages`：带 `alloc_capped_tiles` 的段数；
+      * `has_split_field`：整份 stages[] 里出现过任一拆分字段。
+    """
+    recs = [st for st in as_list(stages) if isinstance(st, dict)]
+    out = {"stages": len(recs), "with_split": 0, "missing_split": 0,
+           "exec_sum": 0, "blocked_sum": 0, "leftover_sum": 0, "mismatch": 0,
+           "mismatch_stages": [], "cap_stages": 0, "cap_tiles": [],
+           "has_split_field": False, "has_leftover": False}
+    for idx, st in enumerate(recs):
+        if "leftover" in st:
+            out["has_leftover"] = True
+        has_exec = "leftover_executable" in st
+        has_blocked = "leftover_blocked" in st
+        if has_exec or has_blocked:
+            out["has_split_field"] = True
+        if "alloc_capped_tiles" in st:
+            out["cap_stages"] += 1
+            for tile in as_list(st.get("alloc_capped_tiles")):
+                if isinstance(tile, list) and len(tile) == 2 and tile not in out["cap_tiles"]:
+                    out["cap_tiles"].append([tile[0], tile[1]])
+        if not (has_exec and has_blocked):
+            if recs:
+                out["missing_split"] += 1
+            continue
+        out["with_split"] += 1
+        ex = as_int(st.get("leftover_executable"), None)
+        bl = as_int(st.get("leftover_blocked"), None)
+        lo = as_int(st.get("leftover"), None)
+        if ex is None or bl is None:
+            out["missing_split"] += 1
+            out["with_split"] -= 1
+            continue
+        out["exec_sum"] += ex
+        out["blocked_sum"] += bl
+        if lo is not None:
+            out["leftover_sum"] += lo
+            if ex + bl != lo:
+                out["mismatch"] += 1
+                out["mismatch_stages"].append(idx)
+    return out
+
+
+def scan_already_aware(stages):
+    """扫一天 `day_end.stages[]` 里「`ok==0` 且 `already>0`」的阶段（task-13 / task-10 #1）。
+
+    这正是 0.7.44 要修的 already-aware 空转形态：阶段一格都没做成（`ok==0`），但记录里
+    `already>0` = 那些格本来就不用做（`already_tiles`）。**必须并列 ok 与 already 两列**，
+    否则 A9 只看 `ok 跨版本不可比` 会误判「阶段白干」。返回：
+
+      * `stages`：阶段记录总数；`ok0`：`ok==0` 的段数；`ok0_already`：`ok==0 且 already>0` 的段数；
+      * `ok_sum` / `already_sum` / `already_stages`（有 already>0 的段数）；
+      * `names`：`ok0_already` 段的 stage 名列表（去重保序）；
+      * `coords`：这些段的 `already_tiles` 坐标并集；
+      * `causes`：这些段 `already_cause`（若有）的分布；
+      * `has_ok` / `has_already`：判据字段是否在场（缺失 ⇒ 调用方写【无法判定】，**缺失 ≠ 0**）。
+    """
+    recs = [st for st in as_list(stages) if isinstance(st, dict)]
+    out = {"stages": len(recs), "ok0": 0, "ok0_already": 0, "ok_sum": 0,
+           "already_sum": 0, "already_stages": 0, "names": [], "coords": [],
+           "causes": {}, "has_ok": False, "has_already": False}
+    for st in recs:
+        ok = as_int(st.get("ok"), None)
+        already = as_int(st.get("already"), None)
+        if "ok" in st:
+            out["has_ok"] = True
+        if "already" in st:
+            out["has_already"] = True
+        if ok is not None:
+            out["ok_sum"] += ok
+            if ok == 0:
+                out["ok0"] += 1
+        if already is not None and already > 0:
+            out["already_sum"] += already
+            out["already_stages"] += 1
+        if ok == 0 and already is not None and already > 0:
+            out["ok0_already"] += 1
+            name = str(st.get("stage") or "?")
+            if name not in out["names"]:
+                out["names"].append(name)
+            for tile in as_list(st.get("already_tiles")):
+                if isinstance(tile, list) and len(tile) == 2 and tile not in out["coords"]:
+                    out["coords"].append([tile[0], tile[1]])
+            cause = st.get("already_cause")
+            if isinstance(cause, dict):
+                for k, v in cause.items():
+                    n = as_int(v, None)
+                    if n is not None and n > 0:
+                        out["causes"][str(k)] = out["causes"].get(str(k), 0) + n
+            elif cause:
+                out["causes"][str(cause)] = out["causes"].get(str(cause), 0) + 1
+    return out
 
 
 #: 季节顺序（跨日校验用：每季固定 28 天）
@@ -3773,6 +3968,54 @@ def build_advice(report, top=9):
             "text": "A8 新形态（task-3；**全是 info /【无法判定】，不进 rc**）：" + "；".join(_t3_parts),
             "lines": [ln for ln in _t3_lines if ln is not None][:10],
         })
+    # 0s-11（task-13，0.7.44）：六类新字段/形态 —— 默认 info /【无法判定】，**不进 rc**
+    _t13_parts = []
+    _t13_lines = []
+    re0 = report.get("resume_exhausted") or {}
+    sr1 = report.get("stage_realloc") or {}
+    ls1 = report.get("leftover_split") or {}
+    so1 = report.get("slept_ok") or {}
+    bs1 = report.get("budget_suppressed") or {}
+    aa1 = report.get("already_aware") or {}
+    if re0.get("days"):
+        _t13_parts.append(
+            f"`resume_exhausted:` 新前缀收工 {re0.get('days_count')} 天"
+            f"（换片/回看/清障用尽 ⇒ 诚实收工，不是失败）"
+            f"；旧 stuck 前缀另 {re0.get('legacy_count', 0)} 天")
+        _t13_lines.extend([d.get("line") for d in re0.get("days") or []])
+    if sr1.get("days"):
+        _t13_parts.append(
+            f"`stage_realloc` 封格 {sr1.get('events')} 次 / {sr1.get('days_count')} 天"
+            "（同格重分配无产出 ⇒ 有界保护，不是失败）")
+        _t13_lines.extend([d.get("line") for d in sr1.get("days") or []])
+    if (ls1.get("totals") or {}).get("mismatch"):
+        _t13_parts.append(
+            f"余格拆分不变式违背 {(ls1.get('totals') or {}).get('mismatch')} 段"
+            "（leftover_executable+blocked != leftover ⇒ 只能【无法判定】余格构成）")
+        _t13_lines.extend([d.get("line") for d in ls1.get("invariant_days") or []])
+    if so1.get("inconsistent_days"):
+        _t13_parts.append(
+            f"slept_ok 与 checks.slept_by_us 不一致 {len(so1['inconsistent_days'])} 天 ⇒ 人工核对")
+        _t13_lines.extend([d.get("line") for d in so1.get("inconsistent_days") or []])
+    if bs1.get("conflict_days"):
+        _t13_parts.append(
+            f"预算抑制与 deferred_by_budget 同真 {len(bs1['conflict_days'])} 天"
+            "（本该互斥 ⇒ 人工核对）")
+        _t13_lines.extend([d.get("line") for d in bs1.get("conflict_days") or []])
+    _aa_t = aa1.get("totals") or {}
+    if _aa_t.get("ok0_already"):
+        _t13_parts.append(
+            f"already-aware 双列：ok=0 且 already>0 {_aa_t['ok0_already']} 段 / "
+            f"{len(aa1.get('days_with_ok0_already') or [])} 天"
+            f"（ok 合计 {_aa_t.get('ok_sum')} / already 合计 {_aa_t.get('already_sum')}）"
+            "—— **ok=0 不代表白干**，两列必须并读；判决前先核这张双列读数")
+        _t13_lines.extend([d.get("line") for d in aa1.get("days") or [] if d.get("ok0_already")])
+    if _t13_parts:
+        advice.append({
+            "text": "0.7.44 新字段/形态（task-13；**全是 info /【无法判定】，不进 rc**）："
+                    + "；".join(_t13_parts),
+            "lines": [ln for ln in _t13_lines if ln is not None][:10],
+        })
     # 0c) 环境挡路 / 没拿到结论（task-22 记账）
     env = report.get("env_inconclusive") or {}
     if env.get("env_fail_events"):
@@ -4017,6 +4260,14 @@ def build_undecidable(rows, sessions, prelude, report):
                 _uk = _spec.split(".", 1)[1]
                 absent = not any(isinstance(ev.get("ui"), dict) and _uk in ev["ui"]
                                  for _, ev in rows)
+            elif _spec == "day_end.stamina_budget.deferred_by_budget_suppressed":
+                # task-13（0.7.44）：`stamina_budget` 是 day_end 里的**嵌套 dict**，要真去
+                # `.stamina_budget` 里找键；否则 "stamina_budget.deferred_by_budget_suppressed"
+                # 会被当成 day_end 顶层键、恒缺失（等于没探）。只给这一条新探针开嵌套，
+                # 旧探针判定路径一律不动（"#无法判定 只允许按新增探针增加"）。
+                absent = not any(isinstance(ev.get("stamina_budget"), dict)
+                                 and "deferred_by_budget_suppressed" in ev["stamina_budget"]
+                                 for _, ev in rows if ev.get("event") == "day_end")
             elif "." in _spec:
                 _evname, _field = _spec.split(".", 1)
                 _hits = [ev for _, ev in rows if ev.get("event") == _evname]
@@ -6328,6 +6579,351 @@ def build_report(rows, path, args, bad_lines):
         "has_slept_field": _stuck_slept_field_seen,
         "has_day_end": bool(days),
     }
+    # ===== task-13（0.7.44 新字段/形态）=====
+    # 设计口径：**全部 info 或【无法判定】**，一律不进 `report["red"]`（不判红、不改 rc）。
+    # 缺失字段 ⇒ 该形态/该天记【无法判定】（缺失 ≠ 0、缺失 ≠ false）；只有结构化字段在场且
+    # 自相矛盾时给 ⚠ 提示，仍不进 rc。旧账本（0.7.43 及以前）没有这些字段 ⇒ 多出【无法判定】，
+    # 这是允许的（"#无法判定 只允许按新增探针增加"），rc/红数必须一字不变。
+    #
+    # D) `ended_reason` 新前缀 `resume_exhausted:`（0.7.44 取代 A8 的 `stuck:回片区（…）`）：
+    #    与 task-3 的 `work_spot_resume_exhausted` **分开**呈现（旧块只认旧原文，不吞新前缀）。
+    _re_all_labels = []
+    _re_days = []
+    _re_legacy_days = []
+    _re_burst_mismatch_days = []
+    _re_undecidable_days = []
+    _re_burst_exhausted = 0
+    _re_has_reason_field = False
+    for _sess, _drow in zip(sessions, days):
+        _lbl = _drow.get("label") or "<无日>"
+        _re_all_labels.append(_lbl)
+        _ends = _sess.get("day_ends") or []
+        if not _ends:
+            _re_undecidable_days.append({"label": _lbl, "line": None, "why": "没有 day_end"})
+            continue
+        _end_ln, _end = _ends[-1]
+        _reason = _end.get("ended_reason")
+        if "ended_reason" in _end:
+            _re_has_reason_field = True
+        _form = resume_exhausted_form(_reason)
+        _bursts = [(ln, ev) for ln, ev in (_sess.get("events") or [])
+                   if ev.get("event") == "no_progress_burst" and ev.get("exhausted") is True]
+        _re_burst_exhausted += len(_bursts)
+        _sw = _RE_SWITCHES.search(_reason) if isinstance(_reason, str) else None
+        _entry = {
+            "label": _lbl,
+            "line": _end_ln,
+            "form": _form or None,
+            "ended_by": _end.get("ended_by"),
+            "ended_reason": _reason,
+            "switches": (as_int(_sw.group(1), None) if _sw else None),
+            "burst_lines": [ln for ln, _ in _bursts],
+            "burst_count": max([as_int(ev.get("count"), 0) for _, ev in _bursts] or [0]),
+            "burst_switches": [as_int(ev.get("switches"), None) for _, ev in _bursts],
+            "burst_stalled": [as_int(ev.get("stalled_tiles"), None) for _, ev in _bursts],
+        }
+        if _form == "resume_exhausted":
+            _re_days.append(_entry)
+        elif _form == "legacy":
+            _re_legacy_days.append(_entry)
+        elif _bursts:
+            # 穷尽 burst（exhausted=True）在场、但 ended_reason 里没有新前缀 ⇒ 形态对不上（info ⚠）。
+            _entry["why"] = "no_progress_burst{exhausted=true} 在场但 ended_reason 无 resume_exhausted 前缀"
+            _re_burst_mismatch_days.append(_entry)
+    if not days:
+        _re_state = "undecidable"
+        _re_undecidable_days = [{"label": "<整本没有 day_end>", "line": None, "why": "没有 day_end"}]
+    elif _re_days:
+        _re_state = "found"
+    elif not _re_has_reason_field and not _re_burst_exhausted:
+        _re_state = "undecidable"
+        _re_undecidable_days = [{"label": lbl, "line": None,
+                                 "why": "没有 ended_reason 字段、也没有穷尽 burst"}
+                                for lbl in _re_all_labels]
+    else:
+        _re_state = "zero"
+    resume_exhausted_new = {
+        "state": _re_state,
+        "days": _re_days,
+        "days_count": len(_re_days),
+        "labels": [d["label"] for d in _re_days],
+        "legacy_days": _re_legacy_days,
+        "legacy_count": len(_re_legacy_days),
+        "legacy_labels": [d["label"] for d in _re_legacy_days],
+        "burst_mismatch_days": _re_burst_mismatch_days,
+        "burst_exhausted_events": _re_burst_exhausted,
+        "undecidable_days": _re_undecidable_days,
+        "has_reason_field": _re_has_reason_field,
+        "has_day_end": bool(days),
+    }
+    # E) `blocked{action="stage_realloc"}` = 同格当天重分配仍无产出 ⇒ 封格（0.7.44 task-10 的
+    #    「1 格余量反复重分」硬刹车）。A8 冬 9/14 的 28/62 次重分正是这个形态的**前身**（旧版没有封格）。
+    _sr_days = []
+    _sr_events_total = 0
+    _sr_stage_capped = 0
+    _sr_mechanism = False
+    _sr_has_blocked_events = any(ev.get("event") == "blocked" for _, ev in rows)
+    for _sess, _drow in zip(sessions, days):
+        _lbl = _drow.get("label") or "<无日>"
+        _ends = _sess.get("day_ends") or []
+        _end_ln, _end = (_ends[-1] if _ends else (None, {}))
+        _evs = _sess.get("events") or []
+        _caps = []
+        for _ln, _ev in _evs:
+            if _ev.get("event") != "blocked":
+                continue
+            _act = str(_ev.get("action") or "")
+            if "alloc_no_progress" in _ev or "alloc_capped_tiles" in _ev:
+                _sr_mechanism = True
+            if _act in ALLOC_NO_PROGRESS_ACTIONS:
+                _caps.append({
+                    "line": _ln, "tile": as_list(_ev.get("tile")),
+                    "zone": _ev.get("zone"), "stage": _ev.get("stage"),
+                    "alloc_no_progress": as_int(_ev.get("alloc_no_progress"), None),
+                    "limit": as_int(_ev.get("limit"), None),
+                    "reason": _ev.get("reason"), "note": _ev.get("note"),
+                })
+        _stage_tiles = []
+        for _st in as_list(_end.get("stages")):
+            if not isinstance(_st, dict) or "alloc_capped_tiles" not in _st:
+                continue
+            _sr_mechanism = True
+            _sr_stage_capped += 1
+            for _t in as_list(_st.get("alloc_capped_tiles")):
+                if isinstance(_t, list) and len(_t) == 2 and _t not in _stage_tiles:
+                    _stage_tiles.append([_t[0], _t[1]])
+        if _caps or _stage_tiles:
+            _sr_events_total += len(_caps)
+            _sr_days.append({"label": _lbl, "line": _end_ln, "events": _caps,
+                             "stage_capped_tiles": _stage_tiles,
+                             "event_count": len(_caps)})
+    if _sr_days:
+        _sr_state = "found"
+    elif _sr_mechanism:
+        _sr_state = "zero"
+    elif not days:
+        _sr_state = "undecidable"
+    else:
+        # 没有 blocked 事件也没有 alloc_capped_tiles：0.7.43 前根本不存在这个机制 ⇒ 无法证明 0 次。
+        _sr_state = "undecidable"
+    stage_realloc = {
+        "state": _sr_state,
+        "days": _sr_days,
+        "days_count": len(_sr_days),
+        "labels": [d["label"] for d in _sr_days],
+        "events": _sr_events_total,
+        "stage_capped": _sr_stage_capped,
+        "has_blocked_events": _sr_has_blocked_events,
+        "has_day_end": bool(days),
+    }
+    # F) 余格拆分 `leftover_executable` / `leftover_blocked`（0.7.44）：leftover 语义不变，
+    #    只把「可执行余格 vs 物理挡死格」拆开；硬不变式 exec + blocked == leftover。
+    _ls_days = []
+    _ls_totals = {"stages": 0, "with_split": 0, "missing_split": 0, "exec_sum": 0,
+                  "blocked_sum": 0, "leftover_sum": 0, "mismatch": 0,
+                  "cap_stages": 0, "cap_tiles": []}
+    _ls_has_split = False
+    _ls_invariant_days = []
+    _ls_pending_days = []
+    for _sess, _drow in zip(sessions, days):
+        _lbl = _drow.get("label") or "<无日>"
+        _ends = _sess.get("day_ends") or []
+        if not _ends:
+            continue
+        _end_ln, _end = _ends[-1]
+        _sp = scan_stage_leftover_split(_end.get("stages"))
+        if _sp["has_split_field"]:
+            _ls_has_split = True
+        for _k in ("stages", "with_split", "missing_split", "exec_sum", "blocked_sum",
+                   "leftover_sum", "mismatch", "cap_stages"):
+            _ls_totals[_k] += _sp[_k]
+        for _t in _sp["cap_tiles"]:
+            if _t not in _ls_totals["cap_tiles"]:
+                _ls_totals["cap_tiles"].append(_t)
+        _entry = {"label": _lbl, "line": _end_ln,
+                  "stages": _sp["stages"], "with_split": _sp["with_split"],
+                  "missing_split": _sp["missing_split"],
+                  "exec_sum": _sp["exec_sum"], "blocked_sum": _sp["blocked_sum"],
+                  "leftover_sum": _sp["leftover_sum"], "mismatch": _sp["mismatch"],
+                  "mismatch_stages": _sp["mismatch_stages"],
+                  "cap_stages": _sp["cap_stages"], "cap_tiles": _sp["cap_tiles"],
+                  "leftover": as_int(_end.get("leftover"), None),
+                  "plot_pending": as_int(_end.get("plot_pending"), None),
+                  "plot_pending_executable": as_int(_end.get("plot_pending_executable"), None),
+                  "plot_pending_blocked": as_int(_end.get("plot_pending_blocked"), None)}
+        if _sp["mismatch"] or (_sp["with_split"] and _sp["missing_split"]):
+            _ls_invariant_days.append({"label": _lbl, "line": _end_ln,
+                                       "mismatch": _sp["mismatch"],
+                                       "missing_split": _sp["missing_split"]})
+        if _sp["exec_sum"] > 0 or (_sp["with_split"] and _sp["blocked_sum"] > 0):
+            _ls_pending_days.append({"label": _lbl, "line": _end_ln,
+                                     "exec": _sp["exec_sum"], "blocked": _sp["blocked_sum"]})
+        if _sp["stages"]:
+            _ls_days.append(_entry)
+    _ls_day_invariant = []
+    for _e in _ls_days:
+        _pe, _pb, _pp = (_e["plot_pending_executable"], _e["plot_pending_blocked"],
+                         _e["plot_pending"])
+        if _pe is not None and _pb is not None and _pp is not None and _pe + _pb != _pp:
+            _ls_day_invariant.append({"label": _e["label"], "line": _e["line"],
+                                      "plot_pending_executable": _pe,
+                                      "plot_pending_blocked": _pb,
+                                      "plot_pending": _pp})
+    if _ls_has_split and not (_ls_totals["mismatch"] or _ls_day_invariant):
+        _ls_state = "ok"
+    elif _ls_has_split:
+        _ls_state = "violated"
+    else:
+        _ls_state = "undecidable"
+    leftover_split = {
+        "state": _ls_state,
+        "days": _ls_days,
+        "days_count": len(_ls_days),
+        "labels": [d["label"] for d in _ls_days],
+        "totals": _ls_totals,
+        "pending_days": _ls_pending_days,
+        "invariant_days": _ls_invariant_days,
+        "day_invariant_days": _ls_day_invariant,
+        "has_split_field": _ls_has_split,
+        "has_leftover_field": any("leftover" in as_dict(ev) for _, ev in rows
+                                  if ev.get("event") == "day_end"),
+        "has_day_end": bool(days),
+    }
+    # G) `day_end.slept_ok`（0.7.44，与 ended_by 解耦）+ 与 checks.slept_by_us 的旁证。
+    _so_true, _so_false, _so_undec = [], [], []
+    _so_inconsistent = []
+    for _sess, _drow in zip(sessions, days):
+        _lbl = _drow.get("label") or "<无日>"
+        _ends = _sess.get("day_ends") or []
+        if not _ends:
+            _so_undec.append({"label": _lbl, "line": None, "why": "没有 day_end"})
+            continue
+        _end_ln, _end = _ends[-1]
+        _checks = as_dict(_end.get("checks"))
+        _entry = {"label": _lbl, "line": _end_ln, "ended_by": _end.get("ended_by"),
+                  "slept_ok": _end.get("slept_ok"),
+                  "slept_by_us": _checks.get("slept_by_us")}
+        if "slept_ok" not in _end:
+            _so_undec.append(_entry)
+        elif _end.get("slept_ok") is True:
+            _so_true.append(_entry)
+        elif _end.get("slept_ok") is False:
+            _so_false.append(_entry)
+        else:
+            _so_undec.append(_entry)
+        if "slept_ok" in _end and isinstance(_checks.get("slept_by_us"), bool) \
+                and bool(_end.get("slept_ok")) != bool(_checks.get("slept_by_us")):
+            _entry["why"] = "slept_ok 与 checks.slept_by_us 不一致"
+            _so_inconsistent.append(_entry)
+    slept_ok = {
+        "state": ("found" if _so_true else ("undecidable" if _so_undec and not _so_false
+                                            and not _so_true else "zero")),
+        "true_days": [_d["label"] for _d in _so_true],
+        "false_days": [_d["label"] for _d in _so_false],
+        "undecidable_days": _so_undec,
+        "inconsistent_days": _so_inconsistent,
+        "true_count": len(_so_true),
+        "false_count": len(_so_false),
+        "undecidable_count": len(_so_undec),
+        "has_field": bool(_so_true or _so_false),
+        "has_day_end": bool(days),
+    }
+    # H) 体力预算抑制 `day_end.stamina_budget.deferred_by_budget_suppressed`（0.7.44）：抑制时
+    #    **不发** `deferred_by_budget` 事件 ⇒ 只出现在 day_end 里；两者不得同真（brain 保证）。
+    _bs_days = []
+    _bs_total = 0
+    _bs_has = False
+    _bs_conflict_days = []
+    for _sess, _drow in zip(sessions, days):
+        _lbl = _drow.get("label") or "<无日>"
+        _ends = _sess.get("day_ends") or []
+        if not _ends:
+            continue
+        _end_ln, _end = _ends[-1]
+        _sb = as_dict(_end.get("stamina_budget"))
+        if "deferred_by_budget_suppressed" not in _sb:
+            continue
+        _bs_has = True
+        _n = as_int(_sb.get("deferred_by_budget_suppressed"), None)
+        if _n is None:
+            continue
+        _ev_cnt = sum(1 for _, ev in (_sess.get("events") or [])
+                      if ev.get("event") == "deferred_by_budget")
+        _entry = {"label": _lbl, "line": _end_ln, "suppressed": _n,
+                  "deferred_by_budget": _sb.get("deferred_by_budget"),
+                  "events": _ev_cnt,
+                  "watered_outdoor": as_dict(_end.get("checks")).get("watered_outdoor")}
+        _bs_total += _n
+        if _n > 0:
+            _bs_days.append(_entry)
+            if _ev_cnt > 0 or _entry["deferred_by_budget"] is True:
+                _bs_conflict_days.append(_entry)
+    budget_suppressed = {
+        "state": ("found" if _bs_days else ("zero" if _bs_has else "undecidable")),
+        "days": _bs_days,
+        "days_count": len(_bs_days),
+        "labels": [d["label"] for d in _bs_days],
+        "total": _bs_total,
+        "conflict_days": _bs_conflict_days,
+        "has_field": _bs_has,
+        "has_day_end": bool(days),
+    }
+    # I) already-aware 双列（task-10 #1）：`ok==0 且 already>0` 的「阶段空转」必须与 ok 并列读，
+    #    否则只看 `ok`（0.7.44 起 ok = 真世界变化数）会把「本来没事可做」误判成「白干」。
+    _aa_all = []
+    _aa_totals = {"stages": 0, "ok0": 0, "ok0_already": 0, "ok_sum": 0,
+                  "already_sum": 0, "already_stages": 0, "names": [], "coords": []}
+    _aa_has_ok = False
+    _aa_has_already = False
+    _aa_days = []
+    for _sess, _drow in zip(sessions, days):
+        _lbl = _drow.get("label") or "<无日>"
+        _ends = _sess.get("day_ends") or []
+        if not _ends:
+            continue
+        _end_ln, _end = _ends[-1]
+        _aa = scan_already_aware(_end.get("stages"))
+        _aa_has_ok = _aa_has_ok or _aa["has_ok"]
+        _aa_has_already = _aa_has_already or _aa["has_already"]
+        for _k in ("stages", "ok0", "ok0_already", "ok_sum", "already_sum", "already_stages"):
+            _aa_totals[_k] += _aa[_k]
+        for _nm in _aa["names"]:
+            if _nm not in _aa_totals["names"]:
+                _aa_totals["names"].append(_nm)
+        for _c in _aa["coords"]:
+            if _c not in _aa_totals["coords"]:
+                _aa_totals["coords"].append(_c)
+        _entry = {"label": _lbl, "line": _end_ln}
+        _entry.update({k: _aa[k] for k in ("stages", "ok0", "ok0_already", "ok_sum",
+                                           "already_sum", "already_stages", "names",
+                                           "coords", "causes")})
+        if _aa["stages"]:
+            _aa_days.append(_entry)
+    _aa_window_n = as_int(getattr(args, "window", 3) or 3, 3)
+    _aa_window_labels = [d["label"] for d in _aa_days[-_aa_window_n:]] if _aa_window_n > 0 else []
+    _aa_window = {"labels": _aa_window_labels, "stages": 0, "ok0": 0, "ok0_already": 0,
+                  "ok_sum": 0, "already_sum": 0}
+    for _e in _aa_days:
+        if _e["label"] in _aa_window_labels:
+            for _k in ("stages", "ok0", "ok0_already", "ok_sum", "already_sum"):
+                _aa_window[_k] += _e[_k]
+    if _aa_totals["stages"] and _aa_has_ok and _aa_has_already:
+        _aa_state = "ok"
+    elif not _aa_totals["stages"]:
+        _aa_state = "undecidable"
+    else:
+        _aa_state = "undecidable"
+    already_aware = {
+        "state": _aa_state,
+        "days": _aa_days,
+        "days_count": len(_aa_days),
+        "days_with_ok0_already": [d["label"] for d in _aa_days if d["ok0_already"]],
+        "totals": _aa_totals,
+        "window": _aa_window,
+        "has_ok_field": _aa_has_ok,
+        "has_already_field": _aa_has_already,
+        "has_day_end": bool(days),
+    }
     # 0 步 VERIFIED 的弱日（已有 task-88 口径）；这里只做信息项。
     sleep_ok = sum(1 for _, ev in rows if ev.get("event") == "sleep" and ev.get("ok"))
     sleep_failed = sum(1 for _, ev in rows if ev.get("event") == "sleep" and not ev.get("ok"))
@@ -6760,6 +7356,13 @@ def build_report(rows, path, args, bad_lines):
     report["stage_churn"] = stage_churn
     report["work_spot_resume_exhausted"] = work_spot_resume_exhausted
     report["stuck_without_sleep"] = stuck_without_sleep
+    # 【task-13】0.7.44 新字段/形态六聚合（同样默认 info /【无法判定】、不进 rc）
+    report["resume_exhausted"] = resume_exhausted_new
+    report["stage_realloc"] = stage_realloc
+    report["leftover_split"] = leftover_split
+    report["slept_ok"] = slept_ok
+    report["budget_suppressed"] = budget_suppressed
+    report["already_aware"] = already_aware
     # task-88：`cat_self_report` 要按**目标窗口**（`--window N`）而不是 `finish.days` 判自洽。
     report["window_days"] = as_int(getattr(args, "window", 3), 3)
     self_report = cat_self_report(report)
@@ -7202,6 +7805,41 @@ MAPPING_TEXT = [
      "当天**没有由我们睡过去**，「为什么 stuck / 是否真的收工」只能【无法判定】（不是睡眠失败、"
      "也不是通过）；`checks.slept_by_us` 缺失同样【无法判定】（缺失 ≠ 0，绝不默认 false 或 true）；"
      "`slept_by_us=true` 却 `ended_by=stuck` 的天单独计数（自相形态，只作核对线索）"),
+    # task-13（0.7.44 新字段/形态）：全部 info /【无法判定】、不进 rc。
+    ("resume_exhausted 前缀（task-13，0.7.44）",
+     "0.7.44 新收工理由·**info /【无法判定】、不进 rc**：`ended_reason` 前缀 `resume_exhausted:`"
+     "（brain 原文「回片区 N 格都回去看过、换片 M 次，当前观测里没有可执行目标（守卫仍说：…）」）"
+     "= 换片/回看/清障都用尽后的诚实收工（不在 `JUSTIFIED_END_REASONS` ⇒ 不 VERIFIED），"
+     "**不是 stuck、不是失败**；与旧 `stuck:回片区（work_spot_resume）` 形态**分开计数**（两代口径），"
+     "旧前缀仍由 `work_spot_resume_exhausted` 块单列；`no_progress_burst{exhausted=true}` 在场而"
+     "`ended_reason` 无新前缀 ⇒ 形态对不上，只能【无法判定】"),
+    ("stage_realloc 封格（task-13，0.7.44）",
+     "0.7.44 新机制·**info、不进 rc**：`blocked{action=\"stage_realloc\", alloc_no_progress, limit, "
+     "tile, stage}` = 同格当天重分配仍无产出、达到 `MAX_ALLOC_NO_PROGRESS(=3)` ⇒ **封格**"
+     "（A8 冬 9/14 的 28/62 次「1 格余量反复重分」正是这个形态的前身）；`stage` 记录里还有 "
+     "`alloc_capped_tiles`（当天被封的格坐标）。这是有界保护，不是失败；缺失字段/整本无该机制 ⇒"
+     "【无法判定】（缺失 ≠ 0，0.7.43 前不存在封格）"),
+    ("leftover_executable/blocked（task-13，0.7.44）",
+     "0.7.44 新拆分·**info、不进 rc**：`leftover` 语义**一字不动**，只把余格拆成「可执行余格 vs "
+     "物理挡死格」：硬不变式 `leftover_executable + leftover_blocked == leftover`；日级 "
+     "`plot_pending_executable + plot_pending_blocked == plot_pending`。拆分字段缺失 ⇒【无法判定】"
+     "（**绝不把 leftover 全当成可执行**）；不变式被违背 ⇒ 只警告、不进 rc"),
+    ("slept_ok（task-13，0.7.44）",
+     "0.7.44 新字段·**info、不进 rc**：`day_end.slept_ok` = 扫钟是否真成功（与 `ended_by` 解耦；"
+     "`checks.slept_by_us = slept_ok or ended_by∈(sleep, inventory_blocked)`）。A8 的「stuck 却"
+     "slept_by_us=false」在 0.7.44 起可由 slept_ok 区分「真没睡成」与「ended_by 语义撞车」；"
+     "字段缺失 ⇒【无法判定】（缺失 ≠ 0）"),
+    ("deferred_by_budget_suppressed（task-13，0.7.44）",
+     "0.7.44 新口径·**info、不进 rc**：「只因预算延后」与「户外浇水达标」**不得同真** ⇒ 当天已浇完"
+     "户外水时 `deferred_by_budget` 事件**一条不发**，降级成 `stamina_budget."
+     "deferred_by_budget_suppressed=<n>`（且 `deferred_by_budget=false`）。所以「日级计数>0 且当天"
+     "无事件」是**设计**、不是矛盾；同日两者都出现才提示人工核对（仍不进 rc）。字段缺失 ⇒【无法判定】"),
+    ("already-aware 双列（task-13 / task-10 #1）",
+     "0.7.44 判决口径·**info、不进 rc**：对 `stage.ok==0 && stage.already>0` 给出**并列读数**"
+     "（阶段数/天数/坐标 + ok 与 already 两列合计，窗口内同时给两列）。口径：0.7.44 起 `ok` = "
+     "**真世界变化数**（task-242），`already` = 本来就不用做的格（`already_tiles`，含 "
+     "`cleared_by_neighbor`/`no_target` 成因）⇒ **ok=0 不代表白干**，A9 判决必须两列并读，"
+     "不许用「ok 跨版本不可比」的单列数下结论；字段缺失 ⇒【无法判定】（缺失 ≠ 0）"),
 
     ("idle", "辅助：一整轮没动作（acted/rounds）⇒ 空转，常与'该做没做'并看"),
 ]
@@ -7389,6 +8027,120 @@ def render_text(report, top):
     else:
         add(f"stuck 未睡: 0 天（ended_by=stuck 共 {sw.get('stuck_days', 0)} 天，"
             "`slept_by_us` 均不是 false）")
+    # ===== task-13（0.7.44 新字段/形态）：全部 info 或【无法判定】、不进 rc =====
+    # D) 回片区穷尽**新前缀** `resume_exhausted:`（0.7.44；旧 `stuck:` 前缀由上面 task-3 的
+    #    work_spot_resume_exhausted 块单列，两代形态分开读，绝不混算）。
+    _re = report.get("resume_exhausted") or {}
+    if _re.get("days"):
+        add(f"回片区穷尽（resume_exhausted 前缀，0.7.44）: {_re.get('days_count')} 天"
+            f"（旧 stuck 前缀另 {_re.get('legacy_count', 0)} 天；换片/回看/清障都用尽 ⇒ 诚实收工，"
+            "不是失败、不进 rc；原文见下）")
+        for _d in _re["days"]:
+            _sw_txt = f"；换片 {_d['switches']} 次" if _d.get("switches") is not None else ""
+            add(f"    · {_d['label']} 原文: {_d.get('ended_reason')}{_sw_txt}")
+        if _re.get("burst_mismatch_days"):
+            add(f"    ⚠ 穷尽 burst 在场但 `ended_reason` 无新前缀："
+                f"{[d['label'] for d in _re['burst_mismatch_days']]} ⇒ 收工理由只能【无法判定】")
+    elif _re.get("state") == "undecidable":
+        add("回片区穷尽（resume_exhausted 前缀，0.7.44）: <缺失>（本账本没有 ended_reason 字段、"
+            "也没有 `no_progress_burst{exhausted=true}` ⇒ 无法判定换片是否用尽；缺失 ≠ 0）")
+    else:
+        add(f"回片区穷尽（resume_exhausted 前缀，0.7.44）: 0 天（旧 stuck 前缀 "
+            f"{_re.get('legacy_count', 0)} 天；`ended_reason` 在场且无新前缀 ⇒ 0 是真实读数）")
+    # E) 阶段重分配封格 `blocked{action=stage_realloc}`（0.7.44 的「1 格余量反复重分」硬刹车）。
+    _sr = report.get("stage_realloc") or {}
+    if _sr.get("days"):
+        _sr_tiles = []
+        for _d in _sr["days"]:
+            for _e in _d.get("events") or []:
+                if _e.get("tile") and _e["tile"] not in _sr_tiles:
+                    _sr_tiles.append(_e["tile"])
+            for _t in _d.get("stage_capped_tiles") or []:
+                if _t not in _sr_tiles:
+                    _sr_tiles.append(_t)
+        add(f"阶段重分配封格（stage_realloc，0.7.44）: {_sr.get('events', 0)} 次 / "
+            f"{_sr.get('days_count', 0)} 天（同格重分配仍无产出、达 limit ⇒ 封格；"
+            f"阶记录留痕 {_sr.get('stage_capped', 0)} 段；涉及格 {json.dumps(_sr_tiles[:8], ensure_ascii=False)}）"
+            "⇒ info：有界保护不是失败、不进 rc")
+        for _d in _sr["days"]:
+            add(f"    · {_d['label']} 封格 {_d.get('event_count', 0)} 次"
+                + (f"（格 {json.dumps(_d.get('stage_capped_tiles') or [], ensure_ascii=False)}）"
+                   if _d.get("stage_capped_tiles") else ""))
+    elif _sr.get("state") == "undecidable":
+        add("阶段重分配封格（stage_realloc，0.7.44）: <缺失>（本账本没有 "
+            "`blocked{action=stage_realloc}`/`alloc_capped_tiles` 机制 ⇒ 无法判定重分配是否被封过；"
+            "缺失 ≠ 0）")
+    else:
+        add("阶段重分配封格（stage_realloc，0.7.44）: 0 次（机制字段在场 ⇒ 0 是真实读数；"
+            "info：不是失败、不进 rc）")
+    # F) 余格拆分 `leftover_executable` / `leftover_blocked`（0.7.44；leftover 语义不变）。
+    _ls = report.get("leftover_split") or {}
+    if not _ls.get("has_split_field"):
+        add("余格拆分（leftover_executable/blocked，0.7.44）: <缺失>（0.7.43 前没有拆分字段 ⇒ "
+            "分不清「可执行余格」与「物理挡死格」；缺失 ≠ 0，绝不把 leftover 全当可执行）")
+    else:
+        _lst = _ls.get("totals") or {}
+        add(f"余格拆分（leftover_executable/blocked，0.7.44）: 带拆分 {_lst.get('with_split', 0)} 段"
+            f"（缺 {_lst.get('missing_split', 0)} 段）；可执行 {_lst.get('exec_sum', 0)} 格 / "
+            f"挡死 {_lst.get('blocked_sum', 0)} 格 / leftover {_lst.get('leftover_sum', 0)} 格；"
+            f"不变式违背 {_lst.get('mismatch', 0)} 段"
+            "（硬不变式：executable + blocked == leftover）；纯 info、不进 rc")
+        for _d in (_ls.get("pending_days") or [])[:8]:
+            add(f"    · {_d['label']} 可执行余格 {_d.get('exec')} / 挡死 {_d.get('blocked')}（L{_d.get('line')}）")
+        if _ls.get("invariant_days"):
+            add(f"    ⚠ 拆分/不变式异常：{[d['label'] for d in _ls['invariant_days']]}"
+                " ⇒ 只能【无法判定】余格构成（仍不进 rc）")
+        if _ls.get("day_invariant_days"):
+            add(f"    ⚠ 日级 plot_pending_executable+blocked != plot_pending："
+                f"{[d['label'] for d in _ls['day_invariant_days']]}（只警告、不进 rc）")
+        if _lst.get("cap_stages"):
+            add(f"    · 阶记录 `alloc_capped_tiles` {_lst.get('cap_stages')} 段"
+                f"（格 {json.dumps(_lst.get('cap_tiles')[:8], ensure_ascii=False)}）")
+    # G) 睡成功标志 `day_end.slept_ok`（0.7.44，与 ended_by 解耦）。
+    _so = report.get("slept_ok") or {}
+    if not _so.get("has_field"):
+        add(f"睡成功标志（slept_ok，0.7.44）: <缺失>（{_so.get('undecidable_count', 0)} 天没有该字段 ⇒ "
+            "无法判定是否真睡成；缺失 ≠ 0；0.7.43 的 `stuck` 日没有这个真相字段）")
+    else:
+        add(f"睡成功标志（slept_ok，0.7.44）: true {_so.get('true_count', 0)} 天 / "
+            f"false {_so.get('false_count', 0)} 天 / 缺字段 {_so.get('undecidable_count', 0)} 天"
+            "（与 ended_by 解耦：stuck 日也可能真睡成；info、不进 rc）"
+            + (f"  ⚠ 与 checks.slept_by_us 不一致：{[d['label'] for d in _so['inconsistent_days']]}"
+               "（互斥字段打架 ⇒ 人工核对，不进 rc）"
+               if _so.get("inconsistent_days") else ""))
+    # H) 体力预算抑制 `day_end.stamina_budget.deferred_by_budget_suppressed`（0.7.44）。
+    _bsv = report.get("budget_suppressed") or {}
+    if not _bsv.get("has_field"):
+        add("预算抑制（deferred_by_budget_suppressed，0.7.44）: <缺失>（本账本没有该日级字段 ⇒ "
+            "无法判定「已浇过户外水导致预算延后被抑制」过没有；缺失 ≠ 0）")
+    else:
+        add(f"预算抑制（deferred_by_budget_suppressed，0.7.44）: {_bsv.get('total', 0)} 条 / "
+            f"{_bsv.get('days_count', 0)} 天（当天浇完户外 ⇒ 推定「只因预算延后」不成立、"
+            "事件一条不发，只留日级计数 ⇒ 日级>0 且无事件是**设计**，不是矛盾；info、不进 rc）"
+            + (f"  ⚠ 同日又有 deferred_by_budget 事件 / deferred_by_budget=true："
+               f"{[d['label'] for d in _bsv['conflict_days']]}（两者本该互斥 ⇒ 人工核对，不进 rc）"
+               if _bsv.get("conflict_days") else ""))
+    # I) already-aware 双列（task-10 #1）：`ok==0 且 already>0` 必须与 ok 并读，别用 ok 单列判白干。
+    _aa = report.get("already_aware") or {}
+    if not (_aa.get("has_ok_field") and _aa.get("has_already_field")):
+        add("already-aware 双列（ok=0 且 already>0，0.7.44 口径）: <缺失>（本账本 stages[] 没有 "
+            "`ok`/`already` 字段 ⇒ 无法判定阶段是否「本来就不用做」；缺失 ≠ 0）")
+    else:
+        _aat = _aa.get("totals") or {}
+        _aaw = _aa.get("window") or {}
+        add(f"already-aware 双列（ok=0 且 already>0，0.7.44 口径）: {_aat.get('ok0_already', 0)} 段 / "
+            f"{len(_aa.get('days_with_ok0_already') or [])} 天；ok 合计 {_aat.get('ok_sum', 0)} / "
+            f"already 合计 {_aat.get('already_sum', 0)}（ok=0 的段 {_aat.get('ok0', 0)} / "
+            f"总段 {_aat.get('stages', 0)}；窗口 {len(_aaw.get('labels') or [])} 天：ok=0&already>0 "
+            f"{_aaw.get('ok0_already', 0)} 段、ok {_aaw.get('ok_sum', 0)} / already "
+            f"{_aaw.get('already_sum', 0)}）⇒ **ok=0 不代表白干**：already>0 = 那些格本来就不用做；"
+            "两列必须并读（0.7.44 起 ok = 真世界变化数）；info、不进 rc")
+        for _d in (_aa.get("days") or []):
+            if not _d.get("ok0_already"):
+                continue
+            add(f"    · {_d['label']} ok=0 且 already>0：{_d['ok0_already']} 段"
+                f"（{_d.get('names')[:4]}；格 {json.dumps((_d.get('coords') or [])[:6], ensure_ascii=False)}；"
+                f"ok 合计 {_d.get('ok_sum')} / already 合计 {_d.get('already_sum')}）")
     # task-32：两种新事件形态的计数（信息项）；task-38：跨日证据覆盖度
     # task-102（`9b09735`）：**背包空格闭环**一行 —— free_slots / buy 尝试 / buy_no_space /
     # 腾格卖出（`why=need_slot`）/ 当日钱变化 / `slept_without_work` / `modal_dismiss_failed`。
