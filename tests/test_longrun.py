@@ -13248,16 +13248,21 @@ class TestTask15PendingCaliber(unittest.TestCase):
         rep = run.days[0]
         self.assertGreater(seeded["n"], 0, "本用例必须真的走到 `_ensure_plot` 兜底")
         self.assertTrue(self._events(run, "plot_exhausted_burst"), run.entries)
-        self.assertTrue(str(rep.ended_reason).startswith("resume_exhausted:"), rep.ended_reason)
+        # 【task-26 / 0.7.46】残留格仍在当前观测里（真能干的活）⇒ 不能用 `resume_exhausted`
+        # 冒充"没有可执行目标"；收工前缀改成 `resume_budget_exhausted`（预算耗尽，诚实）。
+        self.assertTrue(str(rep.ended_reason).startswith("resume_budget_exhausted:"),
+                        rep.ended_reason)
         self.assertNotIn("同一秒连发", str(rep.ended_reason),
                          "有界 burst 不允许再用 `stuck:` 文案掩盖（Lead m01290 ③）")
         # 有界 ≠ 可放行：本用例残留格仍在当前观测里（真能干的活）⇒ day_justified 必须 false，
         # 哪怕只是被 burst 有界收尾；空转多少次都不能洗成"没活"。
         self.assertFalse(rep.checks.get("day_justified", True), rep.checks)
         self.assertFalse(rep.verified, rep.checks)
-        bursts = [e for e in self._events(run, "no_progress_burst") if e.get("exhausted")]
+        bursts = [e for e in self._events(run, "no_progress_burst")
+                  if "claim_exhausted" in e]
         self.assertEqual(len(bursts), 1, run.entries)
         ev = bursts[0]
+        self.assertFalse(ev.get("exhausted"), ev)
         self.assertIn("pending_ledger", ev, ev)
         self.assertEqual(ev["pending_ledger"], 1, ev)
         self.assertEqual(ev["pending"], 1, ev)
@@ -13640,6 +13645,227 @@ class TestTask22MalformedTiles(unittest.TestCase):
         self.assertFalse(is_justified_end(
             "sleep", "resume_exhausted:回片区（work_spot_resume）",
             pending_executable=snap2["executable"], malformed_tiles=snap2["malformed"]))
+
+
+class TestTask26ResumeBudget(unittest.TestCase):
+    """【task-26 / 0.7.46 卡 B】冬 27 `resume_exhausted` 的 7 格可执行余格 —— 走路预算口径 + 自洽收尾。
+
+    真机病灶（`logs/longrun-smoke-0745.jsonl`，只读）：
+    * L637 `work_spot{tiles:7, field_se}` ⇒ L640 `resume_walk` ⇒ L641
+      `no_progress_burst{count=0, source:回片区（switch_limit）, pending:225, pending_ledger:230,
+      pending_guard:7, pending_stalled:218, pending_blocked:223, pending_executable:7, samples:
+      [[30,47],[31,42],…]}` ⇒ L647 `day_end` 收尾原文
+      `resume_exhausted:回片区 220 格都回去看过、换片 4 次，当前观测里**没有可执行目标**`；
+    * 三条证据互相矛盾：`pending_executable=7`（当前观测里明明有 7 格能干）↔
+      `resume_exhausted` 文案（"没有可执行目标"）↔ 同日 jsonl 里 attempts 1–7 全是
+      `walked:false`（t=91–204，7 次走不动）却各烧掉一格 `resume_walks`，t=366 就到 10/10；
+      等 t=845 那 7 格浮出来时，`resume_walks < max_plots_per_day` 已为 false，主循环
+      `if work_spot is None and picked is plot and self.resume_walks < …` 一次都不许走
+      ⇒ `recovered>max_plots` ⇒ `_resume_exhausted(where="switch_limit")`。
+    * `ended_by=sleep` 本身**不矛盾**：L643 `sleep` 成功、跨日到冬 28（stamina 62.7→270）——
+      `ended_by` 记的是"怎么结束这一天"（我们睡了），`ended_reason` 记"为什么睡"；
+      矛盾的是原因文案把"预算用尽"说成"没活"。
+
+    本类钉死新口径：
+    1) `resume_walks` 只数**走成**的回片区（成功预算 `max_plots_per_day`）；失败尝试另记
+       `resume_walk_attempts`，封顶 `2*max_plots_per_day` ⇒ 冬 27 的 7 次失败不再挤掉成功预算；
+    2) 收工理由必须与可执行面证据自洽：`exhausted=0` 才许用 `resume_exhausted:`；
+       `executable>0`（账本还有能干的格，只是预算用尽）⇒ `resume_budget_exhausted:`
+       （不在 `is_justified_end` 白名单 ⇒ 当天不 VERIFIED，**禁止放宽判据**）；
+    3) `stuck:` 永不出现；循环有界（尝试封顶后直接 none，不再空走）。
+    """
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list:
+        return [e for e in run.entries if e.get("event") == name]
+
+    @staticmethod
+    def _plot(tiles, area: str = "field_se") -> dict:
+        return {"zone": "", "label": "", "area": area,
+                "anchor": list(tiles[0]), "tiles": list(tiles), "note": ""}
+
+    def _run(self, w: FakeWorld):
+        client = _CountingClient(w)
+        worker = FarmWorker(client, log=lambda *_: None)
+        run = make_run(w, target_days=1, max_days=1,
+                       client_factory=lambda: client, worker_factory=lambda c: worker)
+        run.worker = worker
+        run.client = client
+        return run
+
+    @staticmethod
+    def _rep(day: int = 27) -> DayReport:
+        return DayReport(day_key=("winter", 1, day), started_at=0.0)
+
+    def test_walk_budget_counts_success_and_attempts_separately(self):
+        """成功 10/10 与尝试 20/20 各自封顶；两个计数器互不侵占。"""
+        run = self._run(FakeWorld(weeds=0, seeds=0, money=0))
+        self.assertTrue(run._resume_walk_available())
+        run.resume_walks = run.max_plots_per_day - 1
+        self.assertTrue(run._resume_walk_available())
+        run.resume_walks = run.max_plots_per_day
+        self.assertFalse(run._resume_walk_available(), "成功预算用尽 ⇒ 不再走")
+        run.resume_walks = 0
+        run.resume_walk_attempts = 2 * run.max_plots_per_day
+        self.assertFalse(run._resume_walk_available(), "尝试预算用尽 ⇒ 不再走（防失败重试空转）")
+        run.resume_walk_attempts = 2 * run.max_plots_per_day - 1
+        self.assertTrue(run._resume_walk_available())
+
+    def test_failed_walks_do_not_consume_success_budget(self):
+        """冬 27 形态：先走失败 7 次，再走成 1 次 ⇒ 成功预算只掉 1（旧口径会掉 8）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        w.player_tile = [62, 14]
+        run = self._run(w)
+        run.leftover_targets = {(60, 10)}
+        run.leftover_area = {(60, 10): "field_nw"}
+        run._resume_reevaluate = lambda **kw: None
+        calls = {"n": 0}
+
+        def walk(obs, plot):
+            calls["n"] += 1
+            return calls["n"] > 1          # 第一次走不动（walked:false），第二次走成
+
+        run._walk_into_plot = walk
+        rep = self._rep()
+
+        action, walked = run._guard_leftover_resume(w.obs(), rep, text="守卫说还有活")
+        self.assertEqual((action, walked), ("none", False))
+        self.assertEqual(run.resume_walks, 0,
+                         "走失败不许烧掉成功预算（冬 27 attempts 1–7 就是这么把 10/10 提前烧光的）")
+        self.assertEqual(run.resume_walk_attempts, 1)
+
+        action, walked = run._guard_leftover_resume(w.obs(), rep, text="守卫说还有活")
+        self.assertEqual((action, walked), ("walked", True))
+        self.assertEqual(run.resume_walks, 1)
+        self.assertEqual(run.resume_walk_attempts, 2)
+        evs = self._events(run, "resume_walk")
+        self.assertEqual(len(evs), 2, evs)
+        self.assertFalse(evs[0]["walked"], evs[0])
+        self.assertTrue(evs[1]["walked"], evs[1])
+        self.assertEqual(evs[0]["attempt"], 1, evs[0])
+        self.assertEqual(evs[1]["attempt"], 2, evs[1])
+        self.assertEqual(evs[1]["walks"], 1, evs[1])
+
+    def test_seven_executable_at_switch_limit_closes_as_budget_not_exhausted(self):
+        """冬 27 重放：7 格可执行余格 + 预算用尽 ⇒ `resume_budget_exhausted:`，不冒充没活。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        tiles = sorted(w.tillable)[:7]
+        for t in tiles:
+            w.blockers[t] = "weed"
+        w.player_tile = [62, 14]
+        run = self._run(w)
+        run.leftover_targets = set(tiles)
+        run.leftover_area = {t: "field_se" for t in tiles}
+        run.resume_walks = run.max_plots_per_day
+        run.resume_walk_attempts = 2 * run.max_plots_per_day
+        run.resume_switches = 4
+        run._do_sleep = lambda obs, rep, why, **kw: ("sleep", why)
+        rep = self._rep()
+        obs = w.obs()
+
+        snap = run._pending_snapshot(obs)
+        self.assertEqual(snap["ledger"], 7, snap)
+        self.assertEqual(snap["guard"], 7, snap)
+        self.assertEqual(snap["blocked"], 0, snap)
+        self.assertEqual(snap["executable"], 7, snap)
+        self.assertEqual(snap["unobserved"], 0, snap)
+        self.assertFalse(run._resume_walk_available())
+
+        run._resume_exhausted(obs, rep, plot=self._plot(tiles), where="switch_limit")
+
+        self.assertEqual(rep.ended_by, "sleep")
+        reason = str(rep.ended_reason)
+        self.assertTrue(reason.startswith("resume_budget_exhausted:"), reason)
+        self.assertFalse(reason.startswith("resume_exhausted:"), reason)
+        self.assertNotIn("stuck:", reason)
+        self.assertIn("7 格", reason)
+        self.assertIn("走路预算用尽", reason)
+        # 反向洗白：账本还有 7 格可执行 ⇒ day_justified 必须 false（禁止放宽 is_justified_end）
+        self.assertFalse(is_justified_end("sleep", reason, pending_executable=snap["executable"]))
+        bursts = self._events(run, "no_progress_burst")
+        self.assertEqual(len(bursts), 1, run.entries)
+        ev = bursts[0]
+        self.assertEqual(ev["source"], "回片区（switch_limit）")
+        self.assertFalse(ev["exhausted"], ev)
+        self.assertFalse(ev["claim_exhausted"], ev)
+        self.assertEqual(ev["pending_executable"], 7, ev)
+        self.assertEqual(ev["pending_unobserved"], 0, ev)
+        self.assertEqual(ev["resume_walks"], run.max_plots_per_day, ev)
+        self.assertEqual(ev["resume_walk_attempts"], 2 * run.max_plots_per_day, ev)
+        self.assertIn("预算用尽", ev["note"])
+
+    def test_zero_executable_exhausted_claim_remains_justified(self):
+        """反向对照：真没可执行格（只有看不见的陈旧账本格）⇒ 仍走 `resume_exhausted:`。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.player_tile = [62, 14]
+        run = self._run(w)
+        run.leftover_targets = {(90, 90)}
+        run.leftover_area = {(90, 90): "field_nw"}
+        run._do_sleep = lambda obs, rep, why, **kw: ("sleep", why)
+        rep = self._rep(26)
+        obs = w.obs()
+
+        snap = run._pending_snapshot(obs)
+        self.assertEqual(snap["executable"], 0, snap)
+        self.assertEqual(snap["unobserved"], 1, snap)
+
+        run._resume_exhausted(obs, rep, plot=None, where="work_spot_resume")
+
+        reason = str(rep.ended_reason)
+        self.assertTrue(reason.startswith("resume_exhausted:"), reason)
+        self.assertNotIn("resume_budget_exhausted", reason)
+        self.assertTrue(is_justified_end("sleep", reason, pending_executable=0))
+        ev = self._events(run, "no_progress_burst")[0]
+        self.assertTrue(ev["exhausted"])
+        self.assertTrue(ev["claim_exhausted"])
+        self.assertEqual(ev["pending_executable"], 0, ev)
+
+    def test_walk_attempts_are_bounded_and_fail_closed(self):
+        """全部走不动也必须有界：尝试 20/20 后直接 none，不再空走（不写 stuck、不无限重试）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        w.player_tile = [62, 14]
+        run = self._run(w)
+        run.leftover_targets = {(60, 10)}
+        run.leftover_area = {(60, 10): "field_nw"}
+        run._resume_reevaluate = lambda **kw: None
+        run._resume_plot = lambda obs, *, avoid_area="": self._plot([(60, 10)], "field_nw")
+        run._walk_into_plot = lambda obs, plot: False
+        run._resume_switch_or_exhaust = (
+            lambda obs, rep, *, plot=None, where="", repeated=False: ("none", None))
+        run.no_progress_cycles = -1000          # 只测预算封顶，不让 burst 分支插手
+        rep = self._rep()
+
+        actions = [run._guard_leftover_resume(w.obs(), rep, text="守卫说还有活")[0]
+                   for _ in range(40)]
+
+        self.assertEqual(run.resume_walks, 0)
+        self.assertEqual(run.resume_walk_attempts, 2 * run.max_plots_per_day,
+                         "尝试次数必须封顶 2*max_plots_per_day，不许无限空走")
+        self.assertEqual(actions[-1], "none")
+        action, walked = run._guard_leftover_resume(w.obs(), rep, text="守卫说还有活")
+        self.assertEqual((action, walked), ("none", False))
+        self.assertEqual(run.resume_walk_attempts, 2 * run.max_plots_per_day)
+        self.assertEqual(self._events(run, "stuck"), [])
+
+    def test_guard_blocks_when_success_budget_full_even_if_attempts_remain(self):
+        """成功预算满（10/10）、尝试预算还空着 ⇒ 也不走（预算封顶优先，仍诚实收口）。"""
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.blockers[(60, 10)] = "weed"
+        w.player_tile = [62, 14]
+        run = self._run(w)
+        run.leftover_targets = {(60, 10)}
+        run.leftover_area = {(60, 10): "field_nw"}
+        run.resume_walks = run.max_plots_per_day
+        run.resume_walk_attempts = 0
+        rep = self._rep()
+
+        action, walked = run._guard_leftover_resume(w.obs(), rep, text="守卫说还有活")
+
+        self.assertEqual((action, walked), ("none", False))
+        self.assertEqual(run.resume_walk_attempts, 0, "预算被拒时连尝试计数都不该动")
+        self.assertFalse(run._resume_walk_available())
 
 
 if __name__ == "__main__":  # pragma: no cover

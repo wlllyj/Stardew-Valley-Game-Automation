@@ -1260,8 +1260,14 @@ class LongRun:
         # 【task-73】**整轮**（不是每天）已经用掉的"stuck 日翻篇"次数（上界 `MAX_STUCK_FLUSH`）。
         # 刻意不复位：一次卡死睡过去还能算偶发，两次以上就该让人来看，而不是无限"睡过去再撞一次"。
         self.stuck_flushes = 0
-        # 本日"为了看没做完的格子而往回走"的次数上限（防"来回跑"把一天走光）。
+        # 本日"为了看没做完的格子而往回走"的**成功**次数上限（防"来回跑"把一天走光）。
+        # 【task-26 / 0.7.46】只数真的走成了的；走失败（`walked=False`，四邻不可站/寻路不动）
+        # 不该烧掉"还能回去看"的预算 —— 冬27 的 7 格可执行余格就是这么被 7 次失败走路
+        # 提前把 `resume_walks` 顶到 10、之后 5 小时再也没法回去看它们。
         self.resume_walks = 0
+        # 本日回片区的**尝试**次数（含失败），单独封顶 = `2 * max_plots_per_day`
+        # （见 `_resume_walk_available`）：既防"失败重试"无限烧时间，又不再挤掉成功预算。
+        self.resume_walk_attempts = 0
         # 【task-4 / 0.7.44】`leftover_targets` 的**片区归属**（记账坐标 → fields 田区名；
         # 观测里没有田区信息时退化成 8×8 空间簇 `@x,y`）。只由 `_step_stage` 在记账时写入，
         # 换片只从这份账本里挑坐标 —— 绝不臆造。冬 7/12/18 的病灶正是"最近的残留格全是
@@ -3987,6 +3993,24 @@ class LongRun:
                 return None
         return None
 
+    def _resume_walk_available(self) -> bool:
+        """【task-26 / 0.7.46】回片区走路预算：**成功**次数封顶 `max_plots_per_day`，
+        **尝试**次数另封顶 `2 * max_plots_per_day`。
+
+        为什么要把两者分开（冬27 账本证据，L637/L641）：`resume_walks` 旧口径在走路**之前**
+        就自增，attempts 1–7（L39/L59/L93/L123/L150/L204，全部 `walked:false`）也各烧掉
+        一格预算 ⇒ t=366 时 `resume_walks` 已经是 10/10；等 t=845 只剩 7 格可执行余格
+        （L637 `work_spot{tiles:7, field_se}`）时预算已尽，`_walk_into_plot` 一次都不许走，
+        最终以 `resume_exhausted`（自称"当前观测里没有可执行目标"）收尾 —— 而 day_end
+        快照实测 `pending_executable=7`，两句话自相矛盾。
+
+        失败尝试仍要封顶（否则"走不动"的路会把一天全烧在反复走路上）；但失败不再挤掉
+        "真的看过一次"的额度，所以像冬27 这种"前面失败 7 次、后面才浮出可执行余格"的日子
+        还能回去把它们做完。
+        """
+        return (self.resume_walks < self.max_plots_per_day
+                and self.resume_walk_attempts < 2 * self.max_plots_per_day)
+
     def _tile_area(self, obs: dict[str, Any], tile: tuple[int, int]) -> str:
         """账本坐标 → 具名田区（`fields.zones_from_observe` 由**当前观测**现算，不硬编码坐标）。
 
@@ -4119,11 +4143,18 @@ class LongRun:
         from_anchor = self._resume_anchor(plot)
         # 【task-15 / 0.7.45】收工同时把"可执行面"证据一起记下来（与 day_end 同一口径）：
         # 写 resume_exhausted 的时候必须能指着数字说"当前观测里真的一格可执行格都没有"。
+        # 【task-26 / 0.7.46】只有**证据成立**（executable==0 且无残缺记录）才算 resume_exhausted；
+        # 若账本还有可执行格却收工（冬27 的 7 格、switch_limit 分支），前缀改成
+        # `resume_budget_exhausted`：诚实说"是走路预算/换片上界用尽"，不冒充"没有可执行目标"。
         snap = self._pending_snapshot(obs)
+        claim_exhausted = (int(snap["executable"]) == 0
+                           and int(snap.get("malformed", 0)) == 0)
+        burst_source = f"回片区（{where}）"
         self._journal(
             "no_progress_burst", count=self.no_progress_cycles,
-            source=f"回片区（{where}）", tiles=len(plot.get("tiles") or []),
-            reasons=reasons, exhausted=True,
+            source=burst_source, tiles=len(plot.get("tiles") or []),
+            reasons=reasons, exhausted=bool(claim_exhausted),
+            claim_exhausted=bool(claim_exhausted),
             from_area=str(plot.get("area") or ""),
             from_anchor=[from_anchor[0], from_anchor[1]] if from_anchor else None,
             pending=len(raw_pending), pending_ledger=snap["ledger"],
@@ -4131,23 +4162,40 @@ class LongRun:
             newly_stalled=marked, encircled_pending=len(encircled_pending),
             switches=self.resume_switches, farm_actions_today=self.farm_actions_today,
             samples=[[t[0], t[1]] for t in raw_pending[:8]],
+            # 【task-26 / 0.7.46】走路预算证据（成功/尝试两个计数器）
+            resume_walks=self.resume_walks,
+            resume_walk_attempts=self.resume_walk_attempts,
+            resume_walk_limit=int(self.max_plots_per_day),
+            resume_walk_attempt_limit=2 * int(self.max_plots_per_day),
             # 【task-15 / 0.7.45】新增证据字段（事件名不变）
             pending_executable=snap["executable"], pending_blocked=snap["blocked"],
             pending_unobserved=snap["unobserved"], pending_guard=snap["guard"],
             pending_stalled=snap["stalled"],
             # 【task-22 / 0.7.45】残缺 tile 数（>0 ⇒ 当天 day_justified 必 false）
             pending_malformed=snap.get("malformed", 0),
-            note="回片区 / 换片 / 当前观测都没有可执行目标 ⇒ 今天按 resume_exhausted 诚实收工："
-                 "睡下去让游戏日前进；只有当前观测里**确实没有可执行格**时 day_justified 才认这条，"
-                 "否则照旧不 VERIFIED")
+            note=("回片区 / 换片 / 当前观测都没有可执行目标 ⇒ 今天按 resume_exhausted 诚实收工："
+                  "睡下去让游戏日前进；只有当前观测里**确实没有可执行格**时 day_justified 才认这条，"
+                  "否则照旧不 VERIFIED")
+                 if claim_exhausted else
+                 ("回片区走路预算用尽/换片上界用尽，但账本仍报可执行余格 ⇒ 按 resume_budget_exhausted "
+                  "诚实收工（不是「没有可执行目标」，也不 VERIFIED；不应把预算耗尽误报成没活）"))
         rep.notes.append(
             f"回片区 {len(self.resume_stall_tiles)} 格 / 换片 {self.resume_switches} 次都拿不出目标；"
-            f"当前观测可执行 {snap['executable']} 格 vs 守卫口径 {snap['guard']} 格 ⇒ 按 resume_exhausted "
+            f"当前观测可执行 {snap['executable']} 格 vs 守卫口径 {snap['guard']} 格 ⇒ 按 "
+            f"{'resume_exhausted' if claim_exhausted else 'resume_budget_exhausted'} "
             f"诚实收工（day_justified 由可执行面证据决定）")
-        why = (f"resume_exhausted:回片区 {len(self.resume_stall_tiles)} 格都回去看过、"
-               f"换片 {self.resume_switches} 次，当前观测里没有可执行目标"
-               f"（守卫仍说：{'；'.join(reasons) if reasons else '（无）'}）"
-               + self._not_on_farm_suffix())
+        if claim_exhausted:
+            why = (f"resume_exhausted:回片区 {len(self.resume_stall_tiles)} 格都回去看过、"
+                   f"换片 {self.resume_switches} 次，当前观测里没有可执行目标"
+                   f"（守卫仍说：{'；'.join(reasons) if reasons else '（无）'}）"
+                   + self._not_on_farm_suffix())
+        else:
+            why = (f"resume_budget_exhausted:回片区走路预算用尽（成功 {self.resume_walks}/"
+                   f"{int(self.max_plots_per_day)}、尝试 {self.resume_walk_attempts}/"
+                   f"{2 * int(self.max_plots_per_day)}）、换片 {self.resume_switches}/"
+                   f"{int(self.max_plots_per_day)} 次，但账本仍有可执行余格 "
+                   f"{snap['executable']} 格（守卫仍说：{'；'.join(reasons) if reasons else '（无）'}）"
+                   + self._not_on_farm_suffix())
         ended_by, ended_reason = self._do_sleep(obs, rep, why)
         rep.ended_by, rep.ended_reason = ended_by, ended_reason
 
@@ -5246,7 +5294,8 @@ class LongRun:
         # 【task-15 / 0.7.45】守卫口径的 pending 已把"停滞/被围"格剔除；只剩挡死格时它会是空集，
         # 但这条兜底仍必须接管（否则会掉回调用方的 stuck / no_work）⇒ 用 `_dead_end_pending()`
         # 补上"账本里只剩挡死格"的情形。
-        if (pending or self._dead_end_pending()) and self.resume_walks < self.max_plots_per_day:
+        # 【task-26 / 0.7.46】预算口径换成 `_resume_walk_available()`（成功/尝试分开封顶）。
+        if (pending or self._dead_end_pending()) and self._resume_walk_available():
             self._resume_reevaluate(where="review_only_fallback")     # 【task-134 A】
             resume = self._resume_plot(obs)
             if resume is None:
@@ -5267,7 +5316,8 @@ class LongRun:
                         return None, True
                     resume = alt
             if resume is not None:
-                self.resume_walks += 1
+                # 【task-26 / 0.7.46】只有真走到了才用掉"回去看过"的预算；先记尝试。
+                self.resume_walk_attempts += 1
                 self.no_progress_cycles += 1                          # 【task-134 A】
                 if self.no_progress_cycles >= PLOT_EXHAUSTED_BURST:
                     # 【task-11 / 0.7.44】不再直接 `_no_progress_stop(stuck:)`：统一路由到
@@ -5282,16 +5332,21 @@ class LongRun:
                     if alt is not None:
                         resume = alt
                 walked = self._walk_into_plot(obs, resume)
+                if walked:
+                    # 【task-26 / 0.7.46】只有走成了才用掉"回去看过"的预算（失败尝试不计）。
+                    self.resume_walks += 1
                 self._journal("review_only_fallback", source="pending_walk",
                               tiles=len(resume["tiles"]), walked=bool(walked),
-                              attempt=self.resume_walks, reasons=reasons[:6],
+                              attempt=self.resume_walk_attempts,
+                              walks=self.resume_walks, reasons=reasons[:6],
                               note="只有 review 却说还有活 ⇒ 回到跨片地 leftover 旁边再看一次")
                 if walked:
                     self._actions += 1
                     rep.notes.append(
                         f"只有 review 却有活（{'；'.join(reasons[:2]) or '守卫说有活'}）⇒ 回到 "
                         f"{len(resume['tiles'])} 格没做完的地方再看一次"
-                        f"（review 兜底 {self.resume_walks}/{self.max_plots_per_day}）")
+                        f"（review 兜底成功 {self.resume_walks}/{self.max_plots_per_day}，"
+                        f"尝试 {self.resume_walk_attempts}/{2 * self.max_plots_per_day}）")
                     self.plot = resume
                     self.zone_name = ""
                     self.idle_rounds = 0
@@ -5331,8 +5386,9 @@ class LongRun:
         """
         # 【task-15 / 0.7.45】守卫口径 pending 已剔除停滞/被围格；只剩挡死格时它为空，但诚实
         # 收口仍要接管（见 `_dead_end_pending` 的原始账本口径）。
+        # 【task-26 / 0.7.46】预算口径换成 `_resume_walk_available()`（成功/尝试分开封顶）。
         if not ((self._pending_work() or self._dead_end_pending())
-                and self.resume_walks < self.max_plots_per_day):
+                and self._resume_walk_available()):
             return "none", False
         self._resume_reevaluate(where="guard_leftover")               # 【task-134 A】
         resume = self._resume_plot(obs)
@@ -5354,7 +5410,7 @@ class LongRun:
             resume = alt
             if resume is None:
                 return "none", False
-        self.resume_walks += 1
+        self.resume_walk_attempts += 1
         self.no_progress_cycles += 1                                  # 【task-134 A】
         if self.no_progress_cycles >= PLOT_EXHAUSTED_BURST:
             action, alt = self._resume_switch_or_exhaust(
@@ -5366,9 +5422,12 @@ class LongRun:
             if alt is not None:
                 resume = alt
         walked = self._walk_into_plot(obs, resume)
+        if walked:
+            # 【task-26 / 0.7.46】只有走成了才用掉"回去看过"的预算（失败尝试不计）。
+            self.resume_walks += 1
         self._journal("resume_walk", zone=self.zone_name,
                       tiles=len(resume["tiles"]), walked=bool(walked),
-                      attempt=self.resume_walks,
+                      attempt=self.resume_walk_attempts, walks=self.resume_walks,
                       note="守卫说还有活但本片没意图 ⇒ 回去看今天没做完的格子")
         if not walked:
             return "none", False
@@ -5376,7 +5435,8 @@ class LongRun:
         rep.notes.append(
             f"守卫说还有活（{text}）⇒ 回到没做完的 "
             f"{len(resume['tiles'])} 格旁边再看一次"
-            f"（resume_walk {self.resume_walks}/{self.max_plots_per_day}）")
+            f"（resume_walk 成功 {self.resume_walks}/{self.max_plots_per_day}，"
+            f"尝试 {self.resume_walk_attempts}/{2 * self.max_plots_per_day}）")
         self.plot = resume
         self.zone_name = ""
         self.idle_rounds = 0
@@ -8751,6 +8811,8 @@ class LongRun:
         self.encircled_day = set()
         self.frontier_clears = 0
         self.resume_walks = 0
+        # 【task-26 / 0.7.46】回片区尝试次数（含失败）每天重置；与 `resume_walks`（只数成功）分开。
+        self.resume_walk_attempts = 0
         # 【task-4 / 0.7.44】回片区"换片/停滞"账本每日重置：坐标只来自当天的 `leftover_targets`。
         self.leftover_area = {}
         self.resume_stall_tiles = set()
@@ -8950,12 +9012,15 @@ class LongRun:
                             self.idle_rounds = 0
                             continue
                         if alt is not None:            # 防御性：dead-only 一般拿不出 alt
+                            self.resume_walk_attempts += 1   # 【task-26】尝试计数（成功另记）
                             walked = self._walk_into_plot(obs, alt)
                             self._journal("resume_walk", zone=self.zone_name,
                                           tiles=len(alt["tiles"]), walked=bool(walked),
-                                          attempt=self.resume_walks, switched=True,
+                                          attempt=self.resume_walk_attempts,
+                                          walks=self.resume_walks, switched=True,
                                           note="只剩挡死格 ⇒ 换到另一片的账本待做格")
                             if walked:
+                                self.resume_walks += 1
                                 self._actions += 1
                                 self.resume_last_anchor = self._resume_anchor(alt)
                                 self.idle_rounds = 0
@@ -8998,12 +9063,17 @@ class LongRun:
                 self._journal("work_spot", zone=self.zone_name, tiles=len(plot["tiles"]),
                               note=plot.get("note"))
                 # 【task-49】`_resume_plot` 给的是**别处**的格子（玩家窗口看不到）⇒ 先走回去，
-                # 让传感器重新看见它们再谈策略。上界 `resume_walks < max_plots_per_day`
-                # （与"换片地"同一个量级）；走不动就落回正常判定，不空转。
+                # 让传感器重新看见它们再谈策略。上界见 `_resume_walk_available`
+                # （成功 `resume_walks` 与尝试 `resume_walk_attempts` 分开封顶；与"换片地"
+                # 同一个量级）；走不动就落回正常判定，不空转。
                 # 【task-4 / 0.7.44】同一锚点连走第二遍 = 该邻域已经看过、仍然拿不出目标 ⇒
                 # 先换到另一片的账本待做格，再尝试观测里可达的一格；都没有才按
                 # `resume_exhausted` 诚实收工（绝不写 `stuck:回片区…`、绝不 VERIFIED）。
-                if work_spot is None and picked is plot and self.resume_walks < self.max_plots_per_day:
+                # 【task-26 / 0.7.46】旧口径在走路**之前**就自增 `resume_walks`，失败尝试也烧
+                # 成功预算（冬27：7 次 `walked:false` 把 10/10 提前烧光，t=845 的 7 格可执行
+                # 余格一次都走不回去）⇒ 这里改用 `_resume_walk_available()`，且只在
+                # `walked == True` 时给 `resume_walks` 记账。
+                if work_spot is None and picked is plot and self._resume_walk_available():
                     self._resume_reevaluate(where="work_spot_resume")  # 【task-134 A】
                     anchor = self._resume_anchor(plot)
                     pt = FarmWorker.player_tile(obs)
@@ -9012,7 +9082,7 @@ class LongRun:
                     repeated = (anchor is not None and anchor == self.resume_last_anchor
                                 and (pt is None
                                      or _dist((int(pt[0]), int(pt[1])), anchor) <= OBSERVE_REACH))
-                    self.resume_walks += 1
+                    self.resume_walk_attempts += 1
                     self.no_progress_cycles += 1                       # 【task-134 A】
                     switched = False
                     if repeated or self.no_progress_cycles >= PLOT_EXHAUSTED_BURST:
@@ -9027,8 +9097,12 @@ class LongRun:
                         plot = alt
                         switched = True
                     walked = self._walk_into_plot(obs, plot)
+                    if walked:
+                        # 只有真的走到了才算用掉一次"回去看过"的预算（task-26 口径）。
+                        self.resume_walks += 1
                     self._journal("resume_walk", zone=self.zone_name, tiles=len(plot["tiles"]),
-                                  walked=bool(walked), attempt=self.resume_walks,
+                                  walked=bool(walked), attempt=self.resume_walk_attempts,
+                                  walks=self.resume_walks,
                                   switched=bool(switched),
                                   note=("回片区拿不出目标 ⇒ 换到另一片的待做格旁边再看一次"
                                         if switched else
@@ -9037,7 +9111,8 @@ class LongRun:
                         self._actions += 1
                         rep.notes.append(
                             f"回到没做完的 {len(plot['tiles'])} 格旁边再看一次"
-                            f"（resume_walk {self.resume_walks}/{self.max_plots_per_day}"
+                            f"（resume_walk 成功 {self.resume_walks}/{self.max_plots_per_day}，"
+                            f"尝试 {self.resume_walk_attempts}/{2 * self.max_plots_per_day}"
                             + (f"，换片 {self.resume_switches}" if switched else "") + "）")
                         self.resume_last_anchor = self._resume_anchor(plot)
                         if switched:
