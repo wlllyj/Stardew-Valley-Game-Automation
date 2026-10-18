@@ -15,6 +15,10 @@
   * 末次 `NewDay` 的行号若晚于最后一次 `SaveGame.Save() called.` 的行号 ⇒ 末次跨日后没有保存调用 ⇒ FAIL；
   * **链内单调**（deputy 审计 GAP-1）：每次保存链必须 `before save < Save called < [Save task] < completed < after save`，
     且第 k 次链整体在第 k-1 次之后；任一处逆序 ⇒ FAIL，并写清哪两串、行号。
+  * **缺失≠通过**（deputy 复审 GAP-236B-4）：PASS 前要求 `NewDay == before save == Save called == completed == after save`
+    各 ≥1 且相等；任一为 0 或不等 ⇒ 降级【无法判定】rc=2（reason 点名缺哪串）。
+  * **task 链缺失只做部分校验**（deputy 复审 GAP-236B-5）：`Synchronizing 'Save' task` 整串缺失（0 行）时
+    仍校验 `before save < Save called < completed < after save`，并标 `checked_without_task=true`，不许整体跳过。
 
 `SaveGame.Save() called.` 的假阳性判别式（L16：SMAPI 插件描述里就写着这句话）：
   有 `[HH:MM:SS LEVEL CHANNEL]` 前缀 **且** 不含 ` by AgentFarm ` / `| v0.`
@@ -118,14 +122,19 @@ def check_order(h: dict) -> dict:
     每次保存链应满足 `before save < Save called < [Save task] < completed < after save`；
     且第 k 次保存链整体在第 k-1 次之后（`after save(k-1) < before save(k)`）。
     任一处逆序 ⇒ FAIL，并写清哪两串、行号。
+
+    **GAP-236B-5（deputy 复审）**：`Synchronizing 'Save' task` 链缺失时**不许整体跳过** ——
+    仍按 `before save < Save called < completed < after save` 做**部分校验**，
+    并标记 `checked_without_task=true`；只有"除 task 外五串计数不齐"才交给计数判据。
     """
     n = len(h["after_save"])
     if n == 0:
-        return {"ok": True, "violations": [], "pairs": 0}
+        return {"ok": True, "violations": [], "pairs": 0, "checked_without_task": False}
     counts = {k: len(h[k]) for k in ORDER}
-    if len(set(counts.values())) != 1:
-        return {"ok": True, "violations": [], "pairs": 0,
-                "skipped": f"六串计数不齐（{counts}），先由计数判据处理"}
+    base = [k for k in ORDER if k != "save_task"]
+    if len({counts[k] for k in base}) != 1:
+        return {"ok": True, "violations": [], "pairs": 0, "checked_without_task": False,
+                "skipped": f"除 Save task 外五串计数不齐（{counts}），先由计数判据处理"}
     use_task = counts["save_task"] == n
     violations: list[dict] = []
     prev_after: int | None = None
@@ -144,7 +153,28 @@ def check_order(h: dict) -> dict:
                                "why": (f"第 {k + 1} 次保存链的 before save 行 {line['before_save']} 不晚于"
                                        f"第 {k} 次的 after save 行 {prev_after}（两次跨日保存链交叠）")})
         prev_after = line["after_save"]
-    return {"ok": not violations, "violations": violations, "pairs": n, "use_task_chain": use_task}
+    return {"ok": not violations, "violations": violations, "pairs": n, "use_task_chain": use_task,
+            "checked_without_task": not use_task}
+
+
+def _missing_chains(n_new: int, n_before: int, n_done: int, n_after: int) -> list[str]:
+    """GAP-236B-4（deputy 复审）：PASS 前必须六串齐全，缺失/不等都要点名。"""
+    lacks = []
+    if n_new < 1:
+        lacks.append("NewDay")
+    if n_before == 0:
+        lacks.append("`Context: before save.`（整串缺失）")
+    elif n_before != n_new:
+        lacks.append(f"before save {n_before}≠{n_new}")
+    if n_done == 0:
+        lacks.append("`completed without exceptions.`（整串缺失）")
+    elif n_done != n_new:
+        lacks.append(f"completed {n_done}≠{n_new}")
+    if n_after == 0:
+        lacks.append("`Context: after save`（整串缺失）")
+    elif n_after != n_new:
+        lacks.append(f"after save {n_after}≠{n_new}")
+    return lacks
 
 
 def judge(scan_res: dict) -> dict:
@@ -175,14 +205,24 @@ def judge(scan_res: dict) -> dict:
         if not order["ok"]:
             verdict, code = "FAIL", 1
             reasons.extend(v["why"] for v in order["violations"][:4])
+        elif (lacks := _missing_chains(n_new, n_before, n_done, n_after)):
+            # GAP-236B-4：缺失≠通过 —— 五串任一为 0 或不等 都不许 PASS，降级【无法判定】
+            verdict, code = "无法判定", 2
+            reasons.append(f"六串不齐（缺失≠通过）：{lacks}；计数 NewDay {n_new} / before {n_before} / "
+                           f"Save called {n_save} / Save task {n_task} / completed {n_done} / after {n_after}")
+        elif n_task not in (0, n_new):
+            # Save task 允许整串缺失（0），但"部分缺失"不能当 PASS
+            verdict, code = "无法判定", 2
+            reasons.append(f"Save task 链部分缺失：{n_task} 行，既不是 0 也不等于 NewDay {n_new} ⇒ 无法判定")
         else:
             verdict, code = "PASS", 0
+            if n_task == 0:
+                reasons.append("说明：`Synchronizing 'Save' task` 链缺失（0 行）⇒ 链内顺序按 "
+                               "before<called<completed<after 部分校验（checked_without_task=true）")
     else:
         verdict, code = "无法判定", 2
         reasons.append(f"六串不一致且不构成已知 FAIL 形态：NewDay {n_new} / Save called {n_save} / after save {n_after}")
 
-    if verdict == "PASS" and not (n_before == n_new and n_task == n_new and n_done == n_new):
-        reasons.append(f"PASS 但六串不齐：before {n_before} / save task {n_task} / completed {n_done}（各应为 {n_new}）")
     excluded = scan_res.get("excluded") or {}
     return {"verdict": verdict, "exit_code": code, "counts": {
         "newday": n_new, "before_save": n_before, "save_called": n_save,
@@ -382,7 +422,60 @@ def selftest() -> int:
         if r["counts"]["newday"] != 3 or r["excluded_by_chain"].get("newday") != 1:
             print("!! 夹具 F：修正后 newday 应为 3、被排除 1"); ok = False
 
-        print(f"\nSELFTEST {'PASS' if ok else 'FAIL'}（A/B/C/D/E/F 六个夹具：一红一绿 + 无法判定 + 末次顺序 + 链内逆序 + 插件行 L16）")
+        # 夹具 G（GAP-236B-4）：绿窗口但**删掉全部 `Context: before save.`** ⇒ 缺失≠通过 ⇒ 无法判定 rc=2
+        g = os.path.join(tmp, "no_before.txt")
+        _mk(g, [
+            "[12:14:43 TRACE SMAPI] Synchronizing 'NewDay' task...",
+            "[12:14:44 TRACE game] SaveGame.Save() called.",
+            "[12:14:44 TRACE SMAPI] Synchronizing 'Save' task...",
+            "[12:14:45 TRACE game] SaveGame.Save() completed without exceptions.",
+            "[12:14:46 TRACE SMAPI] Context: after save, starting fall 27 Y1.",
+            "[12:18:20 TRACE SMAPI] Synchronizing 'NewDay' task...",
+            "[12:18:21 TRACE game] SaveGame.Save() called.",
+            "[12:18:21 TRACE SMAPI] Synchronizing 'Save' task...",
+            "[12:18:22 TRACE game] SaveGame.Save() completed without exceptions.",
+            "[12:18:23 TRACE SMAPI] Context: after save, starting fall 28 Y1.",
+            "[12:20:40 TRACE SMAPI] Synchronizing 'NewDay' task...",
+            "[12:23:53 TRACE game] SaveGame.Save() called.",
+            "[12:23:53 TRACE SMAPI] Synchronizing 'Save' task...",
+            "[12:23:54 TRACE game] SaveGame.Save() completed without exceptions.",
+            "[12:23:56 TRACE SMAPI] Context: after save, starting winter 1 Y1.",
+        ])
+        r = judge(scan(g, None, None))
+        print(f"[selftest G] verdict={r['verdict']} counts={r['counts']}")
+        if r["verdict"] != "无法判定" or r["exit_code"] != 2:
+            print("!! 夹具 G 应为无法判定（before save 整串缺失 ⇒ 缺失≠通过，不是 PASS）"); ok = False
+
+        # 夹具 H（GAP-236B-5）：绿窗口**删掉全部 `Synchronizing 'Save' task`**，并把末链 completed 前移到 called 之前
+        #   ⇒ task 链缺失时仍必须校验 before<called<completed<after ⇒ FAIL，且 checked_without_task=true
+        h = os.path.join(tmp, "no_task_inverted.txt")
+        _mk(h, [
+            "[12:14:43 TRACE SMAPI] Synchronizing 'NewDay' task...",
+            "[12:14:44 TRACE SMAPI] Context: before save.",
+            "[12:14:44 TRACE game] SaveGame.Save() called.",
+            "[12:14:45 TRACE game] SaveGame.Save() completed without exceptions.",
+            "[12:14:46 TRACE SMAPI] Context: after save, starting fall 27 Y1.",
+            "[12:18:20 TRACE SMAPI] Synchronizing 'NewDay' task...",
+            "[12:18:21 TRACE SMAPI] Context: before save.",
+            "[12:18:21 TRACE game] SaveGame.Save() called.",
+            "[12:18:22 TRACE game] SaveGame.Save() completed without exceptions.",
+            "[12:18:23 TRACE SMAPI] Context: after save, starting fall 28 Y1.",
+            "[12:20:40 TRACE SMAPI] Synchronizing 'NewDay' task...",
+            "[12:23:53 TRACE SMAPI] Context: before save.",
+            "[12:23:54 TRACE game] SaveGame.Save() completed without exceptions.",   # ← 逆序（完成在调用之前）
+            "[12:23:53 TRACE game] SaveGame.Save() called.",
+            "[12:23:56 TRACE SMAPI] Context: after save, starting winter 1 Y1.",
+        ])
+        r = judge(scan(h, None, None))
+        print(f"[selftest H] verdict={r['verdict']} order_ok={r['order']['ok']} "
+              f"checked_without_task={r['order'].get('checked_without_task')}")
+        if r["verdict"] != "FAIL" or r["exit_code"] != 1 or r["order"]["ok"]:
+            print("!! 夹具 H 应为 FAIL（Save task 缺失时仍必须校验 before<called<completed<after）"); ok = False
+        if not r["order"].get("checked_without_task"):
+            print("!! 夹具 H：order.checked_without_task 应为 true（部分校验）"); ok = False
+
+        print(f"\nSELFTEST {'PASS' if ok else 'FAIL'}（A/B/C/D/E/F/G/H 八个夹具：一红一绿 + 无法判定 + 末次顺序 +"
+              f" 链内逆序 + 插件行 L16 + 缺 before save 降级 + 缺 task 链部分校验）")
         return 0 if ok else 3
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -431,9 +524,13 @@ def main() -> int:
     if order.get("skipped"):
         print(f"  链内顺序：跳过（{order['skipped']}）")
     elif order.get("violations"):
-        print(f"  链内顺序 ❌：{len(order['violations'])} 处逆序（连 Save task 链 = {order.get('use_task_chain')}）")
+        print(f"  链内顺序 ❌：{len(order['violations'])} 处逆序"
+              f"（连 Save task 链 = {order.get('use_task_chain')} / checked_without_task = {order.get('checked_without_task')}）")
         for v in order["violations"][:4]:
             print(f"    · {v['why']}")
+    elif order.get("checked_without_task"):
+        print(f"  链内顺序 ✅（部分校验）：{order.get('pairs', 0)} 次保存链满足 before < called < completed < after"
+              f"（Save task 链缺失 ⇒ checked_without_task=true）")
     else:
         print(f"  链内顺序 ✅：{order.get('pairs', 0)} 次保存链均满足 before < called < [task] < completed < after"
               f"（连 Save task 链 = {order.get('use_task_chain')}）")
