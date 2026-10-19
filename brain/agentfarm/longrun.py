@@ -9583,6 +9583,7 @@ class LongRun:
         self.scope_cap_refused_today = False
         self.refills_today = 0
         self.idle_rounds = 0
+        self._guard_walk_streak = 0
         self.blocked = {}
         self.tile_attempts = {}
         # 【task-5 / 0.7.44】"同格重分无产出"的当日计数同样每天清零（次日世界变了重新判）。
@@ -10133,8 +10134,19 @@ class LongRun:
                         break
                     if action == "acted":
                         self.idle_rounds = 0
+                        self._guard_walk_streak = 0
                         continue
                     if action == "walked":
+                        # 【liveness 修复】连续走路无进展硬上限：守卫说还有活、但反复走回 leftovers
+                        # 仍拿不出可执行目标 ⇒ 不再无限 continue，强制 honest sleep 让游戏日推进，
+                        # 避免 winter26 这类"全部 encircled"场景整天空转。
+                        self._guard_walk_streak = getattr(self, "_guard_walk_streak", 0) + 1
+                        if self._guard_walk_streak >= 10:
+                            rep.notes.append(
+                                f"连续 {self._guard_walk_streak} 次走路仍无进展 ⇒ 强制收工避免空转")
+                            rep.ended_by, rep.ended_reason = self._do_sleep(
+                                obs, rep, "stuck:连续走路无进展（encircled/unreachable 目标）")
+                            break
                         continue
                     recovered += 1
                     self.plot_exhausted_today += 1     # 【task-122】当日计数（喂当晚教训）
@@ -10190,10 +10202,12 @@ class LongRun:
             if acted and changed:
                 self.idle_rounds = 0
                 self.no_progress_cycles = 0      # 【task-134 A】真有进展 ⇒ 空转计数清零
+                self._guard_walk_streak = 0
             elif changed:
                 # 意图没落地（比如被否决），但世界确实变了 —— 也算有进展
                 self.idle_rounds = 0
                 self.no_progress_cycles = 0      # 【task-134 A】
+                self._guard_walk_streak = 0
             else:
                 self.idle_rounds += 1
                 self._journal("idle", rounds=self.idle_rounds, zone=self.zone_name,
