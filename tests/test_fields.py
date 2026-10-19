@@ -36,6 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "brain"))
 
+from agentfarm import fields as fields_mod  # noqa: E402  # 反事实测试要临时替换模块级常量
 from agentfarm.fields import (  # noqa: E402
     BLOCKER_KINDS,
     CLUMP_KIND,
@@ -474,6 +475,63 @@ class ZoneBlockerKindsTest(unittest.TestCase):
                 t.update({"clumpKind": "unknown", "clumpTarget": None, "toolOk": None})
         zone = zones_from_observe(obs, split=1)[0]
         self.assertEqual(zone_blockers_total(zone, obs), 1)
+
+    # ---- observer 的最小观测复现（scratch/observe_t15_d1_minobs.py）：同形态、同期望值 ----
+    @staticmethod
+    def _observer_minobs() -> dict:
+        """observer 的最小观测：包络 0..19、split=2 ⇒ field_nw=(5,5)+(6,5)、field_ne=(15,5)+(15,6)。
+
+        承载位一律是 `tiles[].kind == "clump"`；`clumpKind` 只作"是用什么工具"的原因说明，
+        **不参与任何判定**（脑侧从不读 clumpKind）。tillable 与 observer 脚本一致铺 0..19 的两行。
+        """
+        kinds = {(5, 5): "clump", (6, 5): "weed", (15, 5): "stone", (15, 6): "clump"}
+        tillable = [[x, y] for x in range(0, 20) for y in (0, 19)]
+        obs = farm_obs(x0=0, y0=0, x1=19, y1=19, kinds=kinds, tillable=tillable)
+        meta = {(5, 5): {"clumpKind": "stump", "clumpIndex": 600, "toolOk": True},
+                (15, 6): {"clumpKind": "boulder", "clumpIndex": 672, "toolOk": False}}
+        for t in obs["location"]["tiles"]:
+            m = meta.get(tuple(t["tile"]))
+            if m:
+                t.update(m)
+        return obs
+
+    def test_observer_minobs_two_blockers_per_zone(self):
+        """observer 实测（照抄）：field_nw={clump/stump, weed}=2、field_ne={stone, clump/boulder}=2。"""
+        obs = self._observer_minobs()
+        zones = {z.name: z for z in zones_from_observe(obs, split=2)}
+        self.assertEqual(zones["field_nw"].blockers, 2, "field_nw 两格障碍（clump 必须计入）")
+        self.assertEqual(zones["field_ne"].blockers, 2, "field_ne 两格障碍（clump 必须计入）")
+        self.assertEqual(zones["field_sw"].blockers, 0)
+        self.assertEqual(zones["field_se"].blockers, 0)
+        self.assertEqual(zone_blockers_total(zones["field_nw"], obs), 2)
+        self.assertEqual(zone_blockers_total(zones["field_ne"], obs), 2)
+
+    def test_observer_minobs_truncated_reports_none(self):
+        """observer 实测：tilesTruncated=True ⇒ zone_blockers_total 四个区一律 None（不许当 0）。"""
+        obs = self._observer_minobs()
+        obs["location"]["tilesTruncated"] = True
+        zones = {z.name: z for z in zones_from_observe(obs, split=2)}
+        for name in ("field_nw", "field_ne", "field_sw", "field_se"):
+            self.assertIsNone(zone_blockers_total(zones[name], obs),
+                              f"{name} 截断时必须【无法判定】而不是给一个数")
+
+    def test_observer_minobs_counterfactual_old_set_misses_clump(self):
+        """红/绿对照（反事实）：把 ZONE_BLOCKER_KINDS 换回 D1 之前的集合（误把 clumpKind 的
+        子类型当 kind）⇒ nw/ne 各掉 1 —— 如实复现 observer 说的"现在是 1"；还原后回到 2。"""
+        obs = self._observer_minobs()
+        old = frozenset(BLOCKER_KINDS | {"stump", "log", "boulder", "rockPile", "greenRain"})
+        saved = fields_mod.ZONE_BLOCKER_KINDS
+        try:
+            fields_mod.ZONE_BLOCKER_KINDS = old
+            zones = {z.name: z for z in zones_from_observe(obs, split=2)}
+            self.assertEqual(zones["field_nw"].blockers, 1, "D1 缺口：只剩 weed 一格（clump 漏计）")
+            self.assertEqual(zones["field_ne"].blockers, 1, "D1 缺口：只剩 stone 一格（clump 漏计）")
+        finally:
+            fields_mod.ZONE_BLOCKER_KINDS = saved
+        # 还原后必须回到 2 —— 证明这 1 的差确实只来自那个集合。
+        zones = {z.name: z for z in zones_from_observe(obs, split=2)}
+        self.assertEqual(zones["field_nw"].blockers, 2)
+        self.assertEqual(zones["field_ne"].blockers, 2)
 
 
 class VerifyZoneRetentionCliTest(unittest.TestCase):
