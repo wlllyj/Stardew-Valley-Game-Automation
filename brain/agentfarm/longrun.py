@@ -9040,9 +9040,12 @@ class LongRun:
                 obs = self._snap()
                 continue
             if task == "buy":
-                # 【0.7.48 D2 修复】`_preconditions` 返回的是**观测 dict**（不是 bool）——旧接线
-                # `changed = self._preconditions(obs, rep)` 把非空 dict 当真值 ⇒ 每条 `buy` 意图都
-                # 记 `executed_steps=1` + `acted`，**不管有没有真买到**（"假装下单"）。
+                # 【0.7.49 D2 修复】`_preconditions` 返回的是**观测 dict**（不是 bool），但它内部
+                # （`:7393`）**确实调用了** `_preconditions_apply` ⇒ 旧接线
+                # `changed = self._preconditions(obs, rep)` 的**购买路径照常真的执行（钱真的花）**；
+                # 缺陷在**记账**：`changed` 绑定非空 dict（恒真）⇒ 每条 `buy` 意图都记
+                # `executed_steps=1` + `acted`，**不管这一轮有没有真买到** ⇒ 无动作的一天被记成
+                # acted、遮蔽 stuck/无进展路径（`{"unknown_evidence":1}` 成死代码）。
                 # 真正"有没有改动世界"由 `_preconditions_apply` 返回 bool（买/卖成功才 True）。
                 # 真实入口链：`_preconditions_apply` → `_buy_seed` → `worker.buy` → 桥 `buy` →
                 # 游戏 `ShopMenu.tryToPurchaseItem(item, null, count, 0, 0)`；成败判据是**钱/背包差分**
