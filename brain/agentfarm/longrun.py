@@ -9040,7 +9040,15 @@ class LongRun:
                 obs = self._snap()
                 continue
             if task == "buy":
-                changed = self._preconditions(obs, rep)
+                # 【0.7.48 D2 修复】`_preconditions` 返回的是**观测 dict**（不是 bool）——旧接线
+                # `changed = self._preconditions(obs, rep)` 把非空 dict 当真值 ⇒ 每条 `buy` 意图都
+                # 记 `executed_steps=1` + `acted`，**不管有没有真买到**（"假装下单"）。
+                # 真正"有没有改动世界"由 `_preconditions_apply` 返回 bool（买/卖成功才 True）。
+                # 真实入口链：`_preconditions_apply` → `_buy_seed` → `worker.buy` → 桥 `buy` →
+                # 游戏 `ShopMenu.tryToPurchaseItem(item, null, count, 0, 0)`；成败判据是**钱/背包差分**
+                # （`farmwork.FarmWorker.buy`：`have_after > have_before and money_after < money_before`），
+                # 回执只是声明 —— 见 `bridge.py:1132-1136`。
+                changed = self._preconditions_apply(obs, rep)
                 if changed:
                     try:
                         obs = self._snap()
@@ -9053,6 +9061,11 @@ class LongRun:
                 acted = changed or acted
                 continue
             if task == "upgrade_tool":
+                # 【0.7.48 已知限制】工具种类**硬编码 "axe"**（本卡只做接线 + 审计，不顺手做通用化）。
+                # 真实入口链：`worker.upgrade_tool("axe")` → 桥 `upgrade_tool` → 铁匠铺
+                # `Utility.TryOpenShopMenu("ClintUpgrade","Clint",true)` → 反射
+                # `tryToPurchaseItem(item, null, 1, 0, 0)`；成败靠观测差分
+                # （`farmwork.FarmWorker.upgrade_tool`：钱少/出现 `toolBeingUpgraded`/等级变大）。
                 st = None
                 try:
                     mv = self.worker.ensure_location("Blacksmith", timeout_ms=30000)
@@ -9060,10 +9073,12 @@ class LongRun:
                         obs = self._snap()
                     st = self.worker.upgrade_tool("axe", timeout_ms=60000)
                 except Exception as exc:  # noqa: BLE001
-                    self._journal("upgrade_tool", ok=False, code="exception", reason="exception:" + type(exc).__name__)
+                    self._journal("upgrade_tool", ok=False, code="exception", reason="exception:" + type(exc).__name__,
+                                  tool="axe", tool_hardcoded=True)
                 changed = bool(getattr(st, "ok", False))
                 if st is not None:
                     self._journal("upgrade_tool", ok=changed, code=getattr(st, "code", ""), reason=getattr(st, "reason", ""),
+                                  tool="axe", tool_hardcoded=True,
                                   before=getattr(st, "before", None), after=getattr(st, "after", None))
                 self._record_intent(intent, task=task,
                                     executed_steps=1 if changed else 0,
