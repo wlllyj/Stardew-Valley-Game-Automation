@@ -51,9 +51,14 @@ MOD_VERSION_EXPECTED = "0.7.49"   # v0.7.49：P0 判据批——指定作业区�
                                   #   （`CLUMP_KIND="clump"`），另设 `CLUMP_SUBKINDS` 仅作可读原因、
                                   #   不再混进 kind 口径；`clumpKind=="unknown"` **仍计 blocker**；
                                   # ②D2：`longrun.py` 的 `buy` 分派原为 `changed = self._preconditions(obs, rep)`
-                                  #   （拿观测 dict 当真值）⇒ **每条 buy 恒 `executed_steps=1` + `acted`**
-                                  #   （假装下单）、`{"unknown_evidence":1}` 成死代码；改
-                                  #   `bool(self._preconditions_apply(obs, rep))`；
+                                  #   —— `_preconditions`（`:7379`）内部第 `:7393` 行**已调**
+                                  #   `_preconditions_apply` ⇒ **购买路径原本真的执行（钱真的花）**；
+                                  #   缺陷在**记账**：`changed` 绑定的是**观测 dict**（恒真）⇒ 恒
+                                  #   `executed_steps=1` + `acted=True`，**即使这一轮啥也没买成** ⇒ 把
+                                  #   "无动作的一天"记成 acted、遮蔽 stuck/无进展路径
+                                  #   （`{"unknown_evidence":1}` 成死代码）；改直调
+                                  #   `bool(self._preconditions_apply(obs, rep))`（购买路径逐字节等价，
+                                  #   只纠正记账；失败时少一次只读 `_snap()`）；
                                   # ③测试 +11 条（fields +8 / longrun +3），全量 `Ran 1405 / OK`；
                                   #   变异 4/4 killed（`git archive` 冻结树逐条复跑、Lead 独立复跑）；
                                   # ④`upgrade_tool` 工具硬编码 `"axe"`（对应目标1 ③铜斧链），留痕
