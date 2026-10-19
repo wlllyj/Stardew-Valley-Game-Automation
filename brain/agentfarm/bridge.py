@@ -36,7 +36,31 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.48"   # v0.7.48：A9 门禁批快修——slot_relief 字段奇偶补齐（clear_gate 补 reached）
+MOD_VERSION_EXPECTED = "0.7.49"   # v0.7.49：P0 判据批——指定作业区「大障碍」口径修正（D1）+ 经济派发真值修正（D2）
+                                  # ①D1（阻断级，目标1 ②的生死线）：`fields.py` 的 `ZONE_BLOCKER_KINDS`
+                                  #   原并入的是 `clumpKind` 的**子类型值**（stump/log/boulder/rockPile/
+                                  #   greenRain），而 Mod 给 tile 的 `kind` 恰是**字面量 `"clump"`**
+                                  #   （`WorldSnapshot.cs:807`；`Contracts.cs:590` 列 clump、`:598` 只有
+                                  #   `kind=="clump"` 才填 clump* 元数据；`ClumpMeta.cs:38-73` 的 `KindOf`
+                                  #   永不返回 "clump"）⇒ 三处判定点（`fields.py:344 zones_from_observe` /
+                                  #   `:386 zone_blockers_total` / `:529 plot_in_zone`）**永不命中大障碍**，
+                                  #   区内只剩树桩/圆木/巨石也报 blockers=0（**假清空**），
+                                  #   `tools/verify-zone-retention.py` 会对"桩一直没清"的两次观测输出
+                                  #   `PASS (retained clear)` / exit 0（observer 实测）；
+                                  #   修法：`ZONE_BLOCKER_KINDS = frozenset(BLOCKER_KINDS | {CLUMP_KIND})`
+                                  #   （`CLUMP_KIND="clump"`），另设 `CLUMP_SUBKINDS` 仅作可读原因、
+                                  #   不再混进 kind 口径；`clumpKind=="unknown"` **仍计 blocker**；
+                                  # ②D2：`longrun.py` 的 `buy` 分派原为 `changed = self._preconditions(obs, rep)`
+                                  #   （拿观测 dict 当真值）⇒ **每条 buy 恒 `executed_steps=1` + `acted`**
+                                  #   （假装下单）、`{"unknown_evidence":1}` 成死代码；改
+                                  #   `bool(self._preconditions_apply(obs, rep))`；
+                                  # ③测试 +11 条（fields +8 / longrun +3），全量 `Ran 1405 / OK`；
+                                  #   变异 4/4 killed（`git archive` 冻结树逐条复跑、Lead 独立复跑）；
+                                  # ④`upgrade_tool` 工具硬编码 `"axe"`（对应目标1 ③铜斧链），留痕
+                                  #   `tool="axe"` / `tool_hardcoded=True`，本批不做通用化；
+                                  # ⑤本批无 Mod 代码变更：dll 与 0.7.47/0.7.48 逐字节相同（293888B/`C9B3BD6C…`）。
+                                  # --- 历史 ---
+                                  # v0.7.48：A9 门禁批快修——slot_relief 字段奇偶补齐（clear_gate 补 reached）
                                   # ①唯一改动：`_note_clear_area_bag_gate` 的 `slot_relief` 记录补
                                   #   `reached=False`（语义：clear_gate 是"今天不再新开 clear_area"的闸，
                                   #   不是"腾到目标水位" ⇒ 绝不谎报达标，与压力通道同口径）；由此
