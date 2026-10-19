@@ -9877,6 +9877,13 @@ class LongRun:
             # `continue` 重新观测/决策；腾不出来时 `_slot_relief` 已置 `inventory_blocked_today`
             # 并记 journal，守卫下一轮就会用 `inventory_blocked` 如实收尾（不假 VERIFIED）。
             if self._slot_relief(obs, rep):
+                # 【task-240b】腾格成功 ⇒ 重新取快照让后续 _preconditions 看见新空格，
+                # 并**立刻尝试买种子**（腾格前 _preconditions 被 _slot_relief 的 continue 跳过，
+                # 买种子因此永远不触发 —— catch-22）。修后：腾格→买种子→continue 重新观测。
+                obs = self._snap_or(obs)
+                last_obs = obs
+                self._observe_free_slots(rep, obs)
+                obs = self._preconditions(obs, rep)
                 continue
 
             # 【task-143】`_preconditions` 会真的买种子 ⇒ 必须用它还回来的**改动后**观测继续

@@ -15140,5 +15140,150 @@ class TestBuyUpgradeDispatch(unittest.TestCase):
         self.assertEqual(w.buy_calls, [], w.buy_calls)
 
 
+class _ReliefBuyWorld(FakeWorld):
+    """【task-240b】复刻真机 `logs/run-test-space.jsonl`（冬 26、Mod 0.7.49）的形态：
+    背包**真满**（0 空格）+ 有可卖盈余 + 没有当季种子。买成功后按真 Mod 的形态往
+    `player.seeds[]` 补一条（`plantableNow` 按季节），让"买完不再下单"可判。
+
+    真机时序（该账本、已带 task-240b 修复）：`t=0.44` 腾格 `freed=2`（0→2、
+    `trigger=space_pressure`）⇒ `t=0.64` **同一轮**发起 `buy`（回执
+    `item_not_sold` 如实记账）。
+    """
+
+    def __init__(self, *, season: str = "winter", day: int = 26) -> None:
+        super().__init__(seeds=0, money=500, weeds=0)
+        self.season = season
+        self.day = day
+        # 新 Mod：背包里**没有**种子（`player.seeds=[]` 是"真没种子"，不是缺字段）
+        self.player_seeds: list[dict] = []
+        # 满包：3 件工具 + 9 叠已知表真盈余（Slime×99 > 保留 K）⇒ 腾格有东西可卖
+        self.inventory = [
+            {"slot": 0, "id": "Axe", "qualifiedId": "(T)Axe", "name": "Axe",
+             "stack": 1, "isTool": True},
+            {"slot": 1, "id": "Hoe", "qualifiedId": "(T)Hoe", "name": "Hoe",
+             "stack": 1, "isTool": True},
+            {"slot": 2, "id": "WateringCan", "qualifiedId": "(T)WateringCan",
+             "name": "Watering Can", "stack": 1, "isTool": True},
+        ] + [{"slot": 3 + i, "id": "766", "qualifiedId": "(O)766", "name": "Slime",
+              "stack": 99, "isTool": False} for i in range(9)]
+        self.dirt = set()
+        self.crops = {}
+
+    def buy(self, item, count, shop):
+        st = super().buy(item, count, shop)
+        if st.ok and self.player_seeds is not None:
+            self.player_seeds = list(self.player_seeds) + [{
+                "id": str(item), "name": SEED_NAME, "stack": int(count),
+                "seasons": ["spring", "summer", "fall"],
+                "plantableNow": self.season != "winter"}]
+        return st
+
+
+class TestTask240bReliefThenBuy(unittest.TestCase):
+    """【task-240b】腾格成功 ⇒ **同一轮就试买种子**（修"腾格后买种子永远不触发"）。
+
+    病灶（catch-22）：`_slot_relief` 腾格成功后旧接线直接 `continue` ⇒ 本轮跳过
+    `_preconditions`（买种子的唯一入口）。而"买种子"本身就要求背包有空格——空格正是
+    腾格刚腾出来的：于是出现"要腾格才买得了、腾了格却本轮不买"，只能指望下一轮
+    （下一轮还可能再被腾格/守卫/预算占掉）。修法（`longrun.py:9879-9887`）：腾格成功
+    ⇒ 重取快照 ⇒ `_observe_free_slots` ⇒ `_preconditions` ⇒ `continue`。
+
+    本类钉三件事（卡面验收）：
+      ① 腾格成功后的下一条主循环调用必须是 `_preconditions`（同一轮必试买种子）；
+      ② 传给 `_preconditions` 的必须是**腾格后重取的新快照**（空格 trace 同轮刷新）；
+      ③ 不重复买：买成之后当天不再发起第二条 `buy`。
+    """
+
+    def _run(self, w: FakeWorld) -> LongRun:
+        worker = _SpaceWorker(w)
+        client = FakeClient(w)
+        run = make_run(w, target_days=1, max_days=1,
+                       client_factory=lambda: client, worker_factory=lambda _c: worker)
+        run.client = client
+        run.worker = worker
+        # `_run_day` 直接驱动时要把起点对齐到"现在"（`run()` 里由 `self.started = self.now()`
+        # 做）：否则 `started=0.0` + 墙钟 `now` ⇒ `_budget_exhausted` 立刻为真、循环一轮不进。
+        run.started = run.now()
+        run.max_steps = 60
+        run.allow_buy = True
+        return run
+
+    @staticmethod
+    def _spy(run: LongRun) -> list[tuple]:
+        """按调用顺序记录主循环里的 `_slot_relief` / `_preconditions`。
+
+        `_preconditions` 那条连**当时拿到的观测**与 `rep.free_slots_last` 一起记
+        （判"快照/trace 刷没刷新"用）。
+        """
+        seq: list[tuple] = []
+        relief, pre = run._slot_relief, run._preconditions
+
+        def _relief(obs, rep):
+            out = relief(obs, rep)
+            seq.append(("relief", bool(out)))
+            return out
+
+        def _pre(obs, rep):
+            seq.append(("pre", obs, rep.free_slots_last))
+            return pre(obs, rep)
+
+        run._slot_relief, run._preconditions = _relief, _pre
+        return seq
+
+    def test_relief_success_buys_seeds_in_the_same_round(self):
+        """①+②：腾格成功 ⇒ 同一轮调 `_preconditions`，且拿到的是腾格后的新快照。"""
+        w = _ReliefBuyWorld(season="winter")
+        run = self._run(w)
+        seq = self._spy(run)
+        run._run_day()
+
+        first_ok = next((i for i, e in enumerate(seq)
+                         if e[0] == "relief" and e[1] is True), None)
+        self.assertIsNotNone(first_ok,
+                             "满包 + 可卖盈余 ⇒ 第一轮腾格必须成功（本用例的前提）")
+        # ① 同一轮买种子：腾格成功后的下一条主循环调用必须是 `_preconditions`
+        self.assertEqual(seq[first_ok + 1][0], "pre",
+                         "腾格成功后必须**同一轮**试买种子（旧接线直接 continue ⇒ 整轮跳过 "
+                         "_preconditions，买种子被推迟甚至永远不触发）")
+        # ② 快照刷新：传给 `_preconditions` 的观测必须看得到腾出来的空格
+        fresh = seq[first_ok + 1][1]
+        free, status = player_free_slots(FarmWorker.player_of(fresh))
+        self.assertEqual(status, "ok")
+        self.assertGreaterEqual(int(free), 1,
+                                "买种子前必须看到腾格腾出来的空格（拿腾格前的 stale obs 进 "
+                                "_preconditions ⇒ free=0 ⇒ buy_full 白撞 no_inventory_space）")
+        # ② trace 同轮刷新：进 `_preconditions` 时 `free_slots_last` 已是腾格后的读数
+        self.assertGreaterEqual(int(seq[first_ok + 1][2] or 0), 1,
+                                "腾格成功后必须同轮重算空格 trace（_observe_free_slots）")
+        # 行为面：这一轮真的发起了 `buy`（不是只接线不下单）
+        self.assertTrue(w.buy_calls, "腾格成功 ⇒ 本轮必试买种子（钱够、有空格）")
+        # 腾格确实发生了（行为佐证）：至少一条 freed>=1 的 slot_relief 事件
+        freed = [e for e in run.entries
+                 if e.get("event") == "slot_relief" and int(e.get("freed") or 0) >= 1]
+        self.assertTrue(freed, run.entries[-3:])
+        # 结构不变量：两个 `_preconditions` 之间只许隔着 `_slot_relief`
+        #（腾格轮多出的那次调用 + continue 不许退化成"同一轮连调两次"）。
+        pres = [i for i, e in enumerate(seq) if e[0] == "pre"]
+        for a, b in zip(pres, pres[1:]):
+            between = seq[a + 1:b]
+            self.assertTrue(between and all(e[0] == "relief" for e in between),
+                            f"两个 `_preconditions` 之间只许隔着 `_slot_relief`：{seq}")
+
+    def test_relief_round_buy_is_never_repeated(self):
+        """③不重复买：买成之后当天不再发起第二条 `buy`（春季 + 货架在售）。"""
+        w = _ReliefBuyWorld(season="spring", day=1)
+        w.buy_offers = [{"id": "472", "name": "Parsnip Seeds", "price": 20}]
+        run = self._run(w)
+        seq = self._spy(run)
+        run._run_day()
+
+        self.assertTrue(seq and seq[0][0] == "relief",
+                        "主循环第一轮就该问一次腾格（本用例的前提）")
+        self.assertTrue(w.buy_calls, "有钱、有货、腾出格 ⇒ 必须真的买到")
+        self.assertEqual(len(w.buy_calls), 1,
+                         f"买成后当季可种 > 0 ⇒ 当天不得再下单（腾格轮多出的那次 "
+                         f"_preconditions 不许变成双买）：{w.buy_calls}")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
