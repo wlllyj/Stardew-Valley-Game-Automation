@@ -15103,6 +15103,42 @@ class TestBuyUpgradeDispatch(unittest.TestCase):
         rec = self._one(run, "upgrade_tool")
         self.assertEqual(rec["executed_steps"], 1, rec)
 
+    # ---- lead 补丁3 裁决①：同日"派发 + 主循环"两处都调 `_preconditions`，但不会重复下单 ----
+    def test_buy_dispatch_and_main_loop_do_not_double_order(self):
+        """重复调用**不会双买**：买到当季可种种子后，`_preconditions_apply` 因 `plantable>0`
+        早退（longrun.py:7424-7425）；主循环再调一次 `_preconditions`（longrun.py:9832 的
+        调用点）不得再产生第二条 `buy`。"""
+        w = FakeWorld(weeds=0, seeds=0, money=5000)
+        run = make_run(w, target_days=1, max_days=1)
+        run.client, run.worker, run.started = FakeClient(w), _NoLootWorker(w), 0.0
+        run.allow_buy = True
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        intent = TaskIntent("buy", "inventory", "买种子", "seeds<2")
+        # ① 派发路径：真的走 `_preconditions_apply`，买中一次。
+        acted1, _ = self._drive(run, intent)
+        self.assertTrue(acted1, "首次应真买到（钱/格/货架都够）")
+        self.assertEqual(len(w.buy_calls), 1, w.buy_calls)
+        # ② 主循环路径：同一天再走一次 `_preconditions`，手上已有当季种子 ⇒ 必须早退，不再下单。
+        run._preconditions(run._snap(), rep)
+        self.assertEqual(len(w.buy_calls), 1, f"同日已买到当季种子后不得再下单：{w.buy_calls}")
+        # ③ 即便强行走派发 6 轮，也不得突破每日上限（两处门闸共享同一计数器）。
+        for _ in range(6):
+            self._drive(run, intent)
+        self.assertLessEqual(len(w.buy_calls), longrun_mod.MAX_BUY_TRIES_PER_DAY, w.buy_calls)
+        self.assertLessEqual(run.buy_attempts_today, longrun_mod.MAX_BUY_TRIES_PER_DAY)
+
+    def test_buy_daily_cap_is_a_hard_stop(self):
+        """每日 buy 上限是**硬闸**（longrun.py:7492）：次数用满后即便钱/格都够也一次都不下单
+        ⇒ `_execute` 的 buy 派发拿不到 `changed`，不会"假装下单"。"""
+        w = FakeWorld(weeds=0, seeds=0, money=5000)
+        run = make_run(w, target_days=1, max_days=1)
+        run.client, run.worker, run.started = FakeClient(w), _NoLootWorker(w), 0.0
+        run.allow_buy = True
+        run.buy_attempts_today = longrun_mod.MAX_BUY_TRIES_PER_DAY
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        self.assertFalse(run._preconditions_apply(run._snap(), rep), "上限用满后不得再下单")
+        self.assertEqual(w.buy_calls, [], w.buy_calls)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
