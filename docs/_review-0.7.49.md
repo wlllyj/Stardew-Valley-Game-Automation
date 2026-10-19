@@ -4,10 +4,14 @@
 - 角色：deputy-lead（对抗验收方）。只读生产代码；写范围仅 `docs/_review-*.md` + `scratch/`；不 deploy、不碰游戏、不改任务板。
 - 立场：不信作者自述、不信回执。变异**必须**在 `git archive <ref>` 冻结树上实测复跑；缺失 ≠ 通过；判据用独立观测差分。
 - 卡：T16（lead m00598）：①冻结树 provenance 双跑 ②变异独立复跑 ③`git show --stat` + `check-release --expect 0.7.49` ④D2 语义复核 ⑤D1 复核 → 产出本文档 + 闸口行。
+- **追加指令（lead m00844）**：验收对象定为 **`daceb48`**；我自己复核"相对 `51ef0a7` 的 delta 只有注释/测试/scratch/docs"（§1.1，**若发现非注释改动必须停下上报**——实测为 0）；`51ef0a7` 首轮读数不推翻，只补 `daceb48` 关键项并标注差异（§2/§3）。
 
 ## 0. 闸口结论（必答行）
 
-**0.7.49 可否用于 A9 与目标1 裁决：放行**（附下述 3 条已知限制；见 §8）。
+**0.7.49（`daceb48`）可否用于 A9 与目标1 裁决：放行**（已知限制 L1–L9 见 §8；其中 L4/L9 是「冻结树单测不绿」的**如实记录，不是通过读数**）。
+
+- **验收对象 = `git archive daceb48` 解出的冻结树**（lead m00844 指令）。
+- **相对 `51ef0a7` 的 delta 判定 = 注释/测试/scratch/docs only**，判定依据是我自己的机械双判（§1.1），**不采信任何自述**；`51ef0a7` 的首轮读数不推翻，并列保留于 §2/§3。
 
 理由（全部为本会话实测读数，非引用作者）：
 
@@ -41,6 +45,57 @@ Lead 裁决：保留代码、dev-coder 接管重交付；**独立验收方 = pro
 
 ---
 
+### 1.1 【自验】`51ef0a7 → daceb48` 的 delta = 注释/测试/scratch/docs only（我自己的判定依据）
+
+**命令原文（lead m00844 第 1 步，我自己跑，未采信其结论）：**
+
+```powershell
+git diff --stat 51ef0a7 daceb48
+git diff 51ef0a7 daceb48 -- brain/
+$env:PYTHONUTF8="1"; & C:\Users\admin\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe scratch\_t16_delta_ast.py 51ef0a7 daceb48
+```
+
+**读数（`git diff --numstat 51ef0a7 daceb48`）：**
+
+```
+8   3  brain/agentfarm/bridge.py
+6   3  brain/agentfarm/longrun.py
+16  0  docs/00-开发日志.md
+169 0  docs/_review-task38-ab.md
+12  0  scratch/_fix_journal.py
+11  0  scratch/_p04_patch.py
+49  0  scratch/_p056_patch.py
+127 0  scratch/_patch3_mutate.py
+161 0  scratch/longrun-a9b9-rollout-checklist.md
+58  0  tests/test_fields.py
+36  0  tests/test_longrun.py
+1   1  tools/_note-0749.txt
+12 files changed, 654 insertions(+), 7 deletions(-)
+```
+
+**五条判据（逐条实测）：**
+
+| # | 判据 | 读数 | 结论 |
+|---|---|---|---|
+| 1 | `git diff 51ef0a7 daceb48 -- brain/` 改动行是否全为 `#` | `bridge.py` 改动全落在 `MOD_VERSION_EXPECTED = "0.7.49"` 之后的注释块；`longrun.py` 改动全落在 `if task == "buy":` 下的 `#` 注释；两处字面量未动 | 纯注释 |
+| 2 | 机械双判（`scratch/_t16_delta_ast.py`）：AST 去 docstring 比对 + 剔 `#` 行逐行比对 | `brain/agentfarm/bridge.py -> AST(去docstring) 相同 ⇒ 语义等价；剔注释后逐行相同 ⇒ 纯注释`；`brain/agentfarm/longrun.py -> 同上` | 生产代码语义零变化 |
+| 3 | 有删除的文件只有 3 个（`bridge.py`/`longrun.py`/`tools/_note-0749.txt`）；`tests/` 为 `58/0` 与 `36/0` | `git diff --numstat` | 测试**纯新增**，无既有测试被改或删；note 是 1 行文字改写 |
+| 4 | 5 个 `scratch/*` 文件在 `51ef0a7` 是否存在 | `git cat-file -e 51ef0a7:scratch/_fix_journal.py` → **rc=128**（`_p04_patch.py`/`_p056_patch.py`/`_patch3_mutate.py`/`longrun-a9b9-rollout-checklist.md` 同为 128） | 全是新增文件，不可能改变既有行为 |
+| 5 | `tests/` 是否 import 任何 `scratch` 模块 | `git grep -nE "^\s*(import\|from)\s+scratch" -- tests/` → 无匹配（rc=1）；`tests/*` 中 `scratch` 字样只出现在**夹具数据路径**（如 `scratch/_ledger_green.jsonl`） | scratch 变化不会改变测试结果 |
+
+> 装置自身 bug 与产品问题分开判（AGENTS.md §4）：`_t16_delta_ast.py` 的整体 `RC=1` 是**我这台粗判装置的误报**——它把「新增文件」和「测试新增代码」也算成"非注释改动"。按上表 5 条逐条核过后，**生产代码侧的非注释改动 = 0**。
+
+**旁证（当前 HEAD 与冻结树的生产代码一致性）：**
+
+```powershell
+git diff --stat daceb48 HEAD -- brain/ mod/ tests/ tools/   # → 无输出（空）
+git log --oneline daceb48..HEAD                             # → 1de5fc2（我的报告/探针）、031c471（devlog）
+```
+
+⇒ 当前 HEAD `1de5fc2` 的**生产代码与冻结树 `daceb48` 逐字节相同**，故本报告的"工作树读数"与"冻结树读数"可直接互证。
+
+---
+
 ## 2. ① 冻结树 provenance 双跑
 
 **命令原文：**
@@ -65,14 +120,18 @@ $env:PYTHONUTF8="1"; & C:\Users\admin\.dsh\dsh-runtimes\dsh-primary-runtime\depe
 [blob] mod/AgentFarm.Bridge/manifest.json       git=25513981a340 sha256=66202D9F4CCBBCE5D4D37E89C9D80B6A50C5D1DC471B5652FCBFDA5DA2EFA694
 ```
 
-**全量单测（冻结树，两次逐字一致）：**
+**全量单测（冻结树 `daceb48`，两次逐字一致，带 `chcp 65001`）：**
+
+```powershell
+chcp 65001 > $null; $env:PYTHONUTF8="1"; & <DSH python> scratch\_t16_accept.py daceb48
+```
 
 ```
-[full#1] Ran 1396 / failures+errors=8 / OK=False / tail='FAILED (failures=2, errors=6, skipped=13)'
-[full#2] Ran 1396 / failures+errors=8 / OK=False / tail='FAILED (failures=2, errors=6, skipped=13)'
+[full#1] Ran 1396 / failures+errors=7 / OK=False / tail='FAILED (failures=1, errors=6, skipped=13)'
+[full#2] Ran 1396 / failures+errors=7 / OK=False / tail='FAILED (failures=1, errors=6, skipped=13)'
 ```
 
-8 条红**逐条归因（非产品问题，均为已知）**：
+7 条红**逐条归因（非产品问题，均为 gitignored 夹具缺失）**：
 
 | # | 测试 | 类型 | 归因 |
 |---|---|---|---|
@@ -83,17 +142,69 @@ $env:PYTHONUTF8="1"; & C:\Users\admin\.dsh\dsh-runtimes\dsh-primary-runtime\depe
 | 5 | `test_analyze_longrun.TestTask24ProbesAndRealLedgers.test_a8_new_aggregates_undecidable` | ERROR | `logs/longrun-runA8-0743.jsonl` 缺失 |
 | 6 | `test_analyze_longrun.TestTask24ProbesAndRealLedgers.test_smoke_0744_new_aggregates_undecidable` | ERROR | `logs/longrun-smoke-0744.jsonl` 缺失 |
 | 7 | `test_analyze_longrun.TestCliContract.test_json_mode_is_parseable` | FAIL | `AssertionError: 2 != 0`（#2 的 `scratch/_ledger_green.jsonl` 缺失 → CLI 退码 2） |
-| 8 | `test_longrun.TestTask182ClumpRulesBehaviour.test_csharp_rules_self_test_passes` | FAIL | C# 自检码页假红（lead 卡面已声明：不带 `chcp 65001` 时假红） |
+| ~~8~~ | ~~`test_longrun.TestTask182ClumpRulesBehaviour.test_csharp_rules_self_test_passes`~~ | ~~FAIL~~ | **带 `chcp 65001` 后不再出现**；不带 chcp 的首轮读数为 8 条红（见下） |
 
-`51ef0a7` 另跑一遍：`Ran 1391 / failures+errors=7`（#8 偶发不出现——该码页假红**不稳定**，两次结果在 7/8 之间摆动），**同样是逐字双跑一致**。#8 是否出现不改变任何产品判据：它是 `Ran` 之外的码页问题，非业务断言。
+> **码页假红（不稳定，如实记）**：`daceb48` **不带** `chcp 65001` 的首轮双跑读到 `Ran 1396 / failures+errors=8 / FAILED (failures=2, errors=6, skipped=13)`（多出第 8 条）；**带** `chcp 65001` 的两轮双跑恒为 **7** 条。`51ef0a7` 首轮为 `Ran 1391 / failures+errors=7`。⇒ 该假红在 7/8 之间摆动，**非产品红也非产品绿**，与 L5 同口径。
 
-**对照：主工作树**（含 logs/ fixtures，`cd tests && python -m unittest discover -p "test_*.py"`）：
+### 2.1 「冻结树 1396 ≠ 工作树 1410」的 14 条差额逐条归因
+
+**命令原文：**
+
+```powershell
+$env:PYTHONUTF8="1"; & <DSH python> scratch\_t16_ids_full.py daceb48   # 全量 -v 测试 ID 差集
+```
+
+**读数：**
 
 ```
-Ran 1410 tests  →  FAILED (failures=1)
+[archive daceb48] 收集到测试 ID = 732   tail=['Ran 1396 tests', 'FAILED (failures=1, errors=6, skipped=13)']
+[worktree HEAD]   收集到测试 ID = 742   tail=['Ran 1410 tests', 'OK']
+only-in-worktree (14): 全部在 test_analyze_longrun 的 4 个类里
+  TestRealRun1 (3) / TestRealRun2 (3) / TestRealRunA8Shapes (4) / TestRealRunA8Task13 (4)
+only-in-archive (4):
+  setUpClass (test_analyze_longrun.TestRealRun1)
+  setUpClass (test_analyze_longrun.TestRealRun2)
+  setUpClass (test_analyze_longrun.TestRealRunA8Shapes)
+  setUpClass (test_analyze_longrun.TestRealRunA8Task13)
 ```
 
-**结论**：冻结树缺 fixture 的 14 条在工作树上可跑（1396 + 14 = 1410）；工作树那 1 条红 = #8（码页假红）。**冻结树缺 fixture 属 `git archive` 的固有特性，不是产品缺陷**；但**验收以冻结树为准**，故 §8 把"fixture 未入库"列作已知限制（与 0.7.47/0.7.48 同口径）。
+`742 − 14 + 4 = 732` ⇒ 冻结树上这 4 个类的 `setUpClass` 因**缺 gitignored 真账本**抛 `SkipTest`，把 14 条测试**折叠成 4 条 setUpClass skip**。跳过原因逐条（`-v` 原文）：
+
+```
+setUpClass (TestRealRun1)      ... skipped '缺少账本 …\logs\longrun-3day-llm-run1.jsonl'
+setUpClass (TestRealRun2)      ... skipped '缺少账本 …\logs\longrun-3day-llm-run2.jsonl'
+setUpClass (TestRealRunA8Shapes)   ... skipped '缺少账本 …\logs\longrun-runA8-0743.jsonl'
+setUpClass (TestRealRunA8Task13)   ... skipped '缺少账本 …\logs\longrun-runA8-0743.jsonl'
+test_run5_three_hits_regression ... skipped '缺少账本 …\logs\longrun-3day-llm-run5.jsonl'
+test_real_run6_buy_and_unmapped ... skipped 'run6 账本不在（logs\longrun-3day-llm-run6.jsonl）'
+test_real_vacuum_fixture_exits_one … skipped 'Lead 的真空夹具不在（scratch\_t5x_vacuum.jsonl）'
+… skipped '0.7.42 冒烟账本不在（干净检出）⇒ skip，不许当 PASS'
+```
+
+⇒ **缺失一律 skip、不许当 PASS**（测试自身就是这么写的），冻结树上没有一条靠"缺失"蒙成绿。
+
+**对照：主工作树**（夹具齐全；产品代码与 `daceb48` 逐字节相同，见 §1.1 旁证）：
+
+```powershell
+chcp 65001 > $null; $env:PYTHONUTF8="1"; $env:PYTHONPATH="<repo>\brain"; & <DSH python> -m unittest discover -s tests -p "test_*.py"
+```
+
+```
+Ran 1410 tests in 15.804s
+OK                     ← 无 skipped 后缀 ⇒ 0 skip
+```
+
+**冻结树 py_compile（与 `check-release` 同口径：`brain/agentfarm/*.py` + `tests/*.py`）：**
+
+```
+ARCHIVE py_compile files = 35  rc = 0  stderr =
+```
+
+**结论（如实，含对 Lead 数字的更正）**：
+
+1. `Ran 1410 / OK` **是工作树读数**；`git archive daceb48` **达不到 1410**（14 条被夹具折叠 + 7 条夹具红）。lead m00844 写的"单测应 `Ran 1410 / OK`"若指**冻结树**，**与实测不符**——冻结树读数是 `Ran 1396 / 7 红`。
+2. 两棵树的**产品代码逐字节相同**（§1.1 旁证），7 条红 + 14 条折叠**全部**归因于 gitignored 夹具（`logs/*.jsonl`、`scratch/_ledger_*.jsonl`、`scratch\_t5x_vacuum.jsonl`）在干净检出中不存在 ⇒ **属 `git archive` 固有特性，不是产品缺陷**；但按"缺失 ≠ 通过"，**冻结树不得读成全绿**（L4/L9）。
+
 
 ---
 
@@ -133,7 +244,12 @@ $env:PYTHONUTF8="1"; & <DSH python> scratch\_patch3_mutate.py
 杀数 = 4 / 4
 ```
 
-> 注：卡面写的文件名 `scratch/_p0_d1d2_mutate.py` **在仓库中不存在**；真实存在的两台装置是 `scratch/_t16_accept.py`（我的，接受 `ref` 参数）与 `scratch/_patch3_mutate.py`（作者的，**硬编码 `git archive HEAD`**，见该文件 `:84`）。后者因此跑的是 HEAD 树 = `031c471`，其 `brain/` 与 `daceb48` 仅注释之差，不影响变异判定。
+> 注：卡面写的文件名 `scratch/_p0_d1d2_mutate.py` **在仓库中不存在**；真实存在的两台装置是 `scratch/_t16_accept.py`（我的，接受 `ref` 参数）与 `scratch/_patch3_mutate.py`（作者的，**硬编码 `git archive HEAD`**，见该文件 `:84`）。
+>
+> **本会话二次复跑（`chcp 65001`，读数与首轮逐字一致）**：
+> - 我的装置 `scratch\_t16_accept.py daceb48` → `[baseline] 定向 Ran 18 / failed=0` + M1/M2/M3/M4 全 **KILL**（4/4，数字见 §3.1）；
+> - 作者装置 `scratch\_patch3_mutate.py`（跑 `git archive HEAD`，HEAD 此时 = `1de5fc2`）→ `[baseline] Ran 18 / failed=0` + M5/M6/M7/M8 全 **KILL**（`Ran=10 failed=9` / `Ran=13 failed=3` / `Ran=5 failed=1` / `Ran=5 failed=1`）。
+> - **可等价于在 `daceb48` 上跑**的依据（非自述）：`git diff --stat daceb48 HEAD -- brain/ mod/ tests/ tools/` → **空**，即 `HEAD` 与冻结树的生产代码逐字节相同（§1.1 旁证）。
 
 ### 3.3 自报 vs 实测（两列）
 
@@ -171,22 +287,29 @@ git show --stat --format="%H %s" 51ef0a7
 $env:PYTHONUTF8="1"; & <DSH python> tools\check-release.py --expect 0.7.49
 ```
 
+```powershell
+chcp 65001 > $null; $env:PYTHONUTF8="1"; & <DSH python> tools\check-release.py --expect 0.7.49
+```
+
 ```
 ✅ manifest Version == brain MOD_VERSION_EXPECTED —— manifest=0.7.49 / brain=0.7.49
-✅ 版本 == 期望值 0.7.49
+✅ 版本 == 期望值 0.7.49 —— manifest=0.7.49 / brain=0.7.49
 ✅ dll 不比源码旧 —— dll=09:29:00 / 最新源码=Skills.cs 20:26:30
 ✅ py_compile（35 个文件）
-❌ 全量单测（Ran 1410 tests） —— FAILED (failures=1)
-❌ 工作树干净（要提交的不能被漏掉） —— 12 项未提交：?? scratch/_patch_analyzer.py; ?? scratch/_t16_accept.py; …
+✅ 全量单测（Ran 1410 tests） —— OK
+❌ 工作树干净（要提交的不能被漏掉） —— 11 项未提交：?? scratch/_patch_analyzer.py; ?? scratch/_t16_delta_ast.py; ?? scratch/_t17_bloat.py; …
 结论：❌ 有红项，不要装机/不要起跑
 RC=1
 ```
 
+> **前后两次读数对照（如实）**：不带 `chcp 65001` 的首轮读到 `❌ 全量单测（Ran 1410 tests） —— FAILED (failures=1)`（= 码页假红 L5）、未提交 12 项；带 `chcp 65001` 的本轮读到 `✅ 全量单测（Ran 1410 tests） —— OK`、未提交 **11** 项（差额是本卡新落盘的 `scratch/_t16_delta_ast.py`）。
+> **注意口径**：`check-release` 的"全量单测"跑的是**工作树**，不是 `git archive` 冻结树 ⇒ 它的 `Ran 1410 / OK` **不能**当作冻结树读数（冻结树是 `Ran 1396 / 7 红`，见 §2）。
+
 **逐条判读（缺失 ≠ 通过）：**
 
-- ✅ manifest==brain==0.7.49 / py_compile / dll 时序：**通过**（可复跑）。
-- ❌ 全量单测 `failures=1`：**是码页假红**（#8 `test_csharp_rules_self_test_passes`），冻结树双跑里它在 7/8 之间摆动 ⇒ 非产品红。**不能把"有红项"当作产品红，也不能把它当通过**：如实记为"需 `chcp 65001` 后复跑"。
-- ❌ 工作树干净 12 项：**分属三个人**——`_patch_analyzer.py`=log-analyst 在制；`_t16_*`+`_t17dl_*`=我的；`_t17_*`=dev-coder 在制。**与 0.7.49 产品代码无关**，本卡收尾时我按路径提交我那部分。
+- ✅ manifest==brain==0.7.49 / py_compile 35 文件 / dll 时序：**通过**（可复跑）。
+- ✅ 全量单测：**仅在带 `chcp 65001` 的工作树上**读到 `Ran 1410 / OK`；不带 chcp 时固定假红 `failures=1`。**既不得据此判产品红，也不得把它当冻结树通过读数**。
+- ❌ 工作树干净 11 项：**分属三个人**——`_patch_analyzer.py`=log-analyst 在制；`_t16_*`+`_t17dl_*`=我的；`_t17_*`=dev-coder 在制。**与 0.7.49 产品代码无关**，本卡收尾时我按路径提交我那部分。
 
 ---
 
@@ -326,22 +449,25 @@ foreach ($p in @("mod\AgentFarm.Bridge\manifest.json",
 | L1 | 顺序 A 记账漏记：主循环先买 → 派发 buy 记 `executed_steps=0` / `unknown_evidence` / `acted=False`（§5.3，实测 `1→0`） | **新**（D2 引入） | 不造假 PASS；可能把"真买了的一天"记成无动作 | 后续 dev 批次 + 补测试；本轮不返修 |
 | L2 | 主循环 `:9835` 的 buy **不归属任何 intent**（无人记账） | 旧有 | 账本上缺一条 day 级 buy 归属 | 与 L1 同批处理 |
 | L3 | `upgrade_tool` 工具种类**硬编码 `"axe"`**（`longrun.py:9066-9085`） | 已声明限制 | 铜斧链之外的升级不可用 | 0.7.48/0.7.49 已知限制，本轮不改 |
-| L4 | 冻结树 `git archive` 缺 14 条 fixture 依赖测试 ⇒ `Ran 1396 / FAILED(7~8)` | 工具/入库问题 | 冻结树**不能**读成"全绿" | 如实记录；验收看归因（§2 表） |
-| L5 | C# 自检码页假红 `test_csharp_rules_self_test_passes` **不稳定**（`51ef0a7` 双跑 7 条、`daceb48` 双跑 8 条） | 环境 | `check-release` 固定报 `failures=1` ⇒ rc=1 | 需 `chcp 65001` 后复跑；不得据此判产品红或产品绿 |
-| L6 | `check-release` ❌ 工作树干净（12 项未提交） | 制度 | 分属 log-analyst / 我 / dev-coder，非产品代码 | 本卡收尾我按路径提交我的 6 个文件 |
+| L4 | 冻结树 `git archive daceb48` 单测**不绿**：`Ran 1396 / 7 红` + 14 条真账本测试被 `setUpClass` 折叠（`skipped=13`）；7 红与 14 折叠**全部**为 gitignored 夹具缺失（§2/§2.1） | 环境/入库问题 | 冻结树**不能**读成"全绿"，也到不了 `Ran 1410` | 如实记录；验收看归因表；缺失一律 skip、不许当 PASS |
+| L5 | C# 自检码页假红 `test_csharp_rules_self_test_passes` **不稳定**：`daceb48` 不带 chcp 双跑 = 8 红、带 `chcp 65001` 双跑 = 7 红；`51ef0a7` = 7 红 | 环境 | 不带 chcp 时 `check-release` 固定 `failures=1` ⇒ rc=1 | 一律 `chcp 65001` 后复跑；不得据此判产品红或产品绿 |
+| L6 | `check-release` ❌ 工作树干净（**11** 项未提交） | 制度 | 分属 log-analyst / 我 / dev-coder，非产品代码 | 本卡收尾我按路径提交我的产物（§附） |
 | L7 | `tools/_note-0749.txt:4` 自报"测试 +11 条（fields +8 / longrun +3）/ 全量 Ran 1405"，**实测 +13（fields +10 / longrun +3）** | 自报不准（偏少） | 无害（实际测试更多） | 记录；note 属 lead 文档，我只读不改 |
 | L8 | 我对 P0 本体存在利益冲突（§0.1） | 制度 | 不得独占放行 | 需 observer 独立验收对数 |
+| L9 | **`Ran 1410 / OK` 只是工作树读数**；lead m00844 要求的"冻结树单测应 `Ran 1410 / OK`"与实测（`Ran 1396 / 7 红`）**不符** | 判据口径 | 若把工作树绿读数写成冻结树读数 ⇒ 违反"缺失 ≠ 通过" | 报告/日志一律注明树别：冻结树 `1396/7红`、工作树 `1410/OK` |
 
 ---
 
 ## 9. 闸口与待办
 
-- **0.7.49 可否用于 A9 与目标1 裁决：放行**（L1/L2 记入已知限制；L5/L6 需在起跑前按 §9 清掉；L8 需 observer 对数）。
-- **起跑前必须满足**（否则 `check-release` 仍 rc=1）：
-  1. 工作树按路径提交各人自己的产物（我提交 6 个：`docs/_review-0.7.49.md`、`scratch/_t16_accept.py`、`scratch/_t16_cmp.py`、`scratch/_t16_diff_ids.py`、`scratch/_t16_probe_d2.py`、`scratch/_t17dl_probe_mainloop_first.py`）；`_patch_analyzer.py`(log-analyst)、`_t17_*`(dev-coder) 不动。
-  2. `chcp 65001` 后复跑 `check-release --expect 0.7.49`，确认全量单测那条红仅剩 fixture 类。
+- **0.7.49（`daceb48`）可否用于 A9 与目标1 裁决：放行**（L1/L2 记入已知限制；L4/L9 = 冻结树单测不绿的口径问题，**按"缺失≠通过"如实记录，不作绿读数**；L5/L6 需在起跑前清掉；L8 需 observer 对数）。
+- **起跑前必须满足**：
+  1. 工作树按路径提交各人自己的产物（我提交：`docs/_review-0.7.49.md`、`scratch/_t16_accept.py`、`scratch/_t16_cmp.py`、`scratch/_t16_diff_ids.py`、`scratch/_t16_probe_d2.py`、`scratch/_t17dl_probe_mainloop_first.py`、`scratch/_t16_delta_ast.py`、`scratch/_t16_ids_full.py`）；`_patch_analyzer.py`(log-analyst)、`_t17_*`(dev-coder) 不动。
+  2. `chcp 65001` 后复跑 `check-release --expect 0.7.49` → **本轮已复跑：`✅ 全量单测（Ran 1410 tests） —— OK`**，唯一红项 = 未提交的 scratch（§4）。
   3. 装机 manifest 需从 `0.7.48` 更新到 `0.7.49`（82951 B）；dll 无需改（哈希同）。
-- **冻结后待跑项**：本文 §2/§3 的所有读数均在 `51ef0a7` / `daceb48` 冻结树上完成；若 `brain/` 或 `tests/` 再变，**须整体重跑**（`scratch/_t16_accept.py <new-ref>` + `scratch/_patch3_mutate.py`）。
+  4. 任何报告/日志引用单测绿读数时**必须写明树别**：冻结树 `Ran 1396 / 7 红 + 14 折叠`、工作树 `Ran 1410 / OK`（L9）。
+- **验收对象与 delta 声明（lead m00844 第 3 点）**：本文**验收对象 = `daceb48`**；相对 `51ef0a7` 的 delta = **注释/测试/scratch/docs only**，判定依据为 §1.1 的 5 条机械判据（AST 双判 + numstat + 存在性 + import 检索），**非引用他人结论**；`51ef0a7` 首轮读数不推翻，差异点已在 §2（7 vs 8 红的 chcp 之差）、§3（基线 13 vs 18）标注。
+- **冻结后待跑项**：本文 §2/§3 读数已在 `51ef0a7` 与 `daceb48` 冻结树上各跑一遍；若 `brain/` 或 `tests/` 再变，**须整体重跑**（`scratch/_t16_accept.py <new-ref>` + `scratch/_patch3_mutate.py` + `scratch/_t16_ids_full.py <new-ref>`）。
 
 ---
 
@@ -354,4 +480,6 @@ foreach ($p in @("mod\AgentFarm.Bridge\manifest.json",
 | `scratch/_t16_diff_ids.py` | archive / 工作树测试 ID 差集 |
 | `scratch/_t16_probe_d2.py` | D2 真买等价探针（钱够/钱不够/等价） |
 | `scratch/_t17dl_probe_mainloop_first.py` | **D2 反序（主循环先买）对抗探针** —— 修前/修后对照 |
+| `scratch/_t16_delta_ast.py` | **`51ef0a7 → daceb48` delta 自验**：AST 去 docstring 比对 + 剔 `#` 行逐行比对（§1.1） |
+| `scratch/_t16_ids_full.py` | **冻结树 / 工作树全量测试 ID 差集**，归因 `1396` vs `1410` 的 14 条（§2.1） |
 | `docs/_review-0.7.49.md` | 本文档 |
