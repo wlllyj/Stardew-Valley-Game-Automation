@@ -6240,6 +6240,8 @@ def build_report(rows, path, args, bad_lines):
         "events": 0, "lines": [], "freed_total": 0, "freed_missing_lines": [],
         "zero_freed_lines": [], "shipped": 0, "noted_events": 0,
         "max_rounds": None, "reserve": None, "has_events": False,
+        "demands": [], "demand": 0, "demand_basis": {}, "target_frees": [],
+        "target_free": None, "reached": 0, "reached_lines": [],
     }
     inventory_blocked = {
         "events": 0, "lines": [], "reasons": {}, "free_slots": [], "rounds": [],
@@ -6260,6 +6262,21 @@ def build_report(rows, path, args, bad_lines):
                     slot_relief["zero_freed_lines"].append(_ln)
             if _ev.get("shipped"):
                 slot_relief["shipped"] += 1
+            _dem = as_int(_ev.get("demand"), None)
+            if _dem is not None:
+                slot_relief["demands"].append(_dem)
+                slot_relief["demand"] += _dem
+            _db = str(_ev.get("demand_basis") or "")
+            if _db:
+                slot_relief["demand_basis"][_db] = slot_relief["demand_basis"].get(_db, 0) + 1
+            _tf = as_int(_ev.get("target_free"), None)
+            if _tf is not None:
+                slot_relief["target_frees"].append(_tf)
+                if slot_relief["target_free"] is None:
+                    slot_relief["target_free"] = _tf
+            if _ev.get("reached") is True:
+                slot_relief["reached"] += 1
+                slot_relief["reached_lines"].append(_ln)
             if slot_relief["max_rounds"] is None:
                 slot_relief["max_rounds"] = as_int(_ev.get("max_rounds"), None)
             if slot_relief["reserve"] is None:
