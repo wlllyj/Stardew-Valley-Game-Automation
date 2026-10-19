@@ -38,6 +38,8 @@ from typing import Any
 
 __all__ = [
     "BLOCKER_KINDS",
+    "CLUMP_KIND",
+    "CLUMP_SUBKINDS",
     "ZONE_BLOCKER_KINDS",
     "TILE_CAP",
     "TILLABLE_CAP",
@@ -55,9 +57,30 @@ __all__ = [
 #: 需要"先清理再谈耕种"的格：Mod 观测里 kind 的取值（协议 §5）。
 BLOCKER_KINDS = frozenset({"weed", "stone", "twig", "tree", "bush"})
 
-#: 作业区/田区"待清理"口径：在 BLOCKER_KINDS 基础上并入 ResourceClump（树桩/圆木/巨石/石堆/绿雨碎屑）。
-#: 与 farmwork.CLUMP_KINDS 中需清理的项保持一致；toolOk 门控在执行层处理，这里只做计数口径。
-ZONE_BLOCKER_KINDS = frozenset(BLOCKER_KINDS | {"stump", "log", "boulder", "rockPile", "greenRain"})
+#: 【P0-1 / D1 修复】`ResourceClump`（大障碍）在 `tiles[].kind` 里的**唯一字面量**。
+#:
+#: 契约（Mod 侧源码，非自述）：
+#:   * `mod/AgentFarm.Bridge/WorldSnapshot.cs:807`
+#:     `else if (tf is StardewValley.TerrainFeatures.ResourceClump clump)
+#:      { t.Kind = "clump"; FillClumpMeta(t, clump); }`  ⇒ 大障碍的 kind 恒为 `"clump"`；
+#:   * `mod/AgentFarm.Bridge/Contracts.cs:590`（kind 取值表含 `clump`）；
+#:     `:598`（"**只有 `kind="clump"` 时**才填 clump* 元数据"）；
+#:   * 具体子类型（stump/log/boulder/rockPile/greenRain）写在**另一个字段** `clumpKind`，
+#:     由 `mod/AgentFarm.Bridge/ClumpMeta.cs:39-73 KindOf()` 推导 —— **它永不返回 "clump"**。
+#:
+#: ⚠️ 事故（D1）：曾把 `clumpKind` 的子类型当成 `kind` 塞进 ZONE_BLOCKER_KINDS，唯独漏掉真正的
+#: 承载位 `"clump"` ⇒ 区内只剩树桩/圆木/巨石也报 blockers=0（**假清空**，目标1 验收禁的那件事）。
+#: 所以这里**只**认承载位字面量，**不**并入 CLUMP_SUBKINDS（那是 clumpKind，不是 kind）。
+CLUMP_KIND = "clump"
+
+#: `clumpKind` 的取值集合（**不是** `tiles[].kind` 的取值）：仅作可读文档 + 漂移对照用。
+#: 语义定死：`clumpKind == "unknown"`（索引读不到/未知）的格**仍然算 blocker** ——
+#: "不知道用什么工具" ≠ "这一格不存在"（`ClumpMeta` 铁律：未知索引一律 unknown + clumpTarget=null）。
+CLUMP_SUBKINDS = frozenset({"stump", "log", "boulder", "rockPile", "greenRain", "unknown"})
+
+#: 作业区/田区"待清理"口径：在 BLOCKER_KINDS 基础上并入 ResourceClump（`tiles[].kind == "clump"`）。
+#: toolOk 门控在执行层处理（`farmwork.clear`），这里只做计数口径。
+ZONE_BLOCKER_KINDS = frozenset(BLOCKER_KINDS | {CLUMP_KIND})
 
 #: Mod 侧的上限（协议 §5）：达到上限说明快照只是"附近的一片"，不是整个农场。
 TILE_CAP = 400
