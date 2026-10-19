@@ -56,6 +56,7 @@ from .farmwork import (CLUMP_KINDS, ENV_BLOCK_STATUSES, FRONTIER_KINDS, NEIGHBOR
                        seed_items, seed_season_state,
                        slot_relief_plan, surplus_sell_plan, tile_ready, till_blocked_by,
                        tool_being_upgraded, tool_suspended_stages, tool_tier, tool_upgrade_days_left)
+from .farmwork import (_bare_item_id, SEED_NAME_HINTS, SLOT_RELIEF_NEVER_SELL_IDS)
 from .planner import load_gaps_file, save_gaps_file
 # 【task-230 P0-4.6】上面的缺口清单（gaps）读写与下面的教训库读写**刻意分成不同 import 行**：
 # 缺口是"只提示"的 L0 证据（`docs/_run10-criteria.md` §8.3），**绝不允许自动转成教训注入**
@@ -6511,6 +6512,49 @@ class LongRun:
         rep.notes.append(f"背包满且腾不出格子（四门槛全过）：{reason}")
         self._say(f"  × 背包满且腾不出格子（四门槛全过）：{reason}")
 
+    def _ship_one_stack_for_space(self, obs, rep):
+        assert self.worker is not None
+        player = FarmWorker.player_of(obs)
+        # 建材/矿石/锭/煤/土/木/石永不送（升级与建造要用）；只送"盈余/战利品"腾格。
+        _PROTECTED = {"330", "378", "380", "382", "384", "386", "388", "390"}
+        cands = []
+        for it in (player.get("inventory") or []):
+            if not isinstance(it, dict) or it.get("isTool"):
+                continue
+            qid = str(it.get("qualifiedId") or it.get("id") or "").strip()
+            if not qid:
+                continue
+            bare = _bare_item_id(qid)
+            if bare in _PROTECTED:
+                continue
+            name = str(it.get("name") or "")
+            if any(hint in name.lower() for hint in SEED_NAME_HINTS):
+                continue
+            if bare in SLOT_RELIEF_NEVER_SELL_IDS:
+                continue
+            try:
+                stack, slot = int(it.get("stack") or 0), int(it.get("slot"))
+            except (TypeError, ValueError):
+                continue
+            if stack <= 0:
+                continue
+            cands.append((stack, slot, qid))
+        if not cands:
+            return False
+        cands.sort(key=lambda c: (c[0], c[1]))
+        stack, slot, qid = cands[0]
+        st = self.worker.sell(slot, whitelist=[qid], timeout_ms=self.sell_timeout_ms)
+        self._actions += 1
+        self._journal("sell", ok=st.ok, code=st.code, strategy="space_relief_ship",
+                      why="space_pressure_last_resort", slot=slot, qid=qid,
+                      stack=stack, before=st.before, after=st.after, reason=st.reason, receipt=st.receipt)
+        if st.ok:
+            rep.notes.append("space relief shipped %s x %d" % (qid, stack))
+            self._say("  space relief shipped %s x %d" % (qid, stack))
+            self.slot_relief_stacks_today += 1
+            return True
+        return False
+
     def _slot_relief(self, obs: dict[str, Any], rep: DayReport) -> bool:
         """【task-198】"腾格收敛回路"：背包低于**需求水位**时先把格子腾出来，再回去干活。
 
@@ -6581,6 +6625,11 @@ class LongRun:
                 # 压力通道腾不出来**不是失败**：清障/浇水照常干（掉落会丢 → 逐格 loot_lost 留痕）。
                 self._note_slot_pressure_stuck(
                     obs, rep, free_slots=int(free_slots), reason=reason)
+            # last-resort space relief: ship one non-protected stack
+            if int(free_slots) <= 0:
+                _shipped = self._ship_one_stack_for_space(obs, rep)
+                if _shipped:
+                    return True
             return False
         if self.slot_relief_today >= SLOT_RELIEF_MAX:
             reason = (f"腾格回路已用满 {SLOT_RELIEF_MAX} 轮（目标 {target_free} 格、"
