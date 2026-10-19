@@ -15013,5 +15013,96 @@ class TestTask35BackpackGate(unittest.TestCase):
         ).read_text(encoding="utf-8"))
 
 
+class TestBuyUpgradeDispatch(unittest.TestCase):
+    """【0.7.48 D2】`_execute` 里 `task=="buy"` / `task=="upgrade_tool"` 的接线。
+
+    背景：`bbb6a89` 把 buy/upgrade_tool 接进 `_execute` 派发（**零单测**）。审计发现 buy 分支
+    旧接线 `changed = self._preconditions(obs, rep)` 把 `_preconditions` 返回的**观测 dict**
+    当真值 ⇒ 每条 `buy` 意图都恒记 `executed_steps=1` + `acted=True`（"假装下单"），
+    不管有没有真买到，`unknown_evidence` 分支成死代码。
+
+    本类钉两件事：
+      ① buy 的 `changed` 必须是 `_preconditions_apply` 的 **bool**（真实入口：
+         `_preconditions_apply` → `_buy_seed` → `worker.buy` → 桥 `buy` →
+         游戏 `ShopMenu.tryToPurchaseItem`，成败靠钱/背包差分）；
+      ② upgrade_tool 的 journal 必须带 `tool="axe"` + `tool_hardcoded=True`
+         （工具种类硬编码是**已知限制**，钉住它不被悄悄改而不自知）。
+    """
+
+    def _run(self) -> tuple[FakeWorld, LongRun]:
+        w = FakeWorld(weeds=0, seeds=10, money=500)
+        run = make_run(w, target_days=1, max_days=1)
+        run.client = FakeClient(w)
+        run.worker = _NoLootWorker(w)
+        run.started = 0.0
+        return w, run
+
+    @staticmethod
+    def _one(run: LongRun, task: str) -> dict:
+        rec = [r for r in run.intent_coverage if r["task"] == task]
+        assert len(rec) == 1, rec
+        return rec[0]
+
+    def _drive(self, run: LongRun, intent: TaskIntent) -> tuple[bool, DayReport]:
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        obs = run._snap()
+        run._plan_intents(SimpleNamespace(intents=[intent], source="llm", boundary="daily"))
+        acted = run._execute(SimpleNamespace(intents=[intent]), obs, None, rep)
+        return acted, rep
+
+    def test_buy_dispatch_uses_bool_not_the_observation_dict(self):
+        """D2 回归守卫：buy 的 `changed` 必须来自 `_preconditions_apply`（bool）。
+
+        把 `_preconditions` 换成"返回非空 dict"的桩（模拟旧 bug 的真值来源），断言它
+        **一次都没被当布尔用**：若接线退回 `self._preconditions(obs, rep)`，dict 为真 ⇒
+        `executed_steps` 会错成 1，本条即红。
+        """
+        _w, run = self._run()
+        intent = TaskIntent("buy", "inventory", "买种子", "seeds<2")
+        calls = {"pre": 0, "apply": 0}
+
+        def _pre(o, r):
+            calls["pre"] += 1
+            return {"unknown_evidence": 0, "note": "观测 dict（真值语义的陷阱）"}
+
+        def _apply(o, r):
+            calls["apply"] += 1
+            return False
+
+        run._preconditions = _pre
+        run._preconditions_apply = _apply
+        acted, _rep = self._drive(run, intent)
+        self.assertEqual(calls["pre"], 0, "buy 不许把返回观测 dict 的 `_preconditions` 当布尔（D2）")
+        self.assertEqual(calls["apply"], 1, "buy 必须走真实入口 `_preconditions_apply`")
+        self.assertFalse(acted, "没真买到就不该记 acted")
+        rec = self._one(run, "buy")
+        self.assertEqual(rec["executed_steps"], 0, rec)
+        self.assertEqual(rec["reasons"], {"unknown_evidence": 1}, rec)
+        self.assertTrue(_intent_coverage_ok(rec), rec)
+
+    def test_buy_dispatch_records_success_when_purchase_took_effect(self):
+        _w, run = self._run()
+        intent = TaskIntent("buy", "inventory", "买种子", "seeds<2")
+        run._preconditions_apply = lambda o, r: True
+        acted, _rep = self._drive(run, intent)
+        self.assertTrue(acted)
+        rec = self._one(run, "buy")
+        self.assertEqual(rec["executed_steps"], 1, rec)
+        self.assertEqual(rec["reasons"], {}, rec)
+
+    def test_upgrade_tool_dispatch_pins_hardcoded_axe(self):
+        _w, run = self._run()
+        intent = TaskIntent("upgrade_tool", "inventory", "升级斧头", "axe<1")
+        acted, _rep = self._drive(run, intent)
+        self.assertTrue(acted)
+        ups = [e for e in run.entries if e.get("event") == "upgrade_tool"]
+        self.assertEqual(len(ups), 1, run.entries[-5:])
+        self.assertTrue(ups[0]["ok"], ups[0])
+        self.assertEqual(ups[0]["tool"], "axe", "硬编码工具种类必须写进 journal（已知限制）")
+        self.assertIs(ups[0]["tool_hardcoded"], True, ups[0])
+        rec = self._one(run, "upgrade_tool")
+        self.assertEqual(rec["executed_steps"], 1, rec)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
