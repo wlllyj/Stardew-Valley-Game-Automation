@@ -56,7 +56,8 @@ from .farmwork import (CLUMP_KINDS, ENV_BLOCK_STATUSES, FRONTIER_KINDS, NEIGHBOR
                        seed_items, seed_season_state,
                        slot_relief_plan, surplus_sell_plan, tile_ready, till_blocked_by,
                        tool_being_upgraded, tool_suspended_stages, tool_tier, tool_upgrade_days_left)
-from .farmwork import (_bare_item_id, SEED_NAME_HINTS, SLOT_RELIEF_NEVER_SELL_IDS)
+from .farmwork import (_bare_item_id, SEED_NAME_HINTS, SLOT_RELIEF_NEVER_SELL_IDS,
+                       season_probe_item)
 from .planner import load_gaps_file, save_gaps_file
 # 【task-230 P0-4.6】上面的缺口清单（gaps）读写与下面的教训库读写**刻意分成不同 import 行**：
 # 缺口是"只提示"的 L0 证据（`docs/_run10-criteria.md` §8.3），**绝不允许自动转成教训注入**
@@ -1428,6 +1429,9 @@ class LongRun:
         # 【task-67】最近一次 `buy` 回执带回来的货架清单（`availableItems`）。**跨天保留**：
         # 货架是稳定事实，留着就能直接挑 id 下单，少发注定失败的那一次请求。
         self.shop_offers: list[dict[str, Any]] = []
+        # 【task-241】`shop_offers` 是被哪个季节捕获的（"" = 未知/旧桥）。跨季时若与当前
+        # 季节不符就丢弃，强制重新探一次当季货架，避免"拿上季残留清单买隔季种子"。
+        self.shop_offers_season: str = ""
         # 【task-55】今天是否已经为买种子卖过一次盈余材料（一天只卖一次，防每轮重复出货）。
         # run7 真形态：`seed_gate {seeds:0, money:14}` 出现 5 次、`sell`/`buy` 事件 0 条 ⇒
         # 脑从来没自己挣过钱、也没自己买过种子。这条链的第一步就是"把超 K 的材料换成钱"。
@@ -7472,6 +7476,18 @@ class LongRun:
         plantable = int(season_state["plantable"]) if season_state["metadata"] else seeds_total
         if plantable > 0:
             return False
+        # 【task-241】季节感知：冬季 Pierre 不卖种子 ⇒ 今天**不发起任何 buy**，直接记
+        # `seed_dead_today = "winter_no_seeds"`（诚实信号，支持 Goal-1 经济闭环证据）。
+        # 不探、不买，避免 run6 那种"白撞 item_not_sold"污染账本；也不是任务失败。
+        season = str(season_state.get("season") or "").strip().lower()
+        if season == "winter":
+            self.seed_dead_today = "winter_no_seeds"
+            if not self.seed_dead_noted:
+                self.seed_dead_noted = True
+                self._journal("winter_no_seeds", season="winter",
+                              note="冬季 Pierre 货架无种子 ⇒ 今天不买（无 item_not_sold 试探）；不是任务失败")
+                rep.notes.append("冬季不买种子（Pierre 货架无当季种子，避免 item_not_sold 空转）；不是任务失败")
+            return changed
         assert self.worker is not None
         money = FarmWorker.money(obs)
         # 【task-102】空格死锁（run8 day 12/13 的主因）：钱够、没种子，但背包**放不下**买来的种子
@@ -7553,13 +7569,20 @@ class LongRun:
         player = FarmWorker.player_of(obs)
         money = FarmWorker.money(obs)
         if self.shop_offers:
+            # 【task-241】跨季货架失效：上一季留下的 `shop_offers` 可能含隔季种子
+            # （例如春末买的 Parsnip 清单在夏初还被当成可买 ⇒ item_not_sold）。
+            # 捕获季节与当前不符就丢弃，强制走"探一次拿当季新鲜货架"。
+            if self.shop_offers_season and self.shop_offers_season != season:
+                self.shop_offers = []
+                self.shop_offers_season = ""
+        if self.shop_offers:
             # 有清单：直接挑，**不发注定失败的请求**（清单跨天保留）。
             pick, code = pick_seed_offer(self.shop_offers, money)
             if pick is None:
                 self._seed_dead(code, rep, money=money, offers=self.shop_offers)
                 return changed
             st = self._buy_seed(str(pick.get("id") or ""), money, "shelf", rep,
-                                price=int(pick.get("price") or 0))
+                                price=int(pick.get("price") or 0), season=season)
             return changed or bool(st is not None and st.ok)
         # 没有清单（旧 Mod / 首次）：拿配置项探**一次**。
         # ⚠️ 探测**成功**时绝不能下"买不到"的结论 —— 上面那次 `no_seed_for_sale` 的误判
@@ -7584,7 +7607,8 @@ class LongRun:
             rep.notes.append(f"没种子且钱不够（{money}g < {price_now}g，差 {short}g），"
                              "只能干等/清障开垦")
             return changed
-        st = self._buy_seed(self.buy_item, money, "probe", rep)
+        st = self._buy_seed(season_probe_item(season, self.buy_item), money, "probe", rep,
+                            season=season)
         if st is not None and st.ok:
             return True
         # 【task-102】`no_space` 是"背包放不下"，跟"这个 id 不在售"无关 ⇒ 换 id 也白搭，
@@ -7595,13 +7619,13 @@ class LongRun:
         pick, code = pick_seed_offer(self.shop_offers, money)
         if pick is not None:
             st2 = self._buy_seed(str(pick.get("id") or ""), money, "shelf", rep,
-                                 price=int(pick.get("price") or 0))
+                                 price=int(pick.get("price") or 0), season=season)
             return changed or bool(st2 is not None and st2.ok)
         self._seed_dead(code, rep, money=money, offers=self.shop_offers)
         return changed
 
     def _buy_seed(self, item: str, money: int, source: str, rep: DayReport,
-                  *, price: int = 0) -> StepResult | None:
+                  *, price: int = 0, season: str = "") -> StepResult | None:
         """发一次 `buy`；把回执里的货架清单收进 `self.shop_offers`，并如实记 `buy` journal。
 
         【task-102】计数与"空格"分流：每次调用都记 `buy_attempts_today`（上界
@@ -7637,6 +7661,8 @@ class LongRun:
         self._actions += 1
         if st.available:
             self.shop_offers = list(st.available)   # 跨天保留：下次直接挑，不发注定失败的请求
+            # 【task-241】记下这份清单是哪个季节捕获的（跨季时据此失效，见 `_preconditions_apply`）。
+            self.shop_offers_season = str(season or "")
         rep.notes.append(f"补种子（{source} {n} 个 @ {price_used}g）：{st.reason}")
         self._say(f"  · 补种子：{st.reason}")
         self._journal("buy", ok=st.ok, code=st.code, reason=st.reason, item=item,

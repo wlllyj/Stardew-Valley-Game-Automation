@@ -15140,6 +15140,64 @@ class TestBuyUpgradeDispatch(unittest.TestCase):
         self.assertEqual(w.buy_calls, [], w.buy_calls)
 
 
+class TestTask241SeasonAwareSeedBuy(unittest.TestCase):
+    """【task-241】季节感知买种子：冬季不买 + 只买当季在售种子。
+
+    (a) 冬季 ⇒ 一次 `buy` 都不发，且 `seed_dead_today == "winter_no_seeds"`（诚实信号，
+        支持 Goal-1 经济闭环证据），不拿春种去撞 `item_not_sold`；
+    (b) 当季有在售种子 ⇒ 真的发起 `buy`；
+    (c) 上一季残留的货架清单（隔季种）在换季后失效、重新探当季货架，不拿旧清单直接买。
+    """
+
+    @staticmethod
+    def _run(season: str, *, seeds: int = 0, money: int = 500) -> tuple[FakeWorld, LongRun]:
+        w = FakeWorld(weeds=0, seeds=seeds, money=money)
+        w.season = season
+        # `[]` = 新 Mod 真的没种子（让 season_state 走 plantable 口径，不是旧 Mod 退回 seed_items）。
+        w.player_seeds = [] if seeds == 0 else None
+        run = make_run(w, target_days=1, max_days=1)
+        run.client, run.worker, run.started = FakeClient(w), FakeWorker(w), 0.0
+        run.allow_buy = True
+        return w, run
+
+    def _call(self, w: FakeWorld, run: LongRun) -> DayReport:
+        rep = DayReport(day_key=(w.season, 1, 9), started_at=0.0)
+        run._preconditions(w.obs(), rep)
+        return rep
+
+    def test_winter_buys_nothing_and_sets_seed_dead(self):
+        w, run = self._run("winter")
+        # 即便货架残留了春种（旧季清单），冬季也绝不该去买。
+        run.shop_offers = [{"id": "(O)472", "name": "Parsnip Seeds", "price": 20}]
+        run.shop_offers_season = "spring"
+        self._call(w, run)
+        self.assertEqual(w.buy_calls, [], "冬季：不发起任何 buy（无 item_not_sold 试探）")
+        self.assertEqual(run.seed_dead_today, "winter_no_seeds", "冬季诚实信号")
+        self.assertTrue(any(e.get("event") == "winter_no_seeds" for e in run.entries), run.entries)
+
+    def test_in_season_shelf_seed_is_bought(self):
+        w, run = self._run("summer")
+        # 当季在售：夏季 Pepper Seeds（482）。
+        w.buy_offers = [{"id": "(O)482", "name": "Pepper Seeds", "price": 40}]
+        self._call(w, run)
+        self.assertTrue(w.buy_calls, "当季在售种子应该被买")
+        self.assertEqual(run.seed_dead_today, "", "买到就不该置 seed_dead")
+        self.assertEqual(w.buy_calls[-1]["item"], "482")
+
+    def test_stale_off_season_shelf_is_invalidated_then_reprobed(self):
+        # 上一季（春）残留的 Parsnip 清单在夏初不应被直接买；应重新探当季货架。
+        w, run = self._run("summer")
+        run.shop_offers = [{"id": "(O)472", "name": "Parsnip Seeds", "price": 20}]
+        run.shop_offers_season = "spring"
+        w.buy_offers = [{"id": "(O)482", "name": "Pepper Seeds", "price": 40}]  # 当季货架
+        self._call(w, run)
+        self.assertTrue(w.buy_calls, "应当重探当季货架")
+        self.assertNotIn("(O)472", [c["item"] for c in w.buy_calls],
+                         "不应拿上季残留的春种去撞 item_not_sold")
+        self.assertNotIn("(O)472", [c["item"] for c in w.buy_calls])
+        self.assertEqual(w.buy_calls[-1]["item"], "482")
+
+
 class _ReliefBuyWorld(FakeWorld):
     """【task-240b】复刻真机 `logs/run-test-space.jsonl`（冬 26、Mod 0.7.49）的形态：
     背包**真满**（0 空格）+ 有可卖盈余 + 没有当季种子。买成功后按真 Mod 的形态往
@@ -15231,8 +15289,13 @@ class TestTask240bReliefThenBuy(unittest.TestCase):
         return seq
 
     def test_relief_success_buys_seeds_in_the_same_round(self):
-        """①+②：腾格成功 ⇒ 同一轮调 `_preconditions`，且拿到的是腾格后的新快照。"""
-        w = _ReliefBuyWorld(season="winter")
+        """①+②：腾格成功 ⇒ 同一轮调 `_preconditions`，且拿到的是腾格后的新快照。
+
+        注（task-241）：原用例用 `season="winter"`，但 task-241 起**冬季不再买种子**
+        （Pierre 货架无种子，避免白撞 item_not_sold），故这里改锚到 spring 验证同一条接线；
+        冬季"不买"的语义由 `TestTask241SeasonAwareSeedBuy` 单独钉。
+        """
+        w = _ReliefBuyWorld(season="spring")
         run = self._run(w)
         seq = self._spy(run)
         run._run_day()

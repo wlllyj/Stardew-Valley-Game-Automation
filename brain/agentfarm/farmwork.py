@@ -1212,6 +1212,58 @@ SEED_NAME_HINTS = ("seed", "seeds", "种子")
 #: 「留够 K 包的钱」：单价 ≤ 钱 / K 才算买得起（K=10）。这样买完种子还剩钱买别的/应急。
 SEED_KEEP_FACTOR = 10
 
+#: 【task-241】常见作物种子**数字 id → 当季可种的季节集合**（用于"只买当季在售种子"）。
+#: 数据核对自《星露谷》1.6 wiki 中文模块 ID 表。冬季 Pierre 不卖任何种子（买种子分支在
+#: `longrun._preconditions_apply` 里对 winter 直接早退，永不走到这里）。
+#: 键用**数字 id**（去掉 `(O)` 前缀），与 `core_seed_id()` 一致。未知 id 返回空（fail-open：
+#: 见 `season_probe_item` 与 `longrun` 里的"跨季货架失效"逻辑，货架本身是当季在售的事实）。
+SEED_SEASONS: dict[str, tuple[str, ...]] = {
+    # 春季
+    "472": ("spring",), "473": ("spring",), "474": ("spring",), "475": ("spring",),
+    "476": ("spring",), "477": ("spring",), "478": ("spring",), "745": ("spring",),
+    "427": ("spring",), "429": ("spring",), "433": ("spring", "summer"),
+    # 夏季
+    "480": ("summer",), "481": ("summer",), "482": ("summer",), "483": ("summer", "fall"),
+    "484": ("summer",), "485": ("summer",), "486": ("summer",), "487": ("summer", "fall"),
+    "453": ("summer",), "431": ("summer",), "455": ("summer",), "302": ("summer",),
+    "479": ("summer",),
+    # 秋季
+    "488": ("fall",), "489": ("fall",), "490": ("fall",), "491": ("fall",),
+    "492": ("fall",), "493": ("fall",), "494": ("fall",), "299": ("fall",),
+    "301": ("fall",), "425": ("fall",), "347": ("fall",),
+}
+
+#: 【task-241】每个季节"探一次"货架用的默认种子 id（避免拿春季 472 去夏天探而吃 `item_not_sold`）。
+#: 仅在 `shop_offers` 为空、需要探一次拿新鲜货架清单时用；探到清单后会照清单重挑，不一定买这个。
+SEED_PROBE_BY_SEASON: dict[str, str] = {
+    "spring": "472",   # Parsnip Seeds
+    "summer": "482",   # Pepper Seeds
+    "fall":   "490",   # Pumpkin Seeds
+    # winter 不会走到这里（早退）
+}
+
+
+def core_seed_id(item: str) -> str:
+    """从 `(O)472` / `472` / `Parsnip Seeds` 里取出**数字 id**（没有数字就原样返回去空格小写）。"""
+    s = str(item or "").strip()
+    if ")" in s:                      # 去掉 `(O)` / `(W)` 之类前缀
+        s = s.split(")", 1)[1]
+    return "".join(ch for ch in s if ch.isdigit())
+
+
+def seed_id_seasons(item: str) -> tuple[str, ...]:
+    """一个种子 id 能在哪些季节种（查 `SEED_SEASONS`）。查不到返回空元组（未知 ⇒ fail-open）。"""
+    return SEED_SEASONS.get(core_seed_id(item), ())
+
+
+def season_probe_item(season: str, default: str) -> str:
+    """探一次用的种子 id：能查到当季默认就用它，否则退回原配置 `default`（通常是春季 472）。
+
+    目的：**不拿当季买不到的种子去撞 `item_not_sold`**——run6 夏季硬买春季 472 就是这么
+    每天白试 6 次的。探到货架清单（`availableItems`）后会照清单重挑，所以这只是"敲门砖"。
+    """
+    return SEED_PROBE_BY_SEASON.get(str(season or "").strip().lower(), default)
+
 
 def seed_offers_from(res: dict[str, Any] | None) -> list[dict[str, Any]]:
     """从 `buy` 回执里取出**结构化货架清单**（`availableItems`，task-67）。
