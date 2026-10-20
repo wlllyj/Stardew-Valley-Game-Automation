@@ -3908,6 +3908,15 @@ class LongRun:
         money = FarmWorker.money(obs)
         can = seeds > 0 or (self.allow_buy and money >= self._seed_price_now()
                             and not self.seed_dead_today)
+        # 【A9 gatefix2 实证】冬季 `plantable==0` 且走"3 轮校验取消"路径时 `_preconditions_apply`
+        # 不一定跑过 ⇒ `seed_dead_today` 可能没置 ⇒ `can` 退化成"钱够就能买"的 True ⇒
+        # `_pending_snapshot` 把冬季不可播种的 242/245 格 tillable 当"可执行活" ⇒ `no_work` 日
+        # 永远 `zero_action_evidenced=False`。这里直接按季节收口：冬季没有可当季买到的种子，
+        # 就算有钱也不能把 tillable 算成可执行活（与 task-241 的 `winter_no_seeds` 同义，
+        # 只是不再依赖"当天是否跑过买种闸门"）。有当季可种种子时不受影响。
+        if can and state["metadata"] and int(state["plantable"]) <= 0 \
+                and str(state.get("season") or "").lower() == "winter":
+            can = False
         return seeds, money, can
 
     def _seed_price_shelf(self) -> int:
