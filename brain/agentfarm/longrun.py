@@ -10308,28 +10308,33 @@ class LongRun:
                         self._no_work_cycle_count += 1
                         if self._no_work_cycle_count >= 3:
                             if self.farm_actions_today <= 0:
-                                rep.notes.append(
-                                    f"连续 {self._no_work_cycle_count} 轮校验取消/确定性兜底均无可执行"
-                                    f"目标、当日 0 农场动作 ⇒ 已证无活，诚实收工（干净跨日、不空转）")
-                                # 【zero_action_evidenced 补】0 动作日要能 VERIFIED，必须置
-                                # `no_work_evidence_ok`（`_zero_action_evidenced` 的唯一放行口，
-                                # 与 sleep_guard:5911 同义）。但**只在日终可执行面证据 executable==0
-                                # 时**才置（fail-closed：真还有可执行格就不许洗成无活，A9 winter27/28
-                                # 就是靠这 3 轮校验取消 + executable==0 才诚实判无活）。
+                                # 【A9 gatefix3 实证】本轮"3 轮校验取消"只是**本片区**看得见没目标；
+                                # 账本里可能还有别的片区的可执行活（winter27/28 实测 exec=237/240）。
+                                # 硬收工会把"还有活"洗成"没活"（zero_action_evidenced 会正确拦住）。
+                                # 只有**日终可执行面证据 executable==0** 才算真无活、才收工；
+                                # 否则**不结束**，落到下面的走路上限继续换片探索（winter26 就是这样
+                                # 走 216 格/换片 4 次后 exec=0 才 VERIFIED 的）。
                                 try:
-                                    if int(self._pending_snapshot(obs).get("executable") or 0) == 0:
-                                        self.no_work_evidence_ok = True
+                                    _exec = int(self._pending_snapshot(obs).get("executable") or 0)
                                 except Exception:
-                                    pass
-                                # require_work=False：我们已通过"多轮校验取消 + 当日 0 农场动作"的证据
-                                # *证明*无活（不是偷懒跳过），`_do_sleep` 因此不再被 `_unfinished_work`
-                                # 挡成 `slept_without_work` ⇒ 睡眠成功、游戏日干净前进。
-                                rep.ended_by, rep.ended_reason = self._do_sleep(
-                                    obs, rep,
-                                    f"no_work:连续{self._no_work_cycle_count}轮校验取消、当日0可执行农场动作"
-                                    f"（已证无活，非跳过）",
-                                    require_work=False)
-                                break
+                                    _exec = 1          # 证据不可用 ⇒ fail-closed 当作"还有活"
+                                if _exec == 0:
+                                    rep.notes.append(
+                                        f"连续 {self._no_work_cycle_count} 轮校验取消、当日 0 农场动作、"
+                                        f"且日终可执行面 executable==0 ⇒ 已证无活，诚实收工（干净跨日）")
+                                    # `no_work_evidence_ok` = `_zero_action_evidenced` 的唯一放行口
+                                    # （与 sleep_guard:5911 同义）；已在 executable==0 前提下，诚实。
+                                    self.no_work_evidence_ok = True
+                                    rep.ended_by, rep.ended_reason = self._do_sleep(
+                                        obs, rep,
+                                        f"no_work:连续{self._no_work_cycle_count}轮校验取消、当日0可执行农场动作"
+                                        f"（已证无活，非跳过）",
+                                        require_work=False)
+                                    break
+                                # exec>0：账本还有可执行的活 ⇒ 不判无活，继续换片/探索
+                                rep.notes.append(
+                                    f"连续 {self._no_work_cycle_count} 轮本片区无可动目标，但账本仍有 "
+                                    f"{_exec} 格可执行 ⇒ 不判无活，继续换片探索（不提前收工）")
                             # 当天其实做过农场动作（只是做不成/被围）⇒ 不是"当日 0 可执行农场动作"，
                             # 绝不许洗成 no_work（那是把"有活做不成"洗白成"没活"）；落回既有
                             # stuck / burst / resume_exhausted 诚实收口（见
@@ -10342,15 +10347,16 @@ class LongRun:
                             # 【devcoder-no-work-sleep】当日 0 农场动作时同样走 `no_work` 诚实口径
                             # （require_work=False），避免 `_do_sleep` 默认 `require_work=True` 在
                             # `_unfinished_work` 仍为真时返回 `slept_without_work` ⇒ 不跨日、整轮自停。
-                            no_work = self.farm_actions_today <= 0
+                            # 【A9 gatefix3】`no_work`（正当、可 VERIFIED）只在**当日 0 动作 _且_
+                            # 日终可执行面 executable==0** 时成立；只满足前半（账本还有可执行活，
+                            # 只是走不到/被围）⇒ 落 `stuck:` 诚实收口（不洗成无活、当天不 VERIFIED）。
+                            try:
+                                _no_exec = int(self._pending_snapshot(obs).get("executable") or 0) == 0
+                            except Exception:
+                                _no_exec = False
+                            no_work = self.farm_actions_today <= 0 and _no_exec
                             if no_work:
-                                # 【zero_action_evidenced 补】同 3 轮校验分支：只在日终可执行面证据
-                                # `executable==0` 时置 `no_work_evidence_ok`，0 动作日才可能 VERIFIED。
-                                try:
-                                    if int(self._pending_snapshot(obs).get("executable") or 0) == 0:
-                                        self.no_work_evidence_ok = True
-                                except Exception:
-                                    pass
+                                self.no_work_evidence_ok = True
                             rep.ended_by, rep.ended_reason = self._do_sleep(
                                 obs, rep,
                                 ("no_work:连续走路无进展（encircled/unreachable，已证无可达可执行目标）"
