@@ -6519,8 +6519,10 @@ class LongRun:
     def _ship_one_stack_for_space(self, obs, rep):
         assert self.worker is not None
         player = FarmWorker.player_of(obs)
-        # 建材/矿石/锭/煤/土/木/石永不送（升级与建造要用）；只送"盈余/战利品"腾格。
-        _PROTECTED = {"330", "378", "380", "382", "384", "386", "388", "390"}
+        # 建材/矿石/锭/煤/土/木/石/纤维/硬木/放射性矿永不送（升级与建造要用）；只送"盈余/战利品"腾格。
+        # 消费 farmwork 的**权威永不卖集合**（`SLOT_RELIEF_NEVER_SELL_IDS`）—— 不再手维护本地
+        # 副本（590f154 违纪：本地 `_PROTECTED` 漏了 Fiber 771 / Radioactive 909 等建材，会让
+        # last-resort 把建材送出，违反 AGENTS.md §5）。`slot_relief_plan` 也消费同一集合，两份清单不再漂移。
         cands = []
         for it in (player.get("inventory") or []):
             if not isinstance(it, dict) or it.get("isTool"):
@@ -6529,12 +6531,10 @@ class LongRun:
             if not qid:
                 continue
             bare = _bare_item_id(qid)
-            if bare in _PROTECTED:
+            if bare in SLOT_RELIEF_NEVER_SELL_IDS:
                 continue
             name = str(it.get("name") or "")
             if any(hint in name.lower() for hint in SEED_NAME_HINTS):
-                continue
-            if bare in SLOT_RELIEF_NEVER_SELL_IDS:
                 continue
             try:
                 stack, slot = int(it.get("stack") or 0), int(it.get("slot"))

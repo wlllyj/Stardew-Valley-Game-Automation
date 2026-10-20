@@ -1544,10 +1544,33 @@ SLOT_RELIEF_HIGH_VALUE_IDS = frozenset({
 })
 
 #: **永远不卖**（升级材料/任务相关/建材级贵重块；工具/武器/种子另有 `isTool`+名字判据）。
+#:
+#: 【590f154 违纪修复 / task-241 后续】这是**唯一权威永不卖集合**：`_ship_one_stack_for_space`
+#: （last-resort 通道，longrun.py）与 `slot_relief_plan` 都消费它，两处不再各自维护会漂移的副本。
+#: 并集必须覆盖：
+#:   * 原 `SLOT_RELIEF_NEVER_SELL_IDS`：334/335/336/337（铜/铁/金/铱锭）、338（精炼石英）、787（电池）；
+#:   * 原手维护 `_PROTECTED`（longrun.py:6519）：330/378/380/382/384/386/388/390
+#:     （粘土/铜矿/铁矿/煤/金矿/铱矿/木材/石头）；
+#:   * 其余建材级（task-28 全部移出可卖表）：709 硬木、771 纤维、**909 放射性矿**——
+#:     后两者正是 590f154 违纪漏掉的（本地 `_PROTECTED` 副本漂移），会让 last-resort 把建材送出。
+#: 这些都是建造/升级/熔锭原料，卖出会破坏经济闭环，故宁可如实 `inventory_blocked` 也不卖。
 SLOT_RELIEF_NEVER_SELL_IDS = frozenset({
+    # 升级锭 / 精炼石英 / 电池（原 NEVER_SELL）
     "334", "335", "336", "337",   # Copper/Iron/Gold/Iridium Bar（升级要 5 锭）
     "338",   # Refined Quartz
     "787",   # Battery Pack
+    # 建材 / 矿石 / 木石（原 `_PROTECTED` + 其余；task-28 建材级全移出可卖表）
+    "330",   # Clay 粘土
+    "378",   # Copper Ore 铜矿
+    "380",   # Iron Ore 铁矿
+    "382",   # Coal 煤
+    "384",   # Gold Ore 金矿
+    "386",   # Iridium Ore 铱矿
+    "388",   # Wood 木材
+    "390",   # Stone 石头
+    "709",   # Hardwood 硬木（task-28 建材级，原 `_PROTECTED` 也漏）
+    "771",   # Fiber 纤维（590f154 违纪：原 `_PROTECTED` 漏，导致 last-resort 把建材送出）
+    "909",   # Radioactive Ore 放射性矿（590f154 违纪：同上漏）
 })
 
 #: 空格压力/换种子钱时**允许卖**的全部 id（fail-closed：不在并集里的一件都不卖）。

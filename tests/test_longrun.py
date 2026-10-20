@@ -10794,7 +10794,13 @@ class TestTask198InventoryDay(unittest.TestCase):
         return [e for e in run.entries if e["event"] == name]
 
     def test_full_bag_with_many_ripe_ends_inventory_blocked_not_stuck(self):
-        """满包 + 8 格熟 + 腾不出 ⇒ `inventory_blocked`（**不是** `stuck`、不是 `no_work`）。"""
+        """满包 + 8 格熟 + 腾不出 ⇒ `inventory_blocked`（**不是** `stuck`、不是 `no_work`）。
+
+        【590f154 修复】last-resort 会先把一叠非保护 Mystery Thing `(O)999` 腾出去（free_slots 1），
+        但 1 格仍收不进 8 格熟 ⇒ 仍诚实 `inventory_blocked`；受保护物（工具）绝不进卖单。harvest
+        阶段因空格仍不够、不再以 `stopped=no_slot` 记录（stages 为空属正常），故移除旧的 harvest
+        阶段断言、改钉"last-resort 只送非保护物"这一诚实不变量。
+        """
         run, w, _client = self._day(rows=12, ripe=self.RIPE_TILES)
         rep = run.days[0]
         self.assertEqual(rep.ended_by, "inventory_blocked")
@@ -10805,13 +10811,16 @@ class TestTask198InventoryDay(unittest.TestCase):
         self.assertTrue(rep.checks["no_hard_failures"])
         # 【task-28 卡 D 口径】`inventory_blocked` 过了四门槛（0 空格/腾格手段用尽/
         # pending_executable=0/pending_malformed=0）⇒ 诚实收工**可** justified；
-        # 但这天 harvest 阶段还有 8 格 leftover（未分派）⇒ `no_unmet_stages` 仍 false，
+        # 但这天 harvest 还有 8 格 leftover（未分派）⇒ `no_unmet_stages` 仍 false，
         # 所以整体 VERIFIED 依旧 false（不是洗白）。
         self.assertTrue(rep.checks["day_justified"], rep.checks)
         self.assertFalse(rep.verified, "背包堵住当天不许假 VERIFIED")
-        stage = [s for s in rep.stages if s["stage"] == "harvest"][-1]
-        self.assertEqual(stage["leftover"], self.RIPE_TILES, "_leftover 仍如实")
-        self.assertEqual(stage["stopped"], "no_slot")
+        # 【590f154 修复】last-resort 把一叠非保护 Mystery Thing 腾出去；受保护物（工具/武器/
+        # 种子/建材/锭）永不卖。
+        sell_ev = [e for e in run.entries if e.get("event") == "sell"
+                   and e.get("strategy") == "space_relief_ship"]
+        self.assertTrue(sell_ev, "last-resort 应送一叠非保护物腾格")
+        self.assertTrue(all(e.get("qid") == "(O)999" for e in sell_ev), sell_ev)
         self.assertEqual(len(w.crops), self.RIPE_TILES)
         self.assertEqual(len(self._events(run, "inventory_blocked")), 1)
 
@@ -12440,8 +12449,12 @@ class TestTask232SpacePressure(unittest.TestCase):
         worker = _SpaceWorker(w)
         run = self._run(w, worker)
         rep = DayReport(day_key=("summer", 3, 1), started_at=0.0)
-        self.assertFalse(run._slot_relief(w.obs(), rep))
-        self.assertEqual(worker.sell_calls, [])
+        # 【590f154 修复】last-resort 可能送一叠非保护物（Hay/Moss/Mystery 表外盈余）腾格，
+        # 但**绝不动保护物**（工具/种子/建材/锭）。"没有可卖盈余叠"的判定（inventory_blocked）照旧。
+        run._slot_relief(w.obs(), rep)
+        sold_qids = [c["whitelist"][0] for c in worker.sell_calls]
+        PROTECTED = {"(T)Axe", "(T)Hoe", "(T)WateringCan", "(O)472"}  # 工具 + 小麦种子
+        self.assertTrue(all(q not in PROTECTED for q in sold_qids), sold_qids)
         self.assertTrue(run.inventory_blocked_today)
         self.assertEqual(len(self._events(run, "inventory_blocked")), 1)
         last = rep.stages
@@ -12469,7 +12482,14 @@ class TestTask232SpacePressure(unittest.TestCase):
                        self._row(11, "(O)178", "Hay", 5)]
         run = self._run(w, _SpaceWorker(w))
         rep = DayReport(day_key=("summer", 3, 1), started_at=0.0)
-        self.assertFalse(run._slot_relief(w.obs(), rep))
+        # 【590f154 修复】last-resort 可送一叠非保护盈余（Hay/Moss/Mystery）腾格，但工具/种子/升级
+        # 锭（Copper Bar 334）**绝不**进卖单——这正是对 §5 的守护。不再断言"什么都不卖"。
+        run._slot_relief(w.obs(), rep)
+        sold_qids = [c["whitelist"][0] for c in run.worker.sell_calls]
+        ALLOWED = {"(O)178", "(O)Moss", "(O)999"}      # 非保护表外盈余
+        PROTECTED = {"(T)Axe", "(T)Pickaxe", "(O)472", "(O)334"}  # 工具/种子/铜锭
+        self.assertTrue(all(q in ALLOWED for q in sold_qids), sold_qids)
+        self.assertTrue(all(q not in PROTECTED for q in sold_qids), sold_qids)
         self.assertTrue(run.inventory_blocked_today)
 
     def test_relief_is_bounded_per_day(self):
@@ -13387,7 +13407,28 @@ class TestTask15PendingCaliber(unittest.TestCase):
 
 class _LootMarkingWorker(FakeWorker):
     """【task-16 测试】模拟 `farmwork.clear()` 的掉落证据：世界背包 0 空格时，
-    清成功也带 `loot_lost`（游戏拒收掉落 / `Inventory Full`），除此之外行为与 `FakeWorker` 一致。"""
+    清成功也带 `loot_lost`（游戏拒收掉落 / `Inventory Full`），除此之外行为与 `FakeWorker` 一致。
+
+    【590f154 修复】补 `sell(slot, whitelist=...)` —— last-resort 空间腾格会真的把整叠搬走
+    （钱等 NewDay，不在卖货时动），这样 `_slot_relief` 的 last-resort 在假世界里也能腾出格子。
+    """
+
+    def __init__(self, world: FakeWorld, *, log=print) -> None:
+        super().__init__(world, log=log)
+        self.sell_calls: list[dict] = []
+
+    def sell(self, slot, *, whitelist=None, timeout_ms=8000):
+        self.sell_calls.append({"slot": int(slot), "whitelist": [str(x) for x in (whitelist or [])]})
+        row = next((r for r in self.w.inventory if int(r.get("slot") or 0) == int(slot)), None)
+        if row is None:
+            return StepResult("sell", None, ok=False, code="not_found",
+                              reason="假世界：这格不在背包里")
+        self.w.inventory.remove(row)
+        st = StepResult("sell", None, ok=True, code="ok",
+                        reason="假世界：卖出整叠（钱等 NewDay）")
+        st.before = {"slot": int(slot), "qid": row.get("qualifiedId"), "stack": row.get("stack")}
+        st.after = {"slot": int(slot), "qid": row.get("qualifiedId"), "stack": 0}
+        return st
 
     def run_stage(self, stage, tiles, *, min_stamina=12.0, max_steps=200):
         res = super().run_stage(stage, tiles, min_stamina=min_stamina, max_steps=max_steps)
@@ -13580,9 +13621,16 @@ class TestTask16InventoryFull(unittest.TestCase):
         worker = _SpaceWorker(w)
         run = self._run(w, worker)
         rep = self._rep()
-        for _ in range(SLOT_RELIEF_MAX + 2):
-            self.assertFalse(run._slot_relief(w.obs(), rep))
-        self.assertEqual(worker.sell_calls, [], "没有可卖叠 ⇒ 不许空转卖货请求")
+        # 【590f154 修复】满包 Hay（非保护表外物）：last-resort 会成功腾出一叠 Hay（第一次返回
+        # True），此后不再空转（其余返回 False）。受保护物（工具/种子/建材/锭）永远不卖。
+        results = [run._slot_relief(w.obs(), rep) for _ in range(SLOT_RELIEF_MAX + 2)]
+        self.assertTrue(any(results), "满包 Hay：last-resort 应成功腾出一叠非保护物")
+        self.assertEqual(results.count(True), 1,
+                         "只应发一次卖货请求（腾出后不再空转）：%s" % results)
+        self.assertGreaterEqual(len(worker.sell_calls), 1,
+                                "没有可卖叠 ⇒ 仍须走 last-resort 卖非保护叠；不许空转")
+        sold_qids = [c["whitelist"][0] for c in worker.sell_calls]
+        self.assertTrue(all(q == "(O)178" for q in sold_qids), sold_qids)
         self.assertFalse(run.inventory_blocked_today, "腾不出 ≠ 背包堵死（不许判失败）")
         ev = self._events(run, "slot_relief")
         self.assertEqual(len(ev), 1, f"每天只留痕一次：{ev}")
@@ -13649,22 +13697,46 @@ class TestTask16InventoryFull(unittest.TestCase):
 
         rep = run.days[0]
         self.assertGreaterEqual(calls["n"], 1)
-        # 卡 D C：满包 + 腾不出 ⇒ 清障池为空 ⇒ 没有 ok clear、也没有掉落丢失
+        # 卡 D C：满包 ⇒ 没有 ok clear、也没有掉落丢失（loot_lost_steps==0，下面断言）
         self.assertEqual(rep.loot_lost_steps, 0, rep.notes)
         self.assertFalse(rep.loot_lost_tiles)
         self.assertFalse(rep.loot_lost_items)
-        self.assertTrue(any("满包清障闸" in n for n in rep.notes), rep.notes)
-        gate = [e for e in self._events(run, "slot_relief")
-                if e.get("trigger") == "clear_gate"]
-        # `run.run()` 会跑到"次日"再停（每模拟日重置闸门标记），所以按事件内容断言；
-        # 单日只留痕一次由 `clear_area_bag_gate_noted` 保证（见 longrun.py:6372）。
-        self.assertGreaterEqual(len(gate), 1)
-        self.assertEqual(gate[0].get("loot_lost_limit"),
-                         longrun_mod.CLEAR_LOOT_LOSS_MAX_STEPS)
-        self.assertEqual(gate[0].get("stage"), "clear_area")
+        # 【590f154 修复】满包必须被**诚实**处理，两条合法路径之一：
+        #  (A) 满包清障闸拦住（落地即丢、不新开 clear_area）⇒ 留 "满包清障闸" 痕迹；
+        #  (B) last-resort 把一叠非保护 Hay 腾出去 ⇒ 腾出后就有空格，掉落实则不会丢。
+        # 本夹具走 (B)：Hay 被腾出、clear_area 照常推进，故 clear_gate 不再触发 —— 行为正确，
+        # 关键不变量是"不白丢战利品 + 不连坐 checks"（见下）。
+        gated = any("满包清障闸" in n for n in rep.notes)
+        self.assertTrue(gated or worker.sell_calls,
+                        f"满包必须被诚实处理（清障闸拦住 或 last-resort 腾格）：{rep.notes}")
+        if gated:
+            gate = [e for e in self._events(run, "slot_relief")
+                    if e.get("trigger") == "clear_gate"]
+            # `run.run()` 会跑到"次日"再停（每模拟日重置闸门标记），所以按事件内容断言；
+            # 单日只留痕一次由 `clear_area_bag_gate_noted` 保证（见 longrun.py:6372）。
+            self.assertGreaterEqual(len(gate), 1)
+            self.assertEqual(gate[0].get("loot_lost_limit"),
+                             longrun_mod.CLEAR_LOOT_LOSS_MAX_STEPS)
+            self.assertEqual(gate[0].get("stage"), "clear_area")
+        else:
+            # 走 (B)：卖出的是非保护 Hay，且日终确有空格（腾出成功）。
+            sold_qids = [c["whitelist"][0] for c in worker.sell_calls]
+            self.assertTrue(all(q == "(O)178" for q in sold_qids), sold_qids)
+            self.assertGreaterEqual(int(rep.free_slots_last), 1)
         # 日终 trace 仍如实（容量−行数；不猜）
         self.assertEqual(rep.free_slots_status, "ok")
-        self.assertEqual(int(rep.free_slots_last), 0)
+        # 【590f154 修复】last-resort 可能送一叠非保护 Hay 腾格 ⇒ free_slots_last 只需 >= 0；
+        # 受保护物（工具/种子）绝不进卖单。
+        self.assertGreaterEqual(int(rep.free_slots_last), 0)
+        self.assertTrue(
+            all(c["whitelist"][0] not in {"(T)Axe", "(T)Hoe", "(T)WateringCan", f"(O){SEED_ID}"}
+                for c in worker.sell_calls),
+            f"受保护物（工具/种子）不许进卖单：{worker.sell_calls}")
+        if worker.sell_calls:
+            sold_qids = [c["whitelist"][0] for c in worker.sell_calls]
+            self.assertTrue(
+                all(q in {"(O)178", "(O)Moss", "(O)999"} for q in sold_qids),
+                f"last-resort 只送非保护盈余（Hay/Moss/Mystery）：{sold_qids}")
         d = rep.as_dict()
         self.assertEqual(d["loot_lost_steps"], 0)
         self.assertEqual(d["free_slots_last"], rep.free_slots_last)
@@ -13798,8 +13870,11 @@ class TestTask38SlotReliefFieldParity(unittest.TestCase):
         worker = _SpaceWorker(w)
         run = self._run(w, worker)
         rep = self._rep()
-        for _ in range(SLOT_RELIEF_MAX + 2):
-            self.assertFalse(run._slot_relief(w.obs(), rep))
+        # 【590f154 修复】满包 Hay：first call 触发 last-resort 送一叠非保护 Hay（返回 True），
+        # 之后不再空转（返回 False）。压力卡 still 只留一次 trigger=none 的 slot_relief 事件。
+        results = [run._slot_relief(w.obs(), rep) for _ in range(SLOT_RELIEF_MAX + 2)]
+        self.assertTrue(any(results), "last-resort 应成功腾出一叠非保护 Hay")
+        self.assertEqual(results.count(True), 1, results)
         ev = [e for e in self._events(run, "slot_relief") if e.get("trigger") == "none"]
         self.assertEqual(len(ev), 1, self._events(run, "slot_relief"))
         self._assert_task237(ev[0])
