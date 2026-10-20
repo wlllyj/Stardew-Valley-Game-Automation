@@ -507,6 +507,22 @@ EVENT_ADVANCE_TIMEOUT_MS = 60000
 EVENT_WAIT_TRIES = 4
 EVENT_WAIT_SECONDS = 15.0
 
+#: 【devcoder-day-end-gates / Fix 3】`eventUp=true` 且**没有对话盒**时的**耐心延长**（真机 A9 spring 1，
+#: `eventId=63`）：基础 4×15s≈60s 全部用尽后事件仍在跑 ⇒ 旧行为直接 `blocked_event` 收工。
+#:
+#: 判断依据是**观测差分**（不是等够时间就硬闯）：`worldSeq` 是 Mod 侧"地点|玩家格|游戏内时间|日|
+#: 金钱|背包件数"的指纹计数器（`mod/AgentFarm.Bridge/WorldSnapshot.cs:103` UpdateWorldSeq）——
+#: 事件脚本拉玩家走位/换场景时它会**单调前进**，而事件卡在 `pause`/等玩家时它是停的。
+#: 所以：
+#:   * 指纹在动 ⇒ 事件**确实在推进**（过场动画/脚本走位）⇒ 允许继续等，最多再等
+#:     :data:`EVENT_WAIT_EXTRA_TRIES` 轮（总上限 ≈ 60s + 180s = 240s）；
+#:   * 连续 :data:`EVENT_WAIT_IDLE_GIVE_UP` 轮指纹**一动不动** ⇒ 事件不是在放动画，是在等人
+#:     （或脚本真要点击才走）⇒ 立刻停手，诚实 `blocked_event`（不再干烧时间）。
+#: 边界不变：等待期间**绝不** dismiss / sleep / load_save / 注入按键；对话盒一出现就交回
+#: task-228 的受控推进（非提问才点、提问/职业选择一次都不点）。
+EVENT_WAIT_EXTRA_TRIES = 12
+EVENT_WAIT_IDLE_GIVE_UP = 4
+
 
 def _dist(a: tuple[int, int], b: tuple[int, int]) -> int:
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
@@ -771,11 +787,24 @@ class DayReport:
     #: 【task-78 NIT-2】判据只讲"四邻没有突破口"，**不再断言**是树/桩/大石（四邻可能是 `weed`
     #: 只是站不上去）；逐格证据看 journal `encircled` 的 `kinds`/`tried_open` 与
     #: `encircled_summary.tried_open_steps`。
-    #: **与 `unreachable*` / `refused*` 都不同**：这些格既不封格、也不进任何豁免分子 ——
+    #: **与 `unreachable*` / `refused*` 都不同**：这些格既不封格、也不进**不可达**的豁免分子 ——
     #: `checks.unreachable_within_bound` 仍然只数"真·不可达"，所以"一圈树围住"不会污染上界；
+    #: 【devcoder-day-end-gates / Fix 1】它们现在有**自己的**一份有界豁免（`encircled_bound`/
+    #: `encircled_exempt`，见下），只扣逐格已证被围死、且仍留在如实 shortfall 阶段 undone 里的格。
     #: 它们的用途是给出**证据**（run6 的 42 格"走不到"里有多少其实是"开不了路"）与下一步归因。
     encircled: int = 0
     encircled_tiles: list[Any] = field(default_factory=list)
+    #: 【devcoder-day-end-gates / Fix 1】"被围住"的**有界豁免**（与 `unreachable*`/`refused*` 同构、
+    #: 但**独立起界**）：`encircled_bound = max(5, floor(0.2 × bound_basis))`，
+    #: `encircled_exempt` = 真正从 `no_unmet_stages` 里扣掉的格数。
+    #: 为什么需要它（A9 winter 27 实证）：那天 clear_area `assigned=16 / 12 做成 / 4 被围住 /
+    #: leftover=0`，这 4 格四邻全被挡死（`_known_enclosed`/`open_way` 已证、逐格 `encircled`
+    #: journal 有 kinds），却因为 `leftover=0` ⇒ `encircled_leftover=0` ⇒ 旧公式一格都扣不掉
+    #: ⇒ 干得没错的一天判红。现在只扣**已证被围死、且仍在某个"如实 shortfall 阶段"的
+    #: `assigned_undone` 里**的格（逐格坐标比对），预过滤的、已经做成的、夜里/体力收工留下的
+    #: 一律不扣；防洗白的 `made_any_progress` 合取项照旧（0 成功日不许被豁免洗白）。
+    encircled_bound: int = 0
+    encircled_exempt: int = 0
     #: 【task-84】当天账本里的"枯死"证据（用户 m11003：死苗还在被浇）：
     #: * `dead_crops` = Mod `farm.deadCrops`（全农场枯死作物格数）= `(格数, 状态 ok|unavailable)`；
     #: * `dry_dead` = Mod `farm.dryDeadCrops`（枯死**且没浇**的格数，0.7.27 新增字段）；
@@ -972,6 +1001,10 @@ class DayReport:
             # 【task-68】被围住：只报证据（计数 + 坐标），不进任何豁免分子
             "encircled": self.encircled,
             "encircled_tiles": [list(t) for t in self.encircled_tiles],
+            # 【devcoder-day-end-gates / Fix 1】被围住的**有界豁免**：界与实扣都要落账
+            # （只扣"已证被围死 + 仍在如实 shortfall 阶段 undone 里"的格）
+            "encircled_bound": self.encircled_bound,
+            "encircled_exempt": self.encircled_exempt,
             # 【task-73】stuck 日是否已翻篇（睡过去了）—— 只作证据；验收口径不变
             "stuck_flushed": self.stuck_flushed,
             # 【task-102】"0 农场动作就想睡"被拒绝（本日不推进、不 VERIFIED）—— 只作证据
@@ -8787,6 +8820,11 @@ class LongRun:
             # 也没按规跳过的格数。日级 `no_unmet_stages` 从 task-134 起看 `assigned_undone`
             # （`leftover` 仍是"片区还剩多少格"，作为 `plot_pending` 落账、供守卫/换片/resume 用）。
             "assigned": len(assigned), "assigned_undone": assigned_undone,
+            # 【devcoder-day-end-gates / Fix 1+2】`assigned_undone` 的**逐格坐标**（前 64 条）：
+            # 日级豁免要靠它做"已证挡死的格"与"真的没做完的格"**逐格求交** —— 只看计数会把
+            # "另一阶段该做没做"的格也一起洗掉；只看最后一条记录的 `*_leftover` 又会在
+            # "不可达格早在前几条记录就解掉、最后一条 leftover=0"时把豁免归零（A9 winter 26）。
+            "assigned_undone_tiles": [list(t) for t in sorted(assigned - assigned_done)[:64]],
             # 【task-161】阶段体力实测（只留痕）：取不到观测就是 `None`，**不许写 0**。
             # `day_end.stamina_calibration` 按 stage 聚合这三个数，用来**事后**标定
             # `farmwork.py` 的估算常量（本卡不动常量、不动任何判据）。
@@ -9447,21 +9485,48 @@ class LongRun:
 
         为什么用 `self.sleep_fn`：长跑的等待一律走可注入的 sleep（测试里被替换成 no-op，
         真机是 `time.sleep`），既不阻塞回合边界，也让单测保持毫秒级。
+
+        【Fix 3】耐心是**有证据**的，不是"等够时间就硬闯"：基础窗口
+        :data:`EVENT_WAIT_TRIES` 轮用满后，只有当 `worldSeq`（Mod 侧世界指纹：地点|玩家格|
+        游戏内时间|日|金钱|背包件数）在这段时间里**动过**，才允许继续等
+        :data:`EVENT_WAIT_EXTRA_TRIES` 轮（事件脚本走位/换场景时它一定在动）；连续
+        :data:`EVENT_WAIT_IDLE_GIVE_UP` 轮毫无变化 ⇒ 事件不是在放动画，是在等人/等点击 ⇒
+        立刻停手诚实收尾（A9 spring 1 `eventId=63` 的 60s 白等就是这么来的）。
         """
         tries = 0
-        for tries in range(1, EVENT_WAIT_TRIES + 1):
+        idle = 0
+        moved_any = False
+        seq_seen = obs.get("worldSeq")
+        total_limit = EVENT_WAIT_TRIES + EVENT_WAIT_EXTRA_TRIES
+        while tries < total_limit:
             self.sleep_fn(EVENT_WAIT_SECONDS)
+            tries += 1
             obs = self._snap_or(obs)
+            seq = obs.get("worldSeq")
+            moved = seq != seq_seen
+            if moved:
+                moved_any = True
+                idle = 0
+            else:
+                idle += 1
+            seq_seen = seq
             ui = obs.get("ui") or {}
             event_up, _is_question, _menu, has_dialogue = self._event_dialogue_state(obs)
             self._journal("event_wait", tries=tries, limit=EVENT_WAIT_TRIES,
+                          limitMax=total_limit, extended=bool(tries > EVENT_WAIT_TRIES),
                           eventId=ui.get("eventId"), eventUp=bool(event_up),
-                          hasDialogue=bool(has_dialogue), worldSeq=obs.get("worldSeq"),
-                          waitSeconds=EVENT_WAIT_SECONDS,
+                          hasDialogue=bool(has_dialogue), worldSeq=seq,
+                          worldMoved=bool(moved), worldMovedAny=bool(moved_any),
+                          idleStreak=idle, waitSeconds=EVENT_WAIT_SECONDS,
                           note="事件进行中但没有对话盒：有界等待（**不** dismiss / **不** sleep / "
                                "**不** load_save；事件结束或对话盒出现就回日循环）")
             if not event_up or has_dialogue:
                 return obs, False, tries
+            # 基础窗口用完之后的**放行条件**（只有证据齐全才继续等）：
+            #   * 指纹动过（事件确实在推进）且还没连续静止到上限；
+            #   * 否则立刻收手 —— 干等只会把整条长跑的时间预算烧在"等一个人"上。
+            if tries >= EVENT_WAIT_TRIES and (not moved_any or idle >= EVENT_WAIT_IDLE_GIVE_UP):
+                return obs, True, tries
         return obs, True, tries
 
     def _clear_modals(self, obs: dict[str, Any], rep: DayReport) -> tuple[dict[str, Any], bool]:
@@ -9609,8 +9674,9 @@ class LongRun:
                       # 由 Mod 的 EventRules 归一，这里原样落账。
                       eventId=ui.get("eventId"),
                       eventWaitTries=event_wait_tries,
-                      eventWaitSeconds=(EVENT_WAIT_TRIES * EVENT_WAIT_SECONDS
-                                        if event_wait_tries else 0.0),
+                      # 【Fix 3】等待秒数按**实际等了几轮**算（耐心延长后可能是 4~16 轮，
+                      # 写死"基础界"会把账本的低效白等时间少算 3 倍）。
+                      eventWaitSeconds=round(event_wait_tries * EVENT_WAIT_SECONDS, 1),
                       # 【task-228】事件对话推进的当日账：`event_blocked` 到底是因为
                       # "提问/职业选择"还是"推了 N 步之后点不动"——账本必须能分清。
                       advance_steps=self.event_advance_steps_today,
@@ -9620,7 +9686,7 @@ class LongRun:
                            "不 dismiss / 不 sleep / 不 load_save，当天不判 VERIFIED，等人处理")
         rep.ended_by = ENDED_BY_EVENT
         event_id = ui.get("eventId")
-        waited = (EVENT_WAIT_TRIES * EVENT_WAIT_SECONDS if event_wait_tries else 0.0)
+        waited = (event_wait_tries * EVENT_WAIT_SECONDS if event_wait_tries else 0.0)
         rep.ended_reason = (f"游戏事件挂住（eventUp=true）：{menu or '?'}"
                             + (f"「{text}」" if text else "")
                             + (f"；eventId={event_id}" if event_id else "；eventId=未知（无法归因）")
@@ -10428,6 +10494,29 @@ class LongRun:
         rep.unreachable = len(unreach_day)
         rep.unreachable_tiles = [list(t) for t in sorted(unreach_day)]
         rep.unreachable_bound = unreachable_bound
+        # 【devcoder-day-end-gates / Fix 1】"被围住"的日级**逐格证据**集合提前算好（豁免要用）：
+        # `enc_day` = 各阶段 `encircled_tiles` ∪ 当天 `self.encircled_day`；
+        # `prefiltered_day` = 其中"目标池前置过滤判死、0 次尝试、没有 step"的那些（task-27）——
+        # 它们不进 `assigned` ⇒ 也不进 `assigned_undone`，扣豁免时先剔掉（双保险，fail-closed）。
+        enc_day: set[tuple[int, int]] = set(self.encircled_day)
+        prefiltered_day: set[tuple[int, int]] = set()
+        for s in rep.stages:
+            for t in (s.get("encircled_tiles") or []):
+                try:
+                    enc_day.add((int(t[0]), int(t[1])))
+                except (TypeError, ValueError, IndexError):
+                    continue
+            for t in (s.get("encircled_prefiltered_tiles") or []):
+                try:
+                    prefiltered_day.add((int(t[0]), int(t[1])))
+                except (TypeError, ValueError, IndexError):
+                    continue
+        rep.encircled = len(enc_day)
+        rep.encircled_tiles = [list(t) for t in sorted(enc_day)]
+        # 与 `unreachable_bound`/`refused_bound` **同一基数、同一公式**（fail-closed：被围住不能
+        # 抬高上界，`bound_basis` 早已把 encircled 步从分母剔掉）。
+        encircled_bound = max(5, int(0.2 * bound_basis_steps))
+        rep.encircled_bound = encircled_bound
         # 【task-134 B】`plot_pending` = 改判据**之前**的 `raw_unmet` 口径（`_leftover` 逐 kind 求和）：
         # "片区里还剩多少格该做没做"。**数值必须逐字一致**（守卫/换片/resume 与工具侧都对它）。
         # `no_unmet_stages` 从此不再由它直接决定（见下面的 `assigned_unmet`）——
@@ -10454,10 +10543,13 @@ class LongRun:
         # 【task-161】日终把"每条 stage 的实测体力"按 stage 聚合（只留痕，不进 checks）：
         # 下一次真机 run 之后用它标定 `farmwork.py` 的 `STAMINA_COST_*` 估算常量。
         rep.stamina_calibration = self._stamina_calibration(rep)
+        # 【devcoder-day-end-gates / Fix 2】`unreach_in_last` 只剩**老账本回退口径**的作用：
+        # 它只数"最后一条阶段记录"里的 `unreachable_leftover`，而 A9 winter 26 的形态是
+        # "6 格真不可达在前几条记录里就解掉了、最后一条 leftover=0" ⇒ 这个数变成 0 ⇒ 豁免
+        # 一格都扣不掉（`unreachable_summary count=6 bound=22 exempted=0`）。新主口径见
+        # `assigned_unmet` 循环之后的"日级逐格求交"。
         unreach_in_last = sum(int(s.get("unreachable_leftover") or 0) for s in last_by_stage.values()
                               if int(s.get("tiles") or 0) > 0)
-        unreachable_exempt = min(unreachable_bound, unreach_in_last)
-        rep.unreachable_exempt = unreachable_exempt
         # 【task-63】被**游戏拒绝**（`tool_ineffective`/`precondition_failed`）：与"走不到"同形态
         # 但**独立起界**（`refused_bound = max(5, floor(0.2 × bound_basis))`，与不可达侧同一基数）：
         #   * 界内 ⇒ 从 `no_unmet_stages` 里扣掉"仍留在 leftover 的拒绝格"（否则 run5 那种
@@ -10489,6 +10581,7 @@ class LongRun:
         deferred_tiles = 0
         honest_stages: list[dict] = []
         shortfall_stages: list[dict] = []
+        shortfall_recs: list[dict] = []
         for name, s in last_by_stage.items():
             if int(s.get("tiles") or 0) <= 0:
                 continue
@@ -10507,17 +10600,70 @@ class LongRun:
                                           "assigned_undone": undone})
             elif undone > 0:
                 assigned_unmet += undone
+                shortfall_recs.append(s)
                 shortfall_stages.append({"stage": name, "stopped": stopped, "undone": undone,
                                          "assigned": int(s.get("assigned") or 0),
                                          "leftover": int(s.get("leftover") or 0)})
-        unmet_leftover = max(0, assigned_unmet - unreachable_exempt - refused_exempt)
+        # 【devcoder-day-end-gates / Fix 1 + Fix 2】豁免分子的新口径：**日级逐格求交**。
+        #
+        # 旧口径的两个洞（真机 A9 实证，均为"诚实做不成却被判红"）：
+        #   * Fix 1（winter 27）：扣的只有 `*_leftover`（"还留在 leftover 里的格数"）。那天
+        #     clear_area `assigned=16 / 12 做成 / 4 被围住 / leftover=0` ⇒ `encircled_leftover=0`
+        #     ⇒ 4 格已证围死却一格都扣不掉 ⇒ `no_unmet_stages=False`。
+        #   * Fix 2（winter 26）：`unreach_in_last` 只取"每个阶段种类的**最后一条**记录"，而 6 格
+        #     不可达在前几条记录里就已解掉、最后一条 `leftover=0` ⇒ 豁免归零（exempted=0）。
+        #
+        # 新口径：`short_undone` = **当天所有"如实 shortfall"阶段**（非体力/夜里收工那类）最后一条
+        # 记录里的 `assigned_undone` **逐格坐标**之并 —— 它与日级证据集合求交，只扣"既已被证明
+        # 走不到/被围死、又确实还欠着"的格：
+        #   * 已做成的格不会出现在 `assigned_undone` 里 ⇒ 不可能被拿来洗白别的格；
+        #   * 诚实上限（体力/夜里收工）留下的格**根本不在** `short_undone` 里 ⇒ 不许拿去抵别人的
+        #     欠账（这是"只按计数扣"最容易漏的洗白通道）；
+        #   * `encircled` 侧先剔掉 `encircled_prefiltered`（0 次尝试、没进 assigned 的格）；
+        #   * 两侧各自按 `max(5, floor(0.2 × bound_basis))` 封顶，且**互不覆盖**（两套集合、两套界）；
+        #   * `bound_basis` 分母一个字没动（fail-closed：豁免只会更难，不会更容易）。
+        # 老账本（阶段记录里没有 `assigned_undone_tiles` 键）⇒ 逐条退回旧口径，行为与改前一致。
+        short_undone: set[tuple[int, int]] = set()
+        short_undone_legacy = False
+        for rec in shortfall_recs:
+            coords = rec.get("assigned_undone_tiles")
+            if coords is None:
+                short_undone_legacy = True
+                continue
+            for t in coords:
+                try:
+                    short_undone.add((int(t[0]), int(t[1])))
+                except (TypeError, ValueError, IndexError):
+                    continue
+        if short_undone_legacy:
+            unreach_evidenced = unreach_in_last
+            enc_evidenced = sum(int(s.get("encircled_leftover") or 0)
+                                for s in last_by_stage.values() if int(s.get("tiles") or 0) > 0)
+        else:
+            unreach_evidenced = len(unreach_day & short_undone)
+            enc_evidenced = len((enc_day - prefiltered_day) & short_undone)
+        unreachable_exempt = min(unreachable_bound, unreach_evidenced)
+        rep.unreachable_exempt = unreachable_exempt
+        encircled_exempt = min(encircled_bound, enc_evidenced)
+        rep.encircled_exempt = encircled_exempt
+        # 三套豁免各自独立、互不覆盖：合计也不许超过"真的欠着"的格数（防同一格被两套同时扣）。
+        exempt_total = min(assigned_unmet, unreachable_exempt + refused_exempt + encircled_exempt)
+        unmet_leftover = max(0, assigned_unmet - exempt_total)
         rep.assigned_undone = assigned_unmet
         rep.deferred_tiles = deferred_tiles
         if shortfall_stages:
             self._journal("stage_shortfall_day", unmet=assigned_unmet, stages=shortfall_stages[:6],
                           plot_pending=raw_unmet, stopped_night=bool(night_end),
+                          unreachable_exempt=unreachable_exempt,
+                          refused_exempt=refused_exempt,
+                          encircled_exempt=encircled_exempt,
+                          unmet_after_exempt=unmet_leftover,
+                          undone_tiles=[list(t) for t in sorted(short_undone)[:24]],
                           note="阶段分下去的格没做完（非诚实上限）⇒ 当天 needs_review；"
-                               "`plot_pending` 是片区还剩多少格，两个口径分开记")
+                               "`plot_pending` 是片区还剩多少格，两个口径分开记。"
+                               "【Fix 1/2】三套豁免按**逐格求交**扣：只有既已被证明"
+                               "（走不到/被围死/游戏拒绝）又确实还欠着的格才算，"
+                               "`unmet_after_exempt` 是扣完之后仍欠的格数")
         if deferred_tiles:
             self._journal("deferred_tiles", tiles=deferred_tiles, night=bool(night_end),
                           by_kind=plot_pending_by_kind, stages=honest_stages[:6],
@@ -10537,35 +10683,38 @@ class LongRun:
                           attempted=attempted_steps, bound_basis=bound_basis_steps,
                           engaged=engaged_steps,
                           exempted=unreachable_exempt,
+                          evidenced=unreach_evidenced,
                           raw_unmet=raw_unmet, unmet=unmet_leftover,
                           tiles=[list(t) for t in sorted(unreach_day)[:12]],
-                          note="不可达豁免：界内不影响 verified；扣掉的格子在 leftover 里逐格可见"
+                          note="不可达豁免：界内不影响 verified"
+                               "（【Fix 2】豁免分子 = **日级**不可达格集合 ∩ 仍留在如实 shortfall "
+                               "阶段 `assigned_undone` 里的格（逐格坐标），不再只看"
+                               "「最后一条记录的 `unreachable_leftover`」—— 那种口径会在"
+                               "不可达格早在前几条记录就解掉、最后一条 leftover=0 时把豁免归零；"
+                               "`evidenced` 是求交后的格数，`exempted` 是过了界之后实扣的数）"
                                "（【task-78】上界分母 = `bound_basis`（发起过动作且**不是** encircled "
                                "的步数）；`attempted` 仍是原始证据计数、`engaged` = 真的站到过目标格"
                                "旁边的步数，两者都只作证据）")
-        # 【task-68】"被围住"的日级账本：**只报证据**，既不影响任何豁免，也不封格。
-        enc_day: set[tuple[int, int]] = set(self.encircled_day)
-        for s in rep.stages:
-            for t in (s.get("encircled_tiles") or []):
-                try:
-                    enc_day.add((int(t[0]), int(t[1])))
-                except (TypeError, ValueError, IndexError):
-                    continue
-        rep.encircled = len(enc_day)
-        rep.encircled_tiles = [list(t) for t in sorted(enc_day)]
+        # 【task-68】"被围住"的日级账本：`enc_day` 已在上面（Fix 1）算好；这里只负责**报账**
+        # （逐格证据 + 日级豁免的界与实扣）。
         tried_open_steps = sum(int(s.get("encircled_tried") or 0) for s in rep.stages)
         if enc_day:
             self._journal("encircled_summary", count=len(enc_day),
                           attempted=attempted_steps, bound_basis=bound_basis_steps,
+                          bound=encircled_bound, exempted=encircled_exempt,
                           engaged=engaged_steps, tried_open_steps=tried_open_steps,
                           tiles=[list(t) for t in sorted(enc_day)[:12]],
-                          note="四邻没有「可清障 + 自己够得着」的突破口 ⇒ 不算「走不到」、不封格、"
-                               "不进 unreachable 豁免；开路后/次日可能变可达"
+                          note="四邻没有「可清障 + 自己够得着」的突破口 ⇒ 不算「走不到」、不封格；"
+                               "【Fix 1】只对**逐格已证被围死、且仍留在如实 shortfall 阶段 "
+                               "`assigned_undone` 里**的格做有界豁免（界 = max(5, 20%×bound_basis)，"
+                               "与 unreachable/refused 各自独立）；预过滤的、已做成的、诚实上限"
+                               "（体力/夜里收工）留下的格一律不扣"
                                "（真实四邻 kind 与逐格开路次数见 encircled 事件的 kinds/tried_open；"
                                "本键 `tried_open_steps` 是当天合计）")
             rep.notes.append(
                 f"有 {len(enc_day)} 格四邻没有「可清障 + 自己够得着」的突破口 ⇒ 不算「走不到」、"
-                f"不进不可达豁免，只记 encircled 证据（为这些格试过开路 {tried_open_steps} 次）")
+                f"不进不可达豁免（自有一套有界豁免：界 {encircled_bound}、实扣 {encircled_exempt}；"
+                f"为这些格试过开路 {tried_open_steps} 次）")
         # 遮蔽可见性（Lead m02561 裁定 1）：同一阶段种类当天**更早**记录 leftover>0、**最后一条**
         # leftover==0 ⇒ "前一片地没做完、后一片地干净"的遮蔽发生了。**纯信息项**：不改 VERIFIED、
         # 不改退出码，只发 journal + 进 notes，让 run3 事后能人工复核。
@@ -10706,8 +10855,12 @@ class LongRun:
             # task-52 防洗白：豁免只对"走不到"的格子生效，且**全部不可达 + 0 成功动作**时
             # 不许靠豁免把 `no_unmet_stages` 洗成 True（真空日必须仍判不达标）。
             # task-63 把同一条防洗白扩到 `refused`：两组豁免都非空且 0 成功 ⇒ 仍不达标。
+            # 【Fix 1】`encircled_exempt` 同样消费这个合取项：0 成功日就算整片只是"被围住"，
+            # 也不许靠豁免判达标（既有用例 `test_day_with_only_encircled_leftover_ends_honestly`
+            # 钉死"只有挡死格的一天不 VERIFIED"）。
             "no_unmet_stages": unmet_leftover == 0 and (
-                made_any_progress or (unreachable_exempt == 0 and refused_exempt == 0)),
+                made_any_progress or (unreachable_exempt == 0 and refused_exempt == 0
+                                      and encircled_exempt == 0)),
             "crops_watered": int(rep.final.get("unwatered_crops") or 0) == 0,
             # task-19：**唯一**浇水证据（卡面 §1；`tools\verify-run3.py` 缺这条即问题）。
             # 窗口口径的 `crops_watered` 只作旁证：它读的是 `_essence` 的窗口计数，在室内恒 0。
@@ -10745,6 +10898,8 @@ class LongRun:
                if rep.unreachable else "")
             + (f" 游戏拒绝 {rep.refused} 格（豁免界 {refused_bound}、实扣 {refused_exempt}）"
                if rep.refused else "")
+            + (f" 被围住 {rep.encircled} 格（有界豁免 界 {encircled_bound}、实扣 {encircled_exempt}）"
+               if rep.encircled else "")
             + f" 浇水 {water_info.get('scope')} 口径 干 {water_info.get('dry')}/{water_info.get('crops')}"
             + f"（watered_outdoor={watered_outdoor}）"
             + f" → {'VERIFIED' if rep.verified else 'needs_review'} {rep.checks}"
