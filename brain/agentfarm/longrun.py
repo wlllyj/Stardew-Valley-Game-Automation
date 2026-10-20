@@ -10619,7 +10619,11 @@ class LongRun:
         #   * 已做成的格不会出现在 `assigned_undone` 里 ⇒ 不可能被拿来洗白别的格；
         #   * 诚实上限（体力/夜里收工）留下的格**根本不在** `short_undone` 里 ⇒ 不许拿去抵别人的
         #     欠账（这是"只按计数扣"最容易漏的洗白通道）；
-        #   * `encircled` 侧先剔掉 `encircled_prefiltered`（0 次尝试、没进 assigned 的格）；
+        #   * `encircled` 侧**不**再剔 `encircled_prefiltered`：`short_undone` 只含"被分配且没做成"
+        #     的格，预过滤格若真没进 assigned 就根本不在 `short_undone` 里（求交天然排掉）；
+        #     而 A9 winter27 实测 stage 记录 `assigned=15` **已经包含**那 3 格预过滤格
+        #     （`assigned_undone_tiles` 与 `encircled_prefiltered_tiles` 是同一批 [35,24]/[35,25]/
+        #     [36,24]）⇒ 再剔一次会把"已证围死且确实欠着"的格归零（旧 `enc_evidenced=0` 的根因）；
         #   * 两侧各自按 `max(5, floor(0.2 × bound_basis))` 封顶，且**互不覆盖**（两套集合、两套界）；
         #   * `bound_basis` 分母一个字没动（fail-closed：豁免只会更难，不会更容易）。
         # 老账本（阶段记录里没有 `assigned_undone_tiles` 键）⇒ 逐条退回旧口径，行为与改前一致。
@@ -10641,7 +10645,10 @@ class LongRun:
                                 for s in last_by_stage.values() if int(s.get("tiles") or 0) > 0)
         else:
             unreach_evidenced = len(unreach_day & short_undone)
-            enc_evidenced = len((enc_day - prefiltered_day) & short_undone)
+            # 【Fix1 修正】不剔 prefiltered_day：short_undone 只含"被分配且没做成"的格，预过滤格若
+            # 真没进 assigned 就不在 short_undone 里（求交天然排掉）；A9 winter27 实测 prefiltered
+            # 那 3 格同时也在 assigned_undone_tiles 里 ⇒ 剔掉会把 encircled_exempt 归零、误判红。
+            enc_evidenced = len(enc_day & short_undone)
         unreachable_exempt = min(unreachable_bound, unreach_evidenced)
         rep.unreachable_exempt = unreachable_exempt
         encircled_exempt = min(encircled_bound, enc_evidenced)
