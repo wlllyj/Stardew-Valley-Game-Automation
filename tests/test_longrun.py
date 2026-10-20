@@ -12778,6 +12778,51 @@ class TestTask240SeedSeasons(unittest.TestCase):
         self.assertTrue(day.verified, day.checks)
         self.assertIs(run.no_work_evidence_ok, True)
 
+    def test_no_work_sleep_escapes_walked_loop_without_hanging(self):
+        """devcoder-no-work-sleep：冬季/无种/满包、账本仍有 pending 格 ⇒ 守卫每轮拒绝、
+        `_guard_leftover_resume` 反复 "walked" 回到 leftover 仍拿不出可执行目标。
+
+        回归：之前这条路径会无限循环（LLM 重试挂起 ⇒ 被外部杀掉、无 day_end），或撞到
+        `_guard_walk_streak>=10` 的 `stuck:` 睡眠被 `_unfinished_work` 挡成 `slept_without_work`
+        ⇒ 不跨日、整轮自停。修复后连续 3 轮"LLM 意图 + 确定性兜底均无可执行目标、当日 0 农场动作"
+        即诚实 `no_work` 收工、干净跨日（不无限循环、不是 slept_without_work）。
+        """
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.season = "winter"
+        w.day = 1
+        w.farm = {"loaded": True, "complete": True, "crops": 0, "ripeCrops": 0,
+                  "readyCrops": 0, "deadCrops": 0, "dryCrops": 0, "dryDeadCrops": 0,
+                  "dryTiles": [], "dryTilesTruncated": False, "unwateredCrops": 0,
+                  "hoeDirt": 29, "emptyDirt": 29}
+        w.player_seeds = [self._seed("(O)472", "Wheat Seeds", 10,
+                                     ["spring", "summer", "fall"], False)]
+        run = self._run(w)
+        # 桩策略/兜底：每轮都"返回无可执行目标"（LLM 意图与确定性兜底都落不到地上）。
+        run.planner = FakePlanner()
+        run._fallback_decision = lambda brief, rep: SimpleNamespace(intents=[])
+        # 账本里留一格未封格、未被围的 pending，让守卫每轮都拒绝放行 ⇒ 走回 leftover。
+        run.leftover_targets = {(60, 10)}
+        run.leftover_area = {(60, 10): "field_nw"}
+        w.player_tile = [62, 14]            # 站在别处，保证走回 leftover 真的 "walked"
+        before_day = w.day
+        run.run()
+        self.assertEqual(len(run.days), 1)
+        day = run.days[0]
+        self.assertEqual(day.ended_by, "sleep")
+        self.assertTrue(str(day.ended_reason).startswith("no_work"),
+                        f"当天应以 no_work 收工，实际：{day.ended_reason}")
+        self.assertNotIn("stuck", str(day.ended_reason))
+        # 不是 slept_without_work：睡眠成功 ⇒ 游戏日干净前进。
+        self.assertFalse(day.slept_without_work, "不该落到 slept_without_work（否则不跨日）")
+        self.assertTrue(day.slept_ok, "睡眠成功 ⇒ 当天干净跨日")
+        # 干净跨日：游戏日确实前进了（没卡在当天、没被外部杀掉）。
+        self.assertEqual(w.day, before_day + 1, "游戏日应干净前进一天")
+        # day_justified 应为 True（no_work 在 JUSTIFIED_END_REASONS 白名单）。
+        self.assertTrue(getattr(day, "checks", {}).get("day_justified"), day.checks)
+        # 没有无限循环：walked 轮次被阈值 3 收敛（不会一直 continue 到被外部杀掉）。
+        self.assertLessEqual(run.resume_walks, 3,
+                             f"应在 3 轮内收敛，实际 resume_walks={run.resume_walks}")
+
     def test_farm_level_plant_reason_needs_a_window_target(self):
         """【task-240 ③】当季种子够、farm 口径也有空耕地，但**窗口里一格目标都没有** ⇒
         farm 计数不许变成「该去种」（farm 计数 vs 400 格窗口目标池错配，冒烟 day1 根因 B）。"""

@@ -1514,6 +1514,10 @@ class LongRun:
         #: 还有 leftover、failed=0"，当时 8 种 kind 一条都生成不了 ⇒ run A 攒不到教训。
         self.plot_exhausted_today = 0
         self.midway_leftover_today = 0
+        #: 【devcoder-no-work-sleep】连续"LLM 意图 + 确定性兜底都无可执行目标、且当日 0 农场
+        #: 动作"的轮次计数（每天重置）。达到阈值（3）即证明"确实无活"，直接诚实收工、干净跨日，
+        #: 而不是无限循环等到被外部杀掉、或落到 `slept_without_work` 不跨日。
+        self._no_work_cycle_count = 0
         #: 【task-124】"同一秒连发换片"的窗口计数（`plot_exhausted` 空转的刹车）。
         self._plot_exhausted_last: float | None = None
         self._plot_exhausted_window = 0
@@ -9718,6 +9722,8 @@ class LongRun:
         # 【task-122】两种退化形态的当日计数，每天清零（只喂教训库，不参与判定）。
         self.plot_exhausted_today = 0
         self.midway_leftover_today = 0
+        # 【devcoder-no-work-sleep】连续"无活轮次"每天清零：昨天证明过无活 ≠ 今天也无活。
+        self._no_work_cycle_count = 0
         # 【task-124】同一秒连发换片的窗口计数每天清零。
         self._plot_exhausted_last = None
         self._plot_exhausted_window = 0
@@ -10217,17 +10223,47 @@ class LongRun:
                     if action == "acted":
                         self.idle_rounds = 0
                         self._guard_walk_streak = 0
+                        self._no_work_cycle_count = 0      # 这轮真做了农场动作 ⇒ 无活计数清零
                         continue
                     if action == "walked":
+                        # 【devcoder-no-work-sleep】连续"LLM 意图 + 确定性兜底都无可执行目标、
+                        # 且当日 0 农场动作"的轮次计数：已用校验证据*证明*无活，不必等
+                        # `_guard_walk_streak>=10`（更不必等到被外部杀掉），直接诚实收工、干净跨日。
+                        # 阈值 3 远小于 walk_streak 的 10：LLM 重试挂起会在进程被外部杀掉之前就收敛。
+                        self._no_work_cycle_count += 1
+                        if self._no_work_cycle_count >= 3:
+                            if self.farm_actions_today <= 0:
+                                rep.notes.append(
+                                    f"连续 {self._no_work_cycle_count} 轮校验取消/确定性兜底均无可执行"
+                                    f"目标、当日 0 农场动作 ⇒ 已证无活，诚实收工（干净跨日、不空转）")
+                                # require_work=False：我们已通过"多轮校验取消 + 当日 0 农场动作"的证据
+                                # *证明*无活（不是偷懒跳过），`_do_sleep` 因此不再被 `_unfinished_work`
+                                # 挡成 `slept_without_work` ⇒ 睡眠成功、游戏日干净前进。
+                                rep.ended_by, rep.ended_reason = self._do_sleep(
+                                    obs, rep,
+                                    f"no_work:连续{self._no_work_cycle_count}轮校验取消、当日0可执行农场动作"
+                                    f"（已证无活，非跳过）",
+                                    require_work=False)
+                                break
+                            # 当天其实做过农场动作（只是做不成/被围）⇒ 不是"当日 0 可执行农场动作"，
+                            # 绝不许洗成 no_work（那是把"有活做不成"洗白成"没活"）；落回既有
+                            # stuck / burst / resume_exhausted 诚实收口（见
+                            # `test_persistent_unfinishable_work_is_bounded_and_never_no_work`）。
                         # 【liveness 修复】连续走路无进展硬上限：守卫说还有活、但反复走回 leftovers
                         # 仍拿不出可执行目标 ⇒ 不再无限 continue，强制 honest sleep 让游戏日推进，
                         # 避免 winter26 这类"全部 encircled"场景整天空转。
                         self._guard_walk_streak = getattr(self, "_guard_walk_streak", 0) + 1
                         if self._guard_walk_streak >= 10:
-                            rep.notes.append(
-                                f"连续 {self._guard_walk_streak} 次走路仍无进展 ⇒ 强制收工避免空转")
+                            # 【devcoder-no-work-sleep】当日 0 农场动作时同样走 `no_work` 诚实口径
+                            # （require_work=False），避免 `_do_sleep` 默认 `require_work=True` 在
+                            # `_unfinished_work` 仍为真时返回 `slept_without_work` ⇒ 不跨日、整轮自停。
+                            no_work = self.farm_actions_today <= 0
                             rep.ended_by, rep.ended_reason = self._do_sleep(
-                                obs, rep, "stuck:连续走路无进展（encircled/unreachable 目标）")
+                                obs, rep,
+                                ("no_work:连续走路无进展（encircled/unreachable，已证无可达可执行目标）"
+                                 if no_work else
+                                 "stuck:连续走路无进展（encircled/unreachable 目标）"),
+                                require_work=not no_work)
                             break
                         continue
                     recovered += 1
@@ -10285,11 +10321,13 @@ class LongRun:
                 self.idle_rounds = 0
                 self.no_progress_cycles = 0      # 【task-134 A】真有进展 ⇒ 空转计数清零
                 self._guard_walk_streak = 0
+                self._no_work_cycle_count = 0   # 这轮真有农场动作 ⇒ 无活计数清零
             elif changed:
                 # 意图没落地（比如被否决），但世界确实变了 —— 也算有进展
                 self.idle_rounds = 0
                 self.no_progress_cycles = 0      # 【task-134 A】
                 self._guard_walk_streak = 0
+                self._no_work_cycle_count = 0   # 世界确有变化 ⇒ 无活计数清零
             else:
                 self.idle_rounds += 1
                 self._journal("idle", rounds=self.idle_rounds, zone=self.zone_name,
