@@ -6127,5 +6127,117 @@ class TestTask24ProbesAndRealLedgers(unittest.TestCase):
         self.assertEqual(rep["red"]["total"], 33, "smoke-0744 的 33 红必须一字不变")
 
 
+class TestWalkBudgetBurn(unittest.TestCase):
+    """A9-0749 复盘新增：resume_walk 走路预算燃烧（逐日 成功/尝试 × 换片 × 真农场动作）。
+
+    口径：纯 info、不进 rc；`walk_budget` 聚合 + 「每天一行」的 `走路 成功X/尝试Y` 片段。
+    缺失（账本没有 resume_walk 事件）⇒ `has_resume_walk=False` 且渲染写【无法判定】，绝不当 0。
+    """
+
+    WALK_DAY = [2, "spring", 1]
+    CLEAN_DAY = [2, "spring", 3]
+
+    @classmethod
+    def _events(cls):
+        walk_day, clean_day = cls.WALK_DAY, cls.CLEAN_DAY
+        events = [day_start(walk_day)]
+        for i in range(10):
+            events.append({"event": "resume_walk", "t": 20.0 + i, "zone": "field_ne",
+                           "tiles": 11, "walked": True, "attempt": i + 1, "walks": i + 1,
+                           "note": "守卫说还有活但本片没意图"})
+        events.append({"event": "frontier_clear", "t": 21.5, "tile": [71, 21], "acted": True,
+                       "attempt": 1, "limit": 20})
+        events.append({"event": "frontier_clear", "t": 22.5, "tile": [70, 20], "acted": True,
+                       "attempt": 2, "limit": 20})
+        events.append({"event": "no_progress_burst", "t": 46.0, "count": 6,
+                       "source": "回片区（plot_exhausted_burst）", "tiles": 14,
+                       "exhausted": False, "claim_exhausted": False, "switches": 2,
+                       "resume_walks": 10, "resume_walk_attempts": 11,
+                       "pending_executable": 38, "farm_actions_today": 19})
+        events.append({
+            "event": "day_end", "t": 62.0, "day": walk_day, "day_text": "2年 spring 1日",
+            "ended_by": "sleep",
+            "ended_reason": "resume_budget_exhausted:回片区走路预算用尽（成功 10/10、尝试 11/20）、"
+                            "换片 2/10 次，但账本仍有可执行余格 38 格",
+            "verified": False,
+            "checks": {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                       "unreachable_within_bound": True, "refused_within_bound": True,
+                       "no_unmet_stages": True, "crops_watered": True, "watered_outdoor": True,
+                       "day_justified": False, "zero_action_evidenced": True},
+            "stages": [{"stage": "till_area", "tiles": 12, "ok": 12, "skipped": 0, "failed": 0,
+                        "stopped": "", "leftover": 11, "leftover_executable": 11,
+                        "leftover_blocked": 0, "bound_basis": 12}],
+            "outcomes": [], "ok_steps": 12, "skipped_steps": 0, "failed_steps": 0, "notes": [],
+            "final": final(walk_day),
+        })
+        events.append(day_start(clean_day))
+        events.append({"event": "resume_walk", "t": 90.0, "zone": "field_se", "tiles": 7,
+                       "walked": True, "attempt": 1, "walks": 1})
+        events.append({
+            "event": "day_end", "t": 130.0, "day": clean_day, "day_text": "2年 spring 3日",
+            "ended_by": "sleep",
+            "ended_reason": "resume_exhausted:回片区 13 格都回去看过、换片 0 次，当前观测里没有可执行目标",
+            "verified": True,
+            "checks": {"slept_by_us": True, "no_blocking_modal": True, "no_hard_failures": True,
+                       "unreachable_within_bound": True, "refused_within_bound": True,
+                       "no_unmet_stages": True, "crops_watered": True, "watered_outdoor": True,
+                       "day_justified": True, "zero_action_evidenced": True},
+            "stages": [{"stage": "till_area", "tiles": 5, "ok": 5, "skipped": 0, "failed": 0,
+                        "stopped": "", "leftover": 0, "leftover_executable": 0,
+                        "leftover_blocked": 0, "bound_basis": 5}],
+            "outcomes": [], "ok_steps": 5, "skipped_steps": 0, "failed_steps": 0, "notes": [],
+            "final": final(clean_day),
+        })
+        events.append({"event": "finish", "t": 131.0, "code": 1, "verified_streak": 0,
+                       "actions": 17, "minutes": 2.2, "stages_seen": ["till_area"],
+                       "no_unmet_stages": True, "unmet_days": [], "stuck_flushes": 0})
+        return events
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.path = write_ledger(cls._tmp.name, "walk_budget.jsonl", cls._events())
+        cls.rep = report_for(cls.path, days=2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_per_day_counts(self):
+        days = {d["label"]: d for d in self.rep["days"]}
+        burn = days["2年 spring 1日"]
+        self.assertEqual((burn["walk_ok"], burn["walk_attempts"]), (10, 10))
+        self.assertEqual(burn["plot_switches"], 2)
+        # 农场动作 = Σ stage.ok(12) + frontier_clear acted(2) = 14
+        self.assertEqual(burn["farm_actions"], 14)
+        clean = days["2年 spring 3日"]
+        self.assertEqual((clean["walk_ok"], clean["walk_attempts"]), (1, 1))
+        self.assertEqual(clean["farm_actions"], 5)
+
+    def test_capped_days_and_totals(self):
+        wb = self.rep["walk_budget"]
+        self.assertTrue(wb["has_resume_walk"])
+        self.assertEqual([d["label"] for d in wb["capped_days"]], ["2年 spring 1日"])
+        self.assertEqual(len(wb["days"]), 2)
+        self.assertEqual(sum(d["walk_ok"] for d in wb["days"]), 11)
+        self.assertEqual(sum(d["farm_actions"] for d in wb["days"]), 19)
+
+    def test_render_exposes_burn_section_and_day_line(self):
+        text = mod.render_text(self.rep, 5)
+        self.assertIn("走路预算燃烧（resume_walk，A9 复盘新增）: 2 天", text)
+        self.assertIn("命中当天成功上限 10 的 1 天", text)
+        self.assertIn("走路 成功10/尝试10", text)
+        self.assertIn("走/干=10:14", text)
+
+    def test_missing_resume_walk_is_undecidable(self):
+        events = [e for e in self._events() if e.get("event") != "resume_walk"]
+        path = write_ledger(self._tmp.name, "no_walk.jsonl", events)
+        rep = report_for(path, days=2)
+        self.assertFalse(rep["walk_budget"]["has_resume_walk"])
+        text = mod.render_text(rep, 5)
+        self.assertIn("走路预算燃烧（resume_walk，A9 复盘新增）: <缺失>", text)
+        self.assertIn("无法判定回片区走路烧没烧预算", text)
+
+
 if __name__ == "__main__":
     unittest.main()
