@@ -10302,6 +10302,16 @@ class LongRun:
                                 rep.notes.append(
                                     f"连续 {self._no_work_cycle_count} 轮校验取消/确定性兜底均无可执行"
                                     f"目标、当日 0 农场动作 ⇒ 已证无活，诚实收工（干净跨日、不空转）")
+                                # 【zero_action_evidenced 补】0 动作日要能 VERIFIED，必须置
+                                # `no_work_evidence_ok`（`_zero_action_evidenced` 的唯一放行口，
+                                # 与 sleep_guard:5911 同义）。但**只在日终可执行面证据 executable==0
+                                # 时**才置（fail-closed：真还有可执行格就不许洗成无活，A9 winter27/28
+                                # 就是靠这 3 轮校验取消 + executable==0 才诚实判无活）。
+                                try:
+                                    if int(self._pending_snapshot(obs).get("executable") or 0) == 0:
+                                        self.no_work_evidence_ok = True
+                                except Exception:
+                                    pass
                                 # require_work=False：我们已通过"多轮校验取消 + 当日 0 农场动作"的证据
                                 # *证明*无活（不是偷懒跳过），`_do_sleep` 因此不再被 `_unfinished_work`
                                 # 挡成 `slept_without_work` ⇒ 睡眠成功、游戏日干净前进。
@@ -10324,6 +10334,14 @@ class LongRun:
                             # （require_work=False），避免 `_do_sleep` 默认 `require_work=True` 在
                             # `_unfinished_work` 仍为真时返回 `slept_without_work` ⇒ 不跨日、整轮自停。
                             no_work = self.farm_actions_today <= 0
+                            if no_work:
+                                # 【zero_action_evidenced 补】同 3 轮校验分支：只在日终可执行面证据
+                                # `executable==0` 时置 `no_work_evidence_ok`，0 动作日才可能 VERIFIED。
+                                try:
+                                    if int(self._pending_snapshot(obs).get("executable") or 0) == 0:
+                                        self.no_work_evidence_ok = True
+                                except Exception:
+                                    pass
                             rep.ended_by, rep.ended_reason = self._do_sleep(
                                 obs, rep,
                                 ("no_work:连续走路无进展（encircled/unreachable，已证无可达可执行目标）"
