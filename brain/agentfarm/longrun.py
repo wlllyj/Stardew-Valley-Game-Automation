@@ -503,24 +503,25 @@ EVENT_ADVANCE_TIMEOUT_MS = 60000
 #: 边界（task-41 不回归）：
 #:   * 等待期间**绝不** dismiss / sleep / load_save（一次都不动手）；
 #:   * 每轮重新观测：事件自己结束 ⇒ 回日循环继续干活；对话盒出现 ⇒ 交回 task-228 的受控推进；
-#:   * 等满 `EVENT_WAIT_TRIES` 仍挂住 ⇒ 才 `event_blocked`（带上 `eventId`/等了几轮/世界序号）。
+#:   * 等满 `total_limit`(=`EVENT_WAIT_TRIES`+`EVENT_WAIT_EXTRA_TRIES`) 仍 `eventUp` ⇒ 才
+#:     `event_blocked`（带上 `eventId`/等了几轮/世界序号）；**无对话框冻结态不再提前判死**
+#:     （skippable 过场 worldSeq/eventCommand/dialogueLines 全冻是正常态，见
+#:     【devcoder-spring1-event / Fix A】）。
 EVENT_WAIT_TRIES = 4
 EVENT_WAIT_SECONDS = 15.0
 
-#: 【devcoder-day-end-gates / Fix 3】`eventUp=true` 且**没有对话盒**时的**耐心延长**（真机 A9 spring 1，
-#: `eventId=63`）：基础 4×15s≈60s 全部用尽后事件仍在跑 ⇒ 旧行为直接 `blocked_event` 收工。
-#:
-#: 判断依据是**观测差分**（不是等够时间就硬闯）：`worldSeq` 是 Mod 侧"地点|玩家格|游戏内时间|日|
-#: 金钱|背包件数"的指纹计数器（`mod/AgentFarm.Bridge/WorldSnapshot.cs:103` UpdateWorldSeq）——
-#: 事件脚本拉玩家走位/换场景时它会**单调前进**，而事件卡在 `pause`/等玩家时它是停的。
-#: 所以：
-#:   * 指纹在动 ⇒ 事件**确实在推进**（过场动画/脚本走位）⇒ 允许继续等，最多再等
-#:     :data:`EVENT_WAIT_EXTRA_TRIES` 轮（总上限 ≈ 60s + 180s = 240s）；
-#:   * 连续 :data:`EVENT_WAIT_IDLE_GIVE_UP` 轮指纹**一动不动** ⇒ 事件不是在放动画，是在等人
-#:     （或脚本真要点击才走）⇒ 立刻停手，诚实 `blocked_event`（不再干烧时间）。
+#: 【devcoder-spring1-event / Fix A】`eventUp=true` 且**没有对话盒**时的**耐心延长**（真机 A9 spring 1，
+#: `eventId=63` = Kent 归来，纯自动过场）：基础 `EVENT_WAIT_TRIES`×`EVENT_WAIT_SECONDS`≈60s 用尽后
+#: 事件仍在跑 ⇒ 旧行为按"指纹冻结=卡死"直接 `blocked_event` 收工，但 A9 实证**推翻**了该假设——
+#: skippable 过场（command 6=pause/动画/视口自播）三合一指纹 worldSeq+eventCommand+dialogueLines
+#: **全冻是正常态**，结束条件=计时到/动画播完、**不需玩家动作**。所以：
+#:   * 无对话框冻结态**不再提前判死**：给足整段等待窗，跑到 `total_limit`=
+#:     `EVENT_WAIT_TRIES`+`EVENT_WAIT_EXTRA_TRIES` 轮仍 `eventUp` 才诚实 `blocked_event`；
+#:   * `EVENT_WAIT_EXTRA_TRIES` 调到 20 ⇒ 总上限 ≈ 60s + 300s = 360s，覆盖更长过场，
+#:     但仍是**有界**等待（`total_limit` 始终兜底，绝不无限等）；
 #: 边界不变：等待期间**绝不** dismiss / sleep / load_save / 注入按键；对话盒一出现就交回
 #: task-228 的受控推进（非提问才点、提问/职业选择一次都不点）。
-EVENT_WAIT_EXTRA_TRIES = 12
+EVENT_WAIT_EXTRA_TRIES = 20
 EVENT_WAIT_IDLE_GIVE_UP = 4
 
 
@@ -7133,24 +7134,29 @@ class LongRun:
             return False, "money_unknown"
         if money < BACKPACK_UPGRADE_PRICE:
             return False, "cannot_afford"
-        if getattr(self.client, "talk", None) is None:
-            return False, "talk_unavailable"
+        # 【devcoder-backpack-interact】背包升级是柜台展示物（GameLocation.checkAction），
+        # 触发原语是 `interact`（不是 `talk`/`NPC.checkAction`）。桥没有 interact 原语时安全降级。
+        if getattr(self.client, "interact", None) is None:
+            return False, "interact_unavailable"
         return True, ""
 
     def _backpack_skip(self, rep: DayReport, why: str, obs: Mapping[str, Any]) -> None:
         rep.backpack_upgrade_skip = str(why)
         # 只在"值得知道"的跳过原因上留一条（每天最多一条）：钱不够 / 桥没有 talk 原语 /
         # task-35 默认关闭。**默认关闭只留痕、绝不发请求**；也不往 rep.notes 里加噪音。
-        if (why in ("cannot_afford", "talk_unavailable", "disabled")
+        if (why in ("cannot_afford", "interact_unavailable", "attempt_limit", "disabled")
                 and not self.backpack_skip_noted):
             self.backpack_skip_noted = True
             if why == "cannot_afford":
                 reason = "钱不够升级（需要 2000g）"
-            elif why == "talk_unavailable":
-                reason = "桥没有 talk 原语（Mod < 0.7.46）⇒ 不试对话购买"
+            elif why == "interact_unavailable":
+                reason = "桥没有 interact 原语（Mod 太旧）⇒ 不试柜台背包展示物交互"
+            elif why == "attempt_limit":
+                reason = ("今天背包升级交互次数已用满"
+                          f"（≤{BACKPACK_UPGRADE_MAX_ATTEMPTS} 次）⇒ 不再发请求")
             else:
                 reason = ("背包升级对话购买默认关闭（task-34 探针：进 SeedShop 触发过场事件 "
-                          "3102768、背包升级入口未取得）⇒ 今天不发 goto/talk；"
+                          "3102768、背包升级入口未取得）⇒ 今天不发 goto/interact；"
                           "要启用加 --enable-backpack-upgrade 或 AGENTFARM_ENABLE_BACKPACK_UPGRADE=1")
             self._journal(
                 "buy", source="backpack_dialogue", item="Backpack",
@@ -7162,15 +7168,21 @@ class LongRun:
                 attempts=self.backpack_attempts_today,
                 limit=BACKPACK_UPGRADE_MAX_ATTEMPTS,
             )
-            if why != "disabled":
-                rep.notes.append(
-                    "背包升级今天不试：" + ("钱不够 2000g" if why == "cannot_afford"
-                                            else "桥没有 talk 原语（安全降级，不影响农务/判据）"))
+        if why != "disabled":
+            if why == "cannot_afford":
+                note = "钱不够 2000g"
+            elif why == "interact_unavailable":
+                note = "桥没有 interact 原语（安全降级，不影响农务/判据）"
+            elif why == "attempt_limit":
+                note = f"今天交互次数已用满（≤{BACKPACK_UPGRADE_MAX_ATTEMPTS} 次）"
+            else:
+                note = "安全降级，不影响农务/判据"
+            rep.notes.append("背包升级今天不试：" + note)
 
     def _backpack_journal(self, rep: DayReport, *, ok: bool, code: str, status: str,
                           reason: str, money_before: int | None, money_after: int | None,
                           cap_before: int | None, cap_after: int | None,
-                          answer_text: str = "", talk: Mapping[str, Any] | None = None,
+                          answer_text: str = "", act: Mapping[str, Any] | None = None,
                           elapsed_ms: float = 0.0,
                           extra: Mapping[str, Any] | None = None) -> None:
         """失败/成功都复用既有 `buy` 事件名（不新增 journal 事件；analyzer 桶不漂移）。"""
@@ -7185,11 +7197,11 @@ class LongRun:
             limit=int(BACKPACK_UPGRADE_MAX_ATTEMPTS),
             elapsed_ms=int(round(float(elapsed_ms))),
         )
-        if isinstance(talk, Mapping):
-            for key in ("applied", "npcTile", "distance", "activeMenu",
+        if isinstance(act, Mapping):
+            for key in ("applied", "activeMenu",
                         "dialogueIsQuestion", "dialogueResponses"):
-                if key in talk:
-                    fields[key] = talk[key]
+                if key in act:
+                    fields[key] = act[key]
         if extra:
             fields.update(dict(extra))
         self._journal("buy", **fields)
@@ -7197,7 +7209,7 @@ class LongRun:
     def _backpack_fail(self, rep: DayReport, *, code: str, reason: str,
                        money_before: int | None, money_after: int | None,
                        cap_before: int | None, cap_after: int | None,
-                       answer_text: str = "", talk: Mapping[str, Any] | None = None,
+                       answer_text: str = "", act: Mapping[str, Any] | None = None,
                        elapsed_ms: float = 0.0,
                        extra: Mapping[str, Any] | None = None) -> None:
         code = str(code or "failed")
@@ -7210,42 +7222,67 @@ class LongRun:
             rep, ok=False, code=code, status="failed", reason=reason,
             money_before=money_before, money_after=money_after,
             cap_before=cap_before, cap_after=cap_after,
-            answer_text=answer_text, talk=talk, elapsed_ms=elapsed_ms, extra=extra)
+            answer_text=answer_text, act=act, elapsed_ms=elapsed_ms, extra=extra)
         rep.notes.append(
             f"背包升级失败（{code}）：{reason} —— 不是任务失败，不影响农务/判据")
 
-    def _backpack_talk_once(self) -> dict[str, Any]:
+    def _backpack_find_object_tile(self, obs: Mapping[str, Any]) -> list[int] | None:
+        """【devcoder-backpack-interact】在 `location.objects`/`furniture` 里找"待售背包展示物"
+        的格，命中就返回 `[x, y]`；找不到（真机未必给 objects 桶）⇒ 返回 None，交给
+        `interact(tile=None)`（桥会朝玩家面朝的格做 GameLocation.checkAction）兜底。
+        """
+        loc = obs.get("location") or {}
+        # `location.objects`/`location.furniture` 本身就是"对象字典的列表"，要展平后才能逐个
+        # 看每个对象字典（否则 `bucket` 会迭代到整个列表、isinstance(Mapping) 失败、直接漏掉）。
+        for bucket in list(loc.get("objects") or []) + list(loc.get("furniture") or []):
+            if not isinstance(bucket, Mapping):
+                continue
+            label = " ".join(str(bucket.get(k, "")) for k in
+                             ("name", "type", "label", "displayName"))
+            low = label.casefold()
+            if "backpack" in low or "for sale" in low:
+                t = bucket.get("tile")
+                if isinstance(t, (list, tuple)) and len(t) >= 2:
+                    return [int(t[0]), int(t[1])]
+        return None
+
+    def _backpack_interact_once(self, tile: list[int] | None) -> dict[str, Any]:
+        """【devcoder-backpack-interact】对柜台背包展示物（GameLocation.checkAction）发一次
+        `interact`。失败要落码，不能把当天拖死；回执不是对象也落码。
+        """
         try:
-            res = self.client.talk(  # type: ignore[attr-defined]
-                BACKPACK_UPGRADE_NPC, timeout_ms=BACKPACK_TALK_TIMEOUT_MS)
+            res = self.client.interact(  # type: ignore[attr-defined]
+                tile=tile, timeout_ms=BACKPACK_TALK_TIMEOUT_MS)
         except Exception as exc:  # noqa: BLE001 - 失败要落码，不能把当天拖死
-            return {"ok": False, "code": "talk_error", "status": "talk_error",
-                    "reason": f"talk 抛错：{exc}"}
+            return {"ok": False, "code": "interact_error", "status": "interact_error",
+                    "reason": f"interact 抛错：{exc}"}
         if not isinstance(res, Mapping):
-            return {"ok": False, "code": "talk_bad_receipt", "status": "talk_bad_receipt",
-                    "reason": "talk 回执不是对象"}
+            return {"ok": False, "code": "interact_bad_receipt", "status": "interact_bad_receipt",
+                    "reason": "interact 回执不是对象"}
         return dict(res)
 
-    def _backpack_walk_adjacent(self, npc_tile: Any) -> bool:
-        """`not_adjacent` ⇒ 脑自己走到 NPC 四邻之一（≤2 次 move_to；Mod 从不替脑移动）。"""
-        if not isinstance(npc_tile, (list, tuple)) or len(npc_tile) < 2:
-            return False
-        try:
-            nx, ny = int(npc_tile[0]), int(npc_tile[1])
-        except (TypeError, ValueError):
-            return False
-        moved = 0
-        for dx, dy in ((0, 1), (1, 0), (0, -1), (-1, 0)):
-            if moved >= 2:
+    def _backpack_clear_intro(self, obs: Mapping[str, Any],
+                              _elapsed_ms: Callable[[], float] | None = None) -> dict[str, Any]:
+        """【devcoder-backpack-interact】进 SeedShop 可能触发过场事件（task-34 实机事件
+        3102768）⇒ 先把挡路的 `eventUp`/`isModal` 用 `advance_dialogue` 推开，≤10 次且受
+        预算约束；推不动就原样退回 obs（由调用方决定 load_save 自愈或 event_hang）。
+        """
+        ui = obs.get("ui") or {}
+        for _ in range(10):
+            if _elapsed_ms is not None and _elapsed_ms() >= BACKPACK_UPGRADE_DEADLINE_S * 1000.0:
                 break
-            moved += 1
+            if not (ui.get("eventUp") or ui.get("isModal")):
+                break
             try:
-                st = self.worker.move_to((nx + dx, ny + dy))
-            except Exception:  # noqa: BLE001 - 走不过去就换一格/放弃这回合
-                continue
-            if getattr(st, "ok", False):
-                return True
-        return False
+                self.client.advance_dialogue(max_steps=1)
+            except Exception:  # noqa: BLE001 - 推不动就按卡死收口
+                break
+            try:
+                obs = self._snap_or(dict(obs) if isinstance(obs, Mapping) else {})
+            except Exception:  # noqa: BLE001
+                break
+            ui = obs.get("ui") or {}
+        return obs
 
     def _backpack_recover_event_hang(self, obs: Mapping[str, Any]) -> tuple[bool, dict[str, Any]]:
         """事件卡死自愈：连续 ≤10 次受控推进都没把 `eventUp` 推走 ⇒ 认 `event_hang`。
@@ -7294,7 +7331,13 @@ class LongRun:
     def _maybe_buy_backpack_upgrade(self, obs: Mapping[str, Any], rep: DayReport) -> bool:
         """开工前试买 Pierre 背包升级；返回 True = 本轮已处理（成功完成），主循环 continue。
 
-        【task-35】默认关闭（`self.backpack_upgrade_enabled=False`）：不发任何 goto/talk/buy，
+        【devcoder-backpack-interact】根因修复：原代码用 `talk("Pierre")`（NPC.checkAction）
+        只能拿到 "Sigh..."，永远开不出背包升级的购买框 ⇒ 永久【无法判定】。背包升级是柜台
+        展示物，正确原语是 `interact`（GameLocation.checkAction）：对着柜台背包展示物（或
+        `tile=None` 朝面朝格）interact ⇒ 由游戏弹出带 "Purchase" 选项的提问框 ⇒ `dismiss_modal`
+        应答，最终**由游戏代码**扣 2000g 并扩容（脑侧只看观测差分，绝不直接写钱/容量）。
+
+        【task-35】默认关闭（`self.backpack_upgrade_enabled=False`）：不发任何 goto/interact/buy，
         只留 `backpack_upgrade_skip="disabled"` + 一条 skipped 留痕；显式开启后行为与 0.7.46 一致。
         """
         if not self.backpack_upgrade_enabled:
@@ -7327,62 +7370,84 @@ class LongRun:
             return False
         obs = self._snap_or(dict(obs) if isinstance(obs, Mapping) else {})
 
-        talk = self._backpack_talk_once()
+        # 【devcoder-backpack-interact】进店先清过场事件（task-34 实机事件 3102768），推不动就
+        # load_save 自愈；仍卡 ⇒ event_hang（不硬做题、不替游戏选选项）。
+        obs = self._backpack_clear_intro(obs, _elapsed_ms)
+        ui = obs.get("ui") or {}
+        if ui.get("eventUp") or ui.get("isModal"):
+            try:
+                self.client.load_save(force=True)
+            except Exception:  # noqa: BLE001 - 自愈失败只是换一条码
+                pass
+            st2 = self.worker.ensure_location(BACKPACK_UPGRADE_SHOP)
+            if not getattr(st2, "ok", False):
+                self._backpack_fail(
+                    rep, code="goto_shop_failed",
+                    reason=(f"自愈后回 {BACKPACK_UPGRADE_SHOP} 失败："
+                            f"{getattr(st2, 'reason', '')}"),
+                    money_before=money_before, money_after=money_before,
+                    cap_before=cap_before, cap_after=cap_before,
+                    elapsed_ms=_elapsed_ms())
+                self._backpack_return_to_farm()
+                return False
+            obs = self._snap_or(dict(obs) if isinstance(obs, Mapping) else {})
+            ui = obs.get("ui") or {}
+            if ui.get("eventUp") or ui.get("isModal"):
+                self._backpack_fail(
+                    rep, code="event_hang",
+                    reason="进店过场事件清不掉（含 load_save 自愈后仍卡）⇒ 不硬做题",
+                    money_before=money_before,
+                    money_after=self._obs_player_int(obs, "money"),
+                    cap_before=cap_before, cap_after=self._backpack_capacity(obs),
+                    elapsed_ms=_elapsed_ms())
+                self._backpack_return_to_farm()
+                return False
+
+        # 定位柜台背包展示物（GameLocation.checkAction 的触发物），发 interact
+        tile = self._backpack_find_object_tile(obs)
+        act = self._backpack_interact_once(tile)
         self.backpack_attempts_today += 1
         rep.backpack_upgrade_attempts = self.backpack_attempts_today
-        code = str(talk.get("code") or talk.get("status") or "")
-        if code == "not_adjacent":
-            # 安全降级：脑自己走一步到相邻格；≤2 次 talk/天、≤90s 总预算。
-            within = (self.backpack_attempts_today < BACKPACK_UPGRADE_MAX_ATTEMPTS
-                      and _elapsed_ms() < BACKPACK_UPGRADE_DEADLINE_S * 1000.0)
-            if within and self._backpack_walk_adjacent(
-                    talk.get("npcTile") or talk.get("npc_tile")):
-                talk = self._backpack_talk_once()
-                self.backpack_attempts_today += 1
-                rep.backpack_upgrade_attempts = self.backpack_attempts_today
-                code = str(talk.get("code") or talk.get("status") or "")
-            else:
-                code = "not_adjacent_unreachable"
+        code = str(act.get("code") or act.get("status") or "")
 
-        ui = obs.get("ui") or {}
-        if (code in ("no_action", "not_supported") and ui.get("eventUp")
-                and not ui.get("isModal")):
+        # no_action / not_supported 且仍有非模态 eventUp ⇒ 清场后再试一次（受预算约束）
+        if code in ("no_action", "not_supported") and ui.get("eventUp") and not ui.get("isModal"):
             recovered, obs = self._backpack_recover_event_hang(obs)
             within = (self.backpack_attempts_today < BACKPACK_UPGRADE_MAX_ATTEMPTS
                       and _elapsed_ms() < BACKPACK_UPGRADE_DEADLINE_S * 1000.0)
             if recovered and within:
-                talk = self._backpack_talk_once()
+                act = self._backpack_interact_once(tile)
                 self.backpack_attempts_today += 1
                 rep.backpack_upgrade_attempts = self.backpack_attempts_today
-                code = str(talk.get("code") or talk.get("status") or "")
+                code = str(act.get("code") or act.get("status") or "")
             else:
                 code = "event_hang"
 
-        if code != "ok" or not talk.get("applied"):
+        if code != "ok" or not act.get("applied"):
             if not code:
-                code = "talk_failed"
+                code = "interact_failed"
             self._backpack_fail(
                 rep, code=code,
-                reason=str(talk.get("reason") or f"talk 失败（code={code}）"),
+                reason=str(act.get("reason") or f"interact 失败（code={code}）"),
                 money_before=money_before,
                 money_after=self._obs_player_int(obs, "money"),
                 cap_before=cap_before, cap_after=self._backpack_capacity(obs),
-                talk=talk, elapsed_ms=_elapsed_ms())
+                act=act, elapsed_ms=_elapsed_ms())
             self._backpack_return_to_farm()
             return False
 
-        question = bool(talk.get("dialogueIsQuestion"))
-        raw_responses = talk.get("dialogueResponses") or []
+        question = bool(act.get("dialogueIsQuestion"))
+        raw_responses = act.get("dialogueResponses") or []
         responses = [str(r) for r in raw_responses if isinstance(r, (str, int))]
         if not question:
             self._backpack_fail(
                 rep, code="dialogue_not_question",
-                reason=(f"talk 开了对话却没有提问（activeMenu={talk.get('activeMenu')!r}，"
+                reason=(f"interact 开了对话却没有提问（activeMenu={act.get('activeMenu')!r}，"
                         f"responses={responses}）⇒ 不猜选项"),
                 money_before=money_before,
                 money_after=self._obs_player_int(obs, "money"),
                 cap_before=cap_before, cap_after=self._backpack_capacity(obs),
-                talk=talk, elapsed_ms=_elapsed_ms())
+                act=act, elapsed_ms=_elapsed_ms())
             self._backpack_escape_dialogue()
             self._backpack_return_to_farm()
             return False
@@ -7396,7 +7461,7 @@ class LongRun:
                 money_before=money_before,
                 money_after=self._obs_player_int(obs, "money"),
                 cap_before=cap_before, cap_after=self._backpack_capacity(obs),
-                answer_text=BACKPACK_UPGRADE_ANSWER, talk=talk,
+                answer_text=BACKPACK_UPGRADE_ANSWER, act=act,
                 elapsed_ms=_elapsed_ms())
             self._backpack_escape_dialogue()
             self._backpack_return_to_farm()
@@ -7408,7 +7473,7 @@ class LongRun:
                 money_before=money_before,
                 money_after=self._obs_player_int(obs, "money"),
                 cap_before=cap_before, cap_after=self._backpack_capacity(obs),
-                answer_text=BACKPACK_UPGRADE_ANSWER, talk=talk,
+                answer_text=BACKPACK_UPGRADE_ANSWER, act=act,
                 elapsed_ms=_elapsed_ms())
             self._backpack_escape_dialogue()
             self._backpack_return_to_farm()
@@ -7428,7 +7493,7 @@ class LongRun:
                 rep, code="answer_failed", reason=f"dismiss_modal 应答抛错：{exc}",
                 money_before=money_b, money_after=self._obs_player_int(obs2, "money"),
                 cap_before=cap_b, cap_after=self._backpack_capacity(obs2),
-                answer_text=BACKPACK_UPGRADE_ANSWER, talk=talk,
+                answer_text=BACKPACK_UPGRADE_ANSWER, act=act,
                 elapsed_ms=_elapsed_ms())
             self._backpack_escape_dialogue()
             self._backpack_return_to_farm()
@@ -7450,7 +7515,7 @@ class LongRun:
                         f"（money {money_b}→{money_a}，capacity {cap_b}→{cap_a}）"),
                 money_before=money_b, money_after=money_a,
                 cap_before=cap_b, cap_after=cap_a,
-                answer_text=BACKPACK_UPGRADE_ANSWER, talk=talk,
+                answer_text=BACKPACK_UPGRADE_ANSWER, act=act,
                 elapsed_ms=_elapsed_ms())
             self._backpack_escape_dialogue()
             self._backpack_return_to_farm()
@@ -7470,7 +7535,7 @@ class LongRun:
                         f"（−{int(money_b) - int(money_a)}），容量 {cap_b}→{cap_a}"),
                 money_before=money_b, money_after=money_a,
                 cap_before=cap_b, cap_after=cap_a,
-                answer_text=BACKPACK_UPGRADE_ANSWER, talk=talk,
+                answer_text=BACKPACK_UPGRADE_ANSWER, act=act,
                 elapsed_ms=_elapsed_ms())
             rep.notes.append(
                 f"背包升级成功：容量 {cap_b}→{cap_a}，钱 {money_b}→{money_a}（对话购买，游戏代码扣钱）")
@@ -7488,7 +7553,7 @@ class LongRun:
             rep, code=code2, reason=f"观测差分不成立：{detail}",
             money_before=money_b, money_after=money_a,
             cap_before=cap_b, cap_after=cap_a,
-            answer_text=BACKPACK_UPGRADE_ANSWER, talk=talk,
+            answer_text=BACKPACK_UPGRADE_ANSWER, act=act,
             elapsed_ms=_elapsed_ms())
         self._backpack_return_to_farm()
         return False
@@ -9719,12 +9784,15 @@ class LongRun:
         为什么用 `self.sleep_fn`：长跑的等待一律走可注入的 sleep（测试里被替换成 no-op，
         真机是 `time.sleep`），既不阻塞回合边界，也让单测保持毫秒级。
 
-        【Fix 3】耐心是**有证据**的，不是"等够时间就硬闯"：基础窗口
-        :data:`EVENT_WAIT_TRIES` 轮用满后，只有当 `worldSeq`（Mod 侧世界指纹：地点|玩家格|
-        游戏内时间|日|金钱|背包件数）在这段时间里**动过**，才允许继续等
-        :data:`EVENT_WAIT_EXTRA_TRIES` 轮（事件脚本走位/换场景时它一定在动）；连续
-        :data:`EVENT_WAIT_IDLE_GIVE_UP` 轮毫无变化 ⇒ 事件不是在放动画，是在等人/等点击 ⇒
-        立刻停手诚实收尾（A9 spring 1 `eventId=63` 的 60s 白等就是这么来的）。
+        【Fix A / devcoder-spring1-event】A9 spring1 实证**推翻**了"冻结=卡死"的旧假设：Kent
+        归来 `eventId=63` 是纯自动过场（skippable，command 6=pause/动画/视口自播，原版事件命令集
+        无"等玩家走格"命令），三合一指纹 `worldSeq`+`ui.eventCommand`+`ui.dialogueLines`
+        **全冻是正常态**，结束条件=计时到/动画播完、**不需玩家动作**。所以：
+          * 无对话框冻结态**不再提前判死** —— 给足整段等待窗（`total_limit` 轮），只跑到
+            `tries >= total_limit` 仍 `eventUp` 才诚实 `event_blocked`；
+          * `total_limit` = :data:`EVENT_WAIT_TRIES` + :data:`EVENT_WAIT_EXTRA_TRIES`
+            始终兜底，绝不无限等（永不结束的事件仍诚实 `event_blocked`，不洗成过关）；
+          * 对话盒一出现 / 事件结束 ⇒ 立刻回日循环（交给 `_advance_event_dialogue`）。
         """
         tries = 0
         idle = 0
@@ -9766,11 +9834,12 @@ class LongRun:
                                "三合一指纹；事件结束或对话盒出现就回日循环）")
             if not event_up or has_dialogue:
                 return obs, False, tries
-            # 基础窗口用完之后的**放行条件**（只有证据齐全才继续等）：
-            #   * 指纹动过（事件确实在推进）且还没连续静止到上限；
-            #   * 否则立刻收手 —— 干等只会把整条长跑的时间预算烧在"等一个人"上。
-            if tries >= EVENT_WAIT_TRIES and (not moved_any or idle >= EVENT_WAIT_IDLE_GIVE_UP):
-                return obs, True, tries
+            # 【devcoder-spring1-event / Fix A】无对话框冻结态（pause/动画自播，三合一指纹
+            # worldSeq+eventCommand+dialogueLines 全冻）是 skippable 过场的**正常**态（A9 spring1
+            # 实证：Kent 归来 eventId=63，command 6=pause/动画/视口自播，原版事件命令集无"等玩家
+            # 走格"命令；结束条件=计时到/动画播完，不需玩家动作）。**不再因"指纹不动"提前判死**
+            # —— 给足整段等待窗，只跑到 `tries >= total_limit` 仍 `eventUp` 才诚实 `event_blocked`。
+            # `total_limit` = EVENT_WAIT_TRIES + EVENT_WAIT_EXTRA_TRIES 永远兜底，绝不无限等。
         return obs, True, tries
 
     def _clear_modals(self, obs: dict[str, Any], rep: DayReport) -> tuple[dict[str, Any], bool]:
@@ -10189,6 +10258,24 @@ class LongRun:
             obs, modal_blocked = self._clear_modals(obs, rep)
             if modal_blocked:
                 break
+
+            # 【devcoder-spring1-event / Fix B】`eventUp=true` 期间**冻结一切日常动作**：事件
+            # （尤其 skippable 过场，如 Kent 归来 eventId=63，command 6=pause/动画/视口自播、原版
+            # 事件命令集无"等玩家走格"命令）不需玩家操作，结束条件=计时到/动画播完；在事件里
+            # sell/buy/goto_farm/walk/plant/water/clear 会干扰过场、甚至替游戏改剧情状态（A9 spring1
+            # 实证：eventUp 下仍跑了 sell/buy ⇒ 被误判 event_blocked）。所以只要观测到
+            # `ui.eventUp=true`，本轮**绝不**跑任何经济/农事动作，只轮询等事件结束/对话盒出现：
+            #   * `_wait_event_up` 返回 `still_blocked=True` ⇒ `_event_blocked` 诚实收尾；
+            #   * 返回 `False`（事件结束或对话盒出现）⇒ 本轮不跑经济，`continue` 回循环顶部
+            #     （对话盒交给 `_advance_event_dialogue` 受控推进：非提问才点、提问/职业选择不动）。
+            # 判定只看观测 `ui.eventUp`，不读回执、绝不 dismiss/推进含提问的事件（task-41 红线）。
+            if (obs.get("ui") or {}).get("eventUp") is True:
+                obs, still_blocked, wait_tries = self._wait_event_up(obs)
+                if still_blocked:
+                    self._event_blocked(obs, rep, event_wait_tries=wait_tries)
+                    break
+                self._observe_free_slots(rep, obs)   # 事件结束/对话盒出现：刷新观测再回顶部
+                continue
 
             # 【task-16 / 0.7.45】每次观测都重算背包空格（只记 trace，不发请求）：
             # `day_end.free_slots_*` / `loot_lost` 的证据都靠这张读数，不靠"事后猜"。
