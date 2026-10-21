@@ -1053,6 +1053,20 @@ namespace AgentFarm.Bridge
         ///   * **字段缺失** ⇒ 读不到候选（旧 Mod 或字段改名）⇒ 脑按“未知”处理，一样不 dismiss（fail-safe）。
         /// </summary>
         [JsonPropertyName("professionsToChoose")] public int[] ProfessionsToChoose { get; set; }
+
+        // ------------------------------------------------------------------
+        //  【dialogue-okfix / P2】取证字段：判"关框后同句复现"是重放还是重触发
+        //  两者都是**可空**：没有事件/没有对话框/读不到 ⇒ null（字段省略）。
+        //  * eventCommand   = `Game1.CurrentEvent.CurrentCommand`（命令下标，int）：脚本执行到第几条；
+        //  * dialogueLines  = 当前 `DialogueBox.dialogues` 的剩余条数。
+        //  对照看：下标不变 + 条数被填回 ⇒ 重放同一条；下标变了 ⇒ 正常推进/重触发。
+        // ------------------------------------------------------------------
+
+        /// <summary>当前事件的命令下标（`Game1.CurrentEvent.CurrentCommand`，int）；无事件/读不到 ⇒ null。【可选字段】</summary>
+        [JsonPropertyName("eventCommand")] public int? EventCommand { get; set; }
+
+        /// <summary>当前 `DialogueBox` 的对话条数（反射 `dialogues`）；无对话框/读不到 ⇒ null。【可选字段】</summary>
+        [JsonPropertyName("dialogueLines")] public int? DialogueLines { get; set; }
     }
 
     internal sealed class LivenessView
@@ -1638,6 +1652,21 @@ namespace AgentFarm.Bridge
 
         /// <summary>当前 `DialogueBox.isQuestion`（无对话框 ⇒ null）。【可选字段】</summary>
         [JsonPropertyName("isQuestion")] public bool? IsQuestion { get; set; }
+
+        // ---- 【dialogue-okfix / P2】取证：判"关框后同句复现"是 command 重放还是事件重触发 ----
+
+        /// <summary>
+        /// 拍这一刻的事件命令下标（`Game1.CurrentEvent.CurrentCommand`，int）；无事件/读不到 ⇒ null。
+        /// `before`→`after` 若下标**没自增**而对话框又回来了，就是重放，不是正常推进。
+        /// 【可选字段】
+        /// </summary>
+        [JsonPropertyName("eventCommand")] public int? EventCommand { get; set; }
+
+        /// <summary>
+        /// 拍这一刻 `DialogueBox.dialogues` 的剩余条数（反射）；无对话框/读不到 ⇒ null。
+        /// 【可选字段】
+        /// </summary>
+        [JsonPropertyName("dialogueLines")] public int? DialogueLines { get; set; }
     }
 
     /// <summary>
