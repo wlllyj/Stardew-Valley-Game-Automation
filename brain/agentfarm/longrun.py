@@ -9729,30 +9729,41 @@ class LongRun:
         tries = 0
         idle = 0
         moved_any = False
-        seq_seen = obs.get("worldSeq")
+        # 【A9 spring1 实证】事件期 `worldSeq`（地点|玩家格|时间|日|钱|背包件数）**必然冻结**
+        # （事件把游戏时间冻在 600），所以只用它判"在不在推进"会把正常过场误判成卡死
+        # （run6：worldSeq 161→162 后冻 60s ⇒ event_blocked）。进展改用**三合一指纹**：
+        # `worldSeq` + `ui.eventCommand`（事件脚本执行到第几条 command，Mod 0.7.5x 新增）+
+        # `ui.dialogueLines`（当前对话剩余条数）。事件脚本走位/换场景/推进对话时后两者一定在动。
+        # 三项都缺（旧 Mod）⇒ 退回只看 worldSeq，行为与改前一致。
+        def _fp(o: dict[str, Any]) -> tuple[Any, Any, Any]:
+            u = o.get("ui") or {}
+            return (o.get("worldSeq"), u.get("eventCommand"), u.get("dialogueLines"))
+        fp_seen = _fp(obs)
         total_limit = EVENT_WAIT_TRIES + EVENT_WAIT_EXTRA_TRIES
         while tries < total_limit:
             self.sleep_fn(EVENT_WAIT_SECONDS)
             tries += 1
             obs = self._snap_or(obs)
-            seq = obs.get("worldSeq")
-            moved = seq != seq_seen
+            ui = obs.get("ui") or {}
+            fp = _fp(obs)
+            moved = fp != fp_seen
             if moved:
                 moved_any = True
                 idle = 0
             else:
                 idle += 1
-            seq_seen = seq
-            ui = obs.get("ui") or {}
+            fp_seen = fp
             event_up, _is_question, _menu, has_dialogue = self._event_dialogue_state(obs)
             self._journal("event_wait", tries=tries, limit=EVENT_WAIT_TRIES,
                           limitMax=total_limit, extended=bool(tries > EVENT_WAIT_TRIES),
                           eventId=ui.get("eventId"), eventUp=bool(event_up),
-                          hasDialogue=bool(has_dialogue), worldSeq=seq,
+                          hasDialogue=bool(has_dialogue), worldSeq=fp[0],
+                          eventCommand=fp[1], dialogueLines=fp[2],
                           worldMoved=bool(moved), worldMovedAny=bool(moved_any),
                           idleStreak=idle, waitSeconds=EVENT_WAIT_SECONDS,
                           note="事件进行中但没有对话盒：有界等待（**不** dismiss / **不** sleep / "
-                               "**不** load_save；事件结束或对话盒出现就回日循环）")
+                               "**不** load_save；进展判据=worldSeq+eventCommand+dialogueLines "
+                               "三合一指纹；事件结束或对话盒出现就回日循环）")
             if not event_up or has_dialogue:
                 return obs, False, tries
             # 基础窗口用完之后的**放行条件**（只有证据齐全才继续等）：
