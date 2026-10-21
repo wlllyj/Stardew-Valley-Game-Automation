@@ -46,7 +46,8 @@
 | 步 | 动作 | 结果 | 耗时 |
 |---|---|---|---|
 | 0 | 现场三核对 + 删残留死令牌 + 存档四件基准 | 进程 0/0/0、端口空；死令牌已删 | — |
-| 1 | Popen 起游戏（`CREATE_NEW_CONSOLE(0x10)\|CREATE_NEW_PROCESS_GROUP(0x200)`、三个 std 全 DEVNULL、close_fds；exe=`StardewModdingAPI.exe`，cwd=游戏目录）→ 轮询等桥（每 2s 新建 BridgeClient 重读 token/port） | 00:25:03 桥就绪：health `modVersion=0.7.49 game=1.6.15 smapi=4.5.2 port=17890 windowActive=true onTitleScreen=true` | 起→桥 20s |
+| 1 | Popen 起游戏（`CREATE_NEW_CONSOLE(0x10)\|CREATE_NEW_PROCESS_GROUP(0x200)`、三个 std 全 DEVNULL、close_fds、**env=scrubbed**；exe=`StardewModdingAPI.exe`，cwd=游戏目录）→ 轮询等桥（每 2s 新建 BridgeClient 重读 token/port） | 00:25:03 桥就绪：health `modVersion=0.7.49 game=1.6.15 smapi=4.5.2 port=17890 windowActive=true onTitleScreen=true` | 起→桥 20s |
+| 1b | **代理清理证据（环境坑自动绕开，无需人工介入）**：import 时发现并清掉 `HTTP_PROXY`/`HTTPS_PROXY`/`http_proxy`/`https_proxy`（原值均 `http://127.0.0.1:40920`，证据 `step0.env_proxy_evidence`），设 `no_proxy=NO_PROXY=127.0.0.1,localhost`；起游戏的 Popen 继承的是**已清理的 os.environ**（scrubbed env；脚本后续已加固为显式 `env=clean_env()`，行为一致）；所有 CLI 子进程 env 同样清理 | **health 直连 127.0.0.1:17890 成功**：HTTP 200、`modVersion=0.7.49`、`server.requestsServed` 递增；随后 load/goto/observe 全部 rc=0 ⇒ 请求不经 40920 代理 | — |
 | 2 | `python -m agentfarm load --save Wahaha_450799035` | **rc=0**（11.8s）：`已进入存档 Wahaha_450799035：地点 FarmHouse 格 [9,9]（9299ms）`；读档后 `第1年 冬26日 06:00 sunny FarmHouse(9,9) 体力270/270 钱2767g seq=1 世界推进中` | 11.8s |
 | 3 | `python -m agentfarm goto Farm` | **rc=0**（9.0s）：`move_to_location status=ok reachedLocation=Farm`，path `FarmHouse → Farm`，hop1 `landing=[64,15] used=[3,12] 7623ms`；移动后 `Farm(64,15) 农场[草0/石88/枝63/树914 耕地8 作物0] seq=10` | 9.0s |
 | 4 | `python -m agentfarm observe --full --json` | **rc=0**：原文 187,858 B 落 `logs/_probe-save-state-2026-10-20.observe.json`（worldSeq=10，`worldAdvancing=true`，`secondsSinceClockMoved=10.5s`） | <1s |
