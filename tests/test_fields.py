@@ -50,6 +50,7 @@ from agentfarm.fields import (  # noqa: E402
     resolve_zone,
     zone_blockers_total,
     zone_brief_lines,
+    zone_unknown_total,
     zones_from_observe,
 )
 
@@ -444,6 +445,27 @@ class ZoneBlockerKindsTest(unittest.TestCase):
         self.assertEqual(sum(z.blockers for z in zones), 2,
                          "大障碍（ResourceClump，kind=clump）必须计入 blockers")
 
+    def test_zones_from_observe_counts_unknown_tiles(self):
+        """Z3 回归：区内 kind=='unknown' 的格必须计入 Zone.unknown（曾静默忽略 ⇒ 假 PASS）。
+
+        kind=='unknown' 不在 ZONE_BLOCKER_KINDS 桶里，旧代码直接跳过 ⇒ 区 blockers 报 0
+        ⇒ 目标1② 假 PASS。现在单独计到 `unknown`，且不得污染 `blockers` 计数。
+        """
+        # split=2 下 field_nw = x∈[-10,-1] ∧ y∈[-10,-1]（西/北半区）。三格都落在 field_nw 内：
+        # 两格 unknown（计入 unknown）、一格 weed（计入 blockers）。
+        obs = farm_obs(kinds={(-1, -1): "unknown", (-2, -1): "unknown", (-1, -2): "weed"})
+        nw = zone_named(zones_from_observe(obs, split=2), "field_nw")
+        self.assertEqual(nw.unknown, 2, "两格 kind='unknown' 必须计入 Zone.unknown")
+        self.assertEqual(nw.blockers, 1, "unknown 不得污染 blockers 计数")
+        # 同时确认 zone_unknown_total 与 Zone.unknown 同口径。
+        self.assertEqual(zone_unknown_total(nw, obs), 2)
+        self.assertEqual(zone_blockers_total(nw, obs), 1)
+        # 截断时 zone_unknown_total 必须 fail-closed 返回 None（不当 0）。
+        obs_t = dict(obs)
+        obs_t["location"] = dict(obs["location"]); obs_t["location"]["tilesTruncated"] = True
+        self.assertIsNone(zone_unknown_total(nw, obs_t),
+                          "tilesTruncated 时 unknown 也必须【无法判定】而非 0")
+
     def test_plot_in_zone_flags_clump_as_blocker(self):
         """plot_in_zone 的 blockers 名单也要含大障碍（与 zones_from_observe 同口径）。"""
         obs = farm_obs(kinds={(-10, -10): "clump", (-9, -10): "clump"})
@@ -568,6 +590,24 @@ class VerifyZoneRetentionCliTest(unittest.TestCase):
         rc, out = self._run(farm_obs(truncated=True), farm_obs(truncated=True), "--zone", "field_nw")
         self.assertEqual(rc, 1, out)
         self.assertIn("【无法判定】tilesTruncated", out)
+
+    def test_unknown_tile_after_blocks_pass(self):
+        """Z3 回归：after 观测里残留 kind=='unknown' 格 ⇒ 工具必须 FAIL（exit=1），不能声明"清空并保持"。"""
+        # before/after 都把 field_nw 内一格置为 unknown（blockers 均为 0）。
+        rc, out = self._run(farm_obs(kinds={(-5, -5): "unknown"}),
+                            farm_obs(kinds={(-5, -5): "unknown"}),
+                            "--zone", "field_nw")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL", out)
+        self.assertIn("unknown tile present, cannot claim cleared", out)
+
+    def test_unknown_tile_in_other_zone_does_not_fail_this_zone(self):
+        """对照：unknown 落在 field_se（与 field_nw 无关）、field_nw 全清（含 unknown=0）⇒ field_nw PASS。"""
+        before = farm_obs(kinds={(5, 5): "unknown"})   # (5,5) 落在 field_se
+        after = farm_obs(kinds={(5, 5): "unknown"})
+        rc, out = self._run(before, after, "--zone", "field_nw")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("PASS (retained clear)", out)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -957,6 +957,10 @@ class DayReport:
     #: 只写一句 notes 等于"缺失当通过"（task-219 被 deputy 点名的 P0-4）。analyzer 按这个
     #: 字段判红（`day_end.gaps_problem` 非空 ⇒ problem），缺失（旧账本）≠ 通过。
     gaps_problem: str = ""
+    #: 【devcoder-zone-retention】日终每个田区的 blockers/unknown 快照（只 info，不进 checks）。
+    #: 每项 `{name, label, tillable, crops, blockers, unknown}`；当当天 obs 被截断时
+    #: 额外带 `undecidable=True` 且 blockers/unknown 为 None（fail-closed，绝不当 0）。
+    zone_blockers: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def failed_steps(self) -> int:
@@ -1088,6 +1092,11 @@ class DayReport:
             "stamina_calibration": {k: dict(v) for k, v in self.stamina_calibration.items()},
             # 【task-230 P0-4.5】gaps 的可判红问题串（"" = 无问题；非空 ⇒ analyzer 判 red）。
             "gaps_problem": self.gaps_problem,
+            # 【devcoder-zone-retention】日终把每个田区的 blockers/unknown 快照落账
+            # （`{name,label,tillable,crops,blockers,unknown}`；`undecidable=True` 表示
+            # 当天 obs 被截断、数字不可信）。只作 info，不参与 `checks`、不进 `verified`；
+            # 跨日复核交给 `tools/verify-zone-retention.py` 与 `<journal>-zones.json` sidecar。
+            "zone_blockers": [dict(z) for z in self.zone_blockers],
         }
 
 
@@ -3411,6 +3420,72 @@ class LongRun:
         except Exception as exc:  # pragma: no cover - fields 坏掉不该拖垮长跑
             self._journal("zones_failed", error=f"{type(exc).__name__}: {exc}")
             return []
+
+    def _zone_snapshot(self, obs: dict[str, Any], split: int = 2) -> list[dict[str, Any]]:
+        """对当前 obs 产每个田区的 `{name, label, tillable, crops, blockers, unknown}` 快照。
+
+        数字直接取自 `zones_from_observe` 的 `Zone`（blockers / unknown 同口径）。
+        当 obs 被截断（`location.tilesTruncated=True`）时，所有区标 `undecidable=True`、
+        blockers/unknown 置 None —— 数据不完整，绝不当 0（fail-closed，不强行 PASS）。
+        非农场 / fields 不可用 / 没有可见田区 ⇒ 返回 []（不抛异常拖垮长跑）。
+        """
+        if fields_mod is None or not self._is_farm(obs):
+            return []
+        try:
+            zones = fields_mod.zones_from_observe(obs, split=split)
+        except Exception as exc:  # pragma: no cover - fields 坏掉不该拖垮长跑
+            self._journal("zones_snapshot_failed", error=f"{type(exc).__name__}: {exc}")
+            return []
+        loc = (obs or {}).get("location") if isinstance(obs, dict) else {}
+        truncated = bool(loc.get("tilesTruncated")) if isinstance(loc, dict) else False
+        out: list[dict[str, Any]] = []
+        for z in zones:
+            snap: dict[str, Any] = {
+                "name": str(getattr(z, "name", "")),
+                "label": str(getattr(z, "label", "")),
+                "tillable": int(getattr(z, "tillable", 0)),
+                "crops": int(getattr(z, "crops", 0)),
+            }
+            if truncated:
+                snap["undecidable"] = True
+                snap["blockers"] = None
+                snap["unknown"] = None
+            else:
+                snap["blockers"] = int(getattr(z, "blockers", 0))
+                snap["unknown"] = int(getattr(z, "unknown", 0))
+            out.append(snap)
+        return out
+
+    @staticmethod
+    def _derive_zones_path(journal_path: Path | None) -> Path | None:
+        """从 `--journal` 自动推导跨日 zone 快照 sidecar：`<stem>-zones.json`。
+
+        与 lessons/scope/gaps 同纪律：只靠 journal 路径推导、不加命令行开关；
+        `journal=None`（一次性 `agentfarm plan`）⇒ 不落盘（只在内存里）。
+        """
+        if journal_path is None:
+            return None
+        if not isinstance(journal_path, Path):
+            journal_path = Path(journal_path)
+        suffix = journal_path.suffix or ".jsonl"
+        stem = journal_path.name[: -len(journal_path.suffix)] if journal_path.suffix else journal_path.name
+        return journal_path.with_name(f"{stem}-zones.json")
+
+    def _flush_zone_sidecar(self, rep: "DayReport") -> None:
+        """把当天的 zone 快照以一行 JSON（含 day + zones 数组）append 进 `<journal>-zones.json`。
+
+        跨天累积：每天一条，供 `tools/verify-zone-retention.py` 之外的跨日复核/analyzer 直接读。
+        失败只记一笔 journal，绝不影响当天（不许崩、不许少一天）。
+        """
+        path = self._derive_zones_path(self.journal_path)
+        if path is None:
+            return
+        record = {"day": list(rep.day_key), "zones": [dict(z) for z in rep.zone_blockers]}
+        try:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as exc:  # pragma: no cover - 磁盘/权限问题只留痕
+            self._journal("zone_sidecar_write_failed", path=str(path), error=str(exc))
 
     def _ordered_zones(self, zones: list[Any]) -> list[Any]:
         """田区尝试顺序：LLM 指定的 → 代码偏好（可锄最多/最近）→ 其余按名字。
@@ -11398,6 +11473,11 @@ class LongRun:
         self._finish_intent_coverage(rep)
         self._gaps_flush(rep)
         self._lessons_flush(rep)
+        # 【devcoder-zone-retention】日终把每个田区的 blockers/unknown 快照落进 day_end +
+        # 跨日 sidecar `<journal>-zones.json`（append）。只作 info，不参与 checks/verified。
+        # tilesTruncated 的区在 `_zone_snapshot` 里标 `undecidable=True`（不强行 PASS）。
+        rep.zone_blockers = self._zone_snapshot(last_obs, split=self.zone_split)
+        self._flush_zone_sidecar(rep)
         self._journal("day_end", **rep.as_dict())
         return rep
 

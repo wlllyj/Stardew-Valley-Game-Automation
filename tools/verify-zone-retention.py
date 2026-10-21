@@ -26,6 +26,7 @@ sys.path.insert(0, str(REPO / "brain"))
 from agentfarm.fields import (  # noqa: E402
     ZONE_BLOCKER_KINDS,
     zone_blockers_total,
+    zone_unknown_total,
     zones_from_observe,
 )
 
@@ -55,31 +56,42 @@ def main() -> int:
 
     zone_by_name = {z.name: z for z in zones}
 
-    print("zone        before  after   verdict")
-    print("-" * 40)
+    print("zone        before  after   unk_b  unk_a  verdict")
+    print("-" * 56)
     all_ok = True
     for name in target_names:
         z = zone_by_name.get(name)
         if z is None:
-            print(f"{name:<11}  ?       ?       【无法判定】zone not found in before obs")
+            print(f"{name:<11}  ?       ?       ?      ?      【无法判定】zone not found in before obs")
             all_ok = False
             continue
         b = zone_blockers_total(z, before)
         a = zone_blockers_total(z, after)
+        b_unk = zone_unknown_total(z, before)
+        a_unk = zone_unknown_total(z, after)
         if b is None or a is None:
             verdict = "【无法判定】tilesTruncated"
             all_ok = False
-        elif b == 0 and a == 0:
+        elif b == 0 and a == 0 and (a_unk == 0):
             verdict = "PASS (retained clear)"
         else:
-            verdict = "FAIL"
+            # after 还残留 unknown 格（Mod 读不到地形特征）⇒ 保守判 FAIL：
+            # 未知格≠已清，不能声明"清空并保持"。before 的 unknown 只报告、不单独判 FAIL。
+            if a_unk and a_unk > 0:
+                verdict = "FAIL (unknown tile present, cannot claim cleared)"
+            else:
+                verdict = "FAIL"
             all_ok = False
         bb = "NA" if b is None else str(b)
         aa = "NA" if a is None else str(a)
-        print(f"{name:<11}  {bb:<6}  {aa:<6}  {verdict}")
+        bu = "NA" if b_unk is None else str(b_unk)
+        au = "NA" if a_unk is None else str(a_unk)
+        print(f"{name:<11}  {bb:<6}  {aa:<6}  {bu:<6}  {au:<6}  {verdict}")
 
     print()
     print("ZONE_BLOCKER_KINDS =", sorted(ZONE_BLOCKER_KINDS))
+    print("注意：unk_b/unk_a = 该区 before/after 的 kind=='unknown' 格数；"
+          "after 有 unknown 一律 FAIL（未知格≠已清）。")
     return 0 if all_ok else 1
 
 
