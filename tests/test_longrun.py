@@ -15468,5 +15468,225 @@ class TestTask240bReliefThenBuy(unittest.TestCase):
                          f"_preconditions 不许变成双买）：{w.buy_calls}")
 
 
+class TestDevcoderClearGate(unittest.TestCase):
+    """【devcoder-clear-gate】「满包清障闸」的四口径对齐（A9 第 5 跑 winter27/28 空转自停）。
+
+    实证（`logs/longrun-runA9-0750.jsonl`）：`_stage_tiles("clear_area")` 因 `_clear_bag_gate_reason`
+    （背包 0 空格 + 腾格手段用尽）整池清零 `return []`；但 `_pending_snapshot` / `work_reasons` /
+    `_plot_has_work` / `day_end` 都不认识这道闸 ⇒ 快照 `exec=206/195`、守卫一直喊"还有地要清"、
+    `_ensure_plot` 永不为 None ⇒ `decision.intents` 每轮非空 ⇒ 主循环既收不了工也换不了片
+    ⇒ `idle` 3 轮 ⇒ `stuck:`（整天报废）。
+
+    本类钉死（对应卡面 A→E）：
+      ① 满包 + 剩余活全 clear-only ⇒ 收尾 `ended_by=clear_gate`、`day_justified=False`、
+         `verified=False`，且**没有** `idle{rounds:3}`、没有 `stuck:`；
+      ② 日终不变式 `gated + unobserved + executable + malformed == guard`（gated 单列、不并入
+         unobserved —— 那会把"今天被闸住"说成"看不见/已陈旧"）；
+      ③ `executable>0` ⇒ 用 `executable_tiles` 造 plot 调 `_stage_tiles` 必非空（守卫/执行同口径）；
+      ④ 反洗白：满包日不得出现 `no_work` + `no_work_evidence_ok=True`。
+    """
+
+    def _row(self, slot: int, qid: str, name: str, stack: int, *, tool: bool = False) -> dict:
+        item_id = qid.rsplit(")", 1)[-1] if qid.startswith("(") else qid
+        return {"slot": slot, "id": item_id, "qualifiedId": qid, "name": name,
+                "stack": stack, "isTool": tool}
+
+    def _full_unsellable(self, *, weeds: int = 4, seeds: int = 0, money: int = 0,
+                         stamina: float = 270.0) -> FakeWorld:
+        """满包 12/12 + **无可卖叠**（Hay 表外）⇒ `_clear_bag_gate_reason` 必生效。
+
+        `FakeWorker` 没有 `sell` 原语 ⇒ last-resort 也腾不出格，闸不会被"其实卖得动"顶掉。
+        """
+        w = FakeWorld(seeds=seeds, money=money, weeds=weeds, stamina=stamina)
+        while len(w.inventory) < 12:
+            w.inventory.append(self._row(len(w.inventory), "(O)178", "Hay", 5))
+        w.inventory = w.inventory[:12]
+        return w
+
+    def _run(self, w: FakeWorld, **kw) -> LongRun:
+        run = make_run(w, **kw)
+        client = FakeClient(w)
+        worker = FakeWorker(w)
+        run.client = client
+        run.worker = worker
+        run.client_factory = lambda: client
+        run.worker_factory = lambda _c: worker
+        return run
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list[dict]:
+        return [e for e in run.entries if e.get("event") == name]
+
+    @staticmethod
+    def _plot(tiles, *, anchor=None) -> dict:
+        tiles = [tuple(t) for t in tiles]
+        return {"zone": "", "label": "", "area": "field_nw",
+                "anchor": list(anchor or (tiles[0] if tiles else (0, 0))),
+                "tiles": tiles, "note": ""}
+
+    # ---- ① 端到端：满包 + clear-only ⇒ clear_gate（不是 stuck、不是 no_work）----
+    def test_full_bag_clear_only_ends_as_clear_gate(self):
+        w = self._full_unsellable(weeds=4)
+        run = self._run(w, max_days=1)
+
+        code = run.run()
+
+        self.assertEqual(code, 1, "clear_gate 不是达标 ⇒ 不许返 0")
+        self.assertEqual(len(run.days), 1)
+        rep = run.days[0]
+        self.assertEqual(rep.ended_by, "clear_gate", f"{rep.ended_reason} / {rep.notes}")
+        self.assertTrue(str(rep.ended_reason).startswith("clear_gate:"), rep.ended_reason)
+        self.assertIn("free_slots=0", rep.ended_reason)
+        self.assertIn("清障类", rep.ended_reason)
+        # 红线：clear_gate 永不 VERIFIED / 永不 day_justified
+        self.assertFalse(rep.checks.get("day_justified", True), rep.checks)
+        self.assertFalse(rep.verified, rep.checks)
+        self.assertFalse([e for e in self._events(run, "idle")
+                          if int(e.get("rounds") or 0) >= 3],
+                         "满包清障日不许再走到 idle 3 轮")
+        self.assertNotIn("stuck", str(rep.ended_by))
+        self.assertFalse(self._events(run, "stuck_flush"),
+                         "不是卡死 ⇒ 不该走 stuck 翻篇")
+        # 证据走既有事件名 slot_relief{trigger=clear_gate}（不新增 journal 事件名）
+        gate = [e for e in self._events(run, "slot_relief")
+                if e.get("trigger") == "clear_gate"]
+        self.assertTrue(gate, self._events(run, "slot_relief")[-2:])
+        self.assertEqual(gate[0].get("stage"), "clear_area")
+        self.assertIs(gate[0].get("reached"), False, "clear_gate 不是水位达标")
+        # ② 不变式（本日账本为空，仍必须自洽）
+        self.assertEqual(rep.pending_guard,
+                         rep.pending_executable + rep.pending_unobserved
+                         + rep.pending_malformed + rep.pending_gated)
+        # ④ 反洗白：满包日不得出现 no_work + no_work_evidence_ok=True
+        self.assertNotEqual(rep.ended_by, "no_work", rep.ended_reason)
+        self.assertFalse(getattr(run, "no_work_evidence_ok", False),
+                         "满包清障日绝不许置 no_work_evidence_ok（那是白拿 VERIFIED 的洗白口）")
+        self.assertFalse(rep.checks.get("zero_action_evidenced", True), rep.checks)
+
+    # ---- ② gated 单列 + 不变式（不并入 unobserved）----
+    def test_pending_snapshot_has_gated_bucket_and_invariant(self):
+        w = self._full_unsellable(weeds=0)
+        w.player_tile = [62, 14]
+        w.blockers[(60, 10)] = "weed"          # 看得见 + 站得到，只因满包闸而不执行 ⇒ gated
+        w.blockers[(60, 11)] = "weed"          # 今天已判死（封格）
+        w.blockers[(60, 12)] = "weed"          # 被围住
+        w.far_tiles[(62, 15)] = {"kind": ""}   # tiles[] 里字段残缺（无 kind/crop、也不在 tillable）
+        run = self._run(w)
+        run.leftover_targets = {(60, 10), (60, 11), (60, 12), (62, 15), (90, 90)}
+        run.leftover_area = {t: "field_nw" for t in run.leftover_targets}
+        run.blocked[(60, 11)] = "blocked_tile"
+        run.encircled_day.add((60, 12))
+        # (90, 90) 不在最后观测里 ⇒ unobserved（0.7.44 冬 26/27 的 263/217 主力）
+
+        obs = w.obs()
+        self.assertTrue(run._clear_bag_gate_reason(obs), "前提：满包 + 腾格用尽")
+        snap = run._pending_snapshot(obs)
+
+        self.assertEqual(snap["ledger"], 5)
+        self.assertEqual(snap["blocked"], 2)
+        self.assertEqual(snap["guard"], 3)
+        self.assertEqual(snap["gated"], 1, f"gated 单列：{snap}")
+        self.assertEqual(snap["gated_tiles"], [[60, 10]], snap)
+        self.assertEqual(snap["unobserved"], 1, "被闸住的格**不许**再并进 unobserved")
+        self.assertEqual(snap["malformed"], 1)
+        self.assertEqual(snap["executable"], 0)
+        # ② 不变式两段
+        self.assertEqual(snap["ledger"], snap["guard"] + snap["blocked"])
+        self.assertEqual(snap["guard"],
+                         snap["executable"] + snap["unobserved"]
+                         + snap["malformed"] + snap["gated"])
+        # 观测证据不可用 ⇒ fail-closed：全部按可执行计、gated=0（旧行为不变）
+        blind = run._pending_snapshot(None)
+        self.assertEqual((blind["executable"], blind["unobserved"],
+                          blind["malformed"], blind["gated"]),
+                         (blind["guard"], 0, 0, 0))
+        # gated>0 ⇒ 任何收工理由都不许判正当（fail-closed 在 `is_justified_end` 最前面）
+        self.assertFalse(is_justified_end("sleep", "no_work:确实找不到可做的活",
+                                          pending_executable=0, gated=snap["gated"]))
+        self.assertFalse(is_justified_end("sleep", "night:已经到点了",
+                                          pending_executable=0, gated=snap["gated"]))
+        self.assertFalse(is_justified_end("inventory_blocked", "inventory_blocked:x",
+                                          pending_executable=0, gated=snap["gated"]))
+        # 老账本 / 未传 gated ⇒ 旧行为逐字一致
+        self.assertTrue(is_justified_end("sleep", "no_work:确实找不到可做的活"))
+
+    # ---- ③ executable>0 ⇒ 用 executable_tiles 造 plot，_stage_tiles 必非空 ----
+    def test_executable_snapshot_tiles_are_really_stageable(self):
+        w = FakeWorld(weeds=0, seeds=0, money=0)      # 8 空格 ⇒ 闸不生效
+        w.player_tile = [62, 14]
+        w.blockers[(60, 10)] = "weed"
+        run = self._run(w)
+        run.leftover_targets = {(60, 10)}
+        run.leftover_area = {(60, 10): "field_nw"}
+
+        snap = run._pending_snapshot(w.obs())
+
+        self.assertEqual(snap["gated"], 0)
+        self.assertEqual(snap["executable"], 1, snap)
+        plot = self._plot([tuple(t) for t in snap["executable_tiles"]],
+                          anchor=snap["executable_tiles"][0])
+        self.assertTrue(run._stage_tiles("clear_area", w.obs(), plot),
+                        "快照说可执行 ⇒ 执行层必须拿得出同一批目标（否则两边口径漂移）")
+        # 满包（闸生效）⇒ 同一个 plot 执行层整池清零（这正是 A9 的病灶）
+        full = self._full_unsellable(weeds=0)
+        full.player_tile = [62, 14]
+        full.blockers[(60, 10)] = "weed"
+        run2 = self._run(full)
+        self.assertEqual(run2._stage_tiles("clear_area", full.obs(),
+                                           self._plot([(60, 10)])), [])
+
+    # ---- ④ 守卫/选区同口径：gated 格不许再被喊成"还有地要清" ----
+    def test_guard_and_plot_selection_ignore_gated_tiles(self):
+        w = self._full_unsellable(weeds=1)
+        run = self._run(w)
+        run.leftover_targets = {(60, 10)}
+        run.leftover_area = {(60, 10): "field_nw"}
+        obs = w.obs()
+
+        reasons = run.work_reasons(obs)
+
+        self.assertFalse([r for r in reasons if "还有地要清" in r], reasons)
+        self.assertFalse([r for r in reasons if "没做完" in r], reasons)
+        self.assertFalse(run._plot_has_work(obs, [(60, 10)]),
+                         "执行层整池清零 ⇒ 守卫/选区必须同口径闭嘴")
+        self.assertIsNone(run._ensure_plot(obs, DayReport(day_key=("spring", 1, 6),
+                                                          started_at=0.0)))
+        self.assertTrue(run._clear_gate_only_work(obs))
+
+        # 反例：同一天只要还有作物活，就**不许**判成"只剩清障"（不许提前收工）
+        w2 = self._full_unsellable(weeds=1)
+        w2.dirt.add((61, 10))
+        w2.crops[(61, 10)] = {"ripe": False, "watered": False}
+        run2 = self._run(w2)
+        self.assertFalse(run2._clear_gate_only_work(w2.obs()),
+                         "还有没浇的活苗 ⇒ 不是「只剩清障」，不许拿背包闸收工")
+        # 反例：闸没生效（有空格）⇒ 一律 False
+        w3 = FakeWorld(weeds=1, seeds=0, money=0)
+        run3 = self._run(w3)
+        self.assertEqual(run3._clear_bag_gate_reason(w3.obs()), "")
+        self.assertFalse(run3._clear_gate_only_work(w3.obs()))
+        self.assertTrue(run3._plot_has_work(w3.obs(), [(60, 10)]),
+                        "闸不生效时选区口径与改动前一致")
+
+    # ---- C 侧：`_leftover("clear_area")` 的树只按当天预算额度计入 ----
+    def test_clear_area_leftover_trees_are_capped_by_tree_budget(self):
+        w = FakeWorld(weeds=0, seeds=0, money=0, stamina=60.0)   # 60 ÷ 12 = 5 棵
+        tiles = sorted(w.tillable)[:12]
+        for t in tiles:
+            w.blockers[t] = "tree"
+        run = self._run(w)
+        obs = w.obs()
+        room = run._tree_budget_room(obs)
+        self.assertGreater(room, 0)
+        self.assertLess(room, len(tiles), "夹具前提：窗口里的树必须多于当天预算")
+
+        left = run._leftover("clear_area", obs, self._plot([(64, 14)]))
+
+        self.assertEqual(len(left), room,
+                         f"树只按预算额度计入 leftover（旧实现把整个窗口的树全塞进来 ⇒ "
+                         f"leftover 278/片地 25）：{len(left)} vs room {room}")
+        self.assertLess(len(left), len(tiles))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

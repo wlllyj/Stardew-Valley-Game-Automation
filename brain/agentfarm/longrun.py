@@ -622,7 +622,8 @@ HONEST_INVENTORY_END_REASONS = ("inventory_blocked",)
 
 def is_justified_end(ended_by: str, ended_reason: str, *,
                      pending_executable: int | None = None,
-                     malformed_tiles: int = 0) -> bool:
+                     malformed_tiles: int = 0,
+                     gated: int = 0) -> bool:
     """这一天是不是以**正当理由**收工（`day_justified` 的判据，task-32 / task-15 / task-22 / task-28）。
 
     口径：
@@ -633,6 +634,11 @@ def is_justified_end(ended_by: str, ended_reason: str, *,
       "看不见"是**观测坏了**，不是"没有活"；若把它当 unobserved，Mod 字段一改名就能让
       全部格变成 unobserved ⇒ executable=0 ⇒ 每个诚实收工日都洗成 VERIFIED。这条放在白名单
       之前：残缺读数和任何收工理由同时出现都**不许**判正当（缺失≠通过）；
+    * 【devcoder-clear-gate】`gated > 0` ⇒ **一律不放行**（fail-closed）：日终快照里还有
+      "其余前置条件本来允许、只因满包清障闸而不执行"的清障格 ⇒ 这一天不是"没活可做"，而是
+      "活被背包闸住"（`clear_gate`）。同样的道理放在白名单之前：**任何**收工理由与 gated>0
+      同时出现都不判正当 —— 这是「`clear_gate` 永不 VERIFIED」的硬闸，绝不许为了绿灯放宽。
+      老账本没有 `gated` 键 ⇒ 调用方传默认 0，行为与改动前逐字一致；
     * 前缀在 `JUSTIFIED_END_REASONS`（夜里到点 / 体力见底 / 确实没活）⇒ 正当（与旧实现逐字一致）；
     * 【task-15】前缀在 `HONEST_EXHAUSTED_END_REASONS`（`resume_exhausted`）**且**
       `pending_executable == 0` ⇒ 正当。"换片/回片区/当前观测都拿不出目标"本来就是诚实收工，
@@ -645,6 +651,9 @@ def is_justified_end(ended_by: str, ended_reason: str, *,
     """
     # 【task-22】残缺 tile 记录 = 观测不可信 ⇒ 无论什么理由都不判"正当"（防洗白）。
     if int(malformed_tiles) > 0:
+        return False
+    # 【devcoder-clear-gate】还有"只因满包清障闸而不执行"的清障格 ⇒ 这一天不是"没活可做"。
+    if int(gated) > 0:
         return False
     if ended_by not in ("sleep", "inventory_blocked"):
         return False
@@ -856,9 +865,13 @@ class DayReport:
     #: * 【task-22】`pending_malformed` = 在 `tiles[]` 里出现、但**缺工作种类字段**的残缺记录
     #:   （只有坐标、没有 `kind`/`crop`）——不并入 unobserved（那是观测坏了，不是没活）；
     #:   >0 ⇒ `day_justified` 必为 false（fail-closed，堵 deputy NIT-1 洗白通道）。
+    #: * 【devcoder-clear-gate】`pending_gated` = **只因「满包清障闸」而不执行**的清障类格
+    #:   （背包 0 空格 + 腾格手段用尽；weed/twig/stone/grass + 树 + 够格 clump 的其余前置
+    #:   条件本来都允许）。它们**不并入 unobserved**（那是"看不见/已陈旧"的谎）；>0 ⇒
+    #:   `day_justified` 必为 false（`clear_gate` 永不 VERIFIED）。老账本没有该键 ⇒ 0。
     #: 不变式：`pending_ledger == pending_guard + pending_blocked`；
-    #: `pending_guard == pending_executable + pending_unobserved + pending_malformed`
-    #: （观测不可用时 executable=guard、malformed=0）。
+    #: `pending_guard == pending_executable + pending_unobserved + pending_malformed + pending_gated`
+    #: （观测不可用时 executable=guard、其余 0）。
     pending_ledger: int = 0
     pending_guard: int = 0
     pending_stalled: int = 0
@@ -866,6 +879,7 @@ class DayReport:
     pending_blocked: int = 0
     pending_unobserved: int = 0
     pending_malformed: int = 0
+    pending_gated: int = 0
     #: 【task-27 / 0.7.46】并列只读坐标（有序、各取前 8 条）：`day_end` 逐格对账用。
     #: 只作证据：不参与任何判据，也不新增 journal 事件名。
     pending_executable_tiles: list[Any] = field(default_factory=list)
@@ -1037,6 +1051,9 @@ class DayReport:
             "pending_unobserved": self.pending_unobserved,
             # 【task-22 / 0.7.45】观测 tiles[] 里字段残缺的记录数（>0 ⇒ day_justified 必 false）
             "pending_malformed": self.pending_malformed,
+            # 【devcoder-clear-gate】只因满包清障闸而不执行的清障格数（>0 ⇒ day_justified 必 false；
+            # `clear_gate` 收尾永不 VERIFIED。老账本没有该键 ⇒ 缺省 0 = 旧行为）
+            "pending_gated": self.pending_gated,
             # 【task-27 / 0.7.46】逐格坐标证据（有序、各前 8 条；只读、不改任何判据）
             "pending_executable_tiles": [list(t) for t in self.pending_executable_tiles],
             "pending_stalled_tiles": [list(t) for t in self.pending_stalled_tiles],
@@ -3949,6 +3966,11 @@ class LongRun:
         # 注意只收窄"熟作物"这一路：没浇的作物（浇水不占格）与枯死作物（清死苗）照旧算活。
         free_slots, bag_need, bag_status = self._bag_state(obs)
         bag_blocked = self.inventory_blocked_today or (bag_status == "ok" and bag_need > 0)
+        # 【devcoder-clear-gate E】满包清障闸与 `_stage_tiles("clear_area")` **同口径**：
+        # 闸住时清障类格今天不再执行 ⇒ 这片地也**不算**"还有地要清"。否则守卫一直喊、
+        # `_ensure_plot` 永不为 None ⇒ `decision.intents` 每轮非空 ⇒ 3 轮 idle ⇒ `stuck:`
+        # （A9 winter27/28 的形态）。收尾交给 `_end_clear_gate`（`clear_gate`，永不 VERIFIED）。
+        clear_gate = bool(self._clear_bag_gate_reason(obs))
         for t in tiles:
             if t in self.blocked or t in shed or t in self.encircled_day:
                 # 今天已经证明"动了没用" / 今天已主动认输 / 【task-5】被围住的格今天也不再算"活"。
@@ -3983,15 +4005,21 @@ class LongRun:
                 continue
             kind = str(tv.get("kind") or "")
             if kind in ACTIONABLE_KINDS and "clear_area" not in deferred:
+                if clear_gate:
+                    continue      # 【devcoder-clear-gate E】满包闸住 ⇒ 今天不清、不算活
                 return True
             # 【task-218】树也算"这片地有活"（LLM 一直这么理解，旧实现却在 `clear()` 里静默跳过）；
             # 但受日级砍树预算约束 —— 预算挡下时不算活，否则守卫会被"砍不完的树"钉死一整天。
             if (kind == TREE_KIND and "clear_area" not in deferred
                     and not _tool_blocked_tv(tv) and self._tree_budget_left(obs)):
+                if clear_gate:
+                    continue      # 【devcoder-clear-gate E】同上
                 return True
             # 够格的 clump 一族（toolOk == true）同样算活；toolOk false/null ⇒ 能力缺口、不算活。
             if (kind in CLUMP_KINDS and "clear_area" not in deferred
                     and not _tool_blocked_tv(tv)):
+                if clear_gate:
+                    continue      # 【devcoder-clear-gate E】同上
                 return True
             if (t in tillable and can_plant and not _till_blocked_by(tv)
                     and "till_area" not in deferred):
@@ -4338,6 +4366,8 @@ class LongRun:
             pending_stalled=snap["stalled"],
             # 【task-22 / 0.7.45】残缺 tile 数（>0 ⇒ 当天 day_justified 必 false）
             pending_malformed=snap.get("malformed", 0),
+            # 【devcoder-clear-gate】只因满包清障闸而不执行的清障格数（>0 ⇒ day_justified 必 false）
+            pending_gated=int(snap.get("gated") or 0),
             # 【task-27 / 0.7.46】逐格坐标证据（有序、各前 8 条；只读、不改判据、不新增事件名）
             pending_executable_tiles=list(snap.get("executable_tiles") or [])[:8],
             pending_stalled_tiles=list(snap.get("stalled_tiles") or [])[:8],
@@ -5043,7 +5073,26 @@ class LongRun:
                        or str((tmap.get(t) or {}).get("kind") or "") in CLUMP_KINDS)
                    and not _tool_blocked_tv(tmap.get(t))]
             if tree_ok:
-                out += [t for t, v in tmap.items() if str(v.get("kind") or "") == TREE_KIND]
+                # 【devcoder-clear-gate C】树**只按当天预算额度**计入 leftover（与
+                # `_stage_tiles` 完全同序：先本片地内/边界一圈，再按到片地锚点的距离）。
+                # 旧实现把**整个观测窗口**里的树全塞进来：窗口 278 棵树 vs 片地 25 格
+                # ⇒ `leftover` 被窗外树灌爆（真机 A9 实测 leftover 278 / 片地 25），
+                # `leftover ⊋ assigned` 造出"0 目标、海量剩余"的假剩余。
+                # 不变式保持 `leftover ⊇ assigned`：`assigned` 本就被 `_tree_budget_room` 限住。
+                room = self._tree_budget_room(obs)
+                anchor = tuple(plot.get("anchor") or (local[0] if local else (0, 0)))
+                if local:
+                    xs = [t[0] for t in local]
+                    ys = [t[1] for t in local]
+                    zone = {(x, y) for x in range(min(xs) - 1, max(xs) + 2)
+                            for y in range(min(ys) - 1, max(ys) + 2)}
+                else:
+                    zone = set()
+                tree_cands = [(t, v) for t, v in tmap.items()
+                              if str(v.get("kind") or "") == TREE_KIND and not _tool_blocked_tv(v)]
+                tree_cands.sort(key=lambda item: (0 if item[0] in zone else 1,
+                                                  _dist(item[0], anchor), item[0][1], item[0][0]))
+                out += [t for t, _v in tree_cands[:max(0, int(room))]]
             return sorted(set(out))
         if task == "till_area":
             # task-15 §②（修法 A）：**种子闸门必须与 `_stage_tiles` 同口径**。
@@ -5228,9 +5277,19 @@ class LongRun:
         # 【task-198 ②】背包满/将满时"跨片地遗留"也**不许**当"还能干活"的理由：那些格子要收/要装，
         # 而背包堵住 ⇒ 唯一的可执行动作是腾格（见下面的 bag_blocked 分支）。`_leftover` 照旧
         # 如实保留这些格（`no_unmet_stages` 不受影响）—— 语义是"不是没活，是背包堵住"。
+        # 【devcoder-clear-gate E】同理，被满包清障闸**单独**闸住的清障格今天不算"还有活"：
+        # 执行层整池清零（`_stage_tiles` 返回 []），守卫再喊"还有 N 格没做完"只会把主循环钉死
+        # （A9 冬 27/28：快照 exec=206/195、守卫喊有活、`_ensure_plot` 永不为 None ⇒ 3 轮 idle
+        # ⇒ `stuck:`）。注意：**只**从这条"跨片地遗留"理由里扣掉它们，`_leftover` 的会计公式
+        # 一个字没动（该做没做照旧如实、当天照旧不 VERIFIED）；收尾口是 `_end_clear_gate`。
         if pending and not bag_blocked:
-            reasons.append(f"今天早些时候还有 {len(pending)} 格没做完（跨片地，最近的是 "
-                           f"{list(min(pending, key=lambda t: _dist(t, FarmWorker.player_tile(obs))))}）")
+            _gated_set = self._gated_tile_set(obs)
+            if _gated_set:
+                pending = [t for t in pending if t not in _gated_set]
+            if pending:
+                reasons.append(
+                    f"今天早些时候还有 {len(pending)} 格没做完（跨片地，最近的是 "
+                    f"{list(min(pending, key=lambda t: _dist(t, FarmWorker.player_tile(obs))))}）")
         for cand in self._plot_candidates(obs):
             if self._plot_has_work(obs, cand["tiles"]):
                 reasons.append(f"{cand.get('zone') or '附近'}还有地要清/开/种")
@@ -5288,6 +5347,23 @@ class LongRun:
         这一层，不等于把 encircled 封格**：`blocked` 本身一个字没动，`_leftover` 也照旧如实计。
         """
         return set(self.blocked) | set(self.encircled_day)
+
+    def _gated_tile_set(self, obs: dict[str, Any]) -> set[tuple[int, int]]:
+        """【devcoder-clear-gate E】今天**只因满包清障闸**而不执行的清障格坐标集合。
+
+        判据与 `_stage_tiles` / `_pending_snapshot` 同源（闸未生效 ⇒ 空集；闸生效时取快照的
+        `gated_tiles`，即"其余前置条件本来允许、只因背包闸而不做"的那批格）。用途只有一处：
+        `work_reasons` 报"跨片地还有 N 格没做完"时把她们扣掉 —— 否则守卫会一直喊"还有地要清"，
+        而执行层整池清零 ⇒ 主循环空转到 `stuck:`（A9 冬 27/28）。
+
+        **不改会计**：`_leftover` / `plot_pending` / `assigned_undone` 一个字没动（该做没做
+        照旧如实、当天照旧不 VERIFIED）；证据不可用 ⇒ 返回空集（fail-open：不扣，守卫照旧
+        喊活，不会洗白）。
+        """
+        if not self._clear_bag_gate_reason(obs):
+            return set()
+        snap = self._pending_snapshot(obs)
+        return {(int(t[0]), int(t[1])) for t in (snap.get("gated_tiles") or [])}
 
     def _ledger_pending(self) -> list[tuple[int, int]]:
         """【task-15 / 0.7.45】**原始账本口径**的待做余格（守卫口径的母集）。
@@ -5368,7 +5444,14 @@ class LongRun:
           **绝不许算 unobserved**：那是"观测坏了"而不是"没有活"。它单独计数，
           调用方用 `is_justified_end(..., malformed_tiles=...)` 强制 `day_justified=false`
           （fail-closed，堵 deputy NIT-1 的洗白通道）；
-        * `ledger == guard + blocked`、`guard == executable + unobserved + malformed`。
+        * 【devcoder-clear-gate】**`gated`** = **唯一**被「满包清障闸」（`_clear_bag_gate_reason`
+          ⇒ 背包 0 空格 + 腾格手段用尽）挡住、其余前置条件（预算/工具）本来都允许的清障类格
+          （`CLEARABLE_KINDS`：weed/twig/stone/grass + 树 + 够格 clump）。它们**不并入
+          `unobserved`**：那等于把"今天被闸住"说成"看不见/已陈旧"（是谎，会让账本对不上
+          `_stage_tiles` 整池清零的事实）。单独成桶 ⇒ 调用方用
+          `is_justified_end(..., gated=...)` 强制 `day_justified=false`（fail-closed：
+          `clear_gate` 收尾永不 VERIFIED）；
+        * `ledger == guard + blocked`、`guard == executable + unobserved + malformed + gated`。
 
         观测不可用（`obs is None` / 不是农场观测）⇒ **全部按可执行计**（fail-closed：不许把
         "没看到"当"没有"，`day_justified` 因此不放行）。
@@ -5376,6 +5459,7 @@ class LongRun:
         分类顺序：已判死（`blocked`/`encircled_day`/`resume_stall_tiles`）→ 不在 `tiles[]`
         ⇒ unobserved（这正是 0.7.44 冒烟 263/217 被判成"还有活"的病灶）→ 【task-22】在
         `tiles[]` 但缺工作种类字段 ⇒ malformed → 看得见但今天已不需要做 ⇒ unobserved →
+        【devcoder-clear-gate】本来允许、只因满包清障闸而不允许的清障格 ⇒ gated →
         要做但不允许/站不到 ⇒ unobserved（"今天没证据能执行"）→ 其余 executable。
         """
         defer = self._budget_deferred_tile_set()
@@ -5398,7 +5482,9 @@ class LongRun:
         if farm is None:
             # 观测证据不可用 ⇒ 不许声称"没有可执行的活"（executable 取全量 ⇒ day_justified 不放行）
             return {**base, "executable": len(guard_tiles), "unobserved": 0, "malformed": 0,
+                    "gated": 0,
                     "executable_tiles": [list(t) for t in sorted(guard_tiles)],
+                    "gated_tiles": [],
                     "malformed_tiles": []}
         tmap = FarmWorker.tiles_of(farm)
         tillable = FarmWorker.tillable_of(farm)
@@ -5409,9 +5495,14 @@ class LongRun:
                    and self._tree_budget_room(farm) > 0)
         free_slots, bag_need, bag_status = self._bag_state(farm)
         bag_blocked = self.inventory_blocked_today or (bag_status == "ok" and bag_need > 0)
-        executable = unobserved = malformed = 0
+        # 【devcoder-clear-gate】满包清障闸：与执行层（`_stage_tiles("clear_area")` 整池清零）
+        # **同一判据**。它只解释"清障类格为什么今天不执行"，不并入 unobserved（那是"看不见/
+        # 已陈旧"的谎），单列 `gated` 桶并由 `is_justified_end(gated=…)` fail-closed。
+        gate = self._clear_bag_gate_reason(farm)
+        executable = unobserved = malformed = gated = 0
         exec_tiles: list[tuple[int, int]] = []
         malformed_tiles: list[tuple[int, int]] = []
+        gated_tiles: list[tuple[int, int]] = []
         for t in guard_tiles:
             tv = tmap.get(t)
             if tv is None:
@@ -5453,14 +5544,23 @@ class LongRun:
             if not need:
                 unobserved += 1          # 已做/账本陈旧：今天不需要做，不算活
                 continue
+            # 【devcoder-clear-gate】"其余前置条件本来就允许、只因满包清障闸而不允许"的清障格
+            # ⇒ 单列 gated（不并入 unobserved）。工具不够格/预算挡下的树**不算** gated：
+            # 那是能力/预算缺口，与背包无关（`allowed` 在加闸之前就已为 False）。
+            if (gate and allowed and not tv.get("crop")
+                    and kind in CLEARABLE_KINDS):
+                gated += 1
+                gated_tiles.append(tuple(t))
+                continue
             if not allowed or not self._standable_next_to(farm, t):
                 unobserved += 1          # 预算延后/工具不够/背包堵/四邻没得站 ⇒ 今天不可执行
                 continue
             executable += 1
             exec_tiles.append(tuple(t))
         return {**base, "executable": executable,
-                "unobserved": unobserved, "malformed": malformed,
+                "unobserved": unobserved, "malformed": malformed, "gated": gated,
                 "executable_tiles": [list(t) for t in sorted(exec_tiles)],
+                "gated_tiles": [list(t) for t in sorted(gated_tiles)],
                 "malformed_tiles": [list(t) for t in sorted(malformed_tiles)]}
 
     # ------------------------------------------------ task-124：review 独苗的对账路径
@@ -5950,6 +6050,14 @@ class LongRun:
             # 铁匠铺动作不进 `work_reasons`（它不是农活），所以必须在这里单独放行。
             if self._tool_upgrade_due(obs):
                 return False, "keep_working", "今天还有一件工具升级/取回要做（铁匠铺），先做完再收工"
+            # 【devcoder-clear-gate D】背包 0 空格 + 腾格手段用尽 + 剩余活**全是**被闸住的清障格
+            # ⇒ 这**不是**"没活可做"：绝不能置 `no_work_evidence_ok`、更不能用 `no_work` 收尾
+            # （`no_work` 在 JUSTIFIED 白名单里，会白拿一个 VERIFIED —— A9 冬 27/28 的洗白口）。
+            # 交 `_end_clear_gate` 点名收口（`clear_gate`，`day_justified` 恒 False）。
+            if self._clear_gate_only_work(obs):
+                return True, "clear_gate", (
+                    "背包 0 空格且腾格手段用尽，剩余活全是清障类（清障掉落必丢）⇒ 今天不再新开 "
+                    "clear_area；这不是「没活可做」，当天按 clear_gate 如实收尾（不 VERIFIED）")
             self.no_work_evidence_ok = True
             # 【task-240】"没活"要说清是不是"有地、但手上的种子都隔季"：0.7.41 冒烟 day1
             # 是冬天 + Wheat Seeds×10，旧口径宣称"手上有种子 ⇒ 该去种"，下地却 `no_seed`
@@ -6483,6 +6591,77 @@ class LongRun:
             return ""
         return "背包 0 空格且腾格手段用尽"
 
+    def _clear_gate_only_work(self, obs: dict[str, Any]) -> bool:
+        """【devcoder-clear-gate D】今天的剩余活是不是**只有**被满包清障闸挡住的那批清障格。
+
+        收尾口 `_end_clear_gate` 只能在这种情况下用：否则就是拿"背包闸"当借口提前结束一天
+        （还有浇水/收获/播种的活就收工 = 白丢一天）。判据（全部要成立）：
+
+        ① 闸生效（`_clear_bag_gate_reason` 非空：背包 0 空格 + 腾格手段用尽）；
+        ② **当前观测窗口里**确实还有"能做、只因闸而不做"的清障格（`CLEARABLE_KINDS` 且
+           工具够格；树另受当天砍树预算约束）。这里**刻意直接扫 `tiles[]`** 而不是只信
+           `leftover_targets`：账本只记"今天真的开过阶段"的格，满包日 `_stage_tiles("clear_area")`
+           整池清零 ⇒ 账本可能是空的（日初就满包的情形），而活明明摆在地里；
+        ③ 观测窗口里没有任何**其它**"该做的活"：活苗没浇 / 熟作物（未认输）/ 枯死作物 /
+           可锄可种（`can_plant` 且没被预算延后）—— 只要有一格，就不是"只剩清障"；
+        ④ 账本口径 `_pending_work()` 里**看得见**的格也全是清障类（看不见的格不参与，由下面
+           ⑤ 的 `executable==0` fail-closed 兜底）；
+        ⑤ 日终快照 `executable == 0` 且 `malformed == 0`（当前观测里没有可执行格、观测也没坏）。
+
+        返回 True 时调用方必须走 `_end_clear_gate`（`ended_by=clear_gate`，
+        `day_justified=False`、永不 VERIFIED）；**绝不许**把它当成 `no_work`。
+        """
+        if not self._clear_bag_gate_reason(obs):
+            return False
+        tmap = FarmWorker.tiles_of(obs)
+        tillable = FarmWorker.tillable_of(obs)
+        _seeds, _money, can_plant = self._seed_outlook(obs)
+        deferred = self._budget_deferred_tasks()
+        shed = self._shed_tile_set()
+        tree_room = self._tree_budget_room(obs)
+        clear_visible = 0
+        for t, tv in tmap.items():
+            if t in self.blocked or t in shed or t in self.encircled_day \
+                    or t in self.resume_stall_tiles:
+                continue                      # 今天已判死/认输/停滞 ⇒ 本来就不算活
+            if tv.get("crop"):
+                # 作物活（浇水 / 收获 / 清死苗）依旧是"真活"：不许拿背包闸收工。
+                if tv.get("dead"):
+                    return False
+                if not tv.get("watered"):
+                    return False
+                if tile_ready(tv) and t not in self.harvest_gave_up:
+                    return False
+                continue
+            kind = str(tv.get("kind") or "")
+            if kind in CLEARABLE_KINDS and not _tool_blocked_tv(tv):
+                if kind == TREE_KIND and tree_room <= 0:
+                    continue                  # 砍树预算挡下 = 今天不做（不是被闸住）
+                clear_visible += 1
+                continue
+            if (t in tillable and can_plant and "till_area" not in deferred) \
+                    or (kind == "dirt" and can_plant and "plant_area" not in deferred):
+                return False                  # 还有地可开/可种 ⇒ 守卫该继续喊活，不许收工
+        snap = self._pending_snapshot(obs)
+        if clear_visible <= 0:
+            # 窗口里此刻看不见清障格（人在室内/换过片地）时，退回账本口径：只要快照说
+            # 还有"只因闸而不执行"的清障格，仍是同一个结论（活被背包闸住）。
+            if int(snap.get("gated") or 0) <= 0:
+                return False
+        for t in self._pending_work():
+            tv = tmap.get(t)
+            if tv is None:
+                continue                      # 不在窗口里 ⇒ 无法分类（由 ⑤ fail-closed 兜底）
+            if tv.get("crop"):
+                return False                  # 还有作物活（浇/收/清死苗）
+            if str(tv.get("kind") or "") not in CLEARABLE_KINDS:
+                return False                  # 耕地/空地/其它 ⇒ 不是"只剩清障"
+        if int(snap.get("executable") or 0) > 0:
+            return False
+        if int(snap.get("malformed") or 0) > 0:
+            return False
+        return True
+
     def _note_clear_area_bag_gate(self, task: str, why: str) -> None:
         """【task-28 卡 D C】满包清障闸留痕（复用既有 `slot_relief` 事件名 + 新字段，不新增事件）。
 
@@ -6864,6 +7043,51 @@ class LongRun:
         else:
             rep.ended_by, rep.ended_reason = "inventory_blocked", f"inventory_blocked:{why}"
         return rep.ended_by
+
+    def _end_clear_gate(self, obs: dict[str, Any], rep: DayReport) -> tuple[str, str]:
+        """【devcoder-clear-gate D】满包清障闸收工口：`ended_by="clear_gate"` + 诚实的 `ended_reason`。
+
+        为什么需要（A9 第 5 跑 `logs/longrun-runA9-0750.jsonl`，winter27/28）：执行层
+        `_stage_tiles("clear_area")` 因满包闸**整池清零**（`return []`），而守卫/选区/日终快照
+        都不知道这道闸 ⇒ 快照 `pending_executable=206/195`、守卫一直喊"还有地要清"、
+        `_ensure_plot` 永不为 None ⇒ `decision.intents` 每轮非空 ⇒ 主循环既收不了工也换不了片
+        ⇒ `idle` 3 轮 ⇒ `stuck:`（整天报废）。本方法给这条真实状态一个**点名**的收尾口。
+
+        语义边界：
+        * 只允许在 `_clear_gate_only_work(obs)` 为真时调用（背包 0 空格 + 腾格用尽 + 剩余活
+          **全是**被闸住的清障格）；
+        * `require_work=False`：理由同 `_stuck_flush`（0 动作日传 True 会被
+          `slept_without_work` 挡成"本日不推进"，整轮自停）；
+        * `clear_gate` **不在** `JUSTIFIED_END_REASONS` / `HONEST_*` 里，且
+          `is_justified_end(gated=…)` 见 `gated>0` 直接 False ⇒ `day_justified=False`、
+          **永不 VERIFIED**（这是"活被背包闸住"，不是"没活可做"）；
+        * 不新增 journal 事件名：证据走既有 `slot_relief{trigger=clear_gate}` 与
+          `day_end.pending_gated` / `bag_evidence`。
+        """
+        free_slots, _need, _status = self._bag_state(obs)
+        snap = self._pending_snapshot(obs)
+        # "剩余 N 格"= 当前观测窗口里"能做、只因闸而不做"的清障格数（拿不到就退回账本口径的
+        # gated 数）—— 两种口径都只描述同一件事：这些格全是清障类。
+        tmap = FarmWorker.tiles_of(obs)
+        visible_clear = sum(
+            1 for t, tv in tmap.items()
+            if not tv.get("crop") and str(tv.get("kind") or "") in CLEARABLE_KINDS
+            and not _tool_blocked_tv(tv) and t not in self.blocked
+            and t not in self.resume_stall_tiles and t not in self.encircled_day)
+        remaining = visible_clear or int(snap.get("gated") or 0)
+        reason = (f"clear_gate:背包0空格且腾格手段用尽（free_slots={free_slots} / "
+                  f"relief_exhausted / 剩余 {remaining} 格全是清障类）")
+        # 抬走"今天不再新开 clear_area"的证据（既有事件名 + 既有字段集，幂等：一天只记一条）。
+        self._note_clear_area_bag_gate("clear_area", self._clear_bag_gate_reason(obs))
+        ended_by, ended_reason = self._do_sleep(obs, rep, reason, require_work=False)
+        if ended_by == "sleep_failed":
+            rep.ended_by, rep.ended_reason = ended_by, ended_reason
+        else:
+            rep.ended_by, rep.ended_reason = "clear_gate", reason
+        rep.notes.append(
+            f"满包清障闸收口：{reason} ⇒ 今天不再新开 clear_area（开路必要前置仍允许）；"
+            "这不是「没活可做」，也不是 stuck —— 当天 day_justified=False、不 VERIFIED")
+        return rep.ended_by, rep.ended_reason
 
     # ------------------------------------------------------------------ task-25 rev4
     #: Pierre 背包升级（12→24 / 2000g）的**对话购买**。判据只看观测差分：
@@ -9970,6 +10194,13 @@ class LongRun:
 
             allow, code, text = self.sleep_guard(obs)
             if allow:
+                # 【devcoder-clear-gate D】满包清障闸的收口必须**点名**（`ended_by=clear_gate`）：
+                # 它不是"没活"，也不是"背包堵住收不了熟作物"，而是"活被背包闸住、今天不开新清障"。
+                # 走 `_end_clear_gate`（`require_work=False`：0 动作日照样能翻篇，理由同
+                # `_stuck_flush`）。`clear_gate` 不在任何白名单 ⇒ `day_justified=False`。
+                if code == "clear_gate":
+                    self._end_clear_gate(obs, rep)
+                    break
                 rep.ended_by, rep.ended_reason = self._do_sleep(obs, rep, f"{code}:{text}")
                 # 【task-198】背包堵住导致的收工与 night/stamina 同形态（睡一觉让游戏日翻篇），
                 # 但 `ended_by` 必须点名**原因**：否则报告里只会看到 `sleep`，看报告的人分不清
@@ -10077,6 +10308,11 @@ class LongRun:
                         continue
                     # 【task-198】背包堵住时**不能**落成 `no_work`（那是假达标）或 `stuck`
                     # （那是误报卡死）：这一天的真实结论是"背包堵住、今天腾不出来"。
+                    # 【devcoder-clear-gate D】"剩余活全是被满包清障闸挡住的清障格" 同样不许落
+                    # `no_work`/`stuck`：用 `_end_clear_gate` 点名收口（day_justified 恒 False）。
+                    if self._clear_gate_only_work(obs):
+                        self._end_clear_gate(obs, rep)
+                        break
                     if self.inventory_blocked_today:
                         self._end_inventory_blocked(obs, rep)
                         break
@@ -10315,10 +10551,18 @@ class LongRun:
                                 # 否则**不结束**，落到下面的走路上限继续换片探索（winter26 就是这样
                                 # 走 216 格/换片 4 次后 exec=0 才 VERIFIED 的）。
                                 try:
-                                    _exec = int(self._pending_snapshot(obs).get("executable") or 0)
+                                    _snap = self._pending_snapshot(obs)
+                                    _exec = int(_snap.get("executable") or 0)
+                                    _gated = int(_snap.get("gated") or 0)
                                 except Exception:
-                                    _exec = 1          # 证据不可用 ⇒ fail-closed 当作"还有活"
-                                if _exec == 0:
+                                    _exec, _gated = 1, 0   # 证据不可用 ⇒ fail-closed 当作"还有活"
+                                # 【devcoder-clear-gate D】`executable==0` 也可能是"格全被满包清障闸
+                                # 闸住"（gated>0）—— 那是"活被背包闸住"，**不是**无活可做：绝不许
+                                # 落 `no_work`+`no_work_evidence_ok=True`（那是白拿 VERIFIED 的洗白口）。
+                                if _exec == 0 and _gated > 0 and self._clear_gate_only_work(obs):
+                                    self._end_clear_gate(obs, rep)
+                                    break
+                                if _exec == 0 and _gated == 0:
                                     rep.notes.append(
                                         f"连续 {self._no_work_cycle_count} 轮校验取消、当日 0 农场动作、"
                                         f"且日终可执行面 executable==0 ⇒ 已证无活，诚实收工（干净跨日）")
@@ -10334,7 +10578,8 @@ class LongRun:
                                 # exec>0：账本还有可执行的活 ⇒ 不判无活，继续换片/探索
                                 rep.notes.append(
                                     f"连续 {self._no_work_cycle_count} 轮本片区无可动目标，但账本仍有 "
-                                    f"{_exec} 格可执行 ⇒ 不判无活，继续换片探索（不提前收工）")
+                                    f"{_exec} 格可执行（另有 {_gated} 格被满包清障闸闸住）⇒ 不判无活，"
+                                    f"继续换片探索（不提前收工）")
                             # 当天其实做过农场动作（只是做不成/被围）⇒ 不是"当日 0 可执行农场动作"，
                             # 绝不许洗成 no_work（那是把"有活做不成"洗白成"没活"）；落回既有
                             # stuck / burst / resume_exhausted 诚实收口（见
@@ -10351,10 +10596,18 @@ class LongRun:
                             # 日终可执行面 executable==0** 时成立；只满足前半（账本还有可执行活，
                             # 只是走不到/被围）⇒ 落 `stuck:` 诚实收口（不洗成无活、当天不 VERIFIED）。
                             try:
-                                _no_exec = int(self._pending_snapshot(obs).get("executable") or 0) == 0
+                                _snap2 = self._pending_snapshot(obs)
+                                _no_exec = int(_snap2.get("executable") or 0) == 0
+                                _gated2 = int(_snap2.get("gated") or 0)
                             except Exception:
-                                _no_exec = False
-                            no_work = self.farm_actions_today <= 0 and _no_exec
+                                _no_exec, _gated2 = False, 0
+                            # 【devcoder-clear-gate D】`executable==0 且 gated>0` = "活被满包闸住"，
+                            # 不是"没活"：走 `clear_gate` 点名收口（day_justified 恒 False），
+                            # 绝不许置 `no_work_evidence_ok` 拿一个假 VERIFIED。
+                            if _no_exec and _gated2 > 0 and self._clear_gate_only_work(obs):
+                                self._end_clear_gate(obs, rep)
+                                break
+                            no_work = self.farm_actions_today <= 0 and _no_exec and _gated2 == 0
                             if no_work:
                                 self.no_work_evidence_ok = True
                             rep.ended_by, rep.ended_reason = self._do_sleep(
@@ -10403,6 +10656,18 @@ class LongRun:
                 note = f"今天确实没有可做的目标（{policy_note or '策略没给出意图'}；守卫放行：{code}）"
                 rep.notes.append(note)
                 self._journal("no_intents", zone=self.zone_name, note=note)
+                # 【devcoder-clear-gate D】这里**不许硬写 `no_work`**：守卫这次放行可能是
+                # `clear_gate`（满包清障闸，剩余活全是被闸住的清障格）或 `inventory_blocked`
+                # （背包堵住）—— 写 `no_work` 会把"活被背包闸住"洗成"今天没活"（`no_work` 在
+                # JUSTIFIED 白名单里 ⇒ 白拿 VERIFIED）。按 `code` 分流，各走自己的点名收尾口。
+                if code == "clear_gate":
+                    self._end_clear_gate(obs, rep)
+                    break
+                if code == "inventory_blocked" and self.inventory_blocked_today:
+                    self._end_inventory_blocked(obs, rep)
+                    break
+                # 其余 code（night/stamina/no_work…）沿用旧行为：`no_work` 由 sleep_guard 的
+                # 证据保证（`no_work_evidence_ok` 只在"真没活"分支置位），不受本次改动影响。
                 rep.ended_by, rep.ended_reason = self._do_sleep(obs, rep, "no_work")
                 break
             # 【task-219】政策/换任务/兜底之后仍没进执行的计划意图：日终按 `superseded` 归因
@@ -10436,6 +10701,12 @@ class LongRun:
                     # 腾 1 格、多格熟作物要好几轮 ⇒ 3 轮 idle 会先撞这里，把"背包堵住"误报成
                     # `stuck`（deputy 的 198f-1..8 全是这个形态，A′ day13 原型）。先判
                     # `inventory_blocked_today`：诚实收工、理由可执行、不算 hard failure。
+                    # 【devcoder-clear-gate D】"剩余活全是清障类、且背包 0 空格腾不出" ⇒ 更准确的
+                    # 结论是 `clear_gate`（不是背包堵住收不了熟作物、也不是 stuck）：A9 冬 27/28
+                    # 就是在这个口上被判 `stuck:` 的。放在 inventory_blocked 之前（闸更具体）。
+                    if self._clear_gate_only_work(obs):
+                        self._end_clear_gate(obs, rep)
+                        break
                     if self.inventory_blocked_today:
                         self._end_inventory_blocked(obs, rep)
                         break
@@ -10834,6 +11105,11 @@ class LongRun:
         # 【task-22 / 0.7.45】tiles[] 里字段残缺的 tile 记录数：不并入 unobserved，
         # 单独留痕并强制 day_justified=false（缺失≠通过，堵 deputy NIT-1 fail-open）。
         rep.pending_malformed = int(snap.get("malformed", 0))
+        # 【devcoder-clear-gate】只因满包清障闸（背包 0 空格 + 腾格用尽）而不执行的清障格数：
+        # 单独成桶，**不并入** `pending_unobserved`（那是"看不见/已陈旧"，与"今天被闸住"是两回事）。
+        # >0 ⇒ `is_justified_end(gated=…)` 直接 False ⇒ 当天永不 VERIFIED（`clear_gate` 的硬闸）。
+        # 老账本/旧快照没有该键 ⇒ 0（行为与改动前逐字一致）。
+        rep.pending_gated = int(snap.get("gated", 0) or 0)
         # 【task-27 / 0.7.46】逐格坐标证据（有序、各前 8 条；只读，不参与判据）：
         # `pending_executable_tiles` 让"day_justified 有证据"能落到具体坐标上；
         # `pending_stalled_tiles` 让"停滞/挡死"能逐格对账（不是只报一个数）。
@@ -10860,6 +11136,9 @@ class LongRun:
                 f"{rep.pending_unobserved} 格"
                 + (f"、观测记录残缺 {rep.pending_malformed} 格（不并入看不见，day_justified 必 false）"
                    if rep.pending_malformed else "")
+                + (f"、满包清障闸闸住 {rep.pending_gated} 格（背包 0 空格 + 腾格用尽；"
+                   "不并入看不见，day_justified 必 false）"
+                   if rep.pending_gated else "")
                 + ("（观测证据不可用 ⇒ 诚实收工判定不放行）" if outdoor_obs is None else ""))
         # 【task-16 / 0.7.45】背包空格与"清障掉落被游戏拒收"的日终留痕：**只作 info** ——
         # 满包清障照常算做成（不因此判失败、不改下面任何一个 checks 键）；但"掉的战利品可能
@@ -10911,10 +11190,13 @@ class LongRun:
             # **当前观测里可执行格为 0** 时才认（证据 = 上面的 `pending_executable`）；
             # 有活却收工/观测证据不可用 ⇒ 仍是 False，反向洗白用例钉死这条。
             # 【task-22 / 0.7.45】`pending_malformed > 0`（tiles[] 记录字段残缺）⇒ 一律 False。
+            # 【devcoder-clear-gate】`pending_gated > 0`（只因满包清障闸而不执行的清障格）⇒ 一律
+            # False：这一天是"活被背包闸住"（`clear_gate`），不是"没活可做"，永不 VERIFIED。
             "day_justified": is_justified_end(
                 rep.ended_by, rep.ended_reason,
                 pending_executable=rep.pending_executable,
-                malformed_tiles=rep.pending_malformed),
+                malformed_tiles=rep.pending_malformed,
+                gated=rep.pending_gated),
             # 【task-149 C】0 动作日**不许** VERIFIED —— 除非当天有真正独立的"无活可做"证据
             # （`sleep_guard` 在 farm 证据齐备且 `work_reasons` 为空时置的
             # `no_work_evidence_ok`）。run9c summer 20：22.81 秒、`ok_steps=0`、`decision=0`，
