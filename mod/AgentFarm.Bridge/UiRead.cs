@@ -106,6 +106,71 @@ namespace AgentFarm.Bridge
             catch { return null; }
         }
 
+        /// <summary>
+        /// 【dialogue-okfix / P2 取证】当前对话框**还剩几条**对话（`DialogueBox.dialogues` 的元素数）。
+        ///
+        /// 【为什么需要】真机现象："关框之后同一句又回来"。两种成因必须分开：
+        ///   * 事件脚本重放同一条 command（`Event.CurrentCommand` 不自增）⇒ `dialogues` 条数会被
+        ///     重新填回、`command` 不变；
+        ///   * 事件重触发（新 Event 实例）⇒ 两者都会变。
+        /// 没有这两个字段，只能靠 reason 文本猜。
+        ///
+        /// 【读法】`dialogues` 是 `DialogueBox` 上的字段（tools/api-probe 编译期实证存在），
+        /// 但不同版本可能是 `List&lt;string&gt;`/`Queue&lt;string&gt;`，所以按 `ICollection.Count`
+        /// 反射读（与 `characterIndexInDialogue` 同一套"读不到就 null"的口径）。
+        /// 没有对话框 / 字段不存在 / 反射异常 ⇒ null（**不拿 0 冒充观测**）。
+        /// </summary>
+        public static int? DialogueLineCount(DialogueBox box)
+        {
+            if (box == null) return null;
+            try
+            {
+                FieldInfo field = DialogueLinesField();
+                if (field == null) return null;
+
+                object raw = field.GetValue(box);
+                if (raw is System.Collections.ICollection col) return col.Count;
+                return null;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// 【dialogue-okfix / P2 取证】当前事件脚本执行到**第几条 command**
+        /// （`Game1.CurrentEvent.CurrentCommand`；编译期实证类型是 `int`，即命令下标）。
+        ///
+        /// 用途：判定"关框后同句复现"是**重放**（下标没自增）还是**重触发/正常推进**（下标变了）。
+        /// 没有事件 ⇒ null（字段被省略）；事件在跑但读不到 ⇒ 同样 null。
+        /// </summary>
+        public static int? EventCommand()
+        {
+            try
+            {
+                Event ev = Game1.CurrentEvent;
+                return ev == null ? (int?)null : ev.CurrentCommand;
+            }
+            catch { return null; }
+        }
+
+        private static FieldInfo _dialogueLinesField;
+        private static bool _dialogueLinesFieldSearched;
+
+        private static FieldInfo DialogueLinesField()
+        {
+            if (!_dialogueLinesFieldSearched)
+            {
+                _dialogueLinesFieldSearched = true;
+                try
+                {
+                    _dialogueLinesField = typeof(DialogueBox).GetField(
+                        "dialogues",
+                        BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                }
+                catch { _dialogueLinesField = null; }
+            }
+            return _dialogueLinesField;
+        }
+
         // 反射结果缓存一次：观察是热路径，但 `GetField` 只在第一次付代价。
         private static FieldInfo _professionField;
         private static bool _professionFieldSearched;

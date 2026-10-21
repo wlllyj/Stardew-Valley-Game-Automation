@@ -56,6 +56,9 @@ namespace AgentFarm.Bridge
         private DateTime _nextAllowedUtc = DateTime.MinValue;
         private string _lastProgress = "";
 
+        // 【P1】第一次观测到"已推进过 + 对话框没了"的时刻；宽限窗口从这一刻开始算。
+        private DateTime? _closedSinceUtc;
+
         // ---- DialogueBox 的私有字段（IL 实证存在；读不到就按"判不了"处理，不猜） ----
         private static readonly FieldInfo CharacterIndexField =
             typeof(DialogueBox).GetField("characterIndexInDialogue", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
@@ -88,22 +91,47 @@ namespace AgentFarm.Bridge
             bool isQuestion = box != null && box.isQuestion;
             bool professions = this.ProfessionsPending();
 
+            // 框又出现了（同一请求内）⇒ 下一次"关框"要重新起算宽限窗口。
+            if (box != null) this._closedSinceUtc = null;
+
             if (!this._beforeCaptured)
             {
                 this._beforeCaptured = true;
                 this._before.EventUp = eventUp;
                 this._before.MenuText = SafeMenuText();
                 this._before.IsQuestion = box != null ? (bool?)isQuestion : null;
+                this._before.EventCommand = UiRead.EventCommand();
+                this._before.DialogueLines = UiRead.DialogueLineCount(box);
                 this._seqBefore = this._world != null ? this._world.WorldSeq : (long?)null;
                 this._monitor?.Log($"advance_dialogue：开动（maxSteps={this._maxSteps}，eventUp={eventUp}，isQuestion={isQuestion}）");
             }
 
             // 已经推进过、而且对话框没了 ⇒ 推进任务完成（事件本体是否继续跑由脑侧 event 守卫管）。
+            //
+            // 【dialogue-okfix / P0】这条是**成功**分支，必须回 ok=true。旧实现走的是
+            // `this.Finish(...)` ⇒ `Build(false,…)` ⇒ 回执 ok=false，而 reason 又写着
+            // "已推进 N 步…对话框已关闭"（自相矛盾）。下游 `bridge.py` 见到 ok!=true 立刻抛
+            // BridgeError，payload 里的 `stepped` 被整包丢弃 ⇒ 脑侧只记 stall、两次后
+            // `event_blocked`。**点击其实每次都是有效的**，是回执照谎报。
+            //
+            // 【dialogue-okfix / P1】关框后不立刻收尾：事件脚本常在关框后极短时间内把下一句
+            // （甚至同一句的重放）又弹出来。宽限 ReopenGraceMs（默认 2000ms）内若冒出新的
+            // `DialogueBox`，就在**同一请求**里接着按原逻辑推（仍受 maxSteps 与 timeout 约束）；
+            // 宽限到点仍无框才按成功收尾。这样才不会"每步等脑侧 15s、一个请求只推 1 步"。
             if (this._stepped > 0 && box == null)
             {
+                if (!this._closedSinceUtc.HasValue) this._closedSinceUtc = DateTime.UtcNow;
+                long waitedMs = (long)(DateTime.UtcNow - this._closedSinceUtc.Value).TotalMilliseconds;
+
+                bool canWait = DialogueAdvanceRules.AfterBoxClosed(eventUp, waitedMs)
+                               == DialogueAdvanceRules.ClosedAfterProgress.KeepWaiting
+                               && this.Elapsed() <= this._timeoutMs;
+                if (canWait) return null; // 宽限中：下一 tick 再看有没有新对话框
+
                 this._lastStepStalled = false;
-                return this.Finish(DialogueAdvanceRules.StatusOk,
-                    $"已推进 {this._stepped} 步（{this._attempts} 次点击），对话框已关闭（eventUp={eventUp}）");
+                return this.FinishOk(DialogueAdvanceRules.StatusOk,
+                    $"已推进 {this._stepped} 步（{this._attempts} 次点击），对话框已关闭"
+                    + $"（宽限 {DialogueAdvanceRules.ReopenGraceMs}ms 内没有新的对话，等待 {waitedMs}ms；eventUp={eventUp}）");
             }
 
             string pre = DialogueAdvanceRules.Precheck(box != null, isQuestion, professions, eventUp);
@@ -245,6 +273,9 @@ namespace AgentFarm.Bridge
                 EventUp = Game1.eventUp,
                 MenuText = SafeMenuText(),
                 IsQuestion = box != null ? (bool?)box.isQuestion : null,
+                // 【P2 取证】和 `before` 用同一套读法 ⇒ 可直接做 command/条数的差分。
+                EventCommand = UiRead.EventCommand(),
+                DialogueLines = UiRead.DialogueLineCount(box),
             };
             this._monitor?.Log($"advance_dialogue：{status}（stepped={this._stepped}/{this._maxSteps}，attempts={this._attempts}，lastProgress={this._lastProgress}）");
             return new ExecResponse
