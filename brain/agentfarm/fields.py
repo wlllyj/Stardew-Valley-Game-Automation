@@ -51,6 +51,7 @@ __all__ = [
     "resolve_zone",
     "zone_brief_lines",
     "zone_blockers_total",
+    "zone_unknown_total",
     "zones_from_observe",
 ]
 
@@ -102,6 +103,8 @@ class Zone:
     crops: int                         # 该区里已有作物的格数
     unwatered: int                     # 该区里"有作物且 watered=False"的格数
     distance: int                      # 该区中心到玩家的曼哈顿距离
+    unknown: int = 0                   # 该区里 kind=="unknown" 的格数（Mod 读不到地形特征；
+                                        # 保守口径：未知格≠已清，retention/复核要求它也为 0）
 
 
 # ---------------------------------------------------------------- 观测解读小工具
@@ -338,11 +341,16 @@ def zones_from_observe(obs: dict, *, split: int = 2) -> list[Zone]:
         blockers = 0
         crops = 0
         unwatered = 0
+        unknown = 0
         for xy, tv in tiles.items():
             if not (x0 <= xy[0] <= x1 and y0 <= xy[1] <= y1):
                 continue
             if tv.get("kind") in ZONE_BLOCKER_KINDS:
                 blockers += 1
+            elif tv.get("kind") == "unknown":
+                # 【Z3 修复】kind=="unknown" 的格不在任何桶里，曾被静默忽略 ⇒ 区 blockers 报 0
+                # ⇒ 目标1② 假 PASS。现在单独计入，retention/复核要求它也得为 0（未知格≠已清）。
+                unknown += 1
             if _crop_id(tv) is not None:
                 crops += 1
                 if not tv.get("watered"):
@@ -350,7 +358,7 @@ def zones_from_observe(obs: dict, *, split: int = 2) -> list[Zone]:
         cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
         zones.append(Zone(name=name, label=label, bounds=(x0, y0, x1, y1),
                           tillable=tillable, blockers=blockers, crops=crops,
-                          unwatered=unwatered,
+                          unwatered=unwatered, unknown=unknown,
                           distance=abs(cx - pt[0]) + abs(cy - pt[1])))
     return zones
 
@@ -384,6 +392,29 @@ def zone_blockers_total(zone: Zone, obs: Any) -> int | None:
     for xy, tv in tiles.items():
         if x0 <= xy[0] <= x1 and y0 <= xy[1] <= y1:
             if tv.get("kind") in ZONE_BLOCKER_KINDS:
+                n += 1
+    return n
+
+
+def zone_unknown_total(zone: Zone, obs: Any) -> int | None:
+    """指定田区内 kind=="unknown" 的格数（与 `zone_blockers_total` 同形态）。
+
+    只统计 zone.bounds 内、且在 location.tiles[] 里出现的格；不猜、不造。
+    tilesTruncated 时返回 None：数据不完整，调用方必须标【无法判定】，绝不当 0。
+
+    【Z3 修复】未知格（Mod 读不到地形特征）曾因不在 `ZONE_BLOCKER_KINDS` 桶里被
+    静默忽略 ⇒ 区 blockers 报 0 ⇒ 目标1② 假 PASS。这里把它单独计数，retention/复核
+    要求 `blockers==0 ∧ unknown==0` 才算清空（单 unknown>0 一律保守算未清）。
+    """
+    loc = _loc(obs)
+    if loc.get("tilesTruncated"):
+        return None
+    tiles = _tile_index(loc.get("tiles"))
+    x0, y0, x1, y1 = zone.bounds
+    n = 0
+    for xy, tv in tiles.items():
+        if x0 <= xy[0] <= x1 and y0 <= xy[1] <= y1:
+            if tv.get("kind") == "unknown":
                 n += 1
     return n
 
