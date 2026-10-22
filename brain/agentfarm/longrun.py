@@ -56,6 +56,8 @@ from .farmwork import (CLUMP_KINDS, ENV_BLOCK_STATUSES, FRONTIER_KINDS, NEIGHBOR
                        seed_items, seed_season_state,
                        slot_relief_plan, surplus_sell_plan, tile_ready, till_blocked_by,
                        tool_being_upgraded, tool_suspended_stages, tool_tier, tool_upgrade_days_left)
+from .farmwork import (_bare_item_id, SEED_NAME_HINTS, SLOT_RELIEF_NEVER_SELL_IDS,
+                       season_probe_item)
 from .planner import load_gaps_file, save_gaps_file
 # 【task-230 P0-4.6】上面的缺口清单（gaps）读写与下面的教训库读写**刻意分成不同 import 行**：
 # 缺口是"只提示"的 L0 证据（`docs/_run10-criteria.md` §8.3），**绝不允许自动转成教训注入**
@@ -501,9 +503,26 @@ EVENT_ADVANCE_TIMEOUT_MS = 60000
 #: 边界（task-41 不回归）：
 #:   * 等待期间**绝不** dismiss / sleep / load_save（一次都不动手）；
 #:   * 每轮重新观测：事件自己结束 ⇒ 回日循环继续干活；对话盒出现 ⇒ 交回 task-228 的受控推进；
-#:   * 等满 `EVENT_WAIT_TRIES` 仍挂住 ⇒ 才 `event_blocked`（带上 `eventId`/等了几轮/世界序号）。
+#:   * 等满 `total_limit`(=`EVENT_WAIT_TRIES`+`EVENT_WAIT_EXTRA_TRIES`) 仍 `eventUp` ⇒ 才
+#:     `event_blocked`（带上 `eventId`/等了几轮/世界序号）；**无对话框冻结态不再提前判死**
+#:     （skippable 过场 worldSeq/eventCommand/dialogueLines 全冻是正常态，见
+#:     【devcoder-spring1-event / Fix A】）。
 EVENT_WAIT_TRIES = 4
 EVENT_WAIT_SECONDS = 15.0
+
+#: 【devcoder-spring1-event / Fix A】`eventUp=true` 且**没有对话盒**时的**耐心延长**（真机 A9 spring 1，
+#: `eventId=63` = Kent 归来，纯自动过场）：基础 `EVENT_WAIT_TRIES`×`EVENT_WAIT_SECONDS`≈60s 用尽后
+#: 事件仍在跑 ⇒ 旧行为按"指纹冻结=卡死"直接 `blocked_event` 收工，但 A9 实证**推翻**了该假设——
+#: skippable 过场（command 6=pause/动画/视口自播）三合一指纹 worldSeq+eventCommand+dialogueLines
+#: **全冻是正常态**，结束条件=计时到/动画播完、**不需玩家动作**。所以：
+#:   * 无对话框冻结态**不再提前判死**：给足整段等待窗，跑到 `total_limit`=
+#:     `EVENT_WAIT_TRIES`+`EVENT_WAIT_EXTRA_TRIES` 轮仍 `eventUp` 才诚实 `blocked_event`；
+#:   * `EVENT_WAIT_EXTRA_TRIES` 调到 20 ⇒ 总上限 ≈ 60s + 300s = 360s，覆盖更长过场，
+#:     但仍是**有界**等待（`total_limit` 始终兜底，绝不无限等）；
+#: 边界不变：等待期间**绝不** dismiss / sleep / load_save / 注入按键；对话盒一出现就交回
+#: task-228 的受控推进（非提问才点、提问/职业选择一次都不点）。
+EVENT_WAIT_EXTRA_TRIES = 20
+EVENT_WAIT_IDLE_GIVE_UP = 4
 
 
 def _dist(a: tuple[int, int], b: tuple[int, int]) -> int:
@@ -604,7 +623,8 @@ HONEST_INVENTORY_END_REASONS = ("inventory_blocked",)
 
 def is_justified_end(ended_by: str, ended_reason: str, *,
                      pending_executable: int | None = None,
-                     malformed_tiles: int = 0) -> bool:
+                     malformed_tiles: int = 0,
+                     gated: int = 0) -> bool:
     """这一天是不是以**正当理由**收工（`day_justified` 的判据，task-32 / task-15 / task-22 / task-28）。
 
     口径：
@@ -615,6 +635,11 @@ def is_justified_end(ended_by: str, ended_reason: str, *,
       "看不见"是**观测坏了**，不是"没有活"；若把它当 unobserved，Mod 字段一改名就能让
       全部格变成 unobserved ⇒ executable=0 ⇒ 每个诚实收工日都洗成 VERIFIED。这条放在白名单
       之前：残缺读数和任何收工理由同时出现都**不许**判正当（缺失≠通过）；
+    * 【devcoder-clear-gate】`gated > 0` ⇒ **一律不放行**（fail-closed）：日终快照里还有
+      "其余前置条件本来允许、只因满包清障闸而不执行"的清障格 ⇒ 这一天不是"没活可做"，而是
+      "活被背包闸住"（`clear_gate`）。同样的道理放在白名单之前：**任何**收工理由与 gated>0
+      同时出现都不判正当 —— 这是「`clear_gate` 永不 VERIFIED」的硬闸，绝不许为了绿灯放宽。
+      老账本没有 `gated` 键 ⇒ 调用方传默认 0，行为与改动前逐字一致；
     * 前缀在 `JUSTIFIED_END_REASONS`（夜里到点 / 体力见底 / 确实没活）⇒ 正当（与旧实现逐字一致）；
     * 【task-15】前缀在 `HONEST_EXHAUSTED_END_REASONS`（`resume_exhausted`）**且**
       `pending_executable == 0` ⇒ 正当。"换片/回片区/当前观测都拿不出目标"本来就是诚实收工，
@@ -627,6 +652,9 @@ def is_justified_end(ended_by: str, ended_reason: str, *,
     """
     # 【task-22】残缺 tile 记录 = 观测不可信 ⇒ 无论什么理由都不判"正当"（防洗白）。
     if int(malformed_tiles) > 0:
+        return False
+    # 【devcoder-clear-gate】还有"只因满包清障闸而不执行"的清障格 ⇒ 这一天不是"没活可做"。
+    if int(gated) > 0:
         return False
     if ended_by not in ("sleep", "inventory_blocked"):
         return False
@@ -769,11 +797,24 @@ class DayReport:
     #: 【task-78 NIT-2】判据只讲"四邻没有突破口"，**不再断言**是树/桩/大石（四邻可能是 `weed`
     #: 只是站不上去）；逐格证据看 journal `encircled` 的 `kinds`/`tried_open` 与
     #: `encircled_summary.tried_open_steps`。
-    #: **与 `unreachable*` / `refused*` 都不同**：这些格既不封格、也不进任何豁免分子 ——
+    #: **与 `unreachable*` / `refused*` 都不同**：这些格既不封格、也不进**不可达**的豁免分子 ——
     #: `checks.unreachable_within_bound` 仍然只数"真·不可达"，所以"一圈树围住"不会污染上界；
+    #: 【devcoder-day-end-gates / Fix 1】它们现在有**自己的**一份有界豁免（`encircled_bound`/
+    #: `encircled_exempt`，见下），只扣逐格已证被围死、且仍留在如实 shortfall 阶段 undone 里的格。
     #: 它们的用途是给出**证据**（run6 的 42 格"走不到"里有多少其实是"开不了路"）与下一步归因。
     encircled: int = 0
     encircled_tiles: list[Any] = field(default_factory=list)
+    #: 【devcoder-day-end-gates / Fix 1】"被围住"的**有界豁免**（与 `unreachable*`/`refused*` 同构、
+    #: 但**独立起界**）：`encircled_bound = max(5, floor(0.2 × bound_basis))`，
+    #: `encircled_exempt` = 真正从 `no_unmet_stages` 里扣掉的格数。
+    #: 为什么需要它（A9 winter 27 实证）：那天 clear_area `assigned=16 / 12 做成 / 4 被围住 /
+    #: leftover=0`，这 4 格四邻全被挡死（`_known_enclosed`/`open_way` 已证、逐格 `encircled`
+    #: journal 有 kinds），却因为 `leftover=0` ⇒ `encircled_leftover=0` ⇒ 旧公式一格都扣不掉
+    #: ⇒ 干得没错的一天判红。现在只扣**已证被围死、且仍在某个"如实 shortfall 阶段"的
+    #: `assigned_undone` 里**的格（逐格坐标比对），预过滤的、已经做成的、夜里/体力收工留下的
+    #: 一律不扣；防洗白的 `made_any_progress` 合取项照旧（0 成功日不许被豁免洗白）。
+    encircled_bound: int = 0
+    encircled_exempt: int = 0
     #: 【task-84】当天账本里的"枯死"证据（用户 m11003：死苗还在被浇）：
     #: * `dead_crops` = Mod `farm.deadCrops`（全农场枯死作物格数）= `(格数, 状态 ok|unavailable)`；
     #: * `dry_dead` = Mod `farm.dryDeadCrops`（枯死**且没浇**的格数，0.7.27 新增字段）；
@@ -825,9 +866,13 @@ class DayReport:
     #: * 【task-22】`pending_malformed` = 在 `tiles[]` 里出现、但**缺工作种类字段**的残缺记录
     #:   （只有坐标、没有 `kind`/`crop`）——不并入 unobserved（那是观测坏了，不是没活）；
     #:   >0 ⇒ `day_justified` 必为 false（fail-closed，堵 deputy NIT-1 洗白通道）。
+    #: * 【devcoder-clear-gate】`pending_gated` = **只因「满包清障闸」而不执行**的清障类格
+    #:   （背包 0 空格 + 腾格手段用尽；weed/twig/stone/grass + 树 + 够格 clump 的其余前置
+    #:   条件本来都允许）。它们**不并入 unobserved**（那是"看不见/已陈旧"的谎）；>0 ⇒
+    #:   `day_justified` 必为 false（`clear_gate` 永不 VERIFIED）。老账本没有该键 ⇒ 0。
     #: 不变式：`pending_ledger == pending_guard + pending_blocked`；
-    #: `pending_guard == pending_executable + pending_unobserved + pending_malformed`
-    #: （观测不可用时 executable=guard、malformed=0）。
+    #: `pending_guard == pending_executable + pending_unobserved + pending_malformed + pending_gated`
+    #: （观测不可用时 executable=guard、其余 0）。
     pending_ledger: int = 0
     pending_guard: int = 0
     pending_stalled: int = 0
@@ -835,6 +880,7 @@ class DayReport:
     pending_blocked: int = 0
     pending_unobserved: int = 0
     pending_malformed: int = 0
+    pending_gated: int = 0
     #: 【task-27 / 0.7.46】并列只读坐标（有序、各取前 8 条）：`day_end` 逐格对账用。
     #: 只作证据：不参与任何判据，也不新增 journal 事件名。
     pending_executable_tiles: list[Any] = field(default_factory=list)
@@ -911,6 +957,10 @@ class DayReport:
     #: 只写一句 notes 等于"缺失当通过"（task-219 被 deputy 点名的 P0-4）。analyzer 按这个
     #: 字段判红（`day_end.gaps_problem` 非空 ⇒ problem），缺失（旧账本）≠ 通过。
     gaps_problem: str = ""
+    #: 【devcoder-zone-retention】日终每个田区的 blockers/unknown 快照（只 info，不进 checks）。
+    #: 每项 `{name, label, tillable, crops, blockers, unknown}`；当当天 obs 被截断时
+    #: 额外带 `undecidable=True` 且 blockers/unknown 为 None（fail-closed，绝不当 0）。
+    zone_blockers: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def failed_steps(self) -> int:
@@ -970,6 +1020,10 @@ class DayReport:
             # 【task-68】被围住：只报证据（计数 + 坐标），不进任何豁免分子
             "encircled": self.encircled,
             "encircled_tiles": [list(t) for t in self.encircled_tiles],
+            # 【devcoder-day-end-gates / Fix 1】被围住的**有界豁免**：界与实扣都要落账
+            # （只扣"已证被围死 + 仍在如实 shortfall 阶段 undone 里"的格）
+            "encircled_bound": self.encircled_bound,
+            "encircled_exempt": self.encircled_exempt,
             # 【task-73】stuck 日是否已翻篇（睡过去了）—— 只作证据；验收口径不变
             "stuck_flushed": self.stuck_flushed,
             # 【task-102】"0 农场动作就想睡"被拒绝（本日不推进、不 VERIFIED）—— 只作证据
@@ -1002,6 +1056,9 @@ class DayReport:
             "pending_unobserved": self.pending_unobserved,
             # 【task-22 / 0.7.45】观测 tiles[] 里字段残缺的记录数（>0 ⇒ day_justified 必 false）
             "pending_malformed": self.pending_malformed,
+            # 【devcoder-clear-gate】只因满包清障闸而不执行的清障格数（>0 ⇒ day_justified 必 false；
+            # `clear_gate` 收尾永不 VERIFIED。老账本没有该键 ⇒ 缺省 0 = 旧行为）
+            "pending_gated": self.pending_gated,
             # 【task-27 / 0.7.46】逐格坐标证据（有序、各前 8 条；只读、不改任何判据）
             "pending_executable_tiles": [list(t) for t in self.pending_executable_tiles],
             "pending_stalled_tiles": [list(t) for t in self.pending_stalled_tiles],
@@ -1035,6 +1092,11 @@ class DayReport:
             "stamina_calibration": {k: dict(v) for k, v in self.stamina_calibration.items()},
             # 【task-230 P0-4.5】gaps 的可判红问题串（"" = 无问题；非空 ⇒ analyzer 判 red）。
             "gaps_problem": self.gaps_problem,
+            # 【devcoder-zone-retention】日终把每个田区的 blockers/unknown 快照落账
+            # （`{name,label,tillable,crops,blockers,unknown}`；`undecidable=True` 表示
+            # 当天 obs 被截断、数字不可信）。只作 info，不参与 `checks`、不进 `verified`；
+            # 跨日复核交给 `tools/verify-zone-retention.py` 与 `<journal>-zones.json` sidecar。
+            "zone_blockers": [dict(z) for z in self.zone_blockers],
         }
 
 
@@ -1427,6 +1489,9 @@ class LongRun:
         # 【task-67】最近一次 `buy` 回执带回来的货架清单（`availableItems`）。**跨天保留**：
         # 货架是稳定事实，留着就能直接挑 id 下单，少发注定失败的那一次请求。
         self.shop_offers: list[dict[str, Any]] = []
+        # 【task-241】`shop_offers` 是被哪个季节捕获的（"" = 未知/旧桥）。跨季时若与当前
+        # 季节不符就丢弃，强制重新探一次当季货架，避免"拿上季残留清单买隔季种子"。
+        self.shop_offers_season: str = ""
         # 【task-55】今天是否已经为买种子卖过一次盈余材料（一天只卖一次，防每轮重复出货）。
         # run7 真形态：`seed_gate {seeds:0, money:14}` 出现 5 次、`sell`/`buy` 事件 0 条 ⇒
         # 脑从来没自己挣过钱、也没自己买过种子。这条链的第一步就是"把超 K 的材料换成钱"。
@@ -1509,6 +1574,10 @@ class LongRun:
         #: 还有 leftover、failed=0"，当时 8 种 kind 一条都生成不了 ⇒ run A 攒不到教训。
         self.plot_exhausted_today = 0
         self.midway_leftover_today = 0
+        #: 【devcoder-no-work-sleep】连续"LLM 意图 + 确定性兜底都无可执行目标、且当日 0 农场
+        #: 动作"的轮次计数（每天重置）。达到阈值（3）即证明"确实无活"，直接诚实收工、干净跨日，
+        #: 而不是无限循环等到被外部杀掉、或落到 `slept_without_work` 不跨日。
+        self._no_work_cycle_count = 0
         #: 【task-124】"同一秒连发换片"的窗口计数（`plot_exhausted` 空转的刹车）。
         self._plot_exhausted_last: float | None = None
         self._plot_exhausted_window = 0
@@ -3352,6 +3421,72 @@ class LongRun:
             self._journal("zones_failed", error=f"{type(exc).__name__}: {exc}")
             return []
 
+    def _zone_snapshot(self, obs: dict[str, Any], split: int = 2) -> list[dict[str, Any]]:
+        """对当前 obs 产每个田区的 `{name, label, tillable, crops, blockers, unknown}` 快照。
+
+        数字直接取自 `zones_from_observe` 的 `Zone`（blockers / unknown 同口径）。
+        当 obs 被截断（`location.tilesTruncated=True`）时，所有区标 `undecidable=True`、
+        blockers/unknown 置 None —— 数据不完整，绝不当 0（fail-closed，不强行 PASS）。
+        非农场 / fields 不可用 / 没有可见田区 ⇒ 返回 []（不抛异常拖垮长跑）。
+        """
+        if fields_mod is None or not self._is_farm(obs):
+            return []
+        try:
+            zones = fields_mod.zones_from_observe(obs, split=split)
+        except Exception as exc:  # pragma: no cover - fields 坏掉不该拖垮长跑
+            self._journal("zones_snapshot_failed", error=f"{type(exc).__name__}: {exc}")
+            return []
+        loc = (obs or {}).get("location") if isinstance(obs, dict) else {}
+        truncated = bool(loc.get("tilesTruncated")) if isinstance(loc, dict) else False
+        out: list[dict[str, Any]] = []
+        for z in zones:
+            snap: dict[str, Any] = {
+                "name": str(getattr(z, "name", "")),
+                "label": str(getattr(z, "label", "")),
+                "tillable": int(getattr(z, "tillable", 0)),
+                "crops": int(getattr(z, "crops", 0)),
+            }
+            if truncated:
+                snap["undecidable"] = True
+                snap["blockers"] = None
+                snap["unknown"] = None
+            else:
+                snap["blockers"] = int(getattr(z, "blockers", 0))
+                snap["unknown"] = int(getattr(z, "unknown", 0))
+            out.append(snap)
+        return out
+
+    @staticmethod
+    def _derive_zones_path(journal_path: Path | None) -> Path | None:
+        """从 `--journal` 自动推导跨日 zone 快照 sidecar：`<stem>-zones.json`。
+
+        与 lessons/scope/gaps 同纪律：只靠 journal 路径推导、不加命令行开关；
+        `journal=None`（一次性 `agentfarm plan`）⇒ 不落盘（只在内存里）。
+        """
+        if journal_path is None:
+            return None
+        if not isinstance(journal_path, Path):
+            journal_path = Path(journal_path)
+        suffix = journal_path.suffix or ".jsonl"
+        stem = journal_path.name[: -len(journal_path.suffix)] if journal_path.suffix else journal_path.name
+        return journal_path.with_name(f"{stem}-zones.json")
+
+    def _flush_zone_sidecar(self, rep: "DayReport") -> None:
+        """把当天的 zone 快照以一行 JSON（含 day + zones 数组）append 进 `<journal>-zones.json`。
+
+        跨天累积：每天一条，供 `tools/verify-zone-retention.py` 之外的跨日复核/analyzer 直接读。
+        失败只记一笔 journal，绝不影响当天（不许崩、不许少一天）。
+        """
+        path = self._derive_zones_path(self.journal_path)
+        if path is None:
+            return
+        record = {"day": list(rep.day_key), "zones": [dict(z) for z in rep.zone_blockers]}
+        try:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as exc:  # pragma: no cover - 磁盘/权限问题只留痕
+            self._journal("zone_sidecar_write_failed", path=str(path), error=str(exc))
+
     def _ordered_zones(self, zones: list[Any]) -> list[Any]:
         """田区尝试顺序：LLM 指定的 → 代码偏好（可锄最多/最近）→ 其余按名字。
 
@@ -3866,6 +4001,15 @@ class LongRun:
         money = FarmWorker.money(obs)
         can = seeds > 0 or (self.allow_buy and money >= self._seed_price_now()
                             and not self.seed_dead_today)
+        # 【A9 gatefix2 实证】冬季 `plantable==0` 且走"3 轮校验取消"路径时 `_preconditions_apply`
+        # 不一定跑过 ⇒ `seed_dead_today` 可能没置 ⇒ `can` 退化成"钱够就能买"的 True ⇒
+        # `_pending_snapshot` 把冬季不可播种的 242/245 格 tillable 当"可执行活" ⇒ `no_work` 日
+        # 永远 `zero_action_evidenced=False`。这里直接按季节收口：冬季没有可当季买到的种子，
+        # 就算有钱也不能把 tillable 算成可执行活（与 task-241 的 `winter_no_seeds` 同义，
+        # 只是不再依赖"当天是否跑过买种闸门"）。有当季可种种子时不受影响。
+        if can and state["metadata"] and int(state["plantable"]) <= 0 \
+                and str(state.get("season") or "").lower() == "winter":
+            can = False
         return seeds, money, can
 
     def _seed_price_shelf(self) -> int:
@@ -3898,6 +4042,11 @@ class LongRun:
         # 注意只收窄"熟作物"这一路：没浇的作物（浇水不占格）与枯死作物（清死苗）照旧算活。
         free_slots, bag_need, bag_status = self._bag_state(obs)
         bag_blocked = self.inventory_blocked_today or (bag_status == "ok" and bag_need > 0)
+        # 【devcoder-clear-gate E】满包清障闸与 `_stage_tiles("clear_area")` **同口径**：
+        # 闸住时清障类格今天不再执行 ⇒ 这片地也**不算**"还有地要清"。否则守卫一直喊、
+        # `_ensure_plot` 永不为 None ⇒ `decision.intents` 每轮非空 ⇒ 3 轮 idle ⇒ `stuck:`
+        # （A9 winter27/28 的形态）。收尾交给 `_end_clear_gate`（`clear_gate`，永不 VERIFIED）。
+        clear_gate = bool(self._clear_bag_gate_reason(obs))
         for t in tiles:
             if t in self.blocked or t in shed or t in self.encircled_day:
                 # 今天已经证明"动了没用" / 今天已主动认输 / 【task-5】被围住的格今天也不再算"活"。
@@ -3932,15 +4081,21 @@ class LongRun:
                 continue
             kind = str(tv.get("kind") or "")
             if kind in ACTIONABLE_KINDS and "clear_area" not in deferred:
+                if clear_gate:
+                    continue      # 【devcoder-clear-gate E】满包闸住 ⇒ 今天不清、不算活
                 return True
             # 【task-218】树也算"这片地有活"（LLM 一直这么理解，旧实现却在 `clear()` 里静默跳过）；
             # 但受日级砍树预算约束 —— 预算挡下时不算活，否则守卫会被"砍不完的树"钉死一整天。
             if (kind == TREE_KIND and "clear_area" not in deferred
                     and not _tool_blocked_tv(tv) and self._tree_budget_left(obs)):
+                if clear_gate:
+                    continue      # 【devcoder-clear-gate E】同上
                 return True
             # 够格的 clump 一族（toolOk == true）同样算活；toolOk false/null ⇒ 能力缺口、不算活。
             if (kind in CLUMP_KINDS and "clear_area" not in deferred
                     and not _tool_blocked_tv(tv)):
+                if clear_gate:
+                    continue      # 【devcoder-clear-gate E】同上
                 return True
             if (t in tillable and can_plant and not _till_blocked_by(tv)
                     and "till_area" not in deferred):
@@ -4287,6 +4442,8 @@ class LongRun:
             pending_stalled=snap["stalled"],
             # 【task-22 / 0.7.45】残缺 tile 数（>0 ⇒ 当天 day_justified 必 false）
             pending_malformed=snap.get("malformed", 0),
+            # 【devcoder-clear-gate】只因满包清障闸而不执行的清障格数（>0 ⇒ day_justified 必 false）
+            pending_gated=int(snap.get("gated") or 0),
             # 【task-27 / 0.7.46】逐格坐标证据（有序、各前 8 条；只读、不改判据、不新增事件名）
             pending_executable_tiles=list(snap.get("executable_tiles") or [])[:8],
             pending_stalled_tiles=list(snap.get("stalled_tiles") or [])[:8],
@@ -4992,7 +5149,26 @@ class LongRun:
                        or str((tmap.get(t) or {}).get("kind") or "") in CLUMP_KINDS)
                    and not _tool_blocked_tv(tmap.get(t))]
             if tree_ok:
-                out += [t for t, v in tmap.items() if str(v.get("kind") or "") == TREE_KIND]
+                # 【devcoder-clear-gate C】树**只按当天预算额度**计入 leftover（与
+                # `_stage_tiles` 完全同序：先本片地内/边界一圈，再按到片地锚点的距离）。
+                # 旧实现把**整个观测窗口**里的树全塞进来：窗口 278 棵树 vs 片地 25 格
+                # ⇒ `leftover` 被窗外树灌爆（真机 A9 实测 leftover 278 / 片地 25），
+                # `leftover ⊋ assigned` 造出"0 目标、海量剩余"的假剩余。
+                # 不变式保持 `leftover ⊇ assigned`：`assigned` 本就被 `_tree_budget_room` 限住。
+                room = self._tree_budget_room(obs)
+                anchor = tuple(plot.get("anchor") or (local[0] if local else (0, 0)))
+                if local:
+                    xs = [t[0] for t in local]
+                    ys = [t[1] for t in local]
+                    zone = {(x, y) for x in range(min(xs) - 1, max(xs) + 2)
+                            for y in range(min(ys) - 1, max(ys) + 2)}
+                else:
+                    zone = set()
+                tree_cands = [(t, v) for t, v in tmap.items()
+                              if str(v.get("kind") or "") == TREE_KIND and not _tool_blocked_tv(v)]
+                tree_cands.sort(key=lambda item: (0 if item[0] in zone else 1,
+                                                  _dist(item[0], anchor), item[0][1], item[0][0]))
+                out += [t for t, _v in tree_cands[:max(0, int(room))]]
             return sorted(set(out))
         if task == "till_area":
             # task-15 §②（修法 A）：**种子闸门必须与 `_stage_tiles` 同口径**。
@@ -5177,9 +5353,19 @@ class LongRun:
         # 【task-198 ②】背包满/将满时"跨片地遗留"也**不许**当"还能干活"的理由：那些格子要收/要装，
         # 而背包堵住 ⇒ 唯一的可执行动作是腾格（见下面的 bag_blocked 分支）。`_leftover` 照旧
         # 如实保留这些格（`no_unmet_stages` 不受影响）—— 语义是"不是没活，是背包堵住"。
+        # 【devcoder-clear-gate E】同理，被满包清障闸**单独**闸住的清障格今天不算"还有活"：
+        # 执行层整池清零（`_stage_tiles` 返回 []），守卫再喊"还有 N 格没做完"只会把主循环钉死
+        # （A9 冬 27/28：快照 exec=206/195、守卫喊有活、`_ensure_plot` 永不为 None ⇒ 3 轮 idle
+        # ⇒ `stuck:`）。注意：**只**从这条"跨片地遗留"理由里扣掉它们，`_leftover` 的会计公式
+        # 一个字没动（该做没做照旧如实、当天照旧不 VERIFIED）；收尾口是 `_end_clear_gate`。
         if pending and not bag_blocked:
-            reasons.append(f"今天早些时候还有 {len(pending)} 格没做完（跨片地，最近的是 "
-                           f"{list(min(pending, key=lambda t: _dist(t, FarmWorker.player_tile(obs))))}）")
+            _gated_set = self._gated_tile_set(obs)
+            if _gated_set:
+                pending = [t for t in pending if t not in _gated_set]
+            if pending:
+                reasons.append(
+                    f"今天早些时候还有 {len(pending)} 格没做完（跨片地，最近的是 "
+                    f"{list(min(pending, key=lambda t: _dist(t, FarmWorker.player_tile(obs))))}）")
         for cand in self._plot_candidates(obs):
             if self._plot_has_work(obs, cand["tiles"]):
                 reasons.append(f"{cand.get('zone') or '附近'}还有地要清/开/种")
@@ -5237,6 +5423,23 @@ class LongRun:
         这一层，不等于把 encircled 封格**：`blocked` 本身一个字没动，`_leftover` 也照旧如实计。
         """
         return set(self.blocked) | set(self.encircled_day)
+
+    def _gated_tile_set(self, obs: dict[str, Any]) -> set[tuple[int, int]]:
+        """【devcoder-clear-gate E】今天**只因满包清障闸**而不执行的清障格坐标集合。
+
+        判据与 `_stage_tiles` / `_pending_snapshot` 同源（闸未生效 ⇒ 空集；闸生效时取快照的
+        `gated_tiles`，即"其余前置条件本来允许、只因背包闸而不做"的那批格）。用途只有一处：
+        `work_reasons` 报"跨片地还有 N 格没做完"时把她们扣掉 —— 否则守卫会一直喊"还有地要清"，
+        而执行层整池清零 ⇒ 主循环空转到 `stuck:`（A9 冬 27/28）。
+
+        **不改会计**：`_leftover` / `plot_pending` / `assigned_undone` 一个字没动（该做没做
+        照旧如实、当天照旧不 VERIFIED）；证据不可用 ⇒ 返回空集（fail-open：不扣，守卫照旧
+        喊活，不会洗白）。
+        """
+        if not self._clear_bag_gate_reason(obs):
+            return set()
+        snap = self._pending_snapshot(obs)
+        return {(int(t[0]), int(t[1])) for t in (snap.get("gated_tiles") or [])}
 
     def _ledger_pending(self) -> list[tuple[int, int]]:
         """【task-15 / 0.7.45】**原始账本口径**的待做余格（守卫口径的母集）。
@@ -5317,7 +5520,14 @@ class LongRun:
           **绝不许算 unobserved**：那是"观测坏了"而不是"没有活"。它单独计数，
           调用方用 `is_justified_end(..., malformed_tiles=...)` 强制 `day_justified=false`
           （fail-closed，堵 deputy NIT-1 的洗白通道）；
-        * `ledger == guard + blocked`、`guard == executable + unobserved + malformed`。
+        * 【devcoder-clear-gate】**`gated`** = **唯一**被「满包清障闸」（`_clear_bag_gate_reason`
+          ⇒ 背包 0 空格 + 腾格手段用尽）挡住、其余前置条件（预算/工具）本来都允许的清障类格
+          （`CLEARABLE_KINDS`：weed/twig/stone/grass + 树 + 够格 clump）。它们**不并入
+          `unobserved`**：那等于把"今天被闸住"说成"看不见/已陈旧"（是谎，会让账本对不上
+          `_stage_tiles` 整池清零的事实）。单独成桶 ⇒ 调用方用
+          `is_justified_end(..., gated=...)` 强制 `day_justified=false`（fail-closed：
+          `clear_gate` 收尾永不 VERIFIED）；
+        * `ledger == guard + blocked`、`guard == executable + unobserved + malformed + gated`。
 
         观测不可用（`obs is None` / 不是农场观测）⇒ **全部按可执行计**（fail-closed：不许把
         "没看到"当"没有"，`day_justified` 因此不放行）。
@@ -5325,6 +5535,7 @@ class LongRun:
         分类顺序：已判死（`blocked`/`encircled_day`/`resume_stall_tiles`）→ 不在 `tiles[]`
         ⇒ unobserved（这正是 0.7.44 冒烟 263/217 被判成"还有活"的病灶）→ 【task-22】在
         `tiles[]` 但缺工作种类字段 ⇒ malformed → 看得见但今天已不需要做 ⇒ unobserved →
+        【devcoder-clear-gate】本来允许、只因满包清障闸而不允许的清障格 ⇒ gated →
         要做但不允许/站不到 ⇒ unobserved（"今天没证据能执行"）→ 其余 executable。
         """
         defer = self._budget_deferred_tile_set()
@@ -5347,7 +5558,9 @@ class LongRun:
         if farm is None:
             # 观测证据不可用 ⇒ 不许声称"没有可执行的活"（executable 取全量 ⇒ day_justified 不放行）
             return {**base, "executable": len(guard_tiles), "unobserved": 0, "malformed": 0,
+                    "gated": 0,
                     "executable_tiles": [list(t) for t in sorted(guard_tiles)],
+                    "gated_tiles": [],
                     "malformed_tiles": []}
         tmap = FarmWorker.tiles_of(farm)
         tillable = FarmWorker.tillable_of(farm)
@@ -5358,9 +5571,14 @@ class LongRun:
                    and self._tree_budget_room(farm) > 0)
         free_slots, bag_need, bag_status = self._bag_state(farm)
         bag_blocked = self.inventory_blocked_today or (bag_status == "ok" and bag_need > 0)
-        executable = unobserved = malformed = 0
+        # 【devcoder-clear-gate】满包清障闸：与执行层（`_stage_tiles("clear_area")` 整池清零）
+        # **同一判据**。它只解释"清障类格为什么今天不执行"，不并入 unobserved（那是"看不见/
+        # 已陈旧"的谎），单列 `gated` 桶并由 `is_justified_end(gated=…)` fail-closed。
+        gate = self._clear_bag_gate_reason(farm)
+        executable = unobserved = malformed = gated = 0
         exec_tiles: list[tuple[int, int]] = []
         malformed_tiles: list[tuple[int, int]] = []
+        gated_tiles: list[tuple[int, int]] = []
         for t in guard_tiles:
             tv = tmap.get(t)
             if tv is None:
@@ -5402,14 +5620,23 @@ class LongRun:
             if not need:
                 unobserved += 1          # 已做/账本陈旧：今天不需要做，不算活
                 continue
+            # 【devcoder-clear-gate】"其余前置条件本来就允许、只因满包清障闸而不允许"的清障格
+            # ⇒ 单列 gated（不并入 unobserved）。工具不够格/预算挡下的树**不算** gated：
+            # 那是能力/预算缺口，与背包无关（`allowed` 在加闸之前就已为 False）。
+            if (gate and allowed and not tv.get("crop")
+                    and kind in CLEARABLE_KINDS):
+                gated += 1
+                gated_tiles.append(tuple(t))
+                continue
             if not allowed or not self._standable_next_to(farm, t):
                 unobserved += 1          # 预算延后/工具不够/背包堵/四邻没得站 ⇒ 今天不可执行
                 continue
             executable += 1
             exec_tiles.append(tuple(t))
         return {**base, "executable": executable,
-                "unobserved": unobserved, "malformed": malformed,
+                "unobserved": unobserved, "malformed": malformed, "gated": gated,
                 "executable_tiles": [list(t) for t in sorted(exec_tiles)],
+                "gated_tiles": [list(t) for t in sorted(gated_tiles)],
                 "malformed_tiles": [list(t) for t in sorted(malformed_tiles)]}
 
     # ------------------------------------------------ task-124：review 独苗的对账路径
@@ -5899,6 +6126,14 @@ class LongRun:
             # 铁匠铺动作不进 `work_reasons`（它不是农活），所以必须在这里单独放行。
             if self._tool_upgrade_due(obs):
                 return False, "keep_working", "今天还有一件工具升级/取回要做（铁匠铺），先做完再收工"
+            # 【devcoder-clear-gate D】背包 0 空格 + 腾格手段用尽 + 剩余活**全是**被闸住的清障格
+            # ⇒ 这**不是**"没活可做"：绝不能置 `no_work_evidence_ok`、更不能用 `no_work` 收尾
+            # （`no_work` 在 JUSTIFIED 白名单里，会白拿一个 VERIFIED —— A9 冬 27/28 的洗白口）。
+            # 交 `_end_clear_gate` 点名收口（`clear_gate`，`day_justified` 恒 False）。
+            if self._clear_gate_only_work(obs):
+                return True, "clear_gate", (
+                    "背包 0 空格且腾格手段用尽，剩余活全是清障类（清障掉落必丢）⇒ 今天不再新开 "
+                    "clear_area；这不是「没活可做」，当天按 clear_gate 如实收尾（不 VERIFIED）")
             self.no_work_evidence_ok = True
             # 【task-240】"没活"要说清是不是"有地、但手上的种子都隔季"：0.7.41 冒烟 day1
             # 是冬天 + Wheat Seeds×10，旧口径宣称"手上有种子 ⇒ 该去种"，下地却 `no_seed`
@@ -6432,6 +6667,77 @@ class LongRun:
             return ""
         return "背包 0 空格且腾格手段用尽"
 
+    def _clear_gate_only_work(self, obs: dict[str, Any]) -> bool:
+        """【devcoder-clear-gate D】今天的剩余活是不是**只有**被满包清障闸挡住的那批清障格。
+
+        收尾口 `_end_clear_gate` 只能在这种情况下用：否则就是拿"背包闸"当借口提前结束一天
+        （还有浇水/收获/播种的活就收工 = 白丢一天）。判据（全部要成立）：
+
+        ① 闸生效（`_clear_bag_gate_reason` 非空：背包 0 空格 + 腾格手段用尽）；
+        ② **当前观测窗口里**确实还有"能做、只因闸而不做"的清障格（`CLEARABLE_KINDS` 且
+           工具够格；树另受当天砍树预算约束）。这里**刻意直接扫 `tiles[]`** 而不是只信
+           `leftover_targets`：账本只记"今天真的开过阶段"的格，满包日 `_stage_tiles("clear_area")`
+           整池清零 ⇒ 账本可能是空的（日初就满包的情形），而活明明摆在地里；
+        ③ 观测窗口里没有任何**其它**"该做的活"：活苗没浇 / 熟作物（未认输）/ 枯死作物 /
+           可锄可种（`can_plant` 且没被预算延后）—— 只要有一格，就不是"只剩清障"；
+        ④ 账本口径 `_pending_work()` 里**看得见**的格也全是清障类（看不见的格不参与，由下面
+           ⑤ 的 `executable==0` fail-closed 兜底）；
+        ⑤ 日终快照 `executable == 0` 且 `malformed == 0`（当前观测里没有可执行格、观测也没坏）。
+
+        返回 True 时调用方必须走 `_end_clear_gate`（`ended_by=clear_gate`，
+        `day_justified=False`、永不 VERIFIED）；**绝不许**把它当成 `no_work`。
+        """
+        if not self._clear_bag_gate_reason(obs):
+            return False
+        tmap = FarmWorker.tiles_of(obs)
+        tillable = FarmWorker.tillable_of(obs)
+        _seeds, _money, can_plant = self._seed_outlook(obs)
+        deferred = self._budget_deferred_tasks()
+        shed = self._shed_tile_set()
+        tree_room = self._tree_budget_room(obs)
+        clear_visible = 0
+        for t, tv in tmap.items():
+            if t in self.blocked or t in shed or t in self.encircled_day \
+                    or t in self.resume_stall_tiles:
+                continue                      # 今天已判死/认输/停滞 ⇒ 本来就不算活
+            if tv.get("crop"):
+                # 作物活（浇水 / 收获 / 清死苗）依旧是"真活"：不许拿背包闸收工。
+                if tv.get("dead"):
+                    return False
+                if not tv.get("watered"):
+                    return False
+                if tile_ready(tv) and t not in self.harvest_gave_up:
+                    return False
+                continue
+            kind = str(tv.get("kind") or "")
+            if kind in CLEARABLE_KINDS and not _tool_blocked_tv(tv):
+                if kind == TREE_KIND and tree_room <= 0:
+                    continue                  # 砍树预算挡下 = 今天不做（不是被闸住）
+                clear_visible += 1
+                continue
+            if (t in tillable and can_plant and "till_area" not in deferred) \
+                    or (kind == "dirt" and can_plant and "plant_area" not in deferred):
+                return False                  # 还有地可开/可种 ⇒ 守卫该继续喊活，不许收工
+        snap = self._pending_snapshot(obs)
+        if clear_visible <= 0:
+            # 窗口里此刻看不见清障格（人在室内/换过片地）时，退回账本口径：只要快照说
+            # 还有"只因闸而不执行"的清障格，仍是同一个结论（活被背包闸住）。
+            if int(snap.get("gated") or 0) <= 0:
+                return False
+        for t in self._pending_work():
+            tv = tmap.get(t)
+            if tv is None:
+                continue                      # 不在窗口里 ⇒ 无法分类（由 ⑤ fail-closed 兜底）
+            if tv.get("crop"):
+                return False                  # 还有作物活（浇/收/清死苗）
+            if str(tv.get("kind") or "") not in CLEARABLE_KINDS:
+                return False                  # 耕地/空地/其它 ⇒ 不是"只剩清障"
+        if int(snap.get("executable") or 0) > 0:
+            return False
+        if int(snap.get("malformed") or 0) > 0:
+            return False
+        return True
+
     def _note_clear_area_bag_gate(self, task: str, why: str) -> None:
         """【task-28 卡 D C】满包清障闸留痕（复用既有 `slot_relief` 事件名 + 新字段，不新增事件）。
 
@@ -6442,9 +6748,15 @@ class LongRun:
         if self.clear_area_bag_gate_noted:
             return
         self.clear_area_bag_gate_noted = True
+        # 【task-237 / 0.7.48 字段奇偶补齐】`slot_relief` 的 task-237 字段集是
+        # demand/demand_basis/target_free/**reached** —— 本闸此前漏写 `reached`（纯只读字段
+        # 缺口，非行为变更；验收探针 scratch/smoke-0742.py:680 按该字段集校验）。
+        # 语义：clear_gate **不是**"腾到了目标水位"，而是"今天不再新开 clear_area"的闸
+        # ⇒ `reached` 如实填 False，绝不谎报水位达标（与压力通道一致）。
         self._journal("slot_relief", pressure=True, need=0, demand=0,
                       demand_basis="space_pressure", trigger="clear_gate",
-                      target_free=SLOT_RELIEF_TARGET_FREE, freed=0, stage=task,
+                      target_free=SLOT_RELIEF_TARGET_FREE, reached=False, freed=0,
+                      stage=task,
                       reason=why, loot_lost_steps=int(self.loot_lost_steps_today),
                       loot_lost_limit=int(CLEAR_LOOT_LOSS_MAX_STEPS),
                       note=("满包清障闸：不新开 clear_area（落地即丢；开路必要前置仍允许）"
@@ -6504,6 +6816,49 @@ class LongRun:
         self.inventory_blocked_noted = True
         rep.notes.append(f"背包满且腾不出格子（四门槛全过）：{reason}")
         self._say(f"  × 背包满且腾不出格子（四门槛全过）：{reason}")
+
+    def _ship_one_stack_for_space(self, obs, rep):
+        assert self.worker is not None
+        player = FarmWorker.player_of(obs)
+        # 建材/矿石/锭/煤/土/木/石/纤维/硬木/放射性矿永不送（升级与建造要用）；只送"盈余/战利品"腾格。
+        # 消费 farmwork 的**权威永不卖集合**（`SLOT_RELIEF_NEVER_SELL_IDS`）—— 不再手维护本地
+        # 副本（590f154 违纪：本地 `_PROTECTED` 漏了 Fiber 771 / Radioactive 909 等建材，会让
+        # last-resort 把建材送出，违反 AGENTS.md §5）。`slot_relief_plan` 也消费同一集合，两份清单不再漂移。
+        cands = []
+        for it in (player.get("inventory") or []):
+            if not isinstance(it, dict) or it.get("isTool"):
+                continue
+            qid = str(it.get("qualifiedId") or it.get("id") or "").strip()
+            if not qid:
+                continue
+            bare = _bare_item_id(qid)
+            if bare in SLOT_RELIEF_NEVER_SELL_IDS:
+                continue
+            name = str(it.get("name") or "")
+            if any(hint in name.lower() for hint in SEED_NAME_HINTS):
+                continue
+            try:
+                stack, slot = int(it.get("stack") or 0), int(it.get("slot"))
+            except (TypeError, ValueError):
+                continue
+            if stack <= 0:
+                continue
+            cands.append((stack, slot, qid))
+        if not cands:
+            return False
+        cands.sort(key=lambda c: (c[0], c[1]))
+        stack, slot, qid = cands[0]
+        st = self.worker.sell(slot, whitelist=[qid], timeout_ms=self.sell_timeout_ms)
+        self._actions += 1
+        self._journal("sell", ok=st.ok, code=st.code, strategy="space_relief_ship",
+                      why="space_pressure_last_resort", slot=slot, qid=qid,
+                      stack=stack, before=st.before, after=st.after, reason=st.reason, receipt=st.receipt)
+        if st.ok:
+            rep.notes.append("space relief shipped %s x %d" % (qid, stack))
+            self._say("  space relief shipped %s x %d" % (qid, stack))
+            self.slot_relief_stacks_today += 1
+            return True
+        return False
 
     def _slot_relief(self, obs: dict[str, Any], rep: DayReport) -> bool:
         """【task-198】"腾格收敛回路"：背包低于**需求水位**时先把格子腾出来，再回去干活。
@@ -6575,6 +6930,11 @@ class LongRun:
                 # 压力通道腾不出来**不是失败**：清障/浇水照常干（掉落会丢 → 逐格 loot_lost 留痕）。
                 self._note_slot_pressure_stuck(
                     obs, rep, free_slots=int(free_slots), reason=reason)
+            # last-resort space relief: ship one non-protected stack
+            if int(free_slots) <= 0:
+                _shipped = self._ship_one_stack_for_space(obs, rep)
+                if _shipped:
+                    return True
             return False
         if self.slot_relief_today >= SLOT_RELIEF_MAX:
             reason = (f"腾格回路已用满 {SLOT_RELIEF_MAX} 轮（目标 {target_free} 格、"
@@ -6760,6 +7120,51 @@ class LongRun:
             rep.ended_by, rep.ended_reason = "inventory_blocked", f"inventory_blocked:{why}"
         return rep.ended_by
 
+    def _end_clear_gate(self, obs: dict[str, Any], rep: DayReport) -> tuple[str, str]:
+        """【devcoder-clear-gate D】满包清障闸收工口：`ended_by="clear_gate"` + 诚实的 `ended_reason`。
+
+        为什么需要（A9 第 5 跑 `logs/longrun-runA9-0750.jsonl`，winter27/28）：执行层
+        `_stage_tiles("clear_area")` 因满包闸**整池清零**（`return []`），而守卫/选区/日终快照
+        都不知道这道闸 ⇒ 快照 `pending_executable=206/195`、守卫一直喊"还有地要清"、
+        `_ensure_plot` 永不为 None ⇒ `decision.intents` 每轮非空 ⇒ 主循环既收不了工也换不了片
+        ⇒ `idle` 3 轮 ⇒ `stuck:`（整天报废）。本方法给这条真实状态一个**点名**的收尾口。
+
+        语义边界：
+        * 只允许在 `_clear_gate_only_work(obs)` 为真时调用（背包 0 空格 + 腾格用尽 + 剩余活
+          **全是**被闸住的清障格）；
+        * `require_work=False`：理由同 `_stuck_flush`（0 动作日传 True 会被
+          `slept_without_work` 挡成"本日不推进"，整轮自停）；
+        * `clear_gate` **不在** `JUSTIFIED_END_REASONS` / `HONEST_*` 里，且
+          `is_justified_end(gated=…)` 见 `gated>0` 直接 False ⇒ `day_justified=False`、
+          **永不 VERIFIED**（这是"活被背包闸住"，不是"没活可做"）；
+        * 不新增 journal 事件名：证据走既有 `slot_relief{trigger=clear_gate}` 与
+          `day_end.pending_gated` / `bag_evidence`。
+        """
+        free_slots, _need, _status = self._bag_state(obs)
+        snap = self._pending_snapshot(obs)
+        # "剩余 N 格"= 当前观测窗口里"能做、只因闸而不做"的清障格数（拿不到就退回账本口径的
+        # gated 数）—— 两种口径都只描述同一件事：这些格全是清障类。
+        tmap = FarmWorker.tiles_of(obs)
+        visible_clear = sum(
+            1 for t, tv in tmap.items()
+            if not tv.get("crop") and str(tv.get("kind") or "") in CLEARABLE_KINDS
+            and not _tool_blocked_tv(tv) and t not in self.blocked
+            and t not in self.resume_stall_tiles and t not in self.encircled_day)
+        remaining = visible_clear or int(snap.get("gated") or 0)
+        reason = (f"clear_gate:背包0空格且腾格手段用尽（free_slots={free_slots} / "
+                  f"relief_exhausted / 剩余 {remaining} 格全是清障类）")
+        # 抬走"今天不再新开 clear_area"的证据（既有事件名 + 既有字段集，幂等：一天只记一条）。
+        self._note_clear_area_bag_gate("clear_area", self._clear_bag_gate_reason(obs))
+        ended_by, ended_reason = self._do_sleep(obs, rep, reason, require_work=False)
+        if ended_by == "sleep_failed":
+            rep.ended_by, rep.ended_reason = ended_by, ended_reason
+        else:
+            rep.ended_by, rep.ended_reason = "clear_gate", reason
+        rep.notes.append(
+            f"满包清障闸收口：{reason} ⇒ 今天不再新开 clear_area（开路必要前置仍允许）；"
+            "这不是「没活可做」，也不是 stuck —— 当天 day_justified=False、不 VERIFIED")
+        return rep.ended_by, rep.ended_reason
+
     # ------------------------------------------------------------------ task-25 rev4
     #: Pierre 背包升级（12→24 / 2000g）的**对话购买**。判据只看观测差分：
     #:   * 成功 ⇔ `money_after == money_before - 2000` 且 `inventoryCount 12→24`；
@@ -6804,24 +7209,29 @@ class LongRun:
             return False, "money_unknown"
         if money < BACKPACK_UPGRADE_PRICE:
             return False, "cannot_afford"
-        if getattr(self.client, "talk", None) is None:
-            return False, "talk_unavailable"
+        # 【devcoder-backpack-interact】背包升级是柜台展示物（GameLocation.checkAction），
+        # 触发原语是 `interact`（不是 `talk`/`NPC.checkAction`）。桥没有 interact 原语时安全降级。
+        if getattr(self.client, "interact", None) is None:
+            return False, "interact_unavailable"
         return True, ""
 
     def _backpack_skip(self, rep: DayReport, why: str, obs: Mapping[str, Any]) -> None:
         rep.backpack_upgrade_skip = str(why)
         # 只在"值得知道"的跳过原因上留一条（每天最多一条）：钱不够 / 桥没有 talk 原语 /
         # task-35 默认关闭。**默认关闭只留痕、绝不发请求**；也不往 rep.notes 里加噪音。
-        if (why in ("cannot_afford", "talk_unavailable", "disabled")
+        if (why in ("cannot_afford", "interact_unavailable", "attempt_limit", "disabled")
                 and not self.backpack_skip_noted):
             self.backpack_skip_noted = True
             if why == "cannot_afford":
                 reason = "钱不够升级（需要 2000g）"
-            elif why == "talk_unavailable":
-                reason = "桥没有 talk 原语（Mod < 0.7.46）⇒ 不试对话购买"
+            elif why == "interact_unavailable":
+                reason = "桥没有 interact 原语（Mod 太旧）⇒ 不试柜台背包展示物交互"
+            elif why == "attempt_limit":
+                reason = ("今天背包升级交互次数已用满"
+                          f"（≤{BACKPACK_UPGRADE_MAX_ATTEMPTS} 次）⇒ 不再发请求")
             else:
                 reason = ("背包升级对话购买默认关闭（task-34 探针：进 SeedShop 触发过场事件 "
-                          "3102768、背包升级入口未取得）⇒ 今天不发 goto/talk；"
+                          "3102768、背包升级入口未取得）⇒ 今天不发 goto/interact；"
                           "要启用加 --enable-backpack-upgrade 或 AGENTFARM_ENABLE_BACKPACK_UPGRADE=1")
             self._journal(
                 "buy", source="backpack_dialogue", item="Backpack",
@@ -6833,15 +7243,21 @@ class LongRun:
                 attempts=self.backpack_attempts_today,
                 limit=BACKPACK_UPGRADE_MAX_ATTEMPTS,
             )
-            if why != "disabled":
-                rep.notes.append(
-                    "背包升级今天不试：" + ("钱不够 2000g" if why == "cannot_afford"
-                                            else "桥没有 talk 原语（安全降级，不影响农务/判据）"))
+        if why != "disabled":
+            if why == "cannot_afford":
+                note = "钱不够 2000g"
+            elif why == "interact_unavailable":
+                note = "桥没有 interact 原语（安全降级，不影响农务/判据）"
+            elif why == "attempt_limit":
+                note = f"今天交互次数已用满（≤{BACKPACK_UPGRADE_MAX_ATTEMPTS} 次）"
+            else:
+                note = "安全降级，不影响农务/判据"
+            rep.notes.append("背包升级今天不试：" + note)
 
     def _backpack_journal(self, rep: DayReport, *, ok: bool, code: str, status: str,
                           reason: str, money_before: int | None, money_after: int | None,
                           cap_before: int | None, cap_after: int | None,
-                          answer_text: str = "", talk: Mapping[str, Any] | None = None,
+                          answer_text: str = "", act: Mapping[str, Any] | None = None,
                           elapsed_ms: float = 0.0,
                           extra: Mapping[str, Any] | None = None) -> None:
         """失败/成功都复用既有 `buy` 事件名（不新增 journal 事件；analyzer 桶不漂移）。"""
@@ -6856,11 +7272,11 @@ class LongRun:
             limit=int(BACKPACK_UPGRADE_MAX_ATTEMPTS),
             elapsed_ms=int(round(float(elapsed_ms))),
         )
-        if isinstance(talk, Mapping):
-            for key in ("applied", "npcTile", "distance", "activeMenu",
+        if isinstance(act, Mapping):
+            for key in ("applied", "activeMenu",
                         "dialogueIsQuestion", "dialogueResponses"):
-                if key in talk:
-                    fields[key] = talk[key]
+                if key in act:
+                    fields[key] = act[key]
         if extra:
             fields.update(dict(extra))
         self._journal("buy", **fields)
@@ -6868,7 +7284,7 @@ class LongRun:
     def _backpack_fail(self, rep: DayReport, *, code: str, reason: str,
                        money_before: int | None, money_after: int | None,
                        cap_before: int | None, cap_after: int | None,
-                       answer_text: str = "", talk: Mapping[str, Any] | None = None,
+                       answer_text: str = "", act: Mapping[str, Any] | None = None,
                        elapsed_ms: float = 0.0,
                        extra: Mapping[str, Any] | None = None) -> None:
         code = str(code or "failed")
@@ -6881,42 +7297,67 @@ class LongRun:
             rep, ok=False, code=code, status="failed", reason=reason,
             money_before=money_before, money_after=money_after,
             cap_before=cap_before, cap_after=cap_after,
-            answer_text=answer_text, talk=talk, elapsed_ms=elapsed_ms, extra=extra)
+            answer_text=answer_text, act=act, elapsed_ms=elapsed_ms, extra=extra)
         rep.notes.append(
             f"背包升级失败（{code}）：{reason} —— 不是任务失败，不影响农务/判据")
 
-    def _backpack_talk_once(self) -> dict[str, Any]:
+    def _backpack_find_object_tile(self, obs: Mapping[str, Any]) -> list[int] | None:
+        """【devcoder-backpack-interact】在 `location.objects`/`furniture` 里找"待售背包展示物"
+        的格，命中就返回 `[x, y]`；找不到（真机未必给 objects 桶）⇒ 返回 None，交给
+        `interact(tile=None)`（桥会朝玩家面朝的格做 GameLocation.checkAction）兜底。
+        """
+        loc = obs.get("location") or {}
+        # `location.objects`/`location.furniture` 本身就是"对象字典的列表"，要展平后才能逐个
+        # 看每个对象字典（否则 `bucket` 会迭代到整个列表、isinstance(Mapping) 失败、直接漏掉）。
+        for bucket in list(loc.get("objects") or []) + list(loc.get("furniture") or []):
+            if not isinstance(bucket, Mapping):
+                continue
+            label = " ".join(str(bucket.get(k, "")) for k in
+                             ("name", "type", "label", "displayName"))
+            low = label.casefold()
+            if "backpack" in low or "for sale" in low:
+                t = bucket.get("tile")
+                if isinstance(t, (list, tuple)) and len(t) >= 2:
+                    return [int(t[0]), int(t[1])]
+        return None
+
+    def _backpack_interact_once(self, tile: list[int] | None) -> dict[str, Any]:
+        """【devcoder-backpack-interact】对柜台背包展示物（GameLocation.checkAction）发一次
+        `interact`。失败要落码，不能把当天拖死；回执不是对象也落码。
+        """
         try:
-            res = self.client.talk(  # type: ignore[attr-defined]
-                BACKPACK_UPGRADE_NPC, timeout_ms=BACKPACK_TALK_TIMEOUT_MS)
+            res = self.client.interact(  # type: ignore[attr-defined]
+                tile=tile, timeout_ms=BACKPACK_TALK_TIMEOUT_MS)
         except Exception as exc:  # noqa: BLE001 - 失败要落码，不能把当天拖死
-            return {"ok": False, "code": "talk_error", "status": "talk_error",
-                    "reason": f"talk 抛错：{exc}"}
+            return {"ok": False, "code": "interact_error", "status": "interact_error",
+                    "reason": f"interact 抛错：{exc}"}
         if not isinstance(res, Mapping):
-            return {"ok": False, "code": "talk_bad_receipt", "status": "talk_bad_receipt",
-                    "reason": "talk 回执不是对象"}
+            return {"ok": False, "code": "interact_bad_receipt", "status": "interact_bad_receipt",
+                    "reason": "interact 回执不是对象"}
         return dict(res)
 
-    def _backpack_walk_adjacent(self, npc_tile: Any) -> bool:
-        """`not_adjacent` ⇒ 脑自己走到 NPC 四邻之一（≤2 次 move_to；Mod 从不替脑移动）。"""
-        if not isinstance(npc_tile, (list, tuple)) or len(npc_tile) < 2:
-            return False
-        try:
-            nx, ny = int(npc_tile[0]), int(npc_tile[1])
-        except (TypeError, ValueError):
-            return False
-        moved = 0
-        for dx, dy in ((0, 1), (1, 0), (0, -1), (-1, 0)):
-            if moved >= 2:
+    def _backpack_clear_intro(self, obs: Mapping[str, Any],
+                              _elapsed_ms: Callable[[], float] | None = None) -> dict[str, Any]:
+        """【devcoder-backpack-interact】进 SeedShop 可能触发过场事件（task-34 实机事件
+        3102768）⇒ 先把挡路的 `eventUp`/`isModal` 用 `advance_dialogue` 推开，≤10 次且受
+        预算约束；推不动就原样退回 obs（由调用方决定 load_save 自愈或 event_hang）。
+        """
+        ui = obs.get("ui") or {}
+        for _ in range(10):
+            if _elapsed_ms is not None and _elapsed_ms() >= BACKPACK_UPGRADE_DEADLINE_S * 1000.0:
                 break
-            moved += 1
+            if not (ui.get("eventUp") or ui.get("isModal")):
+                break
             try:
-                st = self.worker.move_to((nx + dx, ny + dy))
-            except Exception:  # noqa: BLE001 - 走不过去就换一格/放弃这回合
-                continue
-            if getattr(st, "ok", False):
-                return True
-        return False
+                self.client.advance_dialogue(max_steps=1)
+            except Exception:  # noqa: BLE001 - 推不动就按卡死收口
+                break
+            try:
+                obs = self._snap_or(dict(obs) if isinstance(obs, Mapping) else {})
+            except Exception:  # noqa: BLE001
+                break
+            ui = obs.get("ui") or {}
+        return obs
 
     def _backpack_recover_event_hang(self, obs: Mapping[str, Any]) -> tuple[bool, dict[str, Any]]:
         """事件卡死自愈：连续 ≤10 次受控推进都没把 `eventUp` 推走 ⇒ 认 `event_hang`。
@@ -6965,7 +7406,13 @@ class LongRun:
     def _maybe_buy_backpack_upgrade(self, obs: Mapping[str, Any], rep: DayReport) -> bool:
         """开工前试买 Pierre 背包升级；返回 True = 本轮已处理（成功完成），主循环 continue。
 
-        【task-35】默认关闭（`self.backpack_upgrade_enabled=False`）：不发任何 goto/talk/buy，
+        【devcoder-backpack-interact】根因修复：原代码用 `talk("Pierre")`（NPC.checkAction）
+        只能拿到 "Sigh..."，永远开不出背包升级的购买框 ⇒ 永久【无法判定】。背包升级是柜台
+        展示物，正确原语是 `interact`（GameLocation.checkAction）：对着柜台背包展示物（或
+        `tile=None` 朝面朝格）interact ⇒ 由游戏弹出带 "Purchase" 选项的提问框 ⇒ `dismiss_modal`
+        应答，最终**由游戏代码**扣 2000g 并扩容（脑侧只看观测差分，绝不直接写钱/容量）。
+
+        【task-35】默认关闭（`self.backpack_upgrade_enabled=False`）：不发任何 goto/interact/buy，
         只留 `backpack_upgrade_skip="disabled"` + 一条 skipped 留痕；显式开启后行为与 0.7.46 一致。
         """
         if not self.backpack_upgrade_enabled:
@@ -6998,62 +7445,84 @@ class LongRun:
             return False
         obs = self._snap_or(dict(obs) if isinstance(obs, Mapping) else {})
 
-        talk = self._backpack_talk_once()
+        # 【devcoder-backpack-interact】进店先清过场事件（task-34 实机事件 3102768），推不动就
+        # load_save 自愈；仍卡 ⇒ event_hang（不硬做题、不替游戏选选项）。
+        obs = self._backpack_clear_intro(obs, _elapsed_ms)
+        ui = obs.get("ui") or {}
+        if ui.get("eventUp") or ui.get("isModal"):
+            try:
+                self.client.load_save(force=True)
+            except Exception:  # noqa: BLE001 - 自愈失败只是换一条码
+                pass
+            st2 = self.worker.ensure_location(BACKPACK_UPGRADE_SHOP)
+            if not getattr(st2, "ok", False):
+                self._backpack_fail(
+                    rep, code="goto_shop_failed",
+                    reason=(f"自愈后回 {BACKPACK_UPGRADE_SHOP} 失败："
+                            f"{getattr(st2, 'reason', '')}"),
+                    money_before=money_before, money_after=money_before,
+                    cap_before=cap_before, cap_after=cap_before,
+                    elapsed_ms=_elapsed_ms())
+                self._backpack_return_to_farm()
+                return False
+            obs = self._snap_or(dict(obs) if isinstance(obs, Mapping) else {})
+            ui = obs.get("ui") or {}
+            if ui.get("eventUp") or ui.get("isModal"):
+                self._backpack_fail(
+                    rep, code="event_hang",
+                    reason="进店过场事件清不掉（含 load_save 自愈后仍卡）⇒ 不硬做题",
+                    money_before=money_before,
+                    money_after=self._obs_player_int(obs, "money"),
+                    cap_before=cap_before, cap_after=self._backpack_capacity(obs),
+                    elapsed_ms=_elapsed_ms())
+                self._backpack_return_to_farm()
+                return False
+
+        # 定位柜台背包展示物（GameLocation.checkAction 的触发物），发 interact
+        tile = self._backpack_find_object_tile(obs)
+        act = self._backpack_interact_once(tile)
         self.backpack_attempts_today += 1
         rep.backpack_upgrade_attempts = self.backpack_attempts_today
-        code = str(talk.get("code") or talk.get("status") or "")
-        if code == "not_adjacent":
-            # 安全降级：脑自己走一步到相邻格；≤2 次 talk/天、≤90s 总预算。
-            within = (self.backpack_attempts_today < BACKPACK_UPGRADE_MAX_ATTEMPTS
-                      and _elapsed_ms() < BACKPACK_UPGRADE_DEADLINE_S * 1000.0)
-            if within and self._backpack_walk_adjacent(
-                    talk.get("npcTile") or talk.get("npc_tile")):
-                talk = self._backpack_talk_once()
-                self.backpack_attempts_today += 1
-                rep.backpack_upgrade_attempts = self.backpack_attempts_today
-                code = str(talk.get("code") or talk.get("status") or "")
-            else:
-                code = "not_adjacent_unreachable"
+        code = str(act.get("code") or act.get("status") or "")
 
-        ui = obs.get("ui") or {}
-        if (code in ("no_action", "not_supported") and ui.get("eventUp")
-                and not ui.get("isModal")):
+        # no_action / not_supported 且仍有非模态 eventUp ⇒ 清场后再试一次（受预算约束）
+        if code in ("no_action", "not_supported") and ui.get("eventUp") and not ui.get("isModal"):
             recovered, obs = self._backpack_recover_event_hang(obs)
             within = (self.backpack_attempts_today < BACKPACK_UPGRADE_MAX_ATTEMPTS
                       and _elapsed_ms() < BACKPACK_UPGRADE_DEADLINE_S * 1000.0)
             if recovered and within:
-                talk = self._backpack_talk_once()
+                act = self._backpack_interact_once(tile)
                 self.backpack_attempts_today += 1
                 rep.backpack_upgrade_attempts = self.backpack_attempts_today
-                code = str(talk.get("code") or talk.get("status") or "")
+                code = str(act.get("code") or act.get("status") or "")
             else:
                 code = "event_hang"
 
-        if code != "ok" or not talk.get("applied"):
+        if code != "ok" or not act.get("applied"):
             if not code:
-                code = "talk_failed"
+                code = "interact_failed"
             self._backpack_fail(
                 rep, code=code,
-                reason=str(talk.get("reason") or f"talk 失败（code={code}）"),
+                reason=str(act.get("reason") or f"interact 失败（code={code}）"),
                 money_before=money_before,
                 money_after=self._obs_player_int(obs, "money"),
                 cap_before=cap_before, cap_after=self._backpack_capacity(obs),
-                talk=talk, elapsed_ms=_elapsed_ms())
+                act=act, elapsed_ms=_elapsed_ms())
             self._backpack_return_to_farm()
             return False
 
-        question = bool(talk.get("dialogueIsQuestion"))
-        raw_responses = talk.get("dialogueResponses") or []
+        question = bool(act.get("dialogueIsQuestion"))
+        raw_responses = act.get("dialogueResponses") or []
         responses = [str(r) for r in raw_responses if isinstance(r, (str, int))]
         if not question:
             self._backpack_fail(
                 rep, code="dialogue_not_question",
-                reason=(f"talk 开了对话却没有提问（activeMenu={talk.get('activeMenu')!r}，"
+                reason=(f"interact 开了对话却没有提问（activeMenu={act.get('activeMenu')!r}，"
                         f"responses={responses}）⇒ 不猜选项"),
                 money_before=money_before,
                 money_after=self._obs_player_int(obs, "money"),
                 cap_before=cap_before, cap_after=self._backpack_capacity(obs),
-                talk=talk, elapsed_ms=_elapsed_ms())
+                act=act, elapsed_ms=_elapsed_ms())
             self._backpack_escape_dialogue()
             self._backpack_return_to_farm()
             return False
@@ -7067,7 +7536,7 @@ class LongRun:
                 money_before=money_before,
                 money_after=self._obs_player_int(obs, "money"),
                 cap_before=cap_before, cap_after=self._backpack_capacity(obs),
-                answer_text=BACKPACK_UPGRADE_ANSWER, talk=talk,
+                answer_text=BACKPACK_UPGRADE_ANSWER, act=act,
                 elapsed_ms=_elapsed_ms())
             self._backpack_escape_dialogue()
             self._backpack_return_to_farm()
@@ -7079,7 +7548,7 @@ class LongRun:
                 money_before=money_before,
                 money_after=self._obs_player_int(obs, "money"),
                 cap_before=cap_before, cap_after=self._backpack_capacity(obs),
-                answer_text=BACKPACK_UPGRADE_ANSWER, talk=talk,
+                answer_text=BACKPACK_UPGRADE_ANSWER, act=act,
                 elapsed_ms=_elapsed_ms())
             self._backpack_escape_dialogue()
             self._backpack_return_to_farm()
@@ -7099,7 +7568,7 @@ class LongRun:
                 rep, code="answer_failed", reason=f"dismiss_modal 应答抛错：{exc}",
                 money_before=money_b, money_after=self._obs_player_int(obs2, "money"),
                 cap_before=cap_b, cap_after=self._backpack_capacity(obs2),
-                answer_text=BACKPACK_UPGRADE_ANSWER, talk=talk,
+                answer_text=BACKPACK_UPGRADE_ANSWER, act=act,
                 elapsed_ms=_elapsed_ms())
             self._backpack_escape_dialogue()
             self._backpack_return_to_farm()
@@ -7121,7 +7590,7 @@ class LongRun:
                         f"（money {money_b}→{money_a}，capacity {cap_b}→{cap_a}）"),
                 money_before=money_b, money_after=money_a,
                 cap_before=cap_b, cap_after=cap_a,
-                answer_text=BACKPACK_UPGRADE_ANSWER, talk=talk,
+                answer_text=BACKPACK_UPGRADE_ANSWER, act=act,
                 elapsed_ms=_elapsed_ms())
             self._backpack_escape_dialogue()
             self._backpack_return_to_farm()
@@ -7141,7 +7610,7 @@ class LongRun:
                         f"（−{int(money_b) - int(money_a)}），容量 {cap_b}→{cap_a}"),
                 money_before=money_b, money_after=money_a,
                 cap_before=cap_b, cap_after=cap_a,
-                answer_text=BACKPACK_UPGRADE_ANSWER, talk=talk,
+                answer_text=BACKPACK_UPGRADE_ANSWER, act=act,
                 elapsed_ms=_elapsed_ms())
             rep.notes.append(
                 f"背包升级成功：容量 {cap_b}→{cap_a}，钱 {money_b}→{money_a}（对话购买，游戏代码扣钱）")
@@ -7159,7 +7628,7 @@ class LongRun:
             rep, code=code2, reason=f"观测差分不成立：{detail}",
             money_before=money_b, money_after=money_a,
             cap_before=cap_b, cap_after=cap_a,
-            answer_text=BACKPACK_UPGRADE_ANSWER, talk=talk,
+            answer_text=BACKPACK_UPGRADE_ANSWER, act=act,
             elapsed_ms=_elapsed_ms())
         self._backpack_return_to_farm()
         return False
@@ -7417,6 +7886,18 @@ class LongRun:
         plantable = int(season_state["plantable"]) if season_state["metadata"] else seeds_total
         if plantable > 0:
             return False
+        # 【task-241】季节感知：冬季 Pierre 不卖种子 ⇒ 今天**不发起任何 buy**，直接记
+        # `seed_dead_today = "winter_no_seeds"`（诚实信号，支持 Goal-1 经济闭环证据）。
+        # 不探、不买，避免 run6 那种"白撞 item_not_sold"污染账本；也不是任务失败。
+        season = str(season_state.get("season") or "").strip().lower()
+        if season == "winter":
+            self.seed_dead_today = "winter_no_seeds"
+            if not self.seed_dead_noted:
+                self.seed_dead_noted = True
+                self._journal("winter_no_seeds", season="winter",
+                              note="冬季 Pierre 货架无种子 ⇒ 今天不买（无 item_not_sold 试探）；不是任务失败")
+                rep.notes.append("冬季不买种子（Pierre 货架无当季种子，避免 item_not_sold 空转）；不是任务失败")
+            return changed
         assert self.worker is not None
         money = FarmWorker.money(obs)
         # 【task-102】空格死锁（run8 day 12/13 的主因）：钱够、没种子，但背包**放不下**买来的种子
@@ -7498,13 +7979,20 @@ class LongRun:
         player = FarmWorker.player_of(obs)
         money = FarmWorker.money(obs)
         if self.shop_offers:
+            # 【task-241】跨季货架失效：上一季留下的 `shop_offers` 可能含隔季种子
+            # （例如春末买的 Parsnip 清单在夏初还被当成可买 ⇒ item_not_sold）。
+            # 捕获季节与当前不符就丢弃，强制走"探一次拿当季新鲜货架"。
+            if self.shop_offers_season and self.shop_offers_season != season:
+                self.shop_offers = []
+                self.shop_offers_season = ""
+        if self.shop_offers:
             # 有清单：直接挑，**不发注定失败的请求**（清单跨天保留）。
             pick, code = pick_seed_offer(self.shop_offers, money)
             if pick is None:
                 self._seed_dead(code, rep, money=money, offers=self.shop_offers)
                 return changed
             st = self._buy_seed(str(pick.get("id") or ""), money, "shelf", rep,
-                                price=int(pick.get("price") or 0))
+                                price=int(pick.get("price") or 0), season=season)
             return changed or bool(st is not None and st.ok)
         # 没有清单（旧 Mod / 首次）：拿配置项探**一次**。
         # ⚠️ 探测**成功**时绝不能下"买不到"的结论 —— 上面那次 `no_seed_for_sale` 的误判
@@ -7529,7 +8017,8 @@ class LongRun:
             rep.notes.append(f"没种子且钱不够（{money}g < {price_now}g，差 {short}g），"
                              "只能干等/清障开垦")
             return changed
-        st = self._buy_seed(self.buy_item, money, "probe", rep)
+        st = self._buy_seed(season_probe_item(season, self.buy_item), money, "probe", rep,
+                            season=season)
         if st is not None and st.ok:
             return True
         # 【task-102】`no_space` 是"背包放不下"，跟"这个 id 不在售"无关 ⇒ 换 id 也白搭，
@@ -7540,13 +8029,13 @@ class LongRun:
         pick, code = pick_seed_offer(self.shop_offers, money)
         if pick is not None:
             st2 = self._buy_seed(str(pick.get("id") or ""), money, "shelf", rep,
-                                 price=int(pick.get("price") or 0))
+                                 price=int(pick.get("price") or 0), season=season)
             return changed or bool(st2 is not None and st2.ok)
         self._seed_dead(code, rep, money=money, offers=self.shop_offers)
         return changed
 
     def _buy_seed(self, item: str, money: int, source: str, rep: DayReport,
-                  *, price: int = 0) -> StepResult | None:
+                  *, price: int = 0, season: str = "") -> StepResult | None:
         """发一次 `buy`；把回执里的货架清单收进 `self.shop_offers`，并如实记 `buy` journal。
 
         【task-102】计数与"空格"分流：每次调用都记 `buy_attempts_today`（上界
@@ -7582,6 +8071,8 @@ class LongRun:
         self._actions += 1
         if st.available:
             self.shop_offers = list(st.available)   # 跨天保留：下次直接挑，不发注定失败的请求
+            # 【task-241】记下这份清单是哪个季节捕获的（跨季时据此失效，见 `_preconditions_apply`）。
+            self.shop_offers_season = str(season or "")
         rep.notes.append(f"补种子（{source} {n} 个 @ {price_used}g）：{st.reason}")
         self._say(f"  · 补种子：{st.reason}")
         self._journal("buy", ok=st.ok, code=st.code, reason=st.reason, item=item,
@@ -8702,6 +9193,11 @@ class LongRun:
             # 也没按规跳过的格数。日级 `no_unmet_stages` 从 task-134 起看 `assigned_undone`
             # （`leftover` 仍是"片区还剩多少格"，作为 `plot_pending` 落账、供守卫/换片/resume 用）。
             "assigned": len(assigned), "assigned_undone": assigned_undone,
+            # 【devcoder-day-end-gates / Fix 1+2】`assigned_undone` 的**逐格坐标**（前 64 条）：
+            # 日级豁免要靠它做"已证挡死的格"与"真的没做完的格"**逐格求交** —— 只看计数会把
+            # "另一阶段该做没做"的格也一起洗掉；只看最后一条记录的 `*_leftover` 又会在
+            # "不可达格早在前几条记录就解掉、最后一条 leftover=0"时把豁免归零（A9 winter 26）。
+            "assigned_undone_tiles": [list(t) for t in sorted(assigned - assigned_done)[:64]],
             # 【task-161】阶段体力实测（只留痕）：取不到观测就是 `None`，**不许写 0**。
             # `day_end.stamina_calibration` 按 stage 聚合这三个数，用来**事后**标定
             # `farmwork.py` 的估算常量（本卡不动常量、不动任何判据）。
@@ -9033,6 +9529,57 @@ class LongRun:
                                         evidence=evidence, note=note)
                 obs = self._snap()
                 continue
+            if task == "buy":
+                # 【0.7.49 D2 修复】`_preconditions` 返回的是**观测 dict**（不是 bool），但它内部
+                # （`:7393`）**确实调用了** `_preconditions_apply` ⇒ 旧接线
+                # `changed = self._preconditions(obs, rep)` 的**购买路径照常真的执行（钱真的花）**；
+                # 缺陷在**记账**：`changed` 绑定非空 dict（恒真）⇒ 每条 `buy` 意图都记
+                # `executed_steps=1` + `acted`，**不管这一轮有没有真买到** ⇒ 无动作的一天被记成
+                # acted、遮蔽 stuck/无进展路径（`{"unknown_evidence":1}` 成死代码）。
+                # 真正"有没有改动世界"由 `_preconditions_apply` 返回 bool（买/卖成功才 True）。
+                # 真实入口链：`_preconditions_apply` → `_buy_seed` → `worker.buy` → 桥 `buy` →
+                # 游戏 `ShopMenu.tryToPurchaseItem(item, null, count, 0, 0)`；成败判据是**钱/背包差分**
+                # （`farmwork.FarmWorker.buy`：`have_after > have_before and money_after < money_before`），
+                # 回执只是声明 —— 见 `bridge.py:1132-1136`。
+                changed = self._preconditions_apply(obs, rep)
+                if changed:
+                    try:
+                        obs = self._snap()
+                    except Exception:
+                        pass
+                self._record_intent(intent, task=task,
+                                    executed_steps=1 if changed else 0,
+                                    reasons={} if changed else {"unknown_evidence": 1},
+                                    note="buy 由 _preconditions 流程执行（游戏入口 ShopMenu.tryToPurchaseItem）")
+                acted = changed or acted
+                continue
+            if task == "upgrade_tool":
+                # 【0.7.48 已知限制】工具种类**硬编码 "axe"**（本卡只做接线 + 审计，不顺手做通用化）。
+                # 真实入口链：`worker.upgrade_tool("axe")` → 桥 `upgrade_tool` → 铁匠铺
+                # `Utility.TryOpenShopMenu("ClintUpgrade","Clint",true)` → 反射
+                # `tryToPurchaseItem(item, null, 1, 0, 0)`；成败靠观测差分
+                # （`farmwork.FarmWorker.upgrade_tool`：钱少/出现 `toolBeingUpgraded`/等级变大）。
+                st = None
+                try:
+                    mv = self.worker.ensure_location("Blacksmith", timeout_ms=30000)
+                    if getattr(mv, "ok", False):
+                        obs = self._snap()
+                    st = self.worker.upgrade_tool("axe", timeout_ms=60000)
+                except Exception as exc:  # noqa: BLE001
+                    self._journal("upgrade_tool", ok=False, code="exception", reason="exception:" + type(exc).__name__,
+                                  tool="axe", tool_hardcoded=True)
+                changed = bool(getattr(st, "ok", False))
+                if st is not None:
+                    self._journal("upgrade_tool", ok=changed, code=getattr(st, "code", ""), reason=getattr(st, "reason", ""),
+                                  tool="axe", tool_hardcoded=True,
+                                  before=getattr(st, "before", None), after=getattr(st, "after", None))
+                self._record_intent(intent, task=task,
+                                    executed_steps=1 if changed else 0,
+                                    reasons={} if changed else {"unknown_evidence": 1},
+                                    note="upgrade_tool " + ("ok" if changed else "no_effect"))
+                acted = changed or acted
+                obs = self._snap()
+                continue
             if task in STAGE_ACTION:
                 acted = self._run_stage_intent(intent, obs, plot, rep) or acted
                 obs = self._snap()
@@ -9311,21 +9858,63 @@ class LongRun:
 
         为什么用 `self.sleep_fn`：长跑的等待一律走可注入的 sleep（测试里被替换成 no-op，
         真机是 `time.sleep`），既不阻塞回合边界，也让单测保持毫秒级。
+
+        【Fix A / devcoder-spring1-event】A9 spring1 实证**推翻**了"冻结=卡死"的旧假设：Kent
+        归来 `eventId=63` 是纯自动过场（skippable，command 6=pause/动画/视口自播，原版事件命令集
+        无"等玩家走格"命令），三合一指纹 `worldSeq`+`ui.eventCommand`+`ui.dialogueLines`
+        **全冻是正常态**，结束条件=计时到/动画播完、**不需玩家动作**。所以：
+          * 无对话框冻结态**不再提前判死** —— 给足整段等待窗（`total_limit` 轮），只跑到
+            `tries >= total_limit` 仍 `eventUp` 才诚实 `event_blocked`；
+          * `total_limit` = :data:`EVENT_WAIT_TRIES` + :data:`EVENT_WAIT_EXTRA_TRIES`
+            始终兜底，绝不无限等（永不结束的事件仍诚实 `event_blocked`，不洗成过关）；
+          * 对话盒一出现 / 事件结束 ⇒ 立刻回日循环（交给 `_advance_event_dialogue`）。
         """
         tries = 0
-        for tries in range(1, EVENT_WAIT_TRIES + 1):
+        idle = 0
+        moved_any = False
+        # 【A9 spring1 实证】事件期 `worldSeq`（地点|玩家格|时间|日|钱|背包件数）**必然冻结**
+        # （事件把游戏时间冻在 600），所以只用它判"在不在推进"会把正常过场误判成卡死
+        # （run6：worldSeq 161→162 后冻 60s ⇒ event_blocked）。进展改用**三合一指纹**：
+        # `worldSeq` + `ui.eventCommand`（事件脚本执行到第几条 command，Mod 0.7.5x 新增）+
+        # `ui.dialogueLines`（当前对话剩余条数）。事件脚本走位/换场景/推进对话时后两者一定在动。
+        # 三项都缺（旧 Mod）⇒ 退回只看 worldSeq，行为与改前一致。
+        def _fp(o: dict[str, Any]) -> tuple[Any, Any, Any]:
+            u = o.get("ui") or {}
+            return (o.get("worldSeq"), u.get("eventCommand"), u.get("dialogueLines"))
+        fp_seen = _fp(obs)
+        total_limit = EVENT_WAIT_TRIES + EVENT_WAIT_EXTRA_TRIES
+        while tries < total_limit:
             self.sleep_fn(EVENT_WAIT_SECONDS)
+            tries += 1
             obs = self._snap_or(obs)
             ui = obs.get("ui") or {}
+            fp = _fp(obs)
+            moved = fp != fp_seen
+            if moved:
+                moved_any = True
+                idle = 0
+            else:
+                idle += 1
+            fp_seen = fp
             event_up, _is_question, _menu, has_dialogue = self._event_dialogue_state(obs)
             self._journal("event_wait", tries=tries, limit=EVENT_WAIT_TRIES,
+                          limitMax=total_limit, extended=bool(tries > EVENT_WAIT_TRIES),
                           eventId=ui.get("eventId"), eventUp=bool(event_up),
-                          hasDialogue=bool(has_dialogue), worldSeq=obs.get("worldSeq"),
-                          waitSeconds=EVENT_WAIT_SECONDS,
+                          hasDialogue=bool(has_dialogue), worldSeq=fp[0],
+                          eventCommand=fp[1], dialogueLines=fp[2],
+                          worldMoved=bool(moved), worldMovedAny=bool(moved_any),
+                          idleStreak=idle, waitSeconds=EVENT_WAIT_SECONDS,
                           note="事件进行中但没有对话盒：有界等待（**不** dismiss / **不** sleep / "
-                               "**不** load_save；事件结束或对话盒出现就回日循环）")
+                               "**不** load_save；进展判据=worldSeq+eventCommand+dialogueLines "
+                               "三合一指纹；事件结束或对话盒出现就回日循环）")
             if not event_up or has_dialogue:
                 return obs, False, tries
+            # 【devcoder-spring1-event / Fix A】无对话框冻结态（pause/动画自播，三合一指纹
+            # worldSeq+eventCommand+dialogueLines 全冻）是 skippable 过场的**正常**态（A9 spring1
+            # 实证：Kent 归来 eventId=63，command 6=pause/动画/视口自播，原版事件命令集无"等玩家
+            # 走格"命令；结束条件=计时到/动画播完，不需玩家动作）。**不再因"指纹不动"提前判死**
+            # —— 给足整段等待窗，只跑到 `tries >= total_limit` 仍 `eventUp` 才诚实 `event_blocked`。
+            # `total_limit` = EVENT_WAIT_TRIES + EVENT_WAIT_EXTRA_TRIES 永远兜底，绝不无限等。
         return obs, True, tries
 
     def _clear_modals(self, obs: dict[str, Any], rep: DayReport) -> tuple[dict[str, Any], bool]:
@@ -9473,8 +10062,9 @@ class LongRun:
                       # 由 Mod 的 EventRules 归一，这里原样落账。
                       eventId=ui.get("eventId"),
                       eventWaitTries=event_wait_tries,
-                      eventWaitSeconds=(EVENT_WAIT_TRIES * EVENT_WAIT_SECONDS
-                                        if event_wait_tries else 0.0),
+                      # 【Fix 3】等待秒数按**实际等了几轮**算（耐心延长后可能是 4~16 轮，
+                      # 写死"基础界"会把账本的低效白等时间少算 3 倍）。
+                      eventWaitSeconds=round(event_wait_tries * EVENT_WAIT_SECONDS, 1),
                       # 【task-228】事件对话推进的当日账：`event_blocked` 到底是因为
                       # "提问/职业选择"还是"推了 N 步之后点不动"——账本必须能分清。
                       advance_steps=self.event_advance_steps_today,
@@ -9484,7 +10074,7 @@ class LongRun:
                            "不 dismiss / 不 sleep / 不 load_save，当天不判 VERIFIED，等人处理")
         rep.ended_by = ENDED_BY_EVENT
         event_id = ui.get("eventId")
-        waited = (EVENT_WAIT_TRIES * EVENT_WAIT_SECONDS if event_wait_tries else 0.0)
+        waited = (event_wait_tries * EVENT_WAIT_SECONDS if event_wait_tries else 0.0)
         rep.ended_reason = (f"游戏事件挂住（eventUp=true）：{menu or '?'}"
                             + (f"「{text}」" if text else "")
                             + (f"；eventId={event_id}" if event_id else "；eventId=未知（无法归因）")
@@ -9526,6 +10116,7 @@ class LongRun:
         self.scope_cap_refused_today = False
         self.refills_today = 0
         self.idle_rounds = 0
+        self._guard_walk_streak = 0
         self.blocked = {}
         self.tile_attempts = {}
         # 【task-5 / 0.7.44】"同格重分无产出"的当日计数同样每天清零（次日世界变了重新判）。
@@ -9585,6 +10176,8 @@ class LongRun:
         # 【task-122】两种退化形态的当日计数，每天清零（只喂教训库，不参与判定）。
         self.plot_exhausted_today = 0
         self.midway_leftover_today = 0
+        # 【devcoder-no-work-sleep】连续"无活轮次"每天清零：昨天证明过无活 ≠ 今天也无活。
+        self._no_work_cycle_count = 0
         # 【task-124】同一秒连发换片的窗口计数每天清零。
         self._plot_exhausted_last = None
         self._plot_exhausted_window = 0
@@ -9741,6 +10334,24 @@ class LongRun:
             if modal_blocked:
                 break
 
+            # 【devcoder-spring1-event / Fix B】`eventUp=true` 期间**冻结一切日常动作**：事件
+            # （尤其 skippable 过场，如 Kent 归来 eventId=63，command 6=pause/动画/视口自播、原版
+            # 事件命令集无"等玩家走格"命令）不需玩家操作，结束条件=计时到/动画播完；在事件里
+            # sell/buy/goto_farm/walk/plant/water/clear 会干扰过场、甚至替游戏改剧情状态（A9 spring1
+            # 实证：eventUp 下仍跑了 sell/buy ⇒ 被误判 event_blocked）。所以只要观测到
+            # `ui.eventUp=true`，本轮**绝不**跑任何经济/农事动作，只轮询等事件结束/对话盒出现：
+            #   * `_wait_event_up` 返回 `still_blocked=True` ⇒ `_event_blocked` 诚实收尾；
+            #   * 返回 `False`（事件结束或对话盒出现）⇒ 本轮不跑经济，`continue` 回循环顶部
+            #     （对话盒交给 `_advance_event_dialogue` 受控推进：非提问才点、提问/职业选择不动）。
+            # 判定只看观测 `ui.eventUp`，不读回执、绝不 dismiss/推进含提问的事件（task-41 红线）。
+            if (obs.get("ui") or {}).get("eventUp") is True:
+                obs, still_blocked, wait_tries = self._wait_event_up(obs)
+                if still_blocked:
+                    self._event_blocked(obs, rep, event_wait_tries=wait_tries)
+                    break
+                self._observe_free_slots(rep, obs)   # 事件结束/对话盒出现：刷新观测再回顶部
+                continue
+
             # 【task-16 / 0.7.45】每次观测都重算背包空格（只记 trace，不发请求）：
             # `day_end.free_slots_*` / `loot_lost` 的证据都靠这张读数，不靠"事后猜"。
             self._observe_free_slots(rep, obs)
@@ -9756,6 +10367,13 @@ class LongRun:
 
             allow, code, text = self.sleep_guard(obs)
             if allow:
+                # 【devcoder-clear-gate D】满包清障闸的收口必须**点名**（`ended_by=clear_gate`）：
+                # 它不是"没活"，也不是"背包堵住收不了熟作物"，而是"活被背包闸住、今天不开新清障"。
+                # 走 `_end_clear_gate`（`require_work=False`：0 动作日照样能翻篇，理由同
+                # `_stuck_flush`）。`clear_gate` 不在任何白名单 ⇒ `day_justified=False`。
+                if code == "clear_gate":
+                    self._end_clear_gate(obs, rep)
+                    break
                 rep.ended_by, rep.ended_reason = self._do_sleep(obs, rep, f"{code}:{text}")
                 # 【task-198】背包堵住导致的收工与 night/stamina 同形态（睡一觉让游戏日翻篇），
                 # 但 `ended_by` 必须点名**原因**：否则报告里只会看到 `sleep`，看报告的人分不清
@@ -9770,6 +10388,13 @@ class LongRun:
             # `continue` 重新观测/决策；腾不出来时 `_slot_relief` 已置 `inventory_blocked_today`
             # 并记 journal，守卫下一轮就会用 `inventory_blocked` 如实收尾（不假 VERIFIED）。
             if self._slot_relief(obs, rep):
+                # 【task-240b】腾格成功 ⇒ 重新取快照让后续 _preconditions 看见新空格，
+                # 并**立刻尝试买种子**（腾格前 _preconditions 被 _slot_relief 的 continue 跳过，
+                # 买种子因此永远不触发 —— catch-22）。修后：腾格→买种子→continue 重新观测。
+                obs = self._snap_or(obs)
+                last_obs = obs
+                self._observe_free_slots(rep, obs)
+                obs = self._preconditions(obs, rep)
                 continue
 
             # 【task-143】`_preconditions` 会真的买种子 ⇒ 必须用它还回来的**改动后**观测继续
@@ -9856,6 +10481,11 @@ class LongRun:
                         continue
                     # 【task-198】背包堵住时**不能**落成 `no_work`（那是假达标）或 `stuck`
                     # （那是误报卡死）：这一天的真实结论是"背包堵住、今天腾不出来"。
+                    # 【devcoder-clear-gate D】"剩余活全是被满包清障闸挡住的清障格" 同样不许落
+                    # `no_work`/`stuck`：用 `_end_clear_gate` 点名收口（day_justified 恒 False）。
+                    if self._clear_gate_only_work(obs):
+                        self._end_clear_gate(obs, rep)
+                        break
                     if self.inventory_blocked_today:
                         self._end_inventory_blocked(obs, rep)
                         break
@@ -10076,8 +10706,90 @@ class LongRun:
                         break
                     if action == "acted":
                         self.idle_rounds = 0
+                        self._guard_walk_streak = 0
+                        self._no_work_cycle_count = 0      # 这轮真做了农场动作 ⇒ 无活计数清零
                         continue
                     if action == "walked":
+                        # 【devcoder-no-work-sleep】连续"LLM 意图 + 确定性兜底都无可执行目标、
+                        # 且当日 0 农场动作"的轮次计数：已用校验证据*证明*无活，不必等
+                        # `_guard_walk_streak>=10`（更不必等到被外部杀掉），直接诚实收工、干净跨日。
+                        # 阈值 3 远小于 walk_streak 的 10：LLM 重试挂起会在进程被外部杀掉之前就收敛。
+                        self._no_work_cycle_count += 1
+                        if self._no_work_cycle_count >= 3:
+                            if self.farm_actions_today <= 0:
+                                # 【A9 gatefix3 实证】本轮"3 轮校验取消"只是**本片区**看得见没目标；
+                                # 账本里可能还有别的片区的可执行活（winter27/28 实测 exec=237/240）。
+                                # 硬收工会把"还有活"洗成"没活"（zero_action_evidenced 会正确拦住）。
+                                # 只有**日终可执行面证据 executable==0** 才算真无活、才收工；
+                                # 否则**不结束**，落到下面的走路上限继续换片探索（winter26 就是这样
+                                # 走 216 格/换片 4 次后 exec=0 才 VERIFIED 的）。
+                                try:
+                                    _snap = self._pending_snapshot(obs)
+                                    _exec = int(_snap.get("executable") or 0)
+                                    _gated = int(_snap.get("gated") or 0)
+                                except Exception:
+                                    _exec, _gated = 1, 0   # 证据不可用 ⇒ fail-closed 当作"还有活"
+                                # 【devcoder-clear-gate D】`executable==0` 也可能是"格全被满包清障闸
+                                # 闸住"（gated>0）—— 那是"活被背包闸住"，**不是**无活可做：绝不许
+                                # 落 `no_work`+`no_work_evidence_ok=True`（那是白拿 VERIFIED 的洗白口）。
+                                if _exec == 0 and _gated > 0 and self._clear_gate_only_work(obs):
+                                    self._end_clear_gate(obs, rep)
+                                    break
+                                if _exec == 0 and _gated == 0:
+                                    rep.notes.append(
+                                        f"连续 {self._no_work_cycle_count} 轮校验取消、当日 0 农场动作、"
+                                        f"且日终可执行面 executable==0 ⇒ 已证无活，诚实收工（干净跨日）")
+                                    # `no_work_evidence_ok` = `_zero_action_evidenced` 的唯一放行口
+                                    # （与 sleep_guard:5911 同义）；已在 executable==0 前提下，诚实。
+                                    self.no_work_evidence_ok = True
+                                    rep.ended_by, rep.ended_reason = self._do_sleep(
+                                        obs, rep,
+                                        f"no_work:连续{self._no_work_cycle_count}轮校验取消、当日0可执行农场动作"
+                                        f"（已证无活，非跳过）",
+                                        require_work=False)
+                                    break
+                                # exec>0：账本还有可执行的活 ⇒ 不判无活，继续换片/探索
+                                rep.notes.append(
+                                    f"连续 {self._no_work_cycle_count} 轮本片区无可动目标，但账本仍有 "
+                                    f"{_exec} 格可执行（另有 {_gated} 格被满包清障闸闸住）⇒ 不判无活，"
+                                    f"继续换片探索（不提前收工）")
+                            # 当天其实做过农场动作（只是做不成/被围）⇒ 不是"当日 0 可执行农场动作"，
+                            # 绝不许洗成 no_work（那是把"有活做不成"洗白成"没活"）；落回既有
+                            # stuck / burst / resume_exhausted 诚实收口（见
+                            # `test_persistent_unfinishable_work_is_bounded_and_never_no_work`）。
+                        # 【liveness 修复】连续走路无进展硬上限：守卫说还有活、但反复走回 leftovers
+                        # 仍拿不出可执行目标 ⇒ 不再无限 continue，强制 honest sleep 让游戏日推进，
+                        # 避免 winter26 这类"全部 encircled"场景整天空转。
+                        self._guard_walk_streak = getattr(self, "_guard_walk_streak", 0) + 1
+                        if self._guard_walk_streak >= 10:
+                            # 【devcoder-no-work-sleep】当日 0 农场动作时同样走 `no_work` 诚实口径
+                            # （require_work=False），避免 `_do_sleep` 默认 `require_work=True` 在
+                            # `_unfinished_work` 仍为真时返回 `slept_without_work` ⇒ 不跨日、整轮自停。
+                            # 【A9 gatefix3】`no_work`（正当、可 VERIFIED）只在**当日 0 动作 _且_
+                            # 日终可执行面 executable==0** 时成立；只满足前半（账本还有可执行活，
+                            # 只是走不到/被围）⇒ 落 `stuck:` 诚实收口（不洗成无活、当天不 VERIFIED）。
+                            try:
+                                _snap2 = self._pending_snapshot(obs)
+                                _no_exec = int(_snap2.get("executable") or 0) == 0
+                                _gated2 = int(_snap2.get("gated") or 0)
+                            except Exception:
+                                _no_exec, _gated2 = False, 0
+                            # 【devcoder-clear-gate D】`executable==0 且 gated>0` = "活被满包闸住"，
+                            # 不是"没活"：走 `clear_gate` 点名收口（day_justified 恒 False），
+                            # 绝不许置 `no_work_evidence_ok` 拿一个假 VERIFIED。
+                            if _no_exec and _gated2 > 0 and self._clear_gate_only_work(obs):
+                                self._end_clear_gate(obs, rep)
+                                break
+                            no_work = self.farm_actions_today <= 0 and _no_exec and _gated2 == 0
+                            if no_work:
+                                self.no_work_evidence_ok = True
+                            rep.ended_by, rep.ended_reason = self._do_sleep(
+                                obs, rep,
+                                ("no_work:连续走路无进展（encircled/unreachable，已证无可达可执行目标）"
+                                 if no_work else
+                                 "stuck:连续走路无进展（encircled/unreachable 目标）"),
+                                require_work=not no_work)
+                            break
                         continue
                     recovered += 1
                     self.plot_exhausted_today += 1     # 【task-122】当日计数（喂当晚教训）
@@ -10117,6 +10829,18 @@ class LongRun:
                 note = f"今天确实没有可做的目标（{policy_note or '策略没给出意图'}；守卫放行：{code}）"
                 rep.notes.append(note)
                 self._journal("no_intents", zone=self.zone_name, note=note)
+                # 【devcoder-clear-gate D】这里**不许硬写 `no_work`**：守卫这次放行可能是
+                # `clear_gate`（满包清障闸，剩余活全是被闸住的清障格）或 `inventory_blocked`
+                # （背包堵住）—— 写 `no_work` 会把"活被背包闸住"洗成"今天没活"（`no_work` 在
+                # JUSTIFIED 白名单里 ⇒ 白拿 VERIFIED）。按 `code` 分流，各走自己的点名收尾口。
+                if code == "clear_gate":
+                    self._end_clear_gate(obs, rep)
+                    break
+                if code == "inventory_blocked" and self.inventory_blocked_today:
+                    self._end_inventory_blocked(obs, rep)
+                    break
+                # 其余 code（night/stamina/no_work…）沿用旧行为：`no_work` 由 sleep_guard 的
+                # 证据保证（`no_work_evidence_ok` 只在"真没活"分支置位），不受本次改动影响。
                 rep.ended_by, rep.ended_reason = self._do_sleep(obs, rep, "no_work")
                 break
             # 【task-219】政策/换任务/兜底之后仍没进执行的计划意图：日终按 `superseded` 归因
@@ -10133,10 +10857,14 @@ class LongRun:
             if acted and changed:
                 self.idle_rounds = 0
                 self.no_progress_cycles = 0      # 【task-134 A】真有进展 ⇒ 空转计数清零
+                self._guard_walk_streak = 0
+                self._no_work_cycle_count = 0   # 这轮真有农场动作 ⇒ 无活计数清零
             elif changed:
                 # 意图没落地（比如被否决），但世界确实变了 —— 也算有进展
                 self.idle_rounds = 0
                 self.no_progress_cycles = 0      # 【task-134 A】
+                self._guard_walk_streak = 0
+                self._no_work_cycle_count = 0   # 世界确有变化 ⇒ 无活计数清零
             else:
                 self.idle_rounds += 1
                 self._journal("idle", rounds=self.idle_rounds, zone=self.zone_name,
@@ -10146,6 +10874,12 @@ class LongRun:
                     # 腾 1 格、多格熟作物要好几轮 ⇒ 3 轮 idle 会先撞这里，把"背包堵住"误报成
                     # `stuck`（deputy 的 198f-1..8 全是这个形态，A′ day13 原型）。先判
                     # `inventory_blocked_today`：诚实收工、理由可执行、不算 hard failure。
+                    # 【devcoder-clear-gate D】"剩余活全是清障类、且背包 0 空格腾不出" ⇒ 更准确的
+                    # 结论是 `clear_gate`（不是背包堵住收不了熟作物、也不是 stuck）：A9 冬 27/28
+                    # 就是在这个口上被判 `stuck:` 的。放在 inventory_blocked 之前（闸更具体）。
+                    if self._clear_gate_only_work(obs):
+                        self._end_clear_gate(obs, rep)
+                        break
                     if self.inventory_blocked_today:
                         self._end_inventory_blocked(obs, rep)
                         break
@@ -10237,6 +10971,29 @@ class LongRun:
         rep.unreachable = len(unreach_day)
         rep.unreachable_tiles = [list(t) for t in sorted(unreach_day)]
         rep.unreachable_bound = unreachable_bound
+        # 【devcoder-day-end-gates / Fix 1】"被围住"的日级**逐格证据**集合提前算好（豁免要用）：
+        # `enc_day` = 各阶段 `encircled_tiles` ∪ 当天 `self.encircled_day`；
+        # `prefiltered_day` = 其中"目标池前置过滤判死、0 次尝试、没有 step"的那些（task-27）——
+        # 它们不进 `assigned` ⇒ 也不进 `assigned_undone`，扣豁免时先剔掉（双保险，fail-closed）。
+        enc_day: set[tuple[int, int]] = set(self.encircled_day)
+        prefiltered_day: set[tuple[int, int]] = set()
+        for s in rep.stages:
+            for t in (s.get("encircled_tiles") or []):
+                try:
+                    enc_day.add((int(t[0]), int(t[1])))
+                except (TypeError, ValueError, IndexError):
+                    continue
+            for t in (s.get("encircled_prefiltered_tiles") or []):
+                try:
+                    prefiltered_day.add((int(t[0]), int(t[1])))
+                except (TypeError, ValueError, IndexError):
+                    continue
+        rep.encircled = len(enc_day)
+        rep.encircled_tiles = [list(t) for t in sorted(enc_day)]
+        # 与 `unreachable_bound`/`refused_bound` **同一基数、同一公式**（fail-closed：被围住不能
+        # 抬高上界，`bound_basis` 早已把 encircled 步从分母剔掉）。
+        encircled_bound = max(5, int(0.2 * bound_basis_steps))
+        rep.encircled_bound = encircled_bound
         # 【task-134 B】`plot_pending` = 改判据**之前**的 `raw_unmet` 口径（`_leftover` 逐 kind 求和）：
         # "片区里还剩多少格该做没做"。**数值必须逐字一致**（守卫/换片/resume 与工具侧都对它）。
         # `no_unmet_stages` 从此不再由它直接决定（见下面的 `assigned_unmet`）——
@@ -10263,10 +11020,13 @@ class LongRun:
         # 【task-161】日终把"每条 stage 的实测体力"按 stage 聚合（只留痕，不进 checks）：
         # 下一次真机 run 之后用它标定 `farmwork.py` 的 `STAMINA_COST_*` 估算常量。
         rep.stamina_calibration = self._stamina_calibration(rep)
+        # 【devcoder-day-end-gates / Fix 2】`unreach_in_last` 只剩**老账本回退口径**的作用：
+        # 它只数"最后一条阶段记录"里的 `unreachable_leftover`，而 A9 winter 26 的形态是
+        # "6 格真不可达在前几条记录里就解掉了、最后一条 leftover=0" ⇒ 这个数变成 0 ⇒ 豁免
+        # 一格都扣不掉（`unreachable_summary count=6 bound=22 exempted=0`）。新主口径见
+        # `assigned_unmet` 循环之后的"日级逐格求交"。
         unreach_in_last = sum(int(s.get("unreachable_leftover") or 0) for s in last_by_stage.values()
                               if int(s.get("tiles") or 0) > 0)
-        unreachable_exempt = min(unreachable_bound, unreach_in_last)
-        rep.unreachable_exempt = unreachable_exempt
         # 【task-63】被**游戏拒绝**（`tool_ineffective`/`precondition_failed`）：与"走不到"同形态
         # 但**独立起界**（`refused_bound = max(5, floor(0.2 × bound_basis))`，与不可达侧同一基数）：
         #   * 界内 ⇒ 从 `no_unmet_stages` 里扣掉"仍留在 leftover 的拒绝格"（否则 run5 那种
@@ -10298,6 +11058,7 @@ class LongRun:
         deferred_tiles = 0
         honest_stages: list[dict] = []
         shortfall_stages: list[dict] = []
+        shortfall_recs: list[dict] = []
         for name, s in last_by_stage.items():
             if int(s.get("tiles") or 0) <= 0:
                 continue
@@ -10316,17 +11077,77 @@ class LongRun:
                                           "assigned_undone": undone})
             elif undone > 0:
                 assigned_unmet += undone
+                shortfall_recs.append(s)
                 shortfall_stages.append({"stage": name, "stopped": stopped, "undone": undone,
                                          "assigned": int(s.get("assigned") or 0),
                                          "leftover": int(s.get("leftover") or 0)})
-        unmet_leftover = max(0, assigned_unmet - unreachable_exempt - refused_exempt)
+        # 【devcoder-day-end-gates / Fix 1 + Fix 2】豁免分子的新口径：**日级逐格求交**。
+        #
+        # 旧口径的两个洞（真机 A9 实证，均为"诚实做不成却被判红"）：
+        #   * Fix 1（winter 27）：扣的只有 `*_leftover`（"还留在 leftover 里的格数"）。那天
+        #     clear_area `assigned=16 / 12 做成 / 4 被围住 / leftover=0` ⇒ `encircled_leftover=0`
+        #     ⇒ 4 格已证围死却一格都扣不掉 ⇒ `no_unmet_stages=False`。
+        #   * Fix 2（winter 26）：`unreach_in_last` 只取"每个阶段种类的**最后一条**记录"，而 6 格
+        #     不可达在前几条记录里就已解掉、最后一条 `leftover=0` ⇒ 豁免归零（exempted=0）。
+        #
+        # 新口径：`short_undone` = **当天所有"如实 shortfall"阶段**（非体力/夜里收工那类）最后一条
+        # 记录里的 `assigned_undone` **逐格坐标**之并 —— 它与日级证据集合求交，只扣"既已被证明
+        # 走不到/被围死、又确实还欠着"的格：
+        #   * 已做成的格不会出现在 `assigned_undone` 里 ⇒ 不可能被拿来洗白别的格；
+        #   * 诚实上限（体力/夜里收工）留下的格**根本不在** `short_undone` 里 ⇒ 不许拿去抵别人的
+        #     欠账（这是"只按计数扣"最容易漏的洗白通道）；
+        #   * `encircled` 侧**不**再剔 `encircled_prefiltered`：`short_undone` 只含"被分配且没做成"
+        #     的格，预过滤格若真没进 assigned 就根本不在 `short_undone` 里（求交天然排掉）；
+        #     而 A9 winter27 实测 stage 记录 `assigned=15` **已经包含**那 3 格预过滤格
+        #     （`assigned_undone_tiles` 与 `encircled_prefiltered_tiles` 是同一批 [35,24]/[35,25]/
+        #     [36,24]）⇒ 再剔一次会把"已证围死且确实欠着"的格归零（旧 `enc_evidenced=0` 的根因）；
+        #   * 两侧各自按 `max(5, floor(0.2 × bound_basis))` 封顶，且**互不覆盖**（两套集合、两套界）；
+        #   * `bound_basis` 分母一个字没动（fail-closed：豁免只会更难，不会更容易）。
+        # 老账本（阶段记录里没有 `assigned_undone_tiles` 键）⇒ 逐条退回旧口径，行为与改前一致。
+        short_undone: set[tuple[int, int]] = set()
+        short_undone_legacy = False
+        for rec in shortfall_recs:
+            coords = rec.get("assigned_undone_tiles")
+            if coords is None:
+                short_undone_legacy = True
+                continue
+            for t in coords:
+                try:
+                    short_undone.add((int(t[0]), int(t[1])))
+                except (TypeError, ValueError, IndexError):
+                    continue
+        if short_undone_legacy:
+            unreach_evidenced = unreach_in_last
+            enc_evidenced = sum(int(s.get("encircled_leftover") or 0)
+                                for s in last_by_stage.values() if int(s.get("tiles") or 0) > 0)
+        else:
+            unreach_evidenced = len(unreach_day & short_undone)
+            # 【Fix1 修正】不剔 prefiltered_day：short_undone 只含"被分配且没做成"的格，预过滤格若
+            # 真没进 assigned 就不在 short_undone 里（求交天然排掉）；A9 winter27 实测 prefiltered
+            # 那 3 格同时也在 assigned_undone_tiles 里 ⇒ 剔掉会把 encircled_exempt 归零、误判红。
+            enc_evidenced = len(enc_day & short_undone)
+        unreachable_exempt = min(unreachable_bound, unreach_evidenced)
+        rep.unreachable_exempt = unreachable_exempt
+        encircled_exempt = min(encircled_bound, enc_evidenced)
+        rep.encircled_exempt = encircled_exempt
+        # 三套豁免各自独立、互不覆盖：合计也不许超过"真的欠着"的格数（防同一格被两套同时扣）。
+        exempt_total = min(assigned_unmet, unreachable_exempt + refused_exempt + encircled_exempt)
+        unmet_leftover = max(0, assigned_unmet - exempt_total)
         rep.assigned_undone = assigned_unmet
         rep.deferred_tiles = deferred_tiles
         if shortfall_stages:
             self._journal("stage_shortfall_day", unmet=assigned_unmet, stages=shortfall_stages[:6],
                           plot_pending=raw_unmet, stopped_night=bool(night_end),
+                          unreachable_exempt=unreachable_exempt,
+                          refused_exempt=refused_exempt,
+                          encircled_exempt=encircled_exempt,
+                          unmet_after_exempt=unmet_leftover,
+                          undone_tiles=[list(t) for t in sorted(short_undone)[:24]],
                           note="阶段分下去的格没做完（非诚实上限）⇒ 当天 needs_review；"
-                               "`plot_pending` 是片区还剩多少格，两个口径分开记")
+                               "`plot_pending` 是片区还剩多少格，两个口径分开记。"
+                               "【Fix 1/2】三套豁免按**逐格求交**扣：只有既已被证明"
+                               "（走不到/被围死/游戏拒绝）又确实还欠着的格才算，"
+                               "`unmet_after_exempt` 是扣完之后仍欠的格数")
         if deferred_tiles:
             self._journal("deferred_tiles", tiles=deferred_tiles, night=bool(night_end),
                           by_kind=plot_pending_by_kind, stages=honest_stages[:6],
@@ -10346,35 +11167,38 @@ class LongRun:
                           attempted=attempted_steps, bound_basis=bound_basis_steps,
                           engaged=engaged_steps,
                           exempted=unreachable_exempt,
+                          evidenced=unreach_evidenced,
                           raw_unmet=raw_unmet, unmet=unmet_leftover,
                           tiles=[list(t) for t in sorted(unreach_day)[:12]],
-                          note="不可达豁免：界内不影响 verified；扣掉的格子在 leftover 里逐格可见"
+                          note="不可达豁免：界内不影响 verified"
+                               "（【Fix 2】豁免分子 = **日级**不可达格集合 ∩ 仍留在如实 shortfall "
+                               "阶段 `assigned_undone` 里的格（逐格坐标），不再只看"
+                               "「最后一条记录的 `unreachable_leftover`」—— 那种口径会在"
+                               "不可达格早在前几条记录就解掉、最后一条 leftover=0 时把豁免归零；"
+                               "`evidenced` 是求交后的格数，`exempted` 是过了界之后实扣的数）"
                                "（【task-78】上界分母 = `bound_basis`（发起过动作且**不是** encircled "
                                "的步数）；`attempted` 仍是原始证据计数、`engaged` = 真的站到过目标格"
                                "旁边的步数，两者都只作证据）")
-        # 【task-68】"被围住"的日级账本：**只报证据**，既不影响任何豁免，也不封格。
-        enc_day: set[tuple[int, int]] = set(self.encircled_day)
-        for s in rep.stages:
-            for t in (s.get("encircled_tiles") or []):
-                try:
-                    enc_day.add((int(t[0]), int(t[1])))
-                except (TypeError, ValueError, IndexError):
-                    continue
-        rep.encircled = len(enc_day)
-        rep.encircled_tiles = [list(t) for t in sorted(enc_day)]
+        # 【task-68】"被围住"的日级账本：`enc_day` 已在上面（Fix 1）算好；这里只负责**报账**
+        # （逐格证据 + 日级豁免的界与实扣）。
         tried_open_steps = sum(int(s.get("encircled_tried") or 0) for s in rep.stages)
         if enc_day:
             self._journal("encircled_summary", count=len(enc_day),
                           attempted=attempted_steps, bound_basis=bound_basis_steps,
+                          bound=encircled_bound, exempted=encircled_exempt,
                           engaged=engaged_steps, tried_open_steps=tried_open_steps,
                           tiles=[list(t) for t in sorted(enc_day)[:12]],
-                          note="四邻没有「可清障 + 自己够得着」的突破口 ⇒ 不算「走不到」、不封格、"
-                               "不进 unreachable 豁免；开路后/次日可能变可达"
+                          note="四邻没有「可清障 + 自己够得着」的突破口 ⇒ 不算「走不到」、不封格；"
+                               "【Fix 1】只对**逐格已证被围死、且仍留在如实 shortfall 阶段 "
+                               "`assigned_undone` 里**的格做有界豁免（界 = max(5, 20%×bound_basis)，"
+                               "与 unreachable/refused 各自独立）；预过滤的、已做成的、诚实上限"
+                               "（体力/夜里收工）留下的格一律不扣"
                                "（真实四邻 kind 与逐格开路次数见 encircled 事件的 kinds/tried_open；"
                                "本键 `tried_open_steps` 是当天合计）")
             rep.notes.append(
                 f"有 {len(enc_day)} 格四邻没有「可清障 + 自己够得着」的突破口 ⇒ 不算「走不到」、"
-                f"不进不可达豁免，只记 encircled 证据（为这些格试过开路 {tried_open_steps} 次）")
+                f"不进不可达豁免（自有一套有界豁免：界 {encircled_bound}、实扣 {encircled_exempt}；"
+                f"为这些格试过开路 {tried_open_steps} 次）")
         # 遮蔽可见性（Lead m02561 裁定 1）：同一阶段种类当天**更早**记录 leftover>0、**最后一条**
         # leftover==0 ⇒ "前一片地没做完、后一片地干净"的遮蔽发生了。**纯信息项**：不改 VERIFIED、
         # 不改退出码，只发 journal + 进 notes，让 run3 事后能人工复核。
@@ -10454,6 +11278,11 @@ class LongRun:
         # 【task-22 / 0.7.45】tiles[] 里字段残缺的 tile 记录数：不并入 unobserved，
         # 单独留痕并强制 day_justified=false（缺失≠通过，堵 deputy NIT-1 fail-open）。
         rep.pending_malformed = int(snap.get("malformed", 0))
+        # 【devcoder-clear-gate】只因满包清障闸（背包 0 空格 + 腾格用尽）而不执行的清障格数：
+        # 单独成桶，**不并入** `pending_unobserved`（那是"看不见/已陈旧"，与"今天被闸住"是两回事）。
+        # >0 ⇒ `is_justified_end(gated=…)` 直接 False ⇒ 当天永不 VERIFIED（`clear_gate` 的硬闸）。
+        # 老账本/旧快照没有该键 ⇒ 0（行为与改动前逐字一致）。
+        rep.pending_gated = int(snap.get("gated", 0) or 0)
         # 【task-27 / 0.7.46】逐格坐标证据（有序、各前 8 条；只读，不参与判据）：
         # `pending_executable_tiles` 让"day_justified 有证据"能落到具体坐标上；
         # `pending_stalled_tiles` 让"停滞/挡死"能逐格对账（不是只报一个数）。
@@ -10480,6 +11309,9 @@ class LongRun:
                 f"{rep.pending_unobserved} 格"
                 + (f"、观测记录残缺 {rep.pending_malformed} 格（不并入看不见，day_justified 必 false）"
                    if rep.pending_malformed else "")
+                + (f"、满包清障闸闸住 {rep.pending_gated} 格（背包 0 空格 + 腾格用尽；"
+                   "不并入看不见，day_justified 必 false）"
+                   if rep.pending_gated else "")
                 + ("（观测证据不可用 ⇒ 诚实收工判定不放行）" if outdoor_obs is None else ""))
         # 【task-16 / 0.7.45】背包空格与"清障掉落被游戏拒收"的日终留痕：**只作 info** ——
         # 满包清障照常算做成（不因此判失败、不改下面任何一个 checks 键）；但"掉的战利品可能
@@ -10515,8 +11347,12 @@ class LongRun:
             # task-52 防洗白：豁免只对"走不到"的格子生效，且**全部不可达 + 0 成功动作**时
             # 不许靠豁免把 `no_unmet_stages` 洗成 True（真空日必须仍判不达标）。
             # task-63 把同一条防洗白扩到 `refused`：两组豁免都非空且 0 成功 ⇒ 仍不达标。
+            # 【Fix 1】`encircled_exempt` 同样消费这个合取项：0 成功日就算整片只是"被围住"，
+            # 也不许靠豁免判达标（既有用例 `test_day_with_only_encircled_leftover_ends_honestly`
+            # 钉死"只有挡死格的一天不 VERIFIED"）。
             "no_unmet_stages": unmet_leftover == 0 and (
-                made_any_progress or (unreachable_exempt == 0 and refused_exempt == 0)),
+                made_any_progress or (unreachable_exempt == 0 and refused_exempt == 0
+                                      and encircled_exempt == 0)),
             "crops_watered": int(rep.final.get("unwatered_crops") or 0) == 0,
             # task-19：**唯一**浇水证据（卡面 §1；`tools\verify-run3.py` 缺这条即问题）。
             # 窗口口径的 `crops_watered` 只作旁证：它读的是 `_essence` 的窗口计数，在室内恒 0。
@@ -10527,10 +11363,13 @@ class LongRun:
             # **当前观测里可执行格为 0** 时才认（证据 = 上面的 `pending_executable`）；
             # 有活却收工/观测证据不可用 ⇒ 仍是 False，反向洗白用例钉死这条。
             # 【task-22 / 0.7.45】`pending_malformed > 0`（tiles[] 记录字段残缺）⇒ 一律 False。
+            # 【devcoder-clear-gate】`pending_gated > 0`（只因满包清障闸而不执行的清障格）⇒ 一律
+            # False：这一天是"活被背包闸住"（`clear_gate`），不是"没活可做"，永不 VERIFIED。
             "day_justified": is_justified_end(
                 rep.ended_by, rep.ended_reason,
                 pending_executable=rep.pending_executable,
-                malformed_tiles=rep.pending_malformed),
+                malformed_tiles=rep.pending_malformed,
+                gated=rep.pending_gated),
             # 【task-149 C】0 动作日**不许** VERIFIED —— 除非当天有真正独立的"无活可做"证据
             # （`sleep_guard` 在 farm 证据齐备且 `work_reasons` 为空时置的
             # `no_work_evidence_ok`）。run9c summer 20：22.81 秒、`ok_steps=0`、`decision=0`，
@@ -10554,6 +11393,8 @@ class LongRun:
                if rep.unreachable else "")
             + (f" 游戏拒绝 {rep.refused} 格（豁免界 {refused_bound}、实扣 {refused_exempt}）"
                if rep.refused else "")
+            + (f" 被围住 {rep.encircled} 格（有界豁免 界 {encircled_bound}、实扣 {encircled_exempt}）"
+               if rep.encircled else "")
             + f" 浇水 {water_info.get('scope')} 口径 干 {water_info.get('dry')}/{water_info.get('crops')}"
             + f"（watered_outdoor={watered_outdoor}）"
             + f" → {'VERIFIED' if rep.verified else 'needs_review'} {rep.checks}"
@@ -10632,6 +11473,11 @@ class LongRun:
         self._finish_intent_coverage(rep)
         self._gaps_flush(rep)
         self._lessons_flush(rep)
+        # 【devcoder-zone-retention】日终把每个田区的 blockers/unknown 快照落进 day_end +
+        # 跨日 sidecar `<journal>-zones.json`（append）。只作 info，不参与 checks/verified。
+        # tilesTruncated 的区在 `_zone_snapshot` 里标 `undecidable=True`（不强行 PASS）。
+        rep.zone_blockers = self._zone_snapshot(last_obs, split=self.zone_split)
+        self._flush_zone_sidecar(rep)
         self._journal("day_end", **rep.as_dict())
         return rep
 

@@ -107,6 +107,8 @@ TASK_KINDS: tuple[str, ...] = (
     "reduce_scope",     # 【task-168】规模取舍：主动认输一个田区（今天不做它，如实不 VERIFIED）
     "clear_dead",       # 清掉枯死作物（只清 crop.dead，活苗绝不碰；task-51）
     "ship",             # 出货（把今天亲手收获的东西放进农场出货箱，task-42）
+    "buy",              # 买种子（P0-5：游戏入口 ShopMenu.tryToPurchaseItem，money 差分校验）
+    "upgrade_tool",     # 工具升级（P0-6：铁匠铺 ClintUpgrade，tryToPurchaseItem + 观测差分）
     "recover_stamina",  # 体力恢复（进食/睡觉）
     "sleep",            # 收工过夜（跨日）
     "wait_for_save",    # 存档没加载，先读档

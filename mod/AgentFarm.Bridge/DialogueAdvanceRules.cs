@@ -42,6 +42,24 @@ namespace AgentFarm.Bridge
         internal const int StallRetryGapMs = 3000;
         internal const int ConsecutiveStallLimit = 2;
 
+        // 【dialogue-okfix / P1】关框后的宽限窗口。
+        // 真机现象：推完最后一句、`DialogueBox` 关掉之后，事件脚本常在极短时间内把下一句
+        // （甚至同一句的重放）又弹出来。旧实现"一看见 `box==null` 就立刻按成功返回"
+        // ⇒ 每个请求只推 1 步、剩下的步数要等脑侧下一次轮询（实测一轮 ~15s）。
+        // 现在关框后先宽限 REOPEN_GRACE_MS 看有没有**新的非提问** `DialogueBox`：
+        // 有 ⇒ 在同一请求内接着按原逻辑推（仍受 maxSteps / timeout 约束）；没有 ⇒ 按成功收尾。
+        internal const int ReopenGraceMs = 2000;
+
+        /// <summary>`box==null`（已推进过）时该收尾还是继续等宽限。</summary>
+        internal enum ClosedAfterProgress
+        {
+            /// <summary>按**成功**收尾（`FinishOk` ⇒ 回执 `ok=true`）。</summary>
+            FinishOk = 0,
+
+            /// <summary>还在宽限窗口里：本 tick 返回 null，下一 tick 再看有没有新对话框。</summary>
+            KeepWaiting = 1,
+        }
+
         // ---------------------------------------------------------------- 状态码
         // 与 Python 侧 `brain/agentfarm/longrun.py` 的守卫口径逐字对齐（见交付说明）。
         internal const string StatusOk = "ok";
@@ -133,6 +151,24 @@ namespace AgentFarm.Bridge
         internal static bool IsProgress(string progress)
         {
             return progress == ProgressAdvanced || progress == ProgressTyping || progress == ProgressMenuReplaced;
+        }
+
+        /// <summary>
+        /// 【P1】已经推进过 ≥1 步、且此刻 `DialogueBox` 为 null 时，接下来的动作。
+        ///
+        /// 判据顺序（同样是"越权/空转风险优先"）：
+        ///   1. `eventUp==false` ⇒ 事件本身结束了，没有"下一句"可言 ⇒ 立刻按成功收尾；
+        ///   2. 宽限未到 ⇒ 继续等（事件脚本常在关框后立刻弹出下一句）；
+        ///   3. 宽限到点仍无框 ⇒ 按成功收尾。
+        ///
+        /// 注意：宽限只影响"等多久"，**不影响**能不能点 —— 点击仍然每次都过
+        /// <see cref="Precheck"/>，提问/职业选择一次都不会点。
+        /// </summary>
+        internal static ClosedAfterProgress AfterBoxClosed(bool eventUp, long waitedMs)
+        {
+            if (!eventUp) return ClosedAfterProgress.FinishOk;
+            if (waitedMs >= ReopenGraceMs) return ClosedAfterProgress.FinishOk;
+            return ClosedAfterProgress.KeepWaiting;
         }
     }
 }

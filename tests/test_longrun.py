@@ -44,7 +44,7 @@ from agentfarm.longrun import (  # noqa: E402
     ACTIONLESS_TASKS, CLEANUP_DISMISS_MAX, CLEARABLE_KINDS, DEFAULT_LLM_MAX_TOKENS,
     ENDED_BY_EVENT, ENDED_BY_MODAL,
     EVENT_ADVANCE_DAY_STEPS, EVENT_ADVANCE_MAX_STEPS, EVENT_STALL_GIVE_UP,
-    EVENT_WAIT_SECONDS, EVENT_WAIT_TRIES,
+    EVENT_WAIT_SECONDS, EVENT_WAIT_TRIES, EVENT_WAIT_EXTRA_TRIES,
     FAR_DRY_MAX_TRIES, FAR_DRY_OPEN_MAX, FAR_DRY_REFILL_MAX,
     FRONTIER_CLEAR_MAX, INTENT_REASON_CODES, JUSTIFIED_END_REASONS, MAX_BUY_TRIES_PER_DAY,
     MAX_ENV_ATTEMPTS,
@@ -201,6 +201,16 @@ class FakeWorld:
         #: NPC 所在格（默认就在玩家四邻内 ⇒ 默认相邻）。测试 `not_adjacent` 时挪远。
         self.npc_tile = [63, 13]
         self.talk_calls: list[dict] = []
+        #: 【devcoder-backpack-interact】背包升级触发方式从 `talk(Pierre)` 改为
+        #: `interact(柜台背包展示物)`。`interact_mode` 决定 `interact` 回执形态，对齐
+        #: 原 `talk_mode`（`ok` / `not_supported` / `no_action` / `no_question` /
+        #: `response_missing` / `response_ambiguous`）。默认 `None` ⇒ `FakeClient.interact`
+        #: 走**作物**路径（其它用例不受影响）；背包用例显式赋值。
+        self.interact_mode: str | None = None
+        self.interact_calls: list[dict] = []
+        #: 观测 `location.objects`（待售背包展示物桶）；空 ⇒ `_backpack_find_object_tile`
+        #: 找不到格、走 `interact(tile=None)` 兜底。
+        self.objects: list[dict] = []
         #: 应答后的购买结果：`ok`（钱 −2000、容量 24）/ `money_unchanged`（只关对话）/
         #: `capacity_unchanged`（扣钱不扩容）/ `dismiss_new_day`（应答导致跨日 ⇒ 差分歧义）。
         self.purchase_mode = "ok"
@@ -290,7 +300,8 @@ class FakeWorld:
             "location": {"name": self.location, "isOutdoorFarm": self.is_outdoor_farm, "tiles": tiles,
                          "tilesTruncated": False,
                          "tillable": [list(t) for t in free], "refillTiles": [[70, 10], [70, 11]],
-                         "refillTilesTruncated": False, "furniture": [], "doors": []},
+                         "refillTilesTruncated": False, "furniture": [], "objects": list(self.objects),
+                         "doors": []},
             # task-19：真机观测里 `farm` 永远存在（未加载时 loaded=false/complete=true/全 0）。
             # 【task-96 / task-99 ②】默认 `_EMPTY_FARM_SCAN`（桥在线、扫描完整、农场级无事可报）；
             # 显式赋值（含 `{}` / `complete=false` / `loaded=false`）原样发出；
@@ -427,6 +438,40 @@ class FakeWorld:
         return dict(base, ok=True, status="ok", code="ok", applied=True,
                     activeMenu="DialogueBox", activeMenuText=self.dialogue_question_text,
                     dialogueIsQuestion=bool(question), dialogueResponses=responses)
+
+    # ---- 【devcoder-backpack-interact】柜台背包展示物的 `interact`（GameLocation.checkAction）----
+    def interact_for_backpack(self, tile, *, timeout_ms=None) -> dict:
+        """`interact` 的背包场景假世界版：对齐原 `talk` 回执形状（含 `dialogueIsQuestion` /
+        `dialogueResponses`），让生产代码走通"开提问框 → 精确匹配 Purchase → dismiss_modal 应答"。
+
+        回执字段对齐协议：`code`/`status`/`applied`/`activeMenu`/`dialogueIsQuestion`/
+        `dialogueResponses`（下游 `_maybe_buy_backpack_upgrade` 只读这些）。
+        """
+        mode = str(self.interact_mode)
+        if mode == "not_supported":
+            return {"ok": False, "status": "not_supported", "code": "not_supported",
+                    "applied": False, "reason": "假世界：interact 未实现"}
+        if mode == "no_action":
+            return {"ok": False, "status": "no_action", "code": "no_action",
+                    "applied": False, "reason": "checkAction 返回 false（没开任何 UI）"}
+        question = mode not in ("no_question",)
+        responses = list(self.dialogue_responses)
+        if mode == "no_question":
+            responses = []
+        elif mode == "response_missing":
+            responses = ["No"]
+        elif mode == "response_ambiguous":
+            responses = ["Purchase", "purchase"]
+        self.ui_script = [{
+            "activeMenu": "DialogueBox",
+            "activeMenuText": self.dialogue_question_text,
+            "eventUp": False,
+            "dialogueIsQuestion": bool(question),
+            "dialogueResponses": responses,
+        }]
+        return {"ok": True, "status": "ok", "code": "ok", "applied": True,
+                "activeMenu": "DialogueBox", "activeMenuText": self.dialogue_question_text,
+                "dialogueIsQuestion": bool(question), "dialogueResponses": responses}
 
     def dismiss(self, *, answer_index=None, answer_text=None) -> dict:
         """`dismiss_modal` 的假世界版：关掉队首模态（露出下一个）并如实返回回执。
@@ -754,8 +799,12 @@ class FakeClient:
         return {"ok": True, "status": "ok", "location": str(name)}
 
     def interact(self, tile, *, timeout_ms=None):
+        self.w.interact_calls.append({"tile": tile, "timeout_ms": timeout_ms})
+        # 【devcoder-backpack-interact】背包升级交互：interact_mode 非空时走背包回执
+        if self.w.interact_mode is not None:
+            return self.w.interact_for_backpack(tile, timeout_ms=timeout_ms)
         # 【task-170】作物格：模拟游戏 `checkAction` 真的摘（`harvest_on_interact` 可关）。
-        if self.w.harvest_on_interact and tuple(tile) in self.w.crops:
+        if tile is not None and self.w.harvest_on_interact and tuple(tile) in self.w.crops:
             self.w.interacted.append(tuple(tile))
             return self.w.harvest_now(tile)
         return {"ok": True, "status": "ok", "reason": "假世界：交互不影响跨日"}
@@ -10794,7 +10843,13 @@ class TestTask198InventoryDay(unittest.TestCase):
         return [e for e in run.entries if e["event"] == name]
 
     def test_full_bag_with_many_ripe_ends_inventory_blocked_not_stuck(self):
-        """满包 + 8 格熟 + 腾不出 ⇒ `inventory_blocked`（**不是** `stuck`、不是 `no_work`）。"""
+        """满包 + 8 格熟 + 腾不出 ⇒ `inventory_blocked`（**不是** `stuck`、不是 `no_work`）。
+
+        【590f154 修复】last-resort 会先把一叠非保护 Mystery Thing `(O)999` 腾出去（free_slots 1），
+        但 1 格仍收不进 8 格熟 ⇒ 仍诚实 `inventory_blocked`；受保护物（工具）绝不进卖单。harvest
+        阶段因空格仍不够、不再以 `stopped=no_slot` 记录（stages 为空属正常），故移除旧的 harvest
+        阶段断言、改钉"last-resort 只送非保护物"这一诚实不变量。
+        """
         run, w, _client = self._day(rows=12, ripe=self.RIPE_TILES)
         rep = run.days[0]
         self.assertEqual(rep.ended_by, "inventory_blocked")
@@ -10805,13 +10860,16 @@ class TestTask198InventoryDay(unittest.TestCase):
         self.assertTrue(rep.checks["no_hard_failures"])
         # 【task-28 卡 D 口径】`inventory_blocked` 过了四门槛（0 空格/腾格手段用尽/
         # pending_executable=0/pending_malformed=0）⇒ 诚实收工**可** justified；
-        # 但这天 harvest 阶段还有 8 格 leftover（未分派）⇒ `no_unmet_stages` 仍 false，
+        # 但这天 harvest 还有 8 格 leftover（未分派）⇒ `no_unmet_stages` 仍 false，
         # 所以整体 VERIFIED 依旧 false（不是洗白）。
         self.assertTrue(rep.checks["day_justified"], rep.checks)
         self.assertFalse(rep.verified, "背包堵住当天不许假 VERIFIED")
-        stage = [s for s in rep.stages if s["stage"] == "harvest"][-1]
-        self.assertEqual(stage["leftover"], self.RIPE_TILES, "_leftover 仍如实")
-        self.assertEqual(stage["stopped"], "no_slot")
+        # 【590f154 修复】last-resort 把一叠非保护 Mystery Thing 腾出去；受保护物（工具/武器/
+        # 种子/建材/锭）永不卖。
+        sell_ev = [e for e in run.entries if e.get("event") == "sell"
+                   and e.get("strategy") == "space_relief_ship"]
+        self.assertTrue(sell_ev, "last-resort 应送一叠非保护物腾格")
+        self.assertTrue(all(e.get("qid") == "(O)999" for e in sell_ev), sell_ev)
         self.assertEqual(len(w.crops), self.RIPE_TILES)
         self.assertEqual(len(self._events(run, "inventory_blocked")), 1)
 
@@ -12440,8 +12498,12 @@ class TestTask232SpacePressure(unittest.TestCase):
         worker = _SpaceWorker(w)
         run = self._run(w, worker)
         rep = DayReport(day_key=("summer", 3, 1), started_at=0.0)
-        self.assertFalse(run._slot_relief(w.obs(), rep))
-        self.assertEqual(worker.sell_calls, [])
+        # 【590f154 修复】last-resort 可能送一叠非保护物（Hay/Moss/Mystery 表外盈余）腾格，
+        # 但**绝不动保护物**（工具/种子/建材/锭）。"没有可卖盈余叠"的判定（inventory_blocked）照旧。
+        run._slot_relief(w.obs(), rep)
+        sold_qids = [c["whitelist"][0] for c in worker.sell_calls]
+        PROTECTED = {"(T)Axe", "(T)Hoe", "(T)WateringCan", "(O)472"}  # 工具 + 小麦种子
+        self.assertTrue(all(q not in PROTECTED for q in sold_qids), sold_qids)
         self.assertTrue(run.inventory_blocked_today)
         self.assertEqual(len(self._events(run, "inventory_blocked")), 1)
         last = rep.stages
@@ -12469,7 +12531,14 @@ class TestTask232SpacePressure(unittest.TestCase):
                        self._row(11, "(O)178", "Hay", 5)]
         run = self._run(w, _SpaceWorker(w))
         rep = DayReport(day_key=("summer", 3, 1), started_at=0.0)
-        self.assertFalse(run._slot_relief(w.obs(), rep))
+        # 【590f154 修复】last-resort 可送一叠非保护盈余（Hay/Moss/Mystery）腾格，但工具/种子/升级
+        # 锭（Copper Bar 334）**绝不**进卖单——这正是对 §5 的守护。不再断言"什么都不卖"。
+        run._slot_relief(w.obs(), rep)
+        sold_qids = [c["whitelist"][0] for c in run.worker.sell_calls]
+        ALLOWED = {"(O)178", "(O)Moss", "(O)999"}      # 非保护表外盈余
+        PROTECTED = {"(T)Axe", "(T)Pickaxe", "(O)472", "(O)334"}  # 工具/种子/铜锭
+        self.assertTrue(all(q in ALLOWED for q in sold_qids), sold_qids)
+        self.assertTrue(all(q not in PROTECTED for q in sold_qids), sold_qids)
         self.assertTrue(run.inventory_blocked_today)
 
     def test_relief_is_bounded_per_day(self):
@@ -12758,6 +12827,51 @@ class TestTask240SeedSeasons(unittest.TestCase):
         self.assertTrue(day.verified, day.checks)
         self.assertIs(run.no_work_evidence_ok, True)
 
+    def test_no_work_sleep_escapes_walked_loop_without_hanging(self):
+        """devcoder-no-work-sleep：冬季/无种/满包、账本仍有 pending 格 ⇒ 守卫每轮拒绝、
+        `_guard_leftover_resume` 反复 "walked" 回到 leftover 仍拿不出可执行目标。
+
+        回归：之前这条路径会无限循环（LLM 重试挂起 ⇒ 被外部杀掉、无 day_end），或撞到
+        `_guard_walk_streak>=10` 的 `stuck:` 睡眠被 `_unfinished_work` 挡成 `slept_without_work`
+        ⇒ 不跨日、整轮自停。修复后连续 3 轮"LLM 意图 + 确定性兜底均无可执行目标、当日 0 农场动作"
+        即诚实 `no_work` 收工、干净跨日（不无限循环、不是 slept_without_work）。
+        """
+        w = FakeWorld(weeds=0, seeds=0, money=0)
+        w.season = "winter"
+        w.day = 1
+        w.farm = {"loaded": True, "complete": True, "crops": 0, "ripeCrops": 0,
+                  "readyCrops": 0, "deadCrops": 0, "dryCrops": 0, "dryDeadCrops": 0,
+                  "dryTiles": [], "dryTilesTruncated": False, "unwateredCrops": 0,
+                  "hoeDirt": 29, "emptyDirt": 29}
+        w.player_seeds = [self._seed("(O)472", "Wheat Seeds", 10,
+                                     ["spring", "summer", "fall"], False)]
+        run = self._run(w)
+        # 桩策略/兜底：每轮都"返回无可执行目标"（LLM 意图与确定性兜底都落不到地上）。
+        run.planner = FakePlanner()
+        run._fallback_decision = lambda brief, rep: SimpleNamespace(intents=[])
+        # 账本里留一格未封格、未被围的 pending，让守卫每轮都拒绝放行 ⇒ 走回 leftover。
+        run.leftover_targets = {(60, 10)}
+        run.leftover_area = {(60, 10): "field_nw"}
+        w.player_tile = [62, 14]            # 站在别处，保证走回 leftover 真的 "walked"
+        before_day = w.day
+        run.run()
+        self.assertEqual(len(run.days), 1)
+        day = run.days[0]
+        self.assertEqual(day.ended_by, "sleep")
+        self.assertTrue(str(day.ended_reason).startswith("no_work"),
+                        f"当天应以 no_work 收工，实际：{day.ended_reason}")
+        self.assertNotIn("stuck", str(day.ended_reason))
+        # 不是 slept_without_work：睡眠成功 ⇒ 游戏日干净前进。
+        self.assertFalse(day.slept_without_work, "不该落到 slept_without_work（否则不跨日）")
+        self.assertTrue(day.slept_ok, "睡眠成功 ⇒ 当天干净跨日")
+        # 干净跨日：游戏日确实前进了（没卡在当天、没被外部杀掉）。
+        self.assertEqual(w.day, before_day + 1, "游戏日应干净前进一天")
+        # day_justified 应为 True（no_work 在 JUSTIFIED_END_REASONS 白名单）。
+        self.assertTrue(getattr(day, "checks", {}).get("day_justified"), day.checks)
+        # 没有无限循环：walked 轮次被阈值 3 收敛（不会一直 continue 到被外部杀掉）。
+        self.assertLessEqual(run.resume_walks, 3,
+                             f"应在 3 轮内收敛，实际 resume_walks={run.resume_walks}")
+
     def test_farm_level_plant_reason_needs_a_window_target(self):
         """【task-240 ③】当季种子够、farm 口径也有空耕地，但**窗口里一格目标都没有** ⇒
         farm 计数不许变成「该去种」（farm 计数 vs 400 格窗口目标池错配，冒烟 day1 根因 B）。"""
@@ -13011,20 +13125,22 @@ class TestTask245EventWait(unittest.TestCase):
     def _events(run: LongRun, event: str) -> list[dict]:
         return [e for e in run.entries if e["event"] == event]
 
-    def test_event_without_dialogue_waits_bounded_then_blocks_with_event_id(self):
-        """①`eventUp=true` + 无对话盒 ⇒ 有界等 4 轮、带上 eventId 才诚实收尾。"""
+    def test_event_without_dialogue_waits_full_window_then_blocks_with_event_id(self):
+        """①`eventUp=true` + 无对话盒（冻结过场）⇒ 给足整段等待窗 total_limit 轮、带上 eventId
+        才诚实收尾（Fix A：无对话框冻结态是正常过场，不再提前判死）。"""
         w = FakeWorld(weeds=0)
         w.ui_script = [{"activeMenu": "", "activeMenuText": "", "eventUp": True,
                         "eventId": "900553"}]
         run = self._run(w)
         rep = self._rep()
+        total_limit = EVENT_WAIT_TRIES + EVENT_WAIT_EXTRA_TRIES
 
         obs, blocked = run._clear_modals(w.obs(), rep)
 
         self.assertTrue(blocked)
         waits = self._events(run, "event_wait")
-        self.assertEqual(len(waits), EVENT_WAIT_TRIES, run.entries)
-        self.assertEqual([e["tries"] for e in waits], list(range(1, EVENT_WAIT_TRIES + 1)))
+        self.assertEqual(len(waits), total_limit, run.entries)
+        self.assertEqual([e["tries"] for e in waits], list(range(1, total_limit + 1)))
         for e in waits:
             self.assertEqual(e["eventId"], "900553", e)
             self.assertEqual(e["limit"], EVENT_WAIT_TRIES, e)
@@ -13033,15 +13149,14 @@ class TestTask245EventWait(unittest.TestCase):
         ev = self._events(run, "event_blocked")
         self.assertEqual(len(ev), 1, run.entries)
         self.assertEqual(ev[0]["eventId"], "900553", ev[0])
-        self.assertEqual(ev[0]["eventWaitTries"], EVENT_WAIT_TRIES, ev[0])
-        self.assertAlmostEqual(ev[0]["eventWaitSeconds"],
-                               EVENT_WAIT_TRIES * EVENT_WAIT_SECONDS)
+        self.assertEqual(ev[0]["eventWaitTries"], total_limit, ev[0])
+        self.assertAlmostEqual(ev[0]["eventWaitSeconds"], total_limit * EVENT_WAIT_SECONDS)
         self.assertIsNotNone(ev[0]["worldSeq"], ev[0])
         self.assertEqual(w.dismiss_calls, 0, "事件等待期间绝不许关框")
         self.assertEqual(w.sleeps, 0, "事件等待期间绝不许睡觉")
         self.assertEqual(rep.ended_by, ENDED_BY_EVENT, rep.ended_reason)
         self.assertIn("900553", rep.ended_reason)
-        self.assertIn("60s", rep.ended_reason)
+        self.assertIn(f"{total_limit * EVENT_WAIT_SECONDS:.0f}s", rep.ended_reason)
         self.assertFalse(rep.verified)
 
     def test_event_ending_during_wait_is_not_blocked(self):
@@ -13123,7 +13238,8 @@ class TestTask245EventWait(unittest.TestCase):
         self.assertEqual(len(run.days), 1, [d.day_text for d in run.days])
         self.assertEqual(w.dismiss_calls, 0)
         self.assertEqual(w.sleeps, 0)
-        self.assertEqual(len(self._events(run, "event_wait")), EVENT_WAIT_TRIES)
+        self.assertEqual(len(self._events(run, "event_wait")),
+                         EVENT_WAIT_TRIES + EVENT_WAIT_EXTRA_TRIES)
         self.assertEqual(len(self._events(run, "event_blocked")), 1, run.entries)
         self.assertEqual(run.days[0].checks.get("no_blocking_modal"), False)
 
@@ -13140,6 +13256,149 @@ class TestTask245EventWait(unittest.TestCase):
         self.assertFalse(blocked, rep.ended_reason)
         self.assertEqual(len(self._events(run, "event_wait")), 0, run.entries)
         self.assertEqual(w.dismiss_calls, 1)
+
+
+class TestSpring1EventFreeze(unittest.TestCase):
+    """devcoder-spring1-event：修复 spring1 Kent 归来事件（eventId=63，skippable 过场，
+    command 6=pause/动画/视口自播、三合一指纹 worldSeq+eventCommand+dialogueLines 全冻是正常态）
+    被误判 `event_blocked` 的两处 bug。
+
+    Fix A（`_wait_event_up`）：无对话框冻结态是正常过场，**不再提前判死**，给足整段等待窗
+    `total_limit = EVENT_WAIT_TRIES + EVENT_WAIT_EXTRA_TRIES`，只跑到 `total_limit` 仍
+    `eventUp` 才诚实 `event_blocked`（不无限等）。
+    Fix B（day 主循环）：`ui.eventUp=true` 期间**冻结一切经济/农事动作**，只轮询等事件结束。
+
+    红线：不替游戏 dismiss/选选项；提问/职业选择一次不碰；永不结束的事件仍诚实 `event_blocked`。
+    """
+
+    def _run(self, w: "FakeWorld") -> LongRun:
+        run = make_run(w, target_days=1)
+        run.worker = FakeWorker(w)
+        run.client = FakeClient(w)
+        return run
+
+    @staticmethod
+    def _rep() -> DayReport:
+        return DayReport(day_key=("spring", 1, 9), started_at=0.0)
+
+    @staticmethod
+    def _events(run: LongRun, event: str) -> list[dict]:
+        return [e for e in run.entries if e["event"] == event]
+
+    def test_fix_a_frozen_event_waits_full_window_then_blocks(self):
+        """(a1) 无对话框冻结态（worldSeq/eventCommand/dialogueLines 全冻）：不提前死，
+        跑到 total_limit 仍 eventUp 才诚实 event_blocked；`tries == total_limit`。"""
+        w = FakeWorld(weeds=0)
+        w.ui_script = [{"activeMenu": "", "eventUp": True, "eventId": "63",
+                        "eventCommand": 6, "dialogueLines": 0}]
+        run = self._run(w)
+        rep = self._rep()
+        total_limit = EVENT_WAIT_TRIES + EVENT_WAIT_EXTRA_TRIES
+
+        out_obs, still_blocked, tries = run._wait_event_up(w.obs())
+
+        self.assertTrue(still_blocked, run.entries)
+        self.assertEqual(tries, total_limit, run.entries)
+        waits = self._events(run, "event_wait")
+        self.assertEqual(len(waits), total_limit, run.entries)
+        # 冻结过场应进入延长窗（extended=True），不再因"指纹不动"提前判死
+        self.assertTrue(all(e["extended"] for e in waits[EVENT_WAIT_TRIES:]),
+                        "冻结过场应一路进入延长窗（extended=True），不提前判死")
+        # 注：`_wait_event_up` 只负责"有界等待 + 诚实返回 still_blocked"，`event_blocked` 账本
+        # 由调用方（`_clear_modals` / day 主循环护栏）落 —— 见 test_fix_b_*（经 run() 触发）。
+
+    def test_fix_a_event_ending_before_window_is_not_blocked(self):
+        """(a2) 过场在 total_limit 之前自己播完（eventUp 变 False）⇒ still_blocked=False，
+        `tries < total_limit`（不提前死、不无限等）。"""
+        w = FakeWorld(weeds=0)
+        w.ui_script = [{"activeMenu": "", "eventUp": True, "eventId": "63",
+                        "eventCommand": 6, "dialogueLines": 0,
+                        "_autoGoneAfterPolls": 2}]   # 看 2 次后过场结束
+        run = self._run(w)
+        rep = self._rep()
+        total_limit = EVENT_WAIT_TRIES + EVENT_WAIT_EXTRA_TRIES
+
+        out_obs, still_blocked, tries = run._wait_event_up(w.obs())
+
+        self.assertFalse(still_blocked, run.entries)
+        self.assertLess(tries, total_limit, run.entries)
+        self.assertEqual(len(self._events(run, "event_blocked")), 0, run.entries)
+        self.assertEqual(self._events(run, "event_wait")[-1]["eventUp"], False,
+                         "最后一跳应观测到 eventUp=False（过场结束）")
+
+    def test_fix_b_question_event_still_blocked_not_passed(self):
+        """(b) 回归：eventUp + 提问 ⇒ 仍立刻硬停（0 轮等待、不 dismiss），不被 Fix A/B 误放行。"""
+        w = FakeWorld(weeds=0)
+        w.ui_script = [{"activeMenu": "DialogueBox", "eventUp": True,
+                        "dialogueIsQuestion": True, "dialogueResponses": ["Yes", "No"],
+                        "activeMenuText": "领养宠物？"}]
+        run = self._run(w)
+        rep = self._rep()
+
+        obs, blocked = run._clear_modals(w.obs(), rep)
+
+        self.assertTrue(blocked, rep.ended_reason)
+        self.assertEqual(len(self._events(run, "event_wait")), 0,
+                         "提问事件不许用等待掩盖（必须立刻停）")
+        self.assertEqual(len(self._events(run, "event_blocked")), 1, run.entries)
+        self.assertEqual(w.dismiss_calls, 0)
+
+    def test_fix_b_day_loop_freezes_economy_while_event_up(self):
+        """(c) Fix B：day 主循环 eventUp=true 期间不调用任何经济/农事原语
+        （sell/buy/goto_farm/walk/plant/water/clear），只进入等待。"""
+        w = FakeWorld(weeds=0)
+        w.ui_script = [{"activeMenu": "", "eventUp": True, "eventId": "63",
+                        "eventCommand": 6, "dialogueLines": 0}]
+        run = self._run(w)
+        # 记录任何"日常动作"原语是否被调用
+        called: list[str] = []
+        economy_methods = (
+            "_sell_surplus_for_seeds", "_sell_surplus_for_slot", "_sell_surplus_for_space",
+            "_buy_seed", "_maybe_buy_backpack_upgrade", "_goto_farm_for_water",
+            "_execute", "_ship_loot", "_slot_relief", "_ship_one_stack_for_space",
+        )
+        for name in economy_methods:
+            orig = getattr(run, name)
+            def _track(orig=orig, name=name, *a, **k):
+                called.append(name)
+                return orig(*a, **k)
+            setattr(run, name, _track)
+
+        code = run.run()
+
+        blocked_events = self._events(run, "event_blocked")
+        self.assertEqual(len(blocked_events), 1, run.entries)
+        self.assertEqual(code, 1, run.logs)
+        self.assertEqual(called, [],
+                         f"eventUp 期间不应调用任何经济/农事原语，实际调用了 {called}")
+
+    def test_fix_b_guard_freezes_economy_when_clear_modals_returns_event_up(self):
+        """(c-2) 直接验证 Fix B 护栏：当 `_clear_modals` 因事件有可推进对话返回 False
+        （eventUp 仍 True）时，day 主循环进入护栏、冻结经济动作、只轮询等待；绝不跑去卖/买。"""
+        w = FakeWorld(weeds=0)
+        w.ui_script = [{"activeMenu": "", "eventUp": True, "eventId": "63"}]
+        run = self._run(w)
+        # 模拟 `_clear_modals` 的 "advance_possible ⇒ 返回 False" 分支（eventUp 仍 True）
+        run._clear_modals = lambda obs, rep: (obs, False)   # type: ignore[method-assign]
+        # 护栏调 `_wait_event_up`：返回 blocked=True ⇒ 诚实收尾（不跑经济）
+        run._wait_event_up = lambda obs: (obs, True, EVENT_WAIT_TRIES + EVENT_WAIT_EXTRA_TRIES)  # type: ignore[method-assign]
+        called: list[str] = []
+        economy_methods = (
+            "_sell_surplus_for_seeds", "_buy_seed", "_execute",
+            "_maybe_buy_backpack_upgrade", "_goto_farm_for_water", "_slot_relief",
+        )
+        for name in economy_methods:
+            orig = getattr(run, name)
+            def _track(orig=orig, name=name, *a, **k):
+                called.append(name)
+                return orig(*a, **k)
+            setattr(run, name, _track)
+
+        code = run.run()
+
+        self.assertEqual(code, 1, run.logs)
+        self.assertEqual(called, [],
+                         f"护栏应冻结一切经济/农事动作，实际调用了 {called}")
 
 
 class _EmptyDecision:
@@ -13387,7 +13646,28 @@ class TestTask15PendingCaliber(unittest.TestCase):
 
 class _LootMarkingWorker(FakeWorker):
     """【task-16 测试】模拟 `farmwork.clear()` 的掉落证据：世界背包 0 空格时，
-    清成功也带 `loot_lost`（游戏拒收掉落 / `Inventory Full`），除此之外行为与 `FakeWorker` 一致。"""
+    清成功也带 `loot_lost`（游戏拒收掉落 / `Inventory Full`），除此之外行为与 `FakeWorker` 一致。
+
+    【590f154 修复】补 `sell(slot, whitelist=...)` —— last-resort 空间腾格会真的把整叠搬走
+    （钱等 NewDay，不在卖货时动），这样 `_slot_relief` 的 last-resort 在假世界里也能腾出格子。
+    """
+
+    def __init__(self, world: FakeWorld, *, log=print) -> None:
+        super().__init__(world, log=log)
+        self.sell_calls: list[dict] = []
+
+    def sell(self, slot, *, whitelist=None, timeout_ms=8000):
+        self.sell_calls.append({"slot": int(slot), "whitelist": [str(x) for x in (whitelist or [])]})
+        row = next((r for r in self.w.inventory if int(r.get("slot") or 0) == int(slot)), None)
+        if row is None:
+            return StepResult("sell", None, ok=False, code="not_found",
+                              reason="假世界：这格不在背包里")
+        self.w.inventory.remove(row)
+        st = StepResult("sell", None, ok=True, code="ok",
+                        reason="假世界：卖出整叠（钱等 NewDay）")
+        st.before = {"slot": int(slot), "qid": row.get("qualifiedId"), "stack": row.get("stack")}
+        st.after = {"slot": int(slot), "qid": row.get("qualifiedId"), "stack": 0}
+        return st
 
     def run_stage(self, stage, tiles, *, min_stamina=12.0, max_steps=200):
         res = super().run_stage(stage, tiles, min_stamina=min_stamina, max_steps=max_steps)
@@ -13580,9 +13860,16 @@ class TestTask16InventoryFull(unittest.TestCase):
         worker = _SpaceWorker(w)
         run = self._run(w, worker)
         rep = self._rep()
-        for _ in range(SLOT_RELIEF_MAX + 2):
-            self.assertFalse(run._slot_relief(w.obs(), rep))
-        self.assertEqual(worker.sell_calls, [], "没有可卖叠 ⇒ 不许空转卖货请求")
+        # 【590f154 修复】满包 Hay（非保护表外物）：last-resort 会成功腾出一叠 Hay（第一次返回
+        # True），此后不再空转（其余返回 False）。受保护物（工具/种子/建材/锭）永远不卖。
+        results = [run._slot_relief(w.obs(), rep) for _ in range(SLOT_RELIEF_MAX + 2)]
+        self.assertTrue(any(results), "满包 Hay：last-resort 应成功腾出一叠非保护物")
+        self.assertEqual(results.count(True), 1,
+                         "只应发一次卖货请求（腾出后不再空转）：%s" % results)
+        self.assertGreaterEqual(len(worker.sell_calls), 1,
+                                "没有可卖叠 ⇒ 仍须走 last-resort 卖非保护叠；不许空转")
+        sold_qids = [c["whitelist"][0] for c in worker.sell_calls]
+        self.assertTrue(all(q == "(O)178" for q in sold_qids), sold_qids)
         self.assertFalse(run.inventory_blocked_today, "腾不出 ≠ 背包堵死（不许判失败）")
         ev = self._events(run, "slot_relief")
         self.assertEqual(len(ev), 1, f"每天只留痕一次：{ev}")
@@ -13649,22 +13936,46 @@ class TestTask16InventoryFull(unittest.TestCase):
 
         rep = run.days[0]
         self.assertGreaterEqual(calls["n"], 1)
-        # 卡 D C：满包 + 腾不出 ⇒ 清障池为空 ⇒ 没有 ok clear、也没有掉落丢失
+        # 卡 D C：满包 ⇒ 没有 ok clear、也没有掉落丢失（loot_lost_steps==0，下面断言）
         self.assertEqual(rep.loot_lost_steps, 0, rep.notes)
         self.assertFalse(rep.loot_lost_tiles)
         self.assertFalse(rep.loot_lost_items)
-        self.assertTrue(any("满包清障闸" in n for n in rep.notes), rep.notes)
-        gate = [e for e in self._events(run, "slot_relief")
-                if e.get("trigger") == "clear_gate"]
-        # `run.run()` 会跑到"次日"再停（每模拟日重置闸门标记），所以按事件内容断言；
-        # 单日只留痕一次由 `clear_area_bag_gate_noted` 保证（见 longrun.py:6372）。
-        self.assertGreaterEqual(len(gate), 1)
-        self.assertEqual(gate[0].get("loot_lost_limit"),
-                         longrun_mod.CLEAR_LOOT_LOSS_MAX_STEPS)
-        self.assertEqual(gate[0].get("stage"), "clear_area")
+        # 【590f154 修复】满包必须被**诚实**处理，两条合法路径之一：
+        #  (A) 满包清障闸拦住（落地即丢、不新开 clear_area）⇒ 留 "满包清障闸" 痕迹；
+        #  (B) last-resort 把一叠非保护 Hay 腾出去 ⇒ 腾出后就有空格，掉落实则不会丢。
+        # 本夹具走 (B)：Hay 被腾出、clear_area 照常推进，故 clear_gate 不再触发 —— 行为正确，
+        # 关键不变量是"不白丢战利品 + 不连坐 checks"（见下）。
+        gated = any("满包清障闸" in n for n in rep.notes)
+        self.assertTrue(gated or worker.sell_calls,
+                        f"满包必须被诚实处理（清障闸拦住 或 last-resort 腾格）：{rep.notes}")
+        if gated:
+            gate = [e for e in self._events(run, "slot_relief")
+                    if e.get("trigger") == "clear_gate"]
+            # `run.run()` 会跑到"次日"再停（每模拟日重置闸门标记），所以按事件内容断言；
+            # 单日只留痕一次由 `clear_area_bag_gate_noted` 保证（见 longrun.py:6372）。
+            self.assertGreaterEqual(len(gate), 1)
+            self.assertEqual(gate[0].get("loot_lost_limit"),
+                             longrun_mod.CLEAR_LOOT_LOSS_MAX_STEPS)
+            self.assertEqual(gate[0].get("stage"), "clear_area")
+        else:
+            # 走 (B)：卖出的是非保护 Hay，且日终确有空格（腾出成功）。
+            sold_qids = [c["whitelist"][0] for c in worker.sell_calls]
+            self.assertTrue(all(q == "(O)178" for q in sold_qids), sold_qids)
+            self.assertGreaterEqual(int(rep.free_slots_last), 1)
         # 日终 trace 仍如实（容量−行数；不猜）
         self.assertEqual(rep.free_slots_status, "ok")
-        self.assertEqual(int(rep.free_slots_last), 0)
+        # 【590f154 修复】last-resort 可能送一叠非保护 Hay 腾格 ⇒ free_slots_last 只需 >= 0；
+        # 受保护物（工具/种子）绝不进卖单。
+        self.assertGreaterEqual(int(rep.free_slots_last), 0)
+        self.assertTrue(
+            all(c["whitelist"][0] not in {"(T)Axe", "(T)Hoe", "(T)WateringCan", f"(O){SEED_ID}"}
+                for c in worker.sell_calls),
+            f"受保护物（工具/种子）不许进卖单：{worker.sell_calls}")
+        if worker.sell_calls:
+            sold_qids = [c["whitelist"][0] for c in worker.sell_calls]
+            self.assertTrue(
+                all(q in {"(O)178", "(O)Moss", "(O)999"} for q in sold_qids),
+                f"last-resort 只送非保护盈余（Hay/Moss/Mystery）：{sold_qids}")
         d = rep.as_dict()
         self.assertEqual(d["loot_lost_steps"], 0)
         self.assertEqual(d["free_slots_last"], rep.free_slots_last)
@@ -13676,6 +13987,166 @@ class TestTask16InventoryFull(unittest.TestCase):
         # 背包满不是这一天的收工理由（不许被 loot 连坐）
         self.assertNotIn("inventory_blocked", str(rep.ended_by))
         self.assertNotIn("inventory_blocked", str(rep.ended_reason))
+
+
+class TestTask38SlotReliefFieldParity(unittest.TestCase):
+    """【task-38 / 0.7.48 快修】`slot_relief` 事件字段奇偶补齐的**定向护栏**。
+
+    背景：smoke-0746（0.7.47）步 7 FAIL —— 账本里 3 条 `slot_relief` 中 `trigger=clear_gate`
+    那条（`longrun.py::_note_clear_area_bag_gate`）只写了 demand/demand_basis/target_free，
+    **漏 `reached`**；task-237 规定的字段集是 `demand`/`demand_basis`/`target_free`/`reached`
+    （见 `tools/_note-0741.txt` 第 2 条），验收探针 `scratch/smoke-0742.py:680` 按该集合校验
+    （把整条记录 JSON 串出来做 `f'"{k}"'` 子串搜，缺一即 FAIL）。
+
+    本类对**四处** `slot_relief` 写入点逐一钉死（复用事件名，不新增事件）：
+      ① `longrun.py:6670` 主 `_slot_relief`（腾格通道，trigger=space_pressure）；
+      ② `longrun.py:6296` `_note_slot_pressure_stuck`（压力通道腾不出，trigger=none）；
+      ③ `longrun.py:7455` 买种前满包（demand_basis=buy_full）；
+      ④ `longrun.py:6445` `_note_clear_area_bag_gate`（满包清障闸，trigger=clear_gate）← 本次缺口。
+
+    只认**字段在场 + 语义**（`reached` 是否如实），不改任何行为判据 / rc 语义。
+    """
+
+    #: probe 口径的 task-237 必填字段集（`scratch/smoke-0742.py:680` 逐字面量搜这 3 个 + demand_basis）。
+    TASK237_FIELDS = ("demand", "demand_basis", "target_free", "reached")
+
+    MATERIAL_ROWS = (
+        ("(O)388", "Wood"), ("(O)390", "Stone"), ("(O)330", "Clay"),
+        ("(O)771", "Fiber"), ("(O)382", "Coal"), ("(O)378", "Copper Ore"),
+        ("(O)380", "Iron Ore"), ("(O)384", "Gold Ore"), ("(O)386", "Iridium Ore"),
+    )
+
+    def _row(self, slot: int, qid: str, name: str, stack: int, *,
+             tool: bool = False) -> dict:
+        item_id = qid.rsplit(")", 1)[-1] if qid.startswith("(") else qid
+        return {"slot": slot, "id": item_id, "qualifiedId": qid, "name": name,
+                "stack": stack, "isTool": tool}
+
+    def _full(self, rows=(), *, weeds: int = 0, seeds: int = 0,
+              money: int = 3000) -> FakeWorld:
+        """满包 12/12：3 工具 + `rows`，其余 Hay 填满。"""
+        w = FakeWorld(seeds=seeds, money=money, weeds=weeds)
+        inv = [self._row(0, "(T)Axe", "Axe", 1, tool=True),
+               self._row(1, "(T)Hoe", "Hoe", 1, tool=True),
+               self._row(2, "(T)WateringCan", "Watering Can", 1, tool=True)]
+        for i, (qid, name) in enumerate(rows):
+            inv.append(self._row(3 + i, qid, name, 30))
+        while len(inv) < 12:
+            inv.append(self._row(len(inv), "(O)178", "Hay", 5))
+        w.inventory = inv[:12]
+        return w
+
+    def _full_unsellable(self, *, weeds: int = 4) -> FakeWorld:
+        """满包 + **无可卖叠**（Hay 表外）⇒ 压力通道腾不出 / 买种前满包两条路都走这条形态。"""
+        w = FakeWorld(seeds=0, money=500, weeds=weeds)
+        w.inventory = [self._row(0, "(T)Axe", "Axe", 1, tool=True),
+                       self._row(1, "(T)Hoe", "Hoe", 1, tool=True),
+                       self._row(2, "(T)WateringCan", "Watering Can", 1, tool=True)]
+        while len(w.inventory) < 12:
+            w.inventory.append(self._row(len(w.inventory), "(O)178", "Hay", 5))
+        return w
+
+    def _full_with_surplus(self) -> FakeWorld:
+        """满包 + 真盈余 Slime 99 ⇒ 主腾格通道会真的卖出（trigger=space_pressure）。"""
+        w = FakeWorld(seeds=0, money=500, weeds=0)
+        inv = [self._row(0, "(T)Axe", "Axe", 1, tool=True),
+               self._row(1, "(T)Hoe", "Hoe", 1, tool=True),
+               self._row(2, "(T)WateringCan", "Watering Can", 1, tool=True)]
+        inv += [self._row(3 + i, "(O)766", "Slime", 99) for i in range(9)]
+        w.inventory = inv[:12]
+        return w
+
+    def _run(self, w: FakeWorld, worker) -> LongRun:
+        run = make_run(w)
+        client = FakeClient(w)
+        run.client = client
+        run.worker = worker
+        run.client_factory = lambda: client
+        run.worker_factory = lambda _c: worker
+        return run
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list:
+        return [e for e in run.entries if e.get("event") == name]
+
+    @staticmethod
+    def _rep() -> DayReport:
+        return DayReport(day_key=("winter", 26, 1), started_at=0.0)
+
+    def _plot(self, tiles) -> dict:
+        return {"zone": "", "label": "", "area": "field_nw", "anchor": list(tiles[0]),
+                "tiles": list(tiles), "note": ""}
+
+    def _assert_task237(self, ev: dict) -> None:
+        """字段在场（dict 键）+ **探针口径**（JSON 串子串）双口径都过。
+
+        双口径是必须的：探针 `scratch/smoke-0742.py:684` 是 `f'"{k}"' not in blob` 的**字面量**
+        子串搜 —— 光给 `demand_basis` 不会满足 `"demand"` 键，所以必须真的写独立的 `demand`。
+        """
+        for k in self.TASK237_FIELDS:
+            self.assertIn(k, ev, f"slot_relief 缺 task-237 字段 {k!r}：{ev}")
+        blob = json.dumps(ev, ensure_ascii=False)
+        for k in self.TASK237_FIELDS:
+            self.assertIn(f'"{k}"', blob, f"探针口径（子串搜）缺 {k!r}：{blob}")
+        self.assertIsInstance(int(ev["target_free"]), int, ev)
+
+    # ---- ① 主腾格通道（longrun.py:6670）----
+    def test_main_slot_relief_channel_carries_task237_fields(self):
+        w = self._full_with_surplus()
+        worker = _SpaceWorker(w)
+        run = self._run(w, worker)
+        self.assertTrue(run._slot_relief(w.obs(), self._rep()))
+        ev = self._events(run, "slot_relief")
+        self.assertEqual(len(ev), 1, ev)
+        self._assert_task237(ev[0])
+        # 语义：reached == (卖后空格 >= 目标水位)，不谎报。
+        self.assertEqual(bool(ev[0]["reached"]),
+                         int(ev[0]["freeSlots_after"]) >= int(ev[0]["target_free"]), ev[0])
+
+    # ---- ② 压力通道腾不出（longrun.py:6296）----
+    def test_pressure_stuck_channel_carries_task237_fields(self):
+        w = self._full_unsellable(weeds=0)
+        worker = _SpaceWorker(w)
+        run = self._run(w, worker)
+        rep = self._rep()
+        # 【590f154 修复】满包 Hay：first call 触发 last-resort 送一叠非保护 Hay（返回 True），
+        # 之后不再空转（返回 False）。压力卡 still 只留一次 trigger=none 的 slot_relief 事件。
+        results = [run._slot_relief(w.obs(), rep) for _ in range(SLOT_RELIEF_MAX + 2)]
+        self.assertTrue(any(results), "last-resort 应成功腾出一叠非保护 Hay")
+        self.assertEqual(results.count(True), 1, results)
+        ev = [e for e in self._events(run, "slot_relief") if e.get("trigger") == "none"]
+        self.assertEqual(len(ev), 1, self._events(run, "slot_relief"))
+        self._assert_task237(ev[0])
+        self.assertIs(ev[0]["reached"], False, "腾不出 ⇒ reached 必须如实 False")
+        self.assertEqual(ev[0]["target_free"], longrun_mod.SLOT_RELIEF_TARGET_FREE)
+
+    # ---- ③ 买种前满包（longrun.py:7455）----
+    def test_buy_full_channel_carries_task237_fields(self):
+        w = self._full_unsellable(weeds=0)
+        w.player_seeds = []                                  # 当季可种 0 ⇒ 走到买种子门闸
+        worker = _SpaceWorker(w)
+        run = self._run(w, worker)
+        self.assertFalse(run._preconditions_apply(w.obs(), self._rep()))
+        ev = self._events(run, "slot_relief")
+        self.assertEqual(len(ev), 1, ev)
+        self.assertEqual(ev[0]["demand_basis"], "buy_full")
+        self._assert_task237(ev[0])
+        self.assertIs(ev[0]["reached"], False, "不买 ⇒ 没腾到水位，reached 如实 False")
+
+    # ---- ④ 满包清障闸（longrun.py:6445）← 本次修的缺口 ----
+    def test_clear_gate_channel_carries_task237_fields(self):
+        w = self._full(rows=self.MATERIAL_ROWS, weeds=4)
+        run = self._run(w, FakeWorker(w))
+        self.assertEqual(run._stage_tiles("clear_area", w.obs(),
+                                          self._plot([(60, 10), (61, 10)])), [])
+        gate = [e for e in self._events(run, "slot_relief")
+                if e.get("trigger") == "clear_gate"]
+        self.assertEqual(len(gate), 1, self._events(run, "slot_relief"))
+        self._assert_task237(gate[0])
+        # 语义：clear_gate 是"今天不再新开 clear_area"的闸，**不是**腾到了目标水位 ⇒ reached=False。
+        self.assertIs(gate[0]["reached"], False, "clear_gate 不许谎报水位达标")
+        self.assertEqual(gate[0]["demand"], 0)
+        self.assertEqual(gate[0]["target_free"], longrun_mod.SLOT_RELIEF_TARGET_FREE)
 
 
 class TestTask22MalformedTiles(unittest.TestCase):
@@ -14519,15 +14990,19 @@ class TestTask28BagEvidence(unittest.TestCase):
         self.assertFalse(str(rep.ended_reason).startswith("stuck:"))
 
 
-class TestTask25BackpackUpgrade(unittest.TestCase):
-    """【task-25 rev4 / 0.7.46 卡 A】Pierre 背包升级的**对话购买**（脑侧）。
+class TestTask25BackpackUpgradeInteract(unittest.TestCase):
+    """【devcoder-backpack-interact】Pierre 背包升级的**交互购买**（脑侧，interact 触发）。
+
+    根因：vanilla 背包升级是柜台上的**展示物**，需 `GameLocation.checkAction`（即 `interact`
+    原语）交互；旧代码用 `NPC.checkAction`（`talk(Pierre)`）永远只得到 "Sigh..."，从不卖背包
+    ⇒ 永远【无法判定】。本类验证修复后交互触发 + 双差分判定。
 
     判据纪律（卡面 §8.2/§8.4）：
       * 成功**只看观测差分**：`money_after == money_before - 2000` **且** `inventoryCount 12→24`；
         回执说成功不算、进背包计数不算（升级不占格）；
-      * 一切走游戏入口：`talk`（Mod `NPC.checkAction`）+ `dismiss_modal{answerText:"Purchase"}`
+      * 一切走游戏入口：`interact`（Mod `GameLocation.checkAction`）→ `dismiss_modal{answerText:"Purchase"}`
         （Mod `answerDialogue`）；脑侧绝不直写钱/容量；
-      * 失败码单列、一天 ≤2 次 `talk`、整条流程有墙钟预算；失败**不**改 `checks`/`day_justified`。
+      * 失败码单列、一天 ≤2 次 `interact`、整条流程有墙钟预算；失败**不**改 `checks`/`day_justified`。
     """
 
     @staticmethod
@@ -14539,7 +15014,7 @@ class TestTask25BackpackUpgrade(unittest.TestCase):
         run = make_run(w)
         run.client = FakeClient(w)
         run.worker = FakeWorker(w)
-        # 【task-35】默认关闭；本类验证的是"显式开启后"的 0.7.46 行为，故统一打开。
+        # 【task-35】默认关闭；本类验证的是"显式开启后"的行为，故统一打开。
         run.backpack_upgrade_enabled = True
         return run
 
@@ -14547,10 +15022,20 @@ class TestTask25BackpackUpgrade(unittest.TestCase):
     def _events(run: LongRun, name: str = "buy") -> list[dict]:
         return [e for e in run.entries if e.get("event") == name]
 
-    # ---- 成功：钱 −2000 且容量 12→24（观测差分，不是回执） ----
+    # ---- 【team-lead ③】确实调用了 client.interact 而非 client.talk("Pierre") ----
+    def test_calls_interact_not_talk(self):
+        w = FakeWorld(money=3264)
+        w.interact_mode = "ok"
+        run, rep = self._run(w), self._rep()
+        self.assertTrue(run._maybe_buy_backpack_upgrade(w.obs(), rep), rep.notes)
+        self.assertEqual(len(w.interact_calls), 1, "必须走 interact")
+        self.assertEqual(len(w.talk_calls), 0, "绝不许再 talk Pierre")
+        self.assertIsNone(w.interact_calls[0]["tile"], "兜底 tile=None（无展示物）")
+
+    # ---- ① 成功：启用开关 + 容量12 + 钱≥2000 + interact 回执 dialogueIsQuestion + Purchase ⇒ 双差分 ok ----
     def test_success_is_observation_diff_money_minus_2000_capacity_12_to_24(self):
-        w = FakeWorld(money=3264)          # 冬27 冒烟的钱，刚好够 2000g
-        w.talk_mode = "ok"
+        w = FakeWorld(money=3264)          # 刚好够 2000g
+        w.interact_mode = "ok"
         run, rep = self._run(w), self._rep()
         self.assertTrue(run._maybe_buy_backpack_upgrade(w.obs(), rep))
 
@@ -14561,8 +15046,9 @@ class TestTask25BackpackUpgrade(unittest.TestCase):
         self.assertEqual(rep.backpack_capacity_before, 12)
         self.assertEqual(rep.backpack_capacity_after, 24)
         self.assertEqual(rep.backpack_upgrade_failures, [])
-        # 走的是游戏入口：talk → dismiss_modal{answerText:"Purchase"}，没有猜选项
-        self.assertEqual([c["npc"] for c in w.talk_calls], ["Pierre"])
+        # 走的是游戏入口：interact（不是 talk）→ dismiss_modal{answerText:"Purchase"}
+        self.assertEqual(len(w.interact_calls), 1, "只 interact 一次")
+        self.assertEqual(len(w.talk_calls), 0, "绝不许再 talk Pierre")
         self.assertEqual(w.answer_calls[-1]["answer_text"], "Purchase")
         # 失败/成功都复用既有 `buy` 事件（不新增事件名），字段齐
         ev = self._events(run)
@@ -14587,7 +15073,7 @@ class TestTask25BackpackUpgrade(unittest.TestCase):
         self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
         self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
         self.assertEqual((w.money, w.inventory_capacity), before, "没买就不许动钱/容量")
-        self.assertEqual(w.talk_calls, [])
+        self.assertEqual(w.interact_calls, [])
         self.assertEqual(rep.backpack_upgrade_skip, "cannot_afford")
         skipped = [e for e in self._events(run) if e.get("status") == "skipped"]
         self.assertEqual(len(skipped), 1, "跳过原因每天只留一条痕")
@@ -14595,7 +15081,7 @@ class TestTask25BackpackUpgrade(unittest.TestCase):
     # ---- 回执说成功但钱没少 ⇒ money_not_deducted ----
     def test_money_not_deducted_is_failure_not_success(self):
         w = FakeWorld(money=3264)
-        w.talk_mode = "ok"
+        w.interact_mode = "ok"
         w.purchase_mode = "money_unchanged"
         run, rep = self._run(w), self._rep()
         self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
@@ -14610,7 +15096,7 @@ class TestTask25BackpackUpgrade(unittest.TestCase):
     # ---- 钱扣了但容量没变 ⇒ capacity_not_changed（核心反向：不按"进背包计数"判） ----
     def test_capacity_not_changed_is_failure(self):
         w = FakeWorld(money=3264)
-        w.talk_mode = "ok"
+        w.interact_mode = "ok"
         w.purchase_mode = "capacity_unchanged"
         run, rep = self._run(w), self._rep()
         self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
@@ -14621,10 +15107,24 @@ class TestTask25BackpackUpgrade(unittest.TestCase):
         self.assertEqual(e["code"], "capacity_not_changed")
         self.assertFalse(e["ok"])
 
+    # ---- ② interact 回执非提问 ⇒ 仍落 dialogue_not_question，不误成功 ----
+    def test_non_question_receipt_never_succeeds(self):
+        w = FakeWorld(money=3264)
+        w.interact_mode = "no_question"   # dialogueIsQuestion=false
+        run, rep = self._run(w), self._rep()
+        self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
+        self.assertEqual(rep.backpack_upgrade_failures, ["dialogue_not_question"])
+        self.assertFalse([c for c in w.answer_calls if c["answer_text"]],
+                         "非提问就不许发应答")
+        self.assertEqual(w.money, 3264, "没成交不许动钱")
+        self.assertEqual(w.inventory_capacity, 12)
+        self.assertEqual(w.ui_script, [], "自己开的对话必须关掉")
+        self.assertFalse(rep.backpack_upgrade_ok)
+
     # ---- fail-closed：选项里没有精确的 "Purchase" ⇒ 不发应答、不猜 ----
     def test_response_not_found_never_guesses_and_closes_own_dialogue(self):
         w = FakeWorld(money=3264)
-        w.talk_mode = "response_missing"
+        w.interact_mode = "response_missing"
         run, rep = self._run(w), self._rep()
         self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
         self.assertEqual(rep.backpack_upgrade_failures, ["response_not_found"])
@@ -14638,7 +15138,7 @@ class TestTask25BackpackUpgrade(unittest.TestCase):
     # ---- 差分歧义：应答跨日 ⇒ money_diff_ambiguous ----
     def test_money_diff_ambiguous_when_window_crosses_new_day(self):
         w = FakeWorld(money=3264)
-        w.talk_mode = "ok"
+        w.interact_mode = "ok"
         w.purchase_mode = "dismiss_new_day"
         run, rep = self._run(w), self._rep()
         self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
@@ -14646,37 +15146,48 @@ class TestTask25BackpackUpgrade(unittest.TestCase):
         self.assertEqual(rep.backpack_upgrade_failures, ["money_diff_ambiguous"])
         self.assertFalse(rep.backpack_upgrade_ok)
 
-    # ---- talk 不可用安全降级：失败码 + 继续农务（不卡死） ----
-    def test_talk_not_supported_degrades_with_code_and_no_retry(self):
+    # ---- interact 不可用安全降级：失败码 + 继续农务（不卡死） ----
+    def test_interact_not_supported_degrades_with_code_and_no_retry(self):
         w = FakeWorld(money=3264)
-        w.talk_mode = "not_supported"
+        w.interact_mode = "not_supported"
         run, rep = self._run(w), self._rep()
         self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
         self.assertEqual(rep.backpack_upgrade_failures, ["not_supported"])
-        self.assertEqual(len(w.talk_calls), 1)
+        self.assertEqual(len(w.interact_calls), 1)
         self.assertFalse([c for c in w.answer_calls if c["answer_text"]])
-        # 当天只剩一个回合：再调也不会再 talk
+        # 当天只剩一个回合：再调也不会再 interact
         self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
-        self.assertEqual(len(w.talk_calls), 1)
+        self.assertEqual(len(w.interact_calls), 1)
 
-    # ---- not_adjacent：脑自己走过去再谈（Mod 从不替脑移动） ----
-    def test_not_adjacent_walks_toward_npc_then_buys(self):
+    # ---- 兜底：观测里没有背包展示物 ⇒ interact(tile=None) 仍能买成 ----
+    def test_interact_without_object_tile_uses_fallback_and_buys(self):
         w = FakeWorld(money=3264)
-        w.talk_mode = "not_adjacent"
-        w.npc_tile = [64, 10]
-        w.player_tile = [62, 14]
+        w.interact_mode = "ok"
+        w.objects = []  # 找不到待售背包展示物
         run, rep = self._run(w), self._rep()
         self.assertTrue(run._maybe_buy_backpack_upgrade(w.obs(), rep), rep.notes)
-        self.assertEqual(len(w.talk_calls), 2, "第一次 not_adjacent，走一步后第二次成功")
-        self.assertGreaterEqual(run.worker.walk_steps, 1)
+        self.assertEqual(len(w.interact_calls), 1)
+        self.assertIsNone(w.interact_calls[0]["tile"], "兜底必须用 tile=None")
         self.assertEqual(w.money, 1264)
         self.assertEqual(w.inventory_capacity, 24)
         self.assertTrue(rep.backpack_upgrade_ok)
 
-    # ---- 事件卡死：连续 10 次 advance 无果 ⇒ event_hang（不硬做题） ----
-    def test_event_hang_is_recorded_without_faking_success(self):
+    # ---- 优先：观测里能定位到背包展示物格 ⇒ interact(该 tile) ----
+    def test_interact_targets_backpack_object_tile_when_present(self):
         w = FakeWorld(money=3264)
-        w.talk_mode = "no_action"
+        w.interact_mode = "ok"
+        w.objects = [{"name": "Backpack for sale", "tile": [10, 8], "type": "Furniture"}]
+        run, rep = self._run(w), self._rep()
+        self.assertTrue(run._maybe_buy_backpack_upgrade(w.obs(), rep), rep.notes)
+        self.assertEqual(w.interact_calls[0]["tile"], [10, 8], "应命中柜台背包展示物格")
+        self.assertEqual(w.money, 1264)
+        self.assertEqual(w.inventory_capacity, 24)
+        self.assertTrue(rep.backpack_upgrade_ok)
+
+    # ---- 进店过场清不掉 ⇒ event_hang（不硬做题、不替游戏选选项） ----
+    def test_intro_cutscene_cannot_clear_is_event_hang(self):
+        w = FakeWorld(money=3264)
+        w.interact_mode = "no_action"  # 即便交互也不开 UI
         w.ui_script = [{"activeMenu": "DialogueBox", "eventUp": True,
                         "isModal": False, "dialogueIsQuestion": False}]
         w.advance_outcomes = [{"ok": False, "status": "stalled", "stepped": 0,
@@ -14684,30 +15195,30 @@ class TestTask25BackpackUpgrade(unittest.TestCase):
         run, rep = self._run(w), self._rep()
         self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
         self.assertIn("event_hang", rep.backpack_upgrade_failures)
-        self.assertEqual(w.advance_calls, 10)
+        self.assertEqual(w.advance_calls, 10, "进店先清过场推进 10 次")
         self.assertEqual(w.money, 3264)
         self.assertEqual(w.inventory_capacity, 12)
 
-    # ---- 一天 ≤2 次 talk：回合用掉后 gate 直接跳过 ----
+    # ---- 一天 ≤2 次 interact：回合用掉后 gate 直接跳过 ----
     def test_attempts_are_bounded_per_day(self):
         w = FakeWorld(money=3264)
-        w.talk_mode = "no_action"
+        w.interact_mode = "no_action"
         run, rep = self._run(w), self._rep()
         self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
         self.assertEqual(run.backpack_attempts_today, 1)
         self.assertTrue(run.backpack_tried_today)
-        # 模拟同一回合里已经用满两次 talk 的边界：gate 必须直接跳过、不再发请求
+        # 模拟同一回合里已经用满两次 interact 的边界：gate 必须直接跳过、不再发请求
         run.backpack_tried_today = False
         run.backpack_attempts_today = 2
         rep2 = self._rep()
         self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep2))
         self.assertEqual(rep2.backpack_upgrade_skip, "attempt_limit")
-        self.assertEqual(len(w.talk_calls), 1)
+        self.assertEqual(len(w.interact_calls), 1)
 
     # ---- day_end 只读字段齐（as_dict 能直接看出来） ----
     def test_day_report_as_dict_exposes_backpack_trace(self):
         w = FakeWorld(money=3264)
-        w.talk_mode = "ok"
+        w.interact_mode = "ok"
         run, rep = self._run(w), self._rep()
         self.assertTrue(run._maybe_buy_backpack_upgrade(w.obs(), rep))
         d = rep.as_dict()
@@ -14757,7 +15268,7 @@ class TestTask35BackpackGate(unittest.TestCase):
     # ---- ① 默认关闭：零 goto/talk/buy 请求，只有只读 skip 留痕 ----
     def test_default_disabled_sends_zero_requests_and_traces_skip(self):
         w = FakeWorld(money=3264)          # gate 本会满足（capacity 12 + 钱够 2000）
-        w.talk_mode = "ok"                 # 若误发请求，则会真的买成 —— 用来证明"确实没发"
+        w.interact_mode = "ok"             # 若误发请求，则会真的买成 —— 用来证明"确实没发"
         run, rep = self._run(w), self._rep()
         self.assertFalse(run.backpack_upgrade_enabled, "0.7.47 默认必须关闭")
 
@@ -14769,7 +15280,7 @@ class TestTask35BackpackGate(unittest.TestCase):
         self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))  # 再观察一轮也不许发
 
         self.assertEqual((w.money, w.inventory_capacity), (3264, 12), "默认关闭不许动钱/容量")
-        self.assertEqual(w.talk_calls, [], "不许 talk")
+        self.assertEqual(w.interact_calls, [], "不许 interact")
         self.assertEqual(w.buy_calls, [], "不许走货架 buy")
         self.assertEqual(rep.backpack_upgrade_attempts, 0)
         self.assertEqual(rep.backpack_upgrade_failures, [], "默认关闭不是失败")
@@ -14787,7 +15298,7 @@ class TestTask35BackpackGate(unittest.TestCase):
     # ---- ② day_end 区分 skipped(disabled) 与失败码 ----
     def test_day_end_distinguishes_disabled_skip_from_failure_codes(self):
         w = FakeWorld(money=3264)
-        w.talk_mode = "not_supported"
+        w.interact_mode = "not_supported"
         run, rep = self._run(w), self._rep()
         run.backpack_upgrade_enabled = True
         self.assertFalse(run._maybe_buy_backpack_upgrade(w.obs(), rep))
@@ -14808,14 +15319,14 @@ class TestTask35BackpackGate(unittest.TestCase):
     # ---- ③ 显式开启后恢复 task-25 行为（双差分成功） ----
     def test_enabling_restores_task25_double_diff_behavior(self):
         w = FakeWorld(money=3264)
-        w.talk_mode = "ok"
+        w.interact_mode = "ok"
         run, rep = self._run(w), self._rep()
         run.backpack_upgrade_enabled = True
         self.assertTrue(run._maybe_buy_backpack_upgrade(w.obs(), rep))
         self.assertEqual((w.money, w.inventory_capacity), (1264, 24))
         self.assertTrue(rep.backpack_upgrade_ok)
         self.assertEqual(rep.backpack_upgrade_skip, "")
-        self.assertEqual(len(w.talk_calls), 1)
+        self.assertEqual(len(w.interact_calls), 1)
         self.assertEqual(self._events(run)[-1]["code"], "ok")
 
     # ---- ④ CLI 透传 / env 解析 ----
@@ -14854,6 +15365,561 @@ class TestTask35BackpackGate(unittest.TestCase):
         self.assertIn("backpack_upgrade_enabled: bool = False", (
             Path(__file__).resolve().parents[1] / "brain" / "agentfarm" / "longrun.py"
         ).read_text(encoding="utf-8"))
+
+
+class TestBuyUpgradeDispatch(unittest.TestCase):
+    """【0.7.48 D2】`_execute` 里 `task=="buy"` / `task=="upgrade_tool"` 的接线。
+
+    背景：`bbb6a89` 把 buy/upgrade_tool 接进 `_execute` 派发（**零单测**）。审计发现 buy 分支
+    旧接线 `changed = self._preconditions(obs, rep)` 把 `_preconditions` 返回的**观测 dict**
+    当真值 ⇒ 每条 `buy` 意图都恒记 `executed_steps=1` + `acted=True`（"假装下单"），
+    不管有没有真买到，`unknown_evidence` 分支成死代码。
+
+    本类钉两件事：
+      ① buy 的 `changed` 必须是 `_preconditions_apply` 的 **bool**（真实入口：
+         `_preconditions_apply` → `_buy_seed` → `worker.buy` → 桥 `buy` →
+         游戏 `ShopMenu.tryToPurchaseItem`，成败靠钱/背包差分）；
+      ② upgrade_tool 的 journal 必须带 `tool="axe"` + `tool_hardcoded=True`
+         （工具种类硬编码是**已知限制**，钉住它不被悄悄改而不自知）。
+    """
+
+    def _run(self) -> tuple[FakeWorld, LongRun]:
+        w = FakeWorld(weeds=0, seeds=10, money=500)
+        run = make_run(w, target_days=1, max_days=1)
+        run.client = FakeClient(w)
+        run.worker = _NoLootWorker(w)
+        run.started = 0.0
+        return w, run
+
+    @staticmethod
+    def _one(run: LongRun, task: str) -> dict:
+        rec = [r for r in run.intent_coverage if r["task"] == task]
+        assert len(rec) == 1, rec
+        return rec[0]
+
+    def _drive(self, run: LongRun, intent: TaskIntent) -> tuple[bool, DayReport]:
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        obs = run._snap()
+        run._plan_intents(SimpleNamespace(intents=[intent], source="llm", boundary="daily"))
+        acted = run._execute(SimpleNamespace(intents=[intent]), obs, None, rep)
+        return acted, rep
+
+    def test_buy_dispatch_uses_bool_not_the_observation_dict(self):
+        """D2 回归守卫：buy 的 `changed` 必须来自 `_preconditions_apply`（bool）。
+
+        把 `_preconditions` 换成"返回非空 dict"的桩（模拟旧 bug 的真值来源），断言它
+        **一次都没被当布尔用**：若接线退回 `self._preconditions(obs, rep)`，dict 为真 ⇒
+        `executed_steps` 会错成 1，本条即红。
+        """
+        _w, run = self._run()
+        intent = TaskIntent("buy", "inventory", "买种子", "seeds<2")
+        calls = {"pre": 0, "apply": 0}
+
+        def _pre(o, r):
+            calls["pre"] += 1
+            return {"unknown_evidence": 0, "note": "观测 dict（真值语义的陷阱）"}
+
+        def _apply(o, r):
+            calls["apply"] += 1
+            return False
+
+        run._preconditions = _pre
+        run._preconditions_apply = _apply
+        acted, _rep = self._drive(run, intent)
+        self.assertEqual(calls["pre"], 0, "buy 不许把返回观测 dict 的 `_preconditions` 当布尔（D2）")
+        self.assertEqual(calls["apply"], 1, "buy 必须走真实入口 `_preconditions_apply`")
+        self.assertFalse(acted, "没真买到就不该记 acted")
+        rec = self._one(run, "buy")
+        self.assertEqual(rec["executed_steps"], 0, rec)
+        self.assertEqual(rec["reasons"], {"unknown_evidence": 1}, rec)
+        self.assertTrue(_intent_coverage_ok(rec), rec)
+
+    def test_buy_dispatch_records_success_when_purchase_took_effect(self):
+        _w, run = self._run()
+        intent = TaskIntent("buy", "inventory", "买种子", "seeds<2")
+        run._preconditions_apply = lambda o, r: True
+        acted, _rep = self._drive(run, intent)
+        self.assertTrue(acted)
+        rec = self._one(run, "buy")
+        self.assertEqual(rec["executed_steps"], 1, rec)
+        self.assertEqual(rec["reasons"], {}, rec)
+
+    def test_upgrade_tool_dispatch_pins_hardcoded_axe(self):
+        _w, run = self._run()
+        intent = TaskIntent("upgrade_tool", "inventory", "升级斧头", "axe<1")
+        acted, _rep = self._drive(run, intent)
+        self.assertTrue(acted)
+        ups = [e for e in run.entries if e.get("event") == "upgrade_tool"]
+        self.assertEqual(len(ups), 1, run.entries[-5:])
+        self.assertTrue(ups[0]["ok"], ups[0])
+        self.assertEqual(ups[0]["tool"], "axe", "硬编码工具种类必须写进 journal（已知限制）")
+        self.assertIs(ups[0]["tool_hardcoded"], True, ups[0])
+        rec = self._one(run, "upgrade_tool")
+        self.assertEqual(rec["executed_steps"], 1, rec)
+
+    # ---- lead 补丁3 裁决①：同日"派发 + 主循环"两处都调 `_preconditions`，但不会重复下单 ----
+    def test_buy_dispatch_and_main_loop_do_not_double_order(self):
+        """重复调用**不会双买**：买到当季可种种子后，`_preconditions_apply` 因 `plantable>0`
+        早退（longrun.py:7424-7425）；主循环再调一次 `_preconditions`（longrun.py:9832 的
+        调用点）不得再产生第二条 `buy`。"""
+        w = FakeWorld(weeds=0, seeds=0, money=5000)
+        run = make_run(w, target_days=1, max_days=1)
+        run.client, run.worker, run.started = FakeClient(w), _NoLootWorker(w), 0.0
+        run.allow_buy = True
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        intent = TaskIntent("buy", "inventory", "买种子", "seeds<2")
+        # ① 派发路径：真的走 `_preconditions_apply`，买中一次。
+        acted1, _ = self._drive(run, intent)
+        self.assertTrue(acted1, "首次应真买到（钱/格/货架都够）")
+        self.assertEqual(len(w.buy_calls), 1, w.buy_calls)
+        # ② 主循环路径：同一天再走一次 `_preconditions`，手上已有当季种子 ⇒ 必须早退，不再下单。
+        run._preconditions(run._snap(), rep)
+        self.assertEqual(len(w.buy_calls), 1, f"同日已买到当季种子后不得再下单：{w.buy_calls}")
+        # ③ 即便强行走派发 6 轮，也不得突破每日上限（两处门闸共享同一计数器）。
+        for _ in range(6):
+            self._drive(run, intent)
+        self.assertLessEqual(len(w.buy_calls), longrun_mod.MAX_BUY_TRIES_PER_DAY, w.buy_calls)
+        self.assertLessEqual(run.buy_attempts_today, longrun_mod.MAX_BUY_TRIES_PER_DAY)
+
+    def test_buy_daily_cap_is_a_hard_stop(self):
+        """每日 buy 上限是**硬闸**（longrun.py:7492）：次数用满后即便钱/格都够也一次都不下单
+        ⇒ `_execute` 的 buy 派发拿不到 `changed`，不会"假装下单"。"""
+        w = FakeWorld(weeds=0, seeds=0, money=5000)
+        run = make_run(w, target_days=1, max_days=1)
+        run.client, run.worker, run.started = FakeClient(w), _NoLootWorker(w), 0.0
+        run.allow_buy = True
+        run.buy_attempts_today = longrun_mod.MAX_BUY_TRIES_PER_DAY
+        rep = DayReport(day_key=("spring", 1, 9), started_at=0.0)
+        self.assertFalse(run._preconditions_apply(run._snap(), rep), "上限用满后不得再下单")
+        self.assertEqual(w.buy_calls, [], w.buy_calls)
+
+
+class TestTask241SeasonAwareSeedBuy(unittest.TestCase):
+    """【task-241】季节感知买种子：冬季不买 + 只买当季在售种子。
+
+    (a) 冬季 ⇒ 一次 `buy` 都不发，且 `seed_dead_today == "winter_no_seeds"`（诚实信号，
+        支持 Goal-1 经济闭环证据），不拿春种去撞 `item_not_sold`；
+    (b) 当季有在售种子 ⇒ 真的发起 `buy`；
+    (c) 上一季残留的货架清单（隔季种）在换季后失效、重新探当季货架，不拿旧清单直接买。
+    """
+
+    @staticmethod
+    def _run(season: str, *, seeds: int = 0, money: int = 500) -> tuple[FakeWorld, LongRun]:
+        w = FakeWorld(weeds=0, seeds=seeds, money=money)
+        w.season = season
+        # `[]` = 新 Mod 真的没种子（让 season_state 走 plantable 口径，不是旧 Mod 退回 seed_items）。
+        w.player_seeds = [] if seeds == 0 else None
+        run = make_run(w, target_days=1, max_days=1)
+        run.client, run.worker, run.started = FakeClient(w), FakeWorker(w), 0.0
+        run.allow_buy = True
+        return w, run
+
+    def _call(self, w: FakeWorld, run: LongRun) -> DayReport:
+        rep = DayReport(day_key=(w.season, 1, 9), started_at=0.0)
+        run._preconditions(w.obs(), rep)
+        return rep
+
+    def test_winter_buys_nothing_and_sets_seed_dead(self):
+        w, run = self._run("winter")
+        # 即便货架残留了春种（旧季清单），冬季也绝不该去买。
+        run.shop_offers = [{"id": "(O)472", "name": "Parsnip Seeds", "price": 20}]
+        run.shop_offers_season = "spring"
+        self._call(w, run)
+        self.assertEqual(w.buy_calls, [], "冬季：不发起任何 buy（无 item_not_sold 试探）")
+        self.assertEqual(run.seed_dead_today, "winter_no_seeds", "冬季诚实信号")
+        self.assertTrue(any(e.get("event") == "winter_no_seeds" for e in run.entries), run.entries)
+
+    def test_in_season_shelf_seed_is_bought(self):
+        w, run = self._run("summer")
+        # 当季在售：夏季 Pepper Seeds（482）。
+        w.buy_offers = [{"id": "(O)482", "name": "Pepper Seeds", "price": 40}]
+        self._call(w, run)
+        self.assertTrue(w.buy_calls, "当季在售种子应该被买")
+        self.assertEqual(run.seed_dead_today, "", "买到就不该置 seed_dead")
+        self.assertEqual(w.buy_calls[-1]["item"], "482")
+
+    def test_stale_off_season_shelf_is_invalidated_then_reprobed(self):
+        # 上一季（春）残留的 Parsnip 清单在夏初不应被直接买；应重新探当季货架。
+        w, run = self._run("summer")
+        run.shop_offers = [{"id": "(O)472", "name": "Parsnip Seeds", "price": 20}]
+        run.shop_offers_season = "spring"
+        w.buy_offers = [{"id": "(O)482", "name": "Pepper Seeds", "price": 40}]  # 当季货架
+        self._call(w, run)
+        self.assertTrue(w.buy_calls, "应当重探当季货架")
+        self.assertNotIn("(O)472", [c["item"] for c in w.buy_calls],
+                         "不应拿上季残留的春种去撞 item_not_sold")
+        self.assertNotIn("(O)472", [c["item"] for c in w.buy_calls])
+        self.assertEqual(w.buy_calls[-1]["item"], "482")
+
+
+class _ReliefBuyWorld(FakeWorld):
+    """【task-240b】复刻真机 `logs/run-test-space.jsonl`（冬 26、Mod 0.7.49）的形态：
+    背包**真满**（0 空格）+ 有可卖盈余 + 没有当季种子。买成功后按真 Mod 的形态往
+    `player.seeds[]` 补一条（`plantableNow` 按季节），让"买完不再下单"可判。
+
+    真机时序（该账本、已带 task-240b 修复）：`t=0.44` 腾格 `freed=2`（0→2、
+    `trigger=space_pressure`）⇒ `t=0.64` **同一轮**发起 `buy`（回执
+    `item_not_sold` 如实记账）。
+    """
+
+    def __init__(self, *, season: str = "winter", day: int = 26) -> None:
+        super().__init__(seeds=0, money=500, weeds=0)
+        self.season = season
+        self.day = day
+        # 新 Mod：背包里**没有**种子（`player.seeds=[]` 是"真没种子"，不是缺字段）
+        self.player_seeds: list[dict] = []
+        # 满包：3 件工具 + 9 叠已知表真盈余（Slime×99 > 保留 K）⇒ 腾格有东西可卖
+        self.inventory = [
+            {"slot": 0, "id": "Axe", "qualifiedId": "(T)Axe", "name": "Axe",
+             "stack": 1, "isTool": True},
+            {"slot": 1, "id": "Hoe", "qualifiedId": "(T)Hoe", "name": "Hoe",
+             "stack": 1, "isTool": True},
+            {"slot": 2, "id": "WateringCan", "qualifiedId": "(T)WateringCan",
+             "name": "Watering Can", "stack": 1, "isTool": True},
+        ] + [{"slot": 3 + i, "id": "766", "qualifiedId": "(O)766", "name": "Slime",
+              "stack": 99, "isTool": False} for i in range(9)]
+        self.dirt = set()
+        self.crops = {}
+
+    def buy(self, item, count, shop):
+        st = super().buy(item, count, shop)
+        if st.ok and self.player_seeds is not None:
+            self.player_seeds = list(self.player_seeds) + [{
+                "id": str(item), "name": SEED_NAME, "stack": int(count),
+                "seasons": ["spring", "summer", "fall"],
+                "plantableNow": self.season != "winter"}]
+        return st
+
+
+class TestTask240bReliefThenBuy(unittest.TestCase):
+    """【task-240b】腾格成功 ⇒ **同一轮就试买种子**（修"腾格后买种子永远不触发"）。
+
+    病灶（catch-22）：`_slot_relief` 腾格成功后旧接线直接 `continue` ⇒ 本轮跳过
+    `_preconditions`（买种子的唯一入口）。而"买种子"本身就要求背包有空格——空格正是
+    腾格刚腾出来的：于是出现"要腾格才买得了、腾了格却本轮不买"，只能指望下一轮
+    （下一轮还可能再被腾格/守卫/预算占掉）。修法（`longrun.py:9879-9887`）：腾格成功
+    ⇒ 重取快照 ⇒ `_observe_free_slots` ⇒ `_preconditions` ⇒ `continue`。
+
+    本类钉三件事（卡面验收）：
+      ① 腾格成功后的下一条主循环调用必须是 `_preconditions`（同一轮必试买种子）；
+      ② 传给 `_preconditions` 的必须是**腾格后重取的新快照**（空格 trace 同轮刷新）；
+      ③ 不重复买：买成之后当天不再发起第二条 `buy`。
+    """
+
+    def _run(self, w: FakeWorld) -> LongRun:
+        worker = _SpaceWorker(w)
+        client = FakeClient(w)
+        run = make_run(w, target_days=1, max_days=1,
+                       client_factory=lambda: client, worker_factory=lambda _c: worker)
+        run.client = client
+        run.worker = worker
+        # `_run_day` 直接驱动时要把起点对齐到"现在"（`run()` 里由 `self.started = self.now()`
+        # 做）：否则 `started=0.0` + 墙钟 `now` ⇒ `_budget_exhausted` 立刻为真、循环一轮不进。
+        run.started = run.now()
+        run.max_steps = 60
+        run.allow_buy = True
+        return run
+
+    @staticmethod
+    def _spy(run: LongRun) -> list[tuple]:
+        """按调用顺序记录主循环里的 `_slot_relief` / `_preconditions`。
+
+        `_preconditions` 那条连**当时拿到的观测**与 `rep.free_slots_last` 一起记
+        （判"快照/trace 刷没刷新"用）。
+        """
+        seq: list[tuple] = []
+        relief, pre = run._slot_relief, run._preconditions
+
+        def _relief(obs, rep):
+            out = relief(obs, rep)
+            seq.append(("relief", bool(out)))
+            return out
+
+        def _pre(obs, rep):
+            seq.append(("pre", obs, rep.free_slots_last))
+            return pre(obs, rep)
+
+        run._slot_relief, run._preconditions = _relief, _pre
+        return seq
+
+    def test_relief_success_buys_seeds_in_the_same_round(self):
+        """①+②：腾格成功 ⇒ 同一轮调 `_preconditions`，且拿到的是腾格后的新快照。
+
+        注（task-241）：原用例用 `season="winter"`，但 task-241 起**冬季不再买种子**
+        （Pierre 货架无种子，避免白撞 item_not_sold），故这里改锚到 spring 验证同一条接线；
+        冬季"不买"的语义由 `TestTask241SeasonAwareSeedBuy` 单独钉。
+        """
+        w = _ReliefBuyWorld(season="spring")
+        run = self._run(w)
+        seq = self._spy(run)
+        run._run_day()
+
+        first_ok = next((i for i, e in enumerate(seq)
+                         if e[0] == "relief" and e[1] is True), None)
+        self.assertIsNotNone(first_ok,
+                             "满包 + 可卖盈余 ⇒ 第一轮腾格必须成功（本用例的前提）")
+        # ① 同一轮买种子：腾格成功后的下一条主循环调用必须是 `_preconditions`
+        self.assertEqual(seq[first_ok + 1][0], "pre",
+                         "腾格成功后必须**同一轮**试买种子（旧接线直接 continue ⇒ 整轮跳过 "
+                         "_preconditions，买种子被推迟甚至永远不触发）")
+        # ② 快照刷新：传给 `_preconditions` 的观测必须看得到腾出来的空格
+        fresh = seq[first_ok + 1][1]
+        free, status = player_free_slots(FarmWorker.player_of(fresh))
+        self.assertEqual(status, "ok")
+        self.assertGreaterEqual(int(free), 1,
+                                "买种子前必须看到腾格腾出来的空格（拿腾格前的 stale obs 进 "
+                                "_preconditions ⇒ free=0 ⇒ buy_full 白撞 no_inventory_space）")
+        # ② trace 同轮刷新：进 `_preconditions` 时 `free_slots_last` 已是腾格后的读数
+        self.assertGreaterEqual(int(seq[first_ok + 1][2] or 0), 1,
+                                "腾格成功后必须同轮重算空格 trace（_observe_free_slots）")
+        # 行为面：这一轮真的发起了 `buy`（不是只接线不下单）
+        self.assertTrue(w.buy_calls, "腾格成功 ⇒ 本轮必试买种子（钱够、有空格）")
+        # 腾格确实发生了（行为佐证）：至少一条 freed>=1 的 slot_relief 事件
+        freed = [e for e in run.entries
+                 if e.get("event") == "slot_relief" and int(e.get("freed") or 0) >= 1]
+        self.assertTrue(freed, run.entries[-3:])
+        # 结构不变量：两个 `_preconditions` 之间只许隔着 `_slot_relief`
+        #（腾格轮多出的那次调用 + continue 不许退化成"同一轮连调两次"）。
+        pres = [i for i, e in enumerate(seq) if e[0] == "pre"]
+        for a, b in zip(pres, pres[1:]):
+            between = seq[a + 1:b]
+            self.assertTrue(between and all(e[0] == "relief" for e in between),
+                            f"两个 `_preconditions` 之间只许隔着 `_slot_relief`：{seq}")
+
+    def test_relief_round_buy_is_never_repeated(self):
+        """③不重复买：买成之后当天不再发起第二条 `buy`（春季 + 货架在售）。"""
+        w = _ReliefBuyWorld(season="spring", day=1)
+        w.buy_offers = [{"id": "472", "name": "Parsnip Seeds", "price": 20}]
+        run = self._run(w)
+        seq = self._spy(run)
+        run._run_day()
+
+        self.assertTrue(seq and seq[0][0] == "relief",
+                        "主循环第一轮就该问一次腾格（本用例的前提）")
+        self.assertTrue(w.buy_calls, "有钱、有货、腾出格 ⇒ 必须真的买到")
+        self.assertEqual(len(w.buy_calls), 1,
+                         f"买成后当季可种 > 0 ⇒ 当天不得再下单（腾格轮多出的那次 "
+                         f"_preconditions 不许变成双买）：{w.buy_calls}")
+
+
+class TestDevcoderClearGate(unittest.TestCase):
+    """【devcoder-clear-gate】「满包清障闸」的四口径对齐（A9 第 5 跑 winter27/28 空转自停）。
+
+    实证（`logs/longrun-runA9-0750.jsonl`）：`_stage_tiles("clear_area")` 因 `_clear_bag_gate_reason`
+    （背包 0 空格 + 腾格手段用尽）整池清零 `return []`；但 `_pending_snapshot` / `work_reasons` /
+    `_plot_has_work` / `day_end` 都不认识这道闸 ⇒ 快照 `exec=206/195`、守卫一直喊"还有地要清"、
+    `_ensure_plot` 永不为 None ⇒ `decision.intents` 每轮非空 ⇒ 主循环既收不了工也换不了片
+    ⇒ `idle` 3 轮 ⇒ `stuck:`（整天报废）。
+
+    本类钉死（对应卡面 A→E）：
+      ① 满包 + 剩余活全 clear-only ⇒ 收尾 `ended_by=clear_gate`、`day_justified=False`、
+         `verified=False`，且**没有** `idle{rounds:3}`、没有 `stuck:`；
+      ② 日终不变式 `gated + unobserved + executable + malformed == guard`（gated 单列、不并入
+         unobserved —— 那会把"今天被闸住"说成"看不见/已陈旧"）；
+      ③ `executable>0` ⇒ 用 `executable_tiles` 造 plot 调 `_stage_tiles` 必非空（守卫/执行同口径）；
+      ④ 反洗白：满包日不得出现 `no_work` + `no_work_evidence_ok=True`。
+    """
+
+    def _row(self, slot: int, qid: str, name: str, stack: int, *, tool: bool = False) -> dict:
+        item_id = qid.rsplit(")", 1)[-1] if qid.startswith("(") else qid
+        return {"slot": slot, "id": item_id, "qualifiedId": qid, "name": name,
+                "stack": stack, "isTool": tool}
+
+    def _full_unsellable(self, *, weeds: int = 4, seeds: int = 0, money: int = 0,
+                         stamina: float = 270.0) -> FakeWorld:
+        """满包 12/12 + **无可卖叠**（Hay 表外）⇒ `_clear_bag_gate_reason` 必生效。
+
+        `FakeWorker` 没有 `sell` 原语 ⇒ last-resort 也腾不出格，闸不会被"其实卖得动"顶掉。
+        """
+        w = FakeWorld(seeds=seeds, money=money, weeds=weeds, stamina=stamina)
+        while len(w.inventory) < 12:
+            w.inventory.append(self._row(len(w.inventory), "(O)178", "Hay", 5))
+        w.inventory = w.inventory[:12]
+        return w
+
+    def _run(self, w: FakeWorld, **kw) -> LongRun:
+        run = make_run(w, **kw)
+        client = FakeClient(w)
+        worker = FakeWorker(w)
+        run.client = client
+        run.worker = worker
+        run.client_factory = lambda: client
+        run.worker_factory = lambda _c: worker
+        return run
+
+    @staticmethod
+    def _events(run: LongRun, name: str) -> list[dict]:
+        return [e for e in run.entries if e.get("event") == name]
+
+    @staticmethod
+    def _plot(tiles, *, anchor=None) -> dict:
+        tiles = [tuple(t) for t in tiles]
+        return {"zone": "", "label": "", "area": "field_nw",
+                "anchor": list(anchor or (tiles[0] if tiles else (0, 0))),
+                "tiles": tiles, "note": ""}
+
+    # ---- ① 端到端：满包 + clear-only ⇒ clear_gate（不是 stuck、不是 no_work）----
+    def test_full_bag_clear_only_ends_as_clear_gate(self):
+        w = self._full_unsellable(weeds=4)
+        run = self._run(w, max_days=1)
+
+        code = run.run()
+
+        self.assertEqual(code, 1, "clear_gate 不是达标 ⇒ 不许返 0")
+        self.assertEqual(len(run.days), 1)
+        rep = run.days[0]
+        self.assertEqual(rep.ended_by, "clear_gate", f"{rep.ended_reason} / {rep.notes}")
+        self.assertTrue(str(rep.ended_reason).startswith("clear_gate:"), rep.ended_reason)
+        self.assertIn("free_slots=0", rep.ended_reason)
+        self.assertIn("清障类", rep.ended_reason)
+        # 红线：clear_gate 永不 VERIFIED / 永不 day_justified
+        self.assertFalse(rep.checks.get("day_justified", True), rep.checks)
+        self.assertFalse(rep.verified, rep.checks)
+        self.assertFalse([e for e in self._events(run, "idle")
+                          if int(e.get("rounds") or 0) >= 3],
+                         "满包清障日不许再走到 idle 3 轮")
+        self.assertNotIn("stuck", str(rep.ended_by))
+        self.assertFalse(self._events(run, "stuck_flush"),
+                         "不是卡死 ⇒ 不该走 stuck 翻篇")
+        # 证据走既有事件名 slot_relief{trigger=clear_gate}（不新增 journal 事件名）
+        gate = [e for e in self._events(run, "slot_relief")
+                if e.get("trigger") == "clear_gate"]
+        self.assertTrue(gate, self._events(run, "slot_relief")[-2:])
+        self.assertEqual(gate[0].get("stage"), "clear_area")
+        self.assertIs(gate[0].get("reached"), False, "clear_gate 不是水位达标")
+        # ② 不变式（本日账本为空，仍必须自洽）
+        self.assertEqual(rep.pending_guard,
+                         rep.pending_executable + rep.pending_unobserved
+                         + rep.pending_malformed + rep.pending_gated)
+        # ④ 反洗白：满包日不得出现 no_work + no_work_evidence_ok=True
+        self.assertNotEqual(rep.ended_by, "no_work", rep.ended_reason)
+        self.assertFalse(getattr(run, "no_work_evidence_ok", False),
+                         "满包清障日绝不许置 no_work_evidence_ok（那是白拿 VERIFIED 的洗白口）")
+        self.assertFalse(rep.checks.get("zero_action_evidenced", True), rep.checks)
+
+    # ---- ② gated 单列 + 不变式（不并入 unobserved）----
+    def test_pending_snapshot_has_gated_bucket_and_invariant(self):
+        w = self._full_unsellable(weeds=0)
+        w.player_tile = [62, 14]
+        w.blockers[(60, 10)] = "weed"          # 看得见 + 站得到，只因满包闸而不执行 ⇒ gated
+        w.blockers[(60, 11)] = "weed"          # 今天已判死（封格）
+        w.blockers[(60, 12)] = "weed"          # 被围住
+        w.far_tiles[(62, 15)] = {"kind": ""}   # tiles[] 里字段残缺（无 kind/crop、也不在 tillable）
+        run = self._run(w)
+        run.leftover_targets = {(60, 10), (60, 11), (60, 12), (62, 15), (90, 90)}
+        run.leftover_area = {t: "field_nw" for t in run.leftover_targets}
+        run.blocked[(60, 11)] = "blocked_tile"
+        run.encircled_day.add((60, 12))
+        # (90, 90) 不在最后观测里 ⇒ unobserved（0.7.44 冬 26/27 的 263/217 主力）
+
+        obs = w.obs()
+        self.assertTrue(run._clear_bag_gate_reason(obs), "前提：满包 + 腾格用尽")
+        snap = run._pending_snapshot(obs)
+
+        self.assertEqual(snap["ledger"], 5)
+        self.assertEqual(snap["blocked"], 2)
+        self.assertEqual(snap["guard"], 3)
+        self.assertEqual(snap["gated"], 1, f"gated 单列：{snap}")
+        self.assertEqual(snap["gated_tiles"], [[60, 10]], snap)
+        self.assertEqual(snap["unobserved"], 1, "被闸住的格**不许**再并进 unobserved")
+        self.assertEqual(snap["malformed"], 1)
+        self.assertEqual(snap["executable"], 0)
+        # ② 不变式两段
+        self.assertEqual(snap["ledger"], snap["guard"] + snap["blocked"])
+        self.assertEqual(snap["guard"],
+                         snap["executable"] + snap["unobserved"]
+                         + snap["malformed"] + snap["gated"])
+        # 观测证据不可用 ⇒ fail-closed：全部按可执行计、gated=0（旧行为不变）
+        blind = run._pending_snapshot(None)
+        self.assertEqual((blind["executable"], blind["unobserved"],
+                          blind["malformed"], blind["gated"]),
+                         (blind["guard"], 0, 0, 0))
+        # gated>0 ⇒ 任何收工理由都不许判正当（fail-closed 在 `is_justified_end` 最前面）
+        self.assertFalse(is_justified_end("sleep", "no_work:确实找不到可做的活",
+                                          pending_executable=0, gated=snap["gated"]))
+        self.assertFalse(is_justified_end("sleep", "night:已经到点了",
+                                          pending_executable=0, gated=snap["gated"]))
+        self.assertFalse(is_justified_end("inventory_blocked", "inventory_blocked:x",
+                                          pending_executable=0, gated=snap["gated"]))
+        # 老账本 / 未传 gated ⇒ 旧行为逐字一致
+        self.assertTrue(is_justified_end("sleep", "no_work:确实找不到可做的活"))
+
+    # ---- ③ executable>0 ⇒ 用 executable_tiles 造 plot，_stage_tiles 必非空 ----
+    def test_executable_snapshot_tiles_are_really_stageable(self):
+        w = FakeWorld(weeds=0, seeds=0, money=0)      # 8 空格 ⇒ 闸不生效
+        w.player_tile = [62, 14]
+        w.blockers[(60, 10)] = "weed"
+        run = self._run(w)
+        run.leftover_targets = {(60, 10)}
+        run.leftover_area = {(60, 10): "field_nw"}
+
+        snap = run._pending_snapshot(w.obs())
+
+        self.assertEqual(snap["gated"], 0)
+        self.assertEqual(snap["executable"], 1, snap)
+        plot = self._plot([tuple(t) for t in snap["executable_tiles"]],
+                          anchor=snap["executable_tiles"][0])
+        self.assertTrue(run._stage_tiles("clear_area", w.obs(), plot),
+                        "快照说可执行 ⇒ 执行层必须拿得出同一批目标（否则两边口径漂移）")
+        # 满包（闸生效）⇒ 同一个 plot 执行层整池清零（这正是 A9 的病灶）
+        full = self._full_unsellable(weeds=0)
+        full.player_tile = [62, 14]
+        full.blockers[(60, 10)] = "weed"
+        run2 = self._run(full)
+        self.assertEqual(run2._stage_tiles("clear_area", full.obs(),
+                                           self._plot([(60, 10)])), [])
+
+    # ---- ④ 守卫/选区同口径：gated 格不许再被喊成"还有地要清" ----
+    def test_guard_and_plot_selection_ignore_gated_tiles(self):
+        w = self._full_unsellable(weeds=1)
+        run = self._run(w)
+        run.leftover_targets = {(60, 10)}
+        run.leftover_area = {(60, 10): "field_nw"}
+        obs = w.obs()
+
+        reasons = run.work_reasons(obs)
+
+        self.assertFalse([r for r in reasons if "还有地要清" in r], reasons)
+        self.assertFalse([r for r in reasons if "没做完" in r], reasons)
+        self.assertFalse(run._plot_has_work(obs, [(60, 10)]),
+                         "执行层整池清零 ⇒ 守卫/选区必须同口径闭嘴")
+        self.assertIsNone(run._ensure_plot(obs, DayReport(day_key=("spring", 1, 6),
+                                                          started_at=0.0)))
+        self.assertTrue(run._clear_gate_only_work(obs))
+
+        # 反例：同一天只要还有作物活，就**不许**判成"只剩清障"（不许提前收工）
+        w2 = self._full_unsellable(weeds=1)
+        w2.dirt.add((61, 10))
+        w2.crops[(61, 10)] = {"ripe": False, "watered": False}
+        run2 = self._run(w2)
+        self.assertFalse(run2._clear_gate_only_work(w2.obs()),
+                         "还有没浇的活苗 ⇒ 不是「只剩清障」，不许拿背包闸收工")
+        # 反例：闸没生效（有空格）⇒ 一律 False
+        w3 = FakeWorld(weeds=1, seeds=0, money=0)
+        run3 = self._run(w3)
+        self.assertEqual(run3._clear_bag_gate_reason(w3.obs()), "")
+        self.assertFalse(run3._clear_gate_only_work(w3.obs()))
+        self.assertTrue(run3._plot_has_work(w3.obs(), [(60, 10)]),
+                        "闸不生效时选区口径与改动前一致")
+
+    # ---- C 侧：`_leftover("clear_area")` 的树只按当天预算额度计入 ----
+    def test_clear_area_leftover_trees_are_capped_by_tree_budget(self):
+        w = FakeWorld(weeds=0, seeds=0, money=0, stamina=60.0)   # 60 ÷ 12 = 5 棵
+        tiles = sorted(w.tillable)[:12]
+        for t in tiles:
+            w.blockers[t] = "tree"
+        run = self._run(w)
+        obs = w.obs()
+        room = run._tree_budget_room(obs)
+        self.assertGreater(room, 0)
+        self.assertLess(room, len(tiles), "夹具前提：窗口里的树必须多于当天预算")
+
+        left = run._leftover("clear_area", obs, self._plot([(64, 14)]))
+
+        self.assertEqual(len(left), room,
+                         f"树只按预算额度计入 leftover（旧实现把整个窗口的树全塞进来 ⇒ "
+                         f"leftover 278/片地 25）：{len(left)} vs room {room}")
+        self.assertLess(len(left), len(tiles))
 
 
 if __name__ == "__main__":  # pragma: no cover

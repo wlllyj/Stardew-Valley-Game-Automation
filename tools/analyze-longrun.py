@@ -1829,6 +1829,9 @@ def day_label(ev):
 #: 缺失/非 int 字段 ⇒ 该记录**不参与判定**并计入 undecidable（**缺失 ≠ 0**，绝不猜）。
 STAGE_CHURN_MIN_RUN = 3
 STAGE_CHURN_SMALL_ASSIGNED = 1
+#: 【A9-0749 复盘】resume_walk 的当天成功上限（brain/agentfarm/longrun.py 的
+#: `RESUME_WALK_LIMIT` 同值；尝试上限 20 另计）。命中 = 当天"回片区走路预算用尽"。
+WALK_BUDGET_CAP = 10
 #: 只从这些结构化数组字段取「涉及格坐标」，**绝不从 note/ended_reason 文本里猜坐标**。
 STAGE_TILE_FIELDS = ("cleared_tiles", "unreachable_tiles", "encircled_tiles", "already_tiles",
                      "failed_tiles", "ok_tiles", "unexecuted_tiles")
@@ -4850,7 +4853,40 @@ def build_report(rows, path, args, bad_lines):
             "cross_day_day": cross_day,
             "outcomes": len(sess["outcomes"]),
             "blocked": len(sess["blocked"]),
+            # 【A9-0749 复盘】走路预算燃烧（resume_walk）：守卫说还有活 ⇒ 走回 leftover 却拿不出
+            # 意图 ⇒ 白烧预算。成功 10/10 即当天上限（longrun.RESUME_WALK_LIMIT=10）；与
+            # farm_actions（Σ stage.ok + frontier_clear 真清掉的格）并读才能看出"走了不干活"。
+            "walk_ok": sum(1 for _ln, _e in sess["resume_walks"] if _e.get("walked") is True),
+            "walk_attempts": len(sess["resume_walks"]),
+            # 换片次数取当天最后一条 no_progress_burst 的 switches（缺 ⇒ None，不猜）
+            "plot_switches": (as_int(sess["no_progress_bursts"][-1][1].get("switches"))
+                              if sess["no_progress_bursts"]
+                              and sess["no_progress_bursts"][-1][1].get("switches") is not None
+                              else None),
+            # 真农场动作 = 日终 stages[] 的 Σ ok + 当天 frontier_clear 真清掉的格（acted=true）
+            "farm_actions": (sum(as_int(st.get("ok")) for st in as_list(end.get("stages")))
+                             + sum(1 for _ln, _e in sess["frontier_clears"] if _e.get("acted") is True)
+                             ) if end else None,
         })
+    # 【A9-0749 复盘】走路预算燃烧汇总：resume_walk 命中上限的天 + 走/干比。
+    # 判据口径：纯 info、不进 rc（走路是合法动作，烧完预算是诚实收工的证据链一环）。
+    # 「缺失 ≠ 0」：整本账本一条 resume_walk 都没有 ⇒ has_resume_walk=False（渲染写【无法判定】）；
+    # 机制在场而某天 0 次 ⇒ 那天的 0 是真实读数。
+    walk_budget = {"days": [], "capped_days": [],
+                   "has_resume_walk": any(ev.get("event") == "resume_walk" for _ln, ev in rows)}
+    for d in days:
+        if d.get("walk_attempts") is None:
+            continue
+        row = {
+            "label": d["label"],
+            "walk_ok": d.get("walk_ok"),
+            "walk_attempts": d.get("walk_attempts"),
+            "plot_switches": d.get("plot_switches"),
+            "farm_actions": d.get("farm_actions"),
+        }
+        walk_budget["days"].append(row)
+        if (d.get("walk_ok") or 0) >= WALK_BUDGET_CAP:
+            walk_budget["capped_days"].append(row)
     # task-69：同一天重复起跑（run6：stuck 后同日重试）——呈现必须正确：
     # 去重后按"日历日"数，**不算跨日、不算多天**（跨日证据只对 ended_by=sleep 生效）。
     distinct_labels = []
@@ -6240,6 +6276,8 @@ def build_report(rows, path, args, bad_lines):
         "events": 0, "lines": [], "freed_total": 0, "freed_missing_lines": [],
         "zero_freed_lines": [], "shipped": 0, "noted_events": 0,
         "max_rounds": None, "reserve": None, "has_events": False,
+        "demands": [], "demand": 0, "demand_basis": {}, "target_frees": [],
+        "target_free": None, "reached": 0, "reached_lines": [],
     }
     inventory_blocked = {
         "events": 0, "lines": [], "reasons": {}, "free_slots": [], "rounds": [],
@@ -6260,6 +6298,21 @@ def build_report(rows, path, args, bad_lines):
                     slot_relief["zero_freed_lines"].append(_ln)
             if _ev.get("shipped"):
                 slot_relief["shipped"] += 1
+            _dem = as_int(_ev.get("demand"), None)
+            if _dem is not None:
+                slot_relief["demands"].append(_dem)
+                slot_relief["demand"] += _dem
+            _db = str(_ev.get("demand_basis") or "")
+            if _db:
+                slot_relief["demand_basis"][_db] = slot_relief["demand_basis"].get(_db, 0) + 1
+            _tf = as_int(_ev.get("target_free"), None)
+            if _tf is not None:
+                slot_relief["target_frees"].append(_tf)
+                if slot_relief["target_free"] is None:
+                    slot_relief["target_free"] = _tf
+            if _ev.get("reached") is True:
+                slot_relief["reached"] += 1
+                slot_relief["reached_lines"].append(_ln)
             if slot_relief["max_rounds"] is None:
                 slot_relief["max_rounds"] = as_int(_ev.get("max_rounds"), None)
             if slot_relief["reserve"] is None:
@@ -7637,6 +7690,8 @@ def build_report(rows, path, args, bad_lines):
         "weak_days": weak_days,
         # task-69：同日重试的呈现 + buy 事件的成/败计数（跑 run6 复核用）
         "same_day_retries": same_day_retries,
+        # 【A9-0749 复盘】走路预算燃烧（resume_walk 成功/尝试/换片 × 农场动作；纯 info）
+        "walk_budget": walk_budget,
         "buy": buy_counts,
         "sell": sell,
         # task-202（dev task-198）：背包满 ⇒ 腾格回路 + 诚实「背包阻塞」收尾（信息项，不进 rc）
@@ -8716,6 +8771,30 @@ def render_text(report, top):
     else:
         add(f"回片区穷尽（resume_exhausted 前缀，0.7.44）: 0 天（旧 stuck 前缀 "
             f"{_re.get('legacy_count', 0)} 天；`ended_reason` 在场且无新前缀 ⇒ 0 是真实读数）")
+    # E) 【A9-0749 复盘】走路预算燃烧：resume_walk 逐日 成功/尝试 × 换片 × 真农场动作。
+    #    与"回片区穷尽"分开读：budget_exhausted 收工 = 预算烧完但账本还有可执行格；
+    #    resume_exhausted 收工 = 真的拿不出目标。两者都诚实，但前者提示"走了不干活"。
+    _wb = report.get("walk_budget") or {}
+    if not _wb.get("has_resume_walk"):
+        add("走路预算燃烧（resume_walk，A9 复盘新增）: <缺失>（本账本没有 resume_walk 事件 "
+            "⇒ 无法判定回片区走路烧没烧预算；缺失 ≠ 0）")
+    else:
+        _wb_days = _wb.get("days") or []
+        _wb_cap = _wb.get("capped_days") or []
+        _wb_ok = sum(int(d.get("walk_ok") or 0) for d in _wb_days)
+        _wb_at = sum(int(d.get("walk_attempts") or 0) for d in _wb_days)
+        _wb_fa = sum(int(d.get("farm_actions") or 0) for d in _wb_days)
+        add(f"走路预算燃烧（resume_walk，A9 复盘新增）: {len(_wb_days)} 天有回片区走路，"
+            f"合计成功 {_wb_ok} / 尝试 {_wb_at} 次；命中当天成功上限 {WALK_BUDGET_CAP} 的 "
+            f"{len(_wb_cap)} 天（{[d['label'] for d in _wb_cap]}）；同期真农场动作合计 "
+            f"{_wb_fa} ⇒ info：走路是合法动作，但「走了不干活」要并读 ended_reason 与 "
+            f"pending_executable（budget_exhausted 收工日仍有可执行格 ⇒ 预算分配问题，不是没活）")
+        for _d in _wb_days:
+            _fa = _d.get("farm_actions")
+            _ratio = (f"走/干={_d.get('walk_ok')}:{_fa}" if _fa is not None else "走/干=无法判定")
+            add(f"    · {_d['label']}: 走路 成功{_d.get('walk_ok')}/尝试{_d.get('walk_attempts')}"
+                f"、换片{_d.get('plot_switches') if _d.get('plot_switches') is not None else '?'} 次"
+                f"、农场动作{_fa if _fa is not None else '?'}（{_ratio}）")
     # E) 阶段重分配封格 `blocked{action=stage_realloc}`（0.7.44 的「1 格余量反复重分」硬刹车）。
     _sr = report.get("stage_realloc") or {}
     if _sr.get("days"):
@@ -9573,7 +9652,13 @@ def render_text(report, top):
             add(f"  - {day['label']}: ended_by={day['ended_by']} verified={day['verified']} "
                 f"ok/skip/fail={day['ok_steps']}/{day['skipped_steps']}/{day['failed_steps']} "
                 f"checks[{checks}] 模态打断={day.get('modal_interrupts', 0)}{water_text}{cross_text} "
-                f"L{day['day_end_lines']}{final_text}")
+                f"L{day['day_end_lines']}{final_text}"
+                # 【A9-0749 复盘】走路预算燃烧：走了不干活的一天一眼可见（缺字段不渲染；
+                # 整本账本没有 resume_walk 机制 ⇒ 不渲染，交给 walk_budget 段写【无法判定】）
+                + (f" | 走路 成功{day.get('walk_ok')}/尝试{day.get('walk_attempts')}"
+                   f"、农场动作{day.get('farm_actions') if day.get('farm_actions') is not None else '?'}"
+                   if (report.get("walk_budget") or {}).get("has_resume_walk")
+                   and day.get("walk_attempts") is not None else ""))
     add("")
     sections = [
         ("0 必须人工介入（红）", "manual", "必须人工介入"),

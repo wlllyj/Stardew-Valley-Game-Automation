@@ -38,6 +38,9 @@ from typing import Any
 
 __all__ = [
     "BLOCKER_KINDS",
+    "CLUMP_KIND",
+    "CLUMP_SUBKINDS",
+    "ZONE_BLOCKER_KINDS",
     "TILE_CAP",
     "TILLABLE_CAP",
     "Zone",
@@ -47,11 +50,38 @@ __all__ = [
     "plot_in_zone",
     "resolve_zone",
     "zone_brief_lines",
+    "zone_blockers_total",
+    "zone_unknown_total",
     "zones_from_observe",
 ]
 
 #: 需要"先清理再谈耕种"的格：Mod 观测里 kind 的取值（协议 §5）。
 BLOCKER_KINDS = frozenset({"weed", "stone", "twig", "tree", "bush"})
+
+#: 【P0-1 / D1 修复】`ResourceClump`（大障碍）在 `tiles[].kind` 里的**唯一字面量**。
+#:
+#: 契约（Mod 侧源码，非自述）：
+#:   * `mod/AgentFarm.Bridge/WorldSnapshot.cs:807`
+#:     `else if (tf is StardewValley.TerrainFeatures.ResourceClump clump)
+#:      { t.Kind = "clump"; FillClumpMeta(t, clump); }`  ⇒ 大障碍的 kind 恒为 `"clump"`；
+#:   * `mod/AgentFarm.Bridge/Contracts.cs:590`（kind 取值表含 `clump`）；
+#:     `:598`（"**只有 `kind="clump"` 时**才填 clump* 元数据"）；
+#:   * 具体子类型（stump/log/boulder/rockPile/greenRain）写在**另一个字段** `clumpKind`，
+#:     由 `mod/AgentFarm.Bridge/ClumpMeta.cs:39-73 KindOf()` 推导 —— **它永不返回 "clump"**。
+#:
+#: ⚠️ 事故（D1）：曾把 `clumpKind` 的子类型当成 `kind` 塞进 ZONE_BLOCKER_KINDS，唯独漏掉真正的
+#: 承载位 `"clump"` ⇒ 区内只剩树桩/圆木/巨石也报 blockers=0（**假清空**，目标1 验收禁的那件事）。
+#: 所以这里**只**认承载位字面量，**不**并入 CLUMP_SUBKINDS（那是 clumpKind，不是 kind）。
+CLUMP_KIND = "clump"
+
+#: `clumpKind` 的取值集合（**不是** `tiles[].kind` 的取值）：仅作可读文档 + 漂移对照用。
+#: 语义定死：`clumpKind == "unknown"`（索引读不到/未知）的格**仍然算 blocker** ——
+#: "不知道用什么工具" ≠ "这一格不存在"（`ClumpMeta` 铁律：未知索引一律 unknown + clumpTarget=null）。
+CLUMP_SUBKINDS = frozenset({"stump", "log", "boulder", "rockPile", "greenRain", "unknown"})
+
+#: 作业区/田区"待清理"口径：在 BLOCKER_KINDS 基础上并入 ResourceClump（`tiles[].kind == "clump"`）。
+#: toolOk 门控在执行层处理（`farmwork.clear`），这里只做计数口径。
+ZONE_BLOCKER_KINDS = frozenset(BLOCKER_KINDS | {CLUMP_KIND})
 
 #: Mod 侧的上限（协议 §5）：达到上限说明快照只是"附近的一片"，不是整个农场。
 TILE_CAP = 400
@@ -69,10 +99,12 @@ class Zone:
     label: str                         # 中文标签，如 "农场西北田区"
     bounds: tuple[int, int, int, int]  # x0, y0, x1, y1（闭区间，游戏格坐标）
     tillable: int                      # 该区里可锄格数（来自 location.tillable[]，不猜）
-    blockers: int                      # 该区里待清理的格数（kind ∈ BLOCKER_KINDS）
+    blockers: int                      # 该区里待清理的格数（kind ∈ ZONE_BLOCKER_KINDS）
     crops: int                         # 该区里已有作物的格数
     unwatered: int                     # 该区里"有作物且 watered=False"的格数
     distance: int                      # 该区中心到玩家的曼哈顿距离
+    unknown: int = 0                   # 该区里 kind=="unknown" 的格数（Mod 读不到地形特征；
+                                        # 保守口径：未知格≠已清，retention/复核要求它也为 0）
 
 
 # ---------------------------------------------------------------- 观测解读小工具
@@ -309,11 +341,16 @@ def zones_from_observe(obs: dict, *, split: int = 2) -> list[Zone]:
         blockers = 0
         crops = 0
         unwatered = 0
+        unknown = 0
         for xy, tv in tiles.items():
             if not (x0 <= xy[0] <= x1 and y0 <= xy[1] <= y1):
                 continue
-            if tv.get("kind") in BLOCKER_KINDS:
+            if tv.get("kind") in ZONE_BLOCKER_KINDS:
                 blockers += 1
+            elif tv.get("kind") == "unknown":
+                # 【Z3 修复】kind=="unknown" 的格不在任何桶里，曾被静默忽略 ⇒ 区 blockers 报 0
+                # ⇒ 目标1② 假 PASS。现在单独计入，retention/复核要求它也得为 0（未知格≠已清）。
+                unknown += 1
             if _crop_id(tv) is not None:
                 crops += 1
                 if not tv.get("watered"):
@@ -321,7 +358,7 @@ def zones_from_observe(obs: dict, *, split: int = 2) -> list[Zone]:
         cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
         zones.append(Zone(name=name, label=label, bounds=(x0, y0, x1, y1),
                           tillable=tillable, blockers=blockers, crops=crops,
-                          unwatered=unwatered,
+                          unwatered=unwatered, unknown=unknown,
                           distance=abs(cx - pt[0]) + abs(cy - pt[1])))
     return zones
 
@@ -338,6 +375,48 @@ def zone_brief_lines(zones: list[Zone]) -> list[str]:
         f"已有作物 {z.crops} 格、待浇水 {z.unwatered} 格、离你约 {z.distance} 格"
         for z in zones
     ]
+
+
+def zone_blockers_total(zone: Zone, obs: Any) -> int | None:
+    """指定田区内的待清理格数（按 ZONE_BLOCKER_KINDS 口径）。
+
+    只统计 zone.bounds 内、且在 location.tiles[] 里出现的格；不猜、不造。
+    tilesTruncated 时返回 None：数据不完整，调用方必须标【无法判定】，绝不当 0。
+    """
+    loc = _loc(obs)
+    if loc.get("tilesTruncated"):
+        return None
+    tiles = _tile_index(loc.get("tiles"))
+    x0, y0, x1, y1 = zone.bounds
+    n = 0
+    for xy, tv in tiles.items():
+        if x0 <= xy[0] <= x1 and y0 <= xy[1] <= y1:
+            if tv.get("kind") in ZONE_BLOCKER_KINDS:
+                n += 1
+    return n
+
+
+def zone_unknown_total(zone: Zone, obs: Any) -> int | None:
+    """指定田区内 kind=="unknown" 的格数（与 `zone_blockers_total` 同形态）。
+
+    只统计 zone.bounds 内、且在 location.tiles[] 里出现的格；不猜、不造。
+    tilesTruncated 时返回 None：数据不完整，调用方必须标【无法判定】，绝不当 0。
+
+    【Z3 修复】未知格（Mod 读不到地形特征）曾因不在 `ZONE_BLOCKER_KINDS` 桶里被
+    静默忽略 ⇒ 区 blockers 报 0 ⇒ 目标1② 假 PASS。这里把它单独计数，retention/复核
+    要求 `blockers==0 ∧ unknown==0` 才算清空（单 unknown>0 一律保守算未清）。
+    """
+    loc = _loc(obs)
+    if loc.get("tilesTruncated"):
+        return None
+    tiles = _tile_index(loc.get("tiles"))
+    x0, y0, x1, y1 = zone.bounds
+    n = 0
+    for xy, tv in tiles.items():
+        if x0 <= xy[0] <= x1 and y0 <= xy[1] <= y1:
+            if tv.get("kind") == "unknown":
+                n += 1
+    return n
 
 
 def area_hint_text(zones: list[Zone]) -> str:
@@ -478,7 +557,7 @@ def plot_in_zone(zone: Zone, obs: dict, *, size: int = 5) -> dict:
             tv = tiles.get(c)
             if c in till:                      # tillable = 能锄出耕地的空格，优先按它归类
                 t_in.append(c)
-            elif tv is not None and tv.get("kind") in BLOCKER_KINDS:
+            elif tv is not None and tv.get("kind") in ZONE_BLOCKER_KINDS:
                 b_in.append(c)
             if tv is not None and _crop_id(tv) is not None:
                 c_in.append(c)

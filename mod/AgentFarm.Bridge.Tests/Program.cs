@@ -598,6 +598,29 @@ namespace AgentFarm.Bridge.Tests
                   && Array.IndexOf(SkillCatalog.LongTask, "advance_dialogue") >= 0,
                   "advance_dialogue 必须同时进 SkillCatalog.Executable 与 LongTask（跨 tick 等 safetyTimer/pause）");
 
+            // ---- dialogue-okfix：成功分支必须回 ok=true + 关框后的宽限窗口（P0/P1 的回归钉） ----
+            string advanceSkillPath = repoRoot == null ? null
+                : Path.Combine(repoRoot, "mod", "AgentFarm.Bridge", "DialogueAdvanceSkill.cs");
+            string advanceSkillText = advanceSkillPath != null && File.Exists(advanceSkillPath)
+                ? File.ReadAllText(advanceSkillPath) : "";
+
+            Check("okfix_closed_branch_returns_ok_true",
+                  advanceSkillText.Length > 0 && ClosedBranchCallsFinishOk(advanceSkillText),
+                  "`_stepped>0 && box==null` 是**成功**分支，必须调 this.FinishOk( ⇒ Build(true,…) ⇒ ok=true。"
+                  + "旧实现走 this.Finish( ⇒ ok=false，而 reason 还写着\"已推进 N 步…对话框已关闭\"（自相矛盾）；"
+                  + "下游 bridge.py:785 见到 ok!=true 立刻抛 BridgeError、payload 的 stepped 被整包丢弃 "
+                  + "⇒ 脑侧只累加 stall、两次 event_blocked");
+
+            Check("okfix_reopen_grace_window",
+                  DialogueAdvanceRules.ReopenGraceMs >= 1500 && DialogueAdvanceRules.ReopenGraceMs <= 3000
+                  && DialogueAdvanceRules.AfterBoxClosed(true, 0) == DialogueAdvanceRules.ClosedAfterProgress.KeepWaiting
+                  && DialogueAdvanceRules.AfterBoxClosed(true, DialogueAdvanceRules.ReopenGraceMs - 1) == DialogueAdvanceRules.ClosedAfterProgress.KeepWaiting
+                  && DialogueAdvanceRules.AfterBoxClosed(true, DialogueAdvanceRules.ReopenGraceMs) == DialogueAdvanceRules.ClosedAfterProgress.FinishOk
+                  && DialogueAdvanceRules.AfterBoxClosed(false, 0) == DialogueAdvanceRules.ClosedAfterProgress.FinishOk,
+                  "关框后：事件仍在跑 ⇒ 先宽限（默认 2000ms）等下一句，有框就同请求内接着推；"
+                  + "事件已结束（eventUp=false）或宽限到点 ⇒ 立刻按成功收尾。宽限只影响\"等多久\"，"
+                  + "不绕过 Precheck（提问/职业选择仍然一次都不点）");
+
             // ---- task-240：种子季节判定（"有种子" ≠ "当季能种"）----
             Check("t240_season_normalization",
                   SeedRules.NormalizeSeason(" Spring ") == "spring"
@@ -751,9 +774,31 @@ namespace AgentFarm.Bridge.Tests
             return result;
         }
 
-        /// <summary>从 bin 目录向上找仓库根（含 `mod/AgentFarm.Bridge/Skills.cs` 的目录）。</summary>
-        private static string FindRepoRoot()
+        /// <summary>
+        /// 文本级回归钉（dialogue-okfix / P0）：`DialogueAdvanceSkill` 里
+        /// "已推进过 + 对话框已关闭"这段**成功分支**必须调 `this.FinishOk(`，不许调 `this.Finish(`。
+        ///
+        /// 为什么只能扫源码：该文件直接吃 `Game1`/`DialogueBox` 类型，零依赖自检工程引用不了它
+        /// （与 `Skills.cs` 用 `CaseLiteralsInMethod` 当源码看是同一套纪律）。
+        /// 窗口界定：从 if 行到后面第一个 `string pre = DialogueAdvanceRules.Precheck`（前置判定）。
+        /// </summary>
+        private static bool ClosedBranchCallsFinishOk(string text)
         {
+            if (string.IsNullOrEmpty(text)) return false;
+            const string marker = "if (this._stepped > 0 && box == null)";
+            int at = text.IndexOf(marker, StringComparison.Ordinal);
+            if (at < 0) return false;
+
+            int end = text.IndexOf("string pre = DialogueAdvanceRules.Precheck", at, StringComparison.Ordinal);
+            if (end < 0) end = Math.Min(text.Length, at + 2000);
+
+            string block = text.Substring(at, end - at);
+            // `this.FinishOk(` 里不含 `this.Finish(`（"Finish" 后紧跟 'O'），两条可以并存判定。
+            return block.Contains("this.FinishOk(") && !block.Contains("this.Finish(");
+        }
+
+        /// <summary>从 bin 目录向上找仓库根（含 `mod/AgentFarm.Bridge/Skills.cs` 的目录）。</summary>
+        private static string FindRepoRoot()        {
             DirectoryInfo dir;
             try { dir = new DirectoryInfo(AppContext.BaseDirectory); }
             catch { return null; }

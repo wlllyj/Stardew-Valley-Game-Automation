@@ -36,15 +36,21 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "brain"))
 
+from agentfarm import fields as fields_mod  # noqa: E402  # 反事实测试要临时替换模块级常量
 from agentfarm.fields import (  # noqa: E402
     BLOCKER_KINDS,
+    CLUMP_KIND,
+    CLUMP_SUBKINDS,
+    ZONE_BLOCKER_KINDS,
     Zone,
     area_hint_text,
     choose_zone,
     normalize_hint,
     plot_in_zone,
     resolve_zone,
+    zone_blockers_total,
     zone_brief_lines,
+    zone_unknown_total,
     zones_from_observe,
 )
 
@@ -399,6 +405,209 @@ class PlotInZoneTest(unittest.TestCase):
         self.assertEqual([z.distance for z in without], [z.distance for z in with_player])
         self.assertEqual(choose_zone(without, prefer="nearest").name,
                          choose_zone(with_player, prefer="nearest").name)
+
+
+class ZoneBlockerKindsTest(unittest.TestCase):
+    """【0.7.48 P0-1 / D1】作业区"待清理"口径必须认得 ResourceClump 的**真实承载位**
+    `tiles[].kind == "clump"`（不是 `clumpKind` 的子树类型），且 tilesTruncated 时 fail-closed。"""
+
+    def test_zone_blocker_kinds_is_superset_of_blocker_kinds(self):
+        """基本口径不回归：BLOCKER_KINDS 全在、`clump` 也在。"""
+        self.assertTrue(BLOCKER_KINDS <= ZONE_BLOCKER_KINDS,
+                        f"ZONE_BLOCKER_KINDS 必须包含 BLOCKER_KINDS：{sorted(ZONE_BLOCKER_KINDS)}")
+        self.assertIn("clump", ZONE_BLOCKER_KINDS)
+
+    def test_clump_carrier_is_tile_kind_not_clumpkind(self):
+        """**漂移钉**：我们认的 clump 承载位 = `tiles[].kind` 的字面量 `"clump"`。
+
+        Mod 侧证据（纯 Python 不便 import C#，靠这条钉 + 源码注释防漂移）：
+          * `mod/AgentFarm.Bridge/WorldSnapshot.cs:807`：
+            `else if (tf is StardewValley.TerrainFeatures.ResourceClump clump)
+             { t.Kind = "clump"; FillClumpMeta(t, clump); }`  —— 大障碍的 kind 恒为 `"clump"`；
+          * `mod/AgentFarm.Bridge/Contracts.cs:590`（kind 取值表含 `clump`）与
+            `:598`（"只有 `kind="clump"` 时才填 clump* 元数据"）；
+          * `mod/AgentFarm.Bridge/ClumpMeta.cs:38-73 KindOf()` 只返回
+            `stump`/`log`/`boulder`/`rockPile`/`greenRain`/`unknown` —— **永不返回 `"clump"`**。
+
+        ⇒ 若哪天有人把 `clumpKind` 的子类型当成 `kind`（D1 就是这么发生的）塞进这个集合，
+        这条会红。
+        """
+        self.assertEqual(CLUMP_KIND, "clump")
+        self.assertIn(CLUMP_KIND, ZONE_BLOCKER_KINDS)
+        # clumpKind 的取值（含 unknown）**不是** tiles[].kind 的取值 ⇒ 一个都不许混进来。
+        self.assertEqual(ZONE_BLOCKER_KINDS & CLUMP_SUBKINDS, frozenset(),
+                         "clumpKind 的子类型是 clumpKind 的取值，不是 kind —— D1 就是错把它们当 kind")
+
+    def test_zones_from_observe_counts_clump_tiles_as_blockers(self):
+        """回归守卫：区内只剩大障碍（kind="clump"）时 blockers 必须 > 0（旧的死代码会报 0）。"""
+        obs = farm_obs(kinds={(0, 0): "clump", (1, 0): "clump"})
+        zones = zones_from_observe(obs, split=2)
+        self.assertEqual(sum(z.blockers for z in zones), 2,
+                         "大障碍（ResourceClump，kind=clump）必须计入 blockers")
+
+    def test_zones_from_observe_counts_unknown_tiles(self):
+        """Z3 回归：区内 kind=='unknown' 的格必须计入 Zone.unknown（曾静默忽略 ⇒ 假 PASS）。
+
+        kind=='unknown' 不在 ZONE_BLOCKER_KINDS 桶里，旧代码直接跳过 ⇒ 区 blockers 报 0
+        ⇒ 目标1② 假 PASS。现在单独计到 `unknown`，且不得污染 `blockers` 计数。
+        """
+        # split=2 下 field_nw = x∈[-10,-1] ∧ y∈[-10,-1]（西/北半区）。三格都落在 field_nw 内：
+        # 两格 unknown（计入 unknown）、一格 weed（计入 blockers）。
+        obs = farm_obs(kinds={(-1, -1): "unknown", (-2, -1): "unknown", (-1, -2): "weed"})
+        nw = zone_named(zones_from_observe(obs, split=2), "field_nw")
+        self.assertEqual(nw.unknown, 2, "两格 kind='unknown' 必须计入 Zone.unknown")
+        self.assertEqual(nw.blockers, 1, "unknown 不得污染 blockers 计数")
+        # 同时确认 zone_unknown_total 与 Zone.unknown 同口径。
+        self.assertEqual(zone_unknown_total(nw, obs), 2)
+        self.assertEqual(zone_blockers_total(nw, obs), 1)
+        # 截断时 zone_unknown_total 必须 fail-closed 返回 None（不当 0）。
+        obs_t = dict(obs)
+        obs_t["location"] = dict(obs["location"]); obs_t["location"]["tilesTruncated"] = True
+        self.assertIsNone(zone_unknown_total(nw, obs_t),
+                          "tilesTruncated 时 unknown 也必须【无法判定】而非 0")
+
+    def test_plot_in_zone_flags_clump_as_blocker(self):
+        """plot_in_zone 的 blockers 名单也要含大障碍（与 zones_from_observe 同口径）。"""
+        obs = farm_obs(kinds={(-10, -10): "clump", (-9, -10): "clump"})
+        nw = zone_named(zones_from_observe(obs, split=2), "field_nw")
+        plot = plot_in_zone(nw, obs, size=5)
+        self.assertEqual(sorted(map(tuple, plot["blockers"])), [(-10, -10), (-9, -10)])
+
+    def test_zone_blockers_total_counts_then_reports_zero_when_cleared(self):
+        """清空前 > 0（含 clump）、清空后 == 0。"""
+        obs_hot = farm_obs(kinds={(0, 0): "clump", (1, 0): "clump", (2, 0): "weed"})
+        zone = zones_from_observe(obs_hot, split=1)[0]
+        self.assertEqual(zone_blockers_total(zone, obs_hot), 3)
+        obs_clear = farm_obs()                     # 同范围，全是 dirt
+        self.assertEqual(zone_blockers_total(zone, obs_clear), 0)
+
+    def test_zone_blockers_total_fail_closed_on_truncated(self):
+        """tilesTruncated ⇒ None（调用方必须判【无法判定】），**绝不当 0**。"""
+        zone = zones_from_observe(farm_obs(), split=1)[0]
+        obs_trunc = farm_obs(kinds={(0, 0): "clump"}, truncated=True)
+        self.assertIsNone(zone_blockers_total(zone, obs_trunc))
+        # 反例：同样的观测但未截断时必须给得出数（证明是 truncated 令它 fail-closed）
+        self.assertEqual(zone_blockers_total(zone, farm_obs(kinds={(0, 0): "clump"})), 1)
+
+    def test_unknown_clumpkind_still_counts_as_blocker(self):
+        """`clumpKind=="unknown"`（索引读不到/未知）的格**仍然算 blocker**：不知道用什么工具 ≠ 不存在。"""
+        obs = farm_obs(kinds={(0, 0): "clump"})
+        for t in obs["location"]["tiles"]:
+            if t["tile"] == [0, 0]:
+                t.update({"clumpKind": "unknown", "clumpTarget": None, "toolOk": None})
+        zone = zones_from_observe(obs, split=1)[0]
+        self.assertEqual(zone_blockers_total(zone, obs), 1)
+
+    # ---- observer 的最小观测复现（scratch/observe_t15_d1_minobs.py）：同形态、同期望值 ----
+    @staticmethod
+    def _observer_minobs() -> dict:
+        """observer 的最小观测：包络 0..19、split=2 ⇒ field_nw=(5,5)+(6,5)、field_ne=(15,5)+(15,6)。
+
+        承载位一律是 `tiles[].kind == "clump"`；`clumpKind` 只作"是用什么工具"的原因说明，
+        **不参与任何判定**（脑侧从不读 clumpKind）。tillable 与 observer 脚本一致铺 0..19 的两行。
+        """
+        kinds = {(5, 5): "clump", (6, 5): "weed", (15, 5): "stone", (15, 6): "clump"}
+        tillable = [[x, y] for x in range(0, 20) for y in (0, 19)]
+        obs = farm_obs(x0=0, y0=0, x1=19, y1=19, kinds=kinds, tillable=tillable)
+        meta = {(5, 5): {"clumpKind": "stump", "clumpIndex": 600, "toolOk": True},
+                (15, 6): {"clumpKind": "boulder", "clumpIndex": 672, "toolOk": False}}
+        for t in obs["location"]["tiles"]:
+            m = meta.get(tuple(t["tile"]))
+            if m:
+                t.update(m)
+        return obs
+
+    def test_observer_minobs_two_blockers_per_zone(self):
+        """observer 实测（照抄）：field_nw={clump/stump, weed}=2、field_ne={stone, clump/boulder}=2。"""
+        obs = self._observer_minobs()
+        zones = {z.name: z for z in zones_from_observe(obs, split=2)}
+        self.assertEqual(zones["field_nw"].blockers, 2, "field_nw 两格障碍（clump 必须计入）")
+        self.assertEqual(zones["field_ne"].blockers, 2, "field_ne 两格障碍（clump 必须计入）")
+        self.assertEqual(zones["field_sw"].blockers, 0)
+        self.assertEqual(zones["field_se"].blockers, 0)
+        self.assertEqual(zone_blockers_total(zones["field_nw"], obs), 2)
+        self.assertEqual(zone_blockers_total(zones["field_ne"], obs), 2)
+
+    def test_observer_minobs_truncated_reports_none(self):
+        """observer 实测：tilesTruncated=True ⇒ zone_blockers_total 四个区一律 None（不许当 0）。"""
+        obs = self._observer_minobs()
+        obs["location"]["tilesTruncated"] = True
+        zones = {z.name: z for z in zones_from_observe(obs, split=2)}
+        for name in ("field_nw", "field_ne", "field_sw", "field_se"):
+            self.assertIsNone(zone_blockers_total(zones[name], obs),
+                              f"{name} 截断时必须【无法判定】而不是给一个数")
+
+    def test_observer_minobs_counterfactual_old_set_misses_clump(self):
+        """红/绿对照（反事实）：把 ZONE_BLOCKER_KINDS 换回 D1 之前的集合（误把 clumpKind 的
+        子类型当 kind）⇒ nw/ne 各掉 1 —— 如实复现 observer 说的"现在是 1"；还原后回到 2。"""
+        obs = self._observer_minobs()
+        old = frozenset(BLOCKER_KINDS | {"stump", "log", "boulder", "rockPile", "greenRain"})
+        saved = fields_mod.ZONE_BLOCKER_KINDS
+        try:
+            fields_mod.ZONE_BLOCKER_KINDS = old
+            zones = {z.name: z for z in zones_from_observe(obs, split=2)}
+            self.assertEqual(zones["field_nw"].blockers, 1, "D1 缺口：只剩 weed 一格（clump 漏计）")
+            self.assertEqual(zones["field_ne"].blockers, 1, "D1 缺口：只剩 stone 一格（clump 漏计）")
+        finally:
+            fields_mod.ZONE_BLOCKER_KINDS = saved
+        # 还原后必须回到 2 —— 证明这 1 的差确实只来自那个集合。
+        zones = {z.name: z for z in zones_from_observe(obs, split=2)}
+        self.assertEqual(zones["field_nw"].blockers, 2)
+        self.assertEqual(zones["field_ne"].blockers, 2)
+
+
+class VerifyZoneRetentionCliTest(unittest.TestCase):
+    """P0-3 工具 `tools/verify-zone-retention.py` 的 rc 语义（只读观测，不采信 journal）。"""
+
+    def _run(self, before: dict, after: dict, *extra: str):
+        import json
+        import subprocess
+        import tempfile
+        tool = Path(__file__).resolve().parents[1] / "tools" / "verify-zone-retention.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            b = Path(tmp) / "b.json"
+            a = Path(tmp) / "a.json"
+            b.write_text(json.dumps(before, ensure_ascii=False), encoding="utf-8")
+            a.write_text(json.dumps(after, ensure_ascii=False), encoding="utf-8")
+            p = subprocess.run([sys.executable, str(tool), "--before", str(b), "--after", str(a), *extra],
+                               capture_output=True, text=True, encoding="utf-8")
+        return p.returncode, (p.stdout or "")
+
+    def test_retained_clear_passes(self):
+        obs = farm_obs()
+        rc, out = self._run(obs, obs, "--zone", "field_nw")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("PASS (retained clear)", out)
+
+    def test_blockers_mean_fail(self):
+        # (-5,-5) 落在 field_nw 内（split=2 的西/北半区）
+        rc, out = self._run(farm_obs(kinds={(-5, -5): "clump"}), farm_obs(kinds={(-5, -5): "clump"}),
+                            "--zone", "field_nw")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL", out)
+
+    def test_truncated_is_undecidable_not_pass(self):
+        rc, out = self._run(farm_obs(truncated=True), farm_obs(truncated=True), "--zone", "field_nw")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("【无法判定】tilesTruncated", out)
+
+    def test_unknown_tile_after_blocks_pass(self):
+        """Z3 回归：after 观测里残留 kind=='unknown' 格 ⇒ 工具必须 FAIL（exit=1），不能声明"清空并保持"。"""
+        # before/after 都把 field_nw 内一格置为 unknown（blockers 均为 0）。
+        rc, out = self._run(farm_obs(kinds={(-5, -5): "unknown"}),
+                            farm_obs(kinds={(-5, -5): "unknown"}),
+                            "--zone", "field_nw")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL", out)
+        self.assertIn("unknown tile present, cannot claim cleared", out)
+
+    def test_unknown_tile_in_other_zone_does_not_fail_this_zone(self):
+        """对照：unknown 落在 field_se（与 field_nw 无关）、field_nw 全清（含 unknown=0）⇒ field_nw PASS。"""
+        before = farm_obs(kinds={(5, 5): "unknown"})   # (5,5) 落在 field_se
+        after = farm_obs(kinds={(5, 5): "unknown"})
+        rc, out = self._run(before, after, "--zone", "field_nw")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("PASS (retained clear)", out)
 
 
 if __name__ == "__main__":  # pragma: no cover

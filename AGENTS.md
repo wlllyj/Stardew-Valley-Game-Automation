@@ -10,6 +10,7 @@
 - **machine-runner**：真机独占（启游戏 / 起长跑 / 观测 / 优雅退游戏）；只写 `docs/_run*-evidence.md`、`docs/_smoke-*.md`、`logs/`、`scratch/`。
 - **log-analyst**：只读代码与账本；只写 `tools/analyze-longrun.py`、`tests/test_analyze_longrun.py`、`docs/_analyze-*.md`、`docs/_il-*.md`、`scratch/`。
 - **deputy-lead**：只读生产代码；只写 `docs/_review-*.md`、`scratch/`；不改任务板、不 deploy、不碰游戏。
+- **product-observer（旁观者）**：只读生产代码与账本；只写 `docs/_observe-*.md`、`scratch/`；不改任务板、不 deploy、不碰游戏、不改任何判据、不写生产代码。职责＝整体观察与问题发掘（缺口清单：缺口 / 现有证据 / 建议卡面 / 可验证判据）。
 - 越界写入 ⇒ 评审直接 FAIL，不看功能对不对。
 
 ## 1. Git 纪律（血泪教训：条目 079/080）

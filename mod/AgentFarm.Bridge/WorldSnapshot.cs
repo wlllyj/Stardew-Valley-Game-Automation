@@ -1331,6 +1331,13 @@ namespace AgentFarm.Bridge
             // 非 LevelUpMenu / 读不到 时为 null（字段被省略），脑按“未知”处理（同样不 dismiss）。
             v.ProfessionsToChoose = UiRead.ProfessionsToChoose();
 
+            // 【dialogue-okfix / P2】取证：判"关框后同一句又回来"是 command 重放还是事件重触发。
+            //   eventCommand  = 事件脚本执行到哪条 command（没自增 ⇒ 同一条被重放）；
+            //   dialogueLines = 当前对话框剩余条数（被填回 ⇒ 对话被重新灌入）。
+            // 两者都可能读不到 ⇒ null（字段省略），不用 0/"" 冒充观测。
+            v.EventCommand = UiRead.EventCommand();
+            v.DialogueLines = UiRead.DialogueLineCount(UiRead.ActiveDialogueBox());
+
             v.IsModal = v.ActiveMenu != null
                 || v.EventUp
                 || SafeBool(() => Game1.dialogueUp)

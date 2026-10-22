@@ -1212,6 +1212,58 @@ SEED_NAME_HINTS = ("seed", "seeds", "种子")
 #: 「留够 K 包的钱」：单价 ≤ 钱 / K 才算买得起（K=10）。这样买完种子还剩钱买别的/应急。
 SEED_KEEP_FACTOR = 10
 
+#: 【task-241】常见作物种子**数字 id → 当季可种的季节集合**（用于"只买当季在售种子"）。
+#: 数据核对自《星露谷》1.6 wiki 中文模块 ID 表。冬季 Pierre 不卖任何种子（买种子分支在
+#: `longrun._preconditions_apply` 里对 winter 直接早退，永不走到这里）。
+#: 键用**数字 id**（去掉 `(O)` 前缀），与 `core_seed_id()` 一致。未知 id 返回空（fail-open：
+#: 见 `season_probe_item` 与 `longrun` 里的"跨季货架失效"逻辑，货架本身是当季在售的事实）。
+SEED_SEASONS: dict[str, tuple[str, ...]] = {
+    # 春季
+    "472": ("spring",), "473": ("spring",), "474": ("spring",), "475": ("spring",),
+    "476": ("spring",), "477": ("spring",), "478": ("spring",), "745": ("spring",),
+    "427": ("spring",), "429": ("spring",), "433": ("spring", "summer"),
+    # 夏季
+    "480": ("summer",), "481": ("summer",), "482": ("summer",), "483": ("summer", "fall"),
+    "484": ("summer",), "485": ("summer",), "486": ("summer",), "487": ("summer", "fall"),
+    "453": ("summer",), "431": ("summer",), "455": ("summer",), "302": ("summer",),
+    "479": ("summer",),
+    # 秋季
+    "488": ("fall",), "489": ("fall",), "490": ("fall",), "491": ("fall",),
+    "492": ("fall",), "493": ("fall",), "494": ("fall",), "299": ("fall",),
+    "301": ("fall",), "425": ("fall",), "347": ("fall",),
+}
+
+#: 【task-241】每个季节"探一次"货架用的默认种子 id（避免拿春季 472 去夏天探而吃 `item_not_sold`）。
+#: 仅在 `shop_offers` 为空、需要探一次拿新鲜货架清单时用；探到清单后会照清单重挑，不一定买这个。
+SEED_PROBE_BY_SEASON: dict[str, str] = {
+    "spring": "472",   # Parsnip Seeds
+    "summer": "482",   # Pepper Seeds
+    "fall":   "490",   # Pumpkin Seeds
+    # winter 不会走到这里（早退）
+}
+
+
+def core_seed_id(item: str) -> str:
+    """从 `(O)472` / `472` / `Parsnip Seeds` 里取出**数字 id**（没有数字就原样返回去空格小写）。"""
+    s = str(item or "").strip()
+    if ")" in s:                      # 去掉 `(O)` / `(W)` 之类前缀
+        s = s.split(")", 1)[1]
+    return "".join(ch for ch in s if ch.isdigit())
+
+
+def seed_id_seasons(item: str) -> tuple[str, ...]:
+    """一个种子 id 能在哪些季节种（查 `SEED_SEASONS`）。查不到返回空元组（未知 ⇒ fail-open）。"""
+    return SEED_SEASONS.get(core_seed_id(item), ())
+
+
+def season_probe_item(season: str, default: str) -> str:
+    """探一次用的种子 id：能查到当季默认就用它，否则退回原配置 `default`（通常是春季 472）。
+
+    目的：**不拿当季买不到的种子去撞 `item_not_sold`**——run6 夏季硬买春季 472 就是这么
+    每天白试 6 次的。探到货架清单（`availableItems`）后会照清单重挑，所以这只是"敲门砖"。
+    """
+    return SEED_PROBE_BY_SEASON.get(str(season or "").strip().lower(), default)
+
 
 def seed_offers_from(res: dict[str, Any] | None) -> list[dict[str, Any]]:
     """从 `buy` 回执里取出**结构化货架清单**（`availableItems`，task-67）。
@@ -1492,10 +1544,33 @@ SLOT_RELIEF_HIGH_VALUE_IDS = frozenset({
 })
 
 #: **永远不卖**（升级材料/任务相关/建材级贵重块；工具/武器/种子另有 `isTool`+名字判据）。
+#:
+#: 【590f154 违纪修复 / task-241 后续】这是**唯一权威永不卖集合**：`_ship_one_stack_for_space`
+#: （last-resort 通道，longrun.py）与 `slot_relief_plan` 都消费它，两处不再各自维护会漂移的副本。
+#: 并集必须覆盖：
+#:   * 原 `SLOT_RELIEF_NEVER_SELL_IDS`：334/335/336/337（铜/铁/金/铱锭）、338（精炼石英）、787（电池）；
+#:   * 原手维护 `_PROTECTED`（longrun.py:6519）：330/378/380/382/384/386/388/390
+#:     （粘土/铜矿/铁矿/煤/金矿/铱矿/木材/石头）；
+#:   * 其余建材级（task-28 全部移出可卖表）：709 硬木、771 纤维、**909 放射性矿**——
+#:     后两者正是 590f154 违纪漏掉的（本地 `_PROTECTED` 副本漂移），会让 last-resort 把建材送出。
+#: 这些都是建造/升级/熔锭原料，卖出会破坏经济闭环，故宁可如实 `inventory_blocked` 也不卖。
 SLOT_RELIEF_NEVER_SELL_IDS = frozenset({
+    # 升级锭 / 精炼石英 / 电池（原 NEVER_SELL）
     "334", "335", "336", "337",   # Copper/Iron/Gold/Iridium Bar（升级要 5 锭）
     "338",   # Refined Quartz
     "787",   # Battery Pack
+    # 建材 / 矿石 / 木石（原 `_PROTECTED` + 其余；task-28 建材级全移出可卖表）
+    "330",   # Clay 粘土
+    "378",   # Copper Ore 铜矿
+    "380",   # Iron Ore 铁矿
+    "382",   # Coal 煤
+    "384",   # Gold Ore 金矿
+    "386",   # Iridium Ore 铱矿
+    "388",   # Wood 木材
+    "390",   # Stone 石头
+    "709",   # Hardwood 硬木（task-28 建材级，原 `_PROTECTED` 也漏）
+    "771",   # Fiber 纤维（590f154 违纪：原 `_PROTECTED` 漏，导致 last-resort 把建材送出）
+    "909",   # Radioactive Ore 放射性矿（590f154 违纪：同上漏）
 })
 
 #: 空格压力/换种子钱时**允许卖**的全部 id（fail-closed：不在并集里的一件都不卖）。
