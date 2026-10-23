@@ -619,7 +619,21 @@ namespace AgentFarm.Bridge.Tests
                   && DialogueAdvanceRules.AfterBoxClosed(false, 0) == DialogueAdvanceRules.ClosedAfterProgress.FinishOk,
                   "关框后：事件仍在跑 ⇒ 先宽限（默认 2000ms）等下一句，有框就同请求内接着推；"
                   + "事件已结束（eventUp=false）或宽限到点 ⇒ 立刻按成功收尾。宽限只影响\"等多久\"，"
-                  + "不绕过 Precheck（提问/职业选择仍然一次都不点）");
+                  +                   "不绕过 Precheck（提问/职业选择仍然一次都不点）");
+
+            // ---- goal-12 / task-241：dismiss_modal 的“无模态”分支必须兜底复位 dialogueUp ----
+            // 真机根因：Town 的 ui_modal 是 dialogueUp 残留（无可关 DialogueBox 菜单），
+            // 旧实现 menu==null 分支只回“无需关闭”却不动 dialogueUp ⇒ 永久卡死、背包升级恒失败。
+            // 零依赖自检跑不了真 Dismiss()（要吃 Game1），所以用源码契约钉死：
+            // “没有打开的模态”分支必须在 dialogueUp 为真时调 ClearDialogueFlag() 复位。
+            string modalDismissPath = repoRoot == null ? null
+                : Path.Combine(repoRoot, "mod", "AgentFarm.Bridge", "ModalDismiss.cs");
+            string modalDismissText = modalDismissPath != null && File.Exists(modalDismissPath)
+                ? File.ReadAllText(modalDismissPath) : "";
+            Check("t241_no_modal_branch_resets_dialogue_up",
+                  NoModalBranchResetsDialogueUp(modalDismissText),
+                  "menu==null 分支必须在 dialogueUp 为真时调 ClearDialogueFlag()（否则 Town 对话残留 ui_modal 永久卡死）；"
+                  + "源码契约防止改动被“优化”回只回“无需关闭”。");
 
             // ---- task-240：种子季节判定（"有种子" ≠ "当季能种"）----
             Check("t240_season_normalization",
@@ -795,6 +809,26 @@ namespace AgentFarm.Bridge.Tests
             string block = text.Substring(at, end - at);
             // `this.FinishOk(` 里不含 `this.Finish(`（"Finish" 后紧跟 'O'），两条可以并存判定。
             return block.Contains("this.FinishOk(") && !block.Contains("this.Finish(");
+        }
+
+        /// <summary>
+        /// 源码契约（goal-12 / task-241）：`ModalDismiss.Dismiss` 的“没有打开的模态”分支
+        /// 必须在 `Game1.dialogueUp` 为真时调 `ClearDialogueFlag()` 兜底复位。
+        /// 为什么只能扫源码：该分支吃 `Game1`/`Context`，零依赖自检工程跑不了真 Dismiss()。
+        /// 窗口界定：从“无需关闭”那句 return 向前找最近的 `if (menu == null)`，取到它的块，
+        /// 必须同时含 `Game1.dialogueUp` 判据与 `ClearDialogueFlag()` 调用。
+        /// </summary>
+        private static bool NoModalBranchResetsDialogueUp(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return false;
+            const string marker = "当前没有打开的模态，无需关闭";
+            int at = text.IndexOf(marker, StringComparison.Ordinal);
+            if (at < 0) return false;
+            int ifAt = text.LastIndexOf("if (menu == null)", at, StringComparison.Ordinal);
+            if (ifAt < 0) return false;
+            string block = text.Substring(ifAt, at - ifAt);
+            return block.Contains("Game1.dialogueUp")
+                && block.Contains("ClearDialogueFlag()");
         }
 
         /// <summary>从 bin 目录向上找仓库根（含 `mod/AgentFarm.Bridge/Skills.cs` 的目录）。</summary>

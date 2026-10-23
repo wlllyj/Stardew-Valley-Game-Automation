@@ -135,6 +135,18 @@ namespace AgentFarm.Bridge
                 // ---- 情况 3：没有模态 ----
                 if (menu == null)
                 {
+                    // 【goal-12 / task-241】Town 真机实测：NPC 反复触发对话 / 对话框已抽离却没复位标志，
+                    // 会让 `Game1.dialogueUp` 残留为 true 而 `activeClickableMenu` 为 null。
+                    // 此时 `UiBlocked()`（StepMover.cs）仍会因 dialogueUp 判 ui_modal，旧实现却只回“无需关闭”
+                    // 不动 dialogueUp ⇒ dismiss_modal 永远清不掉、背包升级链 goto_shop 恒 goto_shop_failed、
+                    // 容量恒 12、E2 满包死锁破不了。
+                    // 用项目唯一获准的状态写入点 `ClearDialogueFlag()` 兜底复位；dialogueUp 本就 false 时走原语义。
+                    if (SafeBool(() => Game1.dialogueUp))
+                    {
+                        ClearDialogueFlag();
+                        return Finish(true, "ok",
+                            "没有打开的模态，但检测到 dialogueUp 残留标志，已复位（解除对话残留导致的 ui_modal 卡死）");
+                    }
                     return Finish(true, "ok", "当前没有打开的模态，无需关闭");
                 }
 
