@@ -1021,6 +1021,11 @@ EVENT_BUCKETS = {
     # --- Lead m02395 机械核对：brain 里 `_journal("<name>"` 发出的**每个**事件名都要有桶，
     #     否则 run6 复盘会把新证据当"未映射"漏掉。下列 = task-15/41/42/49/50 等新事件。
     "event_blocked": "event_blocked",
+    # task-253（Option A）：事件在等待窗走完仍冻结 → 脑调 Mod `skip_event` 一次性翻篇；
+    # 三态均只作信息项，不判红、不进任何豁免分子。
+    "event_skipped": "event_skipped",
+    "event_skip_ineffective": "event_skip_ineffective",
+    "event_skip_failed": "event_skip_failed",
     "farm_evidence_unavailable": "farm_evidence_unavailable",
     "sell": "sells",
     "sell_failed": "sell_failures",
@@ -1300,6 +1305,9 @@ NEW_EVENT_BUCKETS = (
     "gaps_load_failures", "gaps_write_failures",
     # task-246（dev task-245）：事件进行中的有界等待（4×15s；info，不进 rc）
     "event_waits",
+    # task-253（Option A / skip_event）：事件在等待窗走完仍冻结时脑调 Mod `skip_event` 一次性翻篇；
+    # 三态都是信息项（成功翻篇 / 调用成功但事件仍 eventUp / 调用异常），一律不判红、不进 rc。
+    "event_skipped", "event_skip_ineffective", "event_skip_failed",
 )
 
 

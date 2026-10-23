@@ -33,7 +33,7 @@ namespace AgentFarm.Bridge
             "select_item", "plant", "sleep", "buy", "sell", "dismiss_modal",
             "upgrade_tool", "pickup_tool", "debug_dump", "add_missed_recipes",
             "craft_item", "place_object", "machine", "advance_dialogue",
-            "talk",
+            "talk", "skip_event",
         };
 
         /// <summary>

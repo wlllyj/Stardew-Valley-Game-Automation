@@ -17,11 +17,12 @@ import http.client
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # ---- 契约常量（改这里必须同步 docs/03-桥接协议.md 并升版本号） ----
 SCHEMA_BRIDGE = "agentfarm-bridge/1"
@@ -36,7 +37,9 @@ SCHEMA_WORLD_LEGACY = ("agentfarm-world/5", "agentfarm-world/4", "agentfarm-worl
 # 所以"脑已经改了、游戏里还是上一版 Mod"是**正常会发生的中间态**。
 # 对上一版 schema：**接受 + 大声警告一次**（新字段不可用），绝不静默吞掉。
 SCHEMA_EXEC = "agentfarm-exec/2"     # v2：新增 worldResumed
-MOD_VERSION_EXPECTED = "0.7.49"   # v0.7.49：P0 判据批——指定作业区「大障碍」口径修正（D1）+ 经济派发真值修正（D2）
+MOD_VERSION_EXPECTED = "0.7.50"   # v0.7.50：在 0.7.49 判据批（D1/D2）基础上新增 `skip_event` 技能（Option A / task-253），
+                                  # 仅新增能力、不删改既有字段（wateringCan/refillTiles 仍在），故 0.7.50 是 0.7.49 的超集，
+                                  # 期望版本随 Mod 部署版本同步升；脑侧 skip_event 接线已就绪（bridge.skip_event + longrun 钩子）。
                                   # ①D1（阻断级，目标1 ②的生死线）：`fields.py` 的 `ZONE_BLOCKER_KINDS`
                                   #   原并入的是 `clumpKind` 的**子类型值**（stump/log/boulder/rockPile/
                                   #   greenRain），而 Mod 给 tile 的 `kind` 恰是**字面量 `"clump"`**
@@ -716,6 +719,15 @@ def parse_bridge_info(raw: dict[str, Any], *, path: Path | None = None) -> Bridg
     )
 
 
+# ---- exec 的 busy 退避重试（见 BridgeClient.exec_skill）----
+# Mod 的 _activeLong 一次只放一个长任务；其它长任务请求会被 RejectBusy 拒回 status="busy"。
+# 脑侧若不重试，会永远卡在 busy、当天无法推进（真机 9VXBtA 在 Town 的死锁根因）。
+# 退避序列覆盖 Mod 长任务（move_to_location 等走位自限 ~60s）的占用窗口，
+# 总时长 ~90s，与 Mod 侧 _activeLong 的 90s 硬上限（MainThreadDispatcher）对齐。
+_EXEC_BUSY_BACKOFF_S = (2, 4, 8, 16, 30)
+_EXEC_BUSY_MAX_RETRIES = 6  # 2+4+8+16+30+30 = 90s
+
+
 class BridgeClient:
     """薄 HTTP 客户端。每个方法只做一件事：发请求、解析、把失败变成 BridgeError。"""
 
@@ -827,23 +839,42 @@ class BridgeClient:
         timeout_ms: int = 8000,
         based_on_seq: int | None = None,
         http_timeout: float | None = None,
+        _sleep: Callable[[float], None] = time.sleep,
     ) -> dict[str, Any]:
         """协议 §6。
 
         `http_timeout` 默认比 `timeout_ms` 多留 3 秒，避免"客户端先超时、
         服务端还在跑"造成两边认知不一致（旧协议没有这个区分）。
+
+        对 `status="busy"`（Mod 的 _activeLong 槽位被占用）做**指数退避重试**：
+        Mod 一次只跑一个长任务（move_to_location 等走位最多自限 ~60s），
+        其它长任务请求会被 RejectBusy 拒回 status="busy"。脑侧若不重试，会永远
+        卡在 busy、当天无法推进（真机 9VXBtA 在 Town 的死锁根因）。这里撑过占用
+        窗口，直到拿到释放后的槽位；非 busy 错误（含 world_stuck / timeout /
+        连接断 / schema_mismatch）照常上抛、**绝不重试**。
         """
         body: dict[str, Any] = {"skill": skill, "timeout_ms": int(timeout_ms)}
         if args:
             body["args"] = args
         if based_on_seq is not None:
             body["based_on_seq"] = int(based_on_seq)
-        result = self._request(
-            "POST",
-            "/v1/exec",
-            body,
-            timeout=http_timeout if http_timeout is not None else (timeout_ms / 1000.0 + 3.0),
-        )
+
+        http_to = http_timeout if http_timeout is not None else (timeout_ms / 1000.0 + 3.0)
+
+        # busy 退避重试：只对 status=="busy" 重试（短暂占用窗口，撑过去即可）；
+        # 其余失败（含 world_stuck / timeout / 连接断）直接上抛，避免无意义的死等。
+        attempt = 0
+        while True:
+            try:
+                result = self._request("POST", "/v1/exec", body, timeout=http_to)
+                break
+            except BridgeError as exc:
+                if exc.status == "busy" and attempt < _EXEC_BUSY_MAX_RETRIES:
+                    attempt += 1
+                    wait = _EXEC_BUSY_BACKOFF_S[min(attempt - 1, len(_EXEC_BUSY_BACKOFF_S) - 1)]
+                    _sleep(wait)
+                    continue
+                raise
 
         # exec 的 schema 校验采取"**存在才校验**"的宽松口径：
         # 实测 Mod 的部分响应分支（如未实现技能）不带 schema 字段，硬校验会把自己人打自己人
@@ -923,6 +954,23 @@ class BridgeClient:
         if max_steps is not None:
             args["maxSteps"] = int(max_steps)
         return self.exec_skill("advance_dialogue", args or None, timeout_ms=timeout_ms)
+
+    def skip_event(self, *, timeout_ms: int = 30000) -> dict[str, Any]:
+        """程序化结束当前游戏事件（skip_event，Option A / task-253）。
+
+        为什么需要：spring1 进 Town 触发的 `eventId=15389722` 在 command 48（playerControl 形态、
+        等玩家动作/移动）冻结，而脑侧在 `eventUp` 下没有任何合法游戏动作（`StepMover` 在 `eventUp`
+        时拒移动；桥只暴露 `dismiss_modal`/`advance_dialogue`，都只对 `DialogueBox`）⇒ 事件永久挂住、
+        从 spring1 起跑必死于 day1。Mod 用反射调 `Game1.CurrentEvent.skipEvent()`（fallback
+        `exitEvent`，等价于玩家 `endevent` 调试命令）程序化结束事件。
+
+        纪律（fail-closed）：
+          * 没有事件在跑（`eventUp=false` / `CurrentEvent=null`）⇒ Mod 回 `no_event`，一次都不调；
+          * 绝不用于有对话盒的事件（那应交给 `advance_dialogue` 推非提问对话）；
+          * 只看观测差分：调用后脑侧重观测 `eventUp` 是否转 false 才判定成功（Mod 回 `skip_issued`
+            只是"已发出跳过指令"，事件真正结束在下一 tick）。
+        """
+        return self.exec_skill("skip_event", None, timeout_ms=timeout_ms)
 
     def move_to(
         self,

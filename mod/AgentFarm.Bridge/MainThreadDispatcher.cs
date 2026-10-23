@@ -34,6 +34,13 @@ namespace AgentFarm.Bridge
         private WorkItem _activeLong;      // 允许跨 tick 推进的长任务（同一时刻至多 1 个）
         private long _tick;
 
+        /// <summary>长任务硬上限（毫秒）。任何长任务都不该无限占槽（卡死/寻路死循环的兜底）。
+        /// 90s 远超正常走位自限（~60s），仅作最后保险；与脑侧 busy 重试总时长（~90s）对齐。</summary>
+        private const long MaxLongTaskMs = 90_000;
+
+        /// <summary>当前长任务已运行的真实时长（用于硬上限判定，帧率无关）。</summary>
+        private readonly System.Diagnostics.Stopwatch _longTaskWatch = new System.Diagnostics.Stopwatch();
+
         /// <summary>当前 tick 序号（主线程自增，网络线程只读，用于日志与诊断）。</summary>
         public long Tick => Interlocked.Read(ref _tick);
 
@@ -66,13 +73,38 @@ namespace AgentFarm.Bridge
         {
             Interlocked.Increment(ref _tick);
 
-            // ---- 0) 长任务若已结束，先释放槽位 ----
+            // ---- 0) 长任务硬上限兜底（防占槽死锁）----
+            // 任何长任务都不该无限占槽。MoveToLocation 等走位自限 ~60s，但寻路死循环/
+            // 卡死会让槽位被永远占住（真机 9VXBtA 在 Town 的死锁根因）。这里给一个 90s
+            // 硬上限：超时就强制释放槽位、清场（HaltPlayer），并把该工作项以超时失败告终
+            // （ServeExec 的 try/catch 会转成 ok=false 回执，脑侧会当作硬错误而非 busy 重试）。
             lock (_longLock)
             {
-                if (_activeLong != null && _activeLong.IsDone) _activeLong = null;
+                if (_activeLong != null && !_activeLong.IsDone
+                    && _longTaskWatch.ElapsedMilliseconds > MaxLongTaskMs)
+                {
+                    WorkItem stuck = _activeLong;
+                    _activeLong = null;
+                    _longTaskWatch.Stop();
+                    _longTaskWatch.Reset();
+                    try { StepMover.HaltPlayer(); } catch { /* 清场失败也不能让主线程崩 */ }
+                    stuck.Fail(new TimeoutException(
+                        $"长任务超过 {MaxLongTaskMs}ms 硬上限被强制终止（疑似卡死/占槽，已调用 HaltPlayer 清场）"));
+                }
             }
 
-            // ---- 1) 队列排空（有界）----
+            // ---- 1) 长任务若已结束，先释放槽位 ----
+            lock (_longLock)
+            {
+                if (_activeLong != null && _activeLong.IsDone)
+                {
+                    _activeLong = null;
+                    _longTaskWatch.Stop();
+                    _longTaskWatch.Reset();
+                }
+            }
+
+            // ---- 2) 队列排空（有界）----
             for (int i = 0; i < MaxQueueDrainPerTick; i++)
             {
                 if (!_queue.TryPeek(out WorkItem head)) break;
@@ -88,19 +120,31 @@ namespace AgentFarm.Bridge
 
                 if (item.IsLongTask)
                 {
-                    lock (_longLock) _activeLong = item;
+                    lock (_longLock)
+                    {
+                        _activeLong = item;
+                        _longTaskWatch.Restart();
+                    }
                 }
 
                 RunOne(item);
             }
 
-            // ---- 2) 长任务步进（每 tick 恰好一次）----
+            // ---- 3) 长任务步进（每 tick 恰好一次）----
             WorkItem active;
             lock (_longLock) active = _activeLong;
             if (active != null)
             {
                 RunOne(active);
-                if (active.IsDone) lock (_longLock) { if (ReferenceEquals(_activeLong, active)) _activeLong = null; }
+                if (active.IsDone)
+                {
+                    lock (_longLock)
+                    {
+                        if (ReferenceEquals(_activeLong, active)) _activeLong = null;
+                        _longTaskWatch.Stop();
+                        _longTaskWatch.Reset();
+                    }
+                }
             }
         }
 

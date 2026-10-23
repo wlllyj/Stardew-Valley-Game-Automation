@@ -3777,7 +3777,7 @@ class FarmWorker:
         loc = str((obs.get("location") or {}).get("name") or "")
         if loc != home:
             state["stage"] = f"去 {home}（ensure_location）"
-            mv = self.ensure_location(home, timeout_ms=30000)
+            mv = self.ensure_location(home, timeout_ms=60000)
             if not mv.ok:
                 r.code, r.reason, r.receipt = "failed", f"回不了 {home}：{mv.reason}", mv.receipt
                 return r
@@ -4004,7 +4004,7 @@ class FarmWorker:
                         "此时买 = 钱和锭当场扣掉、工具不升级（游戏不回滚）⇒ 先取回在途那把")
             return r
         if self.location_of(obs).get("name") != shop_location:
-            mv = self.ensure_location(shop_location, timeout_ms=30000)
+            mv = self.ensure_location(shop_location, timeout_ms=60000)
             if not mv.ok:
                 r.code, r.reason, r.receipt = "failed", f"去不了 {shop_location}：{mv.reason}", mv.receipt
                 return r
@@ -4095,7 +4095,7 @@ class FarmWorker:
                         "「背包满了」，工具拿不回来（先腾格再来）")
             return r
         if self.location_of(obs).get("name") != home:
-            mv = self.ensure_location(home, timeout_ms=30000)
+            mv = self.ensure_location(home, timeout_ms=60000)
             if not mv.ok:
                 r.code, r.reason, r.receipt = "failed", f"去不了 {home}：{mv.reason}", mv.receipt
                 return r

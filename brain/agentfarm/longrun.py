@@ -524,6 +524,13 @@ EVENT_WAIT_SECONDS = 15.0
 EVENT_WAIT_EXTRA_TRIES = 20
 EVENT_WAIT_IDLE_GIVE_UP = 4
 
+#: 【Option A / skip_event】等满整段等待窗仍"无对话框冻结态"⇒ 事件被判定挂住前，先尝试程序化跳过
+#: （等价于玩家 endevent）。给自解过场（如 Kent 归来 eventId=63）留足计时/动画播完的时间，
+#: 绝不在其结束前误跳；只有真·无限冻结（如 15389722 command48）才会走到这里被兜底跳过。
+#: 跳过指令发出后，事件真正结束（eventUp 转 false）在下一 tick，故还要再等若干轮确认。
+EVENT_SKIP_TIMEOUT_MS = 30000
+EVENT_SKIP_SETTLE_TRIES = 4
+
 
 def _dist(a: tuple[int, int], b: tuple[int, int]) -> int:
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
@@ -9561,7 +9568,7 @@ class LongRun:
                 # （`farmwork.FarmWorker.upgrade_tool`：钱少/出现 `toolBeingUpgraded`/等级变大）。
                 st = None
                 try:
-                    mv = self.worker.ensure_location("Blacksmith", timeout_ms=30000)
+                    mv = self.worker.ensure_location("Blacksmith", timeout_ms=60000)
                     if getattr(mv, "ok", False):
                         obs = self._snap()
                     st = self.worker.upgrade_tool("axe", timeout_ms=60000)
@@ -9841,6 +9848,50 @@ class LongRun:
                           status=status, reason=str(receipt.get("reason") or "")[:200])
         return obs
 
+    def _skip_event_supported(self) -> bool:
+        """客户端是否具备程序化跳过事件的能力（Mod ≥ 含 skip_event 的版本）。"""
+        client = getattr(self, "client", None)
+        return getattr(client, "skip_event", None) is not None
+
+    def _try_skip_event(self, obs: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        """尝试程序化结束当前事件（skip_event）。返回 `(最新 obs, 是否真的结束)`。
+
+        只看观测差分：调用后重观测，eventUp 转 false 才算成功；否则视为无效、交给原等待窗兜底。
+        skipEvent 是下一 tick 才把 eventUp 扳回 false 的，所以这里再等若干轮确认（不立刻判死）。
+        """
+        client = getattr(self, "client", None)
+        skip = getattr(client, "skip_event", None)
+        if skip is None:
+            return obs, False
+        ui = obs.get("ui") or {}
+        event_id = ui.get("eventId")
+        try:
+            receipt = skip(timeout_ms=EVENT_SKIP_TIMEOUT_MS)
+        except BridgeError as exc:
+            self._journal("event_skip_failed", eventId=event_id,
+                          status=str(getattr(exc, "status", "") or ""),
+                          reason=str(exc)[:200])
+            return obs, False
+        if not isinstance(receipt, dict):
+            return obs, False
+        status = str(receipt.get("status") or "")
+        # skipEvent 下一 tick 才把 eventUp 扳回 false；等若干轮确认事件真的结束。
+        for _ in range(EVENT_SKIP_SETTLE_TRIES):
+            self.sleep_fn(EVENT_WAIT_SECONDS)
+            obs = self._snap_or(obs)
+            up, _q, _m, _d = self._event_dialogue_state(obs)
+            if not up:
+                self._journal("event_skipped", eventId=event_id, status=status,
+                              reason=str(receipt.get("reason") or "")[:200],
+                              note="程序化跳过事件成功（eventUp 已转 false）：等价于玩家 endevent，"
+                                   "事件被主动合理结束、不是挂住无解；回日循环继续当日")
+                return obs, True
+        # 等了若干轮事件仍 eventUp ⇒ skip 没生效（可能该事件不支持程序化跳过 / 反射入口缺失）。
+        self._journal("event_skip_ineffective", eventId=event_id, status=status,
+                      reason=f"skip_event 调用成功但事件仍 eventUp（等了 {EVENT_SKIP_SETTLE_TRIES} 轮仍冻结）"
+                             "⇒ 不放弃，交回原等待窗兜底、诚实 event_blocked")
+        return obs, False
+
     def _wait_event_up(self, obs: dict[str, Any]) -> tuple[dict[str, Any], bool, int]:
         """【task-245】`eventUp=true` 且没有对话盒：**有界等待**事件自己开出对话盒。
 
@@ -9915,6 +9966,14 @@ class LongRun:
             # 走格"命令；结束条件=计时到/动画播完，不需玩家动作）。**不再因"指纹不动"提前判死**
             # —— 给足整段等待窗，只跑到 `tries >= total_limit` 仍 `eventUp` 才诚实 `event_blocked`。
             # `total_limit` = EVENT_WAIT_TRIES + EVENT_WAIT_EXTRA_TRIES 永远兜底，绝不无限等。
+        # 循环正常走到尽头：仍是 eventUp 且无对话盒 ⇒ 先试 skip_event（程序化结束事件，等价于玩家
+        # endevent），成功则翻篇回日循环；失败/不支持才诚实 event_blocked（绝不把"跳不动"洗成过关）。
+        # 放在整段等待窗之后：给自解过场（Kent 归来 eventId=63）留足计时/动画播完的时间，绝不在其
+        # 结束前误跳；只有真·无限冻结（15389722 command48）才会走到这里被兜底跳过。
+        if self._skip_event_supported() and not self._event_dialogue_state(obs)[3]:
+            obs, skipped = self._try_skip_event(obs)
+            if skipped:
+                return obs, False, tries
         return obs, True, tries
 
     def _clear_modals(self, obs: dict[str, Any], rep: DayReport) -> tuple[dict[str, Any], bool]:

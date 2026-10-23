@@ -13257,6 +13257,49 @@ class TestTask245EventWait(unittest.TestCase):
         self.assertEqual(len(self._events(run, "event_wait")), 0, run.entries)
         self.assertEqual(w.dismiss_calls, 1)
 
+    def test_frozen_event_is_skipped_after_full_window_when_skip_supported(self):
+        """【Option A / skip_event】冻结过场等满整段窗仍挂住、且客户端具备跳过能力 ⇒ 程序化结束事件
+        翻篇（event_skipped），**不当** event_blocked；给自解过场（Kent eventId=63）留足时间、不误跳。"""
+        class _SkipClient(FakeClient):
+            def skip_event(self, *, timeout_ms=30000):
+                return self.w.skip_event()
+        class _SkipWorld(FakeWorld):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.skip_calls = 0
+            def skip_event(self):
+                self.skip_calls += 1
+                self._event_ended = True
+                return {"ok": True, "status": "skip_issued", "skill": "skip_event"}
+            def obs(self):
+                o = super().obs()
+                if getattr(self, "_event_ended", False):
+                    o = dict(o)
+                    ui = dict(o.get("ui") or {})
+                    ui["eventUp"] = False
+                    ui["eventId"] = None
+                    ui["activeMenu"] = ""
+                    ui["activeMenuText"] = ""
+                    o["ui"] = ui
+                return o
+        w = _SkipWorld(weeds=0)
+        w.ui_script = [{"activeMenu": "", "activeMenuText": "", "eventUp": True,
+                        "eventId": "15389722"}]
+        run = make_run(w, target_days=1)
+        run.worker = FakeWorker(w)
+        run.client = _SkipClient(w)
+        rep = self._rep()
+
+        obs, blocked = run._clear_modals(w.obs(), rep)
+
+        self.assertFalse(blocked, rep.ended_reason)
+        self.assertEqual(len(self._events(run, "event_blocked")), 0, run.entries)
+        skipped = self._events(run, "event_skipped")
+        self.assertEqual(len(skipped), 1, run.entries)
+        self.assertEqual(skipped[0]["eventId"], "15389722", skipped[0])
+        self.assertEqual(w.skip_calls, 1, "应当只调用一次 skip_event")
+        self.assertEqual(rep.ended_by, "", "跳过成功后不当 blocked_event，应回日循环")
+
 
 class TestSpring1EventFreeze(unittest.TestCase):
     """devcoder-spring1-event：修复 spring1 Kent 归来事件（eventId=63，skippable 过场，

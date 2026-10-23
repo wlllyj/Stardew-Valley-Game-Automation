@@ -20,6 +20,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -45,6 +46,8 @@ class FakeBridgeHandler(BaseHTTPRequestHandler):
     token = TOKEN
     world_schema = "agentfarm-world/6"
     exec_status = "ok"
+    exec_busy_left = 0  # 非 0 时：前 N 次 /v1/exec 返回 busy（用于测 busy 退避重试）
+    exec_busy_until_ts = 0.0  # 非 0 时：在此时间戳前所有 /v1/exec 返回 busy（模拟 Mod 真实占槽窗口）
     require_token = True
     # 失败回执上额外挂的字段（用来测"失败也带 path/hops"这类审计要求）
     exec_fail_extra = None
@@ -119,6 +122,13 @@ class FakeBridgeHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
         # 记下最近一次请求体，供测试断言"客户端到底发了什么"（例如 allow_bed 是否只在 True 时出现）
         type(self).last_body = body
+        # busy 重试测试钩子：前 exec_busy_left 次、或在 exec_busy_until_ts 之前都返回 busy
+        if type(self).exec_busy_left > 0 or type(self).exec_busy_until_ts > time.monotonic():
+            if type(self).exec_busy_left > 0:
+                type(self).exec_busy_left -= 1
+            self._send(200, {"ok": False, "status": "busy", "skill": body.get("skill"),
+                             "reason": "已有技能正在执行，同一时刻只允许一个 exec"})
+            return
         skill = body.get("skill")
         if skill == "noop":
             self._send(200, {"ok": True, "status": "ok", "skill": "noop", "reason": "",
@@ -596,6 +606,53 @@ class BridgeClientTest(unittest.TestCase):
             BridgeClient().move_to(64, 15)
         self.assertEqual(ctx.exception.status, "unreachable")
         self.assertIn("不可达", ctx.exception.reason)
+
+    def test_exec_retries_on_busy_then_succeeds(self) -> None:
+        """status=="busy" 必须被指数退避重试而非硬失败（优先级 A / 9VXBtA 死锁根因）。
+
+        Mod 的 _activeLong 槽位被长任务占用时，后续 exec 会反复收到 busy；
+        脑侧若不重试会永远卡死。这里验证：前 3 次 busy、第 4 次成功时，
+        exec_skill 能撑过去拿到结果，且退避序列与预期一致。
+        """
+        FakeBridgeHandler.exec_busy_left = 3
+        sleeps = []
+        try:
+            result = BridgeClient().exec_skill("move_to", {"x": 64, "y": 15}, _sleep=sleeps.append)
+        finally:
+            FakeBridgeHandler.exec_busy_left = 0
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(len(sleeps), 3)        # 重试了 3 次
+        self.assertEqual(sleeps, [2, 4, 8])      # 退避序列前 3 档
+
+    def test_exec_does_not_retry_non_busy_error(self) -> None:
+        """非 busy 错误（unreachable）必须照常上抛，绝不重试、绝不睡眠。"""
+        FakeBridgeHandler.exec_status = "unreachable"
+        sleeps = []
+        try:
+            with self.assertRaises(BridgeError) as ctx:
+                BridgeClient().exec_skill("move_to", {"x": 64, "y": 15}, _sleep=sleeps.append)
+        finally:
+            FakeBridgeHandler.exec_status = "ok"
+        self.assertEqual(ctx.exception.status, "unreachable")
+        self.assertEqual(sleeps, [])             # 一次都没睡，没有重试
+
+    def test_exec_carries_through_real_busy_window(self) -> None:
+        """busy 重试必须能撑过 Mod 真实占槽窗口（非瞬时桩，用真实 wall-clock 模拟）。
+
+        模拟 Mod 的 _activeLong 被长任务占用约 1s：期间每次 exec 都回 busy，
+        exec_skill 必须按退避序列等到窗口结束、拿到释放后的槽位，而不是立刻失败。
+        这比纯计数桩更接近真机 9VXBtA 的 Town 死锁场景。
+        """
+        FakeBridgeHandler.exec_busy_until_ts = time.monotonic() + 1.0
+        try:
+            t0 = time.monotonic()
+            result = BridgeClient().exec_skill("move_to", {"x": 64, "y": 15})  # 用真实 time.sleep 退避
+            elapsed = time.monotonic() - t0
+        finally:
+            FakeBridgeHandler.exec_busy_until_ts = 0.0
+        self.assertEqual(result["status"], "ok")
+        # 至少等过一次退避（2s 首档），证明它不是"立刻拿 busy 就放弃"
+        self.assertGreaterEqual(elapsed, 1.5)
 
     def test_unknown_path_404(self) -> None:
         with self.assertRaises(BridgeError) as ctx:

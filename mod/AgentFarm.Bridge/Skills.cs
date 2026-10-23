@@ -112,6 +112,10 @@ namespace AgentFarm.Bridge
                 // 3s 重试；默认 60s、上限 120s（暂停/长事件都装得下，但不许无界）
                 case "advance_dialogue":
                     return ClampDialogueTimeout(timeoutMs);
+                // 【Option A / skip_event】程序化结束事件：单 tick 同步（反射调 skipEvent 立即返回），
+                // 但带反射遍历，给 30s 默认 / 60s 上限足够、不许无界（与机器链同口径）。
+                case "skip_event":
+                    return ClampMachineTimeout(timeoutMs);
                 default:
                     return ClampTimeout(timeoutMs);
             }
@@ -539,6 +543,13 @@ namespace AgentFarm.Bridge
                 case "talk":
                     return new TalkSkill(req, world, monitor).Step;
 
+                // 【Option A / skip_event】程序化结束当前事件（等价于玩家 endevent 调试命令）：
+                // 反射调 Game1.CurrentEvent.skipEvent()（fallback exitEvent）。只在 eventUp 且无
+                // CurrentEvent 时回 no_event；脑侧只在"无对话框冻结态"触发，绝不用于有对话盒的事件
+                // （那交给 advance_dialogue）。单 tick 同步 ⇒ 不进 LongTask（见 SkillCatalog）。
+                case "skip_event":
+                    return new SkipEventSkill(req, world, monitor).Step;
+
                 default:
                     // 未实现的技能：合法请求但还没有实现（区别于 unknown_skill）。
                     return () => new ExecResponse
@@ -549,7 +560,7 @@ namespace AgentFarm.Bridge
                         Reason = $"技能“{skill}”尚未实现（已实现：noop、move_to、move_to_location、"
                                + "dismiss_modal、load_save、quit_game、interact、use_tool、select_item、plant、"
                                + "sleep、buy、sell、upgrade_tool、pickup_tool、debug_dump、add_missed_recipes、"
-                               + "craft_item、place_object、machine、advance_dialogue、talk）",
+                               + "craft_item、place_object、machine、advance_dialogue、talk、skip_event）",
                     };
             }
         }
