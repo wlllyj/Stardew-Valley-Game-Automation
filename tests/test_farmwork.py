@@ -1574,6 +1574,48 @@ class TestTask43LongPathRecovery(unittest.TestCase):
         self.assertIsNone(FarmWorker._warp_source_of("没有源格的老回执"))
         self.assertIsNone(FarmWorker._remaining_steps_of("没有步数的老回执"))
 
+    def _ui_modal_fail(self, target="SeedShop"):
+        """室外行程被 NPC 对话/过场挡住的回执（照真机 UYFc6J 措辞）。"""
+        return {"fail": {
+            "status": "ui_modal",
+            "reason": ("移动过程中被菜单/对话/过场打断，已停止移动"
+                       f"（当前 DialogueBox，目标 17,4）"),
+        }}
+
+    def test_ui_modal_is_recovered_by_dismiss_and_retry(self):
+        """【抗 ui_modal 打断】首跳被 ui_modal 挡住 ⇒ dismiss_modal 后重试一次 ⇒ 到达。
+
+        真机 UYFc6J：goto_shop 连续两天被 ui_modal 打断、背包升级跑不通、容量恒 12
+        ⇒ E2 满包死锁无法打破。本用例钉死"清模态重试"契约：不把 ui_modal 当终局失败。
+        """
+        w = MiniWorld()
+        w.location_name = "Farm"
+        w.move_to_location_script = [self._ui_modal_fail(), {"ok": True}]
+        r = self._worker(w).ensure_location("SeedShop")
+        self.assertTrue(r.ok, r.reason)
+        self.assertEqual(w.location_name, "SeedShop")
+        self.assertEqual(w.dismiss_calls, 1)          # 只清一次模态（不风暴）
+        # 请求次数：首跳 1 + 成功重试 1（≤ 上限，绝不自旋）
+        self.assertEqual(len(w.move_to_location_calls), 2)
+        self.assertEqual(w.move_to_location_calls[0]["timeout_ms"], 60000)
+
+    def test_ui_modal_repeatedly_blocked_is_bounded_and_gives_up(self):
+        """ui_modal 连续挡住每一次重试 ⇒ 有界停手（恰 1 首跳 + 3 次重试），如实记失败。"""
+        w = MiniWorld()
+        w.location_name = "Farm"
+        w.move_to_location_script = [self._ui_modal_fail(),
+                                     self._ui_modal_fail(),
+                                     self._ui_modal_fail(),
+                                     self._ui_modal_fail()]
+        r = self._worker(w).ensure_location("SeedShop")
+        self.assertFalse(r.ok)
+        self.assertEqual(r.code, "failed")
+        self.assertEqual(w.dismiss_calls, FarmWorker.ENSURE_LOC_MODAL_RETRIES)
+        # 1 首跳 + ENSURE_LOC_MODAL_RETRIES 次重试（有界，不无限重试）
+        self.assertEqual(len(w.move_to_location_calls),
+                         1 + FarmWorker.ENSURE_LOC_MODAL_RETRIES)
+        self.assertIn("清模态重试后仍被挡", r.reason)
+
 
 class TestTask42Sell(unittest.TestCase):
     """task-42 出货闭环：**白名单只认"亲眼看见进了背包"的东西**，判据只看观测差分。

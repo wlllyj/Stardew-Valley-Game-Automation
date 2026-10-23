@@ -2404,6 +2404,11 @@ class FarmWorker:
         r.reason = "；".join(bits)
         _mark_status(r, _exc_status(exc))               # 环境挡路 / 没结论 ⇒ 不封格
 
+    #: 【抗 ui_modal 打断】室外行程（如背包升级去 SeedShop）被 NPC 对话/过场挡住时，
+    #: move_to_location 会回 ui_modal 失败。清掉模态后重试的上限（真机 UYFc6J 连续两天
+    #: goto_shop 被 ui_modal 打断、背包升级跑不通、容量恒 12 ⇒ E2 满包死锁无法打破）。
+    ENSURE_LOC_MODAL_RETRIES = 3
+
     def ensure_location(self, name: str, *, tile: tuple[int, int] | None = None,
                         timeout_ms: int = 60000) -> StepResult:
         """走到另一个地点；**失败后做一次两段式重试**（task-43）。
@@ -2424,6 +2429,36 @@ class FarmWorker:
         try:
             self.c.move_to_location(name, tile=tile, timeout_ms=timeout_ms)
         except BridgeError as exc:
+            # 【抗 ui_modal 打断】移动被菜单/对话/过场挡住（status=="ui_modal"）：
+            # 这是 Town 等室外行程被 NPC 对话/过场挡住的常态，不是失败——清掉模态后重试，
+            # 让背包升级等室外行程能真正抵达（否则容量恒 12、E2 满包死锁无法打破）。
+            # 睡眠触发格的 ui_modal 命中信号由 move_to/_do_sleep 单独处理，不在这里。
+            if exc.status == "ui_modal":
+                diag.append("移动被 ui_modal 打断，尝试清模态重试（上限 %d 次）" % self.ENSURE_LOC_MODAL_RETRIES)
+                recovered = False
+                for _ in range(self.ENSURE_LOC_MODAL_RETRIES):
+                    try:
+                        self.c.dismiss_modal()
+                    except BridgeError:
+                        pass
+                    try:
+                        self.c.move_to_location(name, tile=tile, timeout_ms=timeout_ms)
+                        recovered = True
+                        break
+                    except BridgeError as exc2:
+                        if exc2.status != "ui_modal":
+                            exc = exc2
+                            break
+                if not recovered:
+                    diag.append("清模态重试后仍被挡（ui_modal 或新错误），放弃行程")
+                else:
+                    obs = self.snap()
+                    now = str((obs.get("location") or {}).get("name") or "")
+                    if now != name:
+                        r.code, r.reason = "failed", f"回执说到了，但观测显示还在 {now}"
+                        return r
+                    r.ok = True
+                    return r
             src = self._warp_source_of(str(exc))
             steps = self._remaining_steps_of(str(exc))
             if src is not None:
