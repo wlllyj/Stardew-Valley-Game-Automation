@@ -75,6 +75,7 @@ class MiniWorld:
         #: 关掉提问框之后日期会不会跟着前进（真机定案：会，~3s；置 False 用来测"仍不动"）。
         self.dismiss_finishes_day = True
         self.dismiss_calls = 0
+        self.skip_event_calls = 0
         self.dismiss_errors: list[str] = []   # 每次 dismiss_modal 的说明（单测直接看）
         self.day = 9
         self.tod = 1300
@@ -648,6 +649,15 @@ class MiniBridge:
             note += "（当时没有提问框）"
         self.w.dismiss_errors.append(note)
         return {"ok": True, "status": "ok", "reason": note}
+
+    def skip_event(self, *, timeout_ms=None):
+        """`skip_event`：程序化结束当前事件（反射 Game1.CurrentEvent.skipEvent()）。
+
+        真机定案：Town 的 ui_modal 多为 eventUp 过场，dismiss_modal 关不掉它
+        （ModalDismiss 只处理 DialogueBox/菜单），必须用 skip_event 结束事件。
+        """
+        self.w.skip_event_calls += 1
+        return {"ok": True, "status": "skip_issued", "reason": "已发出跳过事件指令"}
 
     def move_to_location(self, location, *, tile=None, timeout_ms=None, based_on_seq=None,
                          allow_bed=False):
@@ -1600,21 +1610,51 @@ class TestTask43LongPathRecovery(unittest.TestCase):
         self.assertEqual(w.move_to_location_calls[0]["timeout_ms"], 60000)
 
     def test_ui_modal_repeatedly_blocked_is_bounded_and_gives_up(self):
-        """ui_modal 连续挡住每一次重试 ⇒ 有界停手（恰 1 首跳 + 3 次重试），如实记失败。"""
+        """ui_modal 连续挡住每一次重试（含 skip_event 升级）⇒ 有界停手，如实记失败。
+
+        dismiss 3 次关不掉（eventUp 过场）→ 升级 skip_event（限 1 次）→ 退避重试仍被挡
+        ⇒ 放弃。校验：dismiss/skip/重试都**有界**，绝不无限自旋。
+        """
         w = MiniWorld()
         w.location_name = "Farm"
-        w.move_to_location_script = [self._ui_modal_fail(),
-                                     self._ui_modal_fail(),
-                                     self._ui_modal_fail(),
-                                     self._ui_modal_fail()]
+        # 首跳 + 3 次 dismiss 重试 + 3 次 skip 后重试，全部 ui_modal（事件始终在）。
+        w.move_to_location_script = [self._ui_modal_fail()] * (
+            1 + FarmWorker.ENSURE_LOC_MODAL_RETRIES + FarmWorker.ENSURE_LOC_SKIP_RETRIES)
         r = self._worker(w).ensure_location("SeedShop")
         self.assertFalse(r.ok)
         self.assertEqual(r.code, "failed")
         self.assertEqual(w.dismiss_calls, FarmWorker.ENSURE_LOC_MODAL_RETRIES)
-        # 1 首跳 + ENSURE_LOC_MODAL_RETRIES 次重试（有界，不无限重试）
+        self.assertEqual(w.skip_event_calls, 1)          # 升级只试 1 次，不风暴
+        # 1 首跳 + 3 次 dismiss 重试 + 3 次 skip 后重试（有界）
         self.assertEqual(len(w.move_to_location_calls),
-                         1 + FarmWorker.ENSURE_LOC_MODAL_RETRIES)
-        self.assertIn("清模态重试后仍被挡", r.reason)
+                         1 + FarmWorker.ENSURE_LOC_MODAL_RETRIES
+                         + FarmWorker.ENSURE_LOC_SKIP_RETRIES)
+        self.assertIn("清模态 + skip_event 后仍被挡", r.reason)
+
+    def test_ui_modal_event_cutscene_cleared_by_skip_event(self):
+        """ui_modal 是 eventUp 过场（dismiss 3 次关不掉）⇒ skip_event 结束事件后抵达。
+
+        真机证据：本存档背包升级 goto_shop 被 ui_modal 打断，但 dismiss_modal 只关
+        DialogueBox/菜单、关不掉 eventUp 过场（ModalDismiss 对 menu==null 回"没有模态"
+        却清不掉事件），于是 move_to_location 在 UiBlocked(eventUp) 下反复失败、E2 满包
+        死锁无法打破。本用例钉死"dismiss 耗尽 → skip_event → 退避重试抵达"的升级链路。
+        """
+        w = MiniWorld()
+        w.location_name = "Farm"
+        # 首跳 + 3 次 dismiss 重试全部 ui_modal（事件始终在）；skip_event 后第 5 次 move 抵达。
+        w.move_to_location_script = [self._ui_modal_fail(),
+                                     self._ui_modal_fail(),
+                                     self._ui_modal_fail(),
+                                     self._ui_modal_fail(),
+                                     {"ok": True}]
+        r = self._worker(w).ensure_location("SeedShop", pause=lambda s: None)
+        self.assertTrue(r.ok, r.reason)
+        self.assertEqual(w.location_name, "SeedShop")
+        # dismiss 3 次（耗尽上限） + skip_event 1 次 + 重试一次即抵达。
+        self.assertEqual(w.dismiss_calls, FarmWorker.ENSURE_LOC_MODAL_RETRIES)
+        self.assertEqual(w.skip_event_calls, 1)
+        self.assertEqual(len(w.move_to_location_calls),
+                         1 + FarmWorker.ENSURE_LOC_MODAL_RETRIES + 1)
 
 
 class TestTask42Sell(unittest.TestCase):

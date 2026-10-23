@@ -2408,9 +2408,14 @@ class FarmWorker:
     #: move_to_location 会回 ui_modal 失败。清掉模态后重试的上限（真机 UYFc6J 连续两天
     #: goto_shop 被 ui_modal 打断、背包升级跑不通、容量恒 12 ⇒ E2 满包死锁无法打破）。
     ENSURE_LOC_MODAL_RETRIES = 3
+    #: 【抗 eventUp 过场打断】`dismiss_modal` 只关 DialogueBox/菜单，关不掉 Town 的 eventUp 过场
+    #: （`UiBlocked` 仍为真 ⇒ `move_to_location` 反复 `ui_modal`）。dismiss 3 次仍被挡时升级到
+    #: 已布线的 `skip_event`（反射 `Game1.CurrentEvent.skipEvent()`）程序化结束事件，再退避重试几次。
+    ENSURE_LOC_SKIP_RETRIES = 3
 
     def ensure_location(self, name: str, *, tile: tuple[int, int] | None = None,
-                        timeout_ms: int = 60000) -> StepResult:
+                        timeout_ms: int = 60000,
+                        pause: Callable[[float], None] = time.sleep) -> StepResult:
         """走到另一个地点；**失败后做一次两段式重试**（task-43）。
 
         run4 的致命卡点：从田里 `Farm [47,29]` 回农舍，A* 真实路径 ≈88 步（被草/石/枝/树逼得
@@ -2450,7 +2455,33 @@ class FarmWorker:
                             exc = exc2
                             break
                 if not recovered:
-                    diag.append("清模态重试后仍被挡（ui_modal 或新错误），放弃行程")
+                    # 【抗 eventUp 过场打断】Town 的 ui_modal 常是 eventUp 过场（非 DialogueBox），
+                    # ModalDismiss 只处理 DialogueBox/菜单——dismiss_modal 会回"没有模态"却清不掉
+                    # 事件，move_to_location 在 UiBlocked(eventUp) 下反复失败。已布线的 skip_event
+                    # 用反射 Game1.CurrentEvent.skipEvent() 程序化结束事件（见 bridge.skip_event
+                    # 文档：spring1 进 Town 事件冻结正是同一类死锁），让室外行程（背包升级等）能抵达。
+                    # skip 后事件在下一 tick 才真正结束，故退避重试几次。
+                    try:
+                        self.c.skip_event()
+                        skip_ok = True
+                    except BridgeError as exc_skip:
+                        diag.append("skip_event 也失败：%s" % str(exc_skip)[:160])
+                        skip_ok = False
+                    if skip_ok:
+                        for _ in range(self.ENSURE_LOC_SKIP_RETRIES):
+                            pause(1.5)
+                            try:
+                                self.c.move_to_location(name, tile=tile, timeout_ms=timeout_ms)
+                                recovered = True
+                                break
+                            except BridgeError as exc2:
+                                if exc2.status != "ui_modal":
+                                    exc = exc2
+                                    break
+                        if not recovered:
+                            diag.append("skip_event 后仍被 ui_modal 挡（或新错误），放弃行程")
+                if not recovered:
+                    diag.append("清模态 + skip_event 后仍被挡，放弃行程")
                 else:
                     obs = self.snap()
                     now = str((obs.get("location") or {}).get("name") or "")
